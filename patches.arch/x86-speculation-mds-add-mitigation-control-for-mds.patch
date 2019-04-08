@@ -1,0 +1,205 @@
+From: Thomas Gleixner <tglx@linutronix.de>
+Date: Mon, 18 Feb 2019 22:04:08 +0100
+Subject: x86/speculation/mds: Add mitigation control for MDS
+Git-commit: bc1241700acd82ec69fde98c5763ce51086269f8
+Patch-mainline: v5.1 or v5.1-rc4 (next release)
+References: bsc#1111331
+
+Now that the mitigations are in place, add a command line parameter to
+control the mitigation, a mitigation selector function and a SMT update
+mechanism.
+
+This is the minimal straight forward initial implementation which just
+provides an always on/off mode. The command line parameter is:
+
+  mds=[full|off]
+
+This is consistent with the existing mitigations for other speculative
+hardware vulnerabilities.
+
+The idle invocation is dynamically updated according to the SMT state of
+the system similar to the dynamic update of the STIBP mitigation. The idle
+mitigation is limited to CPUs which are only affected by MSBDS and not any
+other variant, because the other variants cannot be mitigated on SMT
+enabled systems.
+
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Reviewed-by: Borislav Petkov <bp@suse.de>
+Reviewed-by: Jon Masters <jcm@redhat.com>
+Tested-by: Jon Masters <jcm@redhat.com>
+Acked-by: Borislav Petkov <bp@suse.de>
+---
+ Documentation/kernel-parameters.txt |   22 ++++++++++
+ arch/x86/include/asm/processor.h    |    5 ++
+ arch/x86/kernel/cpu/bugs.c          |   79 ++++++++++++++++++++++++++++++++++--
+ 3 files changed, 102 insertions(+), 4 deletions(-)
+
+--- a/arch/x86/include/asm/processor.h
++++ b/arch/x86/include/asm/processor.h
+@@ -1074,4 +1074,9 @@ enum l1tf_mitigations {
+ 
+ extern enum l1tf_mitigations l1tf_mitigation;
+ 
++enum mds_mitigations {
++	MDS_MITIGATION_OFF,
++	MDS_MITIGATION_FULL,
++};
++
+ #endif /* _ASM_X86_PROCESSOR_H */
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@ -189,6 +189,7 @@ static void __init spectre_v2_select_mit
+ void ssb_select_mitigation(void);
+ static void x86_amd_ssbd_disable(void);
+ static void __init l1tf_select_mitigation(void);
++static void __init mds_select_mitigation(void);
+ 
+ /* The base value of the SPEC_CTRL MSR that always has to be preserved. */
+ u64 x86_spec_ctrl_base;
+@@ -243,6 +244,8 @@ void __init check_bugs(void)
+ 
+ 	l1tf_select_mitigation();
+ 
++	mds_select_mitigation();
++
+ 	/*
+ 	 * Select proper mitigation for any exposure to the Speculative Store
+ 	 * Bypass vulnerability.
+@@ -281,6 +284,52 @@ void __init check_bugs(void)
+ #endif
+ }
+ 
++#undef pr_fmt
++#define pr_fmt(fmt)	"MDS: " fmt
++
++/* Default mitigation for L1TF-affected CPUs */
++static enum mds_mitigations mds_mitigation = MDS_MITIGATION_FULL;
++
++static const char * const mds_strings[] = {
++	[MDS_MITIGATION_OFF]	= "Vulnerable",
++	[MDS_MITIGATION_FULL]	= "Mitigation: Clear CPU buffers"
++};
++
++static bool x86_bug_mds;
++
++static void __init mds_select_mitigation(void)
++{
++	if (!x86_bug_mds) {
++		mds_mitigation = MDS_MITIGATION_OFF;
++		return;
++	}
++
++	if (mds_mitigation == MDS_MITIGATION_FULL) {
++		if (boot_cpu_has(X86_FEATURE_MD_CLEAR))
++			mds_user_clear = true;
++		else
++			mds_mitigation = MDS_MITIGATION_OFF;
++	}
++	pr_info("%s\n", mds_strings[mds_mitigation]);
++}
++
++static int __init mds_cmdline(char *str)
++{
++	if (!x86_bug_mds)
++		return 0;
++
++	if (!str)
++		return -EINVAL;
++
++	if (!strcmp(str, "off"))
++		mds_mitigation = MDS_MITIGATION_OFF;
++	else if (!strcmp(str, "full"))
++		mds_mitigation = MDS_MITIGATION_FULL;
++
++	return 0;
++}
++early_param("mds", mds_cmdline);
++
+ /* The kernel command line selection */
+ enum spectre_v2_mitigation_cmd {
+ 	SPECTRE_V2_CMD_NONE,
+@@ -389,7 +438,6 @@ static bool __init cpu_matches(unsigned
+ static bool x86_bug_spectre_v1, x86_bug_spectre_v2, x86_bug_meltdown;
+ static bool x86_bug_spec_store_bypass;
+ static bool x86_bug_l1tf;
+-static bool x86_bug_mds;
+ static bool x86_bug_msbds_only;
+ 
+ bool arch_has_pfn_modify_check(void)
+@@ -514,10 +562,24 @@ static bool __init is_skylake_era(void)
+ 	return false;
+ }
+ 
+-void arch_smt_update(void)
++/* Update the static key controlling the MDS CPU buffer clear in idle */
++static void update_mds_branch_idle(void)
+ {
+-	mutex_lock(&spec_ctrl_mutex);
+-	mutex_unlock(&spec_ctrl_mutex);
++	/*
++	 * Enable the idle clearing if SMT is active on CPUs which are
++	 * affected only by MSBDS and not any other MDS variant.
++	 *
++	 * The other variants cannot be mitigated when SMT is enabled, so
++	 * clearing the buffers on idle just to prevent the Store Buffer
++	 * repartitioning leak would be a window dressing exercise.
++	 */
++	if (!x86_bug_msbds_only)
++		return;
++
++	if (sched_smt_active())
++		mds_idle_clear = true;
++	else
++		mds_idle_clear = false;
+ }
+ 
+ static void __init spectre_v2_select_mitigation(void)
+@@ -600,8 +662,17 @@ retpoline_auto:
+ 
+ 	/* Enable STIBP if appropriate */
+ 	arch_smt_update();
++}
+ 
++void arch_smt_update(void)
++{
++	mutex_lock(&spec_ctrl_mutex);
++	if (mds_mitigation == MDS_MITIGATION_FULL)
++		update_mds_branch_idle();
++
++	mutex_unlock(&spec_ctrl_mutex);
+ }
++
+ /* Default mitigation for L1TF-affected CPUs */
+ enum l1tf_mitigations l1tf_mitigation = L1TF_MITIGATION_FLUSH;
+ EXPORT_SYMBOL_GPL(l1tf_mitigation);
+--- a/Documentation/kernel-parameters.txt
++++ b/Documentation/kernel-parameters.txt
+@@ -1515,6 +1515,28 @@ bytes respectively. Such letter suffixes
+ 			Format: <first>,<last>
+ 			Specifies range of consoles to be captured by the MDA.
+ 
++	mds=		[X86,INTEL]
++			Control mitigation for the Micro-architectural Data
++			Sampling (MDS) vulnerability.
++
++			Certain CPUs are vulnerable to an exploit against CPU
++			internal buffers which can forward information to a
++			disclosure gadget under certain conditions.
++
++			In vulnerable processors, the speculatively
++			forwarded data can be used in a cache side channel
++			attack, to access data to which the attacker does
++			not have direct access.
++
++			This parameter controls the MDS mitigation. The
++			options are:
++
++			full    - Enable MDS mitigation on vulnerable CPUs
++			off     - Unconditionally disable MDS mitigation
++
++			Not specifying this option is equivalent to
++			mds=full.
++
+ 	mem=nn[KMG]	[KNL,BOOT] Force usage of a specific amount of memory
+ 			Amount of memory to be used when the kernel is not able
+ 			to see the whole system memory or for test.
