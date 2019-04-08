@@ -1,0 +1,100 @@
+From: Jiri Kosina <jkosina@suse.cz>
+Date: Tue, 25 Sep 2018 14:38:55 +0200
+Subject: x86/speculation: Enable cross-hyperthread spectre v2 STIBP mitigation
+Git-commit: 53c613fe6349994f023245519265999eed75957f
+Patch-mainline: v4.20-rc1
+References: bsc#1111331
+
+STIBP is a feature provided by certain Intel ucodes / CPUs. This feature
+(once enabled) prevents cross-hyperthread control of decisions made by
+indirect branch predictors.
+
+Enable this feature if
+
+- the CPU is vulnerable to spectre v2
+- the CPU supports SMT and has SMT siblings online
+- spectre_v2 mitigation autoselection is enabled (default)
+
+After some previous discussion, this leaves STIBP on all the time, as wrmsr
+on crossing kernel boundary is a no-no. This could perhaps later be a bit
+more optimized (like disabling it in NOHZ, experiment with disabling it in
+idle, etc) if needed.
+
+Note that the synchronization of the mask manipulation via newly added
+spec_ctrl_mutex is currently not strictly needed, as the only updater is
+already being serialized by cpu_add_remove_lock, but let's make this a
+little bit more future-proof.
+
+Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Josh Poimboeuf <jpoimboe@redhat.com>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc:  "WoodhouseDavid" <dwmw@amazon.co.uk>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Tim Chen <tim.c.chen@linux.intel.com>
+Cc:  "SchauflerCasey" <casey.schaufler@intel.com>
+Cc: stable@vger.kernel.org
+Link: https://lkml.kernel.org/r/nycvar.YFH.7.76.1809251438240.15880@cbobk.fhfr.pm
+[ rip out the rest, need only arch_smt_update() for now. ]
+Acked-by: Borislav Petkov <bp@suse.de>
+---
+ arch/x86/kernel/cpu/bugs.c |   16 ++++++++++++----
+ kernel/cpu.c               |    6 ++++++
+ 2 files changed, 18 insertions(+), 4 deletions(-)
+
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@ -182,11 +182,9 @@ void ssb_select_mitigation(void);
+ static void x86_amd_ssbd_disable(void);
+ static void __init l1tf_select_mitigation(void);
+ 
+-/*
+- * Our boot-time value of the SPEC_CTRL MSR. We read it once so that any
+- * writes to SPEC_CTRL contain whatever reserved bits have been set.
+- */
++/* The base value of the SPEC_CTRL MSR that always has to be preserved. */
+ u64 x86_spec_ctrl_base;
++static DEFINE_MUTEX(spec_ctrl_mutex);
+ 
+ /*
+  * The vendor and possibly platform specific bits which can be modified in
+@@ -474,6 +472,12 @@ static bool __init is_skylake_era(void)
+ 	return false;
+ }
+ 
++void arch_smt_update(void)
++{
++	mutex_lock(&spec_ctrl_mutex);
++	mutex_unlock(&spec_ctrl_mutex);
++}
++
+ static void __init spectre_v2_select_mitigation(void)
+ {
+ 	enum spectre_v2_mitigation_cmd cmd = spectre_v2_parse_cmdline();
+@@ -551,6 +555,10 @@ retpoline_auto:
+ 		pr_info("Retpolines enabled, force-disabling IBRS due to !SKL-era core\n");
+ 		ibrs_state = 0;
+ 	}
++
++	/* Enable STIBP if appropriate */
++	arch_smt_update();
++
+ }
+ /* Default mitigation for L1TF-affected CPUs */
+ enum l1tf_mitigations l1tf_mitigation = L1TF_MITIGATION_FLUSH;
+--- a/kernel/cpu.c
++++ b/kernel/cpu.c
+@@ -814,6 +814,12 @@ static void cpuhp_online_cpu_device(unsi
+ 	kobject_uevent(&sys_dev->kobj, KOBJ_ONLINE);
+ }
+ 
++/*
++ * Architectures that need SMT-specific errata handling during SMT hotplug
++ * should override this.
++ */
++void __weak arch_smt_update(void) { };
++
+ static int cpuhp_smt_disable(enum cpuhp_smt_control ctrlval)
+ {
+ 	int cpu, ret = 0;
