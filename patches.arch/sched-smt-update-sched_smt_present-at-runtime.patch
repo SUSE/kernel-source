@@ -1,0 +1,113 @@
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Tue, 29 May 2018 16:43:46 +0200
+Subject: sched/smt: Update sched_smt_present at runtime
+Git-commit: ba2591a5993eabcc8e874e30f361d8ffbb10d6d4
+Patch-mainline: v4.19-rc1
+References: bsc#1111331, CVE-2018-12126, CVE-2018-12127, CVE-2018-12130, CVE-2019-11091
+
+The static key sched_smt_present is only updated at boot time when SMT
+siblings have been detected. Booting with maxcpus=1 and bringing the
+siblings online after boot rebuilds the scheduling domains correctly but
+does not update the static key, so the SMT code is not enabled.
+
+Let the key be updated in the scheduler CPU hotplug code to fix this.
+
+Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Reviewed-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+Acked-by: Ingo Molnar <mingo@kernel.org>
+Acked-by: Borislav Petkov <bp@suse.de>
+---
+ kernel/sched.c |   47 +++++++++++++++++++++--------------------------
+ 1 file changed, 21 insertions(+), 26 deletions(-)
+
+--- a/kernel/sched.c
++++ b/kernel/sched.c
+@@ -128,6 +128,8 @@
+  */
+ #define RUNTIME_INF	((u64)~0ULL)
+ 
++bool sched_smt_present;
++
+ static inline int rt_policy(int policy)
+ {
+ 	if (unlikely(policy == SCHED_FIFO || policy == SCHED_RR))
+@@ -6924,12 +6926,31 @@ static struct notifier_block __cpuinitda
+ 	.priority = CPU_PRI_MIGRATION,
+ };
+ 
++#ifdef CONFIG_SCHED_SMT
++static const struct cpumask *cpu_smt_mask(int cpu)
++{
++	return topology_thread_cpumask(cpu);
++}
++#endif
++
+ static int __cpuinit sched_cpu_active(struct notifier_block *nfb,
+ 				      unsigned long action, void *hcpu)
+ {
+ 	switch (action & ~CPU_TASKS_FROZEN) {
+ 	case CPU_ONLINE:
+ 	case CPU_DOWN_FAILED:
++#ifdef CONFIG_SCHED_SMT
++	/*
++	 * The sched_smt_present static key needs to be evaluated on every
++	 * hotplug event because at boot time SMT might be disabled when
++	 * the number of booted CPUs is limited.
++	 *
++	 * If then later a sibling gets hotplugged, then the key would stay
++	 * off and SMT scheduling would never be functional.
++	 */
++	if (cpumask_weight(cpu_smt_mask(0)) > 1)
++		sched_smt_present = true;
++#endif
+ 		set_cpu_active((long)hcpu, true);
+ 		return NOTIFY_OK;
+ 	default:
+@@ -7929,13 +7950,6 @@ static void claim_allocations(int cpu, s
+ 		*per_cpu_ptr(sdd->sgp, cpu) = NULL;
+ }
+ 
+-#ifdef CONFIG_SCHED_SMT
+-static const struct cpumask *cpu_smt_mask(int cpu)
+-{
+-	return topology_thread_cpumask(cpu);
+-}
+-#endif
+-
+ /*
+  * Topology list, bottom-up.
+  */
+@@ -8492,22 +8506,6 @@ static int update_runtime(struct notifie
+ 	}
+ }
+ 
+-#ifdef CONFIG_SCHED_SMT
+-bool sched_smt_present;
+-
+-static void sched_init_smt(void)
+-{
+-	/*
+-	 * We've enumerated all CPUs and will assume that if any CPU
+-	 * has SMT siblings, CPU0 will too.
+-	 */
+-	if (cpumask_weight(cpu_smt_mask(0)) > 1)
+-		sched_smt_present = true;
+-}
+-#else
+-static inline void sched_init_smt(void) { }
+-#endif
+-
+ void __init sched_init_smp(void)
+ {
+ 	cpumask_var_t non_isolated_cpus;
+@@ -8539,9 +8537,6 @@ void __init sched_init_smp(void)
+ 	free_cpumask_var(non_isolated_cpus);
+ 
+ 	init_sched_rt_class();
+-
+-	sched_init_smt();
+-
+ }
+ #else
+ void __init sched_init_smp(void)

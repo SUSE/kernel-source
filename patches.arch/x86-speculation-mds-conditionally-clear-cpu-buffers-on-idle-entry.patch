@@ -1,0 +1,159 @@
+From: Thomas Gleixner <tglx@linutronix.de>
+Date: Mon, 18 Feb 2019 23:04:01 +0100
+Subject: x86/speculation/mds: Conditionally clear CPU buffers on idle entry
+Git-commit: 07f07f55a29cb705e221eda7894dd67ab81ef343
+Patch-mainline: v5.1 or v5.1-rc4 (next release)
+References: bsc#1111331, CVE-2018-12126, CVE-2018-12127, CVE-2018-12130, CVE-2019-11091
+
+Add a static key which controls the invocation of the CPU buffer clear
+mechanism on idle entry. This is independent of other MDS mitigations
+because the idle entry invocation to mitigate the potential leakage due to
+store buffer repartitioning is only necessary on SMT systems.
+
+Add the actual invocations to the different halt/mwait variants which
+covers all usage sites. mwaitx is not patched as it's not available on
+Intel CPUs.
+
+The buffer clear is only invoked before entering the C-State to prevent
+that stale data from the idling CPU is spilled to the Hyper-Thread sibling
+after the Store buffer got repartitioned and all entries are available to
+the non idle sibling.
+
+When coming out of idle the store buffer is partitioned again so each
+sibling has half of it available. Now CPU which returned from idle could be
+speculatively exposed to contents of the sibling, but the buffers are
+flushed either on exit to user space or on VMENTER.
+
+When later on conditional buffer clearing is implemented on top of this,
+then there is no action required either because before returning to user
+space the context switch will set the condition flag which causes a flush
+on the return to user path.
+
+Note, that the buffer clearing on idle is only sensible on CPUs which are
+solely affected by MSBDS and not any other variant of MDS because the other
+MDS variants cannot be mitigated when SMT is enabled, so the buffer
+clearing on idle would be a window dressing exercise.
+
+This intentionally does not handle the case in the acpi/processor_idle
+driver which uses the legacy IO port interface for C-State transitions for
+two reasons:
+
+ - The acpi/processor_idle driver was replaced by the intel_idle driver
+   almost a decade ago. Anything Nehalem upwards supports it and defaults
+   to that new driver.
+
+ - The legacy IO port interface is likely to be used on older and therefore
+   unaffected CPUs or on systems which do not receive microcode updates
+   anymore, so there is no point in adding that.
+
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Reviewed-by: Borislav Petkov <bp@suse.de>
+Reviewed-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Reviewed-by: Frederic Weisbecker <frederic@kernel.org>
+Reviewed-by: Jon Masters <jcm@redhat.com>
+Tested-by: Jon Masters <jcm@redhat.com>
+[ rip out docs. ]
+Acked-by: Borislav Petkov <bp@suse.de>
+---
+ arch/x86/include/asm/irqflags.h      |    4 ++++
+ arch/x86/include/asm/nospec-branch.h |   13 ++++++++++++-
+ arch/x86/include/asm/processor.h     |    5 +++++
+ arch/x86/kernel/cpu/bugs.c           |    3 +++
+ 4 files changed, 24 insertions(+), 1 deletion(-)
+
+--- a/arch/x86/include/asm/irqflags.h
++++ b/arch/x86/include/asm/irqflags.h
+@@ -8,6 +8,8 @@
+  * Interrupt control:
+  */
+ 
++#include <asm/nospec-branch.h>
++
+ static inline unsigned long native_save_fl(void)
+ {
+ 	unsigned long flags;
+@@ -46,11 +48,13 @@ static inline void native_irq_enable(voi
+ 
+ static inline void native_safe_halt(void)
+ {
++	mds_idle_clear_cpu_buffers();
+ 	asm volatile("sti; hlt": : :"memory");
+ }
+ 
+ static inline void native_halt(void)
+ {
++	mds_idle_clear_cpu_buffers();
+ 	asm volatile("hlt": : :"memory");
+ }
+ 
+--- a/arch/x86/include/asm/nospec-branch.h
++++ b/arch/x86/include/asm/nospec-branch.h
+@@ -212,10 +212,10 @@ static inline void vmexit_fill_RSB(void)
+ 		      : "r" (loops) : "memory" );
+ #endif
+ }
+-
+ #include <asm/segment.h>
+ 
+ extern bool mds_user_clear;
++extern bool mds_idle_clear;
+ 
+ /**
+  * mds_clear_cpu_buffers - Mitigation for MDS vulnerability
+@@ -251,5 +251,16 @@ static inline void mds_user_clear_cpu_bu
+ 		mds_clear_cpu_buffers();
+ }
+ 
++/**
++ * mds_idle_clear_cpu_buffers - Mitigation for MDS vulnerability
++ *
++ * Clear CPU buffers if the corresponding static key is enabled
++ */
++static inline void mds_idle_clear_cpu_buffers(void)
++{
++	if (likely(mds_idle_clear))
++		mds_clear_cpu_buffers();
++}
++
+ #endif /* __ASSEMBLY__ */
+ #endif /* __NOSPEC_BRANCH_H__ */
+--- a/arch/x86/include/asm/processor.h
++++ b/arch/x86/include/asm/processor.h
+@@ -21,6 +21,7 @@ struct mm_struct;
+ #include <asm/msr.h>
+ #include <asm/desc_defs.h>
+ #include <asm/nops.h>
++#include <asm/nospec-branch.h>
+ 
+ #include <linux/personality.h>
+ #include <linux/cpumask.h>
+@@ -775,6 +776,8 @@ static inline void __monitor(const void
+ 
+ static inline void __mwait(unsigned long eax, unsigned long ecx)
+ {
++	mds_idle_clear_cpu_buffers();
++
+ 	/* "mwait %eax, %ecx;" */
+ 	asm volatile(".byte 0x0f, 0x01, 0xc9;"
+ 		     :: "a" (eax), "c" (ecx));
+@@ -782,6 +785,8 @@ static inline void __mwait(unsigned long
+ 
+ static inline void __sti_mwait(unsigned long eax, unsigned long ecx)
+ {
++	mds_idle_clear_cpu_buffers();
++
+ 	trace_hardirqs_on();
+ 	/* "mwait %eax, %ecx;" */
+ 	asm volatile("sti; .byte 0x0f, 0x01, 0xc9;"
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@ -38,6 +38,9 @@
+ /* Control MDS CPU buffer clear before returning to user space */
+ bool mds_user_clear;
+ EXPORT_SYMBOL_GPL(mds_user_clear);
++/* Control MDS CPU buffer clear before idling (halt, mwait) */
++bool mds_idle_clear;
++EXPORT_SYMBOL_GPL(mds_idle_clear);
+ 
+ static void ssb_init_cmd_line(void);
+ 

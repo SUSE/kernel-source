@@ -1,0 +1,145 @@
+From: Thomas Gleixner <tglx@linutronix.de>
+Date: Mon, 18 Feb 2019 23:42:51 +0100
+Subject: x86/speculation/mds: Clear CPU buffers on exit to user
+Git-commit: 04dcbdb8057827b043b3c71aa397c4c63e67d086
+Patch-mainline: v5.1 or v5.1-rc4 (next release)
+References: bsc#1111331, CVE-2018-12126, CVE-2018-12127, CVE-2018-12130, CVE-2019-11091
+
+Add a static key which controls the invocation of the CPU buffer clear
+mechanism on exit to user space and add the call into
+prepare_exit_to_usermode() and do_nmi() right before actually returning.
+
+Add documentation which kernel to user space transition this covers and
+explain why some corner cases are not mitigated.
+
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Reviewed-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Reviewed-by: Borislav Petkov <bp@suse.de>
+Reviewed-by: Frederic Weisbecker <frederic@kernel.org>
+Reviewed-by: Jon Masters <jcm@redhat.com>
+Tested-by: Jon Masters <jcm@redhat.com>
+[ rip out docs.
+  use normal variables for static keys to simplify backport.
+  add a mds_clear_user() for asm. ]
+Acked-by: Borislav Petkov <bp@suse.de>
+---
+ arch/x86/include/asm/nospec-branch.h |   13 +++++++++++++
+ arch/x86/kernel/cpu/bugs.c           |    3 +++
+ arch/x86/kernel/cpu/spec_ctrl.c      |    6 ++++++
+ arch/x86/kernel/entry_64.S           |    3 +++
+ arch/x86/kernel/traps.c              |   12 ++++++++++++
+ 5 files changed, 37 insertions(+)
+
+--- a/arch/x86/include/asm/nospec-branch.h
++++ b/arch/x86/include/asm/nospec-branch.h
+@@ -215,6 +215,8 @@ static inline void vmexit_fill_RSB(void)
+ 
+ #include <asm/segment.h>
+ 
++extern bool mds_user_clear;
++
+ /**
+  * mds_clear_cpu_buffers - Mitigation for MDS vulnerability
+  *
+@@ -238,5 +240,16 @@ static inline void mds_clear_cpu_buffers
+ 	asm volatile("verw %[ds]" : : [ds] "m" (ds) : "cc");
+ }
+ 
++/**
++ * mds_user_clear_cpu_buffers - Mitigation for MDS vulnerability
++ *
++ * Clear CPU buffers if the corresponding static key is enabled
++ */
++static inline void mds_user_clear_cpu_buffers(void)
++{
++	if (likely(mds_user_clear))
++		mds_clear_cpu_buffers();
++}
++
+ #endif /* __ASSEMBLY__ */
+ #endif /* __NOSPEC_BRANCH_H__ */
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@ -35,6 +35,9 @@
+ #include <asm/spec-ctrl.h>
+ #include <asm/e820.h>
+ 
++/* Control MDS CPU buffer clear before returning to user space */
++bool mds_user_clear;
++
+ static void ssb_init_cmd_line(void);
+ 
+ #ifdef CONFIG_X86_32
+--- a/arch/x86/kernel/cpu/spec_ctrl.c
++++ b/arch/x86/kernel/cpu/spec_ctrl.c
+@@ -131,3 +131,9 @@ int __init nospec(char *str)
+ 	return 0;
+ }
+ early_param("nospec", nospec);
++
++/* Wrapper callable by asm */
++void mds_clear_user(void)
++{
++	return mds_user_clear_cpu_buffers();
++}
+--- a/arch/x86/kernel/entry_64.S
++++ b/arch/x86/kernel/entry_64.S
+@@ -562,6 +562,7 @@ sysret_check:
+ 	RESTORE_ARGS 1,-ARG_SKIP,0
+ 	/*CFI_REGISTER	rflags,r11*/
+ 
++	call mds_clear_user
+ 	DISABLE_IBRS
+ 	/*
+ 	 * This opens a window where we have a user CR3, but are
+@@ -926,6 +927,7 @@ retint_swapgs:		/* return to user-space
+ 	 */
+ 
+ swapgs_restore_regs_and_return_to_usermode:
++	call mds_clear_user
+ 	DISABLE_IBRS
+ 	/*
+ 	 * Returning from an interrupt/NMI/exception to user space, currently
+@@ -1007,6 +1009,7 @@ native_irq_return_ldt:
+ 	popq_cfi %rdi
+ 	orq PER_CPU_VAR(espfix_stack),%rax
+ 
++	call mds_clear_user
+ 	DISABLE_IBRS
+ 
+ 	SWITCH_USER_CR3
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@ -61,6 +61,7 @@
+ #include <asm/mce.h>
+ 
+ #include <asm/mach_traps.h>
++#include <asm/nospec-branch.h>
+ 
+ #ifdef CONFIG_X86_64
+ #include <asm/x86_init.h>
+@@ -253,6 +254,14 @@ dotraplinkage void do_double_fault(struc
+ 		normal_regs->orig_ax = 0;  /* Missing (lost) #GP error code */
+ 		regs->ip = (unsigned long)general_protection;
+ 		regs->sp = (unsigned long)&normal_regs->orig_ax;
++
++		/*
++		 * This situation can be triggered by userspace via
++		 * modify_ldt(2) and the return does not take the regular
++		 * user space exit, so a CPU buffer clear is required when
++		 * MDS mitigation is enabled.
++		 */
++		mds_user_clear_cpu_buffers();
+ 		return;
+ 	}
+ #endif
+@@ -504,6 +513,9 @@ do_nmi(struct pt_regs *regs, long error_
+ 		default_do_nmi(regs);
+ 
+ 	nmi_exit();
++
++	if (user_mode(regs))
++		mds_user_clear_cpu_buffers();
+ }
+ 
+ void stop_nmi(void)
