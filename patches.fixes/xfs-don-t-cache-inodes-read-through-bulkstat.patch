@@ -1,0 +1,137 @@
+From 5132ba8f2b7705fb6b06fa6ad3d009233c816b67 Mon Sep 17 00:00:00 2001
+From: Dave Chinner <dchinner@redhat.com>
+Date: Thu, 22 Mar 2012 05:15:10 +0000
+Subject: [PATCH] xfs: don't cache inodes read through bulkstat
+Git-commit: 5132ba8f2b7705fb6b06fa6ad3d009233c816b67
+Patch-mainline: v3.4-rc1
+References: bsc#1134102
+
+When we read inodes via bulkstat, we generally only read them once
+and then throw them away - they never get used again. If we retain
+them in cache, then it simply causes the working set of inodes and
+other cached items to be reclaimed just so the inode cache can grow.
+
+Avoid this problem by marking inodes read by bulkstat not to be
+cached and check this flag in .drop_inode to determine whether the
+inode should be added to the VFS LRU or not. If the inode lookup
+hits an already cached inode, then don't set the flag. If the inode
+lookup hits an inode marked with no cache flag, remove the flag and
+allow it to be cached once the current reference goes away.
+
+Inodes marked as not cached will get cleaned up by the background
+inode reclaim or via memory pressure, so they will still generate
+some short term cache pressure. They will, however, be reclaimed
+much sooner and in preference to cache hot inodes.
+
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Ben Myers <bpm@sgi.com>
+Acked-by: Anthony Iliopoulos <ailiopoulos@suse.com>
+
+---
+ fs/xfs/linux-2.6/xfs_super.c |   17 +++++++++++++++++
+ fs/xfs/xfs_iget.c            |    8 ++++++--
+ fs/xfs/xfs_inode.h           |    4 +++-
+ fs/xfs/xfs_itable.c          |    3 ++-
+ 4 files changed, 28 insertions(+), 4 deletions(-)
+
+--- a/fs/xfs/linux-2.6/xfs_super.c
++++ b/fs/xfs/linux-2.6/xfs_super.c
+@@ -1106,6 +1106,22 @@
+ 	xfs_inactive(ip);
+ }
+ 
++/*
++ * We do an unlocked check for XFS_IDONTCACHE here because we are already
++ * serialised against cache hits here via the inode->i_lock and igrab() in
++ * xfs_iget_cache_hit(). Hence a lookup that might clear this flag will not be
++ * racing with us, and it avoids needing to grab a spinlock here for every inode
++ * we drop the final reference on.
++ */
++STATIC int
++xfs_fs_drop_inode(
++	struct inode		*inode)
++{
++	struct xfs_inode	*ip = XFS_I(inode);
++
++	return generic_drop_inode(inode) || (ip->i_flags & XFS_IDONTCACHE);
++}
++
+ STATIC void
+ xfs_free_fsname(
+ 	struct xfs_mount	*mp)
+@@ -1614,6 +1630,7 @@
+ 	.dirty_inode		= xfs_fs_dirty_inode,
+ 	.write_inode		= xfs_fs_write_inode,
+ 	.evict_inode		= xfs_fs_evict_inode,
++	.drop_inode		= xfs_fs_drop_inode,
+ 	.put_super		= xfs_fs_put_super,
+ 	.sync_fs		= xfs_fs_sync_fs,
+ 	.freeze_fs		= xfs_fs_freeze,
+--- a/fs/xfs/xfs_iget.c
++++ b/fs/xfs/xfs_iget.c
+@@ -296,7 +296,7 @@
+ 	if (lock_flags != 0)
+ 		xfs_ilock(ip, lock_flags);
+ 
+-	xfs_iflags_clear(ip, XFS_ISTALE);
++	xfs_iflags_clear(ip, XFS_ISTALE | XFS_IDONTCACHE);
+ 	XFS_STATS_INC(xs_ig_found);
+ 
+ 	return 0;
+@@ -321,6 +321,7 @@
+ 	struct xfs_inode	*ip;
+ 	int			error;
+ 	xfs_agino_t		agino = XFS_INO_TO_AGINO(mp, ino);
++	int			iflags;
+ 
+ 	ip = xfs_inode_alloc(mp, ino);
+ 	if (!ip)
+@@ -365,8 +366,11 @@
+ 	 * memory barrier that ensures this detection works correctly at lookup
+ 	 * time.
+ 	 */
++	iflags = XFS_INEW;
++	if (flags & XFS_IGET_DONTCACHE)
++		iflags |= XFS_IDONTCACHE;
+ 	ip->i_udquot = ip->i_gdquot = NULL;
+-	xfs_iflags_set(ip, XFS_INEW);
++	xfs_iflags_set(ip, iflags);
+ 
+ 	/* insert the new inode */
+ 	spin_lock(&pag->pag_ici_lock);
+--- a/fs/xfs/xfs_inode.h
++++ b/fs/xfs/xfs_inode.h
+@@ -382,10 +382,11 @@
+ #define XFS_IFILESTREAM		0x0010	/* inode is in a filestream directory */
+ #define XFS_ITRUNCATED		0x0020	/* truncated down so flush-on-close */
+ #define XFS_IDIRTY_RELEASE	0x0040	/* dirty release already seen */
++#define XFS_IDONTCACHE		(1 << 9) /* don't cache the inode long term */
+ 
+ /*
+  * Per-lifetime flags need to be reset when re-using a reclaimable inode during
+- * inode lookup. Thi prevents unintended behaviour on the new inode from
++ * inode lookup. This prevents unintended behaviour on the new inode from
+  * ocurring.
+  */
+ #define XFS_IRECLAIM_RESET_FLAGS	\
+@@ -537,6 +538,7 @@
+  */
+ #define XFS_IGET_CREATE		0x1
+ #define XFS_IGET_UNTRUSTED	0x2
++#define XFS_IGET_DONTCACHE	0x4
+ 
+ int		xfs_inotobp(struct xfs_mount *, struct xfs_trans *,
+ 			    xfs_ino_t, struct xfs_dinode **,
+--- a/fs/xfs/xfs_itable.c
++++ b/fs/xfs/xfs_itable.c
+@@ -76,7 +76,8 @@
+ 		return XFS_ERROR(ENOMEM);
+ 
+ 	error = xfs_iget(mp, NULL, ino,
+-			 XFS_IGET_UNTRUSTED, XFS_ILOCK_SHARED, &ip);
++			 (XFS_IGET_DONTCACHE | XFS_IGET_UNTRUSTED),
++			 XFS_ILOCK_SHARED, &ip);
+ 	if (error) {
+ 		*stat = BULKSTAT_RV_NOTHING;
+ 		goto out_free;
