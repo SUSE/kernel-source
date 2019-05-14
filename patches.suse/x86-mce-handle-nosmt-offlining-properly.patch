@@ -1,0 +1,50 @@
+From: Borislav Petkov <bp@suse.de>
+Date: Tue May 14 10:43:46 CEST 2019
+Subject: x86/MCE: Handle "nosmt" offlining properly
+Patch-mainline: no, SUSE-specific
+References: bsc#1134729
+
+The "nosmt" boot cmdline parameter disables SMT siblings on a machine.
+However, during boot, those SMT siblings need to be brought online once
+so that CR4.MCE gets set (otherwise machine triple-faults on an MCE).
+
+The old code sets up the per-CPU MCE timer in the CPU init path
+mcheck_cpu_init() so when the sibling gets onlined, the timer is
+started. That same timer is cancelled in the hotplug notifier, however.
+
+cpu_up() which onlines the siblings, runs earlier than the MCE code and
+thus there's no hotplug notifier registered yet, to cancel the timer
+when the sibling is offlined immediately again in cpu_up().
+
+So the timer remains running and fires on an offlined CPU after
+the default interval of 5 minutes. Which triggers the WARN_ON() in
+mce_timer_fn().
+
+Instead of doing a major surgery on the CPU hotplug code, simply check
+whether the CPU is online in the timer callback.
+
+Reported-by: Michal Koutný <mkoutny@suse.com>
+Signed-off-by: Borislav Petkov <bp@suse.de>
+
+---
+ arch/x86/kernel/cpu/mcheck/mce.c |    9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+--- a/arch/x86/kernel/cpu/mcheck/mce.c
++++ b/arch/x86/kernel/cpu/mcheck/mce.c
+@@ -1315,6 +1315,15 @@ static void mce_timer_fn(unsigned long d
+ 	int cpu = smp_processor_id();
+ 	unsigned long iv;
+ 
++	/*
++	 * Return if the CPU has been offlined by "nosmt" or other similar
++	 * mitigation switches. The offlining happens before the CPU notifier is
++	 * registered so we cannot do proper cleanup like cancelling the timer.
++	 * So do the easy thing here. It also fixes a Xen issue, see bsc#929141.
++	 */
++	if (!cpu_online(data))
++		return;
++
+ 	WARN_ON(cpu != data);
+ 
+ 	iv = __this_cpu_read(mce_next_interval);
