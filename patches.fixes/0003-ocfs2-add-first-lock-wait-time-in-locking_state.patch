@@ -1,0 +1,166 @@
+From 5da844a2c7df642de2618fc3efe9a92eec40899d Mon Sep 17 00:00:00 2001
+From: Gang He <ghe@suse.com>
+Date: Thu, 11 Jul 2019 20:53:09 -0700
+Subject: [PATCH 3/3] ocfs2: add first lock wait time in locking_state
+Git-commit: 5da844a2c7df642de2618fc3efe9a92eec40899d
+Patch-mainline: v5.3-rc1
+References: bsc#1134390
+
+ocfs2 file system uses locking_state file under debugfs to dump each
+ocfs2 file system's dlm lock resources, but the users ever encountered
+some hang(deadlock) problems in ocfs2 file system.  I'd like to add
+first lock wait time in locking_state file, which can help the upper
+scripts detect these deadlock problems via comparing the first lock wait
+time with the current time.
+
+Link: http://lkml.kernel.org/r/20190611015414.27754-3-ghe@suse.com
+Signed-off-by: Gang He <ghe@suse.com>
+Reviewed-by: Joseph Qi <joseph.qi@linux.alibaba.com>
+Cc: Mark Fasheh <mark@fasheh.com>
+Cc: Joel Becker <jlbec@evilplan.org>
+Cc: Junxiao Bi <junxiao.bi@oracle.com>
+Cc: Changwei Ge <gechangwei@live.cn>
+Cc: Gang He <ghe@suse.com>
+Cc: Jun Piao <piaojun@huawei.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+---
+ fs/ocfs2/dlmglue.c | 32 +++++++++++++++++++++++++++++---
+ fs/ocfs2/ocfs2.h   |  1 +
+ 2 files changed, 30 insertions(+), 3 deletions(-)
+
+diff --git a/fs/ocfs2/dlmglue.c b/fs/ocfs2/dlmglue.c
+index 4089daba4c6f..cf90688ff2ed 100644
+--- a/fs/ocfs2/dlmglue.c
++++ b/fs/ocfs2/dlmglue.c
+@@ -426,6 +426,7 @@ static void ocfs2_remove_lockres_tracking(struct ocfs2_lock_res *res)
+ static void ocfs2_init_lock_stats(struct ocfs2_lock_res *res)
+ {
+ 	res->l_lock_refresh = 0;
++	res->l_lock_wait = 0;
+ 	memset(&res->l_lock_prmode, 0, sizeof(struct ocfs2_lock_stats));
+ 	memset(&res->l_lock_exmode, 0, sizeof(struct ocfs2_lock_stats));
+ }
+@@ -469,6 +470,21 @@ static inline void ocfs2_track_lock_refresh(struct ocfs2_lock_res *lockres)
+ 	lockres->l_lock_refresh++;
+ }
+ 
++static inline void ocfs2_track_lock_wait(struct ocfs2_lock_res *lockres)
++{
++	struct ocfs2_mask_waiter *mw;
++
++	if (list_empty(&lockres->l_mask_waiters)) {
++		lockres->l_lock_wait = 0;
++		return;
++	}
++
++	mw = list_first_entry(&lockres->l_mask_waiters,
++				struct ocfs2_mask_waiter, mw_item);
++	lockres->l_lock_wait = ktime_to_us(ktime_sub(mw->mw_lock_start,
++				ktime_get_monotonic_offset()));
++}
++
+ static inline void ocfs2_init_start_time(struct ocfs2_mask_waiter *mw)
+ {
+ 	mw->mw_lock_start = ktime_get();
+@@ -484,6 +500,9 @@ static inline void ocfs2_update_lock_stats(struct ocfs2_lock_res *res,
+ static inline void ocfs2_track_lock_refresh(struct ocfs2_lock_res *lockres)
+ {
+ }
++static inline void ocfs2_track_lock_wait(struct ocfs2_lock_res *lockres)
++{
++}
+ static inline void ocfs2_init_start_time(struct ocfs2_mask_waiter *mw)
+ {
+ }
+@@ -877,6 +896,7 @@ static void lockres_set_flags(struct ocfs2_lock_res *lockres,
+ 		list_del_init(&mw->mw_item);
+ 		mw->mw_status = 0;
+ 		complete(&mw->mw_complete);
++		ocfs2_track_lock_wait(lockres);
+ 	}
+ }
+ static void lockres_or_flags(struct ocfs2_lock_res *lockres, unsigned long or)
+@@ -1388,6 +1408,7 @@ static void lockres_add_mask_waiter(struct ocfs2_lock_res *lockres,
+ 	list_add_tail(&mw->mw_item, &lockres->l_mask_waiters);
+ 	mw->mw_mask = mask;
+ 	mw->mw_goal = goal;
++	ocfs2_track_lock_wait(lockres);
+ }
+ 
+ /* returns 0 if the mw that was removed was already satisfied, -EBUSY
+@@ -1404,6 +1425,7 @@ static int __lockres_remove_mask_waiter(struct ocfs2_lock_res *lockres,
+ 
+ 		list_del_init(&mw->mw_item);
+ 		init_completion(&mw->mw_complete);
++		ocfs2_track_lock_wait(lockres);
+ 	}
+ 
+ 	return ret;
+@@ -3084,7 +3106,7 @@ static void *ocfs2_dlm_seq_next(struct seq_file *m, void *v, loff_t *pos)
+  * New in version 3
+  *	- Max time in lock stats is in usecs (instead of nsecs)
+  * New in version 4
+- *	- Add last pr/ex unlock times in usecs
++ *	- Add last pr/ex unlock times and first lock wait time in usecs
+  */
+ #define OCFS2_DLM_DEBUG_STR_VERSION 4
+ static int ocfs2_dlm_seq_show(struct seq_file *m, void *v)
+@@ -3102,7 +3124,7 @@ static int ocfs2_dlm_seq_show(struct seq_file *m, void *v)
+ 		return -EINVAL;
+ 
+ #ifdef CONFIG_OCFS2_FS_STATS
+-	if (dlm_debug->d_filter_secs) {
++	if (!lockres->l_lock_wait && dlm_debug->d_filter_secs) {
+ 		now = ktime_to_us(ktime_get_real());
+ 		if (lockres->l_lock_prmode.ls_last >
+ 		    lockres->l_lock_exmode.ls_last)
+@@ -3163,6 +3185,7 @@ static int ocfs2_dlm_seq_show(struct seq_file *m, void *v)
+ # define lock_refresh(_l)		((_l)->l_lock_refresh)
+ # define lock_last_prmode(_l)		((_l)->l_lock_prmode.ls_last)
+ # define lock_last_exmode(_l)		((_l)->l_lock_exmode.ls_last)
++# define lock_wait(_l)			((_l)->l_lock_wait)
+ #else
+ # define lock_num_prmode(_l)		(0)
+ # define lock_num_exmode(_l)		(0)
+@@ -3175,6 +3198,7 @@ static int ocfs2_dlm_seq_show(struct seq_file *m, void *v)
+ # define lock_refresh(_l)		(0)
+ # define lock_last_prmode(_l)		(0ULL)
+ # define lock_last_exmode(_l)		(0ULL)
++# define lock_wait(_l)			(0ULL)
+ #endif
+ 	/* The following seq_print was added in version 2 of this output */
+ 	seq_printf(m, "%u\t"
+@@ -3187,6 +3211,7 @@ static int ocfs2_dlm_seq_show(struct seq_file *m, void *v)
+ 		   "%u\t"
+ 		   "%u\t"
+ 		   "%llu\t"
++		   "%llu\t"
+ 		   "%llu\t",
+ 		   lock_num_prmode(lockres),
+ 		   lock_num_exmode(lockres),
+@@ -3198,7 +3223,8 @@ static int ocfs2_dlm_seq_show(struct seq_file *m, void *v)
+ 		   lock_max_exmode(lockres),
+ 		   lock_refresh(lockres),
+ 		   lock_last_prmode(lockres),
+-		   lock_last_exmode(lockres));
++		   lock_last_exmode(lockres),
++		   lock_wait(lockres));
+ 
+ 	/* End the line */
+ 	seq_printf(m, "\n");
+diff --git a/fs/ocfs2/ocfs2.h b/fs/ocfs2/ocfs2.h
+index c7539601555b..fddbbd60f434 100644
+--- a/fs/ocfs2/ocfs2.h
++++ b/fs/ocfs2/ocfs2.h
+@@ -192,6 +192,7 @@ struct ocfs2_lock_res {
+ #ifdef CONFIG_OCFS2_FS_STATS
+ 	struct ocfs2_lock_stats  l_lock_prmode;		/* PR mode stats */
+ 	u32                      l_lock_refresh;	/* Disk refreshes */
++	u64                      l_lock_wait;	/* First lock wait time */
+ 	struct ocfs2_lock_stats  l_lock_exmode;		/* EX mode stats */
+ #endif
+ #ifdef CONFIG_DEBUG_LOCK_ALLOC
+-- 
+2.12.3
+
