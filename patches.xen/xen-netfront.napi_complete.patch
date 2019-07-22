@@ -1,0 +1,63 @@
+Subject: xen-netfront: use napi_complete() correctly to prevent Rx stalling
+From: <ohering@suse.de>
+Patch-mainline: v3.19-rc1
+Git-commit: 6a6dc08ff6395f58be3ee568cb970ea956f16819
+References: bsc#1138744
+
+After d75b1ade567ffab085e8adbbdacf0092d10cd09c (net: less interrupt
+masking in NAPI) the napi instance is removed from the per-cpu list
+prior to calling the n->poll(), and is only requeued if all of the
+budget was used.  This inadvertently broke netfront because netfront
+does not use NAPI correctly.
+
+If netfront had not used all of its budget it would do a final check
+for any Rx responses and avoid calling napi_complete() if there were
+more responses.  It would still return under budget so it would never
+be rescheduled.  The final check would also not re-enable the Rx
+interrupt.
+
+Additionally, xenvif_poll() would also call napi_complete() /after/
+enabling the interrupt.  This resulted in a race between the
+napi_complete() and the napi_schedule() in the interrupt handler.  The
+use of local_irq_save/restore() avoided by race iff the handler is
+running on the same CPU but not if it was running on a different CPU.
+
+Fix both of these by always calling napi_compete() if the budget was
+not all used, and then calling napi_schedule() if the final checks
+says there's more work.
+
+Signed-off-by: David Vrabel <david.vrabel@citrix.com>
+Cc: Eric Dumazet <edumazet@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+--- a/drivers/xen/netfront/netfront.c
++++ b/drivers/xen/netfront/netfront.c
+@@ -1369,7 +1369,6 @@ static int netif_poll(struct napi_struct
+ 	struct sk_buff_head rxq;
+ 	struct sk_buff_head errq;
+ 	struct sk_buff_head tmpq;
+-	unsigned long flags;
+ 	unsigned int len;
+ 	int pages_flipped = 0;
+ 	int err;
+@@ -1544,7 +1543,7 @@ err:
+ 	}
+ 
+ 	if (work_done < budget) {
+-		local_irq_save(flags);
++		napi_complete(napi);
+ 
+ 		RING_FINAL_CHECK_FOR_RESPONSES(&np->rx, more_to_do);
+ 
+@@ -1558,10 +1557,8 @@ err:
+ 				np->accel_vif_state.hooks->start_napi_irq(dev);
+ 		}
+ 
+-		if (!more_to_do && !accel_more_to_do)
+-			__napi_complete(napi);
+-
+-		local_irq_restore(flags);
++		if (more_to_do || accel_more_to_do)
++			napi_schedule(napi);
+ 	}
+ 
+ 	spin_unlock(&np->rx_lock);
