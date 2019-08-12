@@ -218,14 +218,14 @@ remotes = (
     Head(RepoURL("mkp/scsi.git"), "5.0/scsi-fixes"),
     Head(RepoURL("git://git.kernel.dk/linux-block.git"), "for-next"),
     Head(RepoURL("git://git.kernel.org/pub/scm/virt/kvm/kvm.git"), "queue"),
-    Head(RepoURL("git://git.infradead.org/nvme.git"), "nvme-4.18"),
-    Head(RepoURL("git://git.infradead.org/nvme.git"), "nvme-4.19"),
+    Head(RepoURL("git://git.infradead.org/nvme.git"), "nvme-5.3-rc"),
     Head(RepoURL("dhowells/linux-fs.git")),
     Head(RepoURL("herbert/cryptodev-2.6.git")),
     Head(RepoURL("helgaas/pci.git"), "next"),
     Head(RepoURL("viro/vfs.git"), "for-linus"),
     Head(RepoURL("jeyu/linux.git"), "modules-next"),
     Head(RepoURL("nvdimm/nvdimm.git"), "libnvdimm-for-next"),
+    Head(RepoURL("herbert/crypto-2.6.git"), "master"),
 )
 
 
@@ -642,10 +642,14 @@ if __name__ == "__main__":
         path = os.environ["GIT_DIR"]
     except KeyError:
         try:
+            # depending on the pygit2 version, discover_repository() will either
+            # raise KeyError or return None if a repository is not found.
             path = pygit2.discover_repository(os.getcwd())
         except KeyError:
-            print("Error: Not a git repository", file=sys.stderr)
-            sys.exit(1)
+            path = None
+    if path is None:
+        print("Error: Not a git repository", file=sys.stderr)
+        sys.exit(1)
     repo = pygit2.Repository(path)
 
     if args.dump_heads:
