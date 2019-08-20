@@ -1,0 +1,66 @@
+From c9fbd7bbc23dbdd73364be4d045e5d3612cf6e82 Mon Sep 17 00:00:00 2001
+From: Dave Chinner <dchinner@redhat.com>
+Date: Thu, 10 May 2018 21:50:23 -0700
+Subject: [PATCH] xfs: clear sb->s_fs_info on mount failure
+Git-commit: c9fbd7bbc23dbdd73364be4d045e5d3612cf6e82
+Patch-mainline: v4.18-rc1
+References: bsc#1146285, CVE-2018-20976
+
+We recently had an oops reported on a 4.14 kernel in
+xfs_reclaim_inodes_count() where sb->s_fs_info pointed to garbage
+and so the m_perag_tree lookup walked into lala land.
+
+Essentially, the machine was under memory pressure when the mount
+was being run, xfs_fs_fill_super() failed after allocating the
+xfs_mount and attaching it to sb->s_fs_info. It then cleaned up and
+freed the xfs_mount, but the sb->s_fs_info field still pointed to
+the freed memory. Hence when the superblock shrinker then ran
+it fell off the bad pointer.
+
+With the superblock shrinker problem fixed at teh VFS level, this
+stale s_fs_info pointer is still a problem - we use it
+unconditionally in ->put_super when the superblock is being torn
+down, and hence we can still trip over it after a ->fill_super
+call failure. Hence we need to clear s_fs_info if
+xfs-fs_fill_super() fails, and we need to check if it's valid in
+the places it can potentially be dereferenced after a ->fill_super
+failure.
+
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+Acked-by: Anthony Iliopoulos <ailiopoulos@suse.com>
+
+---
+ fs/xfs/linux-2.6/xfs_super.c |    6 ++++++
+ 1 file changed, 6 insertions(+)
+
+--- a/fs/xfs/linux-2.6/xfs_super.c
++++ b/fs/xfs/linux-2.6/xfs_super.c
+@@ -1088,6 +1088,10 @@
+ {
+ 	struct xfs_mount	*mp = XFS_M(sb);
+ 
++	/* if ->fill_super failed, we have no mount to tear down */
++	if (!sb->s_fs_info)
++		return;
++
+ 	/*
+ 	 * Unregister the memory shrinker before we tear down the mount
+ 	 * structure so we don't have memory reclaim racing with us here.
+@@ -1113,6 +1117,7 @@
+ 	xfs_icsb_destroy_counters(mp);
+ 	xfs_destroy_mount_workqueues(mp);
+ 	xfs_close_devices(mp);
++	sb->s_fs_info = NULL;
+ 	xfs_dmops_put(mp);
+ 	xfs_free_fsname(mp);
+ 	kfree(mp->m_mtpt);
+@@ -1538,6 +1543,7 @@
+  out_put_dmops:
+ 	xfs_dmops_put(mp);
+  out_free_fsname:
++	sb->s_fs_info = NULL;
+ 	xfs_free_fsname(mp);
+ 	kfree(mtpt);
+ 	kfree(mp);
