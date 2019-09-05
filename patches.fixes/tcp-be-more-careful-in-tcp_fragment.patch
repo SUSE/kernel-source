@@ -1,0 +1,112 @@
+From: Eric Dumazet <edumazet@google.com>
+Subject: tcp: be more careful in tcp_fragment()
+Patch-mainline: v5.3-rc2
+Git-commit: b617158dc096709d8600c53b6052144d12b89fab
+References: CVE-2019-11477 bsc#1137586 bsc#1139751
+
+Some applications set tiny SO_SNDBUF values and expect
+TCP to just work. Recent patches to address CVE-2019-11478
+broke them in case of losses, since retransmits might
+be prevented.
+
+We should allow these flows to make progress.
+
+This patch allows the first and last skb in retransmit queue
+to be split even if memory limits are hit.
+
+It also adds the some room due to the fact that tcp_sendmsg()
+and tcp_sendpage() might overshoot sk_wmem_queued by about one full
+TSO skb (64KB size). Note this allowance was already present
+in stable backports for kernels < 4.15
+
+Note for < 4.15 backports :
+ tcp_rtx_queue_tail() will probably look like :
+
+static inline struct sk_buff *tcp_rtx_queue_tail(const struct sock *sk)
+{
+	struct sk_buff *skb = tcp_send_head(sk);
+
+	return skb ? tcp_write_queue_prev(sk, skb) : tcp_write_queue_tail(sk);
+}
+
+Fixes: f070ef2ac667 ("tcp: tcp_fragment() should apply sane memory limits")
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Reported-by: Andrew Prout <aprout@ll.mit.edu>
+Tested-by: Andrew Prout <aprout@ll.mit.edu>
+Tested-by: Jonathan Lemon <jonathan.lemon@gmail.com>
+Tested-by: Michal Kubecek <mkubecek@suse.cz>
+Acked-by: Neal Cardwell <ncardwell@google.com>
+Acked-by: Yuchung Cheng <ycheng@google.com>
+Acked-by: Christoph Paasch <cpaasch@apple.com>
+Cc: Jonathan Looney <jtl@netflix.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Michal Kubecek <mkubecek@suse.cz>
+
+---
+ include/linux/skbuff.h |  5 +++++
+ include/net/tcp.h      | 14 ++++++++++++++
+ net/ipv4/tcp_output.c  | 11 ++++++++++-
+ 3 files changed, 29 insertions(+), 1 deletion(-)
+
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -45,6 +45,11 @@
+ #define SKB_MAX_HEAD(X)		(SKB_MAX_ORDER((X), 0))
+ #define SKB_MAX_ALLOC		(SKB_MAX_ORDER(0, 2))
+ 
++/* return minimum truesize of one skb containing X bytes of data */
++#define SKB_TRUESIZE(X) ((X) +						\
++			 SKB_DATA_ALIGN(sizeof(struct sk_buff)) +	\
++			 SKB_DATA_ALIGN(sizeof(struct skb_shared_info)))
++
+ /* A. Checksumming of received packets by device.
+  *
+  *	NONE: device failed to checksum this packet.
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -1536,4 +1536,18 @@ static inline struct tcp_extend_values *tcp_xv(struct request_values *rvp)
+ extern void tcp_v4_init(void);
+ extern void tcp_init(void);
+ 
++static inline struct sk_buff *tcp_rtx_queue_head(struct sock *sk)
++{
++	struct sk_buff *skb = tcp_write_queue_head(sk);
++
++	return skb == tcp_send_head(sk) ? NULL : skb;
++}
++
++static inline struct sk_buff *tcp_rtx_queue_tail(struct sock *sk)
++{
++	struct sk_buff *skb = tcp_send_head(sk);
++
++	return skb ? tcp_write_queue_prev(sk, skb) : tcp_write_queue_tail(sk);
++}
++
+ #endif	/* _TCP_H */
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@ -1003,6 +1003,7 @@ int tcp_fragment(struct sock *sk, struct sk_buff *skb, u32 len,
+ 	struct tcp_sock *tp = tcp_sk(sk);
+ 	struct sk_buff *buff;
+ 	int nsize, old_factor;
++	long limit;
+ 	int nlen;
+ 	u8 flags;
+ 
+@@ -1013,7 +1014,15 @@ int tcp_fragment(struct sock *sk, struct sk_buff *skb, u32 len,
+ 	if (nsize < 0)
+ 		nsize = 0;
+ 
+-	if (unlikely((sk->sk_wmem_queued >> 1) > sk->sk_sndbuf + 0x20000)) {
++	/* tcp_sendmsg() can overshoot sk_wmem_queued by one full size skb.
++	 * We need some allowance to not penalize applications setting small
++	 * SO_SNDBUF values.
++	 * Also allow first and last skb in retransmit queue to be split.
++	 */
++	limit = sk->sk_sndbuf + 2 * SKB_TRUESIZE(GSO_MAX_SIZE);
++	if (unlikely((sk->sk_wmem_queued >> 1) > limit &&
++		     skb != tcp_rtx_queue_head(sk) &&
++		     skb != tcp_rtx_queue_tail(sk))) {
+ 		NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPWQUEUETOOBIG);
+ 		return -ENOMEM;
+ 	}
