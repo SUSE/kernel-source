@@ -1,0 +1,256 @@
+From: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+Subject: [PATCH 1/5] x86: Add ITLB_MULTIHIT bug infrastructure
+References: bsc#1117665, CVE-2018-12207
+Patch-mainline: No, still under discussion
+
+Some processors may incur a machine check error possibly
+resulting in an unrecoverable cpu hang when an instruction fetch
+encounters a TLB multi-hit in the instruction TLB. This can occur
+when the page size is changed along with either the physical
+address or cache type [1].
+
+This issue affects both bare-metal x86 page tables and EPT.
+
+This can be mitigated by either eliminating the use of large
+pages or by using careful TLB invalidations when changing the
+page size in the page tables.
+
+Just like Spectre, Meltdown, L1TF and MDS, a new bit has been
+allocated in MSR_IA32_ARCH_CAPABILITIES (PSCHANGE_MC_NO) and will
+be set on CPUs which are mitigated against this issue.
+
+[1] For example please refer to erratum SKL002 in "6th Generation
+Intel Processor Family Specification Update"
+https://www.intel.com/content/www/us/en/products/docs/processors/core/desktop-6th-gen-core-family-spec-update.html
+https://www.google.com/search?q=site:intel.com+SKL002
+
+There are a lot of other affected processors outside of Skylake and
+that the erratum(referred above) does not fully disclose the issue
+and the impact, both on Skylake and across all the affected CPUs.
+
+Signed-off-by: Vineela Tummalapalli <vineela.tummalapalli@intel.com>
+Co-developed-by: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+Signed-off-by: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Acked-by: Joerg Roedel <jroedel@suse.de>
+---
+ Documentation/ABI/testing/sysfs-devices-system-cpu |  1 +
+ arch/x86/include/asm/cpufeatures.h                 |  1 +
+ arch/x86/include/asm/msr-index.h                   |  7 +++
+ arch/x86/kernel/cpu/bugs.c                         | 13 ++++
+ arch/x86/kernel/cpu/common.c                       | 71 ++++++++++++----------
+ drivers/base/cpu.c                                 |  8 +++
+ include/linux/cpu.h                                |  2 +
+ 7 files changed, 70 insertions(+), 33 deletions(-)
+
+--- a/Documentation/ABI/testing/sysfs-devices-system-cpu
++++ b/Documentation/ABI/testing/sysfs-devices-system-cpu
+@@ -208,6 +208,7 @@ What:		/sys/devices/system/cpu/vulnerabi
+ 		/sys/devices/system/cpu/vulnerabilities/spectre_v1
+ 		/sys/devices/system/cpu/vulnerabilities/spectre_v2
+ 		/sys/devices/system/cpu/vulnerabilities/mds
++		/sys/devices/system/cpu/vulnerabilities/itlb_multihit
+ Date:		January 2018
+ Contact:	Linux kernel mailing list <linux-kernel@vger.kernel.org>
+ Description:	Information about CPU vulnerabilities
+--- a/arch/x86/include/asm/msr-index.h
++++ b/arch/x86/include/asm/msr-index.h
+@@ -56,6 +56,13 @@
+ 						  * Microarchitectural Data
+ 						  * Sampling (MDS) vulnerabilities.
+ 						  */
++#define ARCH_CAP_PSCHANGE_MC_NO		BIT(6)	 /*
++						  * The processor is not susceptible to a
++						  * machine check error due to modifying the
++						  * code page size along with either the
++						  * physical address or cache type
++						  * without TLB invalidation.
++						  */
+ 
+ #define MSR_IA32_FLUSH_CMD		0x0000010b
+ #define L1D_FLUSH			(1 << 0)   /*
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@ -500,12 +500,13 @@ static inline const char *spectre_v2_mod
+ static inline const char *spectre_v2_module_string(void) { return ""; }
+ #endif
+ 
+-#define NO_SPECULATION	BIT(0)
+-#define NO_MELTDOWN	BIT(1)
+-#define NO_SSB		BIT(2)
+-#define NO_L1TF		BIT(3)
+-#define NO_MDS		BIT(4)
+-#define MSBDS_ONLY	BIT(5)
++#define NO_SPECULATION		BIT(0)
++#define NO_MELTDOWN		BIT(1)
++#define NO_SSB			BIT(2)
++#define NO_L1TF			BIT(3)
++#define NO_MDS			BIT(4)
++#define MSBDS_ONLY		BIT(5)
++#define NO_ITLB_MULTIHIT	BIT(7)
+ 
+ #define VULNWL(_vendor, _family, _model, _whitelist)	\
+ 	{ X86_VENDOR_##_vendor, _family, _model, X86_FEATURE_ANY, _whitelist }
+@@ -523,34 +524,34 @@ static const __initconst struct x86_cpu_
+ 	VULNWL(NSC,	5, X86_MODEL_ANY,	NO_SPECULATION),
+ 
+ 	/* Intel Family 6 */
+-	VULNWL_INTEL(ATOM_SALTWELL,		NO_SPECULATION),
+-	VULNWL_INTEL(ATOM_SALTWELL_TABLET,	NO_SPECULATION),
+-	VULNWL_INTEL(ATOM_SALTWELL_MID,		NO_SPECULATION),
+-	VULNWL_INTEL(ATOM_BONNELL,		NO_SPECULATION),
+-	VULNWL_INTEL(ATOM_BONNELL_MID,		NO_SPECULATION),
+-
+-	VULNWL_INTEL(ATOM_SILVERMONT,		NO_SSB | NO_L1TF | MSBDS_ONLY),
+-	VULNWL_INTEL(ATOM_SILVERMONT_X,		NO_SSB | NO_L1TF | MSBDS_ONLY),
+-	VULNWL_INTEL(ATOM_SILVERMONT_MID,	NO_SSB | NO_L1TF | MSBDS_ONLY),
+-	VULNWL_INTEL(ATOM_AIRMONT,		NO_SSB | NO_L1TF | MSBDS_ONLY),
+-	VULNWL_INTEL(XEON_PHI_KNL,		NO_SSB | NO_L1TF | MSBDS_ONLY),
+-	VULNWL_INTEL(XEON_PHI_KNM,		NO_SSB | NO_L1TF | MSBDS_ONLY),
++	VULNWL_INTEL(ATOM_SALTWELL,		NO_SPECULATION | NO_ITLB_MULTIHIT),
++	VULNWL_INTEL(ATOM_SALTWELL_TABLET,	NO_SPECULATION | NO_ITLB_MULTIHIT),
++	VULNWL_INTEL(ATOM_SALTWELL_MID,		NO_SPECULATION | NO_ITLB_MULTIHIT),
++	VULNWL_INTEL(ATOM_BONNELL,		NO_SPECULATION | NO_ITLB_MULTIHIT),
++	VULNWL_INTEL(ATOM_BONNELL_MID,		NO_SPECULATION | NO_ITLB_MULTIHIT),
++
++	VULNWL_INTEL(ATOM_SILVERMONT,		NO_SSB | NO_L1TF | MSBDS_ONLY | NO_ITLB_MULTIHIT),
++	VULNWL_INTEL(ATOM_SILVERMONT_X,		NO_SSB | NO_L1TF | MSBDS_ONLY | NO_ITLB_MULTIHIT),
++	VULNWL_INTEL(ATOM_SILVERMONT_MID,	NO_SSB | NO_L1TF | MSBDS_ONLY | NO_ITLB_MULTIHIT),
++	VULNWL_INTEL(ATOM_AIRMONT,		NO_SSB | NO_L1TF | MSBDS_ONLY | NO_ITLB_MULTIHIT),
++	VULNWL_INTEL(XEON_PHI_KNL,		NO_SSB | NO_L1TF | MSBDS_ONLY | NO_ITLB_MULTIHIT),
++	VULNWL_INTEL(XEON_PHI_KNM,		NO_SSB | NO_L1TF | MSBDS_ONLY | NO_ITLB_MULTIHIT),
+ 
+ 	VULNWL_INTEL(CORE_YONAH,		NO_SSB),
+ 
+-	VULNWL_INTEL(ATOM_AIRMONT_MID,		NO_L1TF | MSBDS_ONLY),
+-	VULNWL_INTEL(ATOM_GOLDMONT,		NO_MDS | NO_L1TF),
+-	VULNWL_INTEL(ATOM_GOLDMONT_X,		NO_MDS | NO_L1TF),
+-	VULNWL_INTEL(ATOM_GOLDMONT_PLUS,	NO_MDS | NO_L1TF),
++	VULNWL_INTEL(ATOM_AIRMONT_MID,		NO_L1TF | MSBDS_ONLY | NO_ITLB_MULTIHIT),
++	VULNWL_INTEL(ATOM_GOLDMONT,		NO_MDS | NO_L1TF | NO_ITLB_MULTIHIT),
++	VULNWL_INTEL(ATOM_GOLDMONT_X,		NO_MDS | NO_L1TF | NO_ITLB_MULTIHIT),
++	VULNWL_INTEL(ATOM_GOLDMONT_PLUS,	NO_MDS | NO_L1TF | NO_ITLB_MULTIHIT),
+ 
+ 	/* AMD Family 0xf - 0x12 */
+-	VULNWL_AMD(0x0f,	NO_MELTDOWN | NO_SSB | NO_L1TF | NO_MDS),
+-	VULNWL_AMD(0x10,	NO_MELTDOWN | NO_SSB | NO_L1TF | NO_MDS),
+-	VULNWL_AMD(0x11,	NO_MELTDOWN | NO_SSB | NO_L1TF | NO_MDS),
+-	VULNWL_AMD(0x12,	NO_MELTDOWN | NO_SSB | NO_L1TF | NO_MDS),
++	VULNWL_AMD(0x0f,	NO_MELTDOWN | NO_SSB | NO_L1TF | NO_MDS | NO_ITLB_MULTIHIT),
++	VULNWL_AMD(0x10,	NO_MELTDOWN | NO_SSB | NO_L1TF | NO_MDS | NO_ITLB_MULTIHIT),
++	VULNWL_AMD(0x11,	NO_MELTDOWN | NO_SSB | NO_L1TF | NO_MDS | NO_ITLB_MULTIHIT),
++	VULNWL_AMD(0x12,	NO_MELTDOWN | NO_SSB | NO_L1TF | NO_MDS | NO_ITLB_MULTIHIT),
+ 
+ 	/* FAMILY_ANY must be last, otherwise 0x0f - 0x12 matches won't work */
+-	VULNWL_AMD(X86_FAMILY_ANY,	NO_MELTDOWN | NO_L1TF | NO_MDS),
++	VULNWL_AMD(X86_FAMILY_ANY,	NO_MELTDOWN | NO_L1TF | NO_MDS | NO_ITLB_MULTIHIT),
+ 	{}
+ };
+ 
+@@ -563,6 +564,7 @@ static bool __init cpu_matches(unsigned
+ 
+ static bool x86_bug_spec_store_bypass;
+ static bool x86_bug_l1tf;
++static bool x86_bug_itlb_multihit;
+ 
+ bool arch_has_pfn_modify_check(void)
+ {
+@@ -570,6 +572,12 @@ bool arch_has_pfn_modify_check(void)
+ }
+ EXPORT_SYMBOL_GPL(arch_has_pfn_modify_check);
+ 
++bool has_bug_itlb_multihit(void)
++{
++	return x86_bug_itlb_multihit;
++}
++EXPORT_SYMBOL_GPL(has_bug_itlb_multihit);
++
+ void setup_force_cpu_bugs(unsigned long __unused)
+ {
+         u64 ia32_cap = 0;
+@@ -581,6 +589,10 @@ void setup_force_cpu_bugs(unsigned long
+ 	if (boot_cpu_has(X86_FEATURE_ARCH_CAPABILITIES))
+ 		rdmsrl(MSR_IA32_ARCH_CAPABILITIES, ia32_cap);
+ 
++	/* Set ITLB_MULTIHIT bug if cpu is not in the whitelist and not mitigated */
++	if (!cpu_matches(NO_ITLB_MULTIHIT) && !(ia32_cap & ARCH_CAP_PSCHANGE_MC_NO))
++		x86_bug_itlb_multihit = true;
++
+ 	if (!cpu_matches(NO_SSB))
+ 		x86_bug_spec_store_bypass = true;
+ 
+@@ -1230,6 +1242,11 @@ ssize_t cpu_show_l1tf(struct device *dev
+ 	return l1tf_show_state(buf);;
+ }
+ 
++ssize_t itlb_multihit_show_state(char *buf)
++{
++	return sprintf(buf, "Processor vulnerable\n");
++}
++
+ static ssize_t mds_show_state(char *buf)
+ {
+ #ifndef CONFIG_XEN
+@@ -1253,6 +1270,11 @@ ssize_t cpu_show_mds(struct device *dev,
+ {
+ 	return mds_show_state(buf);
+ }
++
++ssize_t cpu_show_itlb_multihit(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	return sprintf(buf, "Processor vulnerable\n");
++}
+ #endif
+ 
+ void x86_spec_ctrl_set(u64 val)
+--- a/drivers/base/cpu.c
++++ b/drivers/base/cpu.c
+@@ -276,12 +276,19 @@ ssize_t __weak cpu_show_mds(struct devic
+ 	return sprintf(buf, "Not affected\n");
+ }
+ 
++ssize_t __weak cpu_show_itlb_multihit(struct device *dev,
++			    struct device_attribute *attr, char *buf)
++{
++	return sprintf(buf, "Not affected\n");
++}
++
+ static DEVICE_ATTR(meltdown, 0444, cpu_show_meltdown, NULL);
+ static DEVICE_ATTR(spectre_v1, 0444, cpu_show_spectre_v1, NULL);
+ static DEVICE_ATTR(spectre_v2, 0444, cpu_show_spectre_v2, NULL);
+ static DEVICE_ATTR(spec_store_bypass, 0444, cpu_show_spec_store_bypass, NULL);
+ static DEVICE_ATTR(l1tf, 0444, cpu_show_l1tf, NULL);
+ static DEVICE_ATTR(mds, 0444, cpu_show_mds, NULL);
++static DEVICE_ATTR(itlb_multihit, 0444, cpu_show_itlb_multihit, NULL);
+ 
+ static struct attribute *cpu_root_vulnerabilities_attrs[] = {
+ 	&dev_attr_meltdown.attr,
+@@ -290,6 +297,7 @@ static struct attribute *cpu_root_vulner
+ 	&dev_attr_spec_store_bypass.attr,
+ 	&dev_attr_l1tf.attr,
+ 	&dev_attr_mds.attr,
++	&dev_attr_itlb_multihit.attr,
+ 	NULL
+ };
+ 
+--- a/include/linux/cpu.h
++++ b/include/linux/cpu.h
+@@ -51,6 +51,8 @@ extern ssize_t cpu_show_l1tf(struct devi
+ 			     struct device_attribute *attr, char *buf);
+ extern ssize_t cpu_show_mds(struct device *dev,
+ 			    struct device_attribute *attr, char *buf);
++extern ssize_t cpu_show_itlb_multihit(struct device *dev,
++				      struct device_attribute *attr, char *buf);
+ 
+ #ifdef CONFIG_HOTPLUG_CPU
+ extern void unregister_cpu(struct cpu *cpu);
+--- a/arch/x86/include/asm/pgtable.h
++++ b/arch/x86/include/asm/pgtable.h
+@@ -861,6 +861,7 @@ static inline unsigned long page_level_m
+ extern bool pfn_modify_allowed(unsigned long pfn, pgprot_t prot);
+ 
+ extern bool arch_has_pfn_modify_check(void);
++extern bool has_bug_itlb_multihit(void);
+ 
+ #include <asm-generic/pgtable.h>
+ #endif	/* __ASSEMBLY__ */
