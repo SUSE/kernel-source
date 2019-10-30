@@ -1,0 +1,163 @@
+From: Junaid Shahid <junaids@google.com>
+Subject: [PATCH 4/5] kvm: Add helper function for creating VM worker
+References: bsc#1117665, CVE-2018-12207
+Patch-mainline: No, still under discussion
+
+This adds a function to create a kernel thread associated with a given
+VM. In particular, it ensures that the worker thread inherits the
+priority and cgroups of the calling thread.
+
+Signed-off-by: Junaid Shahid <junaids@google.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Acked-by: Joerg Roedel <jroedel@suse.de>
+---
+ include/linux/kvm_host.h |  6 ++++
+ virt/kvm/kvm_main.c      | 84 ++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 90 insertions(+)
+
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -18,6 +18,7 @@
+ #include <linux/msi.h>
+ #include <linux/slab.h>
+ #include <linux/rcupdate.h>
++#include <linux/completion.h>
+ #include <asm/signal.h>
+ 
+ #include <linux/kvm.h>
+@@ -783,6 +784,12 @@ static inline long kvm_vm_ioctl_assigned
+ 
+ #endif
+ 
++typedef int (*kvm_vm_thread_fn_t)(struct kvm *kvm, uintptr_t data);
++
++int kvm_vm_create_worker_thread(struct kvm *kvm, kvm_vm_thread_fn_t thread_fn,
++				uintptr_t data, const char *name,
++				struct task_struct **thread_ptr);
++
+ static inline void kvm_make_request(int req, struct kvm_vcpu *vcpu)
+ {
+ 	set_bit(req, &vcpu->requests);
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -47,6 +47,7 @@
+ #include <linux/srcu.h>
+ #include <linux/hugetlb.h>
+ #include <linux/slab.h>
++#include <linux/kthread.h>
+ 
+ #include <asm/processor.h>
+ #include <asm/io.h>
+@@ -2720,3 +2721,86 @@ void kvm_exit(void)
+ 	__free_page(bad_page);
+ }
+ EXPORT_SYMBOL_GPL(kvm_exit);
++
++struct kvm_vm_worker_thread_context {
++	struct kvm *kvm;
++	struct task_struct *parent;
++	struct completion init_done;
++	kvm_vm_thread_fn_t thread_fn;
++	uintptr_t data;
++	int err;
++};
++
++static int kvm_vm_worker_thread(void *context)
++{
++	/*
++	 * The init_context is allocated on the stack of the parent thread, so
++	 * we have to locally copy anything that is needed beyond initialization
++	 */
++	struct kvm_vm_worker_thread_context *init_context = context;
++	struct kvm *kvm = init_context->kvm;
++	kvm_vm_thread_fn_t thread_fn = init_context->thread_fn;
++	uintptr_t data = init_context->data;
++	int err;
++
++	err = kthread_park(current);
++	/* kthread_park(current) is never supposed to return an error */
++	WARN_ON(err != 0);
++	if (err)
++		goto init_complete;
++
++	err = cgroup_attach_task_all(init_context->parent, current);
++	if (err) {
++		printk(KERN_ERR "kvm: %s: cgroup_attach_task_all failed with err %d\n",
++			__func__, err);
++		goto init_complete;
++	}
++
++	set_user_nice(current, task_nice(init_context->parent));
++
++init_complete:
++	init_context->err = err;
++	complete(&init_context->init_done);
++	init_context = NULL;
++
++	if (err)
++		return err;
++
++	/* Wait to be woken up by the spawner before proceeding. */
++	kthread_parkme();
++
++	if (!kthread_should_stop())
++		err = thread_fn(kvm, data);
++
++	return err;
++}
++
++int kvm_vm_create_worker_thread(struct kvm *kvm, kvm_vm_thread_fn_t thread_fn,
++				uintptr_t data, const char *name,
++				struct task_struct **thread_ptr)
++{
++	struct kvm_vm_worker_thread_context init_context = {};
++	struct task_struct *thread;
++
++	*thread_ptr = NULL;
++	init_context.kvm = kvm;
++	init_context.parent = current;
++	init_context.thread_fn = thread_fn;
++	init_context.data = data;
++	init_completion(&init_context.init_done);
++
++	thread = kthread_run(kvm_vm_worker_thread, &init_context,
++			     "%s-%d", name, task_pid_nr(current));
++	if (IS_ERR(thread))
++		return PTR_ERR(thread);
++
++	/* kthread_run is never supposed to return NULL */
++	WARN_ON(thread == NULL);
++
++	wait_for_completion(&init_context.init_done);
++
++	if (!init_context.err)
++		*thread_ptr = thread;
++
++	return init_context.err;
++}
+--- a/kernel/kthread.c
++++ b/kernel/kthread.c
+@@ -116,6 +116,7 @@ void kthread_parkme(void)
+ {
+ 	__kthread_parkme(to_kthread(current));
+ }
++EXPORT_SYMBOL_GPL(kthread_parkme);
+ 
+ static int kthread(void *_create)
+ {
+@@ -353,6 +354,7 @@ void kthread_unpark(struct task_struct *
+ 	}
+ 	put_task_struct(k);
+ }
++EXPORT_SYMBOL_GPL(kthread_unpark);
+ 
+ /**
+  * kthread_park - park a thread created by kthread_create().
+@@ -384,6 +386,7 @@ int kthread_park(struct task_struct *k)
+ 	put_task_struct(k);
+ 	return ret;
+ }
++EXPORT_SYMBOL_GPL(kthread_park);
+ 
+ /**
+  * kthread_stop - stop a thread created by kthread_create().

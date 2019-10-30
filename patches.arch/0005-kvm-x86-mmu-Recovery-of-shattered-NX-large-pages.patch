@@ -1,0 +1,336 @@
+From: Junaid Shahid <junaids@google.com>
+Subject: [PATCH 5/5] kvm: x86: mmu: Recovery of shattered NX large pages
+References: bsc#1117665, CVE-2018-12207
+Patch-mainline: No, still under discussion
+
+The page table pages corresponding to broken down large pages are
+zapped in FIFO order, so that the large page can potentially
+be recovered, if it is no longer being used for execution.  This removes
+the performance penalty for walking deeper EPT page tables.
+
+By default, one large page will last about one hour once the guest
+reaches a steady state.
+
+Signed-off-by: Junaid Shahid <junaids@google.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Acked-by: Joerg Roedel <jroedel@suse.de>
+---
+ Documentation/admin-guide/kernel-parameters.txt |   6 ++
+ arch/x86/include/asm/kvm_host.h                 |   4 +
+ arch/x86/kvm/mmu.c                              | 129 ++++++++++++++++++++++++
+ arch/x86/kvm/mmu.h                              |   4 +
+ arch/x86/kvm/x86.c                              |  11 ++
+ virt/kvm/kvm_main.c                             |  30 +++++-
+ 6 files changed, 183 insertions(+), 1 deletion(-)
+
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -215,6 +215,8 @@ union kvm_mmu_page_role {
+ struct kvm_mmu_page {
+ 	struct list_head link;
+ 	struct hlist_node hash_link;
++	struct list_head lpage_disallowed_link;
++
+ 
+ 	/*
+ 	 * The following two entries are used to key the shadow page in the
+@@ -474,6 +476,7 @@ struct kvm_arch {
+ 	 */
+ 	struct list_head active_mmu_pages;
+ 	struct list_head assigned_dev_head;
++	struct list_head lpage_disallowed_mmu_pages;
+ 	struct iommu_domain *iommu_domain;
+ 	int iommu_flags;
+ 	struct kvm_pic *vpic;
+@@ -508,6 +511,8 @@ struct kvm_arch {
+ 	#ifdef CONFIG_KVM_MMU_AUDIT
+ 	int audit_point;
+ 	#endif
++
++	struct task_struct *nx_lpage_recovery_thread;
+ };
+ 
+ struct kvm_vm_stat {
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@ -36,6 +36,7 @@
+ #include <linux/srcu.h>
+ #include <linux/slab.h>
+ #include <linux/uaccess.h>
++#include <linux/kthread.h>
+ 
+ #include <asm/page.h>
+ #include <asm/cmpxchg.h>
+@@ -45,16 +46,26 @@
+ extern bool itlb_multihit_kvm_mitigation;
+ 
+ static int __read_mostly nx_huge_pages = -1;
++static uint __read_mostly nx_huge_pages_recovery_ratio = 60;
+ 
+ static int set_nx_huge_pages(const char *val, const struct kernel_param *kp);
++static int set_nx_huge_pages_recovery_ratio(const char *val, const struct kernel_param *kp);
+ 
+ static struct kernel_param_ops nx_huge_pages_ops = {
+ 	.set = set_nx_huge_pages,
+ 	.get = param_get_bool,
+ };
+ 
++static struct kernel_param_ops nx_huge_pages_recovery_ratio_ops = {
++	.set = set_nx_huge_pages_recovery_ratio,
++	.get = param_get_uint,
++};
++
+ module_param_cb(nx_huge_pages, &nx_huge_pages_ops, &nx_huge_pages, 0644);
+ __MODULE_PARM_TYPE(nx_huge_pages, "bool");
++module_param_cb(nx_huge_pages_recovery_ratio, &nx_huge_pages_recovery_ratio_ops,
++		&nx_huge_pages_recovery_ratio, 0644);
++__MODULE_PARM_TYPE(nx_huge_pages_recovery_ratio, "uint");
+ 
+ /*
+  * When setting this variable to true it enables Two-Dimensional-Paging
+@@ -525,6 +536,8 @@ static void account_huge_nx_page(struct
+ 		return;
+ 
+ 	++kvm->stat.nx_lpage_splits;
++	list_add_tail(&sp->lpage_disallowed_link,
++		      &kvm->arch.lpage_disallowed_mmu_pages);
+ 	sp->lpage_disallowed = true;
+ }
+ 
+@@ -547,6 +560,7 @@ static void unaccount_huge_nx_page(struc
+ {
+ 	--kvm->stat.nx_lpage_splits;
+ 	sp->lpage_disallowed = false;
++	list_del(&sp->lpage_disallowed_link);
+ }
+ 
+ static int has_wrprotected_page(struct kvm *kvm,
+@@ -3812,6 +3826,8 @@ static int set_nx_huge_pages(const char
+ 			idx = srcu_read_lock(&kvm->srcu);
+ 			kvm_mmu_invalidate_zap_all_pages(kvm);
+ 			srcu_read_unlock(&kvm->srcu, idx);
++
++			wake_up_process(kvm->arch.nx_lpage_recovery_thread);
+ 		}
+ 		mutex_unlock(&kvm_lock);
+ 	}
+@@ -4036,3 +4052,116 @@ void kvm_mmu_module_exit(void)
+ 	unregister_shrinker(&mmu_shrinker);
+ 	mmu_audit_disable();
+ }
++
++static int set_nx_huge_pages_recovery_ratio(const char *val, const struct kernel_param *kp)
++{
++	unsigned int old_val;
++	int err;
++
++	old_val = nx_huge_pages_recovery_ratio;
++	err = param_set_uint(val, kp);
++	if (err)
++		return err;
++
++	if (nx_huge_pages &&
++	    !old_val && nx_huge_pages_recovery_ratio) {
++		struct kvm *kvm;
++
++		mutex_lock(&kvm_lock);
++
++		list_for_each_entry(kvm, &vm_list, vm_list)
++			wake_up_process(kvm->arch.nx_lpage_recovery_thread);
++
++		mutex_unlock(&kvm_lock);
++	}
++
++	return err;
++}
++
++static void kvm_recover_nx_lpages(struct kvm *kvm)
++{
++	int rcu_idx;
++	struct kvm_mmu_page *sp;
++	unsigned int ratio;
++	LIST_HEAD(invalid_list);
++	ulong to_zap;
++
++	rcu_idx = srcu_read_lock(&kvm->srcu);
++	spin_lock(&kvm->mmu_lock);
++
++	ratio = nx_huge_pages_recovery_ratio;
++	to_zap = ratio ? DIV_ROUND_UP(kvm->stat.nx_lpage_splits, ratio) : 0;
++	while (to_zap && !list_empty(&kvm->arch.lpage_disallowed_mmu_pages)) {
++		/*
++		 * We use a separate list instead of just using active_mmu_pages
++		 * because the number of lpage_disallowed pages is expected to
++		 * be relatively small compared to the total.
++		 */
++		sp = list_first_entry(&kvm->arch.lpage_disallowed_mmu_pages,
++				      struct kvm_mmu_page,
++				      lpage_disallowed_link);
++		WARN_ON_ONCE(!sp->lpage_disallowed);
++		kvm_mmu_prepare_zap_page(kvm, sp, &invalid_list);
++		WARN_ON_ONCE(sp->lpage_disallowed);
++
++		if (!--to_zap || need_resched() || spin_needbreak(&kvm->mmu_lock)) {
++			kvm_mmu_commit_zap_page(kvm, &invalid_list);
++			if (to_zap)
++				cond_resched_lock(&kvm->mmu_lock);
++		}
++	}
++
++	spin_unlock(&kvm->mmu_lock);
++	srcu_read_unlock(&kvm->srcu, rcu_idx);
++}
++
++static long get_nx_lpage_recovery_timeout(u64 start_time)
++{
++	return nx_huge_pages && nx_huge_pages_recovery_ratio
++		? start_time + 60 * HZ - get_jiffies_64()
++		: MAX_SCHEDULE_TIMEOUT;
++}
++
++static int kvm_nx_lpage_recovery_worker(struct kvm *kvm, uintptr_t data)
++{
++	u64 start_time;
++	long remaining_time;
++
++	while (true) {
++		start_time = get_jiffies_64();
++		remaining_time = get_nx_lpage_recovery_timeout(start_time);
++
++		set_current_state(TASK_INTERRUPTIBLE);
++		while (!kthread_should_stop() && remaining_time > 0) {
++			schedule_timeout(remaining_time);
++			remaining_time = get_nx_lpage_recovery_timeout(start_time);
++			set_current_state(TASK_INTERRUPTIBLE);
++		}
++
++		set_current_state(TASK_RUNNING);
++
++		if (kthread_should_stop())
++			return 0;
++
++		kvm_recover_nx_lpages(kvm);
++	}
++}
++
++int kvm_mmu_post_init_vm(struct kvm *kvm)
++{
++	int err;
++
++	err = kvm_vm_create_worker_thread(kvm, kvm_nx_lpage_recovery_worker, 0,
++					  "kvm-nx-lpage-recovery",
++					  &kvm->arch.nx_lpage_recovery_thread);
++	if (!err)
++		kthread_unpark(kvm->arch.nx_lpage_recovery_thread);
++
++	return err;
++}
++
++void kvm_mmu_pre_destroy_vm(struct kvm *kvm)
++{
++	if (kvm->arch.nx_lpage_recovery_thread)
++		kthread_stop(kvm->arch.nx_lpage_recovery_thread);
++}
+--- a/arch/x86/kvm/mmu.h
++++ b/arch/x86/kvm/mmu.h
+@@ -77,4 +77,8 @@ static inline int is_present_gpte(unsign
+ }
+ 
+ void kvm_mmu_invalidate_zap_all_pages(struct kvm *kvm);
++
++int kvm_mmu_post_init_vm(struct kvm *kvm);
++void kvm_mmu_pre_destroy_vm(struct kvm *kvm);
++
+ #endif
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -6575,6 +6575,7 @@ int kvm_arch_init_vm(struct kvm *kvm)
+ {
+ 	INIT_LIST_HEAD(&kvm->arch.active_mmu_pages);
+ 	INIT_LIST_HEAD(&kvm->arch.assigned_dev_head);
++	INIT_LIST_HEAD(&kvm->arch.lpage_disallowed_mmu_pages);
+ 
+ 	/* Reserve bit 0 of irq_sources_bitmap for userspace irq source */
+ 	set_bit(KVM_USERSPACE_IRQ_SOURCE_ID, &kvm->arch.irq_sources_bitmap);
+@@ -6585,6 +6586,11 @@ int kvm_arch_init_vm(struct kvm *kvm)
+ 	return 0;
+ }
+ 
++int kvm_arch_post_init_vm(struct kvm *kvm)
++{
++	return kvm_mmu_post_init_vm(kvm);
++}
++
+ static void kvm_unload_vcpu_mmu(struct kvm_vcpu *vcpu)
+ {
+ 	int r;
+@@ -6623,6 +6629,11 @@ void kvm_arch_sync_events(struct kvm *kv
+ 	kvm_free_pit(kvm);
+ }
+ 
++void kvm_arch_pre_destroy_vm(struct kvm *kvm)
++{
++	kvm_mmu_pre_destroy_vm(kvm);
++}
++
+ void kvm_arch_destroy_vm(struct kvm *kvm)
+ {
+ 	kvm_iommu_unmap_guest(kvm);
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -445,6 +445,23 @@ static int kvm_init_mmu_notifier(struct
+ 
+ #endif /* CONFIG_MMU_NOTIFIER && KVM_ARCH_WANT_MMU_NOTIFIER */
+ 
++/*
++ * Called after the VM is otherwise initialized, but just before adding it to
++ * the vm_list.
++ */
++int __weak kvm_arch_post_init_vm(struct kvm *kvm)
++{
++	return 0;
++}
++
++/*
++ * Called just after removing the VM from the vm_list, but before doing any
++ * other destruction.
++ */
++void __weak kvm_arch_pre_destroy_vm(struct kvm *kvm)
++{
++}
++
+ static struct kvm *kvm_create_vm(void)
+ {
+ 	int r, i;
+@@ -490,6 +507,10 @@ static struct kvm *kvm_create_vm(void)
+ 
+ 	r = kvm_init_mmu_notifier(kvm);
+ 	if (r)
++		goto out_err_no_mmu_notifier;
++
++	r = kvm_arch_post_init_vm(kvm);
++	if (r)
+ 		goto out_err;
+ 
+ 	mutex_lock(&kvm_lock);
+@@ -499,6 +520,11 @@ static struct kvm *kvm_create_vm(void)
+ 	return kvm;
+ 
+ out_err:
++#if defined(CONFIG_MMU_NOTIFIER) && defined(KVM_ARCH_WANT_MMU_NOTIFIER)
++	if (kvm->mmu_notifier.ops)
++		mmu_notifier_unregister(&kvm->mmu_notifier, current->mm);
++#endif
++out_err_no_mmu_notifier:
+ 	cleanup_srcu_struct(&kvm->srcu);
+ out_err_nosrcu:
+ 	hardware_disable_all();
+@@ -570,6 +596,8 @@ static void kvm_destroy_vm(struct kvm *k
+ 	mutex_lock(&kvm_lock);
+ 	list_del(&kvm->vm_list);
+ 	mutex_unlock(&kvm_lock);
++	kvm_arch_pre_destroy_vm(kvm);
++
+ 	kvm_free_irq_routing(kvm);
+ 	for (i = 0; i < KVM_NR_BUSES; i++)
+ 		kvm_io_bus_destroy(kvm->buses[i]);
