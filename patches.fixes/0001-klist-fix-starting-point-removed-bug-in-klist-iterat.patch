@@ -1,0 +1,69 @@
+From 00cd29b799e3449f0c68b1cc77cd4a5f95b42d17 Mon Sep 17 00:00:00 2001
+From: James Bottomley <James.Bottomley@HansenPartnership.com>
+Date: Wed, 13 Jan 2016 08:10:31 -0800
+Subject: [PATCH] klist: fix starting point removed bug in klist iterators
+References: bsc#1156652
+Git-commit: 00cd29b799e3449f0c68b1cc77cd4a5f95b42d17
+Patch-mainline: v4.10-rc1
+
+The starting node for a klist iteration is often passed in from
+somewhere way above the klist infrastructure, meaning there's no
+guarantee the node is still on the list.  We've seen this in SCSI where
+we use bus_find_device() to iterate through a list of devices.  In the
+face of heavy hotplug activity, the last device returned by
+bus_find_device() can be removed before the next call.  This leads to
+
+Dec  3 13:22:02 localhost kernel: WARNING: CPU: 2 PID: 28073 at include/linux/kref.h:47 klist_iter_init_node+0x3d/0x50()
+Dec  3 13:22:02 localhost kernel: Modules linked in: scsi_debug x86_pkg_temp_thermal kvm_intel kvm irqbypass crc32c_intel joydev iTCO_wdt dcdbas ipmi_devintf acpi_power_meter iTCO_vendor_support ipmi_si imsghandler pcspkr wmi acpi_cpufreq tpm_tis tpm shpchp lpc_ich mfd_core nfsd nfs_acl lockd grace sunrpc tg3 ptp pps_core
+Dec  3 13:22:02 localhost kernel: CPU: 2 PID: 28073 Comm: cat Not tainted 4.4.0-rc1+ #2
+Dec  3 13:22:02 localhost kernel: Hardware name: Dell Inc. PowerEdge R320/08VT7V, BIOS 2.0.22 11/19/2013
+Dec  3 13:22:02 localhost kernel: ffffffff81a20e77 ffff880613acfd18 ffffffff81321eef 0000000000000000
+Dec  3 13:22:02 localhost kernel: ffff880613acfd50 ffffffff8107ca52 ffff88061176b198 0000000000000000
+Dec  3 13:22:02 localhost kernel: ffffffff814542b0 ffff880610cfb100 ffff88061176b198 ffff880613acfd60
+Dec  3 13:22:02 localhost kernel: Call Trace:
+Dec  3 13:22:02 localhost kernel: [<ffffffff81321eef>] dump_stack+0x44/0x55
+Dec  3 13:22:02 localhost kernel: [<ffffffff8107ca52>] warn_slowpath_common+0x82/0xc0
+Dec  3 13:22:02 localhost kernel: [<ffffffff814542b0>] ? proc_scsi_show+0x20/0x20
+Dec  3 13:22:02 localhost kernel: [<ffffffff8107cb4a>] warn_slowpath_null+0x1a/0x20
+Dec  3 13:22:02 localhost kernel: [<ffffffff8167225d>] klist_iter_init_node+0x3d/0x50
+Dec  3 13:22:02 localhost kernel: [<ffffffff81421d41>] bus_find_device+0x51/0xb0
+Dec  3 13:22:02 localhost kernel: [<ffffffff814545ad>] scsi_seq_next+0x2d/0x40
+[...]
+
+And an eventual crash. It can actually occur in any hotplug system
+which has a device finder and a starting device.
+
+We can fix this globally by making sure the starting node for
+klist_iter_init_node() is actually a member of the list before using it
+(and by starting from the beginning if it isn't).
+
+Reported-by: Ewan D. Milne <emilne@redhat.com>
+Tested-by: Ewan D. Milne <emilne@redhat.com>
+Cc: stable@vger.kernel.org
+Signed-off-by: James Bottomley <James.Bottomley@HansenPartnership.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Thomas Abraham <tabraham@suse.com>
+---
+ lib/klist.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/lib/klist.c b/lib/klist.c
+index d74cf7a29afd..0507fa5d84c5 100644
+--- a/lib/klist.c
++++ b/lib/klist.c
+@@ -282,9 +282,9 @@ void klist_iter_init_node(struct klist *k, struct klist_iter *i,
+ 			  struct klist_node *n)
+ {
+ 	i->i_klist = k;
+-	i->i_cur = n;
+-	if (n)
+-		kref_get(&n->n_ref);
++	i->i_cur = NULL;
++	if (n && kref_get_unless_zero(&n->n_ref))
++		i->i_cur = n;
+ }
+ EXPORT_SYMBOL_GPL(klist_iter_init_node);
+ 
+-- 
+2.16.4
+
