@@ -1,0 +1,104 @@
+From: "J. Bruce Fields" <bfields@redhat.com>
+Date: Thu, 13 Oct 2011 15:12:59 -0400
+Subject: [PATCH] nfsd4: clean up open owners on OPEN failure
+Git-commit: d29b20cd589128a599e5045d4effc2d7dbc388f5
+Patch-mainline: v3.2
+References: bsc#1154290
+
+If process_open1() creates a new open owner, but the open later fails,
+the current code will leave the open owner around.  It won't be on the
+close_lru list, and the client isn't expected to send a CLOSE, so it
+will hang around as long as the client does.
+
+Similarly, if process_open1() removes an existing open owner from the
+close lru, anticipating that an open owner that previously had no
+associated stateid's now will, but the open subsequently fails, then
+we'll again be left with the same leak.
+
+Fix both problems.
+
+Reported-by: Bryan Schumaker <bjschuma@netapp.com>
+Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+Acked-by: NeilBrown <neilb@suse.com>
+
+---
+ fs/nfsd/nfs4proc.c  |    1 +
+ fs/nfsd/nfs4state.c |   19 ++++++++++++++++++-
+ fs/nfsd/state.h     |    3 ++-
+ fs/nfsd/xdr4.h      |    1 +
+ 4 files changed, 22 insertions(+), 2 deletions(-)
+
+--- a/fs/nfsd/nfs4proc.c
++++ b/fs/nfsd/nfs4proc.c
+@@ -396,6 +396,7 @@ nfsd4_open(struct svc_rqst *rqstp, struc
+ 	 */
+ 	status = nfsd4_process_open2(rqstp, &cstate->current_fh, open);
+ out:
++	nfsd4_cleanup_open_state(open, status);
+ 	if (open->op_stateowner) {
+ 		nfs4_get_stateowner(open->op_stateowner);
+ 		cstate->replay_owner = open->op_stateowner;
+--- a/fs/nfsd/nfs4state.c
++++ b/fs/nfsd/nfs4state.c
+@@ -2281,6 +2281,7 @@ alloc_init_open_stateowner(unsigned int
+ 	sop->so_client = clp;
+ 	sop->so_seqid = open->op_seqid;
+ 	sop->so_confirmed = 0;
++	sop->so_new = 1;
+ 	rp = &sop->so_replay;
+ 	rp->rp_status = nfserr_serverfault;
+ 	rp->rp_buflen = 0;
+@@ -2532,7 +2533,6 @@ renew:
+ 			return nfserr_jukebox;
+ 		open->op_stateowner = sop;
+ 	}
+-	list_del_init(&sop->so_close_lru);
+ 	renew_client(sop->so_client);
+ 	return nfs_ok;
+ }
+@@ -2956,6 +2956,23 @@ out:
+ 	return status;
+ }
+ 
++void nfsd4_cleanup_open_state(struct nfsd4_open *open, __be32 status)
++{
++	if (open->op_stateowner) {
++		struct nfs4_stateowner *oo = open->op_stateowner;
++
++		if (!list_empty(&oo->so_stateids))
++			list_del_init(&oo->so_close_lru);
++		if (oo->so_new) {
++			if (status) {
++				release_openowner(oo);
++				open->op_stateowner = NULL;
++			} else
++				oo->so_new = 0;
++		}
++	}
++}
++
+ __be32
+ nfsd4_renew(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
+ 	    clientid_t *clid)
+--- a/fs/nfsd/state.h
++++ b/fs/nfsd/state.h
+@@ -351,7 +351,8 @@ struct nfs4_stateowner {
+ 	 * sequence id expected from the client: */
+ 	u32                     so_seqid;
+ 	struct xdr_netobj       so_owner;     /* open owner name */
+-	int                     so_confirmed; /* successful OPEN_CONFIRM? */
++	short			so_confirmed; /* successful OPEN_CONFIRM? */
++	short			so_new;		/* open owner is new */
+ 	struct nfs4_replay	so_replay;
+ };
+ 
+--- a/fs/nfsd/xdr4.h
++++ b/fs/nfsd/xdr4.h
+@@ -539,6 +539,7 @@ extern __be32 nfsd4_process_open1(struct
+ 		struct nfsd4_open *open);
+ extern __be32 nfsd4_process_open2(struct svc_rqst *rqstp,
+ 		struct svc_fh *current_fh, struct nfsd4_open *open);
++extern void nfsd4_cleanup_open_state(struct nfsd4_open *open, __be32 status);
+ extern __be32 nfsd4_open_confirm(struct svc_rqst *rqstp,
+ 		struct nfsd4_compound_state *, struct nfsd4_open_confirm *oc);
+ extern __be32 nfsd4_close(struct svc_rqst *rqstp,
