@@ -187,7 +187,9 @@ class Head(object):
 # kernel.org prefixes and "remote branch name" can be omitted if it is "master".
 remotes = (
     Head(RepoURL("torvalds/linux.git")),
+    Head(RepoURL("netdev/net.git")),
     Head(RepoURL("davem/net.git")),
+    Head(RepoURL("netdev/net-next.git")),
     Head(RepoURL("davem/net-next.git")),
     Head(RepoURL("rdma/rdma.git"), "for-rc"),
     Head(RepoURL("rdma/rdma.git"), "for-next"),
@@ -221,8 +223,8 @@ remotes = (
     Head(RepoURL("mkp/scsi.git"), "fixes"),
     Head(RepoURL("git://git.kernel.dk/linux-block.git"), "for-next"),
     Head(RepoURL("git://git.kernel.org/pub/scm/virt/kvm/kvm.git"), "queue"),
-    Head(RepoURL("git://git.infradead.org/nvme.git"), "nvme-5.3-rc"),
-    Head(RepoURL("git://git.infradead.org/nvme.git"), "nvme-5.4"),
+    Head(RepoURL("git://git.infradead.org/nvme.git"), "nvme-5.7"),
+    Head(RepoURL("git://git.infradead.org/nvme.git"), "nvme-5.8"),
     Head(RepoURL("dhowells/linux-fs.git")),
     Head(RepoURL("herbert/cryptodev-2.6.git")),
     Head(RepoURL("helgaas/pci.git"), "next"),
@@ -244,6 +246,13 @@ remotes = (
     Head(RepoURL("arm64/linux.git"), "for-next/core"),
     Head(RepoURL("robh/linux.git"), "for-next"),
     Head(RepoURL("git://git.infradead.org/users/hch/dma-mapping.git"), "for-next"),
+    Head(RepoURL("thermal/linux.git"), "thermal/linux-next"),
+    Head(RepoURL("git://github.com/cminyard/linux-ipmi.git"), "for-next"),
+    Head(RepoURL("ras/ras.git"), "edac-for-next"),
+    Head(RepoURL("linusw/linux-pinctrl.git"), "for-next"),
+    Head(RepoURL("efi/efi.git"), "next"),
+    Head(RepoURL("ulfh/mmc.git"), "next"),
+    Head(RepoURL("masahiroy/linux-kbuild.git"), "for-next"),
 )
 
 
