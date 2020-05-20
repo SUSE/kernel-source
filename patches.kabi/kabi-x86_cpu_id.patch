@@ -1,0 +1,132 @@
+From: Borislav Petkov <bp@suse.de>
+Date: Wed May 13 12:48:16 CEST 2020
+Subject: x86: Add a struct x86_cpu_id kABI workaround
+Patch-mainline: never, SUSE-specific
+References: bsc#1154824 CVE-2020-0543
+
+Add a workaround to struct x86_cpu_id due to the upstream addition of a new
+member "steppings".
+
+For that, since drivers have arrays of that struct, add a
+
+  const struct x86_cpu_id_legacy *x86_match_cpu(const struct x86_cpu_id_legacy *match)
+
+signature, which uses a legacy variant of the structure without the new member
+so that old modules can see the same layout and x86_match_cpu() can work for
+them without change.
+
+Rename the new variant to x86_match_cpu_stp() to denote that it matches
+steppings too and have modules which are recompiled, use that instead.
+
+Signed-off-by: Borislav Petkov <bp@suse.de>
+
+---
+ arch/x86/include/asm/cpu_device_id.h |    7 +++++-
+ arch/x86/kernel/cpu/bugs.c           |    2 -
+ arch/x86/kernel/cpu/match.c          |   39 ++++++++++++++++++++++++++++++++++-
+ include/linux/mod_devicetable.h      |   10 ++++++++
+ 4 files changed, 55 insertions(+), 3 deletions(-)
+
+--- a/arch/x86/include/asm/cpu_device_id.h
++++ b/arch/x86/include/asm/cpu_device_id.h
+@@ -162,6 +162,11 @@
+ #define X86_MATCH_INTEL_FAM6_MODEL(model, data)				\
+ 	X86_MATCH_VENDOR_FAM_MODEL(INTEL, 6, INTEL_FAM6_##model, data)
+ 
+-extern const struct x86_cpu_id *x86_match_cpu(const struct x86_cpu_id *match);
++#ifndef __GENKSYMS__
++const struct x86_cpu_id_legacy *x86_match_cpu(const struct x86_cpu_id_legacy *match);
++#else
++const struct x86_cpu_id *x86_match_cpu(const struct x86_cpu_id *match);
++#endif
+ 
++const struct x86_cpu_id *x86_match_cpu_stp(const struct x86_cpu_id *match);
+ #endif
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@ -803,7 +803,7 @@ static const struct x86_cpu_id cpu_vuln_
+ 
+ static bool __init cpu_matches(const struct x86_cpu_id *table, unsigned long which)
+ {
+-	const struct x86_cpu_id *m = x86_match_cpu(table);
++	const struct x86_cpu_id *m = x86_match_cpu_stp(table);
+ 
+ 	return m && !!(m->driver_data & which);
+ }
+--- a/arch/x86/kernel/cpu/match.c
++++ b/arch/x86/kernel/cpu/match.c
+@@ -33,7 +33,44 @@
+  * This always matches against the boot cpu, assuming models and features are
+  * consistent over all CPUs.
+  */
++
++/*
++ * kABI workaround notes: since drivers have arrays of that struct, add the
++ * function signature which uses a legacy variant of the structure without the
++ * new member so that old modules can see the same layout and x86_match_cpu()
++ * can work for them without change.
++ *
++ * Rename the new variant to x86_match_cpu_stp() to denote that it matches
++ * steppings too and have modules which are recompiled, use that instead.
++ */
++#ifndef __GENKSYMS__
++const struct x86_cpu_id_legacy *x86_match_cpu(const struct x86_cpu_id_legacy *match)
++#else
+ const struct x86_cpu_id *x86_match_cpu(const struct x86_cpu_id *match)
++#endif
++{
++	const struct x86_cpu_id_legacy *m;
++	struct cpuinfo_x86 *c = &boot_cpu_data;
++
++	for (m = match;
++	     m->vendor | m->family | m->model | m->feature;
++	     m++) {
++		if (m->vendor != X86_VENDOR_ANY && c->x86_vendor != m->vendor)
++			continue;
++		if (m->family != X86_FAMILY_ANY && c->x86 != m->family)
++			continue;
++		if (m->model != X86_MODEL_ANY && c->x86_model != m->model)
++			continue;
++		if (m->feature != X86_FEATURE_ANY && !cpu_has(c, m->feature))
++			continue;
++		return m;
++	}
++	return NULL;
++}
++EXPORT_SYMBOL(x86_match_cpu);
++
++/* As above but with steppings. */
++const struct x86_cpu_id *x86_match_cpu_stp(const struct x86_cpu_id *match)
+ {
+ 	const struct x86_cpu_id *m;
+ 	struct cpuinfo_x86 *c = &boot_cpu_data;
+@@ -56,4 +93,4 @@ const struct x86_cpu_id *x86_match_cpu(c
+ 	}
+ 	return NULL;
+ }
+-EXPORT_SYMBOL(x86_match_cpu);
++EXPORT_SYMBOL(x86_match_cpu_stp);
+--- a/include/linux/mod_devicetable.h
++++ b/include/linux/mod_devicetable.h
+@@ -547,11 +547,21 @@ struct isapnp_device_id {
+  * See documentation of "x86_match_cpu" for details.
+  */
+ 
++struct x86_cpu_id_legacy {
++	__u16 vendor;
++	__u16 family;
++	__u16 model;
++	__u16 feature;	/* bit index */
++	kernel_ulong_t driver_data;
++};
++
+ struct x86_cpu_id {
+ 	__u16 vendor;
+ 	__u16 family;
+ 	__u16 model;
++#ifndef __GENKSYMS__
+ 	__u16 steppings;
++#endif
+ 	__u16 feature;	/* bit index */
+ 	kernel_ulong_t driver_data;
+ };
