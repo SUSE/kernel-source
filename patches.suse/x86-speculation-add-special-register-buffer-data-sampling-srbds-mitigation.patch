@@ -1,0 +1,418 @@
+From: Mark Gross <mgross@linux.intel.com>
+Date: Thu, 16 Apr 2020 17:54:04 +0200
+Subject: x86/speculation: Add Special Register Buffer Data Sampling (SRBDS)
+ mitigation
+Git-commit: 7e5b3c267d256822407a22fdce6afdf9cd13f9fb
+Patch-mainline: v5.7 or v5.7-rc3 (next release)
+References: bsc#1154824 CVE-2020-0543
+
+SRBDS is an MDS-like speculative side channel that can leak bits from the
+random number generator (RNG) across cores and threads. New microcode
+serializes the processor access during the execution of RDRAND and
+RDSEED. This ensures that the shared buffer is overwritten before it is
+released for reuse.
+
+While it is present on all affected CPU models, the microcode mitigation
+is not needed on models that enumerate ARCH_CAPABILITIES[MDS_NO] in the
+cases where TSX is not supported or has been disabled with TSX_CTRL.
+
+The mitigation is activated by default on affected processors and it
+increases latency for RDRAND and RDSEED instructions. Among other
+effects this will reduce throughput from /dev/urandom.
+
+* Enable administrator to configure the mitigation off when desired using
+  either mitigations=off or srbds=off.
+
+* Export vulnerability status via sysfs
+
+* Rename file-scoped macros to apply for non-whitelist table initializations.
+
+ [ bp: Massage,
+   - s/VULNBL_INTEL_STEPPING/VULNBL_INTEL_STEPPINGS/g,
+   - do not read arch cap MSR a second time in tsx_fused_off() - just pass it in,
+   - flip check in cpu_set_bug_bits() to save an indentation level,
+   - reflow comments.
+   jpoimboe: s/Mitigated/Mitigation/ in user-visible strings
+   tglx: Dropped the fused off magic for now
+ ]
+
+[ bp@suse:
+ - skip backporting the model renames from:
+   c66f78a6de4d ("x86/intel: Aggregate big core client naming")
+ ]
+
+Signed-off-by: Mark Gross <mgross@linux.intel.com>
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Reviewed-by: Tony Luck <tony.luck@intel.com>
+Reviewed-by: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+Reviewed-by: Josh Poimboeuf <jpoimboe@redhat.com>
+Tested-by: Neelima Krishnan <neelima.krishnan@intel.com>
+---
+ Documentation/ABI/testing/sysfs-devices-system-cpu |    1 
+ Documentation/kernel-parameters.txt                |   20 +++
+ arch/x86/include/asm/cpu_device_id.h               |    2 
+ arch/x86/include/asm/cpufeature.h                  |    1 
+ arch/x86/include/asm/msr-index.h                   |    4 
+ arch/x86/kernel/cpu/bugs.c                         |  134 ++++++++++++++++++++-
+ arch/x86/kernel/cpu/common.c                       |    1 
+ arch/x86/kernel/cpu/cpu.h                          |    1 
+ arch/x86/kernel/cpu/scattered.c                    |    1 
+ drivers/base/cpu.c                                 |    8 +
+ drivers/edac/amd64_edac.h                          |    8 -
+ include/linux/bitops.h                             |    8 +
+ 12 files changed, 179 insertions(+), 10 deletions(-)
+
+--- a/arch/x86/include/asm/cpu_device_id.h
++++ b/arch/x86/include/asm/cpu_device_id.h
+@@ -19,7 +19,7 @@
+ #define X86_CENTAUR_FAM6_C7_D		0xd
+ #define X86_CENTAUR_FAM6_NANO		0xf
+ 
+-#define X86_STEPPINGS(mins, maxs)    GENMASK(maxs, mins)
++#define X86_STEPPINGS(mins, maxs)    GENMASK(mins, maxs)
+ /**
+  * X86_MATCH_VENDOR_FAM_MODEL_STEPPINGS_FEATURE - Base macro for CPU matching
+  * @_vendor:	The vendor name, e.g. INTEL, AMD, HYGON, ..., ANY
+--- a/arch/x86/include/asm/cpufeature.h
++++ b/arch/x86/include/asm/cpufeature.h
+@@ -64,6 +64,7 @@
+ #define X86_FEATURE_RECOVERY	(2*32+ 0) /* CPU in recovery mode */
+ #define X86_FEATURE_LONGRUN	(2*32+ 1) /* Longrun power control */
+ #define X86_FEATURE_LRTI	(2*32+ 3) /* LongRun table interface */
++#define X86_FEATURE_SRBDS_CTRL	(2*32+ 4) /* "" SRBDS mitigation MSR available */
+ 
+ /* Other features, Linux-defined mapping, word 3 */
+ /* This range is used for feature bits which conflict or are synthesized */
+--- a/arch/x86/include/asm/msr-index.h
++++ b/arch/x86/include/asm/msr-index.h
+@@ -82,6 +82,10 @@
+ #define TSX_CTRL_RTM_DISABLE		(1 << 0)   /* Disable RTM feature */
+ #define TSX_CTRL_CPUID_CLEAR		(1 << 1)   /* Disable TSX enumeration */
+ 
++/* SRBDS support */
++#define MSR_IA32_MCU_OPT_CTRL		0x00000123
++#define RNGDS_MITG_DIS			BIT(0)
++
+ #define MSR_IA32_SYSENTER_CS		0x00000174
+ #define MSR_IA32_SYSENTER_ESP		0x00000175
+ #define MSR_IA32_SYSENTER_EIP		0x00000176
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@ -193,6 +193,7 @@ static void x86_amd_ssbd_disable(void);
+ static void __init l1tf_select_mitigation(void);
+ static void __init mds_select_mitigation(void);
+ static void __init taa_select_mitigation(void);
++static void __init srbds_select_mitigation(void);
+ 
+ /* The base value of the SPEC_CTRL MSR that always has to be preserved. */
+ u64 x86_spec_ctrl_base;
+@@ -255,6 +256,7 @@ void __init check_bugs(void)
+ 
+ 	ssb_init_cmd_line();
+ 	ssb_select_mitigation();
++	srbds_select_mitigation();
+ 
+ #ifdef CONFIG_X86_32
+ 	check_config();
+@@ -477,6 +479,99 @@ static int __init tsx_async_abort_parse_
+ }
+ early_param("tsx_async_abort", tsx_async_abort_parse_cmdline);
+ 
++static bool x86_bug_srbds;
++
++#undef pr_fmt
++#define pr_fmt(fmt)	"SRBDS: " fmt
++
++enum srbds_mitigations {
++	SRBDS_MITIGATION_OFF,
++	SRBDS_MITIGATION_UCODE_NEEDED,
++	SRBDS_MITIGATION_FULL,
++	SRBDS_MITIGATION_TSX_OFF,
++	SRBDS_MITIGATION_HYPERVISOR,
++};
++
++static enum srbds_mitigations srbds_mitigation = SRBDS_MITIGATION_FULL;
++
++static const char * const srbds_strings[] = {
++	[SRBDS_MITIGATION_OFF]		= "Vulnerable",
++	[SRBDS_MITIGATION_UCODE_NEEDED]	= "Vulnerable: No microcode",
++	[SRBDS_MITIGATION_FULL]		= "Mitigation: Microcode",
++	[SRBDS_MITIGATION_TSX_OFF]	= "Mitigation: TSX disabled",
++	[SRBDS_MITIGATION_HYPERVISOR]	= "Unknown: Dependent on hypervisor status",
++};
++
++static bool srbds_off;
++
++void update_srbds_msr(void)
++{
++	u64 mcu_ctrl;
++
++	if (!x86_bug_srbds)
++		return;
++
++	if (boot_cpu_has(X86_FEATURE_HYPERVISOR))
++		return;
++
++	if (srbds_mitigation == SRBDS_MITIGATION_UCODE_NEEDED)
++		return;
++
++	rdmsrl(MSR_IA32_MCU_OPT_CTRL, mcu_ctrl);
++
++	switch (srbds_mitigation) {
++	case SRBDS_MITIGATION_OFF:
++	case SRBDS_MITIGATION_TSX_OFF:
++		mcu_ctrl |= RNGDS_MITG_DIS;
++		break;
++	case SRBDS_MITIGATION_FULL:
++		mcu_ctrl &= ~RNGDS_MITG_DIS;
++		break;
++	default:
++		break;
++	}
++
++	wrmsrl(MSR_IA32_MCU_OPT_CTRL, mcu_ctrl);
++}
++
++static void __init srbds_select_mitigation(void)
++{
++	u64 ia32_cap;
++
++	if (!x86_bug_srbds)
++		return;
++
++	/*
++	 * Check to see if this is one of the MDS_NO systems supporting
++	 * TSX that are only exposed to SRBDS when TSX is enabled.
++	 */
++	ia32_cap = x86_read_arch_cap_msr();
++	if ((ia32_cap & ARCH_CAP_MDS_NO) && !boot_cpu_has(X86_FEATURE_RTM))
++		srbds_mitigation = SRBDS_MITIGATION_TSX_OFF;
++	else if (boot_cpu_has(X86_FEATURE_HYPERVISOR))
++		srbds_mitigation = SRBDS_MITIGATION_HYPERVISOR;
++	else if (!boot_cpu_has(X86_FEATURE_SRBDS_CTRL))
++		srbds_mitigation = SRBDS_MITIGATION_UCODE_NEEDED;
++	else if (cpu_mitigations_off() || srbds_off)
++		srbds_mitigation = SRBDS_MITIGATION_OFF;
++
++	update_srbds_msr();
++	pr_info("%s\n", srbds_strings[srbds_mitigation]);
++}
++
++static int __init srbds_parse_cmdline(char *str)
++{
++	if (!str)
++		return -EINVAL;
++
++	if (!x86_bug_srbds)
++		return 0;
++
++	srbds_off = !strcmp(str, "off");
++	return 0;
++}
++early_param("srbds", srbds_parse_cmdline);
++
+ /* The kernel command line selection */
+ enum spectre_v2_mitigation_cmd {
+ 	SPECTRE_V2_CMD_NONE,
+@@ -685,6 +780,27 @@ static const __initconst struct x86_cpu_
+ 	{}
+ };
+ 
++#define VULNBL_INTEL_STEPPINGS(model, steppings, issues)		   \
++	X86_MATCH_VENDOR_FAM_MODEL_STEPPINGS_FEATURE(INTEL, 6,		   \
++					    INTEL_FAM6_##model, steppings, \
++					    X86_FEATURE_ANY, issues)
++
++#define SRBDS		BIT(0)
++
++static const struct x86_cpu_id cpu_vuln_blacklist[] __initconst = {
++	VULNBL_INTEL_STEPPINGS(IVYBRIDGE,	X86_STEPPING_ANY,		SRBDS),
++	VULNBL_INTEL_STEPPINGS(HASWELL_CORE,	X86_STEPPING_ANY,		SRBDS),
++	VULNBL_INTEL_STEPPINGS(HASWELL_ULT,	X86_STEPPING_ANY,		SRBDS),
++	VULNBL_INTEL_STEPPINGS(HASWELL_GT3E,	X86_STEPPING_ANY,		SRBDS),
++	VULNBL_INTEL_STEPPINGS(BROADWELL_GT3E,	X86_STEPPING_ANY,		SRBDS),
++	VULNBL_INTEL_STEPPINGS(BROADWELL_CORE,	X86_STEPPING_ANY,		SRBDS),
++	VULNBL_INTEL_STEPPINGS(SKYLAKE_MOBILE,	X86_STEPPING_ANY,		SRBDS),
++	VULNBL_INTEL_STEPPINGS(SKYLAKE_DESKTOP,	X86_STEPPING_ANY,		SRBDS),
++	VULNBL_INTEL_STEPPINGS(KABYLAKE_MOBILE,	X86_STEPPINGS(0x0, 0xC),	SRBDS),
++	VULNBL_INTEL_STEPPINGS(KABYLAKE_DESKTOP, X86_STEPPINGS(0x0, 0xD),	SRBDS),
++	{}
++};
++
+ static bool __init cpu_matches(const struct x86_cpu_id *table, unsigned long which)
+ {
+ 	const struct x86_cpu_id *m = x86_match_cpu(table);
+@@ -753,6 +869,14 @@ void setup_force_cpu_bugs(unsigned long
+ 	    (boot_cpu_has(X86_FEATURE_RTM) ||
+ 	     (ia32_cap & ARCH_CAP_TSX_CTRL_MSR)))
+ 		x86_bug_taa = true;
++
++	/*
++	 * SRBDS affects CPUs which support RDRAND or RDSEED and are listed
++	 * in the vulnerability blacklist.
++	 */
++	if (boot_cpu_has(X86_FEATURE_RDRAND) &&
++	    cpu_matches(cpu_vuln_blacklist, SRBDS))
++		    x86_bug_srbds = true;
+ }
+ 
+ static void __init spec2_print_if_insecure(const char *reason)
+@@ -1400,7 +1524,7 @@ ssize_t cpu_show_l1tf(struct device *dev
+ {
+ 	if (!x86_bug_l1tf)
+ 		return sprintf(buf, "Not affected\n");
+-	return l1tf_show_state(buf);;
++	return l1tf_show_state(buf);
+ }
+ 
+ ssize_t itlb_multihit_show_state(char *buf)
+@@ -1470,6 +1594,14 @@ ssize_t cpu_show_itlb_multihit(struct de
+ 		return sprintf(buf, "KVM: Vulnerable\n");
+ }
+ 
++ssize_t cpu_show_srbds(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	if (!x86_bug_srbds)
++		return sprintf(buf, "Not affected\n");
++
++	return sprintf(buf, "%s\n", srbds_strings[srbds_mitigation]);
++}
++
+ void x86_spec_ctrl_set(u64 val)
+ {
+ 	if (val & x86_spec_ctrl_mask)
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@ -1027,6 +1027,7 @@ void __cpuinit identify_secondary_cpu(st
+ 	mtrr_ap_init();
+ 
+ 	x86_spec_ctrl_setup_ap();
++	update_srbds_msr();
+ }
+ 
+ struct msr_range {
+--- a/arch/x86/kernel/cpu/cpu.h
++++ b/arch/x86/kernel/cpu/cpu.h
+@@ -58,6 +58,7 @@ extern void get_cpu_cap(struct cpuinfo_x
+ 
+ extern int detect_extended_topology_early(struct cpuinfo_x86 *c);
+ extern int detect_ht_early(struct cpuinfo_x86 *c);
++extern void update_srbds_msr(void);
+ 
+ extern u64 x86_read_arch_cap_msr(void);
+ 
+--- a/arch/x86/kernel/cpu/scattered.c
++++ b/arch/x86/kernel/cpu/scattered.c
+@@ -38,6 +38,7 @@ void __cpuinit init_scattered_cpuid_feat
+ 		{ X86_FEATURE_PTS,		CR_EAX, 6, 0x00000006, 0 },
+ 		{ X86_FEATURE_APERFMPERF,	CR_ECX, 0, 0x00000006, 0 },
+ 		{ X86_FEATURE_EPB,		CR_ECX, 3, 0x00000006, 0 },
++		{ X86_FEATURE_SRBDS_CTRL,	CR_EDX, 9, 0x00000007, 0 },
+ 		{ X86_FEATURE_MD_CLEAR,		CR_EDX,10, 0x00000007, 0 },
+ 		{ X86_FEATURE_SPEC_CTRL,        CR_EDX,26, 0x00000007, 0 },
+ 		{ X86_FEATURE_SPEC_CTRL_MSR,    CR_EDX,26, 0x00000007, 0 },
+--- a/Documentation/ABI/testing/sysfs-devices-system-cpu
++++ b/Documentation/ABI/testing/sysfs-devices-system-cpu
+@@ -208,6 +208,7 @@ What:		/sys/devices/system/cpu/vulnerabi
+ 		/sys/devices/system/cpu/vulnerabilities/spectre_v1
+ 		/sys/devices/system/cpu/vulnerabilities/spectre_v2
+ 		/sys/devices/system/cpu/vulnerabilities/mds
++		/sys/devices/system/cpu/vulnerabilities/srbds
+ 		/sys/devices/system/cpu/vulnerabilities/itlb_multihit
+ Date:		January 2018
+ Contact:	Linux kernel mailing list <linux-kernel@vger.kernel.org>
+--- a/Documentation/kernel-parameters.txt
++++ b/Documentation/kernel-parameters.txt
+@@ -2688,6 +2688,26 @@ bytes respectively. Such letter suffixes
+ 	spia_pedr=
+ 	spia_peddr=
+ 
++	srbds=		[X86,INTEL]
++			Control the Special Register Buffer Data Sampling
++			(SRBDS) mitigation.
++
++			Certain CPUs are vulnerable to an MDS-like
++			exploit which can leak bits from the random
++			number generator.
++
++			By default, this issue is mitigated by
++			microcode.  However, the microcode fix can cause
++			the RDRAND and RDSEED instructions to become
++			much slower.  Among other effects, this will
++			result in reduced throughput from /dev/urandom.
++
++			The microcode mitigation can be disabled with
++			the following option:
++
++			off:    Disable mitigation and remove
++				performance impact to RDRAND and RDSEED
++
+ 	stack_guard_gap=	[MM]
+ 			override the default stack gap protection. The value
+ 			is in page units and it defines how many pages prior
+--- a/drivers/base/cpu.c
++++ b/drivers/base/cpu.c
+@@ -289,6 +289,12 @@ ssize_t __weak cpu_show_itlb_multihit(st
+ 	return sprintf(buf, "Not affected\n");
+ }
+ 
++ssize_t __weak cpu_show_srbds(struct device *dev,
++			      struct device_attribute *attr, char *buf)
++{
++	return sprintf(buf, "Not affected\n");
++}
++
+ static DEVICE_ATTR(meltdown, 0444, cpu_show_meltdown, NULL);
+ static DEVICE_ATTR(spectre_v1, 0444, cpu_show_spectre_v1, NULL);
+ static DEVICE_ATTR(spectre_v2, 0444, cpu_show_spectre_v2, NULL);
+@@ -297,6 +303,7 @@ static DEVICE_ATTR(l1tf, 0444, cpu_show_
+ static DEVICE_ATTR(mds, 0444, cpu_show_mds, NULL);
+ static DEVICE_ATTR(tsx_async_abort, 0444, cpu_show_tsx_async_abort, NULL);
+ static DEVICE_ATTR(itlb_multihit, 0444, cpu_show_itlb_multihit, NULL);
++static DEVICE_ATTR(srbds, 0444, cpu_show_srbds, NULL);
+ 
+ static struct attribute *cpu_root_vulnerabilities_attrs[] = {
+ 	&dev_attr_meltdown.attr,
+@@ -307,6 +314,7 @@ static struct attribute *cpu_root_vulner
+ 	&dev_attr_mds.attr,
+ 	&dev_attr_tsx_async_abort.attr,
+ 	&dev_attr_itlb_multihit.attr,
++	&dev_attr_srbds.attr,
+ 	NULL
+ };
+ 
+--- a/drivers/edac/amd64_edac.h
++++ b/drivers/edac/amd64_edac.h
+@@ -160,14 +160,6 @@
+ #define OFF false
+ 
+ /*
+- * Create a contiguous bitmask starting at bit position @lo and ending at
+- * position @hi. For example
+- *
+- * GENMASK(21, 39) gives us the 64bit vector 0x000000ffffe00000.
+- */
+-#define GENMASK(lo, hi)			(((1ULL << ((hi) - (lo) + 1)) - 1) << (lo))
+-
+-/*
+  * PCI-defined configuration space registers
+  */
+ #define PCI_DEVICE_ID_AMD_15H_NB_F1	0x1601
+--- a/include/linux/bitops.h
++++ b/include/linux/bitops.h
+@@ -11,6 +11,14 @@
+ #define BITS_TO_LONGS(nr)	DIV_ROUND_UP(nr, BITS_PER_BYTE * sizeof(long))
+ #endif
+ 
++/*
++ * Create a contiguous bitmask starting at bit position @lo and ending at
++ * position @hi. For example
++ *
++ * GENMASK(21, 39) gives us the 64bit vector 0x000000ffffe00000.
++ */
++#define GENMASK(lo, hi)			(((1ULL << ((hi) - (lo) + 1)) - 1) << (lo))
++
+ extern unsigned int __sw_hweight8(unsigned int w);
+ extern unsigned int __sw_hweight16(unsigned int w);
+ extern unsigned int __sw_hweight32(unsigned int w);
