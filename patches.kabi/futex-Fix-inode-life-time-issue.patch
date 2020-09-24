@@ -1,0 +1,118 @@
+From 62fb7880a14914fbdc0169cc318781297b9f5985 Mon Sep 17 00:00:00 2001
+From: Davidlohr Bueso <dbueso@suse.de>
+Date: Sun, 20 Sep 2020 15:32:56 -0700
+Subject: [PATCH] futex: Fix inode life-time issue
+Patch-mainline: Never, kabi workaround
+References: CVE-2020-14381 bsc#1176011
+
+This is a kabi safe fix to the issues fixed upstream in:
+
+     8019ad13ef7f ("futex: Fix inode life-time issue")
+     8d67743653dc ("futex: Unbreak futex hashing")
+
+The main difference is that instead of generating a unique
+number for the inode, this patch pins down the struct file
+instead of the underlying inode, thus preventing the unmount
+operation.
+
+Reviewed-by: Jan Kara <jack@suse.cz>
+Signed-off-by: Davidlohr Bueso <dbueso@suse.de>
+---
+ include/linux/futex.h |  1 +
+ kernel/futex.c        | 52 ++++++++++++++++++++++++++++++++++++++++---
+ 2 files changed, 50 insertions(+), 3 deletions(-)
+
+diff --git a/include/linux/futex.h b/include/linux/futex.h
+index 1e5a26d79232..c5d70f72fe78 100644
+--- a/include/linux/futex.h
++++ b/include/linux/futex.h
+@@ -158,6 +158,7 @@ union futex_key {
+ 		unsigned long pgoff;
+ 		struct inode *inode;
+ 		int offset;
++		struct file *filp;
+ 	} shared;
+ 	struct {
+ 		unsigned long address;
+diff --git a/kernel/futex.c b/kernel/futex.c
+index 2fb5250e0977..7a0a448669f4 100644
+--- a/kernel/futex.c
++++ b/kernel/futex.c
+@@ -185,7 +185,7 @@ static void get_futex_key_refs(union futex_key *key)
+ 
+ 	switch (key->both.offset & (FUT_OFF_INODE|FUT_OFF_MMSHARED)) {
+ 	case FUT_OFF_INODE:
+-		ihold(key->shared.inode); /* implies MB (B) */
++	        get_file(key->shared.filp);
+ 		break;
+ 	case FUT_OFF_MMSHARED:
+ 		futex_get_mm(key); /* implies MB (B) */
+@@ -207,7 +207,7 @@ static void drop_futex_key_refs(union futex_key *key)
+ 
+ 	switch (key->both.offset & (FUT_OFF_INODE|FUT_OFF_MMSHARED)) {
+ 	case FUT_OFF_INODE:
+-		iput(key->shared.inode);
++		fput(key->shared.filp);
+ 		break;
+ 	case FUT_OFF_MMSHARED:
+ 		mmdrop(key->private.mm);
+@@ -362,9 +362,55 @@ again:
+ 		key->private.mm = mm;
+ 		key->private.address = address;
+ 	} else {
++		struct mm_struct *mm = current->mm;
++		struct vm_area_struct *vma;
++
++		unlock_page(page_head);
++		put_page(page_head);
++
++		down_read(&mm->mmap_sem);
++
++		err = get_user_pages(current, mm, address, 1, 1,
++				     0, &page, &vma);
++		/*
++		 * If write access is not required (eg. FUTEX_WAIT), try
++		 * and get read-only access.
++		 */
++		if (err == -EFAULT && rw == VERIFY_READ)
++			err = get_user_pages(current, mm, address, 1,
++					     0, 0, &page, &vma);
++
++		if (err < 0) {
++			up_read(&mm->mmap_sem);
++			return err;
++		}
++
++		/*
++		 * Virtual address could have been remapped.
++		 */
++		if (!vma->vm_file || PageAnon(page)) {
++			put_page(page);
++			up_read(&mm->mmap_sem);
++
++			goto again;
++		}
++
+ 		key->both.offset |= FUT_OFF_INODE; /* inode-based key */
+-		key->shared.inode = page_head->mapping->host;
++		key->shared.inode = vma->vm_file->f_path.dentry->d_inode;
++		/*
++		 * For filesystem-backed pages, the tail is required
++		 * as the index of the page determines the key.
++		 */
+ 		key->shared.pgoff = basepage_index(page);
++		/* refcount on the file, not inode */
++		key->shared.filp = vma->vm_file;
++
++		get_futex_key_refs(key);
++
++		put_page(page);
++		up_read(&mm->mmap_sem);
++
++		return 0;
+ 	}
+ 
+ 	get_futex_key_refs(key); /* implies MB (B) */
+--
+2.26.2
+
