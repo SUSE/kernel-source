@@ -19,8 +19,8 @@ Reviewed-by: Jan Kara <jack@suse.cz>
 Signed-off-by: Davidlohr Bueso <dbueso@suse.de>
 ---
  include/linux/futex.h |  1 +
- kernel/futex.c        | 52 ++++++++++++++++++++++++++++++++++++++++---
- 2 files changed, 50 insertions(+), 3 deletions(-)
+ kernel/futex.c        | 93 ++++++++++++++++++++++++++++++++++++++-----
+ 2 files changed, 83 insertions(+), 11 deletions(-)
 
 diff --git a/include/linux/futex.h b/include/linux/futex.h
 index 1e5a26d79232..c5d70f72fe78 100644
@@ -35,7 +35,7 @@ index 1e5a26d79232..c5d70f72fe78 100644
  	struct {
  		unsigned long address;
 diff --git a/kernel/futex.c b/kernel/futex.c
-index 2fb5250e0977..7a0a448669f4 100644
+index 2fb5250e0977..f018f88bbd28 100644
 --- a/kernel/futex.c
 +++ b/kernel/futex.c
 @@ -185,7 +185,7 @@ static void get_futex_key_refs(union futex_key *key)
@@ -47,7 +47,29 @@ index 2fb5250e0977..7a0a448669f4 100644
  		break;
  	case FUT_OFF_MMSHARED:
  		atomic_inc(&key->private.mm->mm_count);
-@@ -207,7 +207,7 @@ static void drop_futex_key_refs(union futex_key *key)
+@@ -193,6 +193,21 @@ static void get_futex_key_refs(union futex_key *key)
+ 	}
+ }
+ 
++static inline bool key_is_file(union futex_key *key)
++{
++	return (key->both.offset & FUT_OFF_INODE) == FUT_OFF_INODE;
++}
++
++/*
++ * Drop a reference to the file backed addressed by a key.
++ * Can be called with hb->lock held.
++ */
++static void drop_futex_key_refs_atomic(union futex_key *key)
++{
++	if (key_is_file(key))
++		fput(key->shared.filp);
++}
++
+ /*
+  * Drop a reference to the resource addressed by a key.
+  * The hash bucket spinlock must not be held.
+@@ -207,7 +222,7 @@ static void drop_futex_key_refs(union futex_key *key)
  
  	switch (key->both.offset & (FUT_OFF_INODE|FUT_OFF_MMSHARED)) {
  	case FUT_OFF_INODE:
@@ -56,7 +78,7 @@ index 2fb5250e0977..7a0a448669f4 100644
  		break;
  	case FUT_OFF_MMSHARED:
  		mmdrop(key->private.mm);
-@@ -362,9 +362,55 @@ again:
+@@ -362,9 +377,55 @@ again:
  		key->private.mm = mm;
  		key->private.address = address;
  	} else {
@@ -113,6 +135,89 @@ index 2fb5250e0977..7a0a448669f4 100644
  	}
  
  	get_futex_key_refs(key);
---
+@@ -1141,6 +1202,8 @@ void requeue_futex(struct futex_q *q, struct futex_hash_bucket *hb1,
+ 		plist_add(&q->list, &hb2->chain);
+ 		q->lock_ptr = &hb2->lock;
+ 	}
++
++	drop_futex_key_refs_atomic(&q->key);
+ 	get_futex_key_refs(key2);
+ 	q->key = *key2;
+ }
+@@ -1163,6 +1226,7 @@ static inline
+ void requeue_pi_wake_futex(struct futex_q *q, union futex_key *key,
+ 			   struct futex_hash_bucket *hb)
+ {
++	drop_futex_key_refs_atomic(&q->key);
+ 	get_futex_key_refs(key);
+ 	q->key = *key;
+ 
+@@ -1269,6 +1333,7 @@ static int futex_requeue(u32 __user *uaddr1, unsigned int flags,
+ 	struct plist_head *head1;
+ 	struct futex_q *this, *next;
+ 	u32 curval2;
++	bool drop_atomic;
+ 
+ 	if (nr_wake < 0 || nr_requeue < 0)
+ 		return -EINVAL;
+@@ -1315,6 +1380,8 @@ retry:
+ 	hb1 = hash_futex(&key1);
+ 	hb2 = hash_futex(&key2);
+ 
++	drop_atomic = key_is_file(&key1);
++
+ retry_private:
+ 	double_lock_hb(hb1, hb2);
+ 
+@@ -1361,7 +1428,8 @@ retry_private:
+ 		 */
+ 		if (ret == 1) {
+ 			WARN_ON(pi_state);
+-			drop_count++;
++			if (!drop_atomic)
++				drop_count++;
+ 			task_count++;
+ 			ret = get_futex_value_locked(&curval2, uaddr2);
+ 			if (!ret)
+@@ -1444,7 +1512,8 @@ retry_private:
+ 			if (ret == 1) {
+ 				/* We got the lock. */
+ 				requeue_pi_wake_futex(this, &key2, hb2);
+-				drop_count++;
++				if (!drop_atomic)
++					drop_count++;
+ 				continue;
+ 			} else if (ret) {
+ 				/* -EDEADLK */
+@@ -1454,20 +1523,22 @@ retry_private:
+ 			}
+ 		}
+ 		requeue_futex(this, hb1, hb2, &key2);
+-		drop_count++;
++		if (!drop_atomic)
++			drop_count++;
+ 	}
+ 
+ out_unlock:
+ 	double_unlock_hb(hb1, hb2);
+ 
+ 	/*
+-	 * drop_futex_key_refs() must be called outside the spinlocks. During
+-	 * the requeue we moved futex_q's from the hash bucket at key1 to the
+-	 * one at key2 and updated their key pointer.  We no longer need to
++	 * drop_futex_key_refs() for anon mem must be called outside the spinlocks.
++	 * During the requeue we moved futex_q's from the hash bucket at key1 to
++	 * the one at key2 and updated their key pointer.  We no longer need to
+ 	 * hold the references to key1.
+ 	 */
+-	while (--drop_count >= 0)
+-		drop_futex_key_refs(&key1);
++	if (!drop_atomic)
++		while (--drop_count >= 0)
++			drop_futex_key_refs(&key1);
+ 
+ out_put_keys:
+ 	put_futex_key(&key2);
+-- 
 2.26.2
 
