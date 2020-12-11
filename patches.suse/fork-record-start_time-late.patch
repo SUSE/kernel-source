@@ -1,0 +1,78 @@
+From 7b55851367136b1efd84d98fea81ba57a98304cf Mon Sep 17 00:00:00 2001
+From: David Herrmann <dh.herrmann@gmail.com>
+Date: Tue, 8 Jan 2019 13:58:52 +0100
+Subject: [PATCH] fork: record start_time late
+Patch-mainline: v5.0-rc2
+Git-commit: 7b55851367136b1efd84d98fea81ba57a98304cf
+References: bsc#1121872 CVE-2019-6133
+
+This changes the fork(2) syscall to record the process start_time after
+initializing the basic task structure but still before making the new
+process visible to user-space.
+
+Technically, we could record the start_time anytime during fork(2).  But
+this might lead to scenarios where a start_time is recorded long before
+a process becomes visible to user-space.  For instance, with
+userfaultfd(2) and TLS, user-space can delay the execution of fork(2)
+for an indefinite amount of time (and will, if this causes network
+access, or similar).
+
+By recording the start_time late, it much closer reflects the point in
+time where the process becomes live and can be observed by other
+processes.
+
+Lastly, this makes it much harder for user-space to predict and control
+the start_time they get assigned.  Previously, user-space could fork a
+process and stall it in copy_thread_tls() before its pid is allocated,
+but after its start_time is recorded.  This can be misused to later-on
+cycle through PIDs and resume the stalled fork(2) yielding a process
+that has the same pid and start_time as a process that existed before.
+This can be used to circumvent security systems that identify processes
+by their pid+start_time combination.
+
+Even though user-space was always aware that start_time recording is
+flaky (but several projects are known to still rely on start_time-based
+identification), changing the start_time to be recorded late will help
+mitigate existing attacks and make it much harder for user-space to
+control the start_time a process gets assigned.
+
+Reported-by: Jann Horn <jannh@google.com>
+Signed-off-by: Tom Gundersen <teg@jklm.no>
+Signed-off-by: David Herrmann <dh.herrmann@gmail.com>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Acked-by: Jessica Yu <jeyu@suse.de>
+---
+ kernel/fork.c |   15 ++++++++++++---
+ 1 file changed, 12 insertions(+), 3 deletions(-)
+
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1167,9 +1167,6 @@ static struct task_struct *copy_process(
+ 
+ 	posix_cpu_timers_init(p);
+ 
+-	do_posix_clock_monotonic_gettime(&p->start_time);
+-	p->real_start_time = p->start_time;
+-	monotonic_to_bootbased(&p->real_start_time);
+ 	p->io_context = NULL;
+ 	p->audit_context = NULL;
+ 	if (clone_flags & CLONE_THREAD)
+@@ -1310,6 +1307,18 @@ static struct task_struct *copy_process(
+ 	cgroup_fork_callbacks(p);
+ 	cgroup_callbacks_done = 1;
+ 
++	/*
++	 * From this point on we must avoid any synchronous user-space
++	 * communication until we take the tasklist-lock. In particular, we do
++	 * not want user-space to be able to predict the process start-time by
++	 * stalling fork(2) after we recorded the start_time but before it is
++	 * visible to the system.
++	 */
++
++	do_posix_clock_monotonic_gettime(&p->start_time);
++	p->real_start_time = p->start_time;
++	monotonic_to_bootbased(&p->real_start_time);
++
+ 	/* Need tasklist lock for parent etc handling! */
+ 	write_lock_irq(&tasklist_lock);
+ 
