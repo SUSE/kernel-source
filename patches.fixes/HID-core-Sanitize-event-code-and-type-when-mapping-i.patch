@@ -1,0 +1,197 @@
+From 35556bed836f8dc07ac55f69c8d17dce3e7f0e25 Mon Sep 17 00:00:00 2001
+From: Marc Zyngier <maz@kernel.org>
+Date: Tue, 1 Sep 2020 10:52:33 +0100
+Subject: [PATCH] HID: core: Sanitize event code and type when mapping input
+Git-commit: 35556bed836f8dc07ac55f69c8d17dce3e7f0e25
+Patch-mainline: v5.9-rc4
+References: CVE-2020-0465 bsc#1180029
+
+[ backport note: put NULL *bit check in each place after calling
+  hid_map_usage() in mt_input_mapping(); also the inclusion of ratelimit.h
+  was needed to make it build -- tiwai ]
+
+When calling into hid_map_usage(), the passed event code is
+blindly stored as is, even if it doesn't fit in the associated bitmap.
+
+This event code can come from a variety of sources, including devices
+masquerading as input devices, only a bit more "programmable".
+
+Instead of taking the event code at face value, check that it actually
+fits the corresponding bitmap, and if it doesn't:
+- spit out a warning so that we know which device is acting up
+- NULLify the bitmap pointer so that we catch unexpected uses
+
+Code paths that can make use of untrusted inputs can now check
+that the mapping was indeed correct and bail out if not.
+
+Cc: stable@vger.kernel.org
+Signed-off-by: Marc Zyngier <maz@kernel.org>
+Signed-off-by: Benjamin Tissoires <benjamin.tissoires@gmail.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/hid/hid-input.c      |    4 ++++
+ drivers/hid/hid-multitouch.c |   14 ++++++++++++--
+ include/linux/hid.h          |   43 ++++++++++++++++++++++++++++++-------------
+ 3 files changed, 46 insertions(+), 15 deletions(-)
+
+--- a/drivers/hid/hid-input.c
++++ b/drivers/hid/hid-input.c
+@@ -680,6 +680,10 @@ static void hidinput_configure_usage(str
+ 	}
+ 
+ mapped:
++	/* Mapping failed, bail out */
++	if (!bit)
++		return;
++
+ 	if (device->driver->input_mapped &&
+ 	    device->driver->input_mapped(device, hidinput, field, usage,
+ 					 &bit, &max) < 0) {
+--- a/drivers/hid/hid-multitouch.c
++++ b/drivers/hid/hid-multitouch.c
+@@ -239,6 +239,8 @@ static int mt_input_mapping(struct hid_d
+ 			} else {
+ 				hid_map_usage(hi, usage, bit, max,
+ 					EV_ABS, ABS_MT_POSITION_X);
++				if (!*bit)
++					return -1;
+ 				set_abs(hi->input, ABS_MT_POSITION_X, field,
+ 					cls->sn_move);
+ 				/* touchscreen emulation */
+@@ -258,6 +260,8 @@ static int mt_input_mapping(struct hid_d
+ 			} else {
+ 				hid_map_usage(hi, usage, bit, max,
+ 					EV_ABS, ABS_MT_POSITION_Y);
++			if (!*bit)
++				return -1;
+ 				set_abs(hi->input, ABS_MT_POSITION_Y, field,
+ 					cls->sn_move);
+ 				/* touchscreen emulation */
+@@ -288,6 +292,8 @@ static int mt_input_mapping(struct hid_d
+ 			return 1;
+ 		case HID_DG_TIPSWITCH:
+ 			hid_map_usage(hi, usage, bit, max, EV_KEY, BTN_TOUCH);
++			if (!*bit)
++				return -1;
+ 			input_set_capability(hi->input, EV_KEY, BTN_TOUCH);
+ 			if (td->last_mt_collection == usage->collection_index) {
+ 				td->last_slot_field = usage->hid;
+@@ -305,6 +311,8 @@ static int mt_input_mapping(struct hid_d
+ 		case HID_DG_WIDTH:
+ 			hid_map_usage(hi, usage, bit, max,
+ 					EV_ABS, ABS_MT_TOUCH_MAJOR);
++			if (!*bit)
++				return -1;
+ 			set_abs(hi->input, ABS_MT_TOUCH_MAJOR, field,
+ 				cls->sn_width);
+ 			if (td->last_mt_collection == usage->collection_index) {
+@@ -315,6 +323,8 @@ static int mt_input_mapping(struct hid_d
+ 		case HID_DG_HEIGHT:
+ 			hid_map_usage(hi, usage, bit, max,
+ 					EV_ABS, ABS_MT_TOUCH_MINOR);
++			if (!*bit)
++				return -1;
+ 			set_abs(hi->input, ABS_MT_TOUCH_MINOR, field,
+ 				cls->sn_height);
+ 			input_set_abs_params(hi->input,
+@@ -329,6 +339,8 @@ static int mt_input_mapping(struct hid_d
+ 				field->logical_minimum = 0;
+ 			hid_map_usage(hi, usage, bit, max,
+ 					EV_ABS, ABS_MT_PRESSURE);
++			if (!*bit)
++				return -1;
+ 			set_abs(hi->input, ABS_MT_PRESSURE, field,
+ 				cls->sn_pressure);
+ 			/* touchscreen emulation */
+@@ -448,8 +460,6 @@ static void mt_emit_event(struct mt_devi
+ 	td->num_received = 0;
+ }
+ 
+-
+-
+ static int mt_event(struct hid_device *hid, struct hid_field *field,
+ 				struct hid_usage *usage, __s32 value)
+ {
+--- a/include/linux/hid.h
++++ b/include/linux/hid.h
+@@ -68,6 +68,7 @@
+ #include <linux/slab.h>
+ #include <linux/list.h>
+ #include <linux/mod_devicetable.h> /* hid_device_id */
++#include <linux/ratelimit.h>
+ #include <linux/timer.h>
+ #include <linux/workqueue.h>
+ #include <linux/input.h>
+@@ -732,34 +733,49 @@ void hid_disconnect(struct hid_device *h
+  * @max: maximal valid usage->code to consider later (out parameter)
+  * @type: input event type (EV_KEY, EV_REL, ...)
+  * @c: code which corresponds to this usage and type
++ *
++ * The value pointed to by @bit will be set to NULL if either @type is
++ * an unhandled event type, or if @c is out of range for @type. This
++ * can be used as an error condition.
+  */
+ static inline void hid_map_usage(struct hid_input *hidinput,
+ 		struct hid_usage *usage, unsigned long **bit, int *max,
+-		__u8 type, __u16 c)
++		__u8 type, unsigned int c)
+ {
+ 	struct input_dev *input = hidinput->input;
+-
+-	usage->type = type;
+-	usage->code = c;
++	unsigned long *bmap = NULL;
++	unsigned int limit = 0;
+ 
+ 	switch (type) {
+ 	case EV_ABS:
+-		*bit = input->absbit;
+-		*max = ABS_MAX;
++		bmap = input->absbit;
++		limit = ABS_MAX;
+ 		break;
+ 	case EV_REL:
+-		*bit = input->relbit;
+-		*max = REL_MAX;
++		bmap = input->relbit;
++		limit = REL_MAX;
+ 		break;
+ 	case EV_KEY:
+-		*bit = input->keybit;
+-		*max = KEY_MAX;
++		bmap = input->keybit;
++		limit = KEY_MAX;
+ 		break;
+ 	case EV_LED:
+-		*bit = input->ledbit;
+-		*max = LED_MAX;
++		bmap = input->ledbit;
++		limit = LED_MAX;
+ 		break;
+ 	}
++
++	if (unlikely(c > limit || !bmap)) {
++		pr_warn_ratelimited("%s: Invalid code %d type %d\n",
++				    input->name, c, type);
++		*bit = NULL;
++		return;
++	}
++
++	usage->type = type;
++	usage->code = c;
++	*max = limit;
++	*bit = bmap;
+ }
+ 
+ /**
+@@ -773,7 +789,8 @@ static inline void hid_map_usage_clear(s
+ 		__u8 type, __u16 c)
+ {
+ 	hid_map_usage(hidinput, usage, bit, max, type, c);
+-	clear_bit(c, *bit);
++	if (*bit)
++		clear_bit(usage->code, *bit);
+ }
+ 
+ /**
