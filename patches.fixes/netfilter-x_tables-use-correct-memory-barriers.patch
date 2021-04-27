@@ -1,0 +1,69 @@
+From: Mark Tomlinson <mark.tomlinson@alliedtelesis.co.nz>
+Date: Mon, 8 Mar 2021 14:24:13 +1300
+Subject: netfilter: x_tables: Use correct memory barriers.
+Git-commit: 175e476b8cdf2a4de7432583b49c871345e4f8a1
+Patch-mainline: v5.12-rc5
+References: bsc#1184208 CVE-2021-29650
+
+When a new table value was assigned, it was followed by a write memory
+barrier. This ensured that all writes before this point would complete
+before any writes after this point. However, to determine whether the
+rules are unused, the sequence counter is read. To ensure that all
+writes have been done before these reads, a full memory barrier is
+needed, not just a write memory barrier. The same argument applies when
+incrementing the counter, before the rules are read.
+
+Changing to using smp_mb() instead of smp_wmb() fixes the kernel panic
+reported in cc00bcaa5899 (which is still present), while still
+maintaining the same speed of replacing tables.
+
+The smb_mb() barriers potentially slow the packet path, however testing
+has shown no measurable change in performance on a 4-core MIPS64
+platform.
+
+Fixes: 7f5c6d4f665b ("netfilter: get rid of atomic ops in fast path")
+Signed-off-by: Mark Tomlinson <mark.tomlinson@alliedtelesis.co.nz>
+Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+
+ [ bp: Add the second smp_wmb() line in xt_replace_table() from
+   d3d40f237480 ("Revert "netfilter: x_tables: Switch synchronization to RCU"")
+   so that the table->private assignment is "sandwiched" by the two barriers
+   like it is done upstream. ]
+
+Acked-by: Borislav Petkov <bp@suse.de>
+---
+ include/linux/netfilter/x_tables.h |    2 +-
+ net/netfilter/x_tables.c           |    8 ++++++++
+ 2 files changed, 9 insertions(+), 1 deletion(-)
+
+--- a/include/linux/netfilter/x_tables.h
++++ b/include/linux/netfilter/x_tables.h
+@@ -501,7 +501,7 @@ static inline unsigned int xt_write_recs
+ 	 * since addend is most likely 1
+ 	 */
+ 	__this_cpu_add(xt_recseq.sequence, addend);
+-	smp_wmb();
++	smp_mb();
+ 
+ 	return addend;
+ }
+--- a/net/netfilter/x_tables.c
++++ b/net/netfilter/x_tables.c
+@@ -1068,9 +1068,17 @@ xt_replace_table(struct xt_table *table,
+ 		return NULL;
+ 	}
+ 
++        /*
++         * Ensure contents of newinfo are visible before assigning to
++         * private.
++         */
++        smp_wmb();
+ 	table->private = newinfo;
+ 	newinfo->initial_entries = private->initial_entries;
+ 
++	/* make sure all cpus see new ->private value */
++	smp_mb();
++
+ 	/*
+ 	 * Even though table entries have now been swapped, other CPU's
+ 	 * may still be using the old entries. This is okay, because
