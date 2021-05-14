@@ -1,0 +1,128 @@
+From bf30ca922a0c0176007e074b0acc77ed345e9990 Mon Sep 17 00:00:00 2001
+From: Johannes Berg <johannes.berg@intel.com>
+Date: Tue, 11 May 2021 20:02:48 +0200
+Subject: [PATCH] mac80211: check defrag PN against current frame
+Git-commit: bf30ca922a0c0176007e074b0acc77ed345e9990
+Git-repo: git://git.kernel.org/pub/scm/linux/kernel/git/jberg/mac80211-next.git
+Patch-mainline: Queued in subsystem maintainer repo
+References: CVE-2020-24587 CVE-2020-24586 bsc#1185863 bsc#1185862 bsc#1185859
+
+[ backport note: the missing ieee80211_is_frag() is defined locally
+  in this patch -- tiwai ]
+
+As pointed out by Mathy Vanhoef, we implement the RX PN check
+on fragmented frames incorrectly - we check against the last
+received PN prior to the new frame, rather than to the one in
+this frame itself.
+
+Prior patches addressed the security issue here, but in order
+to be able to reason better about the code, fix it to really
+compare against the current frame's PN, not the last stored
+one.
+
+Cc: stable@vger.kernel.org
+Link: https://lore.kernel.org/r/20210511200110.bfbc340ff071.Id0b690e581da7d03d76df90bb0e3fd55930bc8a0@changeid
+Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ net/mac80211/ieee80211_i.h |   11 +++++++++--
+ net/mac80211/rx.c          |    6 ++----
+ net/mac80211/wpa.c         |   16 ++++++++++++----
+ 3 files changed, 23 insertions(+), 10 deletions(-)
+
+--- a/net/mac80211/ieee80211_i.h
++++ b/net/mac80211/ieee80211_i.h
+@@ -185,8 +185,15 @@ struct ieee80211_rx_data {
+ 
+ 	unsigned int flags;
+ 	int queue;
+-	u32 tkip_iv32;
+-	u16 tkip_iv16;
++	union {
++		struct {
++			u32 iv32;
++			u16 iv16;
++		} tkip;
++		struct {
++			u8 pn[CCMP_PN_LEN];
++		} ccm_gcm;
++	};
+ };
+ 
+ struct beacon_data {
+--- a/net/mac80211/rx.c
++++ b/net/mac80211/rx.c
+@@ -1423,7 +1423,6 @@ ieee80211_rx_h_defragment(struct ieee802
+ 	if (entry->ccmp) {
+ 		int i;
+ 		u8 pn[CCMP_PN_LEN], *rpn;
+-		int queue;
+ 		if (!rx->key || rx->key->conf.cipher != WLAN_CIPHER_SUITE_CCMP)
+ 			return RX_DROP_UNUSABLE;
+ 
+@@ -1437,9 +1436,8 @@ ieee80211_rx_h_defragment(struct ieee802
+ 			if (pn[i])
+ 				break;
+ 		}
+-		queue = ieee80211_is_mgmt(fc) ?
+-			NUM_RX_DATA_QUEUES : rx->queue;
+-		rpn = rx->key->u.ccmp.rx_pn[queue];
++
++		rpn = rx->ccm_gcm.pn;
+ 		if (memcmp(pn, rpn, CCMP_PN_LEN))
+ 			return RX_DROP_UNUSABLE;
+ 		memcpy(entry->last_pn, pn, CCMP_PN_LEN);
+--- a/net/mac80211/wpa.c
++++ b/net/mac80211/wpa.c
+@@ -1,6 +1,7 @@
+ /*
+  * Copyright 2002-2004, Instant802 Networks, Inc.
+  * Copyright 2008, Jouni Malinen <j@w1.fi>
++ * Copyright (C) 2020-2021 Intel Corporation
+  *
+  * This program is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License version 2 as
+@@ -154,8 +155,8 @@ ieee80211_rx_h_michael_mic_verify(struct
+ 
+ update_iv:
+ 	/* update IV in key information to be able to detect replays */
+-	rx->key->u.tkip.rx[queue].iv32 = rx->tkip_iv32;
+-	rx->key->u.tkip.rx[queue].iv16 = rx->tkip_iv16;
++	rx->key->u.tkip.rx[queue].iv32 = rx->tkip.iv32;
++	rx->key->u.tkip.rx[queue].iv16 = rx->tkip.iv16;
+ 
+ 	return RX_CONTINUE;
+ 
+@@ -273,8 +274,8 @@ ieee80211_crypto_tkip_decrypt(struct iee
+ 					  key, skb->data + hdrlen,
+ 					  skb->len - hdrlen, rx->sta->sta.addr,
+ 					  hdr->addr1, hwaccel, queue,
+-					  &rx->tkip_iv32,
+-					  &rx->tkip_iv16);
++					  &rx->tkip.iv32,
++					  &rx->tkip.iv16);
+ 	if (res != TKIP_DECRYPT_OK)
+ 		return RX_DROP_UNUSABLE;
+ 
+@@ -458,6 +459,11 @@ ieee80211_crypto_ccmp_encrypt(struct iee
+ 	return TX_CONTINUE;
+ }
+ 
++static inline bool ieee80211_is_frag(struct ieee80211_hdr *hdr)
++{
++	return ieee80211_has_morefrags(hdr->frame_control) ||
++	       hdr->seq_ctrl & cpu_to_le16(IEEE80211_SCTL_FRAG);
++}
+ 
+ ieee80211_rx_result
+ ieee80211_crypto_ccmp_decrypt(struct ieee80211_rx_data *rx)
+@@ -504,6 +510,8 @@ ieee80211_crypto_ccmp_decrypt(struct iee
+ 	}
+ 
+ 	memcpy(key->u.ccmp.rx_pn[queue], pn, CCMP_PN_LEN);
++	if (unlikely(ieee80211_is_frag(hdr)))
++		memcpy(rx->ccm_gcm.pn, pn, CCMP_PN_LEN);
+ 
+ 	/* Remove CCMP header and MIC */
+ 	skb_trim(skb, skb->len - CCMP_MIC_LEN);
