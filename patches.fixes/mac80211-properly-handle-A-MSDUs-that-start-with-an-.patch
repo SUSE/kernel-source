@@ -1,0 +1,159 @@
+From a1d5ff5651ea592c67054233b14b30bf4452999c Mon Sep 17 00:00:00 2001
+From: Mathy Vanhoef <Mathy.Vanhoef@kuleuven.be>
+Date: Tue, 11 May 2021 20:02:44 +0200
+Subject: [PATCH] mac80211: properly handle A-MSDUs that start with an RFC 1042 header
+Git-commit: a1d5ff5651ea592c67054233b14b30bf4452999c
+Git-repo: git://git.kernel.org/pub/scm/linux/kernel/git/jberg/mac80211-next.git
+Patch-mainline: Queued in subsystem maintainer repo
+References: CVE-2020-24587 CVE-2020-24586 bsc#1185863 bsc#1185862 bsc#1185859
+
+[ backport note: this patch is a largely modified version; as 4.4-based
+  mac80211 driver still doesn't have ieee80211_data_to_8023_exthdr(),
+  here we handle directly a variant of ieee80211_data_to_8023() for
+  A-MSDU that is called only from ieee80211_amsdu_to_8023s().
+  Also, another variant of ieee80211_amsdu_to_8023s() is introduced, so
+  that the error check is performed.  -- tiwai ]
+
+Properly parse A-MSDUs whose first 6 bytes happen to equal a rfc1042
+header. This can occur in practice when the destination MAC address
+equals AA:AA:03:00:00:00. More importantly, this simplifies the next
+patch to mitigate A-MSDU injection attacks.
+
+Cc: stable@vger.kernel.org
+Signed-off-by: Mathy Vanhoef <Mathy.Vanhoef@kuleuven.be>
+Link: https://lore.kernel.org/r/20210511200110.0b2b886492f0.I23dd5d685fe16d3b0ec8106e8f01b59f499dffed@changeid
+Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ include/net/cfg80211.h |    6 ++++++
+ net/mac80211/rx.c      |    7 ++++---
+ net/wireless/util.c    |   37 ++++++++++++++++++++++++++++++-------
+ 3 files changed, 40 insertions(+), 10 deletions(-)
+
+--- a/include/net/cfg80211.h
++++ b/include/net/cfg80211.h
+@@ -2213,6 +2213,8 @@ unsigned int __attribute_const__ ieee802
+  */
+ int ieee80211_data_to_8023(struct sk_buff *skb, const u8 *addr,
+ 			   enum nl80211_iftype iftype);
++int ieee80211_data_to_8023_amsdu(struct sk_buff *skb, const u8 *addr,
++				 enum nl80211_iftype iftype);
+ 
+ /**
+  * ieee80211_data_from_8023 - convert an 802.3 frame to 802.11
+@@ -2244,6 +2246,10 @@ void ieee80211_amsdu_to_8023s(struct sk_
+ 			      const u8 *addr, enum nl80211_iftype iftype,
+ 			      const unsigned int extra_headroom,
+ 			      bool has_80211_header);
++int __ieee80211_amsdu_to_8023s(struct sk_buff *skb, struct sk_buff_head *list,
++			       const u8 *addr, enum nl80211_iftype iftype,
++			       const unsigned int extra_headroom,
++			       bool has_80211_header);
+ 
+ /**
+  * cfg80211_classify8021d - determine the 802.1p/1d tag for a data frame
+--- a/net/mac80211/rx.c
++++ b/net/mac80211/rx.c
+@@ -1799,9 +1799,10 @@ ieee80211_rx_h_amsdu(struct ieee80211_rx
+ 	if (skb_linearize(skb))
+ 		return RX_DROP_UNUSABLE;
+ 
+-	ieee80211_amsdu_to_8023s(skb, &frame_list, dev->dev_addr,
+-				 rx->sdata->vif.type,
+-				 rx->local->hw.extra_tx_headroom, true);
++	if (__ieee80211_amsdu_to_8023s(skb, &frame_list, dev->dev_addr,
++				       rx->sdata->vif.type,
++				       rx->local->hw.extra_tx_headroom, true))
++		return RX_DROP_UNUSABLE;
+ 
+ 	while (!skb_queue_empty(&frame_list)) {
+ 		rx->skb = __skb_dequeue(&frame_list);
+--- a/net/wireless/util.c
++++ b/net/wireless/util.c
+@@ -357,8 +357,8 @@ static int ieee80211_get_mesh_hdrlen(str
+ 	}
+ }
+ 
+-int ieee80211_data_to_8023(struct sk_buff *skb, const u8 *addr,
+-			   enum nl80211_iftype iftype)
++static int __ieee80211_data_to_8023(struct sk_buff *skb, const u8 *addr,
++				    enum nl80211_iftype iftype, bool is_amsdu)
+ {
+ 	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *) skb->data;
+ 	u16 hdrlen, ethertype;
+@@ -450,7 +450,7 @@ int ieee80211_data_to_8023(struct sk_buf
+ 	payload = skb->data + hdrlen;
+ 	ethertype = (payload[6] << 8) | payload[7];
+ 
+-	if (likely((compare_ether_addr(payload, rfc1042_header) == 0 &&
++	if (likely((!is_amsdu && compare_ether_addr(payload, rfc1042_header) == 0 &&
+ 		    ethertype != ETH_P_AARP && ethertype != ETH_P_IPX) ||
+ 		   compare_ether_addr(payload, bridge_tunnel_header) == 0)) {
+ 		/* remove RFC1042 or Bridge-Tunnel encapsulation and
+@@ -471,8 +471,21 @@ int ieee80211_data_to_8023(struct sk_buf
+ 	}
+ 	return 0;
+ }
++
++int ieee80211_data_to_8023(struct sk_buff *skb, const u8 *addr,
++			   enum nl80211_iftype iftype)
++{
++	return __ieee80211_data_to_8023(skb, addr, iftype, false);
++}
+ EXPORT_SYMBOL(ieee80211_data_to_8023);
+ 
++int ieee80211_data_to_8023_amsdu(struct sk_buff *skb, const u8 *addr,
++				 enum nl80211_iftype iftype)
++{
++	return __ieee80211_data_to_8023(skb, addr, iftype, true);
++}
++EXPORT_SYMBOL(ieee80211_data_to_8023_amsdu);
++
+ int ieee80211_data_from_8023(struct sk_buff *skb, const u8 *addr,
+ 			     enum nl80211_iftype iftype, u8 *bssid, bool qos)
+ {
+@@ -589,8 +602,7 @@ int ieee80211_data_from_8023(struct sk_b
+ }
+ EXPORT_SYMBOL(ieee80211_data_from_8023);
+ 
+-
+-void ieee80211_amsdu_to_8023s(struct sk_buff *skb, struct sk_buff_head *list,
++int __ieee80211_amsdu_to_8023s(struct sk_buff *skb, struct sk_buff_head *list,
+ 			      const u8 *addr, enum nl80211_iftype iftype,
+ 			      const unsigned int extra_headroom,
+ 			      bool has_80211_header)
+@@ -603,7 +615,7 @@ void ieee80211_amsdu_to_8023s(struct sk_
+ 	u8 dst[ETH_ALEN], src[ETH_ALEN];
+ 
+ 	if (has_80211_header) {
+-		err = ieee80211_data_to_8023(skb, addr, iftype);
++		err = ieee80211_data_to_8023_amsdu(skb, addr, iftype);
+ 		if (err)
+ 			goto out;
+ 
+@@ -680,12 +692,23 @@ void ieee80211_amsdu_to_8023s(struct sk_
+ 		__skb_queue_tail(list, frame);
+ 	}
+ 
+-	return;
++	return 0;
+ 
+  purge:
+ 	__skb_queue_purge(list);
+  out:
+ 	dev_kfree_skb(skb);
++	return -1;
++}
++EXPORT_SYMBOL(__ieee80211_amsdu_to_8023s);
++
++void ieee80211_amsdu_to_8023s(struct sk_buff *skb, struct sk_buff_head *list,
++			      const u8 *addr, enum nl80211_iftype iftype,
++			      const unsigned int extra_headroom,
++			      bool has_80211_header)
++{
++	__ieee80211_amsdu_to_8023s(skb, list, addr, iftype, extra_headroom,
++				   has_80211_header);
+ }
+ EXPORT_SYMBOL(ieee80211_amsdu_to_8023s);
+ 
