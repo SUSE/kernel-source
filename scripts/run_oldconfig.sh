@@ -97,8 +97,8 @@ set_var()
 		fi
 		sed -i "/\\<$name[ =]/d" "${prefix}config/$config"
 		case "$val" in
-		y | m) echo "$name=$val" ;;
 		n) echo "# $name is not set" ;;
+		*) echo "$name=$val" ;;
 		esac >> ${prefix}config/$config
 	done
 }
@@ -159,6 +159,12 @@ until [ "$#" = "0" ] ; do
 		value=n
 		shift 2
 		;;
+	-nco|--new-config-option)
+		mode=single
+		option="${2%%=*}"
+		value="${2#*=}"
+		shift 2
+		;;
 	--flavor)
 		set_flavor="$2"
 		shift 2
@@ -212,6 +218,11 @@ FOO
 FOO=X
 CONFIG_FOO
 CONFIG_FOO=X
+run with the following to modify option taking a value:
+	-nco|--new-config-option OPTION=VALUE
+as above, OPTION can be used with or without the CONFIG_ prefix; for string
+options requiring double quotes, these must be used in argument (and shell
+escaped)
 
 Run with -s|--silent in both modes to suppress most output
 EOF
@@ -362,7 +373,7 @@ ask_reuse_config()
 
 filter_config()
 {
-    sed  -e '/CONFIG_GCC_VERSION/ d' -e '/CONFIG_LD_VERSION/ d' -e '/^# .* is not set$/p' -e '/^$\|^#/d' "$@" | sort
+    sed  -e '/CONFIG_GCC_VERSION/ d' -e '/CONFIG_LD_VERSION/ d' -e '/CONFIG_CC_VERSION_TEXT/ d' -e '/^# .* is not set$/p' -e '/^$\|^#/d' "$@" | sort
 }
 
 # Keep these in the -vanilla fragment even if -default has the same values.
@@ -410,43 +421,12 @@ for config in $config_files; do
         MAKE_ARGS="ARCH=$cpu_arch"
         ;;
     esac
-    unset cross_arch
-    unset cross_extra
-    case $config in
-    arm64/*)
-	cross_arch="aarch64"
-	;;
-    arm*/*)
-	cross_arch="arm"
-        cross_extra="gnueabi-"
-	;;
-    ppc64le/*)
-	cross_arch="powerpc64le"
-	;;
-    ppc64/*)
-	cross_arch="powerpc64"
-	;;
-    ppc/*)
-        cross_arch="powerpc"
-	;;
-    i386/*)
-	# hack: whatever i386-suse-linux-gcc is, it does not support asm-goto
-	cross_arch="x86_64"
-	;;
-    *)
-        cross_arch="${config%%/*}"
-	;;
-    esac
-    [ "$cross_arch" = "$(uname -m)" ] && cross_arch=
-    cross_compile="${CROSS_COMPILE-${cross_arch}-suse-linux-${cross_extra}}"
-    if [ -n "$cross_arch" -a -x /usr/bin/${cross_compile}gcc ]; then
-	MAKE_ARGS="$MAKE_ARGS CROSS_COMPILE=$cross_compile"
-    fi
-    if [ -n "$CC" -a -z "$cross_arch" ]; then
-        MAKE_ARGS="$MAKE_ARGS CC=$CC"
+    if [ -d scripts/dummy-tools ] ; then
+	MAKE_ARGS="$MAKE_ARGS CROSS_COMPILE=scripts/dummy-tools/"
+	chmod 755 scripts/dummy-tools/*
     fi
     if $silent; then
-	    MAKE_ARGS="$MAKE_ARGS -s"
+	MAKE_ARGS="$MAKE_ARGS -s"
     fi
     config="${prefix}config/$config"
     config_orig="config-orig"
