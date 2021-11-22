@@ -368,12 +368,7 @@ Patch-mainline: No, handled differently upstream
 References: bsc#12345
 Acked-by: developer@suse.com
 """
-        with self.assertRaises(header.HeaderException) as cm:
-            self.header = header.Checker(text)
-
-        e = cm.exception
-        self.assertEqual(1, e.errors(header.FormatError))
-        self.assertEqual(1, e.errors())
+        self.header = header.Checker(text)
 
     def test_patch_mainline_not_yet_detail(self):
         text = """
