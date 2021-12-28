@@ -207,7 +207,7 @@ remotes = (
     Head(RepoURL("tytso/ext4.git"), "dev"),
     Head(RepoURL("s390/linux.git"), "fixes"),
     Head(RepoURL("https://github.com/kdave/btrfs-devel.git"), "misc-next"),
-    Head(RepoURL("git://people.freedesktop.org/~airlied/linux"), "drm-next"),
+    Head(RepoURL("git://anongit.freedesktop.org/drm/drm"), "drm-next"),
     Head(RepoURL("git://anongit.freedesktop.org/drm/drm-misc"), "drm-misc-next"),
     Head(RepoURL("gregkh/tty.git"), "tty-next"),
     Head(RepoURL("jj/linux-apparmor.git"), "apparmor-next"),
@@ -239,6 +239,7 @@ remotes = (
     Head(RepoURL("herbert/crypto-2.6.git"), "master"),
     Head(RepoURL("rafael/linux-pm.git")),
     Head(RepoURL("git://git.linux-nfs.org/~bfields/linux.git"), "nfsd-next"),
+    Head(RepoURL("git://git.kernel.org/pub/scm/linux/kernel/git/cel/linux.git"), "for-next"),
     Head(RepoURL("vkoul/soundwire.git"),"fixes"),
     Head(RepoURL("vkoul/soundwire.git"),"next"),
     Head(RepoURL("arm64/linux.git"), "for-next/core"),
@@ -254,6 +255,8 @@ remotes = (
     Head(RepoURL("bluetooth/bluetooth-next.git")),
     Head(RepoURL("clk/linux.git"), "clk-next"),
     Head(RepoURL("git://github.com/ceph/ceph-client"), "testing"),
+    Head(RepoURL("bpf/bpf.git")),
+    Head(RepoURL("linusw/linux-gpio.git"), "for-next"),
 )
 
 
