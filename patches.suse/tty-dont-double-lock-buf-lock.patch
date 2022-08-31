@@ -1,0 +1,179 @@
+From: Jiri Slaby <jslaby@suse.cz>
+Subject: tty: tty don't double lock buf.lock
+Patch-mainline: never, < 3.12 only
+References: bsc#1198829 CVE-2022-1462
+
+The previous patch "tty: extract tty_flip_buffer_commit() from
+tty_flip_buffer_push()" (716b10580283) introduced an A-A deadlock in
+3.0:
+  =============================================
+  [ INFO: possible recursive locking detected ]
+  3.0.101-default #2
+  ---------------------------------------------
+  bash/1559 is trying to acquire lock:
+   (&(&tty->buf.lock)->rlock){-.-...}, at: [<ffffffff81392256>] tty_buffer_request_room+0x26/0x1b0
+ 
+  but task is already holding lock:
+   (&(&tty->buf.lock)->rlock){-.-...}, at: [<ffffffff81392a89>] tty_insert_flip_string_and_push_buffer+0x29/0xa0
+ 
+  other info that might help us debug this:
+   Possible unsafe locking scenario:
+ 
+         CPU0
+         ----
+    lock(&(&tty->buf.lock)->rlock);
+    lock(&(&tty->buf.lock)->rlock);
+ 
+   *** DEADLOCK ***
+ 
+   May be due to missing lock nesting notation
+ 
+  3 locks held by bash/1559:
+   #0:  (&tty->atomic_write_lock){+.+.+.}, at: [<ffffffff81389a29>] tty_write_lock+0x19/0x50
+   #1:  (&tty->output_lock){+.+...}, at: [<ffffffff8138d7fa>] n_tty_write+0x14a/0x4b0
+   #2:  (&(&tty->buf.lock)->rlock){-.-...}, at: [<ffffffff81392a89>] tty_insert_flip_string_and_push_buffer+0x29/0xa0
+ 
+  stack backtrace:
+  Pid: 1559, comm: bash Tainted: G            N  3.0.101-default #2
+  Call Trace:
+   [<ffffffff81005d81>] try_stack_unwind+0x1a1/0x1b0
+   [<ffffffff81004674>] dump_trace+0x84/0x430
+   [<ffffffff81005ddc>] show_trace_log_lvl+0x4c/0x60
+   [<ffffffff815ebebc>] dump_stack+0x79/0x82
+   [<ffffffff8109fc47>] __lock_acquire+0x1447/0x18d0
+   [<ffffffff810a0849>] lock_acquire+0x99/0x120
+   [<ffffffff815fad64>] _raw_spin_lock_irqsave+0x44/0x60
+   [<ffffffff81392256>] tty_buffer_request_room+0x26/0x1b0
+   [<ffffffff81392527>] tty_insert_flip_string_fixed_flag+0x47/0xb0
+   [<ffffffff81392a9c>] tty_insert_flip_string_and_push_buffer+0x3c/0xa0
+   [<ffffffff81393a2f>] pty_write+0x2f/0x40
+   [<ffffffff8138d893>] n_tty_write+0x1e3/0x4b0
+   [<ffffffff81389bb3>] tty_write+0x153/0x2e0
+   [<ffffffff8116834d>] vfs_write+0x9d/0x170
+   [<ffffffff811686ae>] sys_write+0x3e/0x90
+==================
+
+It is because it depends on lockless tty buffers. Those were introduced
+only in 3.12.
+
+The fix for this in 3.0 is fairly trivial. It simply propagates a locked
+parameter and locks buf.lock only from paths *not* coming from
+tty_insert_flip_string_and_push_buffer() which already holds the lock.
+
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/tty/tty_buffer.c |   64 ++++++++++++++++++++++++++++-------------------
+ 1 file changed, 39 insertions(+), 25 deletions(-)
+
+--- a/drivers/tty/tty_buffer.c
++++ b/drivers/tty/tty_buffer.c
+@@ -189,23 +189,14 @@ static struct tty_buffer *tty_buffer_fin
+ 	   have queued and recycle that ? */
+ }
+ 
+-/**
+- *	tty_buffer_request_room		-	grow tty buffer if needed
+- *	@tty: tty structure
+- *	@size: size desired
+- *
+- *	Make at least size bytes of linear space available for the tty
+- *	buffer. If we fail return the size we managed to find.
+- *
+- *	Locking: Takes tty->buf.lock
+- */
+-int tty_buffer_request_room(struct tty_struct *tty, size_t size)
++int __tty_buffer_request_room(struct tty_struct *tty, size_t size, bool locked)
+ {
+ 	struct tty_buffer *b, *n;
+ 	int left;
+ 	unsigned long flags;
+ 
+-	spin_lock_irqsave(&tty->buf.lock, flags);
++	if (!locked)
++		spin_lock_irqsave(&tty->buf.lock, flags);
+ 
+ 	/* OPTIMISATION: We could keep a per tty "zero" sized buffer to
+ 	   remove this conditional if its worth it. This would be invisible
+@@ -228,31 +219,34 @@ int tty_buffer_request_room(struct tty_s
+ 			size = left;
+ 	}
+ 
+-	spin_unlock_irqrestore(&tty->buf.lock, flags);
++	if (!locked)
++		spin_unlock_irqrestore(&tty->buf.lock, flags);
+ 	return size;
+ }
+-EXPORT_SYMBOL_GPL(tty_buffer_request_room);
+ 
+ /**
+- *	tty_insert_flip_string_fixed_flag - Add characters to the tty buffer
++ *	tty_buffer_request_room		-	grow tty buffer if needed
+  *	@tty: tty structure
+- *	@chars: characters
+- *	@flag: flag value for each character
+- *	@size: size
++ *	@size: size desired
+  *
+- *	Queue a series of bytes to the tty buffering. All the characters
+- *	passed are marked with the supplied flag. Returns the number added.
++ *	Make at least size bytes of linear space available for the tty
++ *	buffer. If we fail return the size we managed to find.
+  *
+- *	Locking: Called functions may take tty->buf.lock
++ *	Locking: Takes tty->buf.lock
+  */
++int tty_buffer_request_room(struct tty_struct *tty, size_t size)
++{
++	return __tty_buffer_request_room(tty, size, false);
++}
++EXPORT_SYMBOL_GPL(tty_buffer_request_room);
+ 
+-int tty_insert_flip_string_fixed_flag(struct tty_struct *tty,
+-		const unsigned char *chars, char flag, size_t size)
++int __tty_insert_flip_string_fixed_flag(struct tty_struct *tty,
++		const unsigned char *chars, char flag, size_t size, bool locked)
+ {
+ 	int copied = 0;
+ 	do {
+ 		int goal = min_t(size_t, size - copied, TTY_BUFFER_PAGE);
+-		int space = tty_buffer_request_room(tty, goal);
++		int space = __tty_buffer_request_room(tty, goal, locked);
+ 		struct tty_buffer *tb = tty->buf.tail;
+ 		/* If there is no space then tb may be NULL */
+ 		if (unlikely(space == 0))
+@@ -267,6 +261,25 @@ int tty_insert_flip_string_fixed_flag(st
+ 	} while (unlikely(size > copied));
+ 	return copied;
+ }
++
++/**
++ *	tty_insert_flip_string_fixed_flag - Add characters to the tty buffer
++ *	@tty: tty structure
++ *	@chars: characters
++ *	@flag: flag value for each character
++ *	@size: size
++ *
++ *	Queue a series of bytes to the tty buffering. All the characters
++ *	passed are marked with the supplied flag. Returns the number added.
++ *
++ *	Locking: Called functions may take tty->buf.lock
++ */
++int tty_insert_flip_string_fixed_flag(struct tty_struct *tty,
++		const unsigned char *chars, char flag, size_t size)
++{
++	return __tty_insert_flip_string_fixed_flag(tty, chars, flag, size,
++			false);
++}
+ EXPORT_SYMBOL(tty_insert_flip_string_fixed_flag);
+ 
+ /**
+@@ -527,7 +540,8 @@ int tty_insert_flip_string_and_push_buff
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&tty->buf.lock, flags);
+-	size = tty_insert_flip_string(tty, chars, size);
++	size = __tty_insert_flip_string_fixed_flag(tty, chars, TTY_NORMAL,
++			size, true);
+ 	if (size)
+ 		tty_flip_buffer_commit(tty->buf.tail);
+ 	spin_unlock_irqrestore(&tty->buf.lock, flags);
