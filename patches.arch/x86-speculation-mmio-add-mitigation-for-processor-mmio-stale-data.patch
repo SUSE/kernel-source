@@ -1,0 +1,208 @@
+From: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+Date: Thu, 19 May 2022 20:29:11 -0700
+Subject: x86/speculation/mmio: Add mitigation for Processor MMIO Stale Data
+Git-commit: 8cb861e9e3c9a55099ad3d08e1a3b653d29c33ca
+Patch-mainline: v5.19-rc3
+References: bsc#1199650 CVE-2022-21166 CVE-2022-21127 CVE-2022-21123 CVE-2022-21125 CVE-2022-21180
+
+Processor MMIO Stale Data is a class of vulnerabilities that may
+expose data after an MMIO operation. For details please refer to
+Documentation/admin-guide/hw-vuln/processor_mmio_stale_data.rst.
+
+These vulnerabilities are broadly categorized as:
+
+Device Register Partial Write (DRPW):
+  Some endpoint MMIO registers incorrectly handle writes that are
+  smaller than the register size. Instead of aborting the write or only
+  copying the correct subset of bytes (for example, 2 bytes for a 2-byte
+  write), more bytes than specified by the write transaction may be
+  written to the register. On some processors, this may expose stale
+  data from the fill buffers of the core that created the write
+  transaction.
+
+Shared Buffers Data Sampling (SBDS):
+  After propagators may have moved data around the uncore and copied
+  stale data into client core fill buffers, processors affected by MFBDS
+  can leak data from the fill buffer.
+
+Shared Buffers Data Read (SBDR):
+  It is similar to Shared Buffer Data Sampling (SBDS) except that the
+  data is directly read into the architectural software-visible state.
+
+An attacker can use these vulnerabilities to extract data from CPU fill
+buffers using MDS and TAA methods. Mitigate it by clearing the CPU fill
+buffers using the VERW instruction before returning to a user or a
+guest.
+
+On CPUs not affected by MDS and TAA, user application cannot sample data
+from CPU fill buffers using MDS or TAA. A guest with MMIO access can
+still use DRPW or SBDR to extract data architecturally. Mitigate it with
+VERW instruction to clear fill buffers before VMENTER for MMIO capable
+guests.
+
+Add a kernel parameter mmio_stale_data={off|full|full,nosmt} to control
+the mitigation.
+
+Signed-off-by: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+Signed-off-by: Borislav Petkov <bp@suse.de>
+---
+ arch/x86/kernel/cpu/bugs.c |  107 +++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 103 insertions(+), 4 deletions(-)
+
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@ -194,6 +194,7 @@ static void __init l1tf_select_mitigatio
+ static void __init mds_select_mitigation(void);
+ static void __init md_clear_update_mitigation(void);
+ static void __init taa_select_mitigation(void);
++static void __init mmio_select_mitigation(void);
+ static void __init srbds_select_mitigation(void);
+ 
+ /* The base value of the SPEC_CTRL MSR that always has to be preserved. */
+@@ -213,6 +214,10 @@ static u64 x86_spec_ctrl_mask = ~SPEC_CT
+ u64 x86_amd_ls_cfg_base;
+ u64 x86_amd_ls_cfg_ssbd_mask;
+ 
++/* Controls CPU Fill buffer clear before KVM guest MMIO accesses */
++bool mmio_stale_data_clear;
++EXPORT_SYMBOL_GPL(mmio_stale_data_clear);
++
+ void __init check_bugs(void)
+ {
+ #ifdef CONFIG_X86_32
+@@ -252,10 +257,12 @@ void __init check_bugs(void)
+ 
+ 	mds_select_mitigation();
+ 	taa_select_mitigation();
++	mmio_select_mitigation();
+ 
+ 	/*
+-	 * As MDS and TAA mitigations are inter-related, update and print their
+-	 * mitigation after TAA mitigation selection is done.
++	 * As MDS, TAA and MMIO Stale Data mitigations are inter-related, update
++	 * and print their mitigation after MDS, TAA and MMIO Stale Data
++	 * mitigation selection is done.
+ 	 */
+ 	md_clear_update_mitigation();
+ 
+@@ -477,6 +484,88 @@ early_param("tsx_async_abort", tsx_async
+ static bool x86_bug_mmio;
+ 
+ #undef pr_fmt
++#define pr_fmt(fmt)	"MMIO Stale Data: " fmt
++
++enum mmio_mitigations {
++	MMIO_MITIGATION_OFF,
++	MMIO_MITIGATION_UCODE_NEEDED,
++	MMIO_MITIGATION_VERW,
++};
++
++/* Default mitigation for Processor MMIO Stale Data vulnerabilities */
++static enum mmio_mitigations mmio_mitigation = MMIO_MITIGATION_VERW;
++static bool mmio_nosmt = false;
++
++static const char * const mmio_strings[] = {
++	[MMIO_MITIGATION_OFF]		= "Vulnerable",
++	[MMIO_MITIGATION_UCODE_NEEDED]	= "Vulnerable: Clear CPU buffers attempted, no microcode",
++	[MMIO_MITIGATION_VERW]		= "Mitigation: Clear CPU buffers",
++};
++
++static void __init mmio_select_mitigation(void)
++{
++	u64 ia32_cap;
++
++	if (!x86_bug_mmio || cpu_mitigations_off()) {
++		mmio_mitigation = MMIO_MITIGATION_OFF;
++		return;
++	}
++
++	if (mmio_mitigation == MMIO_MITIGATION_OFF)
++		return;
++
++	ia32_cap = x86_read_arch_cap_msr();
++
++	/*
++	 * Enable CPU buffer clear mitigation for host and VMM, if also affected
++	 * by MDS or TAA. Otherwise, enable mitigation for VMM only.
++	 */
++	if (x86_bug_mds || (x86_bug_taa && boot_cpu_has(X86_FEATURE_RTM)))
++		mds_user_clear = true;
++	else
++		mmio_stale_data_clear = true;
++
++	/*
++	 * Check if the system has the right microcode.
++	 *
++	 * CPU Fill buffer clear mitigation is enumerated by either an explicit
++	 * FB_CLEAR or by the presence of both MD_CLEAR and L1D_FLUSH on MDS
++	 * affected systems.
++	 */
++	if ((ia32_cap & ARCH_CAP_FB_CLEAR) ||
++	    (boot_cpu_has(X86_FEATURE_MD_CLEAR) &&
++	     boot_cpu_has(X86_FEATURE_FLUSH_L1D) &&
++	     !(ia32_cap & ARCH_CAP_MDS_NO)))
++		mmio_mitigation = MMIO_MITIGATION_VERW;
++	else
++		mmio_mitigation = MMIO_MITIGATION_UCODE_NEEDED;
++
++	if (mmio_nosmt || cpu_mitigations_auto_nosmt())
++		cpu_smt_disable(false);
++}
++
++static int __init mmio_stale_data_parse_cmdline(char *str)
++{
++	if (!x86_bug_mmio)
++		return 0;
++
++	if (!str)
++		return -EINVAL;
++
++	if (!strcmp(str, "off")) {
++		mmio_mitigation = MMIO_MITIGATION_OFF;
++	} else if (!strcmp(str, "full")) {
++		mmio_mitigation = MMIO_MITIGATION_VERW;
++	} else if (!strcmp(str, "full,nosmt")) {
++		mmio_mitigation = MMIO_MITIGATION_VERW;
++		mmio_nosmt = true;
++	}
++
++	return 0;
++}
++early_param("mmio_stale_data", mmio_stale_data_parse_cmdline);
++
++#undef pr_fmt
+ #define pr_fmt(fmt)     "" fmt
+ 
+ static void __init md_clear_update_mitigation(void)
+@@ -488,19 +577,29 @@ static void __init md_clear_update_mitig
+ 		goto out;
+ 
+ 	/*
+-	 * mds_user_clear is now enabled. Update MDS mitigation, if
+-	 * necessary.
++	 * mds_user_clear is now enabled. Update MDS, TAA and MMIO Stale Data
++	 * mitigation, if necessary.
+ 	 */
+ 	if (mds_mitigation == MDS_MITIGATION_OFF &&
+ 	    x86_bug_mds) {
+ 		mds_mitigation = MDS_MITIGATION_FULL;
+ 		mds_select_mitigation();
+ 	}
++	if (taa_mitigation == TAA_MITIGATION_OFF && x86_bug_taa) {
++		taa_mitigation = TAA_MITIGATION_VERW;
++		taa_select_mitigation();
++	}
++	if (mmio_mitigation == MMIO_MITIGATION_OFF && x86_bug_mmio) {
++		mmio_mitigation = MMIO_MITIGATION_VERW;
++		mmio_select_mitigation();
++	}
+ out:
+ 	if (x86_bug_mds)
+ 		pr_info("MDS: %s\n", mds_strings[mds_mitigation]);
+ 	if (x86_bug_taa)
+ 		pr_info("TAA: %s\n", taa_strings[taa_mitigation]);
++	if (x86_bug_mmio)
++		pr_info("MMIO Stale Data: %s\n", mmio_strings[mmio_mitigation]);
+ }
+ 
+ static bool x86_bug_srbds;
