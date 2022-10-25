@@ -1,0 +1,120 @@
+From: Vlad Buslov <vladbu@mellanox.com>
+Date: Mon, 24 Sep 2018 19:22:51 +0300
+Subject: net: sched: extend Qdisc with rcu
+Patch-mainline: v4.20-rc1
+Git-commit: 3a7d0d07a386716b459b00783b11a8211cefcc0f
+References: bsc#1196973 CVE-2021-39713
+
+Currently, Qdisc API functions assume that users have rtnl lock taken. To
+implement rtnl unlocked classifiers update interface, Qdisc API must be
+extended with functions that do not require rtnl lock.
+
+Extend Qdisc structure with rcu. Implement special version of put function
+qdisc_put_unlocked() that is called without rtnl lock taken. This function
+only takes rtnl lock if Qdisc reference counter reached zero and is
+intended to be used as optimization.
+
+SUSE: For SLE versions which don't have 752fbcc33405 ("net_sched: no need
+      to free qdisc in RCU callback") backported, there is still rcu_head
+      in struct Qdisc available. So this backport doesn't contain the
+      struct rcu_head rcu; addition to struct Qdisc (and doesn't break
+      KABI that way).
+
+Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+Acked-by: Jiri Pirko <jiri@mellanox.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/linux/rtnetlink.h |    5 +++++
+ include/net/pkt_sched.h   |    1 +
+ include/net/sch_generic.h |    1 +
+ net/sched/sch_api.c       |   18 ++++++++++++++++++
+ net/sched/sch_generic.c   |   16 ++++++++++++++++
+ 5 files changed, 41 insertions(+)
+
+--- a/include/linux/rtnetlink.h
++++ b/include/linux/rtnetlink.h
+@@ -781,6 +781,11 @@ static inline struct netdev_queue *dev_i
+ 	return rtnl_dereference(dev->ingress_queue);
+ }
+ 
++static inline struct netdev_queue *dev_ingress_queue_rcu(struct net_device *dev)
++{
++	return rcu_dereference(dev->ingress_queue);
++}
++
+ extern struct netdev_queue *dev_ingress_queue_create(struct net_device *dev);
+ 
+ extern void rtnetlink_init(void);
+--- a/include/net/pkt_sched.h
++++ b/include/net/pkt_sched.h
+@@ -82,6 +82,7 @@ extern int unregister_qdisc(struct Qdisc
+ extern void qdisc_list_del(struct Qdisc *q);
+ extern struct Qdisc *qdisc_lookup(struct net_device *dev, u32 handle);
+ extern struct Qdisc *qdisc_lookup_class(struct net_device *dev, u32 handle);
++extern struct Qdisc *qdisc_lookup_rcu(struct net_device *dev, u32 handle);
+ extern struct qdisc_rate_table *qdisc_get_rtab(struct tc_ratespec *r,
+ 		struct nlattr *tab);
+ extern void qdisc_put_rtab(struct qdisc_rate_table *tab);
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@ -357,6 +357,7 @@ extern struct Qdisc *dev_graft_qdisc(str
+ extern void qdisc_reset(struct Qdisc *qdisc);
+ extern void qdisc_destroy(struct Qdisc *qdisc);
+ extern void qdisc_put(struct Qdisc *qdisc);
++extern void qdisc_put_unlocked(struct Qdisc *qdisc);
+ extern void qdisc_tree_decrease_qlen(struct Qdisc *qdisc, unsigned int n);
+ extern struct Qdisc *qdisc_alloc(struct netdev_queue *dev_queue,
+ 				 struct Qdisc_ops *ops);
+--- a/net/sched/sch_api.c
++++ b/net/sched/sch_api.c
+@@ -248,6 +248,24 @@ out:
+ 	return q;
+ }
+ 
++struct Qdisc *qdisc_lookup_rcu(struct net_device *dev, u32 handle)
++{
++	struct netdev_queue *nq;
++	struct Qdisc *q;
++
++	if (!handle)
++		return NULL;
++	q = qdisc_match_from_root(dev->qdisc, handle);
++	if (q)
++		goto out;
++
++	nq = dev_ingress_queue_rcu(dev);
++	if (nq)
++		q = qdisc_match_from_root(nq->qdisc_sleeping, handle);
++out:
++	return q;
++}
++
+ static struct Qdisc *qdisc_leaf(struct Qdisc *p, u32 classid)
+ {
+ 	unsigned long cl;
+--- a/net/sched/sch_generic.c
++++ b/net/sched/sch_generic.c
+@@ -669,6 +669,22 @@ void qdisc_destroy(struct Qdisc *qdisc)
+ }
+ EXPORT_SYMBOL(qdisc_destroy);
+ 
++/* Version of qdisc_put() that is called with rtnl mutex unlocked.
++ * Intended to be used as optimization, this function only takes rtnl lock if
++ * qdisc reference counter reached zero.
++ */
++
++void qdisc_put_unlocked(struct Qdisc *qdisc)
++{
++	if (qdisc->flags & TCQ_F_BUILTIN ||
++	    !atomic_dec_and_rtnl_lock(&qdisc->refcnt))
++		return;
++
++	qdisc_destroy_internal(qdisc);
++	rtnl_unlock();
++}
++EXPORT_SYMBOL(qdisc_put_unlocked);
++
+ /* Attach toplevel qdisc to device queue. */
+ struct Qdisc *dev_graft_qdisc(struct netdev_queue *dev_queue,
+ 			      struct Qdisc *qdisc)

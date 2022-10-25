@@ -1,5 +1,5 @@
-#!/usr/bin/python
-# -*- coding: utf-8 -*-,
+#!/usr/bin/env python3
+# vim: sw=4 ts=4 et si:
 
 import sys
 import re
@@ -56,6 +56,11 @@ tag_map = {
                 # a date and a mailing list or a URL to an archived post.
                 'name' : 'Submitted',
                 'match' : 'Submitted,?\s+.+',
+                'excludes' : [ 'Git-commit', 'Git-repo' ],
+            }, {
+                # Catch a frequent misuse of 'Not yet'.
+                'match' : 'Not yet,\s+submitted',
+                'error' : "Please use 'Submitted'",
                 'excludes' : [ 'Git-commit', 'Git-repo' ],
             }, {
                 # Should be used rarely.  Description should provide
@@ -330,7 +335,7 @@ class HeaderChecker(patch.PatchChecker):
             target[tag].append(new_req)
 
     def do_patch(self):
-        for line in self.stream:
+        for line in self.stream.readlines():
             if diffstart.match(line):
                 break
 
