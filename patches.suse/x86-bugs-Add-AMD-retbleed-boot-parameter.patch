@@ -1,0 +1,187 @@
+From: Alexandre Chartre <alexandre.chartre@oracle.com>
+Date: Tue, 14 Jun 2022 23:15:50 +0200
+Subject: x86/bugs: Add AMD retbleed= boot parameter
+Git-commit: 7fbf47c7ce50b38a64576b150e7011ae73d54669
+Patch-mainline: v5.19-rc5
+References: bsc#1199657 CVE-2022-29900 CVE-2022-29901 bsc#1203271
+
+Add the "retbleed=<value>" boot parameter to select a mitigation for
+RETBleed. Possible values are "off", "auto" and "unret"
+(JMP2RET mitigation). The default value is "auto".
+
+Currently, "retbleed=auto" will select the unret mitigation on
+AMD and Hygon and no mitigation on Intel (JMP2RET is not effective on
+Intel).
+
+  [peterz: rebase; add hygon]
+  [jpoimboe: cleanups]
+
+Signed-off-by: Alexandre Chartre <alexandre.chartre@oracle.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Reviewed-by: Josh Poimboeuf <jpoimboe@kernel.org>
+[ Enable CC_HAS_RETURN_THUNK unconditionally as our compilers support it. ]
+Signed-off-by: Borislav Petkov <bp@suse.de>
+---
+ Documentation/kernel-parameters.txt |   14 +++++
+ arch/x86/Kconfig                    |    3 +
+ arch/x86/kernel/cpu/bugs.c          |   92 +++++++++++++++++++++++++++++++++++-
+ 3 files changed, 108 insertions(+), 1 deletion(-)
+
+--- a/Documentation/kernel-parameters.txt
++++ b/Documentation/kernel-parameters.txt
+@@ -2533,6 +2533,20 @@ bytes respectively. Such letter suffixes
+ 
+ 	retain_initrd	[RAM] Keep initrd memory after extraction
+ 
++	retbleed=	[X86] Control mitigation of RETBleed (Arbitrary
++			Speculative Code Execution with Return Instructions)
++			vulnerability.
++
++			auto        - automatically select a migitation
++			unret       - force enable untrained return thunks,
++				      only effective on AMD Zen {1,2}
++				      based systems.
++
++			Selecting 'auto' will choose a mitigation method at run
++			time according to the CPU.
++
++			Not specifying this option is equivalent to retbleed=auto.
++
+ 	rhash_entries=	[KNL,NET]
+ 			Set number of hash buckets for route cache
+ 
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -331,6 +331,9 @@ config SLS
+ 	  against straight line speculation. The kernel image might be slightly
+ 	  larger.
+ 
++config CC_HAS_RETURN_THUNK
++	bool
++
+ if X86_32
+ config X86_EXTENDED_PLATFORM
+ 	bool "Support for extended (non-PC) x86 platforms"
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@ -187,6 +187,7 @@ static void __init check_config(void)
+ #endif /* CONFIG_X86_32 */
+ 
+ static void __init spectre_v1_select_mitigation(void);
++static void __init retbleed_select_mitigation(void);
+ static void __init spectre_v2_select_mitigation(void);
+ void ssb_select_mitigation(void);
+ static void x86_amd_ssbd_disable(void);
+@@ -245,6 +246,12 @@ void __init check_bugs(void)
+ 
+ 	/* Select the proper CPU mitigations before patching alternatives: */
+ 	spectre_v1_select_mitigation();
++	retbleed_select_mitigation();
++	/*
++	 * spectre_v2_select_mitigation() relies on the state set by
++	 * retbleed_select_mitigation(); specifically the STIBP selection is
++	 * forced for UNRET.
++	 */
+ 	spectre_v2_select_mitigation();
+ 
+ 	l1tf_select_mitigation();
+@@ -698,6 +705,85 @@ static int __init nospectre_v1_cmdline(c
+ early_param("nospectre_v1", nospectre_v1_cmdline);
+ 
+ #undef pr_fmt
++#define pr_fmt(fmt)     "RETBleed: " fmt
++
++enum retbleed_mitigation {
++	RETBLEED_MITIGATION_NONE,
++	RETBLEED_MITIGATION_UNRET,
++};
++
++enum retbleed_mitigation_cmd {
++	RETBLEED_CMD_OFF,
++	RETBLEED_CMD_AUTO,
++	RETBLEED_CMD_UNRET,
++};
++
++const char * const retbleed_strings[] = {
++	[RETBLEED_MITIGATION_NONE]	= "Vulnerable",
++	[RETBLEED_MITIGATION_UNRET]	= "Mitigation: untrained return thunk",
++};
++
++static enum retbleed_mitigation retbleed_mitigation = RETBLEED_MITIGATION_NONE;
++static enum retbleed_mitigation_cmd retbleed_cmd = RETBLEED_CMD_AUTO;
++
++static int __init retbleed_parse_cmdline(char *str)
++{
++	if (!str)
++		return -EINVAL;
++
++	if (!strcmp(str, "off"))
++		retbleed_cmd = RETBLEED_CMD_OFF;
++	else if (!strcmp(str, "auto"))
++		retbleed_cmd = RETBLEED_CMD_AUTO;
++	else if (!strcmp(str, "unret"))
++		retbleed_cmd = RETBLEED_CMD_UNRET;
++	else
++		pr_err("Unknown retbleed option (%s). Defaulting to 'auto'\n", str);
++
++	return 0;
++}
++early_param("retbleed", retbleed_parse_cmdline);
++
++#define RETBLEED_UNTRAIN_MSG "WARNING: BTB untrained return thunk mitigation is only effective on AMD/Hygon!\n"
++#define RETBLEED_COMPILER_MSG "WARNING: kernel not compiled with RETPOLINE or -mfunction-return capable compiler!\n"
++
++static void __init retbleed_select_mitigation(void)
++{
++	if (!boot_cpu_has_bug(X86_BUG_RETBLEED))
++		return;
++
++	switch (retbleed_cmd) {
++	case RETBLEED_CMD_OFF:
++		return;
++
++	case RETBLEED_CMD_UNRET:
++		retbleed_mitigation = RETBLEED_MITIGATION_UNRET;
++		break;
++
++	case RETBLEED_CMD_AUTO:
++	default:
++		if (!boot_cpu_has_bug(X86_BUG_RETBLEED))
++			break;
++
++		if (boot_cpu_data.x86_vendor == X86_VENDOR_AMD)
++			retbleed_mitigation = RETBLEED_MITIGATION_UNRET;
++		break;
++	}
++
++	switch (retbleed_mitigation) {
++	case RETBLEED_MITIGATION_UNRET:
++		if (boot_cpu_data.x86_vendor != X86_VENDOR_AMD)
++			pr_err(RETBLEED_UNTRAIN_MSG);
++		break;
++
++	default:
++		break;
++	}
++
++	pr_info("%s\n", retbleed_strings[retbleed_mitigation]);
++}
++
++#undef pr_fmt
+ #define pr_fmt(fmt)     "Spectre V2 mitigation: " fmt
+ 
+ static enum spectre_v2_mitigation spectre_v2_enabled = SPECTRE_V2_NONE;
+@@ -1614,7 +1700,11 @@ ssize_t cpu_show_srbds(struct device *de
+ 
+ static ssize_t retbleed_show_state(char *buf)
+ {
+-	return sprintf(buf, "Vulnerable\n");
++	if (retbleed_mitigation == RETBLEED_MITIGATION_UNRET &&
++	    boot_cpu_data.x86_vendor != X86_VENDOR_AMD)
++		return sprintf(buf, "Vulnerable: untrained return thunk on non-Zen uarch\n");
++
++	return sprintf(buf, "%s\n", retbleed_strings[retbleed_mitigation]);
+ }
+ 
+ 

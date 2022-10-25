@@ -1,0 +1,105 @@
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Tue, 14 Jun 2022 23:15:54 +0200
+Subject: x86/bugs: Optimize SPEC_CTRL MSR writes
+Git-commit: c779bc1a9002fa474175b80e72b85c9bf628abb0
+Patch-mainline: Queued in tip for 5.19
+Git-repo: git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip.git
+References: bsc#1199657 CVE-2022-29900 CVE-2022-29901
+
+When changing SPEC_CTRL for user control, the WRMSR can be delayed
+until return-to-user when KERNEL_IBRS has been enabled.
+
+This avoids an MSR write during context switch.
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Reviewed-by: Josh Poimboeuf <jpoimboe@kernel.org>
+Signed-off-by: Borislav Petkov <bp@suse.de>
+---
+ arch/x86/include/asm/nospec-branch.h |    2 +-
+ arch/x86/kernel/cpu/bugs.c           |   18 ++++++++++++------
+ arch/x86/kernel/process.c            |    2 +-
+ 3 files changed, 14 insertions(+), 8 deletions(-)
+
+--- a/arch/x86/include/asm/nospec-branch.h
++++ b/arch/x86/include/asm/nospec-branch.h
+@@ -187,7 +187,7 @@ extern char __indirect_thunk_end[];
+  */
+ extern void x86_spec_ctrl_set(u64);
+ extern u64 x86_spec_ctrl_get_default(void);
+-extern void write_spec_ctrl_current(u64 val);
++extern void write_spec_ctrl_current(u64 val, bool force);
+ 
+ /* The Speculative Store Bypass disable variants */
+ enum ssb_mitigation {
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@ -206,13 +206,19 @@ static DEFINE_MUTEX(spec_ctrl_mutex);
+  * Keep track of the SPEC_CTRL MSR value for the current task, which may differ
+  * from x86_spec_ctrl_base due to STIBP/SSB in __speculation_ctrl_update().
+  */
+-void write_spec_ctrl_current(u64 val)
++void write_spec_ctrl_current(u64 val, bool force)
+ {
+ 	if (this_cpu_read(x86_spec_ctrl_current) == val)
+ 		return;
+ 
+ 	this_cpu_write(x86_spec_ctrl_current, val);
+-	wrmsrl(MSR_IA32_SPEC_CTRL, val);
++
++	/*
++	 * When KERNEL_IBRS this MSR is written on return-to-user, unless
++	 * forced the update can be delayed until that time.
++	 */
++	if (force || !boot_cpu_has(X86_FEATURE_SPEC_CTRL))
++		wrmsrl(MSR_IA32_SPEC_CTRL, val);
+ }
+ 
+ /*
+@@ -1445,7 +1451,7 @@ static enum ssb_mitigation_cmd __init __
+ 			case X86_VENDOR_INTEL:
+ 				x86_spec_ctrl_base |= SPEC_CTRL_SSBD;
+ 				x86_spec_ctrl_mask &= ~SPEC_CTRL_SSBD;
+-				x86_spec_ctrl_set(SPEC_CTRL_SSBD);
++				write_spec_ctrl_current(x86_spec_ctrl_base, true);
+ 				break;
+ 			case X86_VENDOR_AMD:
+ 				x86_amd_ssbd_disable();
+@@ -1560,7 +1566,7 @@ int arch_prctl_spec_ctrl_get(struct task
+ void x86_spec_ctrl_setup_ap(void)
+ {
+ 	if (boot_cpu_has(X86_FEATURE_IBRS))
+-		x86_spec_ctrl_set(x86_spec_ctrl_base & ~x86_spec_ctrl_mask);
++		write_spec_ctrl_current(x86_spec_ctrl_base & ~x86_spec_ctrl_mask, true);
+ 
+        if (ssb_mode == SPEC_STORE_BYPASS_DISABLE)
+                x86_amd_ssbd_disable();
+@@ -1740,7 +1746,7 @@ void x86_spec_ctrl_set(u64 val)
+ 	if (val & x86_spec_ctrl_mask)
+ 		WARN_ONCE(1, "SPEC_CTRL MSR value 0x%16llx is unknown.\n", val);
+ 	else
+-		write_spec_ctrl_current(x86_spec_ctrl_base | val);
++		write_spec_ctrl_current(x86_spec_ctrl_base | val, true);
+ }
+ EXPORT_SYMBOL_GPL(x86_spec_ctrl_set);
+ 
+@@ -1774,7 +1780,7 @@ void x86_spec_ctrl_restore_host(u64 gues
+ 		host |= ssbd_tif_to_spec_ctrl(current_thread_info()->flags);
+ 
+ 	if (host != guest_spec_ctrl)
+-		write_spec_ctrl_current(host);
++		write_spec_ctrl_current(host, true);
+ }
+ EXPORT_SYMBOL_GPL(x86_spec_ctrl_restore_host);
+ 
+--- a/arch/x86/kernel/process.c
++++ b/arch/x86/kernel/process.c
+@@ -205,7 +205,7 @@ static __always_inline void __speculativ
+ 		wrmsrl(MSR_AMD64_LS_CFG, msr);
+ 	} else {
+ 		msr = x86_spec_ctrl_base | ssbd_tif_to_spec_ctrl(rds);
+-		write_spec_ctrl_current(msr);
++		write_spec_ctrl_current(msr, false);
+ 	}
+ }
+ 
