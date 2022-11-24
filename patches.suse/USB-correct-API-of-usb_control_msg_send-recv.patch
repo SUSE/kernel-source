@@ -1,0 +1,132 @@
+From ddd1198e3e0935066d6e309180d49f64ef4fa702 Mon Sep 17 00:00:00 2001
+From: Oliver Neukum <oneukum@suse.com>
+Date: Wed, 23 Sep 2020 15:43:42 +0200
+Subject: [PATCH] USB: correct API of usb_control_msg_send/recv
+Git-commit: ddd1198e3e0935066d6e309180d49f64ef4fa702
+Patch-mainline: v5.10-rc1
+References: CVE-2022-3903 bsc#1205220
+
+They need to specify how memory is to be allocated,
+as control messages need to work in contexts that require GFP_NOIO.
+
+Signed-off-by: Oliver Neukum <oneukum@suse.com>
+Link: https://lore.kernel.org/r/20200923134348.23862-9-oneukum@suse.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/usb/core/message.c |   22 ++++++++++++++--------
+ include/linux/usb.h        |    6 ++++--
+ 2 files changed, 18 insertions(+), 10 deletions(-)
+
+--- a/drivers/usb/core/message.c
++++ b/drivers/usb/core/message.c
+@@ -172,6 +172,7 @@ EXPORT_SYMBOL_GPL(usb_control_msg);
+  * @size: length in bytes of the data to send
+  * @timeout: time in msecs to wait for the message to complete before timing
+  *	out (if 0 the wait is forever)
++ * @memflags: the flags for memory allocation for buffers
+  *
+  * Context: !in_interrupt ()
+  *
+@@ -194,7 +195,8 @@ EXPORT_SYMBOL_GPL(usb_control_msg);
+  */
+ int usb_control_msg_send(struct usb_device *dev, __u8 endpoint, __u8 request,
+ 			 __u8 requesttype, __u16 value, __u16 index,
+-			 const void *driver_data, __u16 size, int timeout)
++			 const void *driver_data, __u16 size, int timeout,
++			 gfp_t memflags)
+ {
+ 	unsigned int pipe = usb_sndctrlpipe(dev, endpoint);
+ 	int ret;
+@@ -204,7 +206,7 @@ int usb_control_msg_send(struct usb_devi
+ 		return -EINVAL;
+ 
+ 	if (size) {
+-		data = kmemdup(driver_data, size, GFP_KERNEL);
++		data = kmemdup(driver_data, size, memflags);
+ 		if (!data)
+ 			return -ENOMEM;
+ 	}
+@@ -233,6 +235,7 @@ EXPORT_SYMBOL_GPL(usb_control_msg_send);
+  * @size: length in bytes of the data to be received
+  * @timeout: time in msecs to wait for the message to complete before timing
+  *	out (if 0 the wait is forever)
++ * @memflags: the flags for memory allocation for buffers
+  *
+  * Context: !in_interrupt ()
+  *
+@@ -261,7 +264,8 @@ EXPORT_SYMBOL_GPL(usb_control_msg_send);
+  */
+ int usb_control_msg_recv(struct usb_device *dev, __u8 endpoint, __u8 request,
+ 			 __u8 requesttype, __u16 value, __u16 index,
+-			 void *driver_data, __u16 size, int timeout)
++			 void *driver_data, __u16 size, int timeout,
++			 gfp_t memflags)
+ {
+ 	unsigned int pipe = usb_rcvctrlpipe(dev, endpoint);
+ 	int ret;
+@@ -270,7 +274,7 @@ int usb_control_msg_recv(struct usb_devi
+ 	if (!size || !driver_data || usb_pipe_type_check(dev, pipe))
+ 		return -EINVAL;
+ 
+-	data = kmalloc(size, GFP_KERNEL);
++	data = kmalloc(size, memflags);
+ 	if (!data)
+ 		return -ENOMEM;
+ 
+@@ -1144,7 +1148,7 @@ int usb_clear_halt(struct usb_device *de
+ 	result = usb_control_msg_send(dev, 0,
+ 				      USB_REQ_CLEAR_FEATURE, USB_RECIP_ENDPOINT,
+ 				      USB_ENDPOINT_HALT, endp, NULL, 0,
+-				      USB_CTRL_SET_TIMEOUT);
++				      USB_CTRL_SET_TIMEOUT, GFP_NOIO);
+ 
+ 	/* don't un-halt or force to DATA0 except on success */
+ 	if (result)
+@@ -1499,7 +1503,8 @@ int usb_set_interface(struct usb_device
+ 		ret = usb_control_msg_send(dev, 0,
+ 					   USB_REQ_SET_INTERFACE,
+ 					   USB_RECIP_INTERFACE, alternate,
+-					   interface, NULL, 0, 5000);
++					   interface, NULL, 0, 5000,
++					   GFP_NOIO);
+ 
+ 	/* 9.4.10 says devices don't need this and are free to STALL the
+ 	 * request if the interface only has one alternate setting.
+@@ -1659,7 +1664,8 @@ reset_old_alts:
+ 	}
+ 	retval = usb_control_msg_send(dev, 0, USB_REQ_SET_CONFIGURATION, 0,
+ 				      config->desc.bConfigurationValue, 0,
+-				      NULL, 0, USB_CTRL_SET_TIMEOUT);
++				      NULL, 0, USB_CTRL_SET_TIMEOUT,
++				      GFP_NOIO);
+ 	if (retval)
+ 		goto reset_old_alts;
+ 	mutex_unlock(hcd->bandwidth_mutex);
+@@ -2035,7 +2041,7 @@ free_interfaces:
+ 
+ 	ret = usb_control_msg_send(dev, 0, USB_REQ_SET_CONFIGURATION, 0,
+ 				   configuration, 0, NULL, 0,
+-				   USB_CTRL_SET_TIMEOUT);
++				   USB_CTRL_SET_TIMEOUT, GFP_NOIO);
+ 	if (ret && cp) {
+ 		/*
+ 		 * All the old state is gone, so what else can we do?
+--- a/include/linux/usb.h
++++ b/include/linux/usb.h
+@@ -1776,10 +1776,12 @@ extern int usb_bulk_msg(struct usb_devic
+ /* wrappers around usb_control_msg() for the most common standard requests */
+ int usb_control_msg_send(struct usb_device *dev, __u8 endpoint, __u8 request,
+ 			 __u8 requesttype, __u16 value, __u16 index,
+-			 const void *data, __u16 size, int timeout);
++			 const void *data, __u16 size, int timeout,
++			 gfp_t memflags);
+ int usb_control_msg_recv(struct usb_device *dev, __u8 endpoint, __u8 request,
+ 			 __u8 requesttype, __u16 value, __u16 index,
+-			 void *data, __u16 size, int timeout);
++			 void *data, __u16 size, int timeout,
++			 gfp_t memflags);
+ extern int usb_get_descriptor(struct usb_device *dev, unsigned char desctype,
+ 	unsigned char descindex, void *buf, int size);
+ extern int usb_get_status(struct usb_device *dev,

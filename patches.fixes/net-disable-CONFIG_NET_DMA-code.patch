@@ -1,0 +1,452 @@
+From: Michal Kubecek <mkubecek@suse.cz>
+Date: Wed, 2 Nov 2022 17:20:03 +0100
+Subject: net: disable CONFIG_NET_DMA code
+Patch-mainline: Never, code removed in mainline 3.18-rc1
+References: CVE-2019-3837 bsc#1131430
+
+As reported in CVE-2019-3837, IOAT DMA code in TCP Rx path suffers from
+race conditions resulting in memory leaks which can be abused for denial of
+service attacks.
+
+The IOAT DMA code was marked broken by commit 77873803363c ("net_dma: mark
+broken") in mainline 3.13-rc5 and later removed completely by commit
+7bced397510a ("net_dma: simple removal") in mainline 3.18-rc1. The commit
+messages also mention that in practice, the performance benefit was rather
+poor so it seems more appropriate to drop the code in SLE11-SP4-LTSS as
+well, keeping only parts needed to preserve kABI.
+
+Signed-off-by: Michal Kubecek <mkubecek@suse.cz>
+---
+ include/linux/dmaengine.h |   5 --
+ include/linux/tcp.h       |   7 +++
+ include/net/sock.h        |  15 ++----
+ include/net/tcp.h         |   6 ---
+ net/core/dev.c            |   8 ---
+ net/core/sock.c           |   6 ---
+ net/ipv4/tcp.c            | 110 --------------------------------------
+ net/ipv4/tcp_input.c      |  60 ---------------------
+ net/ipv4/tcp_ipv4.c       |  13 -----
+ net/ipv6/tcp_ipv6.c       |   8 ---
+ 10 files changed, 11 insertions(+), 227 deletions(-)
+
+--- a/include/linux/dmaengine.h
++++ b/include/linux/dmaengine.h
+@@ -641,17 +641,12 @@ static inline void dmaengine_put(void)
+ }
+ #endif
+ 
+-#ifdef CONFIG_NET_DMA
+-#define net_dmaengine_get()	dmaengine_get()
+-#define net_dmaengine_put()	dmaengine_put()
+-#else
+ static inline void net_dmaengine_get(void)
+ {
+ }
+ static inline void net_dmaengine_put(void)
+ {
+ }
+-#endif
+ 
+ #ifdef CONFIG_ASYNC_TX_DMA
+ #define async_dmaengine_get()	dmaengine_get()
+--- a/include/linux/tcp.h
++++ b/include/linux/tcp.h
+@@ -335,10 +335,17 @@ struct tcp_sock {
+ 		int			len;
+ #ifdef CONFIG_NET_DMA
+ 		/* members for async copy */
++#ifdef __GENKSYMS__
+ 		struct dma_chan		*dma_chan;
+ 		int			wakeup;
+ 		struct dma_pinned_list	*pinned_list;
+ 		dma_cookie_t		dma_cookie;
++#else
++		struct dma_chan		*__unused_dma_chan;
++		int			__unused_wakeup;
++		struct dma_pinned_list	*__unused_pinned_list;
++		dma_cookie_t		__unused_dma_cookie;
++#endif
+ #endif
+ 	} ucopy;
+ 
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@ -285,7 +285,11 @@ struct sock {
+ 	struct socket_wq __rcu	*sk_wq;
+ 
+ #ifdef CONFIG_NET_DMA
++#ifdef __GENKSYMS__
+ 	struct sk_buff_head	sk_async_wait_queue;
++#else
++	struct sk_buff_head	__unused_sk_async_wait_queue;
++#endif
+ #endif
+ 
+ #ifdef CONFIG_XFRM
+@@ -1841,22 +1845,11 @@ extern int sock_tx_timestamp(struct sock *sk, __u8 *tx_flags);
+  * This routine must be called with interrupts disabled or with the socket
+  * locked so that the sk_buff queue operation is ok.
+ */
+-#ifdef CONFIG_NET_DMA
+-static inline void sk_eat_skb(struct sock *sk, struct sk_buff *skb, int copied_early)
+-{
+-	__skb_unlink(skb, &sk->sk_receive_queue);
+-	if (!copied_early)
+-		__kfree_skb(skb);
+-	else
+-		__skb_queue_tail(&sk->sk_async_wait_queue, skb);
+-}
+-#else
+ static inline void sk_eat_skb(struct sock *sk, struct sk_buff *skb, int copied_early)
+ {
+ 	__skb_unlink(skb, &sk->sk_receive_queue);
+ 	__kfree_skb(skb);
+ }
+-#endif
+ 
+ static inline
+ struct net *sock_net(const struct sock *sk)
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -883,12 +883,6 @@ static inline void tcp_prequeue_init(struct tcp_sock *tp)
+ 	tp->ucopy.len = 0;
+ 	tp->ucopy.memory = 0;
+ 	skb_queue_head_init(&tp->ucopy.prequeue);
+-#ifdef CONFIG_NET_DMA
+-	tp->ucopy.dma_chan = NULL;
+-	tp->ucopy.wakeup = 0;
+-	tp->ucopy.pinned_list = NULL;
+-	tp->ucopy.dma_cookie = 0;
+-#endif
+ }
+ 
+ /* Packet is added to VJ-style prequeue for processing in process
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -4131,14 +4131,6 @@ static void net_rx_action(struct softirq_action *h)
+ out:
+ 	net_rps_action_and_irq_enable(sd);
+ 
+-#ifdef CONFIG_NET_DMA
+-	/*
+-	 * There may not be any more sk_buffs coming right now, so push
+-	 * any pending DMA copies to hardware
+-	 */
+-	dma_issue_pending_all();
+-#endif
+-
+ 	return;
+ 
+ softnet_break:
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@ -1271,9 +1271,6 @@ struct sock *sk_clone(const struct sock *sk, const gfp_t priority)
+ 		atomic_set(&newsk->sk_omem_alloc, 0);
+ 		skb_queue_head_init(&newsk->sk_receive_queue);
+ 		skb_queue_head_init(&newsk->sk_write_queue);
+-#ifdef CONFIG_NET_DMA
+-		skb_queue_head_init(&newsk->sk_async_wait_queue);
+-#endif
+ 
+ 		spin_lock_init(&newsk->sk_dst_lock);
+ 		rwlock_init(&newsk->sk_callback_lock);
+@@ -2016,9 +2013,6 @@ void sock_init_data(struct socket *sock, struct sock *sk)
+ 	skb_queue_head_init(&sk->sk_receive_queue);
+ 	skb_queue_head_init(&sk->sk_write_queue);
+ 	skb_queue_head_init(&sk->sk_error_queue);
+-#ifdef CONFIG_NET_DMA
+-	skb_queue_head_init(&sk->sk_async_wait_queue);
+-#endif
+ 
+ 	sk->sk_send_head	=	NULL;
+ 
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -1272,39 +1272,6 @@ static void tcp_prequeue_process(struct sock *sk)
+ 	tp->ucopy.memory = 0;
+ }
+ 
+-#ifdef CONFIG_NET_DMA
+-static void tcp_service_net_dma(struct sock *sk, bool wait)
+-{
+-	dma_cookie_t done, used;
+-	dma_cookie_t last_issued;
+-	struct tcp_sock *tp = tcp_sk(sk);
+-
+-	if (!tp->ucopy.dma_chan)
+-		return;
+-
+-	last_issued = tp->ucopy.dma_cookie;
+-	dma_async_memcpy_issue_pending(tp->ucopy.dma_chan);
+-
+-	do {
+-		if (dma_async_memcpy_complete(tp->ucopy.dma_chan,
+-					      last_issued, &done,
+-					      &used) == DMA_SUCCESS) {
+-			/* Safe to free early-copied skbs now */
+-			__skb_queue_purge(&sk->sk_async_wait_queue);
+-			break;
+-		} else {
+-			struct sk_buff *skb;
+-			while ((skb = skb_peek(&sk->sk_async_wait_queue)) &&
+-			       (dma_async_is_complete(skb->dma_cookie, done,
+-						      used) == DMA_SUCCESS)) {
+-				__skb_dequeue(&sk->sk_async_wait_queue);
+-				kfree_skb(skb);
+-			}
+-		}
+-	} while (wait);
+-}
+-#endif
+-
+ static inline struct sk_buff *tcp_recv_skb(struct sock *sk, u32 seq, u32 *off)
+ {
+ 	struct sk_buff *skb;
+@@ -1443,28 +1410,6 @@ int tcp_recvmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
+ 
+ 	target = sock_rcvlowat(sk, flags & MSG_WAITALL, len);
+ 
+-#ifdef CONFIG_NET_DMA
+-	tp->ucopy.dma_chan = NULL;
+-	preempt_disable();
+-	skb = skb_peek_tail(&sk->sk_receive_queue);
+-	{
+-		int available = 0;
+-
+-		if (skb)
+-			available = TCP_SKB_CB(skb)->seq + skb->len - (*seq);
+-		if ((available < target) &&
+-		    (len > sysctl_tcp_dma_copybreak) && !(flags & MSG_PEEK) &&
+-		    !sysctl_tcp_low_latency &&
+-		    dma_find_channel(DMA_MEMCPY)) {
+-			preempt_enable_no_resched();
+-			tp->ucopy.pinned_list =
+-					dma_pin_iovec_pages(msg->msg_iov, len);
+-		} else {
+-			preempt_enable_no_resched();
+-		}
+-	}
+-#endif
+-
+ 	do {
+ 		u32 offset;
+ 
+@@ -1595,16 +1540,6 @@ int tcp_recvmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
+ 			/* __ Set realtime policy in scheduler __ */
+ 		}
+ 
+-#ifdef CONFIG_NET_DMA
+-		if (tp->ucopy.dma_chan) {
+-			if (tp->rcv_wnd == 0 &&
+-			    !skb_queue_empty(&sk->sk_async_wait_queue)) {
+-				tcp_service_net_dma(sk, true);
+-				tcp_cleanup_rbuf(sk, copied);
+-			} else
+-				dma_async_memcpy_issue_pending(tp->ucopy.dma_chan);
+-		}
+-#endif
+ 		if (copied >= target) {
+ 			/* Do not sleep, just process backlog. */
+ 			release_sock(sk);
+@@ -1612,11 +1547,6 @@ int tcp_recvmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
+ 		} else
+ 			sk_wait_data(sk, &timeo);
+ 
+-#ifdef CONFIG_NET_DMA
+-		tcp_service_net_dma(sk, false);  /* Don't block */
+-		tp->ucopy.wakeup = 0;
+-#endif
+-
+ 		if (user_recv) {
+ 			int chunk;
+ 
+@@ -1674,33 +1604,6 @@ do_prequeue:
+ 		}
+ 
+ 		if (!(flags & MSG_TRUNC)) {
+-#ifdef CONFIG_NET_DMA
+-			if (!tp->ucopy.dma_chan && tp->ucopy.pinned_list)
+-				tp->ucopy.dma_chan = dma_find_channel(DMA_MEMCPY);
+-
+-			if (tp->ucopy.dma_chan) {
+-				tp->ucopy.dma_cookie = dma_skb_copy_datagram_iovec(
+-					tp->ucopy.dma_chan, skb, offset,
+-					msg->msg_iov, used,
+-					tp->ucopy.pinned_list);
+-
+-				if (tp->ucopy.dma_cookie < 0) {
+-
+-					printk(KERN_ALERT "dma_cookie < 0\n");
+-
+-					/* Exception. Bailout! */
+-					if (!copied)
+-						copied = -EFAULT;
+-					break;
+-				}
+-
+-				dma_async_memcpy_issue_pending(tp->ucopy.dma_chan);
+-
+-				if ((offset + used) == skb->len)
+-					copied_early = 1;
+-
+-			} else
+-#endif
+ 			{
+ 				err = skb_copy_datagram_iovec(skb, offset,
+ 						msg->msg_iov, used);
+@@ -1764,16 +1667,6 @@ skip_copy:
+ 		tp->ucopy.len = 0;
+ 	}
+ 
+-#ifdef CONFIG_NET_DMA
+-	tcp_service_net_dma(sk, true);  /* Wait for queue to drain */
+-	tp->ucopy.dma_chan = NULL;
+-
+-	if (tp->ucopy.pinned_list) {
+-		dma_unpin_iovec_pages(tp->ucopy.pinned_list);
+-		tp->ucopy.pinned_list = NULL;
+-	}
+-#endif
+-
+ 	/* According to UNIX98, msg_name/msg_namelen are ignored
+ 	 * on connected socket. I was just happy when found this 8) --ANK
+ 	 */
+@@ -2086,9 +1979,6 @@ int tcp_disconnect(struct sock *sk, int flags)
+ 	__skb_queue_purge(&sk->sk_receive_queue);
+ 	tcp_write_queue_purge(sk);
+ 	__skb_queue_purge(&tp->out_of_order_queue);
+-#ifdef CONFIG_NET_DMA
+-	__skb_queue_purge(&sk->sk_async_wait_queue);
+-#endif
+ 
+ 	inet->inet_dport = 0;
+ 
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -5255,53 +5255,6 @@ static inline int tcp_checksum_complete_user(struct sock *sk,
+ 	       __tcp_checksum_complete_user(sk, skb);
+ }
+ 
+-#ifdef CONFIG_NET_DMA
+-static int tcp_dma_try_early_copy(struct sock *sk, struct sk_buff *skb,
+-				  int hlen)
+-{
+-	struct tcp_sock *tp = tcp_sk(sk);
+-	int chunk = skb->len - hlen;
+-	int dma_cookie;
+-	int copied_early = 0;
+-
+-	if (tp->ucopy.wakeup)
+-		return 0;
+-
+-	if (!tp->ucopy.dma_chan && tp->ucopy.pinned_list)
+-		tp->ucopy.dma_chan = dma_find_channel(DMA_MEMCPY);
+-
+-	if (tp->ucopy.dma_chan && skb_csum_unnecessary(skb)) {
+-
+-		dma_cookie = dma_skb_copy_datagram_iovec(tp->ucopy.dma_chan,
+-							 skb, hlen,
+-							 tp->ucopy.iov, chunk,
+-							 tp->ucopy.pinned_list);
+-
+-		if (dma_cookie < 0)
+-			goto out;
+-
+-		tp->ucopy.dma_cookie = dma_cookie;
+-		copied_early = 1;
+-
+-		tp->ucopy.len -= chunk;
+-		tp->copied_seq += chunk;
+-		tcp_rcv_space_adjust(sk);
+-
+-		if ((tp->ucopy.len == 0) ||
+-		    (tcp_flag_word(tcp_hdr(skb)) & TCP_FLAG_PSH) ||
+-		    (atomic_read(&sk->sk_rmem_alloc) > (sk->sk_rcvbuf >> 1))) {
+-			tp->ucopy.wakeup = 1;
+-			sk->sk_data_ready(sk, 0);
+-		}
+-	} else if (chunk > 0) {
+-		tp->ucopy.wakeup = 1;
+-		sk->sk_data_ready(sk, 0);
+-	}
+-out:
+-	return copied_early;
+-}
+-#endif /* CONFIG_NET_DMA */
+-
+ /* Does PAWS and seqno based validation of an incoming segment, flags will
+  * play significant role here.
+  */
+@@ -5485,14 +5438,6 @@ int tcp_rcv_established(struct sock *sk, struct sk_buff *skb,
+ 
+ 			if (tp->copied_seq == tp->rcv_nxt &&
+ 			    len - tcp_header_len <= tp->ucopy.len) {
+-#ifdef CONFIG_NET_DMA
+-				if (tp->ucopy.task == current &&
+-				    sock_owned_by_user(sk) &&
+-				    tcp_dma_try_early_copy(sk, skb, tcp_header_len)) {
+-					copied_early = 1;
+-					eaten = 1;
+-				}
+-#endif
+ 				if (tp->ucopy.task == current &&
+ 				    sock_owned_by_user(sk) && !copied_early) {
+ 					__set_current_state(TASK_RUNNING);
+@@ -5560,11 +5505,6 @@ int tcp_rcv_established(struct sock *sk, struct sk_buff *skb,
+ 			if (!copied_early || tp->rcv_nxt != tp->rcv_wup)
+ 				__tcp_ack_snd_check(sk, 0);
+ no_ack:
+-#ifdef CONFIG_NET_DMA
+-			if (copied_early)
+-				__skb_queue_tail(&sk->sk_async_wait_queue, skb);
+-			else
+-#endif
+ 			if (eaten)
+ 				__kfree_skb(skb);
+ 			else
+--- a/net/ipv4/tcp_ipv4.c
++++ b/net/ipv4/tcp_ipv4.c
+@@ -1708,14 +1708,6 @@ process:
+ 	bh_lock_sock_nested(sk);
+ 	ret = 0;
+ 	if (!sock_owned_by_user(sk)) {
+-#ifdef CONFIG_NET_DMA
+-		struct tcp_sock *tp = tcp_sk(sk);
+-		if (!tp->ucopy.dma_chan && tp->ucopy.pinned_list)
+-			tp->ucopy.dma_chan = dma_find_channel(DMA_MEMCPY);
+-		if (tp->ucopy.dma_chan)
+-			ret = tcp_v4_do_rcv(sk, skb);
+-		else
+-#endif
+ 		{
+ 			if (!tcp_prequeue(sk, skb))
+ 				ret = tcp_v4_do_rcv(sk, skb);
+@@ -1942,11 +1934,6 @@ void tcp_v4_destroy_sock(struct sock *sk)
+ 	}
+ #endif
+ 
+-#ifdef CONFIG_NET_DMA
+-	/* Cleans up our sk_async_wait_queue */
+-	__skb_queue_purge(&sk->sk_async_wait_queue);
+-#endif
+-
+ 	/* Clean prequeue, it must be empty really */
+ 	__skb_queue_purge(&tp->ucopy.prequeue);
+ 
+--- a/net/ipv6/tcp_ipv6.c
++++ b/net/ipv6/tcp_ipv6.c
+@@ -1764,14 +1764,6 @@ process:
+ 	bh_lock_sock_nested(sk);
+ 	ret = 0;
+ 	if (!sock_owned_by_user(sk)) {
+-#ifdef CONFIG_NET_DMA
+-		struct tcp_sock *tp = tcp_sk(sk);
+-		if (!tp->ucopy.dma_chan && tp->ucopy.pinned_list)
+-			tp->ucopy.dma_chan = dma_find_channel(DMA_MEMCPY);
+-		if (tp->ucopy.dma_chan)
+-			ret = tcp_v6_do_rcv(sk, skb);
+-		else
+-#endif
+ 		{
+ 			if (!tcp_prequeue(sk, skb))
+ 				ret = tcp_v6_do_rcv(sk, skb);
