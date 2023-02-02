@@ -1,0 +1,202 @@
+From: Eric Dumazet <edumazet@google.com>
+Date: Wed, 16 Aug 2017 07:03:15 -0700
+Subject: dccp: defer ccid_hc_tx_delete() at dismantle time
+Patch-mainline: v4.13-rc7
+Git-commit: 120e9dabaf551c6dc03d3a10a1f026376cb1811c
+References: CVE-2020-16119 bsc#1177471
+
+syszkaller team reported another problem in DCCP [1]
+
+Problem here is that the structure holding RTO timer
+(ccid2_hc_tx_rto_expire() handler) is freed too soon.
+
+We can not use del_timer_sync() to cancel the timer
+since this timer wants to grab socket lock (that would risk a dead lock)
+
+Solution is to defer the freeing of memory when all references to
+the socket were released. Socket timers do own a reference, so this
+should fix the issue.
+
+[1]
+
+==================================================================
+BUG: KASAN: use-after-free in ccid2_hc_tx_rto_expire+0x51c/0x5c0 net/dccp/ccids/ccid2.c:144
+Read of size 4 at addr ffff8801d2660540 by task kworker/u4:7/3365
+
+CPU: 1 PID: 3365 Comm: kworker/u4:7 Not tainted 4.13.0-rc4+ #3
+Hardware name: Google Google Compute Engine/Google Compute Engine, BIOS Google 01/01/2011
+Workqueue: events_unbound call_usermodehelper_exec_work
+Call Trace:
+ <IRQ>
+ __dump_stack lib/dump_stack.c:16 [inline]
+ dump_stack+0x194/0x257 lib/dump_stack.c:52
+ print_address_description+0x73/0x250 mm/kasan/report.c:252
+ kasan_report_error mm/kasan/report.c:351 [inline]
+ kasan_report+0x24e/0x340 mm/kasan/report.c:409
+ __asan_report_load4_noabort+0x14/0x20 mm/kasan/report.c:429
+ ccid2_hc_tx_rto_expire+0x51c/0x5c0 net/dccp/ccids/ccid2.c:144
+ call_timer_fn+0x233/0x830 kernel/time/timer.c:1268
+ expire_timers kernel/time/timer.c:1307 [inline]
+ __run_timers+0x7fd/0xb90 kernel/time/timer.c:1601
+ run_timer_softirq+0x21/0x80 kernel/time/timer.c:1614
+ __do_softirq+0x2f5/0xba3 kernel/softirq.c:284
+ invoke_softirq kernel/softirq.c:364 [inline]
+ irq_exit+0x1cc/0x200 kernel/softirq.c:405
+ exiting_irq arch/x86/include/asm/apic.h:638 [inline]
+ smp_apic_timer_interrupt+0x76/0xa0 arch/x86/kernel/apic/apic.c:1044
+ apic_timer_interrupt+0x93/0xa0 arch/x86/entry/entry_64.S:702
+RIP: 0010:arch_local_irq_enable arch/x86/include/asm/paravirt.h:824 [inline]
+RIP: 0010:__raw_write_unlock_irq include/linux/rwlock_api_smp.h:267 [inline]
+RIP: 0010:_raw_write_unlock_irq+0x56/0x70 kernel/locking/spinlock.c:343
+RSP: 0018:ffff8801cd50eaa8 EFLAGS: 00000286 ORIG_RAX: ffffffffffffff10
+RAX: dffffc0000000000 RBX: ffffffff85a090c0 RCX: 0000000000000006
+RDX: 1ffffffff0b595f3 RSI: 1ffff1003962f989 RDI: ffffffff85acaf98
+RBP: ffff8801cd50eab0 R08: 0000000000000001 R09: 0000000000000000
+R10: 0000000000000000 R11: 0000000000000000 R12: ffff8801cc96ea60
+R13: dffffc0000000000 R14: ffff8801cc96e4c0 R15: ffff8801cc96e4c0
+ </IRQ>
+ release_task+0xe9e/0x1a40 kernel/exit.c:220
+ wait_task_zombie kernel/exit.c:1162 [inline]
+ wait_consider_task+0x29b8/0x33c0 kernel/exit.c:1389
+ do_wait_thread kernel/exit.c:1452 [inline]
+ do_wait+0x441/0xa90 kernel/exit.c:1523
+ kernel_wait4+0x1f5/0x370 kernel/exit.c:1665
+ SYSC_wait4+0x134/0x140 kernel/exit.c:1677
+ SyS_wait4+0x2c/0x40 kernel/exit.c:1673
+ call_usermodehelper_exec_sync kernel/kmod.c:286 [inline]
+ call_usermodehelper_exec_work+0x1a0/0x2c0 kernel/kmod.c:323
+ process_one_work+0xbf3/0x1bc0 kernel/workqueue.c:2097
+ worker_thread+0x223/0x1860 kernel/workqueue.c:2231
+ kthread+0x35e/0x430 kernel/kthread.c:231
+ ret_from_fork+0x2a/0x40 arch/x86/entry/entry_64.S:425
+
+Allocated by task 21267:
+ save_stack_trace+0x16/0x20 arch/x86/kernel/stacktrace.c:59
+ save_stack+0x43/0xd0 mm/kasan/kasan.c:447
+ set_track mm/kasan/kasan.c:459 [inline]
+ kasan_kmalloc+0xad/0xe0 mm/kasan/kasan.c:551
+ kasan_slab_alloc+0x12/0x20 mm/kasan/kasan.c:489
+ kmem_cache_alloc+0x127/0x750 mm/slab.c:3561
+ ccid_new+0x20e/0x390 net/dccp/ccid.c:151
+ dccp_hdlr_ccid+0x27/0x140 net/dccp/feat.c:44
+ __dccp_feat_activate+0x142/0x2a0 net/dccp/feat.c:344
+ dccp_feat_activate_values+0x34e/0xa90 net/dccp/feat.c:1538
+ dccp_rcv_request_sent_state_process net/dccp/input.c:472 [inline]
+ dccp_rcv_state_process+0xed1/0x1620 net/dccp/input.c:677
+ dccp_v4_do_rcv+0xeb/0x160 net/dccp/ipv4.c:679
+ sk_backlog_rcv include/net/sock.h:911 [inline]
+ __release_sock+0x124/0x360 net/core/sock.c:2269
+ release_sock+0xa4/0x2a0 net/core/sock.c:2784
+ inet_wait_for_connect net/ipv4/af_inet.c:557 [inline]
+ __inet_stream_connect+0x671/0xf00 net/ipv4/af_inet.c:643
+ inet_stream_connect+0x58/0xa0 net/ipv4/af_inet.c:682
+ SYSC_connect+0x204/0x470 net/socket.c:1642
+ SyS_connect+0x24/0x30 net/socket.c:1623
+ entry_SYSCALL_64_fastpath+0x1f/0xbe
+
+Freed by task 3049:
+ save_stack_trace+0x16/0x20 arch/x86/kernel/stacktrace.c:59
+ save_stack+0x43/0xd0 mm/kasan/kasan.c:447
+ set_track mm/kasan/kasan.c:459 [inline]
+ kasan_slab_free+0x71/0xc0 mm/kasan/kasan.c:524
+ __cache_free mm/slab.c:3503 [inline]
+ kmem_cache_free+0x77/0x280 mm/slab.c:3763
+ ccid_hc_tx_delete+0xc5/0x100 net/dccp/ccid.c:190
+ dccp_destroy_sock+0x1d1/0x2b0 net/dccp/proto.c:225
+ inet_csk_destroy_sock+0x166/0x3f0 net/ipv4/inet_connection_sock.c:833
+ dccp_done+0xb7/0xd0 net/dccp/proto.c:145
+ dccp_time_wait+0x13d/0x300 net/dccp/minisocks.c:72
+ dccp_rcv_reset+0x1d1/0x5b0 net/dccp/input.c:160
+ dccp_rcv_state_process+0x8fc/0x1620 net/dccp/input.c:663
+ dccp_v4_do_rcv+0xeb/0x160 net/dccp/ipv4.c:679
+ sk_backlog_rcv include/net/sock.h:911 [inline]
+ __sk_receive_skb+0x33e/0xc00 net/core/sock.c:521
+ dccp_v4_rcv+0xef1/0x1c00 net/dccp/ipv4.c:871
+ ip_local_deliver_finish+0x2e2/0xba0 net/ipv4/ip_input.c:216
+ NF_HOOK include/linux/netfilter.h:248 [inline]
+ ip_local_deliver+0x1ce/0x6d0 net/ipv4/ip_input.c:257
+ dst_input include/net/dst.h:477 [inline]
+ ip_rcv_finish+0x8db/0x19c0 net/ipv4/ip_input.c:397
+ NF_HOOK include/linux/netfilter.h:248 [inline]
+ ip_rcv+0xc3f/0x17d0 net/ipv4/ip_input.c:488
+ __netif_receive_skb_core+0x19af/0x33d0 net/core/dev.c:4417
+ __netif_receive_skb+0x2c/0x1b0 net/core/dev.c:4455
+ process_backlog+0x203/0x740 net/core/dev.c:5130
+ napi_poll net/core/dev.c:5527 [inline]
+ net_rx_action+0x792/0x1910 net/core/dev.c:5593
+ __do_softirq+0x2f5/0xba3 kernel/softirq.c:284
+
+The buggy address belongs to the object at ffff8801d2660100
+ which belongs to the cache ccid2_hc_tx_sock of size 1240
+The buggy address is located 1088 bytes inside of
+ 1240-byte region [ffff8801d2660100, ffff8801d26605d8)
+The buggy address belongs to the page:
+page:ffffea0007499800 count:1 mapcount:0 mapping:ffff8801d2660100 index:0x0 compound_mapcount: 0
+flags: 0x200000000008100(slab|head)
+raw: 0200000000008100 ffff8801d2660100 0000000000000000 0000000100000005
+raw: ffffea00075271a0 ffffea0007538820 ffff8801d3aef9c0 0000000000000000
+page dumped because: kasan: bad access detected
+
+Memory state around the buggy address:
+ ffff8801d2660400: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+ ffff8801d2660480: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+>ffff8801d2660500: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+                                           ^
+ ffff8801d2660580: fb fb fb fb fb fb fb fb fb fb fb fc fc fc fc fc
+ ffff8801d2660600: fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc
+==================================================================
+
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Reported-by: Dmitry Vyukov <dvyukov@google.com>
+Cc: Gerrit Renker <gerrit@erg.abdn.ac.uk>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Michal Kubecek <mkubecek@suse.cz>
+
+---
+ net/dccp/proto.c | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+--- a/net/dccp/proto.c
++++ b/net/dccp/proto.c
+@@ -24,6 +24,7 @@
+ #include <net/checksum.h>
+ 
+ #include <net/inet_sock.h>
++#include <net/inet_common.h>
+ #include <net/sock.h>
+ #include <net/xfrm.h>
+ 
+@@ -170,6 +171,15 @@ const char *dccp_packet_name(const int type)
+ 
+ EXPORT_SYMBOL_GPL(dccp_packet_name);
+ 
++static void dccp_sk_destruct(struct sock *sk)
++{
++	struct dccp_sock *dp = dccp_sk(sk);
++
++	ccid_hc_tx_delete(dp->dccps_hc_tx_ccid, sk);
++	dp->dccps_hc_tx_ccid = NULL;
++	inet_sock_destruct(sk);
++}
++
+ int dccp_init_sock(struct sock *sk, const __u8 ctl_sock_initialized)
+ {
+ 	struct dccp_sock *dp = dccp_sk(sk);
+@@ -179,6 +189,7 @@ int dccp_init_sock(struct sock *sk, const __u8 ctl_sock_initialized)
+ 	icsk->icsk_syn_retries	= sysctl_dccp_request_retries;
+ 	sk->sk_state		= DCCP_CLOSED;
+ 	sk->sk_write_space	= dccp_write_space;
++	sk->sk_destruct		= dccp_sk_destruct;
+ 	icsk->icsk_sync_mss	= dccp_sync_mss;
+ 	dp->dccps_mss_cache	= 536;
+ 	dp->dccps_rate_last	= jiffies;
+@@ -223,8 +234,7 @@ void dccp_destroy_sock(struct sock *sk)
+ 		dp->dccps_hc_rx_ackvec = NULL;
+ 	}
+ 	ccid_hc_rx_delete(dp->dccps_hc_rx_ccid, sk);
+-	ccid_hc_tx_delete(dp->dccps_hc_tx_ccid, sk);
+-	dp->dccps_hc_rx_ccid = dp->dccps_hc_tx_ccid = NULL;
++	dp->dccps_hc_rx_ccid = NULL;
+ 
+ 	/* clean up feature negotiation state */
+ 	dccp_feat_list_purge(&dp->dccps_featneg);
