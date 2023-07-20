@@ -1,0 +1,86 @@
+From: Dave Hansen <dave.hansen@linux.intel.com>
+Date: Tue, 21 Feb 2023 12:30:15 -0800
+Subject: uaccess: Add speculation barrier to copy_from_user()
+Git-commit: 74e19ef0ff8061ef55957c3abd71614ef0f42f47
+Patch-mainline: v6.3-rc1
+References: bsc#1211738 CVE-2023-0459
+
+The results of "access_ok()" can be mis-speculated.  The result is that
+you can end speculatively:
+
+	if (access_ok(from, size))
+		// Right here
+
+even for bad from/size combinations.  On first glance, it would be ideal
+to just add a speculation barrier to "access_ok()" so that its results
+can never be mis-speculated.
+
+But there are lots of system calls just doing access_ok() via
+"copy_to_user()" and friends (example: fstat() and friends).  Those are
+generally not problematic because they do not _consume_ data from
+userspace other than the pointer.  They are also very quick and common
+system calls that should not be needlessly slowed down.
+
+"copy_from_user()" on the other hand uses a user-controller pointer and
+is frequently followed up with code that might affect caches.  Take
+something like this:
+
+	if (!copy_from_user(&kernelvar, uptr, size))
+		do_something_with(kernelvar);
+
+If userspace passes in an evil 'uptr' that *actually* points to a kernel
+addresses, and then do_something_with() has cache (or other)
+side-effects, it could allow userspace to infer kernel data values.
+
+Add a barrier to the common copy_from_user() code to prevent
+mis-speculated values which happen after the copy.
+
+Also add a stub for architectures that do not define barrier_nospec().
+This makes the macro usable in generic code.
+
+Since the barrier is now usable in generic code, the x86 #ifdef in the
+BPF code can also go away.
+
+Reported-by: Jordy Zomer <jordyzomer@google.com>
+Suggested-by: Linus Torvalds <torvalds@linuxfoundation.org>
+Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+Acked-by: Daniel Borkmann <daniel@iogearbox.net>   # BPF bits
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Acked-by: Michal Koutný <mkoutny@suse.com>
+[mkoutny: adjust context, no 3b75c1d884e ("instrumented.h: allow instrumenting both sides of copy_from_user()"), 4.12: no KASAN]
+[mkoutny: 4.4 make code x86-only specific because there is arch specific
+ _copy_from_user and vuln is treated on that arch only in this kernel,
+ cf commit 304ec1b05031]
+---
+ arch/x86/lib/usercopy.c |   11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+--- a/arch/x86/lib/usercopy.c
++++ b/arch/x86/lib/usercopy.c
+@@ -6,6 +6,7 @@
+ 
+ #include <linux/highmem.h>
+ #include <linux/module.h>
++#include <linux/nospec.h>
+ 
+ /*
+  * best effort, GUP based copy_from_user() that is NMI-safe
+@@ -83,9 +84,15 @@ EXPORT_SYMBOL(_copy_to_user);
+  */
+ unsigned long _copy_from_user(void *to, const void __user *from, unsigned n)
+ {
+-	if (access_ok(VERIFY_READ, from, n))
++	if (access_ok(VERIFY_READ, from, n)) {
++		/*
++		 * Ensure that bad access_ok() speculation will not
++		 * lead to nasty side effects *after* the copy is
++		 * finished:
++		 */
++		barrier_nospec();
+ 		n = __copy_from_user(to, from, n);
+-	else
++	} else
+ 		memset(to, 0, n);
+ 	return n;
+ }
