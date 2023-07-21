@@ -1,0 +1,211 @@
+From: Borislav Petkov <bp@suse.de>
+Date: Mon, 31 Oct 2016 16:10:15 +0100
+Subject: x86/copy_user: Unify the code by removing the 64-bit asm
+ _copy_*_user() variants
+Git-commit: adb402cd1461eef6e1a21db4532a3b9e6a6be853
+Patch-mainline: v4.10-rc1
+References: bsc#1211738 CVE-2023-0459
+
+We already have the same functionality in usercopy_32.c. Share it with
+64-bit and get rid of some more asm glue which is not needed anymore.
+
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Borislav Petkov <bp@alien8.de>
+Cc: Brian Gerst <brgerst@gmail.com>
+Cc: Denys Vlasenko <dvlasenk@redhat.com>
+Cc: H. Peter Anvin <hpa@zytor.com>
+Cc: Josh Poimboeuf <jpoimboe@redhat.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/20161031151015.22087-1-bp@alien8.de
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Acked-by: Michal Koutný <mkoutny@suse.com>
+[mkoutny: adjusted deletion parts, deexport symbol from arch/x86/kernel/x8664_ksyms_64.c]
+[mkoutny: 3.0: adjusted deletion parts]
+---
+ arch/x86/kernel/x8664_ksyms_64.c |    2 -
+ arch/x86/lib/copy_user_64.S      |   46 ------------------------------------
+ arch/x86/lib/usercopy.c          |   49 +++++++++++++++++++++++++++++++++++++++
+ arch/x86/lib/usercopy_32.c       |   48 --------------------------------------
+ 4 files changed, 49 insertions(+), 96 deletions(-)
+
+--- a/arch/x86/kernel/x8664_ksyms_64.c
++++ b/arch/x86/kernel/x8664_ksyms_64.c
+@@ -29,8 +29,6 @@ EXPORT_SYMBOL(__put_user_8);
+ EXPORT_SYMBOL(copy_user_generic_string);
+ EXPORT_SYMBOL(copy_user_generic_unrolled);
+ EXPORT_SYMBOL(__copy_user_nocache);
+-EXPORT_SYMBOL(_copy_from_user);
+-EXPORT_SYMBOL(_copy_to_user);
+ 
+ EXPORT_SYMBOL(copy_page);
+ EXPORT_SYMBOL(clear_page);
+--- a/arch/x86/lib/copy_user_64.S
++++ b/arch/x86/lib/copy_user_64.S
+@@ -71,52 +71,6 @@
+ #endif
+ 	.endm
+ 
+-/* Standard copy_to_user with segment limit checking */
+-ENTRY(_copy_to_user)
+-	CFI_STARTPROC
+-	GET_THREAD_INFO(%rax)
+-	movq %rdi,%rcx
+-	addq %rdx,%rcx
+-	jc bad_to_user
+-	cmpq TI_addr_limit(%rax),%rcx
+-	ja bad_to_user
+-	ALTERNATIVE_JUMP X86_FEATURE_REP_GOOD,X86_FEATURE_ERMS,	\
+-		copy_user_generic_unrolled,copy_user_generic_string,	\
+-		copy_user_enhanced_fast_string
+-	CFI_ENDPROC
+-ENDPROC(_copy_to_user)
+-
+-/* Standard copy_from_user with segment limit checking */
+-ENTRY(_copy_from_user)
+-	CFI_STARTPROC
+-	GET_THREAD_INFO(%rax)
+-	movq %rsi,%rcx
+-	addq %rdx,%rcx
+-	jc bad_from_user
+-	cmpq TI_addr_limit(%rax),%rcx
+-	ja bad_from_user
+-	ALTERNATIVE_JUMP X86_FEATURE_REP_GOOD,X86_FEATURE_ERMS,	\
+-		copy_user_generic_unrolled,copy_user_generic_string,	\
+-		copy_user_enhanced_fast_string
+-	CFI_ENDPROC
+-ENDPROC(_copy_from_user)
+-
+-	.section .fixup,"ax"
+-	/* must zero dest */
+-ENTRY(bad_from_user)
+-bad_from_user:
+-	CFI_STARTPROC
+-	movl %edx,%ecx
+-	xorl %eax,%eax
+-	rep
+-	stosb
+-bad_to_user:
+-	movl %edx,%eax
+-	ret
+-	CFI_ENDPROC
+-ENDPROC(bad_from_user)
+-	.previous
+-
+ /*
+  * copy_user_generic_unrolled - memory copy with exception handling.
+  * This version is for CPUs like P4 that don't have efficient micro
+--- a/arch/x86/lib/usercopy.c
++++ b/arch/x86/lib/usercopy.c
+@@ -41,3 +41,52 @@ copy_from_user_nmi(void *to, const void
+ 	return len;
+ }
+ EXPORT_SYMBOL_GPL(copy_from_user_nmi);
++
++/**
++ * copy_to_user: - Copy a block of data into user space.
++ * @to:   Destination address, in user space.
++ * @from: Source address, in kernel space.
++ * @n:    Number of bytes to copy.
++ *
++ * Context: User context only. This function may sleep if pagefaults are
++ *          enabled.
++ *
++ * Copy data from kernel space to user space.
++ *
++ * Returns number of bytes that could not be copied.
++ * On success, this will be zero.
++ */
++unsigned long _copy_to_user(void __user *to, const void *from, unsigned n)
++{
++	if (access_ok(VERIFY_WRITE, to, n))
++		n = __copy_to_user(to, from, n);
++	return n;
++}
++EXPORT_SYMBOL(_copy_to_user);
++
++/**
++ * copy_from_user: - Copy a block of data from user space.
++ * @to:   Destination address, in kernel space.
++ * @from: Source address, in user space.
++ * @n:    Number of bytes to copy.
++ *
++ * Context: User context only. This function may sleep if pagefaults are
++ *          enabled.
++ *
++ * Copy data from user space to kernel space.
++ *
++ * Returns number of bytes that could not be copied.
++ * On success, this will be zero.
++ *
++ * If some data could not be copied, this function will pad the copied
++ * data to the requested size using zero bytes.
++ */
++unsigned long _copy_from_user(void *to, const void __user *from, unsigned n)
++{
++	if (access_ok(VERIFY_READ, from, n))
++		n = __copy_from_user(to, from, n);
++	else
++		memset(to, 0, n);
++	return n;
++}
++EXPORT_SYMBOL(_copy_from_user);
+--- a/arch/x86/lib/usercopy_32.c
++++ b/arch/x86/lib/usercopy_32.c
+@@ -839,54 +839,6 @@ unsigned long __copy_from_user_ll_nocach
+ }
+ EXPORT_SYMBOL(__copy_from_user_ll_nocache_nozero);
+ 
+-/**
+- * copy_to_user: - Copy a block of data into user space.
+- * @to:   Destination address, in user space.
+- * @from: Source address, in kernel space.
+- * @n:    Number of bytes to copy.
+- *
+- * Context: User context only.  This function may sleep.
+- *
+- * Copy data from kernel space to user space.
+- *
+- * Returns number of bytes that could not be copied.
+- * On success, this will be zero.
+- */
+-unsigned long
+-copy_to_user(void __user *to, const void *from, unsigned long n)
+-{
+-	if (access_ok(VERIFY_WRITE, to, n))
+-		n = __copy_to_user(to, from, n);
+-	return n;
+-}
+-EXPORT_SYMBOL(copy_to_user);
+-
+-/**
+- * copy_from_user: - Copy a block of data from user space.
+- * @to:   Destination address, in kernel space.
+- * @from: Source address, in user space.
+- * @n:    Number of bytes to copy.
+- *
+- * Context: User context only.  This function may sleep.
+- *
+- * Copy data from user space to kernel space.
+- *
+- * Returns number of bytes that could not be copied.
+- * On success, this will be zero.
+- *
+- * If some data could not be copied, this function will pad the copied
+- * data to the requested size using zero bytes.
+- */
+-unsigned long _copy_from_user(void *to, const void __user *from, unsigned n)
+-{
+-	if (access_ok(VERIFY_READ, from, n))
+-		n = __copy_from_user(to, from, n);
+-	else
+-		memset(to, 0, n);
+-	return n;
+-}
+-EXPORT_SYMBOL(_copy_from_user);
+-
+ void copy_from_user_overflow(void)
+ {
+ 	WARN(1, "Buffer overflow detected!\n");
