@@ -1,0 +1,150 @@
+From: "Borislav Petkov (AMD)" <bp@alien8.de>
+Date: Fri, 11 Aug 2023 23:38:24 +0200
+Subject: x86/CPU/AMD: Fix the DIV(0) initial fix attempt
+Git-commit: f58d6fbcb7c848b7f2469be339bc571f2e9d245b
+Patch-mainline: v6.5-rc7
+References: bsc#1213927, CVE-2023-20588
+
+Initially, it was thought that doing an innocuous division in the #DE
+handler would take care to prevent any leaking of old data from the
+divider but by the time the fault is raised, the speculation has already
+advanced too far and such data could already have been used by younger
+operations.
+
+Therefore, do the innocuous division on every exit to userspace so that
+userspace doesn't see any potentially old data from integer divisions in
+kernel space.
+
+Do the same before VMRUN too, to protect host data from leaking into the
+guest too.
+
+Fixes: 77245f1c3c64 ("x86/CPU/AMD: Do not leak quotient data after a division by 0")
+Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+Cc: <stable@kernel.org>
+Link: https://lore.kernel.org/r/20230811213824.10025-1-bp@alien8.de
+
+Acked-by: nborisov <nik.borisov@suse.com>
+---
+ arch/x86/kernel/cpu/amd.c  |   19 ++++++++++++++++---
+ arch/x86/kernel/entry_64.S |    3 +++
+ arch/x86/kernel/traps.c    |   18 +-----------------
+ arch/x86/kvm/svm.c         |    2 ++
+ 4 files changed, 22 insertions(+), 20 deletions(-)
+
+--- a/arch/x86/kernel/cpu/amd.c
++++ b/arch/x86/kernel/cpu/amd.c
+@@ -916,14 +916,17 @@ bool cpu_has_amd_erratum(const int *erra
+ 
+ EXPORT_SYMBOL_GPL(cpu_has_amd_erratum);
+ 
++static bool div0_bug = false;
++
+ static void zenbleed_check_cpu(void *unused)
+ {
+ 	struct cpuinfo_x86 *c = &cpu_data(smp_processor_id());
+ 
+ 	zenbleed_check(c);
+ 
+-	if (cpu_has_amd_erratum(c, amd_div0)) {
++	if (cpu_has_amd_erratum(amd_div0)) {
+ 		pr_notice_once("AMD Zen1 DIV0 bug detected. Disable SMT for full protection.\n");
++		div0_bug = true;
+ 	}
+ }
+ 
+@@ -933,12 +936,22 @@ void amd_check_microcode(void)
+ }
+ EXPORT_SYMBOL_GPL(amd_check_microcode);
+ 
++#ifdef CONFIG_X86_64
++#define R "r"
++#else
++#define R "e"
++#endif
++
+ /*
+  * Issue a DIV 0/1 insn to clear any division data from previous DIV
+  * operations.
+  */
+ void amd_clear_divider(void)
+ {
+-	asm volatile(ALTERNATIVE("", "div %2\n\t", X86_BUG_DIV0)
+-		     :: "a" (0), "d" (0), "r" (1));
++
++	if (div0_bug) {
++		asm volatile("push %%"R"ax" :::);
++		asm volatile("div %%al\n\tpop %%"R"ax\n" ::"a"(1));
++	}
+ }
++EXPORT_SYMBOL_GPL(amd_clear_divider);
+--- a/arch/x86/kernel/entry_64.S
++++ b/arch/x86/kernel/entry_64.S
+@@ -567,6 +567,7 @@ sysret_check:
+ 	/*CFI_REGISTER	rflags,r11*/
+ 
+ 	call mds_clear_user
++	call amd_clear_divider
+ 	DISABLE_IBRS
+ 	/*
+ 	 * This opens a window where we have a user CR3, but are
+@@ -944,6 +945,7 @@ retint_swapgs:		/* return to user-space
+ 
+ swapgs_restore_regs_and_return_to_usermode:
+ 	call mds_clear_user
++	call amd_clear_divider
+ 	DISABLE_IBRS
+ 	/*
+ 	 * Returning from an interrupt/NMI/exception to user space, currently
+@@ -1026,6 +1028,7 @@ native_irq_return_ldt:
+ 	orq PER_CPU_VAR(espfix_stack),%rax
+ 
+ 	call mds_clear_user
++	call amd_clear_divider
+ 	DISABLE_IBRS
+ 
+ 	SWITCH_USER_CR3
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@ -217,23 +217,7 @@ dotraplinkage void do_##name(struct pt_r
+ 	do_trap(trapnr, signr, str, regs, error_code, &info);		\
+ }
+ 
+-
+-dotraplinkage void do_divide_error(struct pt_regs *regs, long error_code)
+-{V
+-	siginfo_t info;
+-	info.si_signo = SIGFPE;
+-	info.si_errno = 0;
+-	info.si_code = FPE_INTDIV;
+-	info.si_addr = (void __user *)regs->ip;
+-	if (notify_die(DIE_TRAP, "divide error", regs, error_code, trapnr, SIGFPE)
+-							== NOTIFY_STOP)
+-		return;
+-	conditional_sti(regs);
+-	do_trap(trapnr, SIGFPE, "divide error", regs, error_code, &info);
+-	amd_clear_divider();
+-}
+-
+-//DO_ERROR_INFO(0, SIGFPE, "divide error", divide_error, FPE_INTDIV, regs->ip)
++DO_ERROR_INFO(0, SIGFPE, "divide error", divide_error, FPE_INTDIV, regs->ip)
+ DO_ERROR(4, SIGSEGV, "overflow", overflow)
+ DO_ERROR(5, SIGSEGV, "bounds", bounds)
+ DO_ERROR_INFO(6, SIGILL, "invalid opcode", invalid_op, ILL_ILLOPN, regs->ip)
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -36,6 +36,7 @@
+ #include <asm/spec_ctrl.h>
+ #include <asm/nospec-branch.h>
+ #include <asm/cpu_device_id.h>
++#include <asm/processor.h>
+ 
+ #include <asm/virtext.h>
+ #include <asm/spec-ctrl.h>
+@@ -3822,6 +3823,7 @@ static void svm_vcpu_run(struct kvm_vcpu
+ 
+ 	clgi();
+ 
++	amd_clear_divider();
+ 	local_irq_enable();
+ 
+ 	if (static_cpu_has(X86_FEATURE_SPEC_CTRL_MSR))
