@@ -1,0 +1,132 @@
+From: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+Date: Tue, 13 Feb 2024 18:21:35 -0800
+Subject: x86/bugs: Add asm helpers for executing VERW
+Git-repo: git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip.git
+Git-commit: baf8361e54550a48a7087b603313ad013cc13386
+Patch-mainline: Queued in subsystem maintainer repo
+References: git-fixes
+
+MDS mitigation requires clearing the CPU buffers before returning to
+user. This needs to be done late in the exit-to-user path. Current
+location of VERW leaves a possibility of kernel data ending up in CPU
+buffers for memory accesses done after VERW such as:
+
+  1. Kernel data accessed by an NMI between VERW and return-to-user can
+     remain in CPU buffers since NMI returning to kernel does not
+     execute VERW to clear CPU buffers.
+  2. Alyssa reported that after VERW is executed,
+     CONFIG_GCC_PLUGIN_STACKLEAK=y scrubs the stack used by a system
+     call. Memory accesses during stack scrubbing can move kernel stack
+     contents into CPU buffers.
+  3. When caller saved registers are restored after a return from
+     function executing VERW, the kernel stack accesses can remain in
+     CPU buffers(since they occur after VERW).
+
+To fix this VERW needs to be moved very late in exit-to-user path.
+
+In preparation for moving VERW to entry/exit asm code, create macros
+that can be used in asm. Also make VERW patching depend on a new feature
+flag X86_FEATURE_CLEAR_CPU_BUF.
+
+Reported-by: Alyssa Milburn <alyssa.milburn@intel.com>
+Suggested-by: Andrew Cooper <andrew.cooper3@citrix.com>
+Suggested-by: Peter Zijlstra <peterz@infradead.org>
+Cc:  <stable@kernel.org>
+Signed-off-by: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+Acked-by: Nikolay Borisov <nik.borisov@suse.com>
+---
+ arch/x86/include/asm/cpufeature.h    |    1 +
+ arch/x86/include/asm/nospec-branch.h |   21 +++++++++++++++++++++
+ arch/x86/kernel/Makefile             |    2 +-
+ arch/x86/kernel/entry.S              |   26 ++++++++++++++++++++++++++
+ 4 files changed, 49 insertions(+), 1 deletion(-)
+
+--- a/arch/x86/include/asm/cpufeature.h
++++ b/arch/x86/include/asm/cpufeature.h
+@@ -197,6 +197,7 @@
+ #define X86_FEATURE_FENCE_SWAPGS_USER	(7*32+ 24) /* "" LFENCE in user entry SWAPGS path */
+ #define X86_FEATURE_FENCE_SWAPGS_KERNEL	(7*32+ 25) /* "" LFENCE in kernel entry SWAPGS path */
+ 
++#define X86_FEATURE_CLEAR_CPU_BUF ( 7*32+26) /* "" Clear CPU buffers using VERW */
+ #define X86_FEATURE_AMD_SSBD     ( 7*32+27)  /* "" AMD SSBD implementation */
+ #define X86_FEATURE_SPEC_STORE_BYPASS_DISABLE  ( 7*32+28) /* "" Disable Speculative Store Bypass. */
+ #define X86_FEATURE_RETPOLINE	( 7*32+29) /* Generic Retpoline mitigation for Spectre variant 2 */
+--- a/arch/x86/include/asm/nospec-branch.h
++++ b/arch/x86/include/asm/nospec-branch.h
+@@ -122,8 +122,28 @@
+ #endif
+ .endm
+ 
++
++/*
++ * Macro to execute VERW instruction that mitigate transient data sampling
++ * attacks such as MDS. On affected systems a microcode update overloaded VERW
++ * instruction to also clear the CPU buffers. VERW clobbers CFLAGS.ZF.
++ *
++ * Note: Only the memory operand variant of VERW clears the CPU buffers.
++ */
++.macro CLEAR_CPU_BUFFERS
++        ALTERNATIVE "jmp .Lskip_verw_\@", ASM_NOP2, X86_FEATURE_CLEAR_CPU_BUF
++        verw _ASM_RIP(mds_verw_sel)
++.Lskip_verw_\@:
++.endm
++
+ #else /* __ASSEMBLY__ */
+ 
++#define CLEAR_CPU_BUFFERS \
++        ALTERNATIVE("jmp 1f\t\n",  ASM_NOP2 "\t\n" , X86_FEATURE_CLEAR_CPU_BUF) \
++        "verw " _ASM_RIP(mds_verw_sel) " \t\n"                             \
++        "1:\t\n"
++
++
+ #if defined(CONFIG_X86_64) && defined(RETPOLINE)
+ 
+ /*
+@@ -217,6 +237,7 @@ static inline void vmexit_fill_RSB(void)
+ 
+ extern bool mds_user_clear;
+ extern bool mds_idle_clear;
++extern u16 mds_verw_sel;
+ 
+ /**
+  * mds_clear_cpu_buffers - Mitigation for MDS and TAA vulnerability
+--- a/arch/x86/kernel/Makefile
++++ b/arch/x86/kernel/Makefile
+@@ -37,7 +37,7 @@ CFLAGS_REMOVE_vread_tsc_64.o = -pg -fno-
+ 
+ CFLAGS_REMOVE_vsyscall_64.o = $(RETPOLINE_CFLAGS)
+ 
+-obj-y			:= process_$(BITS).o signal.o entry_$(BITS).o
++obj-y			:= entry.o process_$(BITS).o signal.o entry_$(BITS).o
+ obj-y			+= traps.o irq.o irq_$(BITS).o dumpstack_$(BITS).o
+ obj-y			+= time.o ioport.o ldt.o dumpstack.o
+ obj-y			+= setup.o x86_init.o i8259.o irqinit.o jump_label.o
+--- /dev/null
++++ b/arch/x86/kernel/entry.S
+@@ -0,0 +1,26 @@
++#include <asm-generic/export.h>
++#include <asm/segment.h>
++#include <asm/cache.h>
++
++
++/*
++ * Define the VERW operand that is disguised as entry code so that
++ * it can be referenced with KPTI enabled. This ensure VERW can be
++ * used late in exit-to-user path after page tables are switched.
++ */
++.pushsection .entry.text, "ax"
++
++.align L1_CACHE_BYTES, 0xcc
++	.globl mds_verw_sel
++mds_verw_sel:
++	.word __KERNEL_DS
++.align L1_CACHE_BYTES, 0xcc
++	.type mds_verw_sel STT_NOTYPE
++	.set .L__sym_size_mds_verw_sel, .-mds_verw_sel
++	.size mds_verw_sel, .L__sym_size_mds_verw_sel
++
++/* For KVM */
++EXPORT_SYMBOL_GPL(mds_verw_sel);
++
++.popsection
++

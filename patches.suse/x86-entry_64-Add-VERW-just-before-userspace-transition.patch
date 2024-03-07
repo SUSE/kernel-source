@@ -1,0 +1,104 @@
+From: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+Date: Tue, 13 Feb 2024 18:21:52 -0800
+Subject: x86/entry_64: Add VERW just before userspace transition
+Git-repo: git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip.git
+Git-commit: 3c7501722e6b31a6e56edd23cea5e77dbb9ffd1a
+Patch-mainline: Queued in subsystem maintainer repo
+References: git-fixes
+
+Mitigation for MDS is to use VERW instruction to clear any secrets in
+CPU Buffers. Any memory accesses after VERW execution can still remain
+in CPU buffers. It is safer to execute VERW late in return to user path
+to minimize the window in which kernel data can end up in CPU buffers.
+There are not many kernel secrets to be had after SWITCH_TO_USER_CR3.
+
+Add support for deploying VERW mitigation after user register state is
+restored. This helps minimize the chances of kernel data ending up into
+CPU buffers after executing VERW.
+
+Note that the mitigation at the new location is not yet enabled.
+
+  Corner case not handled
+  =======================
+  Interrupts returning to kernel don't clear CPUs buffers since the
+  exit-to-user path is expected to do that anyways. But, there could be
+  a case when an NMI is generated in kernel after the exit-to-user path
+  has cleared the buffers. This case is not handled and NMI returning to
+  kernel don't clear CPU buffers because:
+
+  1. It is rare to get an NMI after VERW, but before returning to userspace.
+  2. For an unprivileged user, there is no known way to make that NMI
+     less rare or target it.
+  3. It would take a large number of these precisely-timed NMIs to mount
+     an actual attack.  There's presumably not enough bandwidth.
+  4. The NMI in question occurs after a VERW, i.e. when user state is
+     restored and most interesting data is already scrubbed. Whats left
+     is only the data that NMI touches, and that may or may not be of
+     any interest.
+
+Suggested-by: Dave Hansen <dave.hansen@intel.com>
+Cc:  <stable@kernel.org>
+Signed-off-by: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+Acked-by: Nikolay Borisov <nik.borisov@suse.com>
+---
+ arch/x86/include/asm/irqflags.h |    1 +
+ arch/x86/kernel/entry_64.S      |   10 ++++++++++
+ 2 files changed, 11 insertions(+)
+
+--- a/arch/x86/include/asm/irqflags.h
++++ b/arch/x86/include/asm/irqflags.h
+@@ -135,6 +135,7 @@ static inline unsigned long arch_local_i
+ #define INTERRUPT_RETURN	jmp native_iret
+ #define USERGS_SYSRET64				\
+ 	swapgs;					\
++	CLEAR_CPU_BUFFERS;			\
+ 	sysretq;
+ #define USERGS_SYSRET32				\
+ 	swapgs;					\
+--- a/arch/x86/kernel/entry_64.S
++++ b/arch/x86/kernel/entry_64.S
+@@ -179,6 +179,7 @@ GLOBAL(return_to_handler)
+ #ifdef CONFIG_PARAVIRT
+ ENTRY(native_usergs_sysret64)
+ 	swapgs
++	CLEAR_CPU_BUFFERS
+ 	sysretq
+ ENDPROC(native_usergs_sysret64)
+ #endif /* CONFIG_PARAVIRT */
+@@ -964,6 +965,7 @@ swapgs_restore_regs_and_return_to_usermo
+ 	movq (%rax), %rax
+ 	SWITCH_USER_CR3_NO_STACK
+ 	SWAPGS
++	CLEAR_CPU_BUFFERS
+ 	jmp irq_return
+ 
+ paranoid_userspace_restore_all:
+@@ -1035,6 +1037,7 @@ native_irq_return_ldt:
+ 	SWAPGS
+ 	movq %rax,%rsp
+ 	popq_cfi %rax
++	CLEAR_CPU_BUFFERS
+ 	jmp native_irq_return_iret
+ #endif
+ 
+@@ -2013,6 +2016,12 @@ nmi_restore:
+ 	movq    $0, 5*8(%rsp)           /* clear "NMI executing" */
+ 
+ 	/*
++	 * Skip CLEAR_CPU_BUFFERS here, since it only helps in rare cases like
++	 * NMI in kernel after user state is restored. For an unprivileged user
++	 * these conditions are hard to meet.
++	 /*
++
++	/*
+ 	 * INTERRUPT_RETURN reads the "iret" frame and exits the NMI
+ 	 * stack in a single instruction.  We are returning to kernel
+ 	 * mode, so this cannot result in a fault.
+@@ -2045,6 +2054,7 @@ end_repeat_nmi:
+ ENTRY(ignore_sysret)
+ 	CFI_STARTPROC
+ 	mov $-ENOSYS,%eax
++	CLEAR_CPU_BUFFERS
+ 	sysret
+ 	CFI_ENDPROC
+ END(ignore_sysret)
