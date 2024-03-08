@@ -1,0 +1,366 @@
+From: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+Date: Tue, 5 Mar 2024 15:21:53 +0200
+Subject: x86/rfds: Mitigate Register File Data Sampling (RFDS)
+Patch-mainline: Not yet, embargo
+References: bsc#1213456 CVE-2023-28746
+
+RFDS is a CPU vulnerability that may allow userspace to infer kernel
+stale data previously used in floating point registers, vector registers
+and integer registers. RFDS only affects certain Intel Atom processors.
+
+Intel released a microcode update that uses VERW instruction to clear
+the affected CPU buffers. Unlike MDS, none of the affected cores support
+SMT.
+
+Add RFDS bug infrastructure and enable the VERW based mitigation by
+default, that clears the affected buffers just before exiting to
+userspace. Also add sysfs reporting and cmdline parameter
+"reg_file_data_sampling" to control the mitigation.
+
+For details see:
+Documentation/admin-guide/hw-vuln/reg-file-data-sampling.rst
+
+Acked-by: Josh Poimboeuf <jpoimboe@kernel.org>
+Signed-off-by: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+Acked-by: Nikolay Borisov <nik.borisov@suse.com>
+---
+ Documentation/ABI/testing/sysfs-devices-system-cpu |    1 
+ Documentation/kernel-parameters.txt                |   29 +++++
+ arch/x86/Kconfig                                   |    2 
+ arch/x86/include/asm/msr-index.h                   |    8 +
+ arch/x86/kernel/cpu/bugs.c                         |  103 ++++++++++++++++++++-
+ drivers/base/cpu.c                                 |    8 +
+ include/linux/cpu.h                                |    2 
+ 7 files changed, 145 insertions(+), 8 deletions(-)
+
+--- a/Documentation/ABI/testing/sysfs-devices-system-cpu
++++ b/Documentation/ABI/testing/sysfs-devices-system-cpu
+@@ -211,6 +211,7 @@ What:		/sys/devices/system/cpu/vulnerabi
+ 		/sys/devices/system/cpu/vulnerabilities/srbds
+ 		/sys/devices/system/cpu/vulnerabilities/itlb_multihit
+ 		/sys/devices/system/cpu/vulnerabilities/mmio_stale_data
++		/sys/devices/system/cpu/vulnerabilities/reg_file_data_sampling
+ Date:		January 2018
+ Contact:	Linux kernel mailing list <linux-kernel@vger.kernel.org>
+ Description:	Information about CPU vulnerabilities
+--- a/Documentation/kernel-parameters.txt
++++ b/Documentation/kernel-parameters.txt
+@@ -696,6 +696,26 @@ bytes respectively. Such letter suffixes
+ 			The filter can be disabled or changed to another
+ 			driver later using sysfs.
+ 
++	reg_file_data_sampling=
++			[X86] Controls mitigation for Register File Data
++			Sampling (RFDS) vulnerability. RFDS is a CPU
++			vulnerability which may allow userspace to infer
++			kernel data values previously stored in floating point
++			registers, vector registers, or integer registers.
++			RFDS only affects Intel Atom processors.
++
++			on:	Turns ON the mitigation.
++			off:	Turns OFF the mitigation.
++
++			This parameter overrides the compile time default set
++			by CONFIG_MITIGATION_RFDS. Mitigation cannot be
++			disabled when other VERW based mitigations (like MDS)
++			are enabled. In order to disable RFDS mitigation all
++			VERW based mitigations need to be disabled.
++
++			For details see:
++			Documentation/admin-guide/hw-vuln/reg-file-data-sampling.rst
++
+ 	drm_kms_helper.edid_firmware=[<connector>:]<file>
+ 			Broken monitors, graphic adapters and KVMs may
+ 			send no or incorrect EDID data sets. This parameter
+@@ -840,7 +860,7 @@ bytes respectively. Such letter suffixes
+ 			tracer at boot up. function-list is a comma separated
+ 			list of functions. This list can be changed at run
+ 			time by the set_ftrace_filter file in the debugfs
+-			tracing directory. 
++			tracing directory.
+ 
+ 	ftrace_notrace=[function-list]
+ 			[FTRACE] Do not trace the functions specified in
+@@ -1360,10 +1380,10 @@ bytes respectively. Such letter suffixes
+ 			libata.dma=0	  Disable all PATA and SATA DMA
+ 			libata.dma=1	  PATA and SATA Disk DMA only
+ 			libata.dma=2	  ATAPI (CDROM) DMA only
+-			libata.dma=4	  Compact Flash DMA only 
++			libata.dma=4	  Compact Flash DMA only
+ 			Combinations also work, so libata.dma=3 enables DMA
+ 			for disks and CDROMs, but not CFs.
+-	
++
+ 	libata.ignore_hpa=	[LIBATA] Ignore HPA limit
+ 			libata.ignore_hpa=0	  keep BIOS limits (default)
+ 			libata.ignore_hpa=1	  ignore limits, using full disk
+@@ -1675,6 +1695,7 @@ bytes respectively. Such letter suffixes
+ 					       nospectre_v1 [x86,PPC]
+ 					       nobp=0 [S390]
+ 					       nospectre_v2 [X86,PPC,S390]
++					       reg_file_data_sampling=off [X86]
+ 					       spectre_v2_user=off [X86]
+ 					       spec_store_bypass_disable=off [X86,PPC]
+ 					       l1tf=off [X86]
+@@ -2359,7 +2380,7 @@ bytes respectively. Such letter suffixes
+ 			Format: { parport<nr> | timid | 0 }
+ 			See also Documentation/parport.txt.
+ 
+-	pmtmr=		[X86] Manual setup of pmtmr I/O Port. 
++	pmtmr=		[X86] Manual setup of pmtmr I/O Port.
+ 			Override pmtimer IOPort with a hex value.
+ 			e.g. pmtmr=0x508
+ 
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -604,6 +604,8 @@ config PARAVIRT_CLOCK
+ config PARAVIRT_MMU
+ 	bool
+ 
++
++
+ endif
+ 
+ config PARAVIRT_DEBUG
+--- a/arch/x86/include/asm/msr-index.h
++++ b/arch/x86/include/asm/msr-index.h
+@@ -97,6 +97,14 @@
+ 						 * CPU is not vulnerable to Gather
+ 						 * Data Sampling (GDS).
+ 						 */
++#define ARCH_CAP_RFDS_NO		BIT(27)	/*
++						 * Not susceptible to Register
++						 * File Data Sampling.
++						 */
++#define ARCH_CAP_RFDS_CLEAR		BIT(28)	/*
++						 * VERW clears CPU Register
++						 * File.
++						 */
+ 
+ #define MSR_IA32_FLUSH_CMD		0x0000010b
+ #define L1D_FLUSH			(1 << 0)   /*
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@ -507,6 +507,8 @@ static bool x86_bug_mmio;
+ 
+ bool x86_bug_gds = false;
+ 
++bool x86_bug_rfds = false;
++
+ #undef pr_fmt
+ #define pr_fmt(fmt)	"MMIO Stale Data: " fmt
+ 
+@@ -598,6 +600,57 @@ static int __init mmio_stale_data_parse_
+ early_param("mmio_stale_data", mmio_stale_data_parse_cmdline);
+ 
+ #undef pr_fmt
++#define pr_fmt(fmt)	"Register File Data Sampling: " fmt
++
++enum rfds_mitigations {
++	RFDS_MITIGATION_OFF,
++	RFDS_MITIGATION_VERW,
++	RFDS_MITIGATION_UCODE_NEEDED,
++};
++
++/* Default mitigation for Register File Data Sampling */
++static enum rfds_mitigations rfds_mitigation = RFDS_MITIGATION_VERW;
++
++static const char * const rfds_strings[] = {
++	[RFDS_MITIGATION_OFF]			= "Vulnerable",
++	[RFDS_MITIGATION_VERW]			= "Mitigation: Clear Register File",
++	[RFDS_MITIGATION_UCODE_NEEDED]		= "Vulnerable: No microcode",
++};
++
++static void __init rfds_select_mitigation(void)
++{
++	if (!x86_bug_rfds || cpu_mitigations_off()) {
++		rfds_mitigation = RFDS_MITIGATION_OFF;
++		return;
++	}
++	if (rfds_mitigation == RFDS_MITIGATION_OFF)
++		return;
++
++	if (x86_read_arch_cap_msr() & ARCH_CAP_RFDS_CLEAR)
++		setup_force_cpu_cap(X86_FEATURE_CLEAR_CPU_BUF);
++	else
++		rfds_mitigation = RFDS_MITIGATION_UCODE_NEEDED;
++}
++
++static __init int rfds_parse_cmdline(char *str)
++{
++	if (!str)
++		return -EINVAL;
++
++	if (!x86_bug_rfds)
++		return 0;
++
++	if (!strcmp(str, "off"))
++		rfds_mitigation = RFDS_MITIGATION_OFF;
++	else if (!strcmp(str, "on"))
++		rfds_mitigation = RFDS_MITIGATION_VERW;
++
++	return 0;
++}
++early_param("reg_file_data_sampling", rfds_parse_cmdline);
++
++
++#undef pr_fmt
+ #define pr_fmt(fmt)     "" fmt
+ 
+ static void __init md_clear_update_mitigation(void)
+@@ -625,6 +678,10 @@ static void __init md_clear_update_mitig
+ 		mmio_mitigation = MMIO_MITIGATION_VERW;
+ 		mmio_select_mitigation();
+ 	}
++	if (rfds_mitigation == RFDS_MITIGATION_OFF && x86_bug_rfds) {
++		rfds_mitigation = RFDS_MITIGATION_VERW;
++		rfds_select_mitigation();
++	}
+ out:
+ 	if (x86_bug_mds)
+ 		pr_info("MDS: %s\n", mds_strings[mds_mitigation]);
+@@ -632,6 +689,8 @@ out:
+ 		pr_info("TAA: %s\n", taa_strings[taa_mitigation]);
+ 	if (x86_bug_mmio)
+ 		pr_info("MMIO Stale Data: %s\n", mmio_strings[mmio_mitigation]);
++	if (x86_bug_rfds)
++		pr_info("Register File Data Sampling: %s\n", rfds_strings[rfds_mitigation]);
+ }
+ 
+ static void __init md_clear_select_mitigation(void)
+@@ -639,11 +698,12 @@ static void __init md_clear_select_mitig
+ 	mds_select_mitigation();
+ 	taa_select_mitigation();
+ 	mmio_select_mitigation();
++	rfds_select_mitigation();
+ 
+ 	/*
+-	 * As MDS, TAA and MMIO Stale Data mitigations are inter-related, update
+-	 * and print their mitigation after MDS, TAA and MMIO Stale Data
+-	 * mitigation selection is done.
++	 * As these mitigations are inter-related and rely on VERW instruction
++	 * to clear the microarchitural buffers, update and print their status
++	 * after mitigation selection is done for each of these vulnerabilities.
+ 	 */
+ 	md_clear_update_mitigation();
+ }
+@@ -1199,6 +1259,8 @@ static const __initconst struct x86_cpu_
+ #define RETBLEED	BIT(2)
+ /* CPU is affected by GDS */
+ #define GDS		BIT(5)
++/* CPU is affected by Register File Data Sampling */
++#define RFDS		BIT(6)
+ 
+ static const struct x86_cpu_id cpu_vuln_blacklist[] __initconst = {
+ 	VULNBL_INTEL_STEPPINGS(IVYBRIDGE,	X86_STEPPING_ANY,		SRBDS),
+@@ -1222,7 +1284,10 @@ static const struct x86_cpu_id cpu_vuln_
+ 	VULNBL_INTEL_STEPPINGS(KABYLAKE_MOBILE,	X86_STEPPINGS(0x0, 0x8),	SRBDS | GDS),
+ 	VULNBL_INTEL_STEPPINGS(KABYLAKE_DESKTOP, X86_STEPPINGS(0x9, 0xD),	SRBDS | MMIO | GDS),
+ 	VULNBL_INTEL_STEPPINGS(KABYLAKE_DESKTOP, X86_STEPPINGS(0x0, 0x8),	SRBDS | GDS),
+-	VULNBL_INTEL_STEPPINGS(ATOM_TREMONT_X,	X86_STEPPING_ANY,		MMIO),
++	VULNBL_INTEL_STEPPINGS(ATOM_TREMONT_X,	X86_STEPPING_ANY,		MMIO | RFDS),
++	VULNBL_INTEL_STEPPINGS(ATOM_GOLDMONT,	X86_STEPPING_ANY,		RFDS),
++	VULNBL_INTEL_STEPPINGS(ATOM_GOLDMONT_X,	X86_STEPPING_ANY,		RFDS),
++	VULNBL_INTEL_STEPPINGS(ATOM_GOLDMONT_PLUS, X86_STEPPING_ANY,		RFDS),
+ 	{}
+ };
+ 
+@@ -1257,6 +1322,24 @@ static bool arch_cap_mmio_immune(u64 ia3
+ 		ia32_cap & ARCH_CAP_SBDR_SSDP_NO);
+ }
+ 
++static bool __init vulnerable_to_rfds(u64 ia32_cap)
++{
++	/* The "immunity" bit trumps everything else: */
++	if (ia32_cap & ARCH_CAP_RFDS_NO)
++		return false;
++
++	/*
++	 * VMMs set ARCH_CAP_RFDS_CLEAR for processors not in the blacklist to
++	 * indicate that mitigation is needed because guest is running on a
++	 * vulnerable hardware or may migrate to such hardware:
++	 */
++	if (ia32_cap & ARCH_CAP_RFDS_CLEAR)
++		return true;
++
++	/* Only consult the blacklist when there is no enumeration: */
++	return cpu_matches(cpu_vuln_blacklist, RFDS);
++}
++
+ void setup_force_cpu_bugs(unsigned long __unused)
+ {
+ 	u64 ia32_cap = x86_read_arch_cap_msr();
+@@ -1334,6 +1417,10 @@ void setup_force_cpu_bugs(unsigned long
+ 	if (cpu_matches(cpu_vuln_blacklist, GDS) && !(ia32_cap & ARCH_CAP_GDS_NO) &&
+ 	    boot_cpu_has(X86_FEATURE_AVX))
+ 		x86_bug_gds = true;
++
++	if (vulnerable_to_rfds(ia32_cap))
++		x86_bug_rfds = true;
++
+ }
+ 
+ static void __init spec2_print_if_insecure(const char *reason)
+@@ -2145,12 +2232,20 @@ ssize_t cpu_show_mmio_stale_data(struct
+ 			  sched_smt_active() ? "vulnerable" : "disabled");
+ }
+ 
++ssize_t cpu_show_reg_file_data_sampling(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	if (!x86_bug_rfds)
++		return sprintf(buf, "Not affected\n");
++
++	return sprintf(buf, "%s\n", rfds_strings[rfds_mitigation]);
++}
+ 
+ static ssize_t gds_show_state(char *buf)
+ {
+ 	return sprintf(buf, "%s", gds_strings[gds_mitigation]);
+ }
+ 
++
+ ssize_t cpu_show_gds(struct device *dev, struct device_attribute *attr, char *buf)
+ {
+ 	if (!x86_bug_gds)
+--- a/drivers/base/cpu.c
++++ b/drivers/base/cpu.c
+@@ -313,6 +313,12 @@ ssize_t __weak cpu_show_gds(struct devic
+ 	return sprintf(buf, "Not affected\n");
+ }
+ 
++ssize_t __weak cpu_show_reg_file_data_sampling(struct device *dev,
++			    struct device_attribute *attr, char *buf)
++{
++	return sprintf(buf, "Not affected\n");
++}
++
+ static DEVICE_ATTR(meltdown, 0444, cpu_show_meltdown, NULL);
+ static DEVICE_ATTR(spectre_v1, 0444, cpu_show_spectre_v1, NULL);
+ static DEVICE_ATTR(spectre_v2, 0444, cpu_show_spectre_v2, NULL);
+@@ -325,6 +331,7 @@ static DEVICE_ATTR(srbds, 0444, cpu_show
+ static DEVICE_ATTR(retbleed, 0444, cpu_show_retbleed, NULL);
+ static DEVICE_ATTR(mmio_stale_data, 0444, cpu_show_mmio_stale_data, NULL);
+ static DEVICE_ATTR(gather_data_sampling, 0444, cpu_show_gds, NULL);
++static DEVICE_ATTR(reg_file_data_sampling, 0444, cpu_show_reg_file_data_sampling, NULL);
+ 
+ static struct attribute *cpu_root_vulnerabilities_attrs[] = {
+ 	&dev_attr_meltdown.attr,
+@@ -339,6 +346,7 @@ static struct attribute *cpu_root_vulner
+ 	&dev_attr_retbleed.attr,
+ 	&dev_attr_mmio_stale_data.attr,
+ 	&dev_attr_gather_data_sampling.attr,
++	&dev_attr_reg_file_data_sampling.attr,
+ 	NULL
+ };
+ 
+--- a/include/linux/cpu.h
++++ b/include/linux/cpu.h
+@@ -63,6 +63,8 @@ extern ssize_t cpu_show_mmio_stale_data(
+ 					char *buf);
+ extern ssize_t cpu_show_gds(struct device *dev, struct device_attribute *attr,
+ 			    char *buf);
++extern ssize_t cpu_show_reg_file_data_sampling(struct device *dev,
++					       struct device_attribute *attr, char *buf);
+ 
+ #ifdef CONFIG_HOTPLUG_CPU
+ extern void unregister_cpu(struct cpu *cpu);
