@@ -1,0 +1,244 @@
+From 22e111ed6c83dcde3037fc81176012721bc34c0b Mon Sep 17 00:00:00 2001
+From: Al Viro <viro@zeniv.linux.org.uk>
+Date: Sun, 19 Nov 2023 20:25:58 -0500
+Subject: [PATCH] rename(): fix the locking of subdirectories
+Git-commit: 22e111ed6c83dcde3037fc81176012721bc34c0b
+Patch-mainline: v6.8-rc1
+References: bsc#1221044 CVE-2023-52591
+
+	We should never lock two subdirectories without having taken
+->s_vfs_rename_mutex; inode pointer order or not, the "order" proposed
+in 28eceeda130f "fs: Lock moved directories" is not transitive, with
+the usual consequences.
+
+	The rationale for locking renamed subdirectory in all cases was
+the possibility of race between rename modifying .. in a subdirectory to
+reflect the new parent and another thread modifying the same subdirectory.
+For a lot of filesystems that's not a problem, but for some it can lead
+to trouble (e.g. the case when short directory contents is kept in the
+inode, but creating a file in it might push it across the size limit
+and copy its contents into separate data block(s)).
+
+	However, we need that only in case when the parent does change -
+otherwise ->rename() doesn't need to do anything with .. entry in the
+first place.  Some instances are lazy and do a tautological update anyway,
+but it's really not hard to avoid.
+
+Amended locking rules for rename():
+	find the parent(s) of source and target
+	if source and target have the same parent
+		lock the common parent
+	else
+		lock ->s_vfs_rename_mutex
+		lock both parents, in ancestor-first order; if neither
+		is an ancestor of another, lock the parent of source
+		first.
+	find the source and target.
+	if source and target have the same parent
+		if operation is an overwriting rename of a subdirectory
+			lock the target subdirectory
+	else
+		if source is a subdirectory
+			lock the source
+		if target is a subdirectory
+			lock the target
+	lock non-directories involved, in inode pointer order if both
+	source and target are such.
+
+That way we are guaranteed that parents are locked (for obvious reasons),
+that any renamed non-directory is locked (nfsd relies upon that),
+that any victim is locked (emptiness check needs that, among other things)
+and subdirectory that changes parent is locked (needed to protect the update
+of .. entries).  We are also guaranteed that any operation locking more
+than one directory either takes ->s_vfs_rename_mutex or locks a parent
+followed by its child.
+
+Cc: stable@vger.kernel.org
+Fixes: 28eceeda130f "fs: Lock moved directories"
+Reviewed-by: Jan Kara <jack@suse.cz>
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+Acked-by: Jan Kara <jack@suse.cz>
+
+---
+ Documentation/filesystems/Locking           |    7 ++--
+ Documentation/filesystems/directory-locking |   24 ++++++++------
+ Documentation/filesystems/porting           |   13 ++++++++
+ fs/namei.c                                  |   45 ++++++++++++++--------------
+ 4 files changed, 55 insertions(+), 34 deletions(-)
+
+--- a/Documentation/filesystems/Locking
++++ b/Documentation/filesystems/Locking
+@@ -74,7 +74,7 @@ symlink:	yes
+ mkdir:		yes
+ unlink:		yes (both)
+ rmdir:		yes (both)	(see below)
+-rename:		yes (all)	(see below)
++rename:		yes (both parents, some children)	(see below)
+ readlink:	no
+ follow_link:	no
+ put_link:	no
+@@ -92,8 +92,9 @@ fiemap:		no
+ update_time:	no
+ 
+ 	Additionally, ->rmdir(), ->unlink() and ->rename() have ->i_mutex on
+-victim.
+-	cross-directory ->rename() has (per-superblock) ->s_vfs_rename_sem.
++all non-directories involved.
++	cross-directory ->rename() has (per-superblock) ->s_vfs_rename_sem and
++->i_mutex on any subdirectory that changes parent.
+ 	->truncate() is never called directly - it's a callback, not a
+ method. It's called by vmtruncate() - deprecated library function used by
+ ->setattr(). Locking information above applies to that call (i.e. is
+--- a/Documentation/filesystems/directory-locking
++++ b/Documentation/filesystems/directory-locking
+@@ -15,11 +15,16 @@ that "inode pointer" order in the follow
+ 3) object removal.  Locking rules: caller locks parent, finds victim,
+ locks victim and calls the method.
+ 
+-4) rename() that is _not_ cross-directory.  Locking rules: caller locks the
+-parent and finds source and target.  We lock both (provided they exist).  If we
+-need to lock two inodes of different type (dir vs non-dir), we lock directory
+-first.  If we need to lock two inodes of the same type, lock them in inode
+-pointer order.  Then call the method.  All locks are exclusive.
++4) rename() that is _not_ cross-directory.  Locking rules: caller locks
++the parent and finds source and target.  Then we decide which of the
++source and target need to be locked.  Source needs to be locked if it's a
++non-directory; target - if it's a non-directory or about to be removed.
++Take the locks that need to be taken, in inode pointer order if need
++to take both (that can happen only when both source and target are
++non-directories - the source because it wouldn't be locked otherwise
++and the target because mixing directory and non-directory is allowed
++only with RENAME_EXCHANGE, and that won't be removing the target).
++After the locks had been taken, call the method.
+ 
+ 5) link creation.  Locking rules:
+ 	* lock parent
+@@ -31,16 +36,14 @@ pointer order.  Then call the method.  A
+ rules:
+ 	* lock the filesystem
+ 	* lock parents in "ancestors first" order. If one is not ancestor of
+-	  the other, lock them in inode pointer order.
++	  the other, lock the parent of source first.
+ 	* find source and target.
+ 	* if old parent is equal to or is a descendent of target
+ 		fail with -ENOTEMPTY
+ 	* if new parent is equal to or is a descendent of source
+ 		fail with -ELOOP
+-	* Lock both the source and the target provided they exist. If we
+-	  need to lock two inodes of different type (dir vs non-dir), we lock
+-	  the directory first. If we need to lock two inodes of the same type,
+-	  lock them in inode pointer order.
++	* Lock subdirectories involved (source before target).
++	* Lock non-directories involved, in inode pointer order.
+ 	* call the method.
+ 
+ 
+@@ -51,6 +54,7 @@ read, modified or removed by method will
+ If no directory is its own ancestor, the scheme above is deadlock-free.
+ Proof:
+ 
++[XXX: will be updated once we are done massaging the lock_rename()]
+ 	First of all, at any moment we have a linear ordering of the
+ 	objects - A < B iff (A is an ancestor of B) or (B is not an ancestor
+         of A and ptr(A) < ptr(B)).
+--- a/Documentation/filesystems/porting
++++ b/Documentation/filesystems/porting
+@@ -407,3 +407,16 @@ a file off.
+ a matter of switching from calling get_sb_... to mount_... and changing the
+ function type.  If you were doing it manually, just switch from setting ->mnt_root
+ to some pointer to returning that pointer.  On errors return ERR_PTR(...).
++--
++[mandatory]
++	If ->rename() update of .. on cross-directory move needs an exclusion
++	with directory modifications, do *not* lock the subdirectory in
++	question in your ->rename() - it's done by the caller now [that item
++	should've been added in 28eceeda130f "fs: Lock moved directories"].
++
++--
++[mandatory]
++	On same-directory ->rename() the (tautological) update of .. is not
++	protected by any locks; just don't do it if the old parent is the same
++	as the new one.  We really can't lock two subdirectories in
++	same-directory rename - not without deadlocks.
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -2122,20 +2122,14 @@ static struct dentry *lock_two_directori
+ 	p = d_ancestor(p2, p1);
+ 	if (p) {
+ 		mutex_lock_nested(&p2->d_inode->i_mutex, I_MUTEX_PARENT);
+-		mutex_lock_nested(&p1->d_inode->i_mutex, I_MUTEX_CHILD);
++		mutex_lock_nested(&p1->d_inode->i_mutex, I_MUTEX_PARENT2);
+ 		return p;
+ 	}
+ 
+ 	p = d_ancestor(p1, p2);
+-	if (p) {
+-		mutex_lock_nested(&p1->d_inode->i_mutex, I_MUTEX_PARENT);
+-		mutex_lock_nested(&p2->d_inode->i_mutex, I_MUTEX_CHILD);
+-		return p;
+-	}
+-
+-	lock_two_inodes(p1->d_inode, p2->d_inode,
+-			I_MUTEX_PARENT, I_MUTEX_PARENT2);
+-	return NULL;
++	mutex_lock_nested(&p1->d_inode->i_mutex, I_MUTEX_PARENT);
++	mutex_lock_nested(&p2->d_inode->i_mutex, I_MUTEX_PARENT2);
++	return p;
+ }
+ 
+ /*
+@@ -3308,11 +3302,12 @@ SYSCALL_DEFINE2(link, const char __user
+  * Problems:
+  *	a) we can get into loop creation. Check is done in is_subdir().
+  *	b) race potential - two innocent renames can create a loop together.
+- *	   That's where 4.4 screws up. Current fix: serialization on
++ *	   That's where 4.4BSD screws up. Current fix: serialization on
+  *	   sb->s_vfs_rename_mutex. We might be more accurate, but that's another
+  *	   story.
+- *	c) we have to lock _four_ objects - parents and victim (if it exists),
+- *	   and source.
++ *	c) we may have to lock up to _four_ objects - parents and victim (if it exists),
++ *	   and source (if it's a non-directory or a subdirectory that moves to
++ *	   different parent).
+  *	   And that - after we got ->i_mutex on parents (until then we don't know
+  *	   whether the target exists).  Solution: try to be smart with locking
+  *	   order for inodes.  We rely on the fact that tree topology may change
+@@ -3335,6 +3330,7 @@ static int vfs_rename_dir(struct inode *
+ {
+ 	int error = 0;
+ 	struct inode *target = new_dentry->d_inode;
++	struct inode *source = old_dentry->d_inode;
+ 
+ 	/*
+ 	 * If we are going to change the parent - check write permissions,
+@@ -3352,15 +3348,22 @@ static int vfs_rename_dir(struct inode *
+ 
+ 	dget(new_dentry);
+ 	/*
+-	 * Lock all moved children. Moved directories may need to change parent
+-	 * pointer so they need the lock to prevent against concurrent
+-	 * directory changes moving parent pointer. For regular files we've
+-	 * historically always done this. The lockdep locking subclasses are
+-	 * somewhat arbitrary but RENAME_EXCHANGE in particular can swap
+-	 * regular files and directories so it's difficult to tell which
+-	 * subclasses to use.
++	 * Lock children.
++	 * The source subdirectory needs to be locked on cross-directory
++	 * rename or cross-directory exchange since its parent changes.
++	 * The target subdirectory needs to be locked on cross-directory
++	 * exchange due to parent change and on any rename due to becoming
++	 * a victim.
++	 * Non-directories need locking in all cases (for NFS reasons);
++	 * they get locked after any subdirectories (in inode address order).
++	 *
++	 * NOTE: WE ONLY LOCK UNRELATED DIRECTORIES IN CROSS-DIRECTORY CASE.
++	 * NEVER, EVER DO THAT WITHOUT ->s_vfs_rename_mutex.
+ 	 */
+-	lock_two_inodes(source, target, I_MUTEX_NORMAL, I_MUTEX_NONDIR2);
++	if (new_dir != old_dir)
++		mutex_lock_nested(&source->i_mutex, I_MUTEX_CHILD);
++	if (target)
++		mutex_lock(&target->i_mutex);
+ 
+ 	error = -EBUSY;
+ 	if (d_mountpoint(old_dentry) || d_mountpoint(new_dentry))

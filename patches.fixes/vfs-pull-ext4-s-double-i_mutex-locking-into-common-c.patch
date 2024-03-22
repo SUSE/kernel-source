@@ -1,0 +1,85 @@
+From 375e289ea85166c5241c570940e7e7e966c63a9f Mon Sep 17 00:00:00 2001
+From: "J. Bruce Fields" <bfields@redhat.com>
+Date: Wed, 18 Apr 2012 15:16:33 -0400
+Subject: [PATCH] vfs: pull ext4's double-i_mutex-locking into common code
+Git-commit: 375e289ea85166c5241c570940e7e7e966c63a9f
+Patch-mainline: v3.13-rc1
+References: bsc#1221044 CVE-2023-52591
+
+We want to do this elsewhere as well.
+
+Also catch any attempts to use it for directories (where this ordering
+would conflict with ancestor-first directory ordering in lock_rename).
+
+[Partial commit, taking only VFS changes]
+
+Cc: Andreas Dilger <adilger.kernel@dilger.ca>
+Cc: Dave Chinner <david@fromorbit.com>
+Acked-by: Jeff Layton <jlayton@redhat.com>
+Acked-by: "Theodore Ts'o" <tytso@mit.edu>
+Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+Acked-by: Jan Kara <jack@suse.cz>
+
+---
+ fs/inode.c         |   36 ++++++++++++++++++++++++++++++++++++
+ include/linux/fs.h |    3 +++
+ 2 files changed, 39 insertions(+)
+
+--- a/fs/inode.c
++++ b/fs/inode.c
+@@ -927,6 +927,42 @@ void unlock_new_inode(struct inode *inod
+ EXPORT_SYMBOL(unlock_new_inode);
+ 
+ /**
++ * lock_two_nondirectories - take two i_mutexes on non-directory objects
++ * @inode1: first inode to lock
++ * @inode2: second inode to lock
++ */
++void lock_two_nondirectories(struct inode *inode1, struct inode *inode2)
++{
++	WARN_ON_ONCE(S_ISDIR(inode1->i_mode));
++	if (inode1 == inode2 || !inode2) {
++		mutex_lock_nested(&inode1->i_mutex, I_MUTEX_PARENT);
++		return;
++	}
++	WARN_ON_ONCE(S_ISDIR(inode2->i_mode));
++	if (inode1 < inode2) {
++		mutex_lock_nested(&inode1->i_mutex, I_MUTEX_PARENT);
++		mutex_lock_nested(&inode2->i_mutex, I_MUTEX_CHILD);
++	} else {
++		mutex_lock_nested(&inode2->i_mutex, I_MUTEX_PARENT);
++		mutex_lock_nested(&inode1->i_mutex, I_MUTEX_CHILD);
++	}
++}
++EXPORT_SYMBOL(lock_two_nondirectories);
++
++/**
++ * unlock_two_nondirectories - release locks from lock_two_nondirectories()
++ * @inode1: first inode to unlock
++ * @inode2: second inode to unlock
++ */
++void unlock_two_nondirectories(struct inode *inode1, struct inode *inode2)
++{
++	mutex_unlock(&inode1->i_mutex);
++	if (inode2 && inode2 != inode1)
++		mutex_unlock(&inode2->i_mutex);
++}
++EXPORT_SYMBOL(unlock_two_nondirectories);
++
++/**
+  * iget5_locked - obtain an inode from a mounted file system
+  * @sb:		super block of file system
+  * @hashval:	hash value (usually inode number) to get
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -871,6 +871,9 @@ enum inode_i_mutex_lock_class
+ 	I_MUTEX_QUOTA
+ };
+ 
++void lock_two_nondirectories(struct inode *, struct inode*);
++void unlock_two_nondirectories(struct inode *, struct inode*);
++
+ /*
+  * NOTE: in a 32bit arch with a preemptable kernel and
+  * an UP compile the i_size_read/write must be atomic
