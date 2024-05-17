@@ -1,0 +1,129 @@
+From: Kuniyuki Iwashima <kuniyu@amazon.com>
+Date: Tue, 23 Jan 2024 09:08:53 -0800
+Subject: af_unix: Do not use atomic ops for unix_sk(sk)->inflight.
+Git-commit: 97af84a6bba2ab2b9c704c08e67de3b5ea551bb2
+Patch-mainline: v6.9-rc1
+References: bsc#1223384
+
+When touching unix_sk(sk)->inflight, we are always under
+spin_lock(&unix_gc_lock).
+
+Let's convert unix_sk(sk)->inflight to the normal unsigned long.
+
+Signed-off-by: Kuniyuki Iwashima <kuniyu@amazon.com>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Link: https://lore.kernel.org/r/20240123170856.41348-3-kuniyu@amazon.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+[ adjust context for 3.0 base, apply scm.c hunks to garbage.c ]
+Acked-by: Michal Koutný <mkoutny@suse.com>
+---
+ include/net/af_unix.h |    2 +-
+ net/unix/af_unix.c    |    2 +-
+ net/unix/garbage.c    |   26 +++++++++++++-------------
+ 3 files changed, 15 insertions(+), 15 deletions(-)
+
+--- a/include/net/af_unix.h
++++ b/include/net/af_unix.h
+@@ -52,7 +52,7 @@ struct unix_sock {
+ 	struct sock		*peer;
+ 	struct sock		*other;
+ 	struct list_head	link;
+-	atomic_long_t		inflight;
++	unsigned long		inflight;
+ 	spinlock_t		lock;
+ 	unsigned int		gc_candidate : 1;
+ 	unsigned int		gc_maybe_cycle : 1;
+--- a/net/unix/af_unix.c
++++ b/net/unix/af_unix.c
+@@ -743,10 +743,10 @@ static struct sock *unix_create1(struct
+ 	sk->sk_max_ack_backlog	= net->unx.sysctl_max_dgram_qlen;
+ 	sk->sk_destruct		= unix_sock_destructor;
+ 	u	  = unix_sk(sk);
++	u->inflight = 0;
+ 	u->dentry = NULL;
+ 	u->mnt	  = NULL;
+ 	spin_lock_init(&u->lock);
+-	atomic_long_set(&u->inflight, 0);
+ 	INIT_LIST_HEAD(&u->link);
+ 	mutex_init(&u->readlock); /* single task reading lock */
+ 	init_waitqueue_head(&u->peer_wait);
+--- a/net/unix/garbage.c
++++ b/net/unix/garbage.c
+@@ -129,13 +129,13 @@ void unix_inflight(struct file *fp)
+ 	spin_lock(&unix_gc_lock);
+ 	if (s) {
+ 		struct unix_sock *u = unix_sk(s);
+-		if (atomic_long_inc_return(&u->inflight) == 1) {
++		if (!u->inflight) {
+ 			BUG_ON(!list_empty(&u->link));
+ 			list_add_tail(&u->link, &gc_inflight_list);
+ 		} else {
+ 			BUG_ON(list_empty(&u->link));
+ 		}
+-		unix_tot_inflight++;
++		u->inflight++;
+ 		/* Paired with READ_ONCE() in wait_for_unix_gc() */
+ 		ACCESS_ONCE(unix_tot_inflight) = unix_tot_inflight + 1;
+ 	}
+@@ -150,9 +150,10 @@ void unix_notinflight(struct file *fp)
+ 	spin_lock(&unix_gc_lock);
+ 	if (s) {
+ 		struct unix_sock *u = unix_sk(s);
+-		BUG_ON(!atomic_long_read(&u->inflight));
++		BUG_ON(!u->inflight);
+ 		BUG_ON(list_empty(&u->link));
+-		if (atomic_long_dec_and_test(&u->inflight))
++		u->inflight--;
++		if (!u->inflight)
+ 			list_del_init(&u->link);
+ 		ACCESS_ONCE(unix_tot_inflight) = unix_tot_inflight - 1;
+ 	}
+@@ -245,17 +246,18 @@ static void scan_children(struct sock *x
+ 
+ static void dec_inflight(struct unix_sock *usk)
+ {
+-	atomic_long_dec(&usk->inflight);
++	usk->inflight--;
+ }
+ 
+ static void inc_inflight(struct unix_sock *usk)
+ {
+-	atomic_long_inc(&usk->inflight);
++	usk->inflight++;
+ }
+ 
+ static void inc_inflight_move_tail(struct unix_sock *u)
+ {
+-	atomic_long_inc(&u->inflight);
++	u->inflight++;
++
+ 	/*
+ 	 * If this still might be part of a cycle, move it to the end
+ 	 * of the list, so that it's checked even if it was already
+@@ -318,14 +320,12 @@ void unix_gc(void)
+ 	 */
+ 	list_for_each_entry_safe(u, next, &gc_inflight_list, link) {
+ 		long total_refs;
+-		long inflight_refs;
+ 
+ 		total_refs = file_count(u->sk.sk_socket->file);
+-		inflight_refs = atomic_long_read(&u->inflight);
+ 
+-		BUG_ON(inflight_refs < 1);
+-		BUG_ON(total_refs < inflight_refs);
+-		if (total_refs == inflight_refs) {
++		BUG_ON(!u->inflight);
++		BUG_ON(total_refs < u->inflight);
++		if (total_refs == u->inflight) {
+ 			list_move_tail(&u->link, &gc_candidates);
+ 			u->gc_candidate = 1;
+ 			u->gc_maybe_cycle = 1;
+@@ -354,7 +354,7 @@ void unix_gc(void)
+ 		/* Move cursor to after the current position. */
+ 		list_move(&cursor, &u->link);
+ 
+-		if (atomic_long_read(&u->inflight) > 0) {
++		if (u->inflight) {
+ 			list_move_tail(&u->link, &not_cycle_list);
+ 			u->gc_maybe_cycle = 0;
+ 			scan_children(&u->sk, inc_inflight_move_tail, NULL);
