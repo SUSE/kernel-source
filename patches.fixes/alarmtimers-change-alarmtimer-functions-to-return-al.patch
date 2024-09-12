@@ -1,0 +1,111 @@
+From: John Stultz <john.stultz@linaro.org>
+Subject: alarmtimers: Change alarmtimer functions to return alarmtimer_restart
+Git-commit: 4b41308d2d0398409620613c7eaaaf52c738b042
+Patch-mainline: v3.2
+References: bsc#1214298
+Acked-by: Jiri Bohac <jbohac@suse.cz>
+
+In order to properly fix the denial of service issue with high freq
+periodic alarm timers, we need to push the re-arming logic into the
+alarm timer handler, much as the hrtimer code does.
+
+This patch introduces alarmtimer_restart enum and changes the
+alarmtimer handler declarations to use it as a return value. Further,
+to ease following changes, it extends the alarmtimer handler functions
+to also take the time at expiration. No logic is yet modified.
+
+CC: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: John Stultz <john.stultz@linaro.org>
+
+---
+ include/linux/alarmtimer.h |    9 +++++++--
+ kernel/time/alarmtimer.c   |   13 +++++++++----
+ 2 files changed, 16 insertions(+), 6 deletions(-)
+
+--- a/include/linux/alarmtimer.h
++++ b/include/linux/alarmtimer.h
+@@ -13,6 +13,11 @@ enum alarmtimer_type {
+ 	ALARM_NUMTYPE,
+ };
+ 
++enum alarmtimer_restart {
++	ALARMTIMER_NORESTART,
++	ALARMTIMER_RESTART,
++};
++
+ /**
+  * struct alarm - Alarm timer structure
+  * @node:	timerqueue node for adding to the event list this value
+@@ -26,14 +31,14 @@ enum alarmtimer_type {
+ struct alarm {
+ 	struct timerqueue_node	node;
+ 	ktime_t			period;
+-	void			(*function)(struct alarm *);
++	enum alarmtimer_restart	(*function)(struct alarm *, ktime_t now);
+ 	enum alarmtimer_type	type;
+ 	bool			enabled;
+ 	void			*data;
+ };
+ 
+ void alarm_init(struct alarm *alarm, enum alarmtimer_type type,
+-		void (*function)(struct alarm *));
++		enum alarmtimer_restart (*function)(struct alarm *, ktime_t));
+ void alarm_start(struct alarm *alarm, ktime_t start, ktime_t period);
+ void alarm_cancel(struct alarm *alarm);
+ 
+--- a/kernel/time/alarmtimer.c
++++ b/kernel/time/alarmtimer.c
+@@ -196,7 +196,7 @@ static enum hrtimer_restart alarmtimer_f
+ 		}
+ 		spin_unlock_irqrestore(&base->lock, flags);
+ 		if (alarm->function)
+-			alarm->function(alarm);
++			alarm->function(alarm, now);
+ 		spin_lock_irqsave(&base->lock, flags);
+ 	}
+ 
+@@ -299,7 +299,7 @@ static void alarmtimer_freezerset(ktime_
+  * @function: callback that is run when the alarm fires
+  */
+ void alarm_init(struct alarm *alarm, enum alarmtimer_type type,
+-		void (*function)(struct alarm *))
++		enum alarmtimer_restart (*function)(struct alarm *, ktime_t))
+ {
+ 	timerqueue_init(&alarm->node);
+ 	alarm->period = ktime_set(0, 0);
+@@ -365,7 +365,8 @@ static enum alarmtimer_type clock2alarm(
+  *
+  * Posix timer callback for expired alarm timers.
+  */
+-static void alarm_handle_timer(struct alarm *alarm)
++static enum alarmtimer_restart alarm_handle_timer(struct alarm *alarm,
++							ktime_t now)
+ {
+ 	struct k_itimer *ptr = container_of(alarm, struct k_itimer,
+ 						it.alarmtimer);
+@@ -373,6 +374,8 @@ static void alarm_handle_timer(struct al
+ 		ptr->it_overrun++;
+ 		ptr->__it_overrun++;
+ 	}
++
++	return ALARMTIMER_NORESTART;
+ }
+ 
+ /**
+@@ -511,13 +514,15 @@ static int alarm_timer_set(struct k_itim
+  *
+  * Wakes up the task that set the alarmtimer
+  */
+-static void alarmtimer_nsleep_wakeup(struct alarm *alarm)
++static enum alarmtimer_restart alarmtimer_nsleep_wakeup(struct alarm *alarm,
++								ktime_t now)
+ {
+ 	struct task_struct *task = (struct task_struct *)alarm->data;
+ 
+ 	alarm->data = NULL;
+ 	if (task)
+ 		wake_up_process(task);
++	return ALARMTIMER_NORESTART;
+ }
+ 
+ /**
