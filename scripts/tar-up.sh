@@ -22,11 +22,6 @@
 
 # generate a kernel-source rpm package
 
-# if this is SLE11_BRANCH and earlier, hand over to scripts/tar-up-old.sh
-if test ! -x rpm/mkspec; then
-    exec ${0%.sh}-old.sh "$@"
-fi
-
 . ${0%/*}/wd-functions.sh
 
 sort()
@@ -63,7 +58,7 @@ until [ "$#" = "0" ] ; do
       shift
       ;;
     -iu|--ignore-unsupported-deps)
-      # ignored, set %supported_modules_check in the spec instead
+      # ignored, unset SUPPORTED_MODULES_CHECK in the config.sh instead
       shift
       ;;
     -rs|--release-string)
@@ -165,8 +160,7 @@ done
     $build_dir/series.conf
 
 inconsistent=false
-check_for_merge_conflicts $referenced_files kernel-source.changes{,.old} || \
-	inconsistent=true
+check_for_merge_conflicts $referenced_files || inconsistent=true
 scripts/check-conf || inconsistent=true
 scripts/check-cvs-add --committed || inconsistent=true
 
@@ -214,17 +208,11 @@ if grep -q '^Source.*:[[:space:]]*log\.sh[[:space:]]*$' rpm/kernel-source.spec.i
 	cp -p scripts/rpm-log.sh "$build_dir"/log.sh
 fi
 rm -f "$build_dir/kernel-source.changes.old" "$build_dir/gitlog-fixups" "$build_dir/gitlog-excludes"
-if test -e "$build_dir"/config-options.changes; then
-	# Rename to  avoid triggering a build service rule error
-	mv "$build_dir"/config-options.changes \
-		"$build_dir"/config-options.changes.txt
-fi
 rm -f "$build_dir/config-subst"
 
-changelog=$build_dir/kernel-source$VARIANT.changes
-if test -e kernel-source.changes; then
-    cat kernel-source.changes{,.old} >"$changelog"
-elif $using_git; then
+create_changelog_from_git () {
+    oldfile="$1"
+    oldlog="$2"
     exclude=()
     # Exclude commits in the scripts branch, these are rarely interesting for
     # users of the rpm packages.
@@ -243,10 +231,15 @@ elif $using_git; then
         echo "warning: no scripts or origin/scripts branch found" >&2
         echo "warning: rpm changelog will have some useless entries" >&2
     fi
-    changes_stop=$(sed 1q rpm/kernel-source.changes.old)
+    changes_stop=$(sed 1q $oldfile)
     case "$changes_stop" in
     last\ commit:\ *)
         exclude[${#exclude[@]}]=^${changes_stop#*: }
+	head="HEAD"
+        ;;
+    commit\ range:\ *)
+        exclude[${#exclude[@]}]=${changes_stop#*: }
+	head=
         ;;
     *)
         echo "expected \"last commit: <commit>\" in rpm/kernel-source.changes.old" >&2
@@ -258,9 +251,16 @@ elif $using_git; then
     if test -e rpm/gitlog-fixups; then
 	    exclude=(--fixups "$_" "${exclude[@]}")
     fi
-    scripts/gitlog2changes "${exclude[@]}" HEAD -- >"$changelog"
-    sed 1d rpm/kernel-source.changes.old >>"$changelog"
-    scripts/rpm-changes-merge.pl -1 "$changelog"
+    scripts/gitlog2changes "${exclude[@]}" $head -- >"$oldlog"
+    sed 1d "$oldfile" >>"$oldlog"
+    scripts/rpm-changes-merge.pl -1 "$oldlog"
+}
+
+changelog=$build_dir/kernel-source$VARIANT.changes
+if test -e kernel-source.changes; then
+    cat kernel-source.changes{,.old} >"$changelog"
+elif $using_git; then
+    create_changelog_from_git rpm/kernel-source.changes.old "$changelog"
 else
     touch "$changelog"
 fi
@@ -407,6 +407,14 @@ if [ -n "$ignore_kabi" ]; then
 fi
 if [ -n "$tolerate_unknown_new_config_options" ]; then
     echo > $build_dir/TOLERATE-UNKNOWN-NEW-CONFIG-OPTIONS
+fi
+
+if [ -s rpm/old_changelog.txt ]; then
+    echo "old_changelog.txt"
+    create_changelog_from_git rpm/old_changelog.txt $build_dir/old_changelog.txt
+else
+    echo "old_changelog.txt (empty)"
+    echo > $build_dir/old_changelog.txt
 fi
 
 echo "cd $build_dir; ./mkspec ${mkspec_args[@]}"

@@ -57,37 +57,59 @@ usage()
     echo "	-c CVE-XXXX-YYYY: provide CVE number for the given sha. Use for"
     echo "	   CVEs issued before the process has changed and VULNS_GIT doesn't"
     echo "	   recognize this CVE"
+    echo "	-n Do not print maintainers candidates."
 }
 
 SUSE_GET_MAINTAINERS=/usr/bin/suse-get-maintainers
-branch=
-bprefix=
+BUGZILLA_LIST_USER_BUGS="$(dirname "$0")/bugzilla-list-user-bugs"
+SUSE_GIT_FIXES=/usr/bin/git-fixes
+
+if [ -z "$CVEKERNELTREE" ]
+then
+	export CVEKERNELTREE=$LINUX_GIT
+fi
 sha=
 references=
-
 cve=
-top_level=
 
 tmpdir=$(mktemp -d /tmp/${0##*/}.XXXXXX)
 trap 'rm -rf "$tmpdir"' EXIT
 
-branch_state_file="$tmpdir/branch-state"
 patch_file="$tmpdir/patches"
 actions_file="$tmpdir/actions"
 affected_file="$tmpdir/affected"
+git_fixes_sha="$tmpdir/git_fixes_sha"
+git_fixes_output="$tmpdir/git_fixes_output"
+git_fixes_pid=0
 
-print_branch_state()
+branch_state_file()
 {
-    local msg="$@"
+	local branch=$1
+	echo $tmpdir/branch-state.$(echo $branch | sed 's@/@_@g')
+}
+
+set_branch_state()
+{
+    local branch=$1
+    local state=$2
+    local branch_file="$(branch_state_file $branch)"
 
     if [ -n "$verbose_mode" ] ; then
-	echo "$msg"
+	echo "$branch $state"
     elif [ -z "$quiet_mode" ] ; then
 	# show progress
 	echo -n "."
     fi
 
-    echo "$msg" >> "$branch_state_file"
+    echo "$state" > $branch_file
+}
+
+wait_for_file()
+{
+	while [ ! -s "$1" ]
+	do
+		sleep 1s
+	done
 }
 
 # Check state of the given branch and store
@@ -116,23 +138,21 @@ check_branch_state()
 
     local patch=
     local base=
-    local ref=
     local missing_references=
-    local msg_prefix="$branch:$sha"
-
-    # 15-SP6-GA should be ignored until GM
-    [ "$branch" = "SLE15-SP6-GA" ] && return
 
     # Check parent branches are ok then nothing to be checked for this one
     # Disable the heuristic for the verbose mode where we want to see all
     # the actions
     if [ -z "$verbose_mode" ]
     then
+	    local merge_branch=
 	    for merge_branch in $(print_merge_branches $branches_conf $branch)
 	    do
-		    if grep -E "$merge_branch:$sha:(ok|missing_references|ok_will_merge)" "$branch_state_file" >/dev/null 2>&1
+		    local merge_branch_file="$(branch_state_file $merge_branch)"
+		    wait_for_file "$merge_branch_file"
+		    if grep -E "$merge_branch:$sha:(ok|missing_references|ok_will_merge)" "$merge_branch_file" >/dev/null 2>&1
 		    then
-			    print_branch_state "$msg_prefix:ok_will_merge"
+			    set_branch_state $branch "$sha:ok_will_merge"
 			    return
 		    fi
 	    done
@@ -142,8 +162,23 @@ check_branch_state()
 
     # Already merged upstream?
     if sha_merged_in_upstream_tag "$sha" "$base" ; then
-	print_branch_state "$msg_prefix:nope"
+	set_branch_state $branch "$sha:nope"
 	return
+    fi
+
+    if [ -n "$cve" ]
+    then
+	    if git grep -qiE "(^$cve|^$sha\b.*#.*$cve)" origin/$branch -- blacklist.conf
+	    then
+		    set_branch_state $branch "$sha:blacklisted"
+		    return
+	    fi
+
+            if git grep -qi "^References:.*$cve\>" origin/$branch
+            then
+                    set_branch_state $branch "$sha:ok"
+                    return
+            fi
     fi
 
     # Does the patch exist?
@@ -153,6 +188,7 @@ check_branch_state()
 	echo "$branch:$patch" >> "$patch_file"
 
 	# Check references
+	local ref=
 	for ref in $references ; do
 	    if ! patch_has_reference_in_branch "$patch" "$ref" "$branch" ; then
 		[ -n "$missing_references" ] && missing_references="$missing_references "
@@ -161,9 +197,9 @@ check_branch_state()
 	done
 
 	if [ -z "$missing_references" ] ; then
-	    print_branch_state "$msg_prefix:ok"
+	    set_branch_state $branch "$sha:ok"
 	else
-	    print_branch_state "$msg_prefix:missing_references:$missing_references"
+	    set_branch_state $branch "$sha:missing_references:$missing_references"
 	fi
 
 	return
@@ -177,16 +213,16 @@ check_branch_state()
 	local affected_by_git_fixes="$(affected_by_git_fixes "$branch" "$base" $sha_git_fixes $expl_fixes)"
 
 	if [ -n "$affected_by_git_fixes" ] ; then
-	    print_branch_state "$msg_prefix:missing_patch:$affected_by_git_fixes"
+	    set_branch_state $branch "$sha:missing_patch:$affected_by_git_fixes"
 	else
-	    print_branch_state "$msg_prefix:nope"
+	    set_branch_state $branch "$sha:nope"
 	fi
 
 	return
     fi
 
     # missing git fixes
-    print_branch_state "$msg_prefix:maybe_missing_patch:$ref"
+    set_branch_state $branch "$sha:maybe_missing_patch:$ref"
 }
 
 print_action()
@@ -204,26 +240,31 @@ print_action()
     # make sure tha the file exists
     touch "$patch_file"
 
-    patch=
-    action=
+    local patch=
+    local action=
+    local warns=
     case "$state" in
 	missing_patch)
 	    action="$branch: MANUAL: backport $sha ($references)"
+	    warns="$(check_config "$branch" "$conf_file_map" "${files[@]}")"
 	    ;;
 
 	maybe_missing_patch)
 	    action="$branch: MANUAL: might need backport of $sha ($references)"
+	    warns="$(check_config "$branch" "$conf_file_map" "${files[@]}")"
 	    ;;
 
 	missing_references)
-	    [ -z $verbose_mode ] && return
-	    patch=$(grep "^$branch:" "$patch_file" | cut -d : -f 2)
-	    if [ -n "$patch" ] ; then
-		ref_args=$(printf -- '-r %s ' $references)
-		action="$branch: RUN: scripts/cve_tools/add-missing-reference $ref_args$patch"
-	    else
-		action="$branch: MANUAL: no patch has the references: $references"
-	    fi
+	   if  [ -n "$verbose_mode" ]
+	   then
+		    patch=$(grep "^$branch:" "$patch_file" | cut -d : -f 2)
+		    if [ -n "$patch" ] ; then
+			ref_args=$(printf -- '-r %s ' $references)
+			action="$branch: RUN: scripts/cve_tools/add-missing-reference $ref_args$patch"
+		    else
+			action="$branch: MANUAL: no patch has the references: $references"
+		    fi
+	   fi
 	    ;;
 
 	nope)
@@ -235,6 +276,9 @@ print_action()
 	    ;;
 	ok_will_merge)
 	    [ -n "$verbose_mode" ] && action="$branch: NOPE: will inherit from parent $sha $references"
+	    ;;
+	blacklisted)
+	    [ -n "$verbose_mode" ] && action="$branch: NOPE: $cve blacklisted"
 	    ;;
 
 	*)
@@ -254,7 +298,9 @@ print_action()
 	fi
 
 	echo "$action"
+	[ -n "$warns" ] && echo -e "$warns"
     fi
+    return 0
 }
 
 cvss_affects_branch()
@@ -284,25 +330,24 @@ find_and_print_toplevel_actions()
     local flat_mode=$2
     local cvss="${3%%.*}"
     local action_parameters=
-    local merge_branch=
     local mb_line=
     local line=
     local merge_found=
     local state=
     local mb_state=
+    local branch_file="$(branch_state_file $branch)"
 
     [ -z "$branch" ] && fail "find_and_print_toplevel_actions: No branch provided"
     [ ! -f $branch_state_file ] && fail "Bailing out"
 
-    grep "^$branch:" "$branch_state_file" | \
 	while read line ; do
 	    if [ "$flat_mode" -eq 1 ]
 	    then
-		    print_action ${line//:/ }
+		    print_action $branch ${line//:/ }
 		    continue
 	    fi
 
-	    state=$(echo $line | cut -d: -f3)
+	    state=$(echo $line | cut -d: -f2)
 	    # We only want to print branches which really need CVE fix backported
 	    # CVSS 9+ EB branches
 	    # CVSS 7+ LTSS branches
@@ -322,6 +367,7 @@ find_and_print_toplevel_actions()
 			continue
 	    fi
 
+	    local merge_branch=
 	    for merge_branch in $(print_merge_branches $branches_conf $branch) ; do
 
 		# Make sure merge_branches are in the same cvss scope
@@ -333,9 +379,8 @@ find_and_print_toplevel_actions()
 		    fi
 		fi
 
-		# branch name might include '/', e.g. cve/linux-4.12
-		mb_line=$(grep ^$merge_branch: $branch_state_file)
-		mb_state=$(echo $mb_line | cut -d: -f3)
+		merge_branch_file="$(branch_state_file $merge_branch)"
+		mb_state=$(cut -d: -f2 $merge_branch_file)
 
 		# if the merge branch is in the same state then do not
 		# bother
@@ -361,17 +406,37 @@ find_and_print_toplevel_actions()
 
 	    if [ -z "$merge_found" ] ; then
 		# split line into parameters
-		print_action ${line//:/ }
+		print_action $branch ${line//:/ }
 	    fi
-	done
+	done < $branch_file
+}
+
+print_maintainer_info()
+{
+    local SHA=$1
+    local SGM_OUTPUT="$(suse-get-maintainers --sha - 2>/dev/null <<<$SHA)"
+    local EMAILS="$(cut -d, -f3- <<<$SGM_OUTPUT | tr ',' ' ')"
+    local output=
+    local nbugs=
+    local email=
+    for email in $EMAILS
+    do
+	output="${output} ${email} ("
+	nbugs="$($BUGZILLA_LIST_USER_BUGS $email 2>/dev/null |wc -l)"
+	output="${output}${nbugs})"
+    done
+    local STANZA="$(echo $SGM_OUTPUT | cut -d, -f2)"
+    output="$output subsystem/role=$STANZA"
+    echo "$output"
 }
 
 verbose_mode=
 quiet_mode=
 flat_mode=0
 expl_fixes=""
+maintainers=1
 
-while getopts "hvrqts:b:Ff:c:" OPT
+while getopts "hvrqtns:b:Ff:c:" OPT
 do
     case $OPT in
 	h)
@@ -394,7 +459,7 @@ do
 	    cvss=$OPTARG
 	    ;;
 	b)
-	    bsc=$OPTARG
+	    bsc="bsc#${OPTARG#bsc#}"
 	    ;;
 	f)
 	    expl_fixes="$expl_fixes $OPTARG"
@@ -404,6 +469,9 @@ do
 	    ;;
 	c)
 	    cve=$OPTARG
+	    ;;
+	n)
+	    maintainers=0
 
     esac
 done
@@ -430,7 +498,7 @@ if ! sha_in_upstream "$1" ; then
 	if [ -z "$sha" ]
 	then
 		[ -z "$VULNS_GIT" ] && fail "VULNS_GIT not defined. It has to point https://git.kernel.org/pub/scm/linux/security/vulns.git tree clone."
-		fail "Can find't sha in upstream: $1."
+		fail "Can't find sha in upstream: $1."
 	fi
 fi
 
@@ -447,22 +515,33 @@ else
 	# emulate no CVE fix as CVSS==0. This will typically happen
 	# for upstream commit with Fixes: which we want to target to
 	# less conservative branches only
-	[ -z "$cvss" ] && ccvss=0
+	[ -z "$cvss" ] && cvss=0
 fi
 
-if [ -x $SUSE_GET_MAINTAINERS ]
+if [ $maintainers -eq 1 -a -x $SUSE_GET_MAINTAINERS ]
 then
 	echo -n "Experts candidates: "
-	$SUSE_GET_MAINTAINERS --sha $sha | tr "\n" " "
-	echo
+	print_maintainer_info $sha
 fi
+
+echo "Link: https://git.kernel.org/linus/$sha"
 
 references="$cve $bsc"
 
 branches_conf="$(fetch_branches $refresh)"
+conf_file_map="$(fetch_conf_file_map "$refresh")"
+readarray -t files < <(sha2files "$sha")
+
+# kick git-fixes in the background
+if [ -x "$SUSE_GIT_FIXES" ]
+then
+	echo $sha > $git_fixes_sha
+	$SUSE_GIT_FIXES --no-grouping -a -f $git_fixes_sha --repo $LINUX_GIT $sha..origin/master > $git_fixes_output &
+	git_fixes_pid=$!
+fi
 
 # Check state of each branch
-for_each_build_branch "$branches_conf" check_branch_state $sha "$expl_fixes" $references
+for_each_build_branch_paralel "$branches_conf" check_branch_state $sha "$expl_fixes" $references
 
 # Newline after the dots showing progress
 [ -z "$quiet_mode" ] && echo
@@ -475,6 +554,13 @@ then
 		echo "No codestream affected"
 	else
 		echo "NO ACTION NEEDED: All relevant branches contain the fix!"
+	fi
+else
+	[ $git_fixes_pid -gt 0 ] && wait $git_fixes_pid
+	if [[ -s $git_fixes_output &&  ! $(grep -q "Nothing found" $git_fixes_output) ]]
+	then
+		echo -e "\nPotential git-fixes for $sha"
+		cat $git_fixes_output
 	fi
 fi
 
