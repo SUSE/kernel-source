@@ -1,0 +1,129 @@
+From 3e14c383de349a86895b8c6c410b9222646574f6 Mon Sep 17 00:00:00 2001
+From: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date: Mon, 17 Jun 2019 11:11:11 -0700
+Subject: [PATCH] net: netem: fix use after free and double free with packet
+ corruption
+Git-commit: 3e14c383de349a86895b8c6c410b9222646574f6
+Patch-mainline: v5.2-rc6
+References: git-fixes CVE-2024-45016 bsc#1230429
+
+Brendan reports that the use of netem's packet corruption capability
+leads to strange crashes.  This seems to be caused by
+commit d66280b12bd7 ("net: netem: use a list in addition to rbtree")
+which uses skb->next pointer to construct a fast-path queue of
+in-order skbs.
+
+Packet corruption code has to invoke skb_gso_segment() in case
+of skbs in need of GSO.  skb_gso_segment() returns a list of
+skbs.  If next pointers of the skbs on that list do not get cleared
+fast path list may point to freed skbs or skbs which are also on
+the RB tree.
+
+Let's say skb gets segmented into 3 frames:
+
+A -> B -> C
+
+A gets hooked to the t_head t_tail list by tfifo_enqueue(), but it's
+next pointer didn't get cleared so we have:
+
+h t
+|/
+A -> B -> C
+
+Now if B and C get also get enqueued successfully all is fine, because
+tfifo_enqueue() will overwrite the list in order.  IOW:
+
+Enqueue B:
+
+h    t
+|    |
+A -> B    C
+
+Enqueue C:
+
+h         t
+|         |
+A -> B -> C
+
+But if B and C get reordered we may end up with:
+
+h t            RB tree
+|/                |
+A -> B -> C       B
+                   \
+                    C
+
+Or if they get dropped just:
+
+h t
+|/
+A -> B -> C
+
+where A and B are already freed.
+
+To reproduce either limit has to be set low to cause freeing of
+segs or reorders have to happen (due to delay jitter).
+
+Note that we only have to mark the first segment as not on the
+list, "finish_segs" handling of other frags already does that.
+
+Another caveat is that qdisc_drop_all() still has to free all
+segments correctly in case of drop of first segment, therefore
+we re-link segs before calling it.
+
+v2:
+ - re-link before drop, v1 was leaking non-first segs if limit
+   was hit at the first seg
+ - better commit message which lead to discovering the above :)
+
+Reported-by: Brendan Galloway <brendan.galloway@netronome.com>
+Fixes: d66280b12bd7 ("net: netem: use a list in addition to rbtree")
+Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+Reviewed-by: Dirk van der Merwe <dirk.vandermerwe@netronome.com>
+Acked-by: Cong Wang <xiyou.wangcong@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Davide Benini <davide.benini@suse.com>
+
+---
+ net/sched/sch_netem.c | 15 +++++++--------
+ 1 file changed, 7 insertions(+), 8 deletions(-)
+
+diff --git a/net/sched/sch_netem.c b/net/sched/sch_netem.c
+index 3b3e2d772c3bb..b17f2ed970e29 100644
+--- a/net/sched/sch_netem.c
++++ b/net/sched/sch_netem.c
+@@ -493,17 +493,14 @@ static int netem_enqueue(struct sk_buff *skb, struct Qdisc *sch,
+ 	 */
+ 	if (q->corrupt && q->corrupt >= get_crandom(&q->corrupt_cor)) {
+ 		if (skb_is_gso(skb)) {
+-			segs = netem_segment(skb, sch, to_free);
+-			if (!segs)
++			skb = netem_segment(skb, sch, to_free);
++			if (!skb)
+ 				return rc_drop;
+-			qdisc_skb_cb(segs)->pkt_len = segs->len;
+-		} else {
+-			segs = skb;
++			segs = skb->next;
++			skb_mark_not_on_list(skb);
++			qdisc_skb_cb(skb)->pkt_len = skb->len;
+ 		}
+ 
+-		skb = segs;
+-		segs = segs->next;
+-
+ 		skb = skb_unshare(skb, GFP_ATOMIC);
+ 		if (unlikely(!skb)) {
+ 			qdisc_qstats_drop(sch);
+@@ -520,6 +517,8 @@ static int netem_enqueue(struct sk_buff *skb, struct Qdisc *sch,
+ 	}
+ 
+ 	if (unlikely(sch->q.qlen >= sch->limit)) {
++		/* re-link segs, so that qdisc_drop_all() frees them all */
++		skb->next = segs;
+ 		qdisc_drop_all(skb, sch, to_free);
+ 		return rc_drop;
+ 	}
+-- 
+2.35.3
+
