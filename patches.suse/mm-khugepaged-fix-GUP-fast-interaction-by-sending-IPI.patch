@@ -1,0 +1,102 @@
+From: Jann Horn <jannh@google.com>
+Date: Fri, 25 Nov 2022 22:37:13 +0100
+Subject: mm/khugepaged: fix GUP-fast interaction by sending IPI
+Git-commit: 2ba99c5e08812494bc57f319fb562f527d9bacd8
+Patch-mainline: v6.1-rc8
+References: CVE-2022-48991 bsc#1232070 prerequisity
+
+[ backport based on upstream 4.14 stable backport ]
+
+Since commit 70cbc3cc78a99 ("mm: gup: fix the fast GUP race against THP
+collapse"), the lockless_pages_from_mm() fastpath rechecks the pmd_t to
+ensure that the page table was not removed by khugepaged in between.
+
+However, lockless_pages_from_mm() still requires that the page table is
+not concurrently freed.  Fix it by sending IPIs (if the architecture uses
+semi-RCU-style page table freeing) before freeing/reusing page tables.
+
+Link: https://lkml.kernel.org/r/20221129154730.2274278-2-jannh@google.com
+Link: https://lkml.kernel.org/r/20221128180252.1684965-2-jannh@google.com
+Link: https://lkml.kernel.org/r/20221125213714.4115729-2-jannh@google.com
+Fixes: ba76149f47d8 ("thp: khugepaged")
+Signed-off-by: Jann Horn <jannh@google.com>
+Reviewed-by: Yang Shi <shy828301@gmail.com>
+Acked-by: David Hildenbrand <david@redhat.com>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
+---
+ include/asm-generic/tlb.h |    6 ++++++
+ mm/khugepaged.c           |   15 +++++++++++++++
+ mm/memory.c               |    5 +++++
+ 3 files changed, 26 insertions(+)
+
+--- a/include/asm-generic/tlb.h
++++ b/include/asm-generic/tlb.h
+@@ -60,6 +60,12 @@ struct mmu_table_batch {
+ extern void tlb_table_flush(struct mmu_gather *tlb);
+ extern void tlb_remove_table(struct mmu_gather *tlb, void *table);
+ 
++void tlb_remove_table_sync_one(void);
++
++#else
++
++static inline void tlb_remove_table_sync_one(void) { }
++
+ #endif
+ 
+ /*
+--- a/mm/khugepaged.c
++++ b/mm/khugepaged.c
+@@ -22,6 +22,19 @@
+ #include <asm/pgalloc.h>
+ #include "internal.h"
+ 
++/* gross hack for <=4.19 stable */
++#if defined(CONFIG_S390) || defined(CONFIG_ARM)
++static void tlb_remove_table_smp_sync(void *arg)
++{
++        /* Simply deliver the interrupt */
++}
++
++static void tlb_remove_table_sync_one(void)
++{
++        smp_call_function(tlb_remove_table_smp_sync, NULL, 1);
++}
++#endif
++
+ enum scan_result {
+ 	SCAN_FAIL,
+ 	SCAN_SUCCEED,
+@@ -1031,6 +1044,7 @@ static void collapse_huge_page(struct mm
+ 	_pmd = pmdp_collapse_flush(vma, address, pmd);
+ 	spin_unlock(pmd_ptl);
+ 	mmu_notifier_invalidate_range_end(mm, mmun_start, mmun_end);
++	tlb_remove_table_sync_one();
+ 
+ 	spin_lock(pte_ptl);
+ 	isolated = __collapse_huge_page_isolate(vma, address, pte);
+@@ -1280,6 +1294,7 @@ static void retract_page_tables(struct a
+ 				_pmd = pmdp_collapse_flush(vma, addr, pmd);
+ 				spin_unlock(ptl);
+ 				atomic_long_dec(&mm->nr_ptes);
++				tlb_remove_table_sync_one();
+ 				pte_free(mm, pmd_pgtable(_pmd));
+ 			}
+ 			up_write(&mm->mmap_sem);
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -348,6 +348,11 @@ static void tlb_remove_table_smp_sync(vo
+ 	/* Simply deliver the interrupt */
+ }
+ 
++void tlb_remove_table_sync_one(void)
++{
++	smp_call_function(tlb_remove_table_smp_sync, NULL, 1);
++}
++
+ static void tlb_remove_table_one(void *table)
+ {
+ 	/*
