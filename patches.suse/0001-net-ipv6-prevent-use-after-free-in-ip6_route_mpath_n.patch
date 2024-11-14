@@ -1,0 +1,107 @@
+From 630f38ac7e4aac6afc5abb277e8c648d5afae97f Mon Sep 17 00:00:00 2001
+From: David Ahern <dsahern@gmail.com>
+Date: Tue, 22 Oct 2024 16:28:33 +0200
+Subject: [PATCH 1/2] net/ipv6: prevent use after free in
+ ip6_route_mpath_notify
+
+Patch-mainline: v4.18-rc1
+Git-commit: f7225172f25aaf0dfd9ad65f05be8da5d6108b12
+References: CVE-2024-26852 bsc#1223057 bsc#1230784
+
+syzbot reported a use-after-free:
+
+BUG: KASAN: use-after-free in ip6_route_mpath_notify+0xe9/0x100 net/ipv6/route.c:4180
+Read of size 4 at addr ffff8801bf789cf0 by task syz-executor756/4555
+
+CPU: 1 PID: 4555 Comm: syz-executor756 Not tainted 4.17.0-rc7+ #78
+Hardware name: Google Google Compute Engine/Google Compute Engine, BIOS Google 01/01/2011
+Call Trace:
+ __dump_stack lib/dump_stack.c:77 [inline]
+ dump_stack+0x1b9/0x294 lib/dump_stack.c:113
+ print_address_description+0x6c/0x20b mm/kasan/report.c:256
+ kasan_report_error mm/kasan/report.c:354 [inline]
+ kasan_report.cold.7+0x242/0x2fe mm/kasan/report.c:412
+ __asan_report_load4_noabort+0x14/0x20 mm/kasan/report.c:432
+ ip6_route_mpath_notify+0xe9/0x100 net/ipv6/route.c:4180
+ ip6_route_multipath_add+0x615/0x1910 net/ipv6/route.c:4303
+ inet6_rtm_newroute+0xe3/0x160 net/ipv6/route.c:4391
+ ...
+
+Allocated by task 4555:
+ save_stack+0x43/0xd0 mm/kasan/kasan.c:448
+ set_track mm/kasan/kasan.c:460 [inline]
+ kasan_kmalloc+0xc4/0xe0 mm/kasan/kasan.c:553
+ kasan_slab_alloc+0x12/0x20 mm/kasan/kasan.c:490
+ kmem_cache_alloc+0x12e/0x760 mm/slab.c:3554
+ dst_alloc+0xbb/0x1d0 net/core/dst.c:104
+ __ip6_dst_alloc+0x35/0xa0 net/ipv6/route.c:361
+ ip6_dst_alloc+0x29/0xb0 net/ipv6/route.c:376
+ ip6_route_info_create+0x4d4/0x3a30 net/ipv6/route.c:2834
+ ip6_route_multipath_add+0xc7e/0x1910 net/ipv6/route.c:4240
+ inet6_rtm_newroute+0xe3/0x160 net/ipv6/route.c:4391
+ ...
+
+Freed by task 4555:
+ save_stack+0x43/0xd0 mm/kasan/kasan.c:448
+ set_track mm/kasan/kasan.c:460 [inline]
+ __kasan_slab_free+0x11a/0x170 mm/kasan/kasan.c:521
+ kasan_slab_free+0xe/0x10 mm/kasan/kasan.c:528
+ __cache_free mm/slab.c:3498 [inline]
+ kmem_cache_free+0x86/0x2d0 mm/slab.c:3756
+ dst_destroy+0x267/0x3c0 net/core/dst.c:140
+ dst_release_immediate+0x71/0x9e net/core/dst.c:205
+ fib6_add+0xa40/0x1650 net/ipv6/ip6_fib.c:1305
+ __ip6_ins_rt+0x6c/0x90 net/ipv6/route.c:1011
+ ip6_route_multipath_add+0x513/0x1910 net/ipv6/route.c:4267
+ inet6_rtm_newroute+0xe3/0x160 net/ipv6/route.c:4391
+ ...
+
+The problem is that rt_last can point to a deleted route if the insert
+fails.
+
+One reproducer is to insert a route and then add a multipath route that
+has a duplicate nexthop.e.g,:
+    $ ip -6 ro add vrf red 2001:db8:101::/64 nexthop via 2001:db8:1::2
+    $ ip -6 ro append vrf red 2001:db8:101::/64 nexthop via 2001:db8:1::4 nexthop via 2001:db8:1::2
+
+Fix by not setting rt_last until the it is verified the insert succeeded.
+
+Fixes: 3b1137fe7482 ("net: ipv6: Change notifications for multipath add to RTA_MULTIPATH")
+Cc: Eric Dumazet <edumazet@google.com>
+Reported-by: syzbot <syzkaller@googlegroups.com>
+Signed-off-by: David Ahern <dsahern@gmail.com>
+Reviewed-by: Eric Dumazet <edumazet@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Firo Yang <firo.yang@suse.com>
+---
+ net/ipv6/route.c | 13 +++++++++----
+ 1 file changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/net/ipv6/route.c b/net/ipv6/route.c
+index d6a5c1f9ad09..97743be53c77 100644
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@ -3169,11 +3169,16 @@ static int ip6_route_multipath_add(struct fib6_config *cfg,
+ 
+ 	err_nh = NULL;
+ 	list_for_each_entry(nh, &rt6_nh_list, next) {
+-		rt_last = nh->rt6_info;
+ 		err = __ip6_ins_rt(nh->rt6_info, info, &nh->mxc, extack);
+-		/* save reference to first route for notification */
+-		if (!rt_notif && !err)
+-			rt_notif = nh->rt6_info;
++
++		if (!err) {
++			/* save reference to last route successfully inserted */
++			rt_last = nh->rt6_info;
++
++			/* save reference to first route for notification */
++			if (!rt_notif)
++				rt_notif = nh->rt6_info;
++		}
+ 
+ 		/* nh->rt6_info is used or freed at this point, reset to NULL*/
+ 		nh->rt6_info = NULL;
+-- 
+2.35.3
+
