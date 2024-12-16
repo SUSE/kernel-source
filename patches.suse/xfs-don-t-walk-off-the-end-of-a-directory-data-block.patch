@@ -1,0 +1,135 @@
+From 0c7fcdb6d06cdf8b19b57c17605215b06afa864a Mon Sep 17 00:00:00 2001
+From: lei lu <llfamsec@gmail.com>
+Date: Fri, 14 Jun 2024 10:22:53 +0800
+Subject: [PATCH] xfs: don't walk off the end of a directory data block
+Git-commit: 0c7fcdb6d06cdf8b19b57c17605215b06afa864a
+Patch-mainline: v6.11-rc1
+References: bsc#1228405 CVE-2024-41013
+
+This adds sanity checks for xfs_dir2_data_unused and xfs_dir2_data_entry
+to make sure don't stray beyond valid memory region. Before patching, the
+loop simply checks that the start offset of the dup and dep is within the
+range. So in a crafted image, if last entry is xfs_dir2_data_unused, we
+can change dup->length to dup->length-1 and leave 1 byte of space. In the
+next traversal, this space will be considered as dup or dep. We may
+encounter an out of bound read when accessing the fixed members.
+
+In the patch, we make sure that the remaining bytes large enough to hold
+an unused entry before accessing xfs_dir2_data_unused and
+xfs_dir2_data_unused is XFS_DIR2_DATA_ALIGN byte aligned. We also make
+sure that the remaining bytes large enough to hold a dirent with a
+single-byte name before accessing xfs_dir2_data_entry.
+
+Signed-off-by: lei lu <llfamsec@gmail.com>
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Signed-off-by: Chandan Babu R <chandanbabu@kernel.org>
+Acked-by: Anthony Iliopoulos <ailiop@suse.com>
+
+---
+ fs/xfs/libxfs/xfs_dir2_data.c | 33 ++++++++++++++++++++++++++++-----
+ fs/xfs/libxfs/xfs_dir2_priv.h |  7 +++++++
+ 2 files changed, 35 insertions(+), 5 deletions(-)
+
+diff --git a/fs/xfs/libxfs/xfs_dir2_data.c b/fs/xfs/libxfs/xfs_dir2_data.c
+index 40938fb0f470..ab208791b6fd 100644
+--- a/fs/xfs/libxfs/xfs_dir2_data.c
++++ b/fs/xfs/libxfs/xfs_dir2_data.c
+@@ -63,6 +63,7 @@ __xfs_dir3_data_check(
+ 	struct xfs_name		name;
+ 	const struct xfs_dir_ops *ops;
+ 	struct xfs_da_geometry	*geo;
++	unsigned int		reclen;
+ 
+ 	mp = bp->b_target->bt_mount;
+ 	geo = mp->m_dir_geo;
+@@ -132,15 +133,28 @@ __xfs_dir3_data_check(
+ 	 */
+ 	while (p < endp) {
+ 		dup = (xfs_dir2_data_unused_t *)p;
++
++		/*
++		 * Are the remaining bytes large enough to hold an
++		 * unused entry?
++		 */
++		if (p > endp - xfs_dir2_data_unusedsize(1))
++			return false;
++
+ 		/*
+ 		 * If it's unused, look for the space in the bestfree table.
+ 		 * If we find it, account for that, else make sure it
+ 		 * doesn't need to be there.
+ 		 */
+ 		if (be16_to_cpu(dup->freetag) == XFS_DIR2_DATA_FREE_TAG) {
++
++			reclen = xfs_dir2_data_unusedsize(
++					be16_to_cpu(dup->length));
+ 			if (lastfree != 0)
+ 				return false;
+-			if (endp < p + be16_to_cpu(dup->length))
++			if (be16_to_cpu(dup->length) != reclen)
++				return false;
++			if (p + reclen > endp)
+ 				return false;
+ 			if (be16_to_cpu(*xfs_dir2_data_unused_tag_p(dup)) !=
+ 			    (char *)dup - (char *)hdr)
+@@ -156,10 +170,18 @@ __xfs_dir3_data_check(
+ 				    be16_to_cpu(bf[2].length))
+ 					return false;
+ 			}
+-			p += be16_to_cpu(dup->length);
++			p += reclen;
+ 			lastfree = 1;
+ 			continue;
+ 		}
++
++		/*
++		 * This is not an unused entry. Are the remaining bytes
++		 * large enough for a dirent with a single-byte name?
++		 */
++		if (p > endp - ops->data_entsize(1))
++			return false;
++
+ 		/*
+ 		 * It's a real entry.  Validate the fields.
+ 		 * If this is a block directory then make sure it's
+@@ -169,9 +191,10 @@ __xfs_dir3_data_check(
+ 		dep = (xfs_dir2_data_entry_t *)p;
+ 		if (dep->namelen == 0)
+ 			return false;
+-		if (xfs_dir_ino_validate(mp, be64_to_cpu(dep->inumber)))
++		reclen = ops->data_entsize(dep->namelen);
++		if (p + reclen > endp)
+ 			return false;
+-		if (endp < p + ops->data_entsize(dep->namelen))
++		if (xfs_dir_ino_validate(mp, be64_to_cpu(dep->inumber)))
+ 			return false;
+ 		if (be16_to_cpu(*ops->data_entry_tag_p(dep)) !=
+ 		    (char *)dep - (char *)hdr)
+@@ -196,7 +219,7 @@ __xfs_dir3_data_check(
+ 			if (i >= be32_to_cpu(btp->count))
+ 				return false;
+ 		}
+-		p += ops->data_entsize(dep->namelen);
++		p += reclen;
+ 	}
+ 	/*
+ 	 * Need to have seen all the entries and all the bestfree slots.
+diff --git a/fs/xfs/libxfs/xfs_dir2_priv.h b/fs/xfs/libxfs/xfs_dir2_priv.h
+index fa943cb52256..516cbb559565 100644
+--- a/fs/xfs/libxfs/xfs_dir2_priv.h
++++ b/fs/xfs/libxfs/xfs_dir2_priv.h
+@@ -139,4 +139,11 @@ extern int xfs_dir2_sf_verify(struct xfs_inode *ip);
+ extern int xfs_readdir(struct xfs_inode *dp, struct dir_context *ctx,
+ 		       size_t bufsize);
+ 
++static inline unsigned int
++xfs_dir2_data_unusedsize(
++	unsigned int	len)
++{
++	return round_up(len, XFS_DIR2_DATA_ALIGN);
++}
++
+ #endif /* __XFS_DIR2_PRIV_H__ */
+-- 
+2.47.0
+
