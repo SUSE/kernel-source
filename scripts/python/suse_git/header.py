@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 # vim: sw=4 ts=4 et si:
 
-import sys
 import re
-from optparse import OptionParser
 from . import patch
 from io import StringIO
 
@@ -259,7 +257,7 @@ class HeaderException(patch.PatchException):
                     for tag in err.target:
                         if tag['name'].lower() == name.lower():
                             return True
-        except KeyError as e:
+        except KeyError:
             pass
 
         return False
@@ -275,14 +273,14 @@ class Tag:
         return "%s: %s" % (self.name, self.value)
 
     def __repr__(self):
-        type = "<none>"
+        tagtype = "<none>"
         if self.tagtype:
-            type = self.tagtype
+            tagtype = self.tagtype
         valid = "No"
         if self.valid:
             valid = "Yes"
         return "<Tag: name=%s value='%s' type='%s' valid='%s'>" % \
-                (self.name, self.value, type, valid)
+                (self.name, self.value, tagtype, valid)
 
     def match_req(self, req):
         if self.name == req['name']:
@@ -313,13 +311,13 @@ class HeaderChecker(patch.PatchChecker):
     def get_rulename(self, ruleset, rulename):
         if rulename in ruleset:
             if self.kabi:
-                 kabi_rule = "%s_on_kabi" % rulename
-                 if kabi_rule in ruleset:
-                     return kabi_rule
+                kabi_rule = "%s_on_kabi" % rulename
+                if kabi_rule in ruleset:
+                    return kabi_rule
             if self.updating:
-                 updating_rule = "%s_on_update" % rulename
-                 if updating_rule in ruleset:
-                     return updating_rule
+                updating_rule = "%s_on_update" % rulename
+                if updating_rule in ruleset:
+                    return updating_rule
             return rulename
         return None
 
@@ -364,7 +362,7 @@ class HeaderChecker(patch.PatchChecker):
 
                 try:
                     multi = mapping['multi']
-                except KeyError as e:
+                except KeyError:
                     multi = False
 
                 for t in self.tags:
