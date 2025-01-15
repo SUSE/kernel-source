@@ -1,0 +1,192 @@
+From: Pablo Neira Ayuso <pablo@netfilter.org>
+Date: Mon, 12 Aug 2024 12:29:24 +0200
+Subject: netfilter: nf_tables: use timestamp to check for set element timeout
+Git-commit: 7395dfacfff65e9938ac0889dafa1ab01e987d15
+References: CVE-2024-27397 bsc#1224095
+Patch-mainline: v6.8-rc4
+
+commit f8dfda798650241c1692058713ca4fef8e429061 on linux-stable 4.19
+
+[Note sj]
+The commit f8dfda79865 has been applied as much as possible and then
+slightly edited.
+The original patch depends on `struct nftables_pernet` being available,
+but this change has not been backported.
+Therefore we place the `u64 tstamp` directly into `struct net`.
+
+```
+$ pahole -C net net/netfilter/nf_tables_api.o
+struct net {
+[...]
+        /* --- cacheline 75 boundary (4800 bytes) --- */
+        struct netns_nftables      nft;                  /*  4800    88 */
+
+        /* XXX last struct has 3 bytes of padding */
+        /* XXX 40 bytes hole, try to pack */
+[...]
+```
+[/Note sj]
+
+Add a timestamp field at the beginning of the transaction, store it
+in the nftables per-netns area.
+
+Update set backend .insert, .deactivate and sync gc path to use the
+timestamp, this avoids that an element expires while control plane
+transaction is still unfinished.
+
+.lookup and .update, which are used from packet path, still use the
+current time to check if the element has expired. And .get path and dump
+also since this runs lockless under rcu read size lock. Then, there is
+async gc which also needs to check the current time since it runs
+asynchronously from a workqueue.
+
+[ NB: rbtree GC updates has been excluded because GC is asynchronous. ]
+
+Fixes: c3e1b005ed1c ("netfilter: nf_tables: add set element timeout support")
+Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Steffen Jaeckel <sjaeckel@suse.de>
+---
+ include/net/net_namespace.h       |  3 +++
+ include/net/netfilter/nf_tables.h | 15 +++++++++++++--
+ net/netfilter/nf_tables_api.c     |  1 +
+ net/netfilter/nft_set_hash.c      |  7 ++++++-
+ net/netfilter/nft_set_rbtree.c    |  3 ++-
+ 5 files changed, 25 insertions(+), 4 deletions(-)
+
+diff --git a/include/net/net_namespace.h b/include/net/net_namespace.h
+index 652cf22ffa838..5e2c555555370 100644
+--- a/include/net/net_namespace.h
++++ b/include/net/net_namespace.h
+@@ -118,6 +118,9 @@ struct net {
+ #endif
+ #if defined(CONFIG_NF_TABLES) || defined(CONFIG_NF_TABLES_MODULE)
+ 	struct netns_nftables	nft;
++#ifndef __GENKSYMS__
++	u64			tstamp;
++#endif
+ #endif
+ #if IS_ENABLED(CONFIG_NF_DEFRAG_IPV6)
+ 	struct netns_nf_frag	nf_frag;
+diff --git a/include/net/netfilter/nf_tables.h b/include/net/netfilter/nf_tables.h
+index 104003df9eeb2..3279c12a31fce 100644
+--- a/include/net/netfilter/nf_tables.h
++++ b/include/net/netfilter/nf_tables.h
+@@ -593,10 +593,16 @@ static inline struct nft_expr *nft_set_ext_expr(const struct nft_set_ext *ext)
+ 	return nft_set_ext(ext, NFT_SET_EXT_EXPR);
+ }
+ 
+-static inline bool nft_set_elem_expired(const struct nft_set_ext *ext)
++static inline bool __nft_set_elem_expired(const struct nft_set_ext *ext,
++					  u64 tstamp)
+ {
+ 	return nft_set_ext_exists(ext, NFT_SET_EXT_EXPIRATION) &&
+-	       time_is_before_eq_jiffies(*nft_set_ext_expiration(ext));
++	       time_after_eq64(tstamp, (u64)*nft_set_ext_expiration(ext));
++}
++
++static inline bool nft_set_elem_expired(const struct nft_set_ext *ext)
++{
++	return __nft_set_elem_expired(ext, get_jiffies_64());
+ }
+ 
+ static inline struct nft_set_ext *nft_set_elem_ext(const struct nft_set *set,
+@@ -1313,4 +1319,9 @@ struct nft_trans_obj {
+ #define nft_trans_obj(trans)	\
+ 	(((struct nft_trans_obj *)trans->data)->obj)
+ 
++static inline u64 nft_net_tstamp(const struct net *net)
++{
++	return net->tstamp;
++}
++
+ #endif /* _NET_NF_TABLES_H */
+diff --git a/net/netfilter/nf_tables_api.c b/net/netfilter/nf_tables_api.c
+index 7489e1b2f42b0..c6edd2bf8425c 100644
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@ -5256,6 +5256,7 @@ static int nf_tables_abort(struct net *net, struct sk_buff *skb)
+ 
+ static bool nf_tables_valid_genid(struct net *net, u32 genid)
+ {
++	net->tstamp = get_jiffies_64();
+ 	return net->nft.base_seq == genid;
+ }
+ 
+diff --git a/net/netfilter/nft_set_hash.c b/net/netfilter/nft_set_hash.c
+index f29c12f2a71a0..cda96879c83a4 100644
+--- a/net/netfilter/nft_set_hash.c
++++ b/net/netfilter/nft_set_hash.c
+@@ -38,6 +38,7 @@ struct nft_hash_cmp_arg {
+ 	const struct nft_set		*set;
+ 	const u32			*key;
+ 	u8				genmask;
++	u64				tstamp;
+ };
+ 
+ static const struct rhashtable_params nft_hash_params;
+@@ -64,7 +65,7 @@ static inline int nft_hash_cmp(struct rhashtable_compare_arg *arg,
+ 
+ 	if (memcmp(nft_set_ext_key(&he->ext), x->key, x->set->klen))
+ 		return 1;
+-	if (nft_set_elem_expired(&he->ext))
++	if (__nft_set_elem_expired(&he->ext, x->tstamp))
+ 		return 1;
+ 	if (!nft_set_elem_active(&he->ext, x->genmask))
+ 		return 1;
+@@ -80,6 +81,7 @@ static bool nft_hash_lookup(const struct net *net, const struct nft_set *set,
+ 		.genmask = nft_genmask_cur(net),
+ 		.set	 = set,
+ 		.key	 = key,
++		.tstamp  = get_jiffies_64(),
+ 	};
+ 
+ 	he = rhashtable_lookup_fast(&priv->ht, &arg, nft_hash_params);
+@@ -103,6 +105,7 @@ static bool nft_hash_update(struct nft_set *set, const u32 *key,
+ 		.genmask = NFT_GENMASK_ANY,
+ 		.set	 = set,
+ 		.key	 = key,
++		.tstamp  = get_jiffies_64(),
+ 	};
+ 
+ 	he = rhashtable_lookup_fast(&priv->ht, &arg, nft_hash_params);
+@@ -144,6 +147,7 @@ static int nft_hash_insert(const struct net *net, const struct nft_set *set,
+ 		.genmask = nft_genmask_next(net),
+ 		.set	 = set,
+ 		.key	 = elem->key.val.data,
++		.tstamp	 = nft_net_tstamp(net),
+ 	};
+ 	struct nft_hash_elem *prev;
+ 
+@@ -190,6 +194,7 @@ static void *nft_hash_deactivate(const struct net *net,
+ 		.genmask = nft_genmask_next(net),
+ 		.set	 = set,
+ 		.key	 = elem->key.val.data,
++		.tstamp	 = nft_net_tstamp(net),
+ 	};
+ 
+ 	rcu_read_lock();
+diff --git a/net/netfilter/nft_set_rbtree.c b/net/netfilter/nft_set_rbtree.c
+index 2c784d94f266d..7f083c933ccb4 100644
+--- a/net/netfilter/nft_set_rbtree.c
++++ b/net/netfilter/nft_set_rbtree.c
+@@ -188,6 +188,7 @@ static void *nft_rbtree_deactivate(const struct net *net,
+ 	const struct rb_node *parent = priv->root.rb_node;
+ 	struct nft_rbtree_elem *rbe, *this = elem->priv;
+ 	u8 genmask = nft_genmask_next(net);
++	u64 tstamp = nft_net_tstamp(net);
+ 	int d;
+ 
+ 	while (parent != NULL) {
+@@ -208,7 +209,7 @@ static void *nft_rbtree_deactivate(const struct net *net,
+ 				   nft_rbtree_interval_end(this)) {
+ 				parent = parent->rb_right;
+ 				continue;
+-			} else if (nft_set_elem_expired(&rbe->ext)) {
++			} else if (__nft_set_elem_expired(&rbe->ext, tstamp)) {
+ 				break;
+ 			} else if (!nft_set_elem_active(&rbe->ext, genmask)) {
+ 				parent = parent->rb_left;
+-- 
+2.47.1
+
