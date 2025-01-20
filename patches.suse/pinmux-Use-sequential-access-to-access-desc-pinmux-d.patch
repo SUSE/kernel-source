@@ -1,0 +1,229 @@
+From 5a3e85c3c397c781393ea5fb2f45b1f60f8a4e6e Mon Sep 17 00:00:00 2001
+From: Mukesh Ojha <quic_mojha@quicinc.com>
+Date: Tue, 15 Oct 2024 00:59:30 +0530
+Subject: [PATCH] pinmux: Use sequential access to access desc->pinmux data
+Git-commit: 5a3e85c3c397c781393ea5fb2f45b1f60f8a4e6e
+Patch-mainline: v6.13-rc1
+References: CVE-2024-47141 bsc#1235708
+
+[ backport note: the original upstream change uses the auto cleanup
+  where SLE12-SP5 doesn't have it, so the patch was largely modified
+  to lock/unlock manually -- tiwai ]
+
+When two client of the same gpio call pinctrl_select_state() for the
+same functionality, we are seeing NULL pointer issue while accessing
+desc->mux_owner.
+
+Let's say two processes A, B executing in pin_request() for the same pin
+and process A updates the desc->mux_usecount but not yet updated the
+desc->mux_owner while process B see the desc->mux_usecount which got
+updated by A path and further executes strcmp and while accessing
+desc->mux_owner it crashes with NULL pointer.
+
+Serialize the access to mux related setting with a mutex lock.
+
+	cpu0 (process A)			cpu1(process B)
+
+pinctrl_select_state() {		  pinctrl_select_state() {
+  pin_request() {				pin_request() {
+  ...
+						 ....
+    } else {
+         desc->mux_usecount++;
+    						desc->mux_usecount && strcmp(desc->mux_owner, owner)) {
+
+         if (desc->mux_usecount > 1)
+               return 0;
+         desc->mux_owner = owner;
+
+  }						}
+
+Signed-off-by: Mukesh Ojha <quic_mojha@quicinc.com>
+Link: https://lore.kernel.org/20241014192930.1539673-1-quic_mojha@quicinc.com
+Signed-off-by: Linus Walleij <linus.walleij@linaro.org>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/pinctrl/core.c   |    3 +++
+ drivers/pinctrl/core.h   |    1 +
+ drivers/pinctrl/pinmux.c |   35 +++++++++++++++++++++++++++++++----
+ 3 files changed, 35 insertions(+), 4 deletions(-)
+
+--- a/drivers/pinctrl/core.c
++++ b/drivers/pinctrl/core.c
+@@ -242,6 +242,9 @@ static int pinctrl_register_one_pin(stru
+ 
+ 	/* Set owner */
+ 	pindesc->pctldev = pctldev;
++#ifdef CONFIG_PINMUX
++	mutex_init(&pindesc->mux_lock);
++#endif
+ 
+ 	/* Copy basic pin info */
+ 	if (pin->name) {
+--- a/drivers/pinctrl/core.h
++++ b/drivers/pinctrl/core.h
+@@ -168,6 +168,7 @@ struct pin_desc {
+ 	const char *mux_owner;
+ 	const struct pinctrl_setting_mux *mux_setting;
+ 	const char *gpio_owner;
++	struct mutex mux_lock;
+ #endif
+ };
+ 
+--- a/drivers/pinctrl/pinmux.c
++++ b/drivers/pinctrl/pinmux.c
+@@ -99,11 +99,13 @@ static int pin_request(struct pinctrl_de
+ 	dev_dbg(pctldev->dev, "request pin %d (%s) for %s\n",
+ 		pin, desc->name, owner);
+ 
++	mutex_lock(&desc->mux_lock);
+ 	if ((!gpio_range || ops->strict) &&
+ 	    desc->mux_usecount && strcmp(desc->mux_owner, owner)) {
+ 		dev_err(pctldev->dev,
+ 			"pin %s already requested by %s; cannot claim for %s\n",
+ 			desc->name, desc->mux_owner, owner);
++		mutex_unlock(&desc->mux_lock);
+ 		goto out;
+ 	}
+ 
+@@ -111,6 +113,7 @@ static int pin_request(struct pinctrl_de
+ 		dev_err(pctldev->dev,
+ 			"pin %s already requested by %s; cannot claim for %s\n",
+ 			desc->name, desc->gpio_owner, owner);
++		mutex_unlock(&desc->mux_lock);
+ 		goto out;
+ 	}
+ 
+@@ -118,11 +121,14 @@ static int pin_request(struct pinctrl_de
+ 		desc->gpio_owner = owner;
+ 	} else {
+ 		desc->mux_usecount++;
+-		if (desc->mux_usecount > 1)
++		if (desc->mux_usecount > 1) {
++			mutex_unlock(&desc->mux_lock);
+ 			return 0;
++		}
+ 
+ 		desc->mux_owner = owner;
+ 	}
++	mutex_unlock(&desc->mux_lock);
+ 
+ 	/* Let each pin increase references to this module */
+ 	if (!try_module_get(pctldev->owner)) {
+@@ -152,6 +158,7 @@ static int pin_request(struct pinctrl_de
+ 
+ out_free_pin:
+ 	if (status) {
++		mutex_lock(&desc->mux_lock);
+ 		if (gpio_range) {
+ 			desc->gpio_owner = NULL;
+ 		} else {
+@@ -159,6 +166,7 @@ out_free_pin:
+ 			if (!desc->mux_usecount)
+ 				desc->mux_owner = NULL;
+ 		}
++		mutex_unlock(&desc->mux_lock);
+ 	}
+ out:
+ 	if (status)
+@@ -193,16 +201,22 @@ static const char *pin_free(struct pinct
+ 		return NULL;
+ 	}
+ 
++	mutex_lock(&desc->mux_lock);
+ 	if (!gpio_range) {
+ 		/*
+ 		 * A pin should not be freed more times than allocated.
+ 		 */
+-		if (WARN_ON(!desc->mux_usecount))
++		if (WARN_ON(!desc->mux_usecount)) {
++			mutex_unlock(&desc->mux_lock);
+ 			return NULL;
++		}
+ 		desc->mux_usecount--;
+-		if (desc->mux_usecount)
++		if (desc->mux_usecount) {
++			mutex_unlock(&desc->mux_lock);
+ 			return NULL;
++		}
+ 	}
++	mutex_unlock(&desc->mux_lock);
+ 
+ 	/*
+ 	 * If there is no kind of request function for the pin we just assume
+@@ -213,6 +227,7 @@ static const char *pin_free(struct pinct
+ 	else if (ops->free)
+ 		ops->free(pctldev, pin);
+ 
++	mutex_lock(&desc->mux_lock);
+ 	if (gpio_range) {
+ 		owner = desc->gpio_owner;
+ 		desc->gpio_owner = NULL;
+@@ -221,6 +236,7 @@ static const char *pin_free(struct pinct
+ 		desc->mux_owner = NULL;
+ 		desc->mux_setting = NULL;
+ 	}
++	mutex_unlock(&desc->mux_lock);
+ 
+ 	module_put(pctldev->owner);
+ 
+@@ -432,7 +448,9 @@ int pinmux_enable_setting(struct pinctrl
+ 				 pins[i]);
+ 			continue;
+ 		}
++		mutex_lock(&desc->mux_lock);
+ 		desc->mux_setting = &(setting->data.mux);
++		mutex_unlock(&desc->mux_lock);
+ 	}
+ 
+ 	ret = ops->set_mux(pctldev, setting->data.mux.func,
+@@ -446,8 +464,10 @@ int pinmux_enable_setting(struct pinctrl
+ err_set_mux:
+ 	for (i = 0; i < num_pins; i++) {
+ 		desc = pin_desc_get(pctldev, pins[i]);
++		mutex_lock(&desc->mux_lock);
+ 		if (desc)
+ 			desc->mux_setting = NULL;
++		mutex_unlock(&desc->mux_lock);
+ 	}
+ err_pin_request:
+ 	/* On error release all taken pins */
+@@ -466,6 +486,7 @@ void pinmux_disable_setting(struct pinct
+ 	unsigned num_pins = 0;
+ 	int i;
+ 	struct pin_desc *desc;
++	bool is_equal;
+ 
+ 	if (pctlops->get_group_pins)
+ 		ret = pctlops->get_group_pins(pctldev, setting->data.mux.group,
+@@ -491,8 +512,12 @@ void pinmux_disable_setting(struct pinct
+ 				 pins[i]);
+ 			continue;
+ 		}
+-		if (desc->mux_setting == &(setting->data.mux)) {
++		mutex_lock(&desc->mux_lock);
++		is_equal = (desc->mux_setting == &(setting->data.mux));
++		if (is_equal)
+ 			desc->mux_setting = NULL;
++		mutex_unlock(&desc->mux_lock);
++		if (is_equal) {
+ 			/* And release the pin */
+ 			pin_free(pctldev, pins[i], NULL);
+ 		} else {
+@@ -585,6 +610,7 @@ static int pinmux_pins_show(struct seq_f
+ 		if (desc == NULL)
+ 			continue;
+ 
++		mutex_lock(&desc->mux_lock);
+ 		if (desc->mux_owner &&
+ 		    !strcmp(desc->mux_owner, pinctrl_dev_get_name(pctldev)))
+ 			is_hog = true;
+@@ -619,6 +645,7 @@ static int pinmux_pins_show(struct seq_f
+ 					desc->mux_setting->group));
+ 		else
+ 			seq_printf(s, "\n");
++		mutex_unlock(&desc->mux_lock);
+ 	}
+ 
+ 	mutex_unlock(&pctldev->mutex);
