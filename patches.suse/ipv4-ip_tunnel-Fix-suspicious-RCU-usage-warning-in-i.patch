@@ -1,0 +1,150 @@
+From 90e0569dd3d32f4f4d2ca691d3fa5a8a14a13c12 Mon Sep 17 00:00:00 2001
+From: Ido Schimmel <idosch@nvidia.com>
+Date: Wed, 23 Oct 2024 15:30:09 +0300
+Subject: [PATCH] ipv4: ip_tunnel: Fix suspicious RCU usage warning in
+ ip_tunnel_find()
+Git-commit: 90e0569dd3d32f4f4d2ca691d3fa5a8a14a13c12
+Patch-mainline: v6.12-rc6
+References: CVE-2024-50304 bsc#1233522
+
+The per-netns IP tunnel hash table is protected by the RTNL mutex and
+ip_tunnel_find() is only called from the control path where the mutex is
+taken.
+
+Add a lockdep expression to hlist_for_each_entry_rcu() in
+ip_tunnel_find() in order to validate that the mutex is held and to
+silence the suspicious RCU usage warning [1].
+
+[1]
+WARNING: suspicious RCU usage
+6.12.0-rc3-custom-gd95d9a31aceb #139 Not tainted
+-----------------------------
+net/ipv4/ip_tunnel.c:221 RCU-list traversed in non-reader section!!
+
+other info that might help us debug this:
+
+rcu_scheduler_active = 2, debug_locks = 1
+1 lock held by ip/362:
+ #0: ffffffff86fc7cb0 (rtnl_mutex){+.+.}-{3:3}, at: rtnetlink_rcv_msg+0x377/0xf60
+
+stack backtrace:
+CPU: 12 UID: 0 PID: 362 Comm: ip Not tainted 6.12.0-rc3-custom-gd95d9a31aceb #139
+Hardware name: Bochs Bochs, BIOS Bochs 01/01/2011
+Call Trace:
+ <TASK>
+ dump_stack_lvl+0xba/0x110
+ lockdep_rcu_suspicious.cold+0x4f/0xd6
+ ip_tunnel_find+0x435/0x4d0
+ ip_tunnel_newlink+0x517/0x7a0
+ ipgre_newlink+0x14c/0x170
+ __rtnl_newlink+0x1173/0x19c0
+ rtnl_newlink+0x6c/0xa0
+ rtnetlink_rcv_msg+0x3cc/0xf60
+ netlink_rcv_skb+0x171/0x450
+ netlink_unicast+0x539/0x7f0
+ netlink_sendmsg+0x8c1/0xd80
+ ____sys_sendmsg+0x8f9/0xc20
+ ___sys_sendmsg+0x197/0x1e0
+ __sys_sendmsg+0x122/0x1f0
+ do_syscall_64+0xbb/0x1d0
+ entry_SYSCALL_64_after_hwframe+0x77/0x7f
+
+[Davide Benini's note]
+
+Added an optional lockdep expression to hlist_for_each_entry_rcu, in case it is
+called from non-RCU protection and a check  during list traversal that we are
+within an RCU reader
+See commit 28875945ba98d
+
+[End of note]
+
+Fixes: c54419321455 ("GRE: Refactor GRE tunneling code.")
+Suggested-by: Eric Dumazet <edumazet@google.com>
+Signed-off-by: Ido Schimmel <idosch@nvidia.com>
+Reviewed-by: Eric Dumazet <edumazet@google.com>
+Link: https://patch.msgid.link/20241023123009.749764-1-idosch@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Davide Benini <davide.benini@suse.com>
+
+---
+ include/linux/rculist.h |   45 +++++++++++++++++++++++++++++++++++++++++++--
+ net/ipv4/ip_tunnel.c    |    2 +-
+ 2 files changed, 44 insertions(+), 3 deletions(-)
+
+--- a/include/linux/rculist.h
++++ b/include/linux/rculist.h
+@@ -40,6 +40,24 @@ static inline void INIT_LIST_HEAD_RCU(st
+ #define list_next_rcu(list)	(*((struct list_head __rcu **)(&(list)->next)))
+ 
+ /*
++ * Check during list traversal that we are within an RCU reader
++ */
++
++#define check_arg_count_one(dummy)
++
++#ifdef CONFIG_PROVE_RCU_LIST
++#define __list_check_rcu(dummy, cond, extra...)				\
++	({								\
++	check_arg_count_one(extra);					\
++	RCU_LOCKDEP_WARN(!cond && !rcu_read_lock_any_held(),		\
++			 "RCU-list traversed in non-reader section!");	\
++	 })
++#else
++#define __list_check_rcu(dummy, cond, extra...)				\
++	({ check_arg_count_one(extra); })
++#endif
++
++/*
+  * Insert a new entry between two known consecutive entries.
+  *
+  * This is only for internal list manipulation where we know
+@@ -617,13 +635,36 @@ static inline void hlist_add_behind_rcu(
+  * @pos:	the type * to use as a loop cursor.
+  * @head:	the head for your list.
+  * @member:	the name of the hlist_node within the struct.
++ * @cond:	optional lockdep expression if called from non-RCU protection.
+  *
+  * This list-traversal primitive may safely run concurrently with
+  * the _rcu list-mutation primitives such as hlist_add_head_rcu()
+  * as long as the traversal is guarded by rcu_read_lock().
+  */
+-#define hlist_for_each_entry_rcu(pos, head, member)			\
+-	for (pos = hlist_entry_safe (rcu_dereference_raw(hlist_first_rcu(head)),\
++#define hlist_for_each_entry_rcu(pos, head, member, cond...)		\
++	for (__list_check_rcu(dummy, ## cond, 0),			\
++	     pos = hlist_entry_safe(rcu_dereference_raw(hlist_first_rcu(head)),\
++			typeof(*(pos)), member);			\
++		pos;							\
++		pos = hlist_entry_safe(rcu_dereference_raw(hlist_next_rcu(\
++			&(pos)->member)), typeof(*(pos)), member))
++
++/**
++ * hlist_for_each_entry_srcu - iterate over rcu list of given type
++ * @pos:	the type * to use as a loop cursor.
++ * @head:	the head for your list.
++ * @member:	the name of the hlist_node within the struct.
++ * @cond:	lockdep expression for the lock required to traverse the list.
++ *
++ * This list-traversal primitive may safely run concurrently with
++ * the _rcu list-mutation primitives such as hlist_add_head_rcu()
++ * as long as the traversal is guarded by srcu_read_lock().
++ * The lockdep expression srcu_read_lock_held() can be passed as the
++ * cond argument from read side.
++ */
++#define hlist_for_each_entry_srcu(pos, head, member, cond)		\
++	for (__list_check_srcu(cond),					\
++	     pos = hlist_entry_safe(rcu_dereference_raw(hlist_first_rcu(head)),\
+ 			typeof(*(pos)), member);			\
+ 		pos;							\
+ 		pos = hlist_entry_safe(rcu_dereference_raw(hlist_next_rcu(\
+--- a/net/ipv4/ip_tunnel.c
++++ b/net/ipv4/ip_tunnel.c
+@@ -231,7 +231,7 @@ static struct ip_tunnel *ip_tunnel_find(
+ 	struct ip_tunnel *t = NULL;
+ 	struct hlist_head *head = ip_bucket(itn, parms);
+ 
+-	hlist_for_each_entry_rcu(t, head, hash_node) {
++	hlist_for_each_entry_rcu(t, head, hash_node, lockdep_rtnl_is_held()) {
+ 		if (local == t->parms.iph.saddr &&
+ 		    remote == t->parms.iph.daddr &&
+ 		    link == t->parms.link &&
