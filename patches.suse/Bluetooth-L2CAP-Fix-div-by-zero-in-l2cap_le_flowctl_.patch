@@ -1,0 +1,237 @@
+From a5b862c6a221459d54e494e88965b48dcfa6cc44 Mon Sep 17 00:00:00 2001
+From: Sungwoo Kim <iam@sung-woo.kim>
+Date: Sat, 4 May 2024 15:23:29 -0400
+Subject: [PATCH] Bluetooth: L2CAP: Fix div-by-zero in l2cap_le_flowctl_init()
+Git-commit: a5b862c6a221459d54e494e88965b48dcfa6cc44
+Patch-mainline: v6.10-rc1
+References: CVE-2024-36968 bsc#1226130
+
+[ backport note: changed hci_conn_add() to return NULL for invalid
+  parameters, too, so that 3rd party modules can still call it
+  potentially.
+  Also, add the handling of AMP_LINK type (that was dropped from the
+  upstream) -- tiwai ]
+
+l2cap_le_flowctl_init() can cause both div-by-zero and an integer
+overflow since hdev->le_mtu may not fall in the valid range.
+
+Move MTU from hci_dev to hci_conn to validate MTU and stop the connection
+process earlier if MTU is invalid.
+Also, add a missing validation in read_buffer_size() and make it return
+an error value if the validation fails.
+Now hci_conn_add() returns ERR_PTR() as it can fail due to the both a
+kzalloc failure and invalid MTU value.
+
+divide error: 0000 [#1] PREEMPT SMP KASAN NOPTI
+Cpu: 0 PID: 67 Comm: kworker/u5:0 Tainted: G        W          6.9.0-rc5+ #20
+Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS 1.15.0-1 04/01/2014
+Workqueue: hci0 hci_rx_work
+Rip: 0010:l2cap_le_flowctl_init+0x19e/0x3f0 net/bluetooth/l2cap_core.c:547
+Code: e8 17 17 0c 00 66 41 89 9f 84 00 00 00 bf 01 00 00 00 41 b8 02 00 00 00 4c
+89 fe 4c 89 e2 89 d9 e8 27 17 0c 00 44 89 f0 31 d2 <66> f7 f3 89 c3 ff c3 4d 8d
+b7 88 00 00 00 4c 89 f0 48 c1 e8 03 42
+Rsp: 0018:ffff88810bc0f858 EFLAGS: 00010246
+Rax: 00000000000002a0 RBX: 0000000000000000 RCX: dffffc0000000000
+Rdx: 0000000000000000 RSI: ffff88810bc0f7c0 RDI: ffffc90002dcb66f
+Rbp: ffff88810bc0f880 R08: aa69db2dda70ff01 R09: 0000ffaaaaaaaaaa
+R10: 0084000000ffaaaa R11: 0000000000000000 R12: ffff88810d65a084
+R13: dffffc0000000000 R14: 00000000000002a0 R15: ffff88810d65a000
+Fs: 0000000000000000(0000) GS:ffff88811ac00000(0000) knlGS:0000000000000000
+Cs: 0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+Cr2: 0000000020000100 CR3: 0000000103268003 CR4: 0000000000770ef0
+Pkru: 55555554
+Call Trace:
+ <TASK>
+ l2cap_le_connect_req net/bluetooth/l2cap_core.c:4902 [inline]
+ l2cap_le_sig_cmd net/bluetooth/l2cap_core.c:5420 [inline]
+ l2cap_le_sig_channel net/bluetooth/l2cap_core.c:5486 [inline]
+ l2cap_recv_frame+0xe59d/0x11710 net/bluetooth/l2cap_core.c:6809
+ l2cap_recv_acldata+0x544/0x10a0 net/bluetooth/l2cap_core.c:7506
+ hci_acldata_packet net/bluetooth/hci_core.c:3939 [inline]
+ hci_rx_work+0x5e5/0xb20 net/bluetooth/hci_core.c:4176
+ process_one_work kernel/workqueue.c:3254 [inline]
+ process_scheduled_works+0x90f/0x1530 kernel/workqueue.c:3335
+ worker_thread+0x926/0xe70 kernel/workqueue.c:3416
+ kthread+0x2e3/0x380 kernel/kthread.c:388
+ ret_from_fork+0x5c/0x90 arch/x86/kernel/process.c:147
+ ret_from_fork_asm+0x1a/0x30 arch/x86/entry/entry_64.S:244
+ </TASK>
+Modules linked in:
+
+---[ end trace 0000000000000000 ]---
+
+Fixes: 6ed58ec520ad ("Bluetooth: Use LE buffers for LE traffic")
+Suggested-by: Luiz Augusto von Dentz <luiz.dentz@gmail.com>
+Signed-off-by: Sungwoo Kim <iam@sung-woo.kim>
+Signed-off-by: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ include/net/bluetooth/hci.h      |    9 +++++++++
+ include/net/bluetooth/hci_core.h |    1 +
+ net/bluetooth/amp.c              |    2 +-
+ net/bluetooth/hci_conn.c         |   33 +++++++++++++++++++++++++++++++++
+ net/bluetooth/l2cap_core.c       |   19 ++-----------------
+ net/bluetooth/sco.c              |    6 +++---
+ 6 files changed, 49 insertions(+), 21 deletions(-)
+
+--- a/include/net/bluetooth/hci.h
++++ b/include/net/bluetooth/hci.h
+@@ -1289,6 +1289,15 @@ struct hci_cp_le_set_event_mask {
+ 	__u8     mask[8];
+ } __packed;
+ 
++/* BLUETOOTH CORE SPECIFICATION Version 5.4 | Vol 4, Part E
++ * 7.8.2 LE Read Buffer Size command
++ * MAX_LE_MTU is 0xffff.
++ * 0 is also valid. It means that no dedicated LE Buffer exists.
++ * It should use the HCI_Read_Buffer_Size command and mtu is shared
++ * between BR/EDR and LE.
++ */
++#define HCI_MIN_LE_MTU 0x001b
++
+ #define HCI_OP_LE_READ_BUFFER_SIZE	0x2002
+ struct hci_rp_le_read_buffer_size {
+ 	__u8     status;
+--- a/include/net/bluetooth/hci_core.h
++++ b/include/net/bluetooth/hci_core.h
+@@ -439,6 +439,7 @@ struct hci_conn {
+ 	__u8		resp_addr_type;
+ 	__u16		handle;
+ 	__u16		state;
++	__u16		mtu;
+ 	__u8		mode;
+ 	__u8		type;
+ 	__u8		role;
+--- a/net/bluetooth/amp.c
++++ b/net/bluetooth/amp.c
+@@ -526,7 +526,7 @@ void amp_physical_cfm(struct hci_conn *b
+ 	bredr_chan->remote_amp_id = hs_hcon->remote_id;
+ 	bredr_chan->local_amp_id = hs_hcon->hdev->id;
+ 	bredr_chan->hs_hcon = hs_hcon;
+-	bredr_chan->conn->mtu = hs_hcon->hdev->block_mtu;
++	bredr_chan->conn->mtu = hs_hcon->mtu;
+ 
+ 	__l2cap_physical_cfm(bredr_chan, 0);
+ 
+--- a/net/bluetooth/hci_conn.c
++++ b/net/bluetooth/hci_conn.c
+@@ -492,6 +492,31 @@ struct hci_conn *hci_conn_add(struct hci
+ {
+ 	struct hci_conn *conn;
+ 
++	switch (type) {
++	case ACL_LINK:
++		if (!hdev->acl_mtu)
++			return NULL;
++		break;
++	case AMP_LINK:
++		if (!hdev->block_mtu)
++			return NULL;
++		break;
++	case LE_LINK:
++		if (hdev->le_mtu && hdev->le_mtu < HCI_MIN_LE_MTU)
++			return NULL;
++		if (!hdev->le_mtu && hdev->acl_mtu < HCI_MIN_LE_MTU)
++			return NULL;
++		break;
++	case SCO_LINK:
++	case ESCO_LINK:
++		if (!hdev->sco_pkts)
++			/* Controller does not support SCO or eSCO over HCI */
++			return NULL;
++		break;
++	default:
++		return NULL;
++	}
++
+ 	BT_DBG("%s dst %pMR", hdev->name, dst);
+ 
+ 	conn = kzalloc(sizeof(*conn), GFP_KERNEL);
+@@ -522,10 +547,15 @@ struct hci_conn *hci_conn_add(struct hci
+ 	switch (type) {
+ 	case ACL_LINK:
+ 		conn->pkt_type = hdev->pkt_type & ACL_PTYPE_MASK;
++		conn->mtu = hdev->acl_mtu;
++		break;
++	case AMP_LINK:
++		conn->mtu = hdev->block_mtu;
+ 		break;
+ 	case LE_LINK:
+ 		/* conn->src should reflect the local identity address */
+ 		hci_copy_identity_address(hdev, &conn->src, &conn->src_type);
++		conn->mtu = hdev->le_mtu ? hdev->le_mtu : hdev->acl_mtu;
+ 		break;
+ 	case SCO_LINK:
+ 		if (lmp_esco_capable(hdev))
+@@ -533,9 +563,12 @@ struct hci_conn *hci_conn_add(struct hci
+ 					(hdev->esco_type & EDR_ESCO_MASK);
+ 		else
+ 			conn->pkt_type = hdev->pkt_type & SCO_PTYPE_MASK;
++
++		conn->mtu = hdev->sco_mtu;
+ 		break;
+ 	case ESCO_LINK:
+ 		conn->pkt_type = hdev->esco_type & ~EDR_ESCO_MASK;
++		conn->mtu = hdev->sco_mtu;
+ 		break;
+ 	}
+ 
+--- a/net/bluetooth/l2cap_core.c
++++ b/net/bluetooth/l2cap_core.c
+@@ -6528,11 +6528,7 @@ static int l2cap_finish_move(struct l2ca
+ 	BT_DBG("chan %p", chan);
+ 
+ 	chan->rx_state = L2CAP_RX_STATE_RECV;
+-
+-	if (chan->hs_hcon)
+-		chan->conn->mtu = chan->hs_hcon->hdev->block_mtu;
+-	else
+-		chan->conn->mtu = chan->conn->hcon->hdev->acl_mtu;
++	chan->conn->mtu = chan->conn->hcon->mtu;
+ 
+ 	return l2cap_resegment(chan);
+ }
+@@ -7138,18 +7134,7 @@ static struct l2cap_conn *l2cap_conn_add
+ 
+ 	BT_DBG("hcon %p conn %p hchan %p", hcon, conn, hchan);
+ 
+-	switch (hcon->type) {
+-	case LE_LINK:
+-		if (hcon->hdev->le_mtu) {
+-			conn->mtu = hcon->hdev->le_mtu;
+-			break;
+-		}
+-		/* fall through */
+-	default:
+-		conn->mtu = hcon->hdev->acl_mtu;
+-		break;
+-	}
+-
++	conn->mtu = hcon->mtu;
+ 	conn->feat_mask = 0;
+ 
+ 	conn->local_fixed_chan = L2CAP_FC_SIG_BREDR | L2CAP_FC_CONNLESS;
+--- a/net/bluetooth/sco.c
++++ b/net/bluetooth/sco.c
+@@ -133,7 +133,6 @@ static void sco_sock_clear_timer(struct
+ /* ---- SCO connections ---- */
+ static struct sco_conn *sco_conn_add(struct hci_conn *hcon)
+ {
+-	struct hci_dev *hdev = hcon->hdev;
+ 	struct sco_conn *conn = hcon->sco_data;
+ 
+ 	if (conn)
+@@ -147,9 +146,10 @@ static struct sco_conn *sco_conn_add(str
+ 
+ 	hcon->sco_data = conn;
+ 	conn->hcon = hcon;
++	conn->mtu = hcon->mtu;
+ 
+-	if (hdev->sco_mtu > 0)
+-		conn->mtu = hdev->sco_mtu;
++	if (hcon->mtu > 0)
++		conn->mtu = hcon->mtu;
+ 	else
+ 		conn->mtu = 60;
+ 
