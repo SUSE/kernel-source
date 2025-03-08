@@ -1,0 +1,308 @@
+From: Dust Li <dust.li@linux.alibaba.com>
+Date: Tue, 28 Dec 2021 17:03:25 +0800
+Subject: net/smc: fix kernel panic caused by race of smc_sock
+Git-commit: 349d43127dac00c15231e8ffbcaabd70f7b0e544
+References: CVE-2021-46925 bsc#1220466
+Patch-mainline: v5.16-rc8
+
+A crash occurs when smc_cdc_tx_handler() tries to access smc_sock
+but smc_release() has already freed it.
+
+[ 4570.695099] BUG: unable to handle page fault for address: 000000002eae9e88
+[ 4570.696048] #PF: supervisor write access in kernel mode
+[ 4570.696728] #PF: error_code(0x0002) - not-present page
+[ 4570.697401] PGD 0 P4D 0
+[ 4570.697716] Oops: 0002 [#1] PREEMPT SMP NOPTI
+[ 4570.698228] CPU: 0 PID: 0 Comm: swapper/0 Not tainted 5.16.0-rc4+ #111
+[ 4570.699013] Hardware name: Alibaba Cloud Alibaba Cloud ECS, BIOS 8c24b4c 04/0
+[ 4570.699933] RIP: 0010:_raw_spin_lock+0x1a/0x30
+<...>
+[ 4570.711446] Call Trace:
+[ 4570.711746]  <IRQ>
+[ 4570.711992]  smc_cdc_tx_handler+0x41/0xc0
+[ 4570.712470]  smc_wr_tx_tasklet_fn+0x213/0x560
+[ 4570.712981]  ? smc_cdc_tx_dismisser+0x10/0x10
+[ 4570.713489]  tasklet_action_common.isra.17+0x66/0x140
+[ 4570.714083]  __do_softirq+0x123/0x2f4
+[ 4570.714521]  irq_exit_rcu+0xc4/0xf0
+[ 4570.714934]  common_interrupt+0xba/0xe0
+
+Though smc_cdc_tx_handler() checked the existence of smc connection,
+smc_release() may have already dismissed and released the smc socket
+before smc_cdc_tx_handler() further visits it.
+
+smc_cdc_tx_handler()           |smc_release()
+if (!conn)                     |
+                               |
+                               |smc_cdc_tx_dismiss_slots()
+                               |      smc_cdc_tx_dismisser()
+                               |
+                               |sock_put(&smc->sk) <- last sock_put,
+                               |                      smc_sock freed
+bh_lock_sock(&smc->sk) (panic) |
+
+To make sure we won't receive any CDC messages after we free the
+smc_sock, add a refcount on the smc_connection for inflight CDC
+message(posted to the QP but haven't received related CQE), and
+don't release the smc_connection until all the inflight CDC messages
+haven been done, for both success or failed ones.
+
+Using refcount on CDC messages brings another problem: when the link
+is going to be destroyed, smcr_link_clear() will reset the QP, which
+then remove all the pending CQEs related to the QP in the CQ. To make
+sure all the CQEs will always come back so the refcount on the
+smc_connection can always reach 0, smc_ib_modify_qp_reset() was replaced
+by smc_ib_modify_qp_error().
+And remove the timeout in smc_wr_tx_wait_no_pending_sends() since we
+need to wait for all pending WQEs done, or we may encounter use-after-
+free when handling CQEs.
+
+For IB device removal routine, we need to wait for all the QPs on that
+device been destroyed before we can destroy CQs on the device, or
+the refcount on smc_connection won't reach 0 and smc_sock cannot be
+released.
+
+Fixes: 5f08318f617b ("smc: connection data control (CDC)")
+Reported-by: Wen Gu <guwen@linux.alibaba.com>
+Signed-off-by: Dust Li <dust.li@linux.alibaba.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Steffen Jaeckel <sjaeckel@suse.de>
+---
+ net/smc/smc.h      |  5 +++++
+ net/smc/smc_cdc.c  | 30 +++++++++++++++++-------------
+ net/smc/smc_cdc.h  |  2 +-
+ net/smc/smc_core.c |  5 +++--
+ net/smc/smc_ib.c   |  4 ++--
+ net/smc/smc_ib.h   |  1 +
+ net/smc/smc_wr.c   | 28 ----------------------------
+ net/smc/smc_wr.h   |  1 -
+ 8 files changed, 29 insertions(+), 47 deletions(-)
+
+diff --git a/net/smc/smc.h b/net/smc/smc.h
+index 6f83cd015a2e8..6f02e326eeeac 100644
+--- a/net/smc/smc.h
++++ b/net/smc/smc.h
+@@ -153,6 +153,11 @@ struct smc_connection {
+ 	atomic_t		sndbuf_space;	/* remaining space in sndbuf */
+ 	u16			tx_cdc_seq;	/* sequence # for CDC send */
+ 	spinlock_t		send_lock;	/* protect wr_sends */
++	atomic_t		cdc_pend_tx_wr; /* number of pending tx CDC wqe
++						 * - inc when post wqe,
++						 * - dec on polled tx cqe
++						 */
++	wait_queue_head_t	cdc_pend_tx_wq; /* wakeup on no cdc_pend_tx_wr*/
+ 	struct delayed_work	tx_work;	/* retry of smc_cdc_msg_send */
+ 	u32			tx_off;		/* base offset in peer rmb */
+ 
+diff --git a/net/smc/smc_cdc.c b/net/smc/smc_cdc.c
+index d1bdbd867cc31..0a792ea6a5d4a 100644
+--- a/net/smc/smc_cdc.c
++++ b/net/smc/smc_cdc.c
+@@ -30,10 +30,6 @@ static void smc_cdc_tx_handler(struct smc_wr_tx_pend_priv *pnd_snd,
+ 	struct smc_sock *smc;
+ 	int diff;
+ 
+-	if (!conn)
+-		/* already dismissed */
+-		return;
+-
+ 	smc = container_of(conn, struct smc_sock, conn);
+ 	bh_lock_sock(&smc->sk);
+ 	if (!wc_status) {
+@@ -47,6 +43,12 @@ static void smc_cdc_tx_handler(struct smc_wr_tx_pend_priv *pnd_snd,
+ 		smp_mb__after_atomic();
+ 		smc_curs_copy(&conn->tx_curs_fin, &cdcpend->cursor, conn);
+ 	}
++
++	if (atomic_dec_and_test(&conn->cdc_pend_tx_wr) &&
++	    unlikely(wq_has_sleeper(&conn->cdc_pend_tx_wq)))
++		wake_up(&conn->cdc_pend_tx_wq);
++	WARN_ON(atomic_read(&conn->cdc_pend_tx_wr) < 0);
++
+ 	smc_tx_sndbuf_nonfull(smc);
+ 	bh_unlock_sock(&smc->sk);
+ }
+@@ -101,10 +103,16 @@ int smc_cdc_msg_send(struct smc_connection *conn,
+ 	conn->tx_cdc_seq++;
+ 	conn->local_tx_ctrl.seqno = conn->tx_cdc_seq;
+ 	smc_host_msg_to_cdc((struct smc_cdc_msg *)wr_buf, conn, &cfed);
++
++	atomic_inc(&conn->cdc_pend_tx_wr);
++	smp_mb__after_atomic(); /* Make sure cdc_pend_tx_wr added before post */
++
+ 	rc = smc_wr_tx_send(link, (struct smc_wr_tx_pend_priv *)pend);
+ 	if (!rc) {
+ 		smc_curs_copy(&conn->rx_curs_confirmed, &cfed, conn);
+ 		conn->local_rx_ctrl.prod_flags.cons_curs_upd_req = 0;
++	} else {
++		atomic_dec(&conn->cdc_pend_tx_wr);
+ 	}
+ 
+ 	return rc;
+@@ -159,15 +167,6 @@ static void smc_cdc_tx_dismisser(struct smc_wr_tx_pend_priv *tx_pend)
+ 	cdc_pend->conn = NULL;
+ }
+ 
+-void smc_cdc_tx_dismiss_slots(struct smc_connection *conn)
+-{
+-	struct smc_link *link = &conn->lgr->lnk[SMC_SINGLE_LINK];
+-
+-	smc_wr_tx_dismiss_slots(link, SMC_CDC_MSG_TYPE,
+-				smc_cdc_tx_filter, smc_cdc_tx_dismisser,
+-				(unsigned long)conn);
+-}
+-
+ /* Send a SMC-D CDC header.
+  * This increments the free space available in our send buffer.
+  * Also update the confirmed receive buffer with what was sent to the peer.
+@@ -401,3 +400,8 @@ int __init smc_cdc_init(void)
+ 	}
+ 	return rc;
+ }
++
++void smc_cdc_wait_pend_tx_wr(struct smc_connection *conn)
++{
++	wait_event(conn->cdc_pend_tx_wq, !atomic_read(&conn->cdc_pend_tx_wr));
++}
+diff --git a/net/smc/smc_cdc.h b/net/smc/smc_cdc.h
+index 1c9cf6f415452..b80598ca879d4 100644
+--- a/net/smc/smc_cdc.h
++++ b/net/smc/smc_cdc.h
+@@ -306,7 +306,7 @@ int smc_cdc_get_free_slot(struct smc_connection *conn,
+ 			  struct smc_wr_buf **wr_buf,
+ 			  struct smc_rdma_wr **wr_rdma_buf,
+ 			  struct smc_cdc_tx_pend **pend);
+-void smc_cdc_tx_dismiss_slots(struct smc_connection *conn);
++void smc_cdc_wait_pend_tx_wr(struct smc_connection *conn);
+ int smc_cdc_msg_send(struct smc_connection *conn, struct smc_wr_buf *wr_buf,
+ 		     struct smc_cdc_tx_pend *pend);
+ int smc_cdc_get_slot_and_msg_send(struct smc_connection *conn);
+diff --git a/net/smc/smc_core.c b/net/smc/smc_core.c
+index a6fda644fca50..f39a0df72eedf 100644
+--- a/net/smc/smc_core.c
++++ b/net/smc/smc_core.c
+@@ -349,7 +349,7 @@ void smc_conn_free(struct smc_connection *conn)
+ 		smc_ism_unset_conn(conn);
+ 		tasklet_kill(&conn->rx_tsklet);
+ 	} else {
+-		smc_cdc_tx_dismiss_slots(conn);
++		smc_cdc_wait_pend_tx_wr(conn);
+ 	}
+ 	smc_lgr_unregister_conn(conn);
+ 	smc_buf_unuse(conn, lgr);		/* allow buffer reuse */
+@@ -363,7 +363,7 @@ static void smc_link_clear(struct smc_link *lnk)
+ {
+ 	lnk->peer_qpn = 0;
+ 	smc_llc_link_clear(lnk);
+-	smc_ib_modify_qp_reset(lnk);
++	smc_ib_modify_qp_error(lnk);
+ 	smc_wr_free_link(lnk);
+ 	smc_ib_destroy_queue_pair(lnk);
+ 	smc_ib_dealloc_protection_domain(lnk);
+@@ -672,6 +672,7 @@ int smc_conn_create(struct smc_sock *smc, struct smc_init_info *ini)
+ 	conn->local_tx_ctrl.common.type = SMC_CDC_MSG_TYPE;
+ 	conn->local_tx_ctrl.len = SMC_WR_TX_SIZE;
+ 	conn->urg_state = SMC_URG_READ;
++	init_waitqueue_head(&conn->cdc_pend_tx_wq);
+ 	if (ini->is_smcd) {
+ 		conn->rx_off = sizeof(struct smcd_cdc_msg);
+ 		smcd_cdc_rx_init(conn); /* init tasklet for this conn */
+diff --git a/net/smc/smc_ib.c b/net/smc/smc_ib.c
+index 3721a4fd8d472..24cbbad02b81d 100644
+--- a/net/smc/smc_ib.c
++++ b/net/smc/smc_ib.c
+@@ -103,12 +103,12 @@ int smc_ib_modify_qp_rts(struct smc_link *lnk)
+ 			    IB_QP_MAX_QP_RD_ATOMIC);
+ }
+ 
+-int smc_ib_modify_qp_reset(struct smc_link *lnk)
++int smc_ib_modify_qp_error(struct smc_link *lnk)
+ {
+ 	struct ib_qp_attr qp_attr;
+ 
+ 	memset(&qp_attr, 0, sizeof(qp_attr));
+-	qp_attr.qp_state = IB_QPS_RESET;
++	qp_attr.qp_state = IB_QPS_ERR;
+ 	return ib_modify_qp(lnk->roce_qp, &qp_attr, IB_QP_STATE);
+ }
+ 
+diff --git a/net/smc/smc_ib.h b/net/smc/smc_ib.h
+index c95eb57bff27e..1ca0707a0ff7f 100644
+--- a/net/smc/smc_ib.h
++++ b/net/smc/smc_ib.h
+@@ -68,6 +68,7 @@ int smc_ib_create_queue_pair(struct smc_link *lnk);
+ int smc_ib_ready_link(struct smc_link *lnk);
+ int smc_ib_modify_qp_rts(struct smc_link *lnk);
+ int smc_ib_modify_qp_reset(struct smc_link *lnk);
++int smc_ib_modify_qp_error(struct smc_link *lnk);
+ long smc_ib_setup_per_ibdev(struct smc_ib_device *smcibdev);
+ int smc_ib_get_memory_region(struct ib_pd *pd, int access_flags,
+ 			     struct smc_buf_desc *buf_slot);
+diff --git a/net/smc/smc_wr.c b/net/smc/smc_wr.c
+index 0cab76c54bd15..5651dc0e20c7f 100644
+--- a/net/smc/smc_wr.c
++++ b/net/smc/smc_wr.c
+@@ -65,7 +65,6 @@ static inline void smc_wr_tx_process_cqe(struct ib_wc *wc)
+ 	struct smc_wr_tx_pend pnd_snd;
+ 	struct smc_link *link;
+ 	u32 pnd_snd_idx;
+-	int i;
+ 
+ 	link = wc->qp->qp_context;
+ 
+@@ -91,14 +90,6 @@ static inline void smc_wr_tx_process_cqe(struct ib_wc *wc)
+ 	if (!test_and_clear_bit(pnd_snd_idx, link->wr_tx_mask))
+ 		return;
+ 	if (wc->status) {
+-		for_each_set_bit(i, link->wr_tx_mask, link->wr_tx_cnt) {
+-			/* clear full struct smc_wr_tx_pend including .priv */
+-			memset(&link->wr_tx_pends[i], 0,
+-			       sizeof(link->wr_tx_pends[i]));
+-			memset(&link->wr_tx_bufs[i], 0,
+-			       sizeof(link->wr_tx_bufs[i]));
+-			clear_bit(i, link->wr_tx_mask);
+-		}
+ 		/* terminate connections of this link group abnormally */
+ 		smc_lgr_terminate(smc_get_lgr(link));
+ 	}
+@@ -290,25 +281,6 @@ int smc_wr_reg_send(struct smc_link *link, struct ib_mr *mr)
+ 	return rc;
+ }
+ 
+-void smc_wr_tx_dismiss_slots(struct smc_link *link, u8 wr_tx_hdr_type,
+-			     smc_wr_tx_filter filter,
+-			     smc_wr_tx_dismisser dismisser,
+-			     unsigned long data)
+-{
+-	struct smc_wr_tx_pend_priv *tx_pend;
+-	struct smc_wr_rx_hdr *wr_tx;
+-	int i;
+-
+-	for_each_set_bit(i, link->wr_tx_mask, link->wr_tx_cnt) {
+-		wr_tx = (struct smc_wr_rx_hdr *)&link->wr_tx_bufs[i];
+-		if (wr_tx->type != wr_tx_hdr_type)
+-			continue;
+-		tx_pend = &link->wr_tx_pends[i].priv;
+-		if (filter(tx_pend, data))
+-			dismisser(tx_pend);
+-	}
+-}
+-
+ /****************************** receive queue ********************************/
+ 
+ int smc_wr_rx_register_handler(struct smc_wr_rx_handler *handler)
+diff --git a/net/smc/smc_wr.h b/net/smc/smc_wr.h
+index 0bd19cdcd6d93..132c594cd2e0f 100644
+--- a/net/smc/smc_wr.h
++++ b/net/smc/smc_wr.h
+@@ -21,7 +21,6 @@
+ #define SMC_WR_BUF_CNT 16	/* # of ctrl buffers per link */
+ 
+ #define SMC_WR_TX_WAIT_FREE_SLOT_TIME	(10 * HZ)
+-#define SMC_WR_TX_WAIT_PENDING_TIME	(5 * HZ)
+ 
+ #define SMC_WR_TX_SIZE 44 /* actual size of wr_send data (<=SMC_WR_BUF_SIZE) */
+ 
+-- 
+2.47.1
+
