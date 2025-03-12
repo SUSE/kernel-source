@@ -1,0 +1,124 @@
+From: Steffen Jaeckel <sjaeckel@suse.de>
+Subject: kABI fix for l2tp: prevent possible tunnel refcount underflow
+Patch-mainline: Never, kABI workaround
+References: CVE-2024-49940 bsc#1232812
+
+Upstream commit 24256415d186 ("l2tp: prevent possible tunnel
+refcount underflow") changed the API of `l2tp_session_set_header_len()`
+and this patch re-introduces the API in that version.
+
+Signed-off-by: Steffen Jaeckel <sjaeckel@suse.de>
+
+---
+ net/l2tp/l2tp_core.c    | 23 +++++++++++++++++------
+ net/l2tp/l2tp_core.h    |  4 +++-
+ net/l2tp/l2tp_netlink.c |  2 +-
+ net/l2tp/l2tp_ppp.c     |  2 +-
+ 4 files changed, 22 insertions(+), 9 deletions(-)
+
+diff --git a/net/l2tp/l2tp_core.c b/net/l2tp/l2tp_core.c
+index 1e1f9a9031350..d370ac59061af 100644
+--- a/net/l2tp/l2tp_core.c
++++ b/net/l2tp/l2tp_core.c
+@@ -705,7 +705,7 @@ void l2tp_recv_common(struct l2tp_session *session, struct sk_buff *skb,
+ 				  "%s: requested to enable seq numbers by LNS\n",
+ 				  session->name);
+ 			session->send_seq = 1;
+-			l2tp_session_set_header_len(session, tunnel->version,
++			__l2tp_session_set_header_len(session, tunnel->version,
+ 						    tunnel->encap);
+ 		}
+ 	} else {
+@@ -730,7 +730,7 @@ void l2tp_recv_common(struct l2tp_session *session, struct sk_buff *skb,
+ 				  "%s: requested to disable seq numbers by LNS\n",
+ 				  session->name);
+ 			session->send_seq = 0;
+-			l2tp_session_set_header_len(session, tunnel->version,
++			__l2tp_session_set_header_len(session, tunnel->version,
+ 						    tunnel->encap);
+ 		} else if (session->send_seq) {
+ 			l2tp_warn(session, L2TP_MSG_SEQ,
+@@ -1662,8 +1662,19 @@ EXPORT_SYMBOL_GPL(l2tp_session_delete);
+ /* We come here whenever a session's send_seq, cookie_len or
+  * l2specific_type parameters are set.
+  */
+-void l2tp_session_set_header_len(struct l2tp_session *session, int version,
+-				 enum l2tp_encap_type encap)
++void l2tp_session_set_header_len(struct l2tp_session *session, int version)
++{
++	struct l2tp_tunnel *tunnel = READ_ONCE(session->tunnel);
++	if (tunnel)
++		__l2tp_session_set_header_len(session, version, tunnel->encap);
++}
++EXPORT_SYMBOL_GPL(l2tp_session_set_header_len);
++
++/* We come here whenever a session's send_seq, cookie_len or
++ * l2specific_type parameters are set.
++ */
++void __l2tp_session_set_header_len(struct l2tp_session *session, int version,
++                                   enum l2tp_encap_type encap)
+ {
+ 	if (version == L2TP_HDR_VER_2) {
+ 		session->hdr_len = 6;
+@@ -1677,7 +1688,7 @@ void l2tp_session_set_header_len(struct l2tp_session *session, int version,
+ 	}
+ 
+ }
+-EXPORT_SYMBOL_GPL(l2tp_session_set_header_len);
++EXPORT_SYMBOL_GPL(__l2tp_session_set_header_len);
+ 
+ struct l2tp_session *l2tp_session_create(int priv_size, struct l2tp_tunnel *tunnel, u32 session_id, u32 peer_session_id, struct l2tp_session_cfg *cfg)
+ {
+@@ -1733,7 +1744,7 @@ struct l2tp_session *l2tp_session_create(int priv_size, struct l2tp_tunnel *tunn
+ 		else
+ 			session->build_header = l2tp_build_l2tpv3_header;
+ 
+-		l2tp_session_set_header_len(session, tunnel->version, tunnel->encap);
++		__l2tp_session_set_header_len(session, tunnel->version, tunnel->encap);
+ 
+ 		l2tp_session_inc_refcount(session);
+ 
+diff --git a/net/l2tp/l2tp_core.h b/net/l2tp/l2tp_core.h
+index 032bea5e977f1..665195887a0cb 100644
+--- a/net/l2tp/l2tp_core.h
++++ b/net/l2tp/l2tp_core.h
+@@ -274,7 +274,9 @@ void l2tp_recv_common(struct l2tp_session *session, struct sk_buff *skb,
+ 		      int length, int (*payload_hook)(struct sk_buff *skb));
+ int l2tp_session_queue_purge(struct l2tp_session *session);
+ int l2tp_udp_encap_recv(struct sock *sk, struct sk_buff *skb);
+-void l2tp_session_set_header_len(struct l2tp_session *session, int version,
++void l2tp_session_set_header_len(struct l2tp_session *session, int version);
++/* Backported&updated version of l2tp_session_set_header_len() which should be used instead. */
++void __l2tp_session_set_header_len(struct l2tp_session *session, int version,
+ 				 enum l2tp_encap_type encap);
+ 
+ int l2tp_xmit_skb(struct l2tp_session *session, struct sk_buff *skb,
+diff --git a/net/l2tp/l2tp_netlink.c b/net/l2tp/l2tp_netlink.c
+index 6e283d8c46c2a..131e355790bb6 100644
+--- a/net/l2tp/l2tp_netlink.c
++++ b/net/l2tp/l2tp_netlink.c
+@@ -721,7 +721,7 @@ static int l2tp_nl_cmd_session_modify(struct sk_buff *skb, struct genl_info *inf
+ 		struct l2tp_tunnel *tunnel = session->tunnel;
+ 
+ 		session->send_seq = nla_get_u8(info->attrs[L2TP_ATTR_SEND_SEQ]);
+-		l2tp_session_set_header_len(session, tunnel->version, tunnel->encap);
++		__l2tp_session_set_header_len(session, tunnel->version, tunnel->encap);
+ 	}
+ 
+ 	if (info->attrs[L2TP_ATTR_LNS_MODE])
+diff --git a/net/l2tp/l2tp_ppp.c b/net/l2tp/l2tp_ppp.c
+index 2163bbffc85e9..ed63eb1f9f71c 100644
+--- a/net/l2tp/l2tp_ppp.c
++++ b/net/l2tp/l2tp_ppp.c
+@@ -1389,7 +1389,7 @@ static int pppol2tp_session_setsockopt(struct sock *sk,
+ 			po->chan.hdrlen = val ? PPPOL2TP_L2TP_HDR_SIZE_SEQ :
+ 				PPPOL2TP_L2TP_HDR_SIZE_NOSEQ;
+ 		}
+-		l2tp_session_set_header_len(session, session->tunnel->version,
++		__l2tp_session_set_header_len(session, session->tunnel->version,
+ 					    session->tunnel->encap);
+ 		l2tp_info(session, L2TP_MSG_CONTROL,
+ 			  "%s: set send_seq=%d\n",
+-- 
+2.47.1
+
