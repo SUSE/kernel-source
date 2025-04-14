@@ -1,0 +1,92 @@
+From: Damien Le Moal <damien.lemoal@opensource.wdc.com>
+Date: Sun, 20 Feb 2022 12:18:00 +0900
+Subject: scsi: pm8001: Fix tag leaks on error
+Git-commit: 4c8f04b1905cd4b776d0b720463c091545478ef7
+Patch-mainline: v5.18-rc1
+References: CVE-2022-49121 bsc#1237926
+
+In pm8001_chip_set_dev_state_req(), pm8001_chip_fw_flash_update_req(),
+pm80xx_chip_phy_ctl_req() and pm8001_chip_reg_dev_req() add missing calls
+to pm8001_tag_free() to free the allocated tag when pm8001_mpi_build_cmd()
+fails.
+
+Similarly, in pm8001_exec_internal_task_abort(), if the chip ->task_abort
+method fails, the tag allocated for the abort request task must be
+freed. Add the missing call to pm8001_tag_free().
+
+[lduncan: mostly hand-applied, since our code is a bit older]
+Link: https://lore.kernel.org/r/20220220031810.738362-22-damien.lemoal@opensource.wdc.com
+Reviewed-by: John Garry <john.garry@huawei.com>
+Signed-off-by: Damien Le Moal <damien.lemoal@opensource.wdc.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Acked-by: Lee Duncan <lduncan@suse.com>
+---
+ drivers/scsi/pm8001/pm8001_hwi.c |    9 +++++++++
+ drivers/scsi/pm8001/pm8001_sas.c |    2 +-
+ drivers/scsi/pm8001/pm80xx_hwi.c |    7 ++++++-
+ 3 files changed, 16 insertions(+), 2 deletions(-)
+
+--- a/drivers/scsi/pm8001/pm8001_hwi.c
++++ b/drivers/scsi/pm8001/pm8001_hwi.c
+@@ -4583,6 +4583,9 @@ static int pm8001_chip_reg_dev_req(struc
+ 	memcpy(payload.sas_addr, pm8001_dev->sas_device->sas_addr,
+ 		SAS_ADDR_SIZE);
+ 	rc = pm8001_mpi_build_cmd(pm8001_ha, circularQ, opc, &payload, 0);
++	if (rc)
++		pm8001_tag_free(pm8001_ha, tag);
++
+ 	return rc;
+ }
+ 
+@@ -4985,6 +4988,9 @@ pm8001_chip_fw_flash_update_req(struct p
+ 	ccb->ccb_tag = tag;
+ 	rc = pm8001_chip_fw_flash_update_build(pm8001_ha, &flash_update_info,
+ 		tag);
++	if (rc)
++		pm8001_tag_free(pm8001_ha, tag);
++
+ 	return rc;
+ }
+ 
+@@ -5088,6 +5094,9 @@ pm8001_chip_set_dev_state_req(struct pm8
+ 	payload.device_id = cpu_to_le32(pm8001_dev->device_id);
+ 	payload.nds = cpu_to_le32(state);
+ 	rc = pm8001_mpi_build_cmd(pm8001_ha, circularQ, opc, &payload, 0);
++	if (rc)
++		pm8001_tag_free(pm8001_ha, tag);
++
+ 	return rc;
+ 
+ }
+--- a/drivers/scsi/pm8001/pm8001_sas.c
++++ b/drivers/scsi/pm8001/pm8001_sas.c
+@@ -810,12 +810,12 @@ pm8001_exec_internal_task_abort(struct p
+ 
+ 		res = PM8001_CHIP_DISP->task_abort(pm8001_ha,
+ 			pm8001_dev, flag, task_tag, ccb_tag);
+-
+ 		if (res) {
+ 			del_timer(&task->slow_task->timer);
+ 			PM8001_FAIL_DBG(pm8001_ha,
+ 				pm8001_printk("Executing internal task "
+ 				"failed\n"));
++			pm8001_tag_free(pm8001_ha, ccb_tag);
+ 			goto ex_err;
+ 		}
+ 		wait_for_completion(&task->slow_task->completion);
+--- a/drivers/scsi/pm8001/pm80xx_hwi.c
++++ b/drivers/scsi/pm8001/pm80xx_hwi.c
+@@ -4632,7 +4632,12 @@ static int pm80xx_chip_phy_ctl_req(struc
+ 	payload.tag = cpu_to_le32(tag);
+ 	payload.phyop_phyid =
+ 		cpu_to_le32(((phy_op & 0xFF) << 8) | (phyId & 0xFF));
+-	return pm8001_mpi_build_cmd(pm8001_ha, circularQ, opc, &payload, 0);
++
++	rc = pm8001_mpi_build_cmd(pm8001_ha, circularQ, opc, &payload, 0);
++	if (rc)
++		pm8001_tag_free(pm8001_ha, tag);
++
++	return rc;
+ }
+ 
+ static u32 pm80xx_chip_is_our_interupt(struct pm8001_hba_info *pm8001_ha)
