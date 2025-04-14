@@ -1,0 +1,108 @@
+From: Qi Liu <liuqi115@huawei.com>
+Date: Thu, 24 Feb 2022 19:51:26 +0800
+Subject: scsi: hisi_sas: Free irq vectors in order for v3 HW
+Git-commit: 554fb72ee34f4732c7f694f56c3c6e67790352a0
+Patch-mainline: v5.18-rc1
+References: CVE-2022-49118 bsc#1237979
+
+If the driver probe fails to request the channel IRQ or fatal IRQ, the
+driver will free the IRQ vectors before freeing the IRQs in free_irq(),
+and this will cause a kernel BUG like this:
+
+------------[ cut here ]------------
+kernel BUG at drivers/pci/msi.c:369!
+Internal error: Oops - BUG: 0 [#1] PREEMPT SMP
+Call trace:
+   free_msi_irqs+0x118/0x13c
+   pci_disable_msi+0xfc/0x120
+   pci_free_irq_vectors+0x24/0x3c
+   hisi_sas_v3_probe+0x360/0x9d0 [hisi_sas_v3_hw]
+   local_pci_probe+0x44/0xb0
+   work_for_cpu_fn+0x20/0x34
+   process_one_work+0x1d0/0x340
+   worker_thread+0x2e0/0x460
+   kthread+0x180/0x190
+   ret_from_fork+0x10/0x20
+---[ end trace b88990335b610c11 ]---
+
+So we use devm_add_action() to control the order in which we free the
+vectors.
+
+[lduncan: hand-applied, heavily modified to match older code base]
+Link: https://lore.kernel.org/r/1645703489-87194-4-git-send-email-john.garry@huawei.com
+Signed-off-by: Qi Liu <liuqi115@huawei.com>
+Signed-off-by: John Garry <john.garry@huawei.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Acked-by: Lee Duncan <lduncan@suse.com>
+---
+ drivers/scsi/hisi_sas/hisi_sas_v3_hw.c |   19 ++++++++++++-------
+ 1 file changed, 12 insertions(+), 7 deletions(-)
+
+--- a/drivers/scsi/hisi_sas/hisi_sas_v3_hw.c
++++ b/drivers/scsi/hisi_sas/hisi_sas_v3_hw.c
+@@ -2385,6 +2385,13 @@ fallback:
+ 	/* Don't clean all CQ masks */
+ }
+ 
++static void hisi_sas_v3_free_vectors(void *data)
++{
++	struct pci_dev *pdev = data;
++
++	pci_free_irq_vectors(pdev);
++}
++
+ static int interrupt_init_v3_hw(struct hisi_hba *hisi_hba)
+ {
+ 	struct device *dev = hisi_hba->dev;
+@@ -2405,7 +2412,7 @@ static int interrupt_init_v3_hw(struct h
+ 						   GFP_KERNEL);
+ 		if (!hisi_hba->reply_map)
+ 			return -ENOMEM;
+-		vectors = pci_alloc_irq_vectors_affinity(hisi_hba->pci_dev,
++		vectors = pci_alloc_irq_vectors_affinity(pdev,
+ 							 min_msi, max_msi,
+ 							 PCI_IRQ_MSI |
+ 							 PCI_IRQ_AFFINITY,
+@@ -2415,7 +2422,7 @@ static int interrupt_init_v3_hw(struct h
+ 		setup_reply_map_v3_hw(hisi_hba, vectors - BASE_VECTORS_V3_HW);
+ 	} else {
+ 		min_msi = max_msi;
+-		vectors = pci_alloc_irq_vectors(hisi_hba->pci_dev, min_msi,
++		vectors = pci_alloc_irq_vectors(pdev, min_msi,
+ 						max_msi, PCI_IRQ_MSI);
+ 		if (vectors < 0)
+ 			return vectors;
+@@ -2423,13 +2430,14 @@ static int interrupt_init_v3_hw(struct h
+ 
+ 	hisi_hba->cq_nvecs = vectors - BASE_VECTORS_V3_HW;
+ 
++	devm_add_action(&pdev->dev, hisi_sas_v3_free_vectors, pdev);
++
+ 	rc = devm_request_irq(dev, pci_irq_vector(pdev, 1),
+ 			      int_phy_up_down_bcast_v3_hw, 0,
+ 			      DRV_NAME " phy", hisi_hba);
+ 	if (rc) {
+ 		dev_err(dev, "could not request phy interrupt, rc=%d\n", rc);
+-		rc = -ENOENT;
+-		goto free_irq_vectors;
++		return -ENOENT;
+ 	}
+ 
+ 	rc = devm_request_irq(dev, pci_irq_vector(pdev, 2),
+@@ -2484,8 +2492,6 @@ free_chnl_interrupt:
+ 	free_irq(pci_irq_vector(pdev, 2), hisi_hba);
+ free_phy_irq:
+ 	free_irq(pci_irq_vector(pdev, 1), hisi_hba);
+-free_irq_vectors:
+-	pci_free_irq_vectors(pdev);
+ 	return rc;
+ }
+ 
+@@ -3152,7 +3158,6 @@ hisi_sas_v3_destroy_irqs(struct pci_dev
+ 
+ 		free_irq(pci_irq_vector(pdev, nr), cq);
+ 	}
+-	pci_free_irq_vectors(pdev);
+ }
+ 
+ static void hisi_sas_v3_remove(struct pci_dev *pdev)
