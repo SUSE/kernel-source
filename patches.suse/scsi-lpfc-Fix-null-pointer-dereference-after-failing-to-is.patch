@@ -1,0 +1,164 @@
+From: James Smart <jsmart2021@gmail.com>
+Date: Tue, 12 Apr 2022 15:19:50 -0700
+Subject: scsi: lpfc: Fix null pointer dereference after failing to issue FLOGI
+ and PLOGI
+Git-commit: 577a942df3de2666f6947bdd3a5c9e8d30073424
+Patch-mainline: v5.19-rc1
+References: CVE-2022-49535 bsc#1238937
+
+If lpfc_issue_els_flogi() fails and returns non-zero status, the node
+reference count is decremented to trigger the release of the nodelist
+structure. However, if there is a prior registration or dev-loss-evt work
+pending, the node may be released prematurely.  When dev-loss-evt
+completes, the released node is referenced causing a use-after-free null
+pointer dereference.
+
+Similarly, when processing non-zero ELS PLOGI completion status in
+lpfc_cmpl_els_plogi(), the ndlp flags are checked for a transport
+registration before triggering node removal.  If dev-loss-evt work is
+pending, the node may be released prematurely and a subsequent call to
+lpfc_dev_loss_tmo_handler() results in a use after free ndlp dereference.
+
+Add test for pending dev-loss before decrementing the node reference count
+for FLOGI, PLOGI, PRLI, and ADISC handling.
+
+[lduncan: hand-applied about half the hunks]
+Link: https://lore.kernel.org/r/20220412222008.126521-9-jsmart2021@gmail.com
+Co-developed-by: Justin Tee <justin.tee@broadcom.com>
+Signed-off-by: Justin Tee <justin.tee@broadcom.com>
+Signed-off-by: James Smart <jsmart2021@gmail.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Acked-by: Lee Duncan <lduncan@suse.com>
+---
+ drivers/scsi/lpfc/lpfc_els.c |   51 +++++++++++++++++++++++++++++--------------
+ 1 file changed, 35 insertions(+), 16 deletions(-)
+
+--- a/drivers/scsi/lpfc/lpfc_els.c
++++ b/drivers/scsi/lpfc/lpfc_els.c
+@@ -1495,10 +1495,13 @@ lpfc_initial_flogi(struct lpfc_vport *vp
+ 	}
+ 
+ 	if (lpfc_issue_els_flogi(vport, ndlp, 0)) {
+-		/* This decrement of reference count to node shall kick off
+-		 * the release of the node.
++		/* A node reference should be retained while registered with a
++		 * transport or dev-loss-evt work is pending.
++		 * Otherwise, decrement node reference to trigger release.
+ 		 */
+-		lpfc_nlp_put(ndlp);
++		if (!(ndlp->fc4_xpt_flags & (SCSI_XPT_REGD | NVME_XPT_REGD)) &&
++		    !(ndlp->nlp_flag & NLP_IN_DEV_LOSS))
++			lpfc_nlp_put(ndlp);
+ 		return 0;
+ 	}
+ 	return 1;
+@@ -1541,10 +1544,13 @@ lpfc_initial_fdisc(struct lpfc_vport *vp
+ 	}
+ 
+ 	if (lpfc_issue_els_fdisc(vport, ndlp, 0)) {
+-		/* decrement node reference count to trigger the release of
+-		 * the node.
++		/* A node reference should be retained while registered with a
++		 * transport or dev-loss-evt work is pending.
++		 * Otherwise, decrement node reference to trigger release.
+ 		 */
+-		lpfc_nlp_put(ndlp);
++		if (!(ndlp->fc4_xpt_flags & (SCSI_XPT_REGD | NVME_XPT_REGD)) &&
++		    !(ndlp->nlp_flag & NLP_IN_DEV_LOSS))
++			lpfc_nlp_put(ndlp);
+ 		return 0;
+ 	}
+ 	return 1;
+@@ -1944,6 +1950,7 @@ lpfc_cmpl_els_plogi(struct lpfc_hba *phb
+ 	struct lpfc_nodelist *ndlp, *free_ndlp;
+ 	struct lpfc_dmabuf *prsp;
+ 	int disc;
++	bool release_node = false;
+ 
+ 	/* we pass cmdiocb to state machine which needs rspiocb as well */
+ 	cmdiocb->context_un.rsp_iocb = rspiocb;
+@@ -2024,19 +2031,21 @@ lpfc_cmpl_els_plogi(struct lpfc_hba *phb
+ 			spin_unlock_irq(&ndlp->lock);
+ 			goto out;
+ 		}
+-		spin_unlock_irq(&ndlp->lock);
+ 
+ 		/* No PLOGI collision and the node is not registered with the
+ 		 * scsi or nvme transport. It is no longer an active node. Just
+ 		 * start the device remove process.
+ 		 */
+ 		if (!(ndlp->fc4_xpt_flags & (SCSI_XPT_REGD | NVME_XPT_REGD))) {
+-			spin_lock_irq(&ndlp->lock);
+ 			ndlp->nlp_flag &= ~NLP_NPR_2B_DISC;
+-			spin_unlock_irq(&ndlp->lock);
++			if (!(ndlp->nlp_flag & NLP_IN_DEV_LOSS))
++				release_node = true;
++		}
++		spin_unlock_irq(&ndlp->lock);
++
++		if (release_node)
+ 			lpfc_disc_state_machine(vport, ndlp, cmdiocb,
+ 						NLP_EVT_DEVICE_RM);
+-		}
+ 	} else {
+ 		/* Good status, call state machine */
+ 		prsp = list_entry(((struct lpfc_dmabuf *)
+@@ -2221,6 +2230,7 @@ lpfc_cmpl_els_prli(struct lpfc_hba *phba
+ 	struct lpfc_nodelist *ndlp;
+ 	char *mode;
+ 	u32 loglevel;
++	bool release_node = false;
+ 
+ 	/* we pass cmdiocb to state machine which needs rspiocb as well */
+ 	cmdiocb->context_un.rsp_iocb = rspiocb;
+@@ -2294,14 +2304,18 @@ lpfc_cmpl_els_prli(struct lpfc_hba *phba
+ 		 * it is no longer an active node.  Otherwise devloss
+ 		 * handles the final cleanup.
+ 		 */
++		spin_lock_irq(&ndlp->lock);
+ 		if (!(ndlp->fc4_xpt_flags & (SCSI_XPT_REGD | NVME_XPT_REGD)) &&
+ 		    !ndlp->fc4_prli_sent) {
+-			spin_lock_irq(&ndlp->lock);
+ 			ndlp->nlp_flag &= ~NLP_NPR_2B_DISC;
+-			spin_unlock_irq(&ndlp->lock);
++			if (!(ndlp->nlp_flag & NLP_IN_DEV_LOSS))
++				release_node = true;
++		}
++		spin_unlock_irq(&ndlp->lock);
++
++		if (release_node)
+ 			lpfc_disc_state_machine(vport, ndlp, cmdiocb,
+ 						NLP_EVT_DEVICE_RM);
+-		}
+ 	} else {
+ 		/* Good status, call state machine.  However, if another
+ 		 * PRLI is outstanding, don't call the state machine
+@@ -2672,6 +2686,7 @@ lpfc_cmpl_els_adisc(struct lpfc_hba *phb
+ 	IOCB_t *irsp;
+ 	struct lpfc_nodelist *ndlp;
+ 	int  disc;
++	bool release_node = false;
+ 
+ 	/* we pass cmdiocb to state machine which needs rspiocb as well */
+ 	cmdiocb->context_un.rsp_iocb = rspiocb;
+@@ -2730,13 +2745,17 @@ lpfc_cmpl_els_adisc(struct lpfc_hba *phb
+ 		 * transport, it is no longer an active node. Otherwise
+ 		 * devloss handles the final cleanup.
+ 		 */
++		spin_lock_irq(&ndlp->lock);
+ 		if (!(ndlp->fc4_xpt_flags & (SCSI_XPT_REGD | NVME_XPT_REGD))) {
+-			spin_lock_irq(&ndlp->lock);
+ 			ndlp->nlp_flag &= ~NLP_NPR_2B_DISC;
+-			spin_unlock_irq(&ndlp->lock);
++			if (!(ndlp->nlp_flag & NLP_IN_DEV_LOSS))
++				release_node = true;
++		}
++		spin_unlock_irq(&ndlp->lock);
++
++		if (release_node)
+ 			lpfc_disc_state_machine(vport, ndlp, cmdiocb,
+ 						NLP_EVT_DEVICE_RM);
+-		}
+ 	} else
+ 		/* Good status, call state machine */
+ 		lpfc_disc_state_machine(vport, ndlp, cmdiocb,
