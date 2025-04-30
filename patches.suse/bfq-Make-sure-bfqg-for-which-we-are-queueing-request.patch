@@ -1,0 +1,140 @@
+From 075a53b78b815301f8d3dd1ee2cd99554e34f0dd Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Fri, 1 Apr 2022 12:27:50 +0200
+Subject: [PATCH] bfq: Make sure bfqg for which we are queueing requests is
+ online
+Git-commit: 075a53b78b815301f8d3dd1ee2cd99554e34f0dd
+Patch-mainline: v5.19-rc1
+References: bsc#1238307 CVE-2022-49411
+
+Bios queued into BFQ IO scheduler can be associated with a cgroup that
+was already offlined. This may then cause insertion of this bfq_group
+into a service tree. But this bfq_group will get freed as soon as last
+bio associated with it is completed leading to use after free issues for
+service tree users. Fix the problem by making sure we always operate on
+online bfq_group. If the bfq_group associated with the bio is not
+online, we pick the first online parent.
+
+Cc: stable@vger.kernel.org
+Fixes: e21b7a0b9887 ("block, bfq: add full hierarchical scheduling and cgroups support")
+Tested-by: "yukuai (C)" <yukuai3@huawei.com>
+Signed-off-by: Jan Kara <jack@suse.cz>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Link: https://lore.kernel.org/r/20220401102752.8599-9-jack@suse.cz
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Jan Kara <jack@suse.cz>
+
+---
+ block/bfq-cgroup.c  |   32 ++++++++++++++++++--------------
+ block/bfq-iosched.c |    2 +-
+ block/bfq-iosched.h |    3 +--
+ 3 files changed, 20 insertions(+), 17 deletions(-)
+
+--- a/block/bfq-cgroup.c
++++ b/block/bfq-cgroup.c
+@@ -508,15 +508,17 @@ static struct bfq_group *bfq_lookup_bfqg
+ 	return NULL;
+ }
+ 
+-struct bfq_group *bfq_find_set_group(struct bfq_data *bfqd,
+-				     struct blkcg *blkcg)
++struct bfq_group *bfq_find_set_group(struct bfq_data *bfqd, struct bio *bio)
+ {
+ 	struct bfq_group *bfqg, *parent;
+ 	struct bfq_entity *entity;
+ 
+-	bfqg = bfq_lookup_bfqg(bfqd, blkcg);
+-	if (unlikely(!bfqg))
++	bfqg = bfq_lookup_bfqg(bfqd, bio_blkcg(bio));
++	if (unlikely(!bfqg)) {
++		bio_associate_blkcg(bio,
++				    &bfqg_to_blkg(bfqd->root_group)->blkcg->css);
+ 		return NULL;
++	}
+ 
+ 	/*
+ 	 * Update chain of bfq_groups as we might be handling a leaf group
+@@ -532,9 +534,13 @@ struct bfq_group *bfq_find_set_group(str
+ 			if (!parent)
+ 				parent = bfqd->root_group;
+ 			bfq_group_set_parent(curr_bfqg, parent);
++			if (!curr_bfqg->online)
++				bfqg = parent;
+ 		}
+ 	}
+ 
++	if (bio_blkcg(bio) != bfqg_to_blkg(bfqg)->blkcg)
++		bio_associate_blkcg(bio, &bfqg_to_blkg(bfqg)->blkcg->css);
+ 	return bfqg;
+ }
+ 
+@@ -610,18 +616,12 @@ void bfq_bfqq_move(struct bfq_data *bfqd
+  */
+ static struct bfq_group *__bfq_bic_change_cgroup(struct bfq_data *bfqd,
+ 						struct bfq_io_cq *bic,
+-						struct blkcg *blkcg)
++						struct bfq_group *bfqg)
+ {
+ 	struct bfq_queue *async_bfqq = bic_to_bfqq(bic, 0);
+ 	struct bfq_queue *sync_bfqq = bic_to_bfqq(bic, 1);
+-	struct bfq_group *bfqg;
+ 	struct bfq_entity *entity;
+ 
+-	bfqg = bfq_find_set_group(bfqd, blkcg);
+-
+-	if (unlikely(!bfqg))
+-		bfqg = bfqd->root_group;
+-
+ 	if (async_bfqq) {
+ 		entity = &async_bfqq->entity;
+ 
+@@ -646,11 +646,15 @@ static struct bfq_group *__bfq_bic_chang
+ void bfq_bic_update_cgroup(struct bfq_io_cq *bic, struct bio *bio)
+ {
+ 	struct bfq_data *bfqd = bic_to_bfqd(bic);
+-	struct bfq_group *bfqg = NULL;
++	struct bfq_group *bfqg;
+ 	uint64_t serial_nr;
+ 
+ 	rcu_read_lock();
+-	serial_nr = bio_blkcg(bio)->css.serial_nr;
++	bfqg = bfq_find_set_group(bfqd, bio);
++	if (unlikely(!bfqg))
++		bfqg = bfqd->root_group;
++
++	serial_nr = bfqg_to_blkg(bfqg)->blkcg->css.serial_nr;
+ 
+ 	/*
+ 	 * Check whether blkcg has changed.  The condition may trigger
+@@ -659,7 +663,7 @@ void bfq_bic_update_cgroup(struct bfq_io
+ 	if (unlikely(!bfqd) || likely(bic->blkcg_serial_nr == serial_nr))
+ 		goto out;
+ 
+-	bfqg = __bfq_bic_change_cgroup(bfqd, bic, bio_blkcg(bio));
++	bfqg = __bfq_bic_change_cgroup(bfqd, bic, bfqg);
+ 	/*
+ 	 * Update blkg_path for bfq_log_* functions. We cache this
+ 	 * path, and update it here, for the following
+--- a/block/bfq-iosched.c
++++ b/block/bfq-iosched.c
+@@ -4427,7 +4427,7 @@ static struct bfq_queue *bfq_get_queue(s
+ 
+ 	rcu_read_lock();
+ 
+-	bfqg = bfq_find_set_group(bfqd, bio_blkcg(bio));
++	bfqg = bfq_find_set_group(bfqd, bio);
+ 	if (!bfqg) {
+ 		bfqq = &bfqd->oom_bfqq;
+ 		goto out;
+--- a/block/bfq-iosched.h
++++ b/block/bfq-iosched.h
+@@ -930,8 +930,7 @@ void bfq_bfqq_move(struct bfq_data *bfqd
+ void bfq_init_entity(struct bfq_entity *entity, struct bfq_group *bfqg);
+ void bfq_bic_update_cgroup(struct bfq_io_cq *bic, struct bio *bio);
+ void bfq_end_wr_async(struct bfq_data *bfqd);
+-struct bfq_group *bfq_find_set_group(struct bfq_data *bfqd,
+-				     struct blkcg *blkcg);
++struct bfq_group *bfq_find_set_group(struct bfq_data *bfqd, struct bio *bio);
+ struct blkcg_gq *bfqg_to_blkg(struct bfq_group *bfqg);
+ struct bfq_group *bfqq_group(struct bfq_queue *bfqq);
+ struct bfq_group *bfq_create_group_hierarchy(struct bfq_data *bfqd, int node);
