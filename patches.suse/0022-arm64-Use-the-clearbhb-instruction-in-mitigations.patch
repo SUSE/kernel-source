@@ -2,7 +2,6 @@ From 955dd30fd47b0ff094532f11d6b83a7ddba0b582 Mon Sep 17 00:00:00 2001
 From: James Morse <james.morse@arm.com>
 Date: Mon, 28 Feb 2022 18:42:00 +0100
 Subject: [PATCH 22/22] arm64: Use the clearbhb instruction in mitigations
-
 Git-commit: 228a26b912287934789023b4132ba76065d9491c
 Git-repo: git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip.git
 Patch-mainline: Queued in a subsystem tree
@@ -25,13 +24,14 @@ Signed-off-by: Matthias Brugger <mbrugger@suse.com>
 ---
  arch/arm64/include/asm/assembler.h  |    7 +++++++
  arch/arm64/include/asm/cpufeature.h |   13 +++++++++++++
+ arch/arm64/include/asm/insn.h       |    2 ++
  arch/arm64/include/asm/sysreg.h     |    3 +++
  arch/arm64/include/asm/vectors.h    |    7 +++++++
  arch/arm64/kernel/bpi.S             |    5 +++++
- arch/arm64/kernel/cpu_errata.c      |   14 ++++++++++++++
+ arch/arm64/kernel/cpu_errata.c      |   16 ++++++++++++++++
  arch/arm64/kernel/cpufeature.c      |    1 +
  arch/arm64/kernel/entry.S           |    8 ++++++++
- 8 files changed, 58 insertions(+)
+ 9 files changed, 62 insertions(+)
 
 --- a/arch/arm64/include/asm/assembler.h
 +++ b/arch/arm64/include/asm/assembler.h
@@ -71,6 +71,17 @@ Signed-off-by: Matthias Brugger <mbrugger@suse.com>
  static inline bool system_supports_32bit_el0(void)
  {
  	return cpus_have_const_cap(ARM64_HAS_32BIT_EL0);
+--- a/arch/arm64/include/asm/insn.h
++++ b/arch/arm64/include/asm/insn.h
+@@ -56,6 +56,8 @@ enum aarch64_insn_hint_op {
+ 	AARCH64_INSN_HINT_WFI	= 0x3 << 5,
+ 	AARCH64_INSN_HINT_SEV	= 0x4 << 5,
+ 	AARCH64_INSN_HINT_SEVL	= 0x5 << 5,
++
++	AARCH64_INSN_HINT_CLEARBHB = 0x16 << 5,
+ };
+ 
+ enum aarch64_insn_imm_type {
 --- a/arch/arm64/include/asm/sysreg.h
 +++ b/arch/arm64/include/asm/sysreg.h
 @@ -522,6 +522,9 @@
@@ -136,7 +147,15 @@ Signed-off-by: Matthias Brugger <mbrugger@suse.com>
   * - Has the 'Exception Clears Branch History Buffer' (ECBHB) feature, so no
   *   software mitigation in the vectors is needed.
   * - Has CSV2.3, so is unaffected.
-@@ -1101,6 +1104,9 @@ bool is_spectre_bhb_affected(const struc
+@@ -970,6 +973,7 @@ enum bhb_mitigation_bits {
+ 	BHB_LOOP,
+ 	BHB_FW,
+ 	BHB_HW,
++	BHB_INSN,
+ };
+ static unsigned long system_bhb_mitigations;
+ 
+@@ -1101,6 +1105,9 @@ bool is_spectre_bhb_affected(const struc
  	if (supports_csv2p3(scope))
  		return false;
  
@@ -146,7 +165,7 @@ Signed-off-by: Matthias Brugger <mbrugger@suse.com>
  	if (spectre_bhb_loop_affected(scope))
  		return true;
  
-@@ -1141,6 +1147,8 @@ static const char *kvm_bhb_get_vecs_end(
+@@ -1141,6 +1148,8 @@ static const char *kvm_bhb_get_vecs_end(
  		return __spectre_bhb_loop_k24_end;
  	else if (start == __spectre_bhb_loop_k32_start)
  		return __spectre_bhb_loop_k32_end;
@@ -155,7 +174,7 @@ Signed-off-by: Matthias Brugger <mbrugger@suse.com>
  
  	return NULL;
  }
-@@ -1182,6 +1190,7 @@ static void kvm_setup_bhb_slot(const cha
+@@ -1182,6 +1191,7 @@ static void kvm_setup_bhb_slot(const cha
  #define __spectre_bhb_loop_k8_start NULL
  #define __spectre_bhb_loop_k24_start NULL
  #define __spectre_bhb_loop_k32_start NULL
@@ -163,18 +182,19 @@ Signed-off-by: Matthias Brugger <mbrugger@suse.com>
  
  static void kvm_setup_bhb_slot(const char *hyp_vecs_start) { };
  #endif
-@@ -1201,6 +1210,11 @@ void spectre_bhb_enable_mitigation(const
- 		pr_info_once("spectre-bhb mitigation disabled by command line option\n");
+@@ -1202,6 +1212,12 @@ void spectre_bhb_enable_mitigation(const
  	} else if (supports_ecbhb(SCOPE_LOCAL_CPU)) {
  		state = SPECTRE_MITIGATED;
+ 		set_bit(BHB_HW, &system_bhb_mitigations);
 +	} else if (supports_clearbhb(SCOPE_LOCAL_CPU)) {
 +		kvm_setup_bhb_slot(__spectre_bhb_clearbhb_start);
 +		this_cpu_set_vectors(EL1_VECTOR_BHB_CLEAR_INSN);
 +
 +		state = SPECTRE_MITIGATED;
- 		set_bit(BHB_HW, &system_bhb_mitigations);
++		set_bit(BHB_INSN, &system_bhb_mitigations);
  	} else if (spectre_bhb_loop_affected(SCOPE_LOCAL_CPU)) {
  		switch (spectre_bhb_loop_affected(SCOPE_SYSTEM)) {
+ 		case 8:
 --- a/arch/arm64/kernel/cpufeature.c
 +++ b/arch/arm64/kernel/cpufeature.c
 @@ -154,6 +154,7 @@ static const struct arm64_ftr_bits ftr_i
