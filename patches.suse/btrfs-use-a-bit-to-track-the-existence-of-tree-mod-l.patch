@@ -1,0 +1,93 @@
+From: Filipe Manana <fdmanana@suse.com>
+Date: Thu, 11 Mar 2021 14:31:09 +0000
+Subject: [PATCH] btrfs: use a bit to track the existence of tree mod log users
+Git-commit: bc03f39ec3c18454b624cd753b536fdb790f18f0
+Patch-mainline: v5.13-rc1
+References: bsc#1242472 CVE-2022-49898
+
+The tree modification log functions are called very frequently, basically
+they are called every time a btree is modified (a pointer added or removed
+to a node, a new root for a btree is set, etc). Because of that, to avoid
+heavy lock contention on the lock that protects the list of tree mod log
+users, we have checks that test the emptiness of the list with a full
+memory barrier before the checks, so that when there are no tree mod log
+users we avoid taking the lock.
+
+Replace the memory barrier and list emptiness check with a test for a new
+bit set at fs_info->flags. This bit is used to indicate when there are
+tree mod log users, set whenever a user is added to the list and cleared
+when the last user is removed from the list. This makes the intention a
+bit more obvious and possibly more efficient (assuming test_bit() may be
+cheaper than a full memory barrier on some architectures).
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Reviewed-by: David Sterba <dsterba@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/ctree.c | 14 ++++++++------
+ fs/btrfs/ctree.h |  3 +++
+ 2 files changed, 11 insertions(+), 6 deletions(-)
+
+diff --git a/fs/btrfs/ctree.c b/fs/btrfs/ctree.c
+index a916b9403..67eab7f6d 100644
+--- a/fs/btrfs/ctree.c
++++ b/fs/btrfs/ctree.c
+@@ -342,6 +342,7 @@ u64 btrfs_get_tree_mod_seq(struct btrfs_fs_info *fs_info,
+ 	if (!elem->seq) {
+ 		elem->seq = btrfs_inc_tree_mod_seq(fs_info);
+ 		list_add_tail(&elem->list, &fs_info->tree_mod_seq_list);
++		set_bit(BTRFS_FS_TREE_MOD_LOG_USERS, &fs_info->flags);
+ 	}
+ 	tree_mod_log_write_unlock(fs_info);
+ 
+@@ -365,7 +366,9 @@ void btrfs_put_tree_mod_seq(struct btrfs_fs_info *fs_info,
+ 	list_del(&elem->list);
+ 	elem->seq = 0;
+ 
+-	if (!list_empty(&fs_info->tree_mod_seq_list)) {
++	if (list_empty(&fs_info->tree_mod_seq_list)) {
++		clear_bit(BTRFS_FS_TREE_MOD_LOG_USERS, &fs_info->flags);
++	} else {
+ 		struct seq_list *first;
+ 
+ 		first = list_first_entry(&fs_info->tree_mod_seq_list,
+@@ -446,9 +449,9 @@ __tree_mod_log_insert(struct btrfs_fs_info *fs_info, struct tree_mod_elem *tm)
+  * call tree_mod_log_write_unlock() to release.
+  */
+ static inline int tree_mod_dont_log(struct btrfs_fs_info *fs_info,
+-				    struct extent_buffer *eb) {
+-	smp_mb();
+-	if (list_empty(&(fs_info)->tree_mod_seq_list))
++				    struct extent_buffer *eb)
++{
++	if (!test_bit(BTRFS_FS_TREE_MOD_LOG_USERS, &fs_info->flags))
+ 		return 1;
+ 	if (eb && btrfs_header_level(eb) == 0)
+ 		return 1;
+@@ -466,8 +469,7 @@ static inline int tree_mod_dont_log(struct btrfs_fs_info *fs_info,
+ static inline int tree_mod_need_log(const struct btrfs_fs_info *fs_info,
+ 				    struct extent_buffer *eb)
+ {
+-	smp_mb();
+-	if (list_empty(&(fs_info)->tree_mod_seq_list))
++	if (!test_bit(BTRFS_FS_TREE_MOD_LOG_USERS, &fs_info->flags))
+ 		return 0;
+ 	if (eb && btrfs_header_level(eb) == 0)
+ 		return 0;
+diff --git a/fs/btrfs/ctree.h b/fs/btrfs/ctree.h
+index 49a0adcaa..9aa995d4f 100644
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@ -541,6 +541,9 @@ struct btrfs_delayed_root;
+ /* Indicate that the cleaner thread is awake and doing something. */
+ #define BTRFS_FS_CLEANER_RUNNING		19
+ 
++/* Indicate whether there are any tree modification log users */
++#define BTRFS_FS_TREE_MOD_LOG_USERS		20
++
+ struct btrfs_fs_info {
+ 	u8 fsid[BTRFS_FSID_SIZE];
+ 	u8 chunk_tree_uuid[BTRFS_UUID_SIZE];
+-- 
+2.35.3
+
