@@ -1,0 +1,117 @@
+From: Jiri Olsa <jolsa@kernel.org>
+Date: Fri, 16 Sep 2022 09:19:14 +0200
+Subject: bpf: Prevent bpf program recursion for raw tracepoint probes
+Patch-mainline: v6.1-rc1
+Git-commit: 05b24ff9b2cfabfcfd951daaa915a036ab53c9e1
+References: CVE-2022-49764 bsc#1242301
+
+We got report from sysbot [1] about warnings that were caused by
+bpf program attached to contention_begin raw tracepoint triggering
+the same tracepoint by using bpf_trace_printk helper that takes
+trace_printk_lock lock.
+
+ Call Trace:
+  <TASK>
+  ? trace_event_raw_event_bpf_trace_printk+0x5f/0x90
+  bpf_trace_printk+0x2b/0xe0
+  bpf_prog_a9aec6167c091eef_prog+0x1f/0x24
+  bpf_trace_run2+0x26/0x90
+  native_queued_spin_lock_slowpath+0x1c6/0x2b0
+  _raw_spin_lock_irqsave+0x44/0x50
+  bpf_trace_printk+0x3f/0xe0
+  bpf_prog_a9aec6167c091eef_prog+0x1f/0x24
+  bpf_trace_run2+0x26/0x90
+  native_queued_spin_lock_slowpath+0x1c6/0x2b0
+  _raw_spin_lock_irqsave+0x44/0x50
+  bpf_trace_printk+0x3f/0xe0
+  bpf_prog_a9aec6167c091eef_prog+0x1f/0x24
+  bpf_trace_run2+0x26/0x90
+  native_queued_spin_lock_slowpath+0x1c6/0x2b0
+  _raw_spin_lock_irqsave+0x44/0x50
+  bpf_trace_printk+0x3f/0xe0
+  bpf_prog_a9aec6167c091eef_prog+0x1f/0x24
+  bpf_trace_run2+0x26/0x90
+  native_queued_spin_lock_slowpath+0x1c6/0x2b0
+  _raw_spin_lock_irqsave+0x44/0x50
+  __unfreeze_partials+0x5b/0x160
+  ...
+
+The can be reproduced by attaching bpf program as raw tracepoint on
+contention_begin tracepoint. The bpf prog calls bpf_trace_printk
+helper. Then by running perf bench the spin lock code is forced to
+take slow path and call contention_begin tracepoint.
+
+Fixing this by skipping execution of the bpf program if it's
+already running, Using bpf prog 'active' field, which is being
+currently used by trampoline programs for the same reason.
+
+Moving bpf_prog_inc_misses_counter to syscall.c because
+trampoline.c is compiled in just for CONFIG_BPF_JIT option.
+
+Reviewed-by: Stanislav Fomichev <sdf@google.com>
+Reported-by: syzbot+2251879aa068ad9c960d@syzkaller.appspotmail.com
+[1] https://lore.kernel.org/bpf/YxhFe3EwqchC%2FfYf@krava/T/#t
+Signed-off-by: Jiri Olsa <jolsa@kernel.org>
+Link: https://lore.kernel.org/r/20220916071914.7156-1-jolsa@kernel.org
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+[shung-hsi.yu: definition of struct bpf_prog.active is borrowed from
+ca06f55b9002 "bpf: Add per-program recursion prevention mechanism" ]
+Acked-by: Shung-Hsi Yu <shung-hsi.yu@suse.com>
+---
+ include/linux/filter.h   |    1 +
+ kernel/bpf/core.c        |    7 +++++++
+ kernel/trace/bpf_trace.c |    5 +++++
+ 3 files changed, 13 insertions(+)
+
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@ -509,6 +509,7 @@ struct bpf_prog {
+ 	u32			len;		/* Number of filter blocks */
+ 	u32			jited_len;	/* Size of jited insns in bytes */
+ 	u8			tag[BPF_TAG_SIZE];
++	int __percpu		*active;
+ 	struct bpf_prog_aux	*aux;		/* Auxiliary fields */
+ 	struct sock_fprog_kern	*orig_prog;	/* Original BPF program */
+ 	unsigned int		(*bpf_func)(const void *ctx,
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -95,6 +95,12 @@ struct bpf_prog *bpf_prog_alloc(unsigned
+ 		vfree(fp);
+ 		return NULL;
+ 	}
++	fp->active = alloc_percpu_gfp(int, GFP_KERNEL_ACCOUNT | gfp_extra_flags);
++	if (!fp->active) {
++		vfree(fp);
++		kfree(aux);
++		return NULL;
++	}
+ 
+ 	fp->pages = size / PAGE_SIZE;
+ 	fp->aux = aux;
+@@ -150,6 +156,7 @@ struct bpf_prog *bpf_prog_realloc(struct
+ void __bpf_prog_free(struct bpf_prog *fp)
+ {
+ 	kfree(fp->aux);
++	free_percpu(fp->active);
+ 	vfree(fp);
+ }
+ 
+--- a/kernel/trace/bpf_trace.c
++++ b/kernel/trace/bpf_trace.c
+@@ -1121,11 +1121,16 @@ struct bpf_raw_event_map *bpf_find_raw_t
+ static __always_inline
+ void __bpf_trace_run(struct bpf_prog *prog, u64 *args)
+ {
++	if (unlikely(this_cpu_inc_return(*(prog->active)) != 1)) {
++		goto out;
++	}
+ 	rcu_read_lock();
+ 	preempt_disable();
+ 	(void) BPF_PROG_RUN(prog, args);
+ 	preempt_enable();
+ 	rcu_read_unlock();
++out:
++	this_cpu_dec(*(prog->active));
+ }
+ 
+ #define UNPACK(...)			__VA_ARGS__
