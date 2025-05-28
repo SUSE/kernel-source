@@ -1,0 +1,173 @@
+From: James Morse <james.morse@arm.com>
+Date: Thu, 9 Dec 2021 15:13:24 +0000
+Subject: arm64: bpf: Add BHB mitigation to the epilogue for cBPF programs
+Patch-mainline: Queued in subsystem maintainer repository
+Git-repo: git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux
+Git-commit: 0dfefc2ea2f29ced2416017d7e5b1253a54c2735
+References: bsc#1242778
+
+A malicious BPF program may manipulate the branch history to influence
+what the hardware speculates will happen next.
+
+On exit from a BPF program, emit the BHB mititgation sequence.
+
+This is only applied for 'classic' cBPF programs that are loaded by
+seccomp.
+
+Signed-off-by: James Morse <james.morse@arm.com>
+Reviewed-by: Catalin Marinas <catalin.marinas@arm.com>
+Acked-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Shung-Hsi Yu <shung-hsi.yu@suse.com>
+---
+ arch/arm64/include/asm/insn.h |    1 
+ arch/arm64/net/bpf_jit.h      |   11 ++++++++
+ arch/arm64/net/bpf_jit_comp.c |   57 +++++++++++++++++++++++++++++++++++++++---
+ 3 files changed, 65 insertions(+), 4 deletions(-)
+
+--- a/arch/arm64/include/asm/insn.h
++++ b/arch/arm64/include/asm/insn.h
+@@ -358,6 +358,7 @@ __AARCH64_INSN_FUNCS(mrs,	0xFFF00000, 0x
+ __AARCH64_INSN_FUNCS(msr_imm,	0xFFF8F01F, 0xD500401F)
+ __AARCH64_INSN_FUNCS(msr_reg,	0xFFF00000, 0xD5100000)
+ __AARCH64_INSN_FUNCS(dsb_base,	0xFFFFF0FF, 0xD503309F)
++__AARCH64_INSN_FUNCS(isb,	0xFFFFF0FF, 0xD50330DF)
+ 
+ #undef	__AARCH64_INSN_FUNCS
+ 
+--- a/arch/arm64/net/bpf_jit.h
++++ b/arch/arm64/net/bpf_jit.h
+@@ -111,6 +111,8 @@
+ /* Rd = Rn OP imm12 */
+ #define A64_ADD_I(sf, Rd, Rn, imm12) A64_ADDSUB_IMM(sf, Rd, Rn, imm12, ADD)
+ #define A64_SUB_I(sf, Rd, Rn, imm12) A64_ADDSUB_IMM(sf, Rd, Rn, imm12, SUB)
++#define A64_SUBS_I(sf, Rd, Rn, imm12) \
++	A64_ADDSUB_IMM(sf, Rd, Rn, imm12, SUB_SETFLAGS)
+ /* Rd = Rn */
+ #define A64_MOV(sf, Rd, Rn) A64_ADD_I(sf, Rd, Rn, 0)
+ 
+@@ -197,4 +199,13 @@
+ /* Rn & Rm; set condition flags */
+ #define A64_TST(sf, Rn, Rm) A64_ANDS(sf, A64_ZR, Rn, Rm)
+ 
++/* Logical (immediate) */
++#define A64_LOGIC_IMM(sf, Rd, Rn, imm, type) ({ \
++	u64 imm64 = (sf) ? (u64)imm : (u64)(u32)imm; \
++	aarch64_insn_gen_logical_immediate(AARCH64_INSN_LOGIC_##type, \
++		A64_VARIANT(sf), Rn, Rd, imm64); \
++})
++/* Rd = Rn OP imm */
++#define A64_ORR_I(sf, Rd, Rn, imm) A64_LOGIC_IMM(sf, Rd, Rn, imm, ORR)
++
+ #endif /* _BPF_JIT_H */
+--- a/arch/arm64/net/bpf_jit_comp.c
++++ b/arch/arm64/net/bpf_jit_comp.c
+@@ -18,14 +18,18 @@
+ 
+ #define pr_fmt(fmt) "bpf_jit: " fmt
+ 
++#include <linux/arm-smccc.h>
+ #include <linux/bpf.h>
+ #include <linux/filter.h>
++#include <linux/psci.h>
+ #include <linux/printk.h>
+ #include <linux/skbuff.h>
+ #include <linux/slab.h>
+ 
+ #include <asm/byteorder.h>
+ #include <asm/cacheflush.h>
++#include <asm/cpu.h>
++#include <asm/cpufeature.h>
+ #include <asm/debug-monitors.h>
+ #include <asm/set_memory.h>
+ 
+@@ -281,7 +285,48 @@ static int emit_bpf_tail_call(struct jit
+ #undef jmp_offset
+ }
+ 
+-static void build_epilogue(struct jit_ctx *ctx)
++/* Clobbers BPF registers 1-4, aka x0-x3 */
++static void __maybe_unused build_bhb_mitigation(struct jit_ctx *ctx)
++{
++	const u8 r1 = bpf2a64[BPF_REG_1]; /* aka x0 */
++	u8 k = get_spectre_bhb_loop_value();
++
++	if (!IS_ENABLED(CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY) ||
++	    cpu_mitigations_off() ||
++	    arm64_get_spectre_bhb_state() == SPECTRE_VULNERABLE)
++		return;
++
++	if (supports_clearbhb(SCOPE_SYSTEM)) {
++		emit(aarch64_insn_gen_hint(AARCH64_INSN_HINT_CLEARBHB), ctx);
++		return;
++	}
++
++	if (k) {
++		emit_a64_mov_i64(r1, k, ctx);
++		emit(A64_B(1), ctx);
++		emit(A64_SUBS_I(true, r1, r1, 1), ctx);
++		emit(A64_B_(A64_COND_NE, -2), ctx);
++		emit(aarch64_insn_gen_dsb(AARCH64_INSN_MB_ISH), ctx);
++		emit(aarch64_insn_get_isb_value(), ctx);
++	}
++
++	if (is_spectre_bhb_fw_mitigated()) {
++		emit(A64_ORR_I(false, r1, AARCH64_INSN_REG_ZR,
++			       ARM_SMCCC_ARCH_WORKAROUND_3), ctx);
++		switch (psci_ops.conduit) {
++		case PSCI_CONDUIT_HVC:
++			emit(aarch64_insn_get_hvc_value(), ctx);
++			break;
++		case PSCI_CONDUIT_SMC:
++			emit(aarch64_insn_get_smc_value(), ctx);
++			break;
++		default:
++			pr_err_once("Firmware mitigation enabled with unknown conduit\n");
++		}
++	}
++}
++
++static void build_epilogue(struct jit_ctx *ctx, bool was_classic)
+ {
+ 	const u8 r0 = bpf2a64[BPF_REG_0];
+ 	const u8 r6 = bpf2a64[BPF_REG_6];
+@@ -300,10 +345,13 @@ static void build_epilogue(struct jit_ct
+ 	emit(A64_POP(r8, r9, A64_SP), ctx);
+ 	emit(A64_POP(r6, r7, A64_SP), ctx);
+ 
++	if (was_classic)
++		build_bhb_mitigation(ctx);
++
+ 	/* Restore FP/LR registers */
+ 	emit(A64_POP(A64_FP, A64_LR, A64_SP), ctx);
+ 
+-	/* Set return value */
++	/* Move the return value from bpf:r0 (aka x7) to x0 */
+ 	emit(A64_MOV(1, A64_R(0), r0), ctx);
+ 
+ 	emit(A64_RET(A64_LR), ctx);
+@@ -862,6 +910,7 @@ struct bpf_prog *bpf_int_jit_compile(str
+ {
+ 	struct bpf_prog *tmp, *orig_prog = prog;
+ 	struct bpf_binary_header *header;
++	bool was_classic = bpf_prog_was_classic(prog);
+ 	bool tmp_blinded = false;
+ 	struct jit_ctx ctx;
+ 	int image_size;
+@@ -904,7 +953,7 @@ struct bpf_prog *bpf_int_jit_compile(str
+ 	}
+ 
+ 	ctx.epilogue_offset = ctx.idx;
+-	build_epilogue(&ctx);
++	build_epilogue(&ctx, was_classic);
+ 
+ 	/* Now we know the actual image size. */
+ 	image_size = sizeof(u32) * ctx.idx;
+@@ -928,7 +977,7 @@ struct bpf_prog *bpf_int_jit_compile(str
+ 		goto out_off;
+ 	}
+ 
+-	build_epilogue(&ctx);
++	build_epilogue(&ctx, was_classic);
+ 
+ 	/* 3. Extra pass to validate JITed code. */
+ 	if (validate_code(&ctx)) {
