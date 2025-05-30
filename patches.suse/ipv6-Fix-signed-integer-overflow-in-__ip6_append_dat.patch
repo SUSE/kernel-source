@@ -1,0 +1,199 @@
+From f93431c86b631bbca5614c66f966bf3ddb3c2803 Mon Sep 17 00:00:00 2001
+From: Wang Yufen <wangyufen@huawei.com>
+Date: Tue, 7 Jun 2022 20:00:27 +0800
+Subject: [PATCH] ipv6: Fix signed integer overflow in __ip6_append_data
+Git-commit: f93431c86b631bbca5614c66f966bf3ddb3c2803
+Patch-mainline: v5.19-rc2
+References: CVE-2022-49728 bsc#1239111
+
+Resurrect ubsan overflow checks and ubsan report this warning,
+fix it by change the variable [length] type to size_t.
+
+Ubsan: signed-integer-overflow in net/ipv6/ip6_output.c:1489:19
+2147479552 + 8567 cannot be represented in type 'int'
+CPU: 0 PID: 253 Comm: err Not tainted 5.16.0+ #1
+Hardware name: linux,dummy-virt (DT)
+Call trace:
+  dump_backtrace+0x214/0x230
+  show_stack+0x30/0x78
+  dump_stack_lvl+0xf8/0x118
+  dump_stack+0x18/0x30
+  ubsan_epilogue+0x18/0x60
+  handle_overflow+0xd0/0xf0
+  __ubsan_handle_add_overflow+0x34/0x44
+  __ip6_append_data.isra.48+0x1598/0x1688
+  ip6_append_data+0x128/0x260
+  udpv6_sendmsg+0x680/0xdd0
+  inet6_sendmsg+0x54/0x90
+  sock_sendmsg+0x70/0x88
+  ____sys_sendmsg+0xe8/0x368
+  ___sys_sendmsg+0x98/0xe0
+  __sys_sendmmsg+0xf4/0x3b8
+  __arm64_sys_sendmmsg+0x34/0x48
+  invoke_syscall+0x64/0x160
+  el0_svc_common.constprop.4+0x124/0x300
+  do_el0_svc+0x44/0xc8
+  el0_svc+0x3c/0x1e8
+  el0t_64_sync_handler+0x88/0xb0
+  el0t_64_sync+0x16c/0x170
+
+Changes since v1:
+-Change the variable [length] type to unsigned, as Eric Dumazet suggested.
+Changes since v2:
+-Don't change exthdrlen type in ip6_make_skb, as Paolo Abeni suggested.
+Changes since v3:
+-Don't change ulen type in udpv6_sendmsg and l2tp_ip6_sendmsg, as
+Jakub Kicinski suggested.
+
+[Davide Benini's notes]
+Changing int to size_t in ip6_append_data cannot be done, as that would change the kABI; how can we avoid this?
+
+The UBSAN overflow control is indicating this call trace:
+
+UBSAN: signed-integer-overflow in net/ipv6/ip6_output.c:1489:19
+2147479552 + 8567 cannot be represented in type 'int'
+CPU: 0 PID: 253 Comm: err Not tainted 5.16.0+ #1
+Hardware name: linux,dummy-virt (DT)
+Call trace:
+  dump_backtrace+0x214/0x230
+  show_stack+0x30/0x78
+  dump_stack_lvl+0xf8/0x118
+  dump_stack+0x18/0x30
+  ubsan_epilogue+0x18/0x60
+  handle_overflow+0xd0/0xf0
+  __ubsan_handle_add_overflow+0x34/0x44
+  __ip6_append_data.isra.48+0x1598/0x1688
+  ip6_append_data+0x128/0x260
+  udpv6_sendmsg+0x680/0xdd0
+  inet6_sendmsg+0x54/0x90
+  sock_sendmsg+0x70/0x88
+
+In udpv6_sendmsg, ip6_append_data() is called with:
+err = ip6_append_data(sk, getfrag, msg, ulen, sizeof(struct udphdr),
+                              &ipc6, fl6, (struct rt6_info *)dst,
+                              corkreq ? msg->msg_flags|MSG_MORE : msg->msg_flags);
+
+where
+int ulen = len;
+(len is a size_t)
+
+So len has already been cast to int, with a potential loss of data from the
+64-bit size_t to the 32-bit int; moreover, there is a signed/unsigned mismatch.
+
+The v2 version of the patch (5 versions have been made, the last one being the
+actual patch) changed the ulen to size_t; that makes sense.
+But in v3 they claimed that the change is not needed, as it will not overflow.
+So let's consider the cast safe
+So, where is the offending line? Let's check the call trace
+udpv6_sendmsg()
+    ip6_append_data()
+
+1)
+int udpv6_sendmsg(struct sock *sk, struct msghdr *msg, size_t len) {
+...
+int ulen = len;  //this is considered safe in upstream discussion
+...
+ulen += sizeof(struct udphdr); //considered safe in upstream discussion, it will not overflow
+
+Here the code will call either:
+   ip6_make_skb(sk, getfrag, msg, ulen, ...
+   ip6_append_data(sk, getfrag, msg, ulen, ...
+
+2)
+int ip6_append_data(struct sock *sk,
+                    int getfrag(void *from, char *to, int offset, int len,
+                                int odd, struct sk_buff *skb),
+                    void *from, int length, int transhdrlen,
+
+...
+length += exthdrlen;
+
+
+The above could overflow; the patch changes
+
+ int ip6_append_data(struct sock *sk,
+ 		    int getfrag(void *from, char *to, int offset, int len,
+ 				int odd, struct sk_buff *skb),
+-		    void *from, int length, int transhdrlen,
++		    void *from, size_t length, int transhdrlen,
+
+avoiding the overflow of the
+length += exthdrlen;
+
+
+But, if we consider steps at 1) safe, it means changing in ip6_append_data the
+parameter type from int to size_t will not avoid a potential loss of data, as
+the value passed is already an int, granted to be correct. So we can work
+inside the function, casting length to size_t before adding exthdrlen:
+size_t ulength = length;
+ulength += exthdrlen;
+
+and go on using ulength
+
+This avoids changing the function prototype and kABI
+[end of notes]
+
+Reported-by: Hulk Robot <hulkci@huawei.com>
+Signed-off-by: Wang Yufen <wangyufen@huawei.com>
+Link: https://lore.kernel.org/r/20220607120028.845916-1-wangyufen@huawei.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Davide Benini <davide.benini@suse.com>
+
+---
+ net/ipv6/ip6_output.c |   10 ++++++----
+ 1 file changed, 6 insertions(+), 4 deletions(-)
+
+--- a/net/ipv6/ip6_output.c
++++ b/net/ipv6/ip6_output.c
+@@ -1241,7 +1241,7 @@ static int __ip6_append_data(struct sock
+ 			     struct page_frag *pfrag,
+ 			     int getfrag(void *from, char *to, int offset,
+ 					 int len, int odd, struct sk_buff *skb),
+-			     void *from, int length, int transhdrlen,
++			     void *from, size_t length, int transhdrlen,
+ 			     unsigned int flags, struct ipcm6_cookie *ipc6,
+ 			     const struct sockcm_cookie *sockc)
+ {
+@@ -1559,6 +1559,7 @@ int ip6_append_data(struct sock *sk,
+ 	struct ipv6_pinfo *np = inet6_sk(sk);
+ 	int exthdrlen;
+ 	int err;
++	size_t ulength = length;
+ 
+ 	if (flags&MSG_PROBE)
+ 		return 0;
+@@ -1572,7 +1573,7 @@ int ip6_append_data(struct sock *sk,
+ 			return err;
+ 
+ 		exthdrlen = (ipc6->opt ? ipc6->opt->opt_flen : 0);
+-		length += exthdrlen;
++		ulength += exthdrlen;
+ 		transhdrlen += exthdrlen;
+ 	} else {
+ 		fl6 = &inet->cork.fl.u.ip6;
+@@ -1581,7 +1582,7 @@ int ip6_append_data(struct sock *sk,
+ 
+ 	return __ip6_append_data(sk, fl6, &sk->sk_write_queue, &inet->cork.base,
+ 				 &np->cork, sk_page_frag(sk), getfrag,
+-				 from, length, transhdrlen, flags, ipc6, sockc);
++				 from, ulength, transhdrlen, flags, ipc6, sockc);
+ }
+ EXPORT_SYMBOL_GPL(ip6_append_data);
+ 
+@@ -1746,6 +1747,7 @@ struct sk_buff *ip6_make_skb(struct sock
+ 	struct sk_buff_head queue;
+ 	int exthdrlen = (ipc6->opt ? ipc6->opt->opt_flen : 0);
+ 	int err;
++	size_t ulength = length;
+ 
+ 	if (flags & MSG_PROBE)
+ 		return NULL;
+@@ -1767,7 +1769,7 @@ struct sk_buff *ip6_make_skb(struct sock
+ 
+ 	err = __ip6_append_data(sk, fl6, &queue, &cork.base, &v6_cork,
+ 				&current->task_frag, getfrag, from,
+-				length + exthdrlen, transhdrlen + exthdrlen,
++				ulength + exthdrlen, transhdrlen + exthdrlen,
+ 				flags, ipc6, sockc);
+ 	if (err) {
+ 		__ip6_flush_pending_frames(sk, &queue, &cork, &v6_cork);
