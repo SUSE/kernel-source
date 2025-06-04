@@ -1,0 +1,67 @@
+From: Davide Caratti <dcaratti@redhat.com>
+Date: Fri, 20 Jan 2023 18:01:40 +0100
+Subject: act_mirred: use the backlog for nested calls to mirred ingress
+Patch-mainline: v6.3-rc1
+Git-commit: ca22da2fbd693b54dc8e3b7b54ccc9f7e9ba3640
+References: CVE-2024-26740 bsc#1222563
+
+William reports kernel soft-lockups on some OVS topologies when TC mirred
+egress->ingress action is hit by local TCP traffic [1].
+The same can also be reproduced with SCTP (thanks Xin for verifying), when
+client and server reach themselves through mirred egress to ingress, and
+one of the two peers sends a "heartbeat" packet (from within a timer).
+
+Enqueueing to backlog proved to fix this soft lockup; however, as Cong
+noticed [2], we should preserve - when possible - the current mirred
+behavior that counts as "overlimits" any eventual packet drop subsequent to
+the mirred forwarding action [3]. A compromise solution might use the
+backlog only when tcf_mirred_act() has a nest level greater than one:
+change tcf_mirred_forward() accordingly.
+
+Also, add a kselftest that can reproduce the lockup and verifies TC mirred
+ability to account for further packet drops after TC mirred egress->ingress
+(when the nest level is 1).
+
+ [1] https://lore.kernel.org/netdev/33dc43f587ec1388ba456b4915c75f02a8aae226.1663945716.git.dcaratti@redhat.com/
+ [2] https://lore.kernel.org/netdev/Y0w%2FWWY60gqrtGLp@pop-os.localdomain/
+ [3] such behavior is not guaranteed: for example, if RPS or skb RX
+     timestamping is enabled on the mirred target device, the kernel
+     can defer receiving the skb and return NET_RX_SUCCESS inside
+     tcf_mirred_forward().
+
+Reported-by: William Zhao <wizhao@redhat.com>
+CC: Xin Long <lucien.xin@gmail.com>
+Signed-off-by: Davide Caratti <dcaratti@redhat.com>
+Reviewed-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+Acked-by: Jamal Hadi Salim <jhs@mojatatu.com>
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Acked-by: Michal Kubecek <mkubecek@suse.cz>
+
+SLE12-SP5: omit selftest part (does not exist)
+
+---
+ net/sched/act_mirred.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+--- a/net/sched/act_mirred.c
++++ b/net/sched/act_mirred.c
+@@ -190,12 +190,19 @@ static int tcf_mirred_init(struct net *net, struct nlattr *nla,
+ 	return ret;
+ }
+ 
++static bool is_mirred_nested(void)
++{
++	return unlikely(__this_cpu_read(mirred_nest_level) > 1);
++}
++
+ static int tcf_mirred_forward(bool want_ingress, struct sk_buff *skb)
+ {
+ 	int err;
+ 
+ 	if (!want_ingress)
+ 		err = dev_queue_xmit(skb);
++	else if (is_mirred_nested())
++		err = netif_rx(skb);
+ 	else
+ 		err = netif_receive_skb(skb);
+ 

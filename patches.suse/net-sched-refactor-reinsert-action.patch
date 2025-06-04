@@ -1,0 +1,81 @@
+From: John Hurley <john.hurley@netronome.com>
+Date: Mon, 24 Jun 2019 23:13:35 +0100
+Subject: net: sched: refactor reinsert action
+Patch-mainline: v5.3-rc1
+Git-commit: 720f22fed81bc6fd1765db7014651b6718887bea
+References: CVE-2024-26740 bsc#1222563
+
+The TC_ACT_REINSERT return type was added as an in-kernel only option to
+allow a packet ingress or egress redirect. This is used to avoid
+unnecessary skb clones in situations where they are not required. If a TC
+hook returns this code then the packet is 'reinserted' and no skb consume
+is carried out as no clone took place.
+
+This return type is only used in act_mirred. Rather than have the reinsert
+called from the main datapath, call it directly in act_mirred. Instead of
+returning TC_ACT_REINSERT, change the type to the new TC_ACT_CONSUMED
+which tells the caller that the packet has been stolen by another process
+and that no consume call is required.
+
+Moving all redirect calls to the act_mirred code is in preparation for
+tracking recursion created by act_mirred.
+
+Signed-off-by: John Hurley <john.hurley@netronome.com>
+Reviewed-by: Simon Horman <simon.horman@netronome.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Michal Kubecek <mkubecek@suse.cz>
+
+---
+ include/net/pkt_cls.h     | 2 +-
+ include/net/sch_generic.h | 2 +-
+ net/core/dev.c            | 4 +---
+ net/sched/act_mirred.c    | 3 ++-
+ 4 files changed, 5 insertions(+), 6 deletions(-)
+
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@ -7,7 +7,7 @@
+ #include <net/act_api.h>
+ 
+ /* TC action not accessible from user space */
+-#define TC_ACT_REINSERT		(TC_ACT_VALUE_MAX + 1)
++#define TC_ACT_CONSUMED		(TC_ACT_VALUE_MAX + 1)
+ 
+ /* Basic packet classifier frontend definitions. */
+ 
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@ -304,7 +304,7 @@ struct tcf_result {
+ 		};
+ 		const struct tcf_proto *goto_tp;
+ 
+-		/* used by the TC_ACT_REINSERT action */
++		/* used in the skb_tc_reinsert function */
+ 		struct {
+ 			bool		ingress;
+ 			struct gnet_stats_queue *qstats;
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -4671,9 +4671,7 @@ sch_handle_ingress(struct sk_buff *skb, struct packet_type **pt_prev, int *ret,
+ 		__skb_push(skb, skb->mac_len);
+ 		skb_do_redirect(skb);
+ 		return NULL;
+-	case TC_ACT_REINSERT:
+-		/* this does not scrub the packet, and updates stats on error */
+-		skb_tc_reinsert(skb, &cl_res);
++	case TC_ACT_CONSUMED:
+ 		return NULL;
+ 	default:
+ 		break;
+--- a/net/sched/act_mirred.c
++++ b/net/sched/act_mirred.c
+@@ -264,7 +264,8 @@ static int tcf_mirred_act(struct sk_buff *skb, const struct tc_action *a,
+ 		if (use_reinsert) {
+ 			res->ingress = want_ingress;
+ 			res->qstats = this_cpu_ptr(m->common.cpu_qstats);
+-			return TC_ACT_REINSERT;
++			skb_tc_reinsert(skb, res);
++			return TC_ACT_CONSUMED;
+ 		}
+ 	}
+ 
