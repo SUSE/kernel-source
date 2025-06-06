@@ -1,0 +1,103 @@
+From 18daa52418e7e4629ed1703b64777294209d2622 Mon Sep 17 00:00:00 2001
+From: Dmitry Torokhov <dmitry.torokhov@gmail.com>
+Date: Mon, 10 Mar 2025 22:24:16 -0700
+Subject: [PATCH] driver core: fix potential NULL pointer dereference in dev_uevent()
+Git-commit: 18daa52418e7e4629ed1703b64777294209d2622
+Patch-mainline: v6.15-rc4
+References: CVE-2025-37800 bsc#1242849
+
+[ backport note: as we have no bus_to_subsys(), replace it with the
+  direct reference to the bus->p pointer -- tiwai ]
+
+If userspace reads "uevent" device attribute at the same time as another
+threads unbinds the device from its driver, change to dev->driver from a
+valid pointer to NULL may result in crash. Fix this by using READ_ONCE()
+when fetching the pointer, and take bus' drivers klist lock to make sure
+driver instance will not disappear while we access it.
+
+Use WRITE_ONCE() when setting the driver pointer to ensure there is no
+tearing.
+
+Signed-off-by: Dmitry Torokhov <dmitry.torokhov@gmail.com>
+Reviewed-by: Masami Hiramatsu (Google) <mhiramat@kernel.org>
+Link: https://lore.kernel.org/r/20250311052417.1846985-3-dmitry.torokhov@gmail.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/base/base.h |   12 +++++++++++-
+ drivers/base/core.c |   34 ++++++++++++++++++++++++++++++++--
+ 2 files changed, 43 insertions(+), 3 deletions(-)
+
+--- a/drivers/base/base.h
++++ b/drivers/base/base.h
+@@ -166,8 +166,18 @@ static inline int devtmpfs_init(void) {
+ 
+ static inline void device_set_driver(struct device *dev, const struct device_driver *drv)
+ {
++	/*
++	 * Majority (all?) read accesses to dev->driver happens either
++	 * while holding device lock or in bus/driver code that is only
++	 * invoked when the device is bound to a driver and there is no
++	 * concern of the pointer being changed while it is being read.
++	 * However when reading device's uevent file we read driver pointer
++	 * without taking device lock (so we do not block there for
++	 * arbitrary amount of time). We use WRITE_ONCE() here to prevent
++	 * tearing so that READ_ONCE() can safely be used in uevent code.
++	 */
+ 	// FIXME - this cast should not be needed "soon"
+-	dev->driver = (struct device_driver *)drv;
++	WRITE_ONCE(dev->driver, (struct device_driver *)drv);
+ }
+ 
+ /* Device links support */
+--- a/drivers/base/core.c
++++ b/drivers/base/core.c
+@@ -881,6 +881,37 @@ static const char *dev_uevent_name(struc
+ 	return NULL;
+ }
+ 
++/*
++ * Try filling "DRIVER=<name>" uevent variable for a device. Because this
++ * function may race with binding and unbinding the device from a driver,
++ * we need to be careful. Binding is generally safe, at worst we miss the
++ * fact that the device is already bound to a driver (but the driver
++ * information that is delivered through uevents is best-effort, it may
++ * become obsolete as soon as it is generated anyways). Unbinding is more
++ * risky as driver pointer is transitioning to NULL, so READ_ONCE() should
++ * be used to make sure we are dealing with the same pointer, and to
++ * ensure that driver structure is not going to disappear from under us
++ * we take bus' drivers klist lock. The assumption that only registered
++ * driver can be bound to a device, and to unregister a driver bus code
++ * will take the same lock.
++ */
++static void dev_driver_uevent(struct device *dev, struct kobj_uevent_env *env)
++{
++	struct subsys_private *sp;
++	struct device_driver *drv;
++
++	if (!dev->bus)
++		return;
++	sp = dev->bus->p;
++	if (!sp)
++		return;
++	spin_lock(&sp->klist_drivers.k_lock);
++	drv = READ_ONCE(dev->driver);
++	if (drv)
++		add_uevent_var(env, "DRIVER=%s", drv->name);
++	spin_unlock(&sp->klist_drivers.k_lock);
++}
++
+ static int dev_uevent(struct kset *kset, struct kobject *kobj,
+ 		      struct kobj_uevent_env *env)
+ {
+@@ -913,8 +944,7 @@ static int dev_uevent(struct kset *kset,
+ 	if (dev->type && dev->type->name)
+ 		add_uevent_var(env, "DEVTYPE=%s", dev->type->name);
+ 
+-	if (dev->driver)
+-		add_uevent_var(env, "DRIVER=%s", dev->driver->name);
++	dev_driver_uevent(dev, env);
+ 
+ 	/* Add common DT information about the device */
+ 	of_device_uevent(dev, env);
