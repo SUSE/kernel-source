@@ -1,0 +1,84 @@
+From: Shung-Hsi Yu <shung-hsi.yu@suse.com>
+Date: Mon, 9 Jun 2025 12:02:15 +0800
+Subject: [PATCH] kABI: workaround "bpf: Prevent bpf program recursion for raw tracepoint probes" changes
+References: bsc#1242301 CVE-2022-49764
+Patch-mainline: never, kABI
+
+Commit 05b24ff9b2cf "bpf: Prevent bpf program recursion for raw tracepoint
+probes" broke kABI by adding a new "int *active" field into "struct bpf_prog",
+move it to the end of "struct bpf_prog_aux" (which is always accessed through a
+pointer) and hide it from genksyms.
+
+Signed-off-by: Shung-Hsi Yu <shung-hsi.yu@suse.com>
+---
+ include/linux/bpf.h      |    3 +++
+ include/linux/filter.h   |    1 -
+ kernel/bpf/core.c        |    6 +++---
+ kernel/trace/bpf_trace.c |    4 ++--
+ 4 files changed, 8 insertions(+), 6 deletions(-)
+
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -292,6 +292,9 @@ struct bpf_prog_aux {
+ 		struct work_struct work;
+ 		struct rcu_head	rcu;
+ 	};
++#ifndef __GENKSYMS__
++	int __percpu *active;
++#endif
+ };
+ 
+ struct bpf_array_aux {
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@ -509,7 +509,6 @@ struct bpf_prog {
+ 	u32			len;		/* Number of filter blocks */
+ 	u32			jited_len;	/* Size of jited insns in bytes */
+ 	u8			tag[BPF_TAG_SIZE];
+-	int __percpu		*active;
+ 	struct bpf_prog_aux	*aux;		/* Auxiliary fields */
+ 	struct sock_fprog_kern	*orig_prog;	/* Original BPF program */
+ 	unsigned int		(*bpf_func)(const void *ctx,
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -96,8 +96,8 @@ struct bpf_prog *bpf_prog_alloc(unsigned
+ 		vfree(fp);
+ 		return NULL;
+ 	}
+-	fp->active = alloc_percpu_gfp(int, GFP_KERNEL_ACCOUNT | gfp_extra_flags);
+-	if (!fp->active) {
++	fp->aux->active = alloc_percpu_gfp(int, GFP_KERNEL_ACCOUNT | gfp_extra_flags);
++	if (!fp->aux->active) {
+ 		vfree(fp);
+ 		kfree(aux);
+ 		return NULL;
+@@ -156,8 +156,8 @@ struct bpf_prog *bpf_prog_realloc(struct
+ 
+ void __bpf_prog_free(struct bpf_prog *fp)
+ {
++	free_percpu(fp->aux->active);
+ 	kfree(fp->aux);
+-	free_percpu(fp->active);
+ 	vfree(fp);
+ }
+ 
+--- a/kernel/trace/bpf_trace.c
++++ b/kernel/trace/bpf_trace.c
+@@ -1121,7 +1121,7 @@ struct bpf_raw_event_map *bpf_find_raw_t
+ static __always_inline
+ void __bpf_trace_run(struct bpf_prog *prog, u64 *args)
+ {
+-	if (unlikely(this_cpu_inc_return(*(prog->active)) != 1)) {
++	if (unlikely(this_cpu_inc_return(*(prog->aux->active)) != 1)) {
+ 		goto out;
+ 	}
+ 	rcu_read_lock();
+@@ -1130,7 +1130,7 @@ void __bpf_trace_run(struct bpf_prog *pr
+ 	preempt_enable();
+ 	rcu_read_unlock();
+ out:
+-	this_cpu_dec(*(prog->active));
++	this_cpu_dec(*(prog->aux->active));
+ }
+ 
+ #define UNPACK(...)			__VA_ARGS__
