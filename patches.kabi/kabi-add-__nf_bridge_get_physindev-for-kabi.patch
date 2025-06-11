@@ -10,10 +10,16 @@ too. For kABI compliance reasons, change the names to
 __nf_bridge_get_physindev() and __nf_log_dump_packet_common(). The original
 functions were restored too.
 
+The patch also adds back physindev field on nf_bridge_info and move physinif to
+the bottom of the struct guarded by __GENKSYMS__.
+
 Signed-off-by: Fernando Fernandez Mancera <fmancera@suse.de>
 ---
  include/linux/netfilter_bridge.h           |    8 ++++++-
+ include/linux/skbuff.h                     |    5 +++-
  include/net/netfilter/nf_log.h             |   10 +++++++--
+ net/bridge/br_netfilter_hooks.c            |    9 ++++----
+ net/bridge/br_netfilter_ipv6.c             |    2 -
  net/ipv4/netfilter/nf_log_arp.c            |    4 +--
  net/ipv4/netfilter/nf_log_ipv4.c           |    4 +--
  net/ipv4/netfilter/nf_reject_ipv4.c        |    2 -
@@ -24,7 +30,7 @@ Signed-off-by: Fernando Fernandez Mancera <fmancera@suse.de>
  net/netfilter/nf_queue.c                   |    6 ++---
  net/netfilter/nfnetlink_log.c              |    2 -
  net/netfilter/xt_physdev.c                 |    2 -
- 12 files changed, 58 insertions(+), 19 deletions(-)
+ 15 files changed, 68 insertions(+), 25 deletions(-)
 
 --- a/include/linux/netfilter_bridge.h
 +++ b/include/linux/netfilter_bridge.h
@@ -41,8 +47,29 @@ Signed-off-by: Fernando Fernandez Mancera <fmancera@suse.de>
 +static inline struct net_device *
 +__nf_bridge_get_physindev(const struct sk_buff *skb, struct net *net)
  {
- 	return skb->nf_bridge ? skb->nf_bridge->physindev : NULL;
- }
+ 	const struct nf_bridge_info *nf_bridge;
+ 
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -262,7 +262,7 @@ struct nf_bridge_info {
+ 	u8			in_prerouting:1;
+ 	u8			bridged_dnat:1;
+ 	__u16			frag_max_size;
+-	int			physinif;
++	struct net_device	*physindev;
+ 
+ 	/* always valid & non-NULL from FORWARD on, for physdev match */
+ 	struct net_device	*physoutdev;
+@@ -277,6 +277,9 @@ struct nf_bridge_info {
+ 		 */
+ 		char neigh_header[8];
+ 	};
++#ifndef __GENKSYMS__
++	int 			physinif;
++#endif
+ };
+ #endif
+ 
 --- a/include/net/netfilter/nf_log.h
 +++ b/include/net/netfilter/nf_log.h
 @@ -111,8 +111,14 @@ void nf_log_dump_packet_common(struct nf
@@ -62,6 +89,63 @@ Signed-off-by: Fernando Fernandez Mancera <fmancera@suse.de>
  void nf_log_l2packet(struct net *net, u_int8_t pf,
  		     __be16 protocol,
  		     unsigned int hooknum,
+--- a/net/bridge/br_netfilter_hooks.c
++++ b/net/bridge/br_netfilter_hooks.c
+@@ -279,7 +279,7 @@ int br_nf_pre_routing_finish_bridge(stru
+ 		if ((neigh->nud_state & NUD_CONNECTED) && neigh->hh.hh_len) {
+ 			struct net_device *br_indev;
+ 
+-			br_indev = nf_bridge_get_physindev(skb, net);
++			br_indev = __nf_bridge_get_physindev(skb, net);
+ 			if (!br_indev) {
+ 				neigh_release(neigh);
+ 				goto free_skb;
+@@ -365,7 +365,7 @@ static int br_nf_pre_routing_finish(stru
+ 	struct rtable *rt;
+ 	int err;
+ 
+-	br_indev = nf_bridge_get_physindev(skb, net);
++	br_indev = __nf_bridge_get_physindev(skb, net);
+ 	if (!br_indev) {
+ 		kfree_skb(skb);
+ 		return 0;
+@@ -464,6 +464,7 @@ struct net_device *setup_pre_routing(str
+ 
+ 	nf_bridge->in_prerouting = 1;
+ 	nf_bridge->physinif = skb->dev->ifindex;
++	nf_bridge->physindev = skb->dev;
+ 	skb->dev = brnf_get_logical_dev(skb, skb->dev);
+ 
+ 	if (skb->protocol == htons(ETH_P_8021Q))
+@@ -552,7 +553,7 @@ static int br_nf_forward_finish(struct n
+ 		if (skb->protocol == htons(ETH_P_IPV6))
+ 			nf_bridge->frag_max_size = IP6CB(skb)->frag_max_size;
+ 
+-		in = nf_bridge_get_physindev(skb, net);
++		in = __nf_bridge_get_physindev(skb, net);
+ 		if (!in) {
+ 			kfree_skb(skb);
+ 			return 0;
+@@ -880,7 +881,7 @@ static void br_nf_pre_routing_finish_bri
+ 	struct nf_bridge_info *nf_bridge = nf_bridge_info_get(skb);
+ 	struct net_device *br_indev;
+ 
+-	br_indev = nf_bridge_get_physindev(skb, dev_net(skb->dev));
++	br_indev = __nf_bridge_get_physindev(skb, dev_net(skb->dev));
+ 	if (!br_indev) {
+ 		kfree_skb(skb);
+ 		return;
+--- a/net/bridge/br_netfilter_ipv6.c
++++ b/net/bridge/br_netfilter_ipv6.c
+@@ -168,7 +168,7 @@ static int br_nf_pre_routing_finish_ipv6
+ 	struct net_device *dev = skb->dev, *br_indev;
+ 	const struct nf_ipv6_ops *v6ops = nf_get_ipv6_ops();
+ 
+-	br_indev = nf_bridge_get_physindev(skb, net);
++	br_indev = __nf_bridge_get_physindev(skb, net);
+ 	if (!br_indev) {
+ 		kfree_skb(skb);
+ 		return 0;
 --- a/net/ipv4/netfilter/nf_log_arp.c
 +++ b/net/ipv4/netfilter/nf_log_arp.c
 @@ -95,8 +95,8 @@ static void nf_log_arp_packet(struct net
@@ -90,15 +174,15 @@ Signed-off-by: Fernando Fernandez Mancera <fmancera@suse.de>
  		dump_ipv4_mac_header(m, loginfo, skb);
 --- a/net/ipv4/netfilter/nf_reject_ipv4.c
 +++ b/net/ipv4/netfilter/nf_reject_ipv4.c
-@@ -148,7 +148,7 @@ void nf_send_reset(struct net *net, stru
- 	if (oldskb->nf_bridge) {
+@@ -149,7 +149,7 @@ void nf_send_reset(struct net *net, stru
  		struct ethhdr *oeth = eth_hdr(oldskb);
+ 		struct net_device *br_indev;
  
--		nskb->dev = nf_bridge_get_physindev(oldskb, net);
-+		nskb->dev = __nf_bridge_get_physindev(oldskb, net);
- 		niph->tot_len = htons(nskb->len);
- 		ip_send_check(niph);
- 		if (dev_hard_header(nskb, nskb->dev, ntohs(nskb->protocol),
+-		br_indev = nf_bridge_get_physindev(oldskb, net);
++		br_indev = __nf_bridge_get_physindev(oldskb, net);
+ 		if (!br_indev)
+ 			goto free_nskb;
+ 
 --- a/net/ipv6/netfilter/nf_log_ipv6.c
 +++ b/net/ipv6/netfilter/nf_log_ipv6.c
 @@ -359,8 +359,8 @@ static void nf_log_ip6_packet(struct net
@@ -114,15 +198,15 @@ Signed-off-by: Fernando Fernandez Mancera <fmancera@suse.de>
  		dump_ipv6_mac_header(m, loginfo, skb);
 --- a/net/ipv6/netfilter/nf_reject_ipv6.c
 +++ b/net/ipv6/netfilter/nf_reject_ipv6.c
-@@ -189,7 +189,7 @@ void nf_send_reset6(struct net *net, str
- 	if (oldskb->nf_bridge) {
+@@ -190,7 +190,7 @@ void nf_send_reset6(struct net *net, str
  		struct ethhdr *oeth = eth_hdr(oldskb);
+ 		struct net_device *br_indev;
  
--		nskb->dev = nf_bridge_get_physindev(oldskb, net);
-+		nskb->dev = __nf_bridge_get_physindev(oldskb, net);
- 		nskb->protocol = htons(ETH_P_IPV6);
- 		ip6h->payload_len = htons(sizeof(struct tcphdr));
- 		if (dev_hard_header(nskb, nskb->dev, ntohs(nskb->protocol),
+-		br_indev = nf_bridge_get_physindev(oldskb, net);
++		br_indev = __nf_bridge_get_physindev(oldskb, net);
+ 		if (!br_indev) {
+ 			kfree_skb(nskb);
+ 			return;
 --- a/net/netfilter/ipset/ip_set_hash_netiface.c
 +++ b/net/netfilter/ipset/ip_set_hash_netiface.c
 @@ -138,7 +138,7 @@ hash_netiface4_data_next(struct hash_net
