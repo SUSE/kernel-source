@@ -1,0 +1,222 @@
+From: Pavel Tikhomirov <ptikhomirov@virtuozzo.com>
+Date: Thu, 11 Jan 2024 23:06:39 +0800
+Subject: netfilter: propagate net to nf_bridge_get_physindev
+Git-commit: a54e72197037d2c9bfcd70dddaac8c8ccb5b41ba
+Patch-mainline: v6.8-rc1
+References: CVE-2024-35839 bsc#1224726
+
+This is a preparation patch for replacing physindev with physinif on
+nf_bridge_info structure. We will use dev_get_by_index_rcu to resolve
+device, when needed, and it requires net to be available.
+
+Signed-off-by: Pavel Tikhomirov <ptikhomirov@virtuozzo.com>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+Acked-by: Fernando Fernandez Mancera <fmancera@suse.de>
+---
+ include/linux/netfilter_bridge.h           |    2 +-
+ include/net/netfilter/nf_log.h             |    3 ++-
+ net/ipv4/netfilter/nf_log_arp.c            |    2 +-
+ net/ipv4/netfilter/nf_log_ipv4.c           |    2 +-
+ net/ipv4/netfilter/nf_reject_ipv4.c        |    2 +-
+ net/ipv6/netfilter/nf_log_ipv6.c           |    2 +-
+ net/ipv6/netfilter/nf_reject_ipv6.c        |    2 +-
+ net/netfilter/ipset/ip_set_hash_netiface.c |    8 ++++----
+ net/netfilter/nf_log_common.c              |    5 +++--
+ net/netfilter/nf_queue.c                   |    4 ++--
+ net/netfilter/nfnetlink_log.c              |    7 ++++---
+ net/netfilter/xt_physdev.c                 |    2 +-
+ 12 files changed, 22 insertions(+), 19 deletions(-)
+
+--- a/include/linux/netfilter_bridge.h
++++ b/include/linux/netfilter_bridge.h
+@@ -50,7 +50,7 @@ static inline int nf_bridge_get_physouti
+ }
+ 
+ static inline struct net_device *
+-nf_bridge_get_physindev(const struct sk_buff *skb)
++nf_bridge_get_physindev(const struct sk_buff *skb, struct net *net)
+ {
+ 	return skb->nf_bridge ? skb->nf_bridge->physindev : NULL;
+ }
+--- a/include/net/netfilter/nf_log.h
++++ b/include/net/netfilter/nf_log.h
+@@ -111,7 +111,8 @@ void nf_log_dump_packet_common(struct nf
+ 			       const struct net_device *in,
+ 			       const struct net_device *out,
+ 			       const struct nf_loginfo *loginfo,
+-			       const char *prefix);
++			       const char *prefix,
++			       struct net *net);
+ void nf_log_l2packet(struct net *net, u_int8_t pf,
+ 		     __be16 protocol,
+ 		     unsigned int hooknum,
+--- a/net/ipv4/netfilter/nf_log_arp.c
++++ b/net/ipv4/netfilter/nf_log_arp.c
+@@ -96,7 +96,7 @@ static void nf_log_arp_packet(struct net
+ 		loginfo = &default_loginfo;
+ 
+ 	nf_log_dump_packet_common(m, pf, hooknum, skb, in, out, loginfo,
+-				  prefix);
++				  prefix, net);
+ 	dump_arp_packet(m, loginfo, skb, 0);
+ 
+ 	nf_log_buf_close(m);
+--- a/net/ipv4/netfilter/nf_log_ipv4.c
++++ b/net/ipv4/netfilter/nf_log_ipv4.c
+@@ -328,7 +328,7 @@ static void nf_log_ip_packet(struct net
+ 		loginfo = &default_loginfo;
+ 
+ 	nf_log_dump_packet_common(m, pf, hooknum, skb, in,
+-				  out, loginfo, prefix);
++				  out, loginfo, prefix, net);
+ 
+ 	if (in != NULL)
+ 		dump_ipv4_mac_header(m, loginfo, skb);
+--- a/net/ipv4/netfilter/nf_reject_ipv4.c
++++ b/net/ipv4/netfilter/nf_reject_ipv4.c
+@@ -148,7 +148,7 @@ void nf_send_reset(struct net *net, stru
+ 	if (oldskb->nf_bridge) {
+ 		struct ethhdr *oeth = eth_hdr(oldskb);
+ 
+-		nskb->dev = nf_bridge_get_physindev(oldskb);
++		nskb->dev = nf_bridge_get_physindev(oldskb, net);
+ 		niph->tot_len = htons(nskb->len);
+ 		ip_send_check(niph);
+ 		if (dev_hard_header(nskb, nskb->dev, ntohs(nskb->protocol),
+--- a/net/ipv6/netfilter/nf_log_ipv6.c
++++ b/net/ipv6/netfilter/nf_log_ipv6.c
+@@ -360,7 +360,7 @@ static void nf_log_ip6_packet(struct net
+ 		loginfo = &default_loginfo;
+ 
+ 	nf_log_dump_packet_common(m, pf, hooknum, skb, in, out,
+-				  loginfo, prefix);
++				  loginfo, prefix, net);
+ 
+ 	if (in != NULL)
+ 		dump_ipv6_mac_header(m, loginfo, skb);
+--- a/net/ipv6/netfilter/nf_reject_ipv6.c
++++ b/net/ipv6/netfilter/nf_reject_ipv6.c
+@@ -189,7 +189,7 @@ void nf_send_reset6(struct net *net, str
+ 	if (oldskb->nf_bridge) {
+ 		struct ethhdr *oeth = eth_hdr(oldskb);
+ 
+-		nskb->dev = nf_bridge_get_physindev(oldskb);
++		nskb->dev = nf_bridge_get_physindev(oldskb, net);
+ 		nskb->protocol = htons(ETH_P_IPV6);
+ 		ip6h->payload_len = htons(sizeof(struct tcphdr));
+ 		if (dev_hard_header(nskb, nskb->dev, ntohs(nskb->protocol),
+--- a/net/netfilter/ipset/ip_set_hash_netiface.c
++++ b/net/netfilter/ipset/ip_set_hash_netiface.c
+@@ -136,9 +136,9 @@ hash_netiface4_data_next(struct hash_net
+ #include "ip_set_hash_gen.h"
+ 
+ #if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+-static const char *get_physindev_name(const struct sk_buff *skb)
++static const char *get_physindev_name(const struct sk_buff *skb, struct net *net)
+ {
+-	struct net_device *dev = nf_bridge_get_physindev(skb);
++	struct net_device *dev = nf_bridge_get_physindev(skb, net);
+ 
+ 	return dev ? dev->name : NULL;
+ }
+@@ -175,7 +175,7 @@ hash_netiface4_kadt(struct ip_set *set,
+ 
+ 	if (opt->cmdflags & IPSET_FLAG_PHYSDEV) {
+ #if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+-		const char *eiface = SRCDIR ? get_physindev_name(skb) :
++		const char *eiface = SRCDIR ? get_physindev_name(skb, xt_net(par)) :
+ 					      get_physoutdev_name(skb);
+ 
+ 		if (!eiface)
+@@ -383,7 +383,7 @@ hash_netiface6_kadt(struct ip_set *set,
+ 
+ 	if (opt->cmdflags & IPSET_FLAG_PHYSDEV) {
+ #if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+-		const char *eiface = SRCDIR ? get_physindev_name(skb) :
++		const char *eiface = SRCDIR ? get_physindev_name(skb, xt_net(par)) :
+ 					      get_physoutdev_name(skb);
+ 
+ 		if (!eiface)
+--- a/net/netfilter/nf_log_common.c
++++ b/net/netfilter/nf_log_common.c
+@@ -153,7 +153,8 @@ nf_log_dump_packet_common(struct nf_log_
+ 			  unsigned int hooknum, const struct sk_buff *skb,
+ 			  const struct net_device *in,
+ 			  const struct net_device *out,
+-			  const struct nf_loginfo *loginfo, const char *prefix)
++			  const struct nf_loginfo *loginfo, const char *prefix,
++			  struct net *net)
+ {
+ 	nf_log_buf_add(m, KERN_SOH "%c%sIN=%s OUT=%s ",
+ 	       '0' + loginfo->u.log.level, prefix,
+@@ -164,7 +165,7 @@ nf_log_dump_packet_common(struct nf_log_
+ 		const struct net_device *physindev;
+ 		const struct net_device *physoutdev;
+ 
+-		physindev = nf_bridge_get_physindev(skb);
++		physindev = nf_bridge_get_physindev(skb, net);
+ 		if (physindev && in != physindev)
+ 			nf_log_buf_add(m, "PHYSIN=%s ", physindev->name);
+ 		physoutdev = nf_bridge_get_physoutdev(skb);
+--- a/net/netfilter/nf_queue.c
++++ b/net/netfilter/nf_queue.c
+@@ -59,7 +59,7 @@ void nf_queue_entry_release_refs(struct
+ 	if (entry->skb->nf_bridge) {
+ 		struct net_device *physdev;
+ 
+-		physdev = nf_bridge_get_physindev(entry->skb);
++		physdev = nf_bridge_get_physindev(entry->skb, state->net);
+ 		if (physdev)
+ 			dev_put(physdev);
+ 		physdev = nf_bridge_get_physoutdev(entry->skb);
+@@ -86,7 +86,7 @@ bool __nf_queue_entry_get_refs(struct nf
+ 	if (entry->skb->nf_bridge) {
+ 		struct net_device *physdev;
+ 
+-		physdev = nf_bridge_get_physindev(entry->skb);
++		physdev = nf_bridge_get_physindev(entry->skb, state->net);
+ 		if (physdev)
+ 			dev_hold(physdev);
+ 		physdev = nf_bridge_get_physoutdev(entry->skb);
+--- a/net/netfilter/nfnetlink_log.c
++++ b/net/netfilter/nfnetlink_log.c
+@@ -401,7 +401,8 @@ __build_packet_message(struct nfnl_log_n
+ 			const struct net_device *outdev,
+ 			const char *prefix, unsigned int plen,
+ 			const struct nfnl_ct_hook *nfnl_ct,
+-			struct nf_conn *ct, enum ip_conntrack_info ctinfo)
++			struct nf_conn *ct, enum ip_conntrack_info ctinfo,
++			struct net *net)
+ {
+ 	struct nfulnl_msg_packet_hdr pmsg;
+ 	struct nlmsghdr *nlh;
+@@ -459,7 +460,7 @@ __build_packet_message(struct nfnl_log_n
+ 					 htonl(indev->ifindex)))
+ 				goto nla_put_failure;
+ 
+-			physindev = nf_bridge_get_physindev(skb);
++			physindev = nf_bridge_get_physindev(skb, net);
+ 			if (physindev &&
+ 			    nla_put_be32(inst->skb, NFULA_IFINDEX_PHYSINDEV,
+ 					 htonl(physindev->ifindex)))
+@@ -739,7 +740,7 @@ nfulnl_log_packet(struct net *net,
+ 
+ 	__build_packet_message(log, inst, skb, data_len, pf,
+ 				hooknum, in, out, prefix, plen,
+-				nfnl_ct, ct, ctinfo);
++				nfnl_ct, ct, ctinfo, net);
+ 
+ 	if (inst->qlen >= qthreshold)
+ 		__nfulnl_flush(inst);
+--- a/net/netfilter/xt_physdev.c
++++ b/net/netfilter/xt_physdev.c
+@@ -61,7 +61,7 @@ physdev_mt(const struct sk_buff *skb, st
+ 	    (!!outdev ^ !(info->invert & XT_PHYSDEV_OP_BRIDGED)))
+ 		return false;
+ 
+-	physdev = nf_bridge_get_physindev(skb);
++	physdev = nf_bridge_get_physindev(skb, xt_net(par));
+ 	indev = physdev ? physdev->name : NULL;
+ 
+ 	if ((info->bitmask & XT_PHYSDEV_OP_ISIN &&

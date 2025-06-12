@@ -1,0 +1,277 @@
+From: Pavel Tikhomirov <ptikhomirov@virtuozzo.com>
+Date: Thu, 11 Jan 2024 23:06:40 +0800
+Subject: netfilter: bridge: replace physindev with physinif in nf_bridge_info
+Git-commit: 9874808878d9eed407e3977fd11fee49de1e1d86
+Patch-mainline: v6.8-rc1
+References: CVE-2024-35839 bsc#1224726
+
+An skb can be added to a neigh->arp_queue while waiting for an arp
+reply. Where original skb's skb->dev can be different to neigh's
+neigh->dev. For instance in case of bridging dnated skb from one veth to
+another, the skb would be added to a neigh->arp_queue of the bridge.
+
+As skb->dev can be reset back to nf_bridge->physindev and used, and as
+there is no explicit mechanism that prevents this physindev from been
+freed under us (for instance neigh_flush_dev doesn't cleanup skbs from
+different device's neigh queue) we can crash on e.g. this stack:
+
+arp_process
+  neigh_update
+    skb = __skb_dequeue(&neigh->arp_queue)
+      neigh_resolve_output(..., skb)
+        ...
+          br_nf_dev_xmit
+            br_nf_pre_routing_finish_bridge_slow
+              skb->dev = nf_bridge->physindev
+              br_handle_frame_finish
+
+Let's use plain ifindex instead of net_device link. To peek into the
+original net_device we will use dev_get_by_index_rcu(). Thus either we
+get device and are safe to use it or we don't get it and drop skb.
+
+Fixes: c4e70a87d975 ("netfilter: bridge: rename br_netfilter.c to br_netfilter_hooks.c")
+Suggested-by: Florian Westphal <fw@strlen.de>
+Signed-off-by: Pavel Tikhomirov <ptikhomirov@virtuozzo.com>
+Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+Acked-by: Fernando Fernandez Mancera <fmancera@suse.de>
+---
+ include/linux/netfilter_bridge.h    |   10 ++++++--
+ include/linux/skbuff.h              |    2 -
+ net/bridge/br_netfilter_hooks.c     |   42 +++++++++++++++++++++++++++++-------
+ net/bridge/br_netfilter_ipv6.c      |   14 ++++++++----
+ net/ipv4/netfilter/nf_reject_ipv4.c |    7 +++++-
+ net/ipv6/netfilter/nf_reject_ipv6.c |    9 ++++++-
+ 6 files changed, 67 insertions(+), 17 deletions(-)
+
+--- a/include/linux/netfilter_bridge.h
++++ b/include/linux/netfilter_bridge.h
+@@ -35,7 +35,7 @@ static inline int nf_bridge_get_physinif
+ 		return 0;
+ 
+ 	nf_bridge = skb->nf_bridge;
+-	return nf_bridge->physindev ? nf_bridge->physindev->ifindex : 0;
++	return nf_bridge->physinif;
+ }
+ 
+ static inline int nf_bridge_get_physoutif(const struct sk_buff *skb)
+@@ -52,7 +52,13 @@ static inline int nf_bridge_get_physouti
+ static inline struct net_device *
+ nf_bridge_get_physindev(const struct sk_buff *skb, struct net *net)
+ {
+-	return skb->nf_bridge ? skb->nf_bridge->physindev : NULL;
++	const struct nf_bridge_info *nf_bridge;
++
++	if (skb->nf_bridge == NULL)
++		return NULL;
++
++	nf_bridge = skb->nf_bridge;
++	return nf_bridge ? dev_get_by_index_rcu(net, nf_bridge->physinif) : NULL;
+ }
+ 
+ static inline struct net_device *
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -262,7 +262,7 @@ struct nf_bridge_info {
+ 	u8			in_prerouting:1;
+ 	u8			bridged_dnat:1;
+ 	__u16			frag_max_size;
+-	struct net_device	*physindev;
++	int			physinif;
+ 
+ 	/* always valid & non-NULL from FORWARD on, for physdev match */
+ 	struct net_device	*physoutdev;
+--- a/net/bridge/br_netfilter_hooks.c
++++ b/net/bridge/br_netfilter_hooks.c
+@@ -276,8 +276,17 @@ int br_nf_pre_routing_finish_bridge(stru
+ 		int ret;
+ 
+ 		if ((neigh->nud_state & NUD_CONNECTED) && neigh->hh.hh_len) {
++			struct net_device *br_indev;
++
++			br_indev = nf_bridge_get_physindev(skb, net);
++			if (!br_indev) {
++				neigh_release(neigh);
++				goto free_skb;
++			}
++
+ 			neigh_hh_bridge(&neigh->hh, skb);
+-			skb->dev = nf_bridge->physindev;
++			skb->dev = br_indev;
++
+ 			ret = br_handle_frame_finish(net, sk, skb);
+ 		} else {
+ 			/* the neighbour function below overwrites the complete
+@@ -349,12 +358,18 @@ br_nf_ipv4_daddr_was_changed(const struc
+  */
+ static int br_nf_pre_routing_finish(struct net *net, struct sock *sk, struct sk_buff *skb)
+ {
+-	struct net_device *dev = skb->dev;
++	struct net_device *dev = skb->dev, *br_indev;
+ 	struct iphdr *iph = ip_hdr(skb);
+ 	struct nf_bridge_info *nf_bridge = nf_bridge_info_get(skb);
+ 	struct rtable *rt;
+ 	int err;
+ 
++	br_indev = nf_bridge_get_physindev(skb, net);
++	if (!br_indev) {
++		kfree_skb(skb);
++		return 0;
++	}
++
+ 	nf_bridge->frag_max_size = IPCB(skb)->frag_max_size;
+ 
+ 	if (nf_bridge->pkt_otherhost) {
+@@ -393,7 +408,7 @@ free_skb:
+ 		} else {
+ 			if (skb_dst(skb)->dev == dev) {
+ bridged_dnat:
+-				skb->dev = nf_bridge->physindev;
++				skb->dev = br_indev;
+ 				nf_bridge_update_protocol(skb);
+ 				nf_bridge_push_encap_header(skb);
+ 				br_nf_hook_thresh(NF_BR_PRE_ROUTING,
+@@ -406,7 +421,7 @@ bridged_dnat:
+ 			skb->pkt_type = PACKET_HOST;
+ 		}
+ 	} else {
+-		rt = bridge_parent_rtable(nf_bridge->physindev);
++		rt = bridge_parent_rtable(br_indev);
+ 		if (!rt) {
+ 			kfree_skb(skb);
+ 			return 0;
+@@ -414,7 +429,7 @@ bridged_dnat:
+ 		skb_dst_set_noref(skb, &rt->dst);
+ 	}
+ 
+-	skb->dev = nf_bridge->physindev;
++	skb->dev = br_indev;
+ 	nf_bridge_update_protocol(skb);
+ 	nf_bridge_push_encap_header(skb);
+ 	br_nf_hook_thresh(NF_BR_PRE_ROUTING, net, sk, skb, skb->dev, NULL,
+@@ -447,7 +462,7 @@ struct net_device *setup_pre_routing(str
+ 	}
+ 
+ 	nf_bridge->in_prerouting = 1;
+-	nf_bridge->physindev = skb->dev;
++	nf_bridge->physinif = skb->dev->ifindex;
+ 	skb->dev = brnf_get_logical_dev(skb, skb->dev);
+ 
+ 	if (skb->protocol == htons(ETH_P_8021Q))
+@@ -536,7 +551,11 @@ static int br_nf_forward_finish(struct n
+ 		if (skb->protocol == htons(ETH_P_IPV6))
+ 			nf_bridge->frag_max_size = IP6CB(skb)->frag_max_size;
+ 
+-		in = nf_bridge->physindev;
++		in = nf_bridge_get_physindev(skb, net);
++		if (!in) {
++			kfree_skb(skb);
++			return 0;
++		}
+ 		if (nf_bridge->pkt_otherhost) {
+ 			skb->pkt_type = PACKET_OTHERHOST;
+ 			nf_bridge->pkt_otherhost = false;
+@@ -854,6 +873,13 @@ static unsigned int ip_sabotage_in(void
+ static void br_nf_pre_routing_finish_bridge_slow(struct sk_buff *skb)
+ {
+ 	struct nf_bridge_info *nf_bridge = nf_bridge_info_get(skb);
++	struct net_device *br_indev;
++
++	br_indev = nf_bridge_get_physindev(skb, dev_net(skb->dev));
++	if (!br_indev) {
++		kfree_skb(skb);
++		return;
++	}
+ 
+ 	skb_pull(skb, ETH_HLEN);
+ 	nf_bridge->bridged_dnat = 0;
+@@ -863,7 +889,7 @@ static void br_nf_pre_routing_finish_bri
+ 	skb_copy_to_linear_data_offset(skb, -(ETH_HLEN - ETH_ALEN),
+ 				       nf_bridge->neigh_header,
+ 				       ETH_HLEN - ETH_ALEN);
+-	skb->dev = nf_bridge->physindev;
++	skb->dev = br_indev;
+ 
+ 	nf_bridge->physoutdev = NULL;
+ 	br_handle_frame_finish(dev_net(skb->dev), NULL, skb);
+--- a/net/bridge/br_netfilter_ipv6.c
++++ b/net/bridge/br_netfilter_ipv6.c
+@@ -165,9 +165,15 @@ static int br_nf_pre_routing_finish_ipv6
+ {
+ 	struct nf_bridge_info *nf_bridge = nf_bridge_info_get(skb);
+ 	struct rtable *rt;
+-	struct net_device *dev = skb->dev;
++	struct net_device *dev = skb->dev, *br_indev;
+ 	const struct nf_ipv6_ops *v6ops = nf_get_ipv6_ops();
+ 
++	br_indev = nf_bridge_get_physindev(skb, net);
++	if (!br_indev) {
++		kfree_skb(skb);
++		return 0;
++	}
++
+ 	nf_bridge->frag_max_size = IP6CB(skb)->frag_max_size;
+ 
+ 	if (nf_bridge->pkt_otherhost) {
+@@ -185,7 +191,7 @@ static int br_nf_pre_routing_finish_ipv6
+ 		}
+ 
+ 		if (skb_dst(skb)->dev == dev) {
+-			skb->dev = nf_bridge->physindev;
++			skb->dev = br_indev;
+ 			nf_bridge_update_protocol(skb);
+ 			nf_bridge_push_encap_header(skb);
+ 			br_nf_hook_thresh(NF_BR_PRE_ROUTING,
+@@ -196,7 +202,7 @@ static int br_nf_pre_routing_finish_ipv6
+ 		ether_addr_copy(eth_hdr(skb)->h_dest, dev->dev_addr);
+ 		skb->pkt_type = PACKET_HOST;
+ 	} else {
+-		rt = bridge_parent_rtable(nf_bridge->physindev);
++		rt = bridge_parent_rtable(br_indev);
+ 		if (!rt) {
+ 			kfree_skb(skb);
+ 			return 0;
+@@ -204,7 +210,7 @@ static int br_nf_pre_routing_finish_ipv6
+ 		skb_dst_set_noref(skb, &rt->dst);
+ 	}
+ 
+-	skb->dev = nf_bridge->physindev;
++	skb->dev = br_indev;
+ 	nf_bridge_update_protocol(skb);
+ 	nf_bridge_push_encap_header(skb);
+ 	br_nf_hook_thresh(NF_BR_PRE_ROUTING, net, sk, skb,
+--- a/net/ipv4/netfilter/nf_reject_ipv4.c
++++ b/net/ipv4/netfilter/nf_reject_ipv4.c
+@@ -147,8 +147,13 @@ void nf_send_reset(struct net *net, stru
+ 	 */
+ 	if (oldskb->nf_bridge) {
+ 		struct ethhdr *oeth = eth_hdr(oldskb);
++		struct net_device *br_indev;
+ 
+-		nskb->dev = nf_bridge_get_physindev(oldskb, net);
++		br_indev = nf_bridge_get_physindev(oldskb, net);
++		if (!br_indev)
++			goto free_nskb;
++
++		nskb->dev = br_indev;
+ 		niph->tot_len = htons(nskb->len);
+ 		ip_send_check(niph);
+ 		if (dev_hard_header(nskb, nskb->dev, ntohs(nskb->protocol),
+--- a/net/ipv6/netfilter/nf_reject_ipv6.c
++++ b/net/ipv6/netfilter/nf_reject_ipv6.c
+@@ -199,8 +199,15 @@ void nf_send_reset6(struct net *net, str
+ 	 */
+ 	if (oldskb->nf_bridge) {
+ 		struct ethhdr *oeth = eth_hdr(oldskb);
++		struct net_device *br_indev;
+ 
+-		nskb->dev = nf_bridge_get_physindev(oldskb, net);
++		br_indev = nf_bridge_get_physindev(oldskb, net);
++		if (!br_indev) {
++			kfree_skb(nskb);
++			return;
++		}
++
++		nskb->dev = br_indev;
+ 		nskb->protocol = htons(ETH_P_IPV6);
+ 		ip6h->payload_len = htons(sizeof(struct tcphdr));
+ 		if (dev_hard_header(nskb, nskb->dev, ntohs(nskb->protocol),
