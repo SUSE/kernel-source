@@ -1,0 +1,138 @@
+From: "Steven Rostedt (VMware)" <rostedt@goodmis.org>
+Date: Thu, 31 Aug 2017 17:36:51 -0400
+Subject: ftrace: Zero out ftrace hashes when a module is removed
+Git-commit: 2a5bfe47624bfc835aa0632a0505ba55576c98db
+Patch-mainline: v4.14-rc1
+References: bsc#1226837
+
+When a ftrace filter has a module function, and that module is removed, the
+filter still has its address as being enabled. This can cause interesting
+side effects. Nothing dangerous, but unwanted functions can be traced
+because of it.
+
+ # cd /sys/kernel/tracing
+ # echo ':mod:snd_seq' > set_ftrace_filter
+ # cat set_ftrace_filter
+snd_use_lock_sync_helper [snd_seq]
+check_event_type_and_length [snd_seq]
+snd_seq_ioctl_pversion [snd_seq]
+snd_seq_ioctl_client_id [snd_seq]
+snd_seq_ioctl_get_queue_tempo [snd_seq]
+update_timestamp_of_queue [snd_seq]
+snd_seq_ioctl_get_queue_status [snd_seq]
+snd_seq_set_queue_tempo [snd_seq]
+snd_seq_ioctl_set_queue_tempo [snd_seq]
+snd_seq_ioctl_get_queue_timer [snd_seq]
+seq_free_client1 [snd_seq]
+[..]
+ # rmmod snd_seq
+ # cat set_ftrace_filter
+
+ # modprobe kvm
+ # cat set_ftrace_filter
+kvm_set_cr4 [kvm]
+kvm_emulate_hypercall [kvm]
+kvm_set_dr [kvm]
+
+This is because removing the snd_seq module after it was being filtered,
+left the address of the snd_seq functions in the hash. When the kvm module
+was loaded, some of its functions were loaded at the same address as the
+snd_seq module. This would enable them to be filtered and traced.
+
+Now we don't want to clear the hash completely. That would cause removing a
+module where only its functions are filtered, to cause the tracing to enable
+all functions, as an empty filter means to trace all functions. Instead,
+just set the hash ip address to zero. Then it will never match any function.
+
+Signed-off-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+Acked-by: Petr Pavlu <petr.pavlu@suse.com>
+---
+ kernel/trace/ftrace.c | 58 ++++++++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 55 insertions(+), 3 deletions(-)
+
+diff --git a/kernel/trace/ftrace.c b/kernel/trace/ftrace.c
+index 96cea88fa00f..165b149ccb1a 100644
+--- a/kernel/trace/ftrace.c
++++ b/kernel/trace/ftrace.c
+@@ -5690,10 +5690,51 @@ static int referenced_filters(struct dyn_ftrace *rec)
+ 	return cnt;
+ }
+ 
++static void
++clear_mod_from_hash(struct ftrace_page *pg, struct ftrace_hash *hash)
++{
++	struct ftrace_func_entry *entry;
++	struct dyn_ftrace *rec;
++	int i;
++
++	if (ftrace_hash_empty(hash))
++		return;
++
++	for (i = 0; i < pg->index; i++) {
++		rec = &pg->records[i];
++		entry = __ftrace_lookup_ip(hash, rec->ip);
++		/*
++		 * Do not allow this rec to match again.
++		 * Yeah, it may waste some memory, but will be removed
++		 * if/when the hash is modified again.
++		 */
++		if (entry)
++			entry->ip = 0;
++	}
++}
++
++/* Clear any records from hashs */
++static void clear_mod_from_hashes(struct ftrace_page *pg)
++{
++	struct trace_array *tr;
++
++	mutex_lock(&trace_types_lock);
++	list_for_each_entry(tr, &ftrace_trace_arrays, list) {
++		if (!tr->ops || !tr->ops->func_hash)
++			continue;
++		mutex_lock(&tr->ops->func_hash->regex_lock);
++		clear_mod_from_hash(pg, tr->ops->func_hash->filter_hash);
++		clear_mod_from_hash(pg, tr->ops->func_hash->notrace_hash);
++		mutex_unlock(&tr->ops->func_hash->regex_lock);
++	}
++	mutex_unlock(&trace_types_lock);
++}
++
+ void ftrace_release_mod(struct module *mod)
+ {
+ 	struct dyn_ftrace *rec;
+ 	struct ftrace_page **last_pg;
++	struct ftrace_page *tmp_page = NULL;
+ 	struct ftrace_page *pg;
+ 	int order;
+ 
+@@ -5723,14 +5764,25 @@ void ftrace_release_mod(struct module *mod)
+ 				ftrace_pages = next_to_ftrace_page(last_pg);
+ 
+ 			*last_pg = pg->next;
+-			order = get_count_order(pg->size / ENTRIES_PER_PAGE);
+-			free_pages((unsigned long)pg->records, order);
+-			kfree(pg);
++
++			pg->next = tmp_page;
++			tmp_page = pg;
+ 		} else
+ 			last_pg = &pg->next;
+ 	}
+  out_unlock:
+ 	mutex_unlock(&ftrace_lock);
++
++	for (pg = tmp_page; pg; pg = tmp_page) {
++
++		/* Needs to be called outside of ftrace_lock */
++		clear_mod_from_hashes(pg);
++
++		order = get_count_order(pg->size / ENTRIES_PER_PAGE);
++		free_pages((unsigned long)pg->records, order);
++		tmp_page = pg->next;
++		kfree(pg);
++	}
+ }
+ 
+ void ftrace_module_enable(struct module *mod)
+
