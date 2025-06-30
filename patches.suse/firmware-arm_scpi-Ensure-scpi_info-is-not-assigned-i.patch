@@ -1,0 +1,102 @@
+From 689640efc0a2c4e07e6f88affe6d42cd40cc3f85 Mon Sep 17 00:00:00 2001
+From: Sudeep Holla <sudeep.holla@arm.com>
+Date: Fri, 1 Jul 2022 17:03:10 +0100
+Subject: [PATCH] firmware: arm_scpi: Ensure scpi_info is not assigned if the probe fails
+Git-commit: 689640efc0a2c4e07e6f88affe6d42cd40cc3f85
+Patch-mainline: v6.0-rc1
+References: CVE-2022-50087 bsc#1245119
+
+When scpi probe fails, at any point, we need to ensure that the scpi_info
+is not set and will remain NULL until the probe succeeds. If it is not
+taken care, then it could result use-after-free as the value is exported
+via get_scpi_ops() and could refer to a memory allocated via devm_kzalloc()
+but freed when the probe fails.
+
+Link: https://lore.kernel.org/r/20220701160310.148344-1-sudeep.holla@arm.com
+Cc: stable@vger.kernel.org # 4.19+
+Reported-by: huhai <huhai@kylinos.cn>
+Reviewed-by: Jackie Liu <liuyun01@kylinos.cn>
+Signed-off-by: Sudeep Holla <sudeep.holla@arm.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/firmware/arm_scpi.c |   33 ++++++++++++++++++++-------------
+ 1 file changed, 20 insertions(+), 13 deletions(-)
+
+--- a/drivers/firmware/arm_scpi.c
++++ b/drivers/firmware/arm_scpi.c
+@@ -790,7 +790,7 @@ static int scpi_init_versions(struct scp
+ 		info->firmware_version = le32_to_cpu(caps.platform_version);
+ 	}
+ 	/* Ignore error if not implemented */
+-	if (scpi_info->is_legacy && ret == -EOPNOTSUPP)
++	if (info->is_legacy && ret == -EOPNOTSUPP)
+ 		return 0;
+ 
+ 	return ret;
+@@ -892,13 +892,14 @@ static int scpi_probe(struct platform_de
+ 	struct scpi_chan *scpi_chan;
+ 	struct device *dev = &pdev->dev;
+ 	struct device_node *np = dev->of_node;
++	struct scpi_drvinfo *scpi_drvinfo;
+ 
+-	scpi_info = devm_kzalloc(dev, sizeof(*scpi_info), GFP_KERNEL);
+-	if (!scpi_info)
++	scpi_drvinfo = devm_kzalloc(dev, sizeof(*scpi_drvinfo), GFP_KERNEL);
++	if (!scpi_drvinfo)
+ 		return -ENOMEM;
+ 
+ 	if (of_match_device(legacy_scpi_of_match, &pdev->dev))
+-		scpi_info->is_legacy = true;
++		scpi_drvinfo->is_legacy = true;
+ 
+ 	count = of_count_phandle_with_args(np, "mboxes", "#mbox-cells");
+ 	if (count < 0) {
+@@ -960,24 +961,26 @@ err:
+ 		return ret;
+ 	}
+ 
+-	scpi_info->channels = scpi_chan;
+-	scpi_info->num_chans = count;
+-	scpi_info->commands = scpi_std_commands;
++	scpi_drvinfo->channels = scpi_chan;
++	scpi_drvinfo->num_chans = count;
++	scpi_drvinfo->commands = scpi_std_commands;
+ 
+-	platform_set_drvdata(pdev, scpi_info);
++	platform_set_drvdata(pdev, scpi_drvinfo);
+ 
+-	if (scpi_info->is_legacy) {
++	if (scpi_drvinfo->is_legacy) {
+ 		/* Replace with legacy variants */
+ 		scpi_ops.clk_set_val = legacy_scpi_clk_set_val;
+-		scpi_info->commands = scpi_legacy_commands;
++		scpi_drvinfo->commands = scpi_legacy_commands;
+ 
+ 		/* Fill priority bitmap */
+ 		for (idx = 0; idx < ARRAY_SIZE(legacy_hpriority_cmds); idx++)
+ 			set_bit(legacy_hpriority_cmds[idx],
+-				scpi_info->cmd_priority);
++				scpi_drvinfo->cmd_priority);
+ 	}
+ 
+-	ret = scpi_init_versions(scpi_info);
++	scpi_info = scpi_drvinfo;
++
++	ret = scpi_init_versions(scpi_drvinfo);
+ 	if (ret) {
+ 		dev_err(dev, "incorrect or no SCP firmware found\n");
+ 		scpi_remove(pdev);
+@@ -996,7 +999,11 @@ err:
+ 	if (ret)
+ 		dev_err(dev, "unable to create sysfs version group\n");
+ 
+-	return of_platform_populate(dev->of_node, NULL, NULL, dev);
++	ret = of_platform_populate(dev->of_node, NULL, NULL, dev);
++	if (ret)
++		scpi_info = NULL;
++
++	return ret;
+ }
+ 
+ static const struct of_device_id scpi_of_match[] = {
