@@ -1,0 +1,92 @@
+From: Shung-Hsi Yu <shung-hsi.yu@suse.com>
+Date: Thu Jul  3 16:17:00 CEST 2025
+Subject: kABI workaround for xsk: Fix race condition in AF_XDP generic RX path
+Patch-mainline: Never, kABI workaround
+References: CVE-2025-37920 bsc#1243479
+
+Commit a1356ac7749cafc4e27aa62c0c4604b5dca4983e moves rx_lock from xsk_socket
+to xdp_umem (upstream commit moved it to xsk_buff_pool, which doesn't exists in
+SLE12-SP5).
+
+struct xdp_umem initiliazer is xdp_umem_reg(); so it is safe in its current
+location (using holes), as the structure is initialzed in a specific place.
+Just add a check to make sure it does not cause visible change in struct
+xdp_umem.
+
+Keep the space in xdp_sock occupied by the no more used spinlock_t.
+
+Signed-off-by: Shung-Hsi Yu <shung-hsi.yu@suse.com>
+---
+ include/net/xdp_sock.h |   29 +++++++++++++++++++++++++++++
+ net/xdp/xdp_umem.c     |    7 +++++++
+ 2 files changed, 36 insertions(+)
+
+--- a/include/net/xdp_sock.h
++++ b/include/net/xdp_sock.h
+@@ -38,7 +38,31 @@ struct xdp_umem {
+ 	struct user_struct *user;
+ 	unsigned long address;
+ 	refcount_t users;
++#ifndef __GENKSYMS__
+ 	spinlock_t rx_lock;
++#endif
++	struct work_struct work;
++	struct page **pgs;
++	u32 npgs;
++	struct net_device *dev;
++	struct xdp_umem_fq_reuse *fq_reuse;
++	u16 queue_id;
++	bool zc;
++	spinlock_t xsk_list_lock;
++	struct list_head xsk_list;
++};
++
++struct __orig_xdp_umem {
++	struct xsk_queue *fq;
++	struct xsk_queue *cq;
++	struct xdp_umem_page *pages;
++	u64 chunk_mask;
++	u64 size;
++	u32 headroom;
++	u32 chunk_size_nohr;
++	struct user_struct *user;
++	unsigned long address;
++	refcount_t users;
+ 	struct work_struct work;
+ 	struct page **pgs;
+ 	u32 npgs;
+@@ -67,6 +91,11 @@ struct xdp_sock {
+ 	 * in the SKB destructor callback.
+ 	 */
+ 	spinlock_t tx_completion_lock;
++#ifdef __GENKSYMS__
++	spinlock_t rx_lock;
++#else
++	spinlock_t rx_lock_unused __attribute__((deprecated));
++#endif
+ 	u64 rx_dropped;
+ };
+ 
+--- a/net/xdp/xdp_umem.c
++++ b/net/xdp/xdp_umem.c
+@@ -13,6 +13,8 @@
+ #include <linux/mm.h>
+ #include <linux/netdevice.h>
+ #include <linux/rtnetlink.h>
++#include <linux/build_bug.h>  /* for BUILD_BUG_ON() */
++#include <linux/stddef.h>     /* for offsetof() */
+ 
+ #include "xdp_umem.h"
+ #include "xsk_queue.h"
+@@ -357,6 +359,11 @@ static int xdp_umem_reg(struct xdp_umem
+ 	spin_lock_init(&umem->xsk_list_lock);
+ 	spin_lock_init(&umem->rx_lock);
+ 
++	BUILD_BUG_ON(offsetof(struct xdp_umem, users) !=
++		     offsetof(struct __orig_xdp_umem, users));
++	BUILD_BUG_ON(offsetof(struct xdp_umem, work) !=
++		     offsetof(struct __orig_xdp_umem, work));
++
+ 	refcount_set(&umem->users, 1);
+ 
+ 	err = xdp_umem_account_pages(umem);

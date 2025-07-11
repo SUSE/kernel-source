@@ -1,0 +1,126 @@
+From: "e.kubanski" <e.kubanski@partner.samsung.com>
+Date: Wed, 16 Apr 2025 12:19:08 +0200
+Subject: xsk: Fix race condition in AF_XDP generic RX path
+Patch-mainline: v6.15-rc5
+Git-commit: a1356ac7749cafc4e27aa62c0c4604b5dca4983e
+References: bsc#1243479 CVE-2025-37920
+
+Move rx_lock from xsk_socket to xsk_buff_pool.
+Fix synchronization for shared umem mode in
+generic RX path where multiple sockets share
+single xsk_buff_pool.
+
+RX queue is exclusive to xsk_socket, while FILL
+queue can be shared between multiple sockets.
+This could result in race condition where two
+CPU cores access RX path of two different sockets
+sharing the same umem.
+
+Protect both queues by acquiring spinlock in shared
+xsk_buff_pool.
+
+Lock contention may be minimized in the future by some
+per-thread FQ buffering.
+
+It's safe and necessary to move spin_lock_bh(rx_lock)
+after xsk_rcv_check():
+* xs->pool and spinlock_init is synchronized by
+  xsk_bind() -> xsk_is_bound() memory barriers.
+* xsk_rcv_check() may return true at the moment
+  of xsk_release() or xsk_unbind_dev(),
+  however this will not cause any data races or
+  race conditions. xsk_unbind_dev() removes xdp
+  socket from all maps and waits for completion
+  of all outstanding rx operations. Packets in
+  RX path will either complete safely or drop.
+
+Signed-off-by: Eryk Kubanski <e.kubanski@partner.samsung.com>
+Fixes: bf0bdd1343efb ("xdp: fix race on generic receive path")
+Acked-by: Magnus Karlsson <magnus.karlsson@intel.com>
+Link: https://patch.msgid.link/20250416101908.10919-1-e.kubanski@partner.samsung.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+[ shung-hsi.yu: `struct xsk_buff_pool` does not exists without commit
+2b43470add8c "xsk: Introduce AF_XDP buffer allocation API", so instead place
+`rx_lock` inside `struct xdp_umem`, which is the structure that contains the
+fill queue that is susceptible to race. ]
+Acked-by: Shung-Hsi Yu <shung-hsi.yu@suse.com>
+---
+ include/net/xdp_sock.h |    3 +--
+ net/xdp/xdp_umem.c     |    1 +
+ net/xdp/xsk.c          |   12 +++++-------
+ 3 files changed, 7 insertions(+), 9 deletions(-)
+
+--- a/include/net/xdp_sock.h
++++ b/include/net/xdp_sock.h
+@@ -38,6 +38,7 @@ struct xdp_umem {
+ 	struct user_struct *user;
+ 	unsigned long address;
+ 	refcount_t users;
++	spinlock_t rx_lock;
+ 	struct work_struct work;
+ 	struct page **pgs;
+ 	u32 npgs;
+@@ -66,8 +67,6 @@ struct xdp_sock {
+ 	 * in the SKB destructor callback.
+ 	 */
+ 	spinlock_t tx_completion_lock;
+-	/* Protects generic receive. */
+-	spinlock_t rx_lock;
+ 	u64 rx_dropped;
+ };
+ 
+--- a/net/xdp/xdp_umem.c
++++ b/net/xdp/xdp_umem.c
+@@ -355,6 +355,7 @@ static int xdp_umem_reg(struct xdp_umem
+ 	umem->user = NULL;
+ 	INIT_LIST_HEAD(&umem->xsk_list);
+ 	spin_lock_init(&umem->xsk_list_lock);
++	spin_lock_init(&umem->rx_lock);
+ 
+ 	refcount_set(&umem->users, 1);
+ 
+--- a/net/xdp/xsk.c
++++ b/net/xdp/xsk.c
+@@ -127,13 +127,13 @@ int xsk_generic_rcv(struct xdp_sock *xs,
+ 	u64 addr;
+ 	int err;
+ 
+-	spin_lock_bh(&xs->rx_lock);
+-
+ 	if (xs->dev != xdp->rxq->dev || xs->queue_id != xdp->rxq->queue_index) {
+ 		err = -EINVAL;
+-		goto out_unlock;
++		return err;
+ 	}
+ 
++	spin_lock_bh(&xs->umem->rx_lock);
++
+ 	if (!xskq_peek_addr(xs->umem->fq, &addr) ||
+ 	    len > xs->umem->chunk_size_nohr - XDP_PACKET_HEADROOM) {
+ 		err = -ENOSPC;
+@@ -152,15 +152,14 @@ int xsk_generic_rcv(struct xdp_sock *xs,
+ 	xskq_discard_addr(xs->umem->fq);
+ 	xskq_produce_flush_desc(xs->rx);
+ 
+-	spin_unlock_bh(&xs->rx_lock);
++	spin_unlock_bh(&xs->umem->rx_lock);
+ 
+ 	xs->sk.sk_data_ready(&xs->sk);
+ 	return 0;
+ 
+ out_drop:
+ 	xs->rx_dropped++;
+-out_unlock:
+-	spin_unlock_bh(&xs->rx_lock);
++	spin_unlock_bh(&xs->umem->rx_lock);
+ 	return err;
+ }
+ 
+@@ -782,7 +781,6 @@ static int xsk_create(struct net *net, s
+ 
+ 	xs = xdp_sk(sk);
+ 	mutex_init(&xs->mutex);
+-	spin_lock_init(&xs->rx_lock);
+ 	spin_lock_init(&xs->tx_completion_lock);
+ 
+ 	local_bh_disable();
