@@ -1,0 +1,252 @@
+From: Filipe Manana <fdmanana@suse.com>
+Date: Fri, 14 Jun 2024 14:50:47 +0100
+Subject: [PATCH] btrfs: do not BUG_ON() when freeing tree block after error
+Git-commit: bb3868033a4cccff7be57e9145f2117cbdc91c11
+Patch-mainline: v6.11-rc1
+References: CVE-2024-44963 bsc#1230216
+
+When freeing a tree block, at btrfs_free_tree_block(), if we fail to
+create a delayed reference we don't deal with the error and just do a
+BUG_ON(). The error most likely to happen is -ENOMEM, and we have a
+comment mentioning that only -ENOMEM can happen, but that is not true,
+because in case qgroups are enabled any error returned from
+btrfs_qgroup_trace_extent_post() (can be -EUCLEAN or anything returned
+from btrfs_search_slot() for example) can be propagated back to
+btrfs_free_tree_block().
+
+So stop doing a BUG_ON() and return the error to the callers and make
+them abort the transaction to prevent leaking space. Syzbot was
+triggering this, likely due to memory allocation failure injection.
+
+Reported-by: syzbot+a306f914b4d01b3958fe@syzkaller.appspotmail.com
+Link: https://lore.kernel.org/linux-btrfs/000000000000fcba1e05e998263c@google.com/
+Reviewed-by: Qu Wenruo <wqu@suse.com>
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Reviewed-by: David Sterba <dsterba@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/ctree.c           |   43 +++++++++++++++++++++++++++++++++++--------
+ fs/btrfs/ctree.h           |    8 ++++----
+ fs/btrfs/extent-tree.c     |   20 ++++++++++++--------
+ fs/btrfs/free-space-tree.c |    9 +++++++--
+ fs/btrfs/qgroup.c          |    4 +++-
+ 5 files changed, 61 insertions(+), 23 deletions(-)
+
+--- a/fs/btrfs/ctree.c
++++ b/fs/btrfs/ctree.c
+@@ -1181,10 +1181,15 @@ static noinline int __btrfs_cow_block(st
+ 		tree_mod_log_set_root_pointer(root, cow, 1);
+ 		rcu_assign_pointer(root->node, cow);
+ 
+-		btrfs_free_tree_block(trans, root, buf, parent_start,
+-				      last_ref);
++		ret = btrfs_free_tree_block(trans, root, buf, parent_start, last_ref);
+ 		free_extent_buffer(buf);
+ 		add_root_to_dirty_list(root);
++		if (ret < 0) {
++			btrfs_tree_unlock(cow);
++			free_extent_buffer(cow);
++			btrfs_abort_transaction(trans, ret);
++			return ret;
++		}
+ 	} else {
+ 		WARN_ON(trans->transid != btrfs_header_generation(parent));
+ 		tree_mod_log_insert_key(fs_info, parent, parent_slot,
+@@ -1201,8 +1206,13 @@ static noinline int __btrfs_cow_block(st
+ 				return ret;
+ 			}
+ 		}
+-		btrfs_free_tree_block(trans, root, buf, parent_start,
+-				      last_ref);
++		ret = btrfs_free_tree_block(trans, root, buf, parent_start, last_ref);
++		if (ret < 0) {
++			btrfs_tree_unlock(cow);
++			free_extent_buffer(cow);
++			btrfs_abort_transaction(trans, ret);
++			return ret;
++		}
+ 	}
+ 	if (unlock_orig)
+ 		btrfs_tree_unlock(buf);
+@@ -1991,9 +2001,13 @@ static noinline int balance_level(struct
+ 		free_extent_buffer(mid);
+ 
+ 		root_sub_used(root, mid->len);
+-		btrfs_free_tree_block(trans, root, mid, 0, 1);
++		ret = btrfs_free_tree_block(trans, root, mid, 0, 1);
+ 		/* once for the root ptr */
+ 		free_extent_buffer_stale(mid);
++		if (ret < 0) {
++			btrfs_abort_transaction(trans, ret);
++			goto out;
++		}
+ 		return 0;
+ 	}
+ 	if (btrfs_header_nritems(mid) >
+@@ -2050,9 +2064,13 @@ static noinline int balance_level(struct
+ 			btrfs_tree_unlock(right);
+ 			del_ptr(root, path, level + 1, pslot + 1);
+ 			root_sub_used(root, right->len);
+-			btrfs_free_tree_block(trans, root, right, 0, 1);
++			ret = btrfs_free_tree_block(trans, root, right, 0, 1);
+ 			free_extent_buffer_stale(right);
+ 			right = NULL;
++			if (ret < 0) {
++				btrfs_abort_transaction(trans, ret);
++				goto out;
++			}
+ 		} else {
+ 			struct btrfs_disk_key right_key;
+ 			btrfs_node_key(right, &right_key, 0);
+@@ -2094,9 +2112,13 @@ static noinline int balance_level(struct
+ 		btrfs_tree_unlock(mid);
+ 		del_ptr(root, path, level + 1, pslot);
+ 		root_sub_used(root, mid->len);
+-		btrfs_free_tree_block(trans, root, mid, 0, 1);
++		ret = btrfs_free_tree_block(trans, root, mid, 0, 1);
+ 		free_extent_buffer_stale(mid);
+ 		mid = NULL;
++		if (ret < 0) {
++			btrfs_abort_transaction(trans, ret);
++			goto out;
++		}
+ 	} else {
+ 		/* update the parent key to reflect our changes */
+ 		struct btrfs_disk_key mid_key;
+@@ -2137,6 +2159,7 @@ enospc:
+ 			btrfs_tree_unlock(left);
+ 		free_extent_buffer(left);
+ 	}
++out:
+ 	return ret;
+ }
+ 
+@@ -5068,6 +5091,8 @@ static noinline void btrfs_del_leaf(stru
+ 				    struct btrfs_path *path,
+ 				    struct extent_buffer *leaf)
+ {
++	int ret;
++
+ 	WARN_ON(btrfs_header_generation(leaf) != trans->transid);
+ 	del_ptr(root, path, 1, path->slots[1]);
+ 
+@@ -5080,8 +5105,10 @@ static noinline void btrfs_del_leaf(stru
+ 	root_sub_used(root, leaf->len);
+ 
+ 	extent_buffer_get(leaf);
+-	btrfs_free_tree_block(trans, root, leaf, 0, 1);
++	ret = btrfs_free_tree_block(trans, root, leaf, 0, 1);
+ 	free_extent_buffer_stale(leaf);
++	if (ret < 0)
++		btrfs_abort_transaction(trans, ret);
+ }
+ /*
+  * delete the item at the leaf level in path.  If that empties
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@ -2526,10 +2526,10 @@ struct extent_buffer *btrfs_alloc_tree_b
+ 					     const struct btrfs_disk_key *key,
+ 					     int level, u64 hint,
+ 					     u64 empty_size);
+-void btrfs_free_tree_block(struct btrfs_trans_handle *trans,
+-			   struct btrfs_root *root,
+-			   struct extent_buffer *buf,
+-			   u64 parent, int last_ref);
++int btrfs_free_tree_block(struct btrfs_trans_handle *trans,
++			  struct btrfs_root *root,
++			  struct extent_buffer *buf,
++			  u64 parent, int last_ref);
+ int btrfs_alloc_reserved_file_extent(struct btrfs_trans_handle *trans,
+ 				     struct btrfs_root *root, u64 owner,
+ 				     u64 offset, u64 ram_bytes,
+--- a/fs/btrfs/extent-tree.c
++++ b/fs/btrfs/extent-tree.c
+@@ -3602,10 +3602,10 @@ out_delayed_unlock:
+ 	return 0;
+ }
+ 
+-void btrfs_free_tree_block(struct btrfs_trans_handle *trans,
+-			   struct btrfs_root *root,
+-			   struct extent_buffer *buf,
+-			   u64 parent, int last_ref)
++int btrfs_free_tree_block(struct btrfs_trans_handle *trans,
++			  struct btrfs_root *root,
++			  struct extent_buffer *buf,
++			  u64 parent, int last_ref)
+ {
+ 	struct btrfs_fs_info *fs_info = root->fs_info;
+ 	struct btrfs_ref generic_ref = { 0 };
+@@ -3621,7 +3621,8 @@ void btrfs_free_tree_block(struct btrfs_
+ 		ret = btrfs_add_delayed_tree_ref(fs_info, trans, &generic_ref,
+ 						 NULL);
+ 
+-		BUG_ON(ret); /* -ENOMEM */
++		if (ret < 0)
++			return ret;
+ 	}
+ 
+ 	if (last_ref && btrfs_header_generation(buf) == trans->transid) {
+@@ -3677,6 +3678,7 @@ out:
+ 		 */
+ 		clear_bit(EXTENT_BUFFER_CORRUPT, &buf->bflags);
+ 	}
++	return 0;
+ }
+ 
+ /* Can return -ENOMEM */
+@@ -5204,7 +5206,7 @@ static noinline int walk_up_proc(struct
+ 				 struct walk_control *wc)
+ {
+ 	struct btrfs_fs_info *fs_info = root->fs_info;
+-	int ret;
++	int ret = 0;
+ 	int level = wc->level;
+ 	struct extent_buffer *eb = path->nodes[level];
+ 	u64 parent = 0;
+@@ -5303,11 +5305,13 @@ static noinline int walk_up_proc(struct
+ 			       btrfs_header_owner(path->nodes[level + 1]));
+ 	}
+ 
+-	btrfs_free_tree_block(trans, root, eb, parent, wc->refs[level] == 1);
++	ret = btrfs_free_tree_block(trans, root, eb, parent, wc->refs[level] == 1);
++	if (ret < 0)
++		btrfs_abort_transaction(trans, ret);
+ out:
+ 	wc->refs[level] = 0;
+ 	wc->flags[level] = 0;
+-	return 0;
++	return ret;
+ }
+ 
+ static noinline int walk_down_tree(struct btrfs_trans_handle *trans,
+--- a/fs/btrfs/free-space-tree.c
++++ b/fs/btrfs/free-space-tree.c
+@@ -1271,8 +1271,13 @@ int btrfs_clear_free_space_tree(struct b
+ 	btrfs_tree_lock(free_space_root->node);
+ 	clean_tree_block(fs_info, free_space_root->node);
+ 	btrfs_tree_unlock(free_space_root->node);
+-	btrfs_free_tree_block(trans, free_space_root, free_space_root->node,
+-			      0, 1);
++	ret = btrfs_free_tree_block(trans, free_space_root, free_space_root->node,
++				    0, 1);
++	if (ret < 0) {
++		btrfs_abort_transaction(trans, ret);
++		btrfs_end_transaction(trans);
++		return ret;
++	}
+ 
+ 	free_extent_buffer(free_space_root->node);
+ 	free_extent_buffer(free_space_root->commit_root);
+--- a/fs/btrfs/qgroup.c
++++ b/fs/btrfs/qgroup.c
+@@ -1055,7 +1055,9 @@ int btrfs_quota_disable(struct btrfs_tra
+ 	btrfs_tree_lock(quota_root->node);
+ 	clean_tree_block(fs_info, quota_root->node);
+ 	btrfs_tree_unlock(quota_root->node);
+-	btrfs_free_tree_block(trans, quota_root, quota_root->node, 0, 1);
++	ret = btrfs_free_tree_block(trans, quota_root, quota_root->node, 0, 1);
++	if (ret < 0)
++		btrfs_abort_transaction(trans, ret);
+ 
+ out:
+ 	if (quota_root) {
