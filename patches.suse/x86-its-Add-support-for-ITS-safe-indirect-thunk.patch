@@ -1,0 +1,156 @@
+From: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+Date: Fri, 21 Jun 2024 21:17:21 -0700
+Subject: x86/its: Add support for ITS-safe indirect thunk
+Git-commit: 8754e67ad4ac692c67ff1f99c0d07156f04ae40c
+Patch-mainline: v6.15-rc7
+References: bsc#1242006 CVE-2024-28956
+
+Due to ITS, indirect branches in the lower half of a cacheline may be
+vulnerable to branch target injection attack.
+
+Introduce ITS-safe thunks to patch indirect branches in the lower half of
+cacheline with the thunk. Also thunk any eBPF generated indirect branches
+in emit_indirect_jump().
+
+Below category of indirect branches are not mitigated:
+
+- Indirect branches in the .init section are not mitigated because they are
+  discarded after boot.
+- Indirect branches that are explicitly marked retpoline-safe.
+
+Note that retpoline also mitigates the indirect branches against ITS. This
+is because the retpoline sequence fills an RSB entry before RET, and it
+does not suffer from RSB-underflow part of the ITS.
+
+Signed-off-by: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+Reviewed-by: Josh Poimboeuf <jpoimboe@kernel.org>
+Reviewed-by: Alexandre Chartre <alexandre.chartre@oracle.com>
+Acked-by: Nikolay Borisov <nik.borisov@suse.com>
+---
+ arch/x86/Kconfig                     |   11 +++++++++++
+ arch/x86/include/asm/cpufeatures.h   |    2 ++
+ arch/x86/include/asm/nospec-branch.h |    5 +++++
+ arch/x86/kernel/alternative.c        |    1 +
+ arch/x86/kernel/vmlinux.lds.S        |    7 +++++++
+ arch/x86/lib/retpoline.S             |   16 ++++++++++++++--
+ 6 files changed, 40 insertions(+), 2 deletions(-)
+
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -2421,6 +2421,17 @@ config MITIGATION_SPECTRE_BHI
+ 	  indirect branches.
+ 	  See <file:Documentation/admin-guide/hw-vuln/spectre.rst>
+ 
++config MITIGATION_ITS
++	bool "Enable Indirect Target Selection mitigation"
++	depends on CPU_SUP_INTEL && X86_64
++	depends on RETPOLINE
++	default y
++	help
++	  Enable Indirect Target Selection (ITS) mitigation. ITS is a bug in
++	  BPU on some Intel CPUs that may allow Spectre V2 style attacks. If
++	  disabled, mitigation cannot be enabled via cmdline.
++	  See <file:Documentation/admin-guide/hw-vuln/indirect-target-selection.rst>
++
+ config ARCH_HAS_ADD_PAGES
+ 	def_bool y
+ 	depends on X86_64 && ARCH_ENABLE_MEMORY_HOTPLUG
+--- a/arch/x86/include/asm/cpufeatures.h
++++ b/arch/x86/include/asm/cpufeatures.h
+@@ -385,6 +385,8 @@
+ #define X86_FEATURE_IBPB_BRTYPE		(20*32+28) /* "" MSR_PRED_CMD[IBPB] flushes all branch type predictions */
+ #define X86_FEATURE_SRSO_NO		(20*32+29) /* "" CPU is not affected by SRSO */
+ 
++#define X86_FEATURE_INDIRECT_THUNK_ITS	(21*32 + 9) /* "" Use thunk for indirect branches in lower half of cacheline */
++
+ /* Linux defined features */
+ #define X86_FEATURE_CLEAR_BHB_LOOP	(22*32+ 0) /* "" Clear branch history at syscall entry using SW loop */
+ #define X86_FEATURE_BHI_CTRL		(22*32+ 1) /* "" BHI_DIS_S HW control available */
+--- a/arch/x86/include/asm/nospec-branch.h
++++ b/arch/x86/include/asm/nospec-branch.h
+@@ -265,6 +265,11 @@
+ 	_ASM_PTR " 999b\n\t"					\
+ 	".popsection\n\t"
+ 
++
++#define ITS_THUNK_SIZE	64
++typedef u8 its_thunk_t[ITS_THUNK_SIZE];
++extern its_thunk_t	 __x86_indirect_its_thunk_array[];
++
+ #ifdef CONFIG_RETPOLINE
+ #ifdef CONFIG_X86_64
+ 
+--- a/arch/x86/kernel/alternative.c
++++ b/arch/x86/kernel/alternative.c
+@@ -623,6 +623,7 @@ extern struct paravirt_patch_site __star
+  * See entry_{32,64}.S for more details.
+  */
+ 
++
+ /*
+  * We define the int3_magic() function in assembly to control the calling
+  * convention such that we can 'call' it from assembly.
+--- a/arch/x86/kernel/vmlinux.lds.S
++++ b/arch/x86/kernel/vmlinux.lds.S
+@@ -435,6 +435,13 @@ INIT_PER_CPU(irq_stack_union);
+ 		"SRSO function pair won't alias");
+ #endif
+ 
++
++#if defined(CONFIG_MITIGATION_ITS)
++. = ASSERT(__x86_indirect_thunk_rax & 0x20, "__x86_indirect_thunk_rax not in second half of cacheline");
++. = ASSERT(((__x86_indirect_thunk_rcx - __x86_indirect_thunk_rax) % 64) == 0, "Indirect thunks are not cacheline apart");
++. = ASSERT(__x86_indirect_its_thunk_array == __x86_indirect_thunk_rax, "Gap in ITS thunk array");
++#endif
++
+ #endif /* CONFIG_X86_32 */
+ 
+ #ifdef CONFIG_KEXEC_CORE
+--- a/arch/x86/lib/retpoline.S
++++ b/arch/x86/lib/retpoline.S
+@@ -10,12 +10,12 @@
+ #include <asm/nops.h>
+ 
+ .macro THUNK reg
+-	.section .text..__x86.indirect_thunk
+-
+ ENTRY(__x86_indirect_thunk_\reg)
+ 	CFI_STARTPROC
+ 	JMP_NOSPEC %\reg
+ 	CFI_ENDPROC
++.align 32, 0xcc		/* fill to the end of the line */
++.skip  32, 0xcc		/* skip to the next upper half */
+ ENDPROC(__x86_indirect_thunk_\reg)
+ .endm
+ 
+@@ -34,10 +34,21 @@ ENDPROC(__x86_indirect_thunk_\reg)
+ #define __EXPORT_THUNK(sym)	_ASM_NOKPROBE(sym); EXPORT_SYMBOL(sym)
+ #define EXPORT_THUNK(reg)	__EXPORT_THUNK(__x86_indirect_thunk_ ## reg)
+ 
++/* Instead of introducing a new set of thunks just ensure the existing RETPOLINE
++ * thunks are properly aligned
++ */
++	.section .text..__x86.indirect_thunk
++	.align 64, 0xcc
++	.skip 32, 0xcc
++SYM_CODE_START(__x86_indirect_its_thunk_array)
++
+ #undef GEN
+ #define GEN(reg) THUNK reg
+ #include <asm/GEN-for-each-reg.h>
+ 
++	.align 64, 0xcc
++SYM_CODE_END(__x86_indirect_its_thunk_array)
++
+ #undef GEN
+ #define GEN(reg) EXPORT_THUNK(reg)
+ #include <asm/GEN-for-each-reg.h>
+@@ -173,6 +184,7 @@ __EXPORT_THUNK(retbleed_untrain_ret)
+  * must start at a cacheline boundary.
+  */
+ 
++
+ /*
+  * SRSO untraining sequence for Zen1/2, similar to retbleed_untrain_ret()
+  * above. On kernel entry, srso_untrain_ret() is executed which is a
