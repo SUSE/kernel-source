@@ -1,0 +1,83 @@
+From: Shaohua Li <shli@fb.com>
+Date: Tue, 29 Mar 2016 14:00:19 -0700
+Subject: MD: add rdev reference for super write
+Patch-mainline: v4.6-rc3
+Git-commit: ed3b98c71cd91fa05954df52a79dcd6be08dd730
+References: CVE-2022-50381, bsc#1250257
+
+Xiao Ni reported below crash:
+[26396.335146] BUG: unable to handle kernel NULL pointer dereference at 00000000000002a8
+[26396.342990] IP: [<ffffffffa0425b00>] super_written+0x20/0x80 [md_mod]
+[26396.349449] PGD 0
+[26396.351468] Oops: 0002 [#1] SMP
+[26396.354898] Modules linked in: ext4 mbcache jbd2 raid456 async_raid6_recov async_memcpy async_pq async_xor xor async_td
+[26396.408404] CPU: 5 PID: 3261 Comm: loop0 Not tainted 4.5.0 #1
+[26396.414140] Hardware name: Dell Inc. PowerEdge R715/0G2DP3, BIOS 3.2.2 09/15/2014
+[26396.421608] task: ffff8808339be680 ti: ffff8808365f4000 task.ti: ffff8808365f4000
+[26396.429074] RIP: 0010:[<ffffffffa0425b00>]  [<ffffffffa0425b00>] super_written+0x20/0x80 [md_mod]
+[26396.437952] RSP: 0018:ffff8808365f7c38  EFLAGS: 00010046
+[26396.443252] RAX: ffffffffa0425ae0 RBX: ffff8804336a7900 RCX: ffffe8f9f7b41198
+[26396.450371] RDX: 0000000000000000 RSI: 0000000000000000 RDI: ffff8804336a7900
+[26396.457489] RBP: ffff8808365f7c50 R08: 0000000000000005 R09: 00001801e02ce3d7
+[26396.464608] R10: 0000000000000001 R11: 0000000000000000 R12: 0000000000000000
+[26396.471728] R13: ffff8808338d9a00 R14: 0000000000000000 R15: ffff880833f9fe00
+[26396.478849] FS:  00007f9e5066d740(0000) GS:ffff880237b40000(0000) knlGS:0000000000000000
+[26396.486922] CS:  0010 DS: 0000 ES: 0000 CR0: 000000008005003b
+[26396.492656] CR2: 00000000000002a8 CR3: 00000000019ea000 CR4: 00000000000006e0
+[26396.499775] Stack:
+[26396.501781]  ffff8804336a7900 0000000000000000 0000000000000000 ffff8808365f7c68
+[26396.509199]  ffffffff81308cd0 ffff8804336a7900 ffff8808365f7ca8 ffffffff81310637
+[26396.516618]  00000000a0233a00 ffff880833f9fe00 0000000000000000 ffff880833fb0000
+[26396.524038] Call Trace:
+[26396.526485]  [<ffffffff81308cd0>] bio_endio+0x40/0x60
+[26396.531529]  [<ffffffff81310637>] blk_update_request+0x87/0x320
+[26396.537439]  [<ffffffff8131a20a>] blk_mq_end_request+0x1a/0x70
+[26396.543261]  [<ffffffff81313889>] blk_flush_complete_seq+0xd9/0x2a0
+[26396.549517]  [<ffffffff81313ccf>] flush_end_io+0x15f/0x240
+[26396.554993]  [<ffffffff8131a22a>] blk_mq_end_request+0x3a/0x70
+[26396.560815]  [<ffffffff8131a314>] __blk_mq_complete_request+0xb4/0xe0
+[26396.567246]  [<ffffffff8131a35c>] blk_mq_complete_request+0x1c/0x20
+[26396.573506]  [<ffffffffa04182df>] loop_queue_work+0x6f/0x72c [loop]
+[26396.579764]  [<ffffffff81697844>] ? __schedule+0x2b4/0x8f0
+[26396.585242]  [<ffffffff810a7812>] kthread_worker_fn+0x52/0x170
+[26396.591065]  [<ffffffff810a77c0>] ? kthread_create_on_node+0x1a0/0x1a0
+[26396.597582]  [<ffffffff810a7238>] kthread+0xd8/0xf0
+[26396.602453]  [<ffffffff810a7160>] ? kthread_park+0x60/0x60
+[26396.607929]  [<ffffffff8169bdcf>] ret_from_fork+0x3f/0x70
+[26396.613319]  [<ffffffff810a7160>] ? kthread_park+0x60/0x60
+
+md_super_write() and corresponding md_super_wait() generally are called
+with reconfig_mutex locked, which prevents disk disappears. There is one
+case this rule is broken. write_sb_page of bitmap.c doesn't hold the
+mutex. next_active_rdev does increase rdev reference, but it decreases
+the reference too early (eg, before IO finish). disk can disappear at
+the window. We unconditionally increase rdev reference in
+md_super_write() to avoid the race.
+
+Reported-and-tested-by: Xiao Ni <xni@redhat.com>
+Reviewed-by: Neil Brown <neilb@suse.de>
+Signed-off-by: Shaohua Li <shli@fb.com>
+Acked-by: Martin Wilck <mwilck@suse.com>
+---
+ drivers/md/md.c |    3 +++
+ 1 file changed, 3 insertions(+)
+
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -881,6 +881,7 @@ static void super_written(struct bio *bi
+ 
+ 	if (atomic_dec_and_test(&mddev->pending_writes))
+ 		wake_up(&mddev->sb_wait);
++	rdev_dec_pending(rdev, mddev);
+ 	bio_put(bio);
+ }
+ 
+@@ -901,6 +902,8 @@ void md_super_write(mddev_t *mddev, mdk_
+ 
+ 	bio = md_bio_alloc_sync(mddev);
+ 
++	atomic_inc(&rdev->nr_pending);
++
+ 	bio->bi_bdev = rdev->meta_bdev ? rdev->meta_bdev : rdev->bdev;
+ 	bio->bi_sector = sector;
+ 	bio_add_page(bio, page, size, 0);
