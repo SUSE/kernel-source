@@ -1,0 +1,55 @@
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Fri, 10 Mar 2023 15:38:51 +0800
+Subject: md: fix soft lockup in status_resync
+Patch-mainline: v6.4-rc1
+Git-commit: 6efddf1e32e2a264694766ca485a4f5e04ee82a7
+References: bsc1251318, CVE-2023-53620
+
+status_resync() will calculate 'curr_resync - recovery_active' to show
+user a progress bar like following:
+
+[============>........]  resync = 61.4%
+
+'curr_resync' and 'recovery_active' is updated in md_do_sync(), and
+status_resync() can read them concurrently, hence it's possible that
+'curr_resync - recovery_active' can overflow to a huge number. In this
+case status_resync() will be stuck in the loop to print a large amount
+of '=', which will end up soft lockup.
+
+Fix the problem by setting 'resync' to MD_RESYNC_ACTIVE in this case,
+this way resync in progress will be reported to user.
+
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Signed-off-by: Song Liu <song@kernel.org>
+Link: https://lore.kernel.org/r/20230310073855.1337560-3-yukuai1@huaweicloud.com
+Acked-by: Martin Wilck <mwilck@suse.com>
+---
+ drivers/md/md.c |   16 +++++++++++++---
+ 1 file changed, 13 insertions(+), 3 deletions(-)
+
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -7922,10 +7922,20 @@ static int status_resync(struct seq_file
+ 		if (test_bit(MD_RECOVERY_DONE, &mddev->recovery))
+ 			/* Still cleaning up */
+ 			resync = max_sectors;
+-	} else if (resync > max_sectors)
++	} else if (resync > max_sectors) {
+ 		resync = max_sectors;
+-	else
+-		resync -= atomic_read(&mddev->recovery_active);
++	} else {
++		res = atomic_read(&mddev->recovery_active);
++		/*
++		 * Resync has started, but the subtraction has overflowed or
++		 * yielded one of the special values. Force it to active to
++		 * ensure the status reports an active resync.
++		 */
++		if (resync < res || resync - res < 3)
++			resync = 3;
++		else
++			resync -= res;
++	}
+ 
+ 	if (resync == 0) {
+ 		if (test_bit(MD_RESYNCING_REMOTE, &mddev->recovery)) {
