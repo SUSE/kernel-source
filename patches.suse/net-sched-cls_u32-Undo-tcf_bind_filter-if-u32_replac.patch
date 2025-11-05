@@ -1,0 +1,115 @@
+From: Victor Nogueira <victor@mojatatu.com>
+Date: Thu, 13 Jul 2023 15:05:11 -0300
+Subject: net: sched: cls_u32: Undo tcf_bind_filter if u32_replace_hw_knode
+Patch-mainline: v6.5-rc3
+Git-commit: 9cb36faedeafb9720ac236aeae2ea57091d90a09
+References: CVE-2023-53733 bsc#1252685
+
+When u32_replace_hw_knode fails, we need to undo the tcf_bind_filter
+operation done at u32_set_parms.
+
+Fixes: d34e3e181395 ("net: cls_u32: Add support for skip-sw flag to tc u32 classifier.")
+Signed-off-by: Victor Nogueira <victor@mojatatu.com>
+Acked-by: Jamal Hadi Salim <jhs@mojatatu.com>
+Reviewed-by: Pedro Tammela <pctammela@mojatatu.com>
+Reviewed-by: Simon Horman <simon.horman@corigine.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Michal Kubecek <mkubecek@suse.cz>
+
+---
+ net/sched/cls_u32.c | 40 ++++++++++++++++++++++++++++++----------
+ 1 file changed, 30 insertions(+), 10 deletions(-)
+
+--- a/net/sched/cls_u32.c
++++ b/net/sched/cls_u32.c
+@@ -722,8 +722,23 @@ static const struct nla_policy u32_policy[TCA_U32_MAX + 1] = {
+ 	[TCA_U32_FLAGS]		= { .type = NLA_U32 },
+ };
+ 
++static void u32_unbind_filter(struct tcf_proto *tp, struct tc_u_knode *n,
++			      struct nlattr **tb)
++{
++	if (tb[TCA_U32_CLASSID])
++		tcf_unbind_filter(tp, &n->res);
++}
++
++static void u32_bind_filter(struct tcf_proto *tp, struct tc_u_knode *n,
++			    unsigned long base, struct nlattr **tb)
++{
++	if (tb[TCA_U32_CLASSID]) {
++		n->res.classid = nla_get_u32(tb[TCA_U32_CLASSID]);
++		tcf_bind_filter(tp, &n->res, base);
++	}
++}
++
+ static int u32_set_parms(struct net *net, struct tcf_proto *tp,
+-			 unsigned long base,
+ 			 struct tc_u_knode *n, struct nlattr **tb,
+ 			 struct nlattr *est, bool ovr,
+ 			 struct netlink_ext_ack *extack)
+@@ -774,10 +789,6 @@ static int u32_set_parms(struct net *net, struct tcf_proto *tp,
+ 		if (ht_old)
+ 			ht_old->refcnt--;
+ 	}
+-	if (tb[TCA_U32_CLASSID]) {
+-		n->res.classid = nla_get_u32(tb[TCA_U32_CLASSID]);
+-		tcf_bind_filter(tp, &n->res, base);
+-	}
+ 
+ #ifdef CONFIG_NET_CLS_IND
+ 	if (ifindex >= 0)
+@@ -923,16 +934,20 @@ static int u32_change(struct net *net, struct sk_buff *in_skb,
+ 		if (!new)
+ 			return -ENOMEM;
+ 
+-		err = u32_set_parms(net, tp, base, new, tb,
+-				    tca[TCA_RATE], ovr, extack);
++		err = u32_set_parms(net, tp, new, tb, tca[TCA_RATE],
++				    ovr, extack);
+ 
+ 		if (err) {
+ 			__u32_destroy_key(new);
+ 			return err;
+ 		}
+ 
++		u32_bind_filter(tp, new, base, tb);
++
+ 		err = u32_replace_hw_knode(tp, new, flags, extack);
+ 		if (err) {
++			u32_unbind_filter(tp, new, tb);
++
+ 			__u32_destroy_key(new);
+ 			return err;
+ 		}
+@@ -1087,15 +1102,18 @@ static int u32_change(struct net *net, struct sk_buff *in_skb,
+ 	}
+ #endif
+ 
+-	err = u32_set_parms(net, tp, base, n, tb, tca[TCA_RATE], ovr,
++	err = u32_set_parms(net, tp, n, tb, tca[TCA_RATE], ovr,
+ 			    extack);
++
++	u32_bind_filter(tp, n, base, tb);
++
+ 	if (err == 0) {
+ 		struct tc_u_knode __rcu **ins;
+ 		struct tc_u_knode *pins;
+ 
+ 		err = u32_replace_hw_knode(tp, n, flags, extack);
+ 		if (err)
+-			goto errhw;
++			goto errunbind;
+ 
+ 		if (!tc_in_hw(n->flags))
+ 			n->flags |= TCA_CLS_FLAGS_NOT_IN_HW;
+@@ -1113,7 +1131,9 @@ static int u32_change(struct net *net, struct sk_buff *in_skb,
+ 		return 0;
+ 	}
+ 
+-errhw:
++errunbind:
++	u32_unbind_filter(tp, n, tb);
++
+ #ifdef CONFIG_CLS_U32_MARK
+ 	free_percpu(n->pcpu_success);
+ #endif
