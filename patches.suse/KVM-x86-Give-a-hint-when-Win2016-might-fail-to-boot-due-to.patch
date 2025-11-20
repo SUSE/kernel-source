@@ -1,0 +1,143 @@
+From: "Maciej S. Szmigiero" <maciej.szmigiero@oracle.com>
+Date: Wed, 24 Jan 2024 21:18:21 +0100
+Subject: KVM: x86: Give a hint when Win2016 might fail to boot due to XSAVES
+ erratum
+Git-commit: d52734d00b8e86604a66b4cdfa9e8bb541daca2d
+Patch-mainline: v6.8-rc4
+References: git-fixes
+
+Since commit b0563468eeac ("x86/CPU/AMD: Disable XSAVES on AMD family 0x17")
+kernel unconditionally clears the XSAVES CPU feature bit on Zen1/2 CPUs.
+
+Because KVM CPU caps are initialized from the kernel boot CPU features this
+makes the XSAVES feature also unavailable for KVM guests in this case.
+At the same time the XSAVEC feature is left enabled.
+
+Unfortunately, having XSAVEC but no XSAVES in CPUID breaks Hyper-V enabled
+Windows Server 2016 VMs that have more than one vCPU.
+
+Let's at least give users hint in the kernel log what could be wrong since
+these VMs currently simply hang at boot with a black screen - giving no
+clue what suddenly broke them and how to make them work again.
+
+Trigger the kernel message hint based on the particular guest ID written to
+the Guest OS Identity Hyper-V MSR implemented by KVM.
+
+Defer this check to when the L1 Hyper-V hypervisor enables SVM in EFER
+since we want to limit this message to Hyper-V enabled Windows guests only
+(Windows session running nested as L2) but the actual Guest OS Identity MSR
+write is done by L1 and happens before it enables SVM.
+
+Fixes: b0563468eeac ("x86/CPU/AMD: Disable XSAVES on AMD family 0x17")
+Signed-off-by: Maciej S. Szmigiero <maciej.szmigiero@oracle.com>
+Message-Id: <b83ab45c5e239e5d148b0ae7750133a67ac9575c.1706127425.git.maciej.szmigiero@oracle.com>
+[Move some checks before mutex_lock(), rename function. - Paolo]
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Acked-by: Nikolay Borisov <nik.borisov@suse.com>
+---
+ arch/x86/include/asm/kvm_host.h |    2 +
+ arch/x86/kvm/hyperv.c           |   50 ++++++++++++++++++++++++++++++++++++++++
+ arch/x86/kvm/hyperv.h           |    1 
+ arch/x86/kvm/x86.c              |    4 +++
+ 4 files changed, 57 insertions(+)
+
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -773,6 +773,8 @@ struct kvm_hv {
+ 
+ 	/* How many vCPUs have VP index != vCPU index */
+ 	atomic_t num_mismatched_vp_indexes;
++
++	bool xsaves_xsavec_checked;
+ };
+ 
+ enum kvm_irqchip_mode {
+--- a/arch/x86/kvm/hyperv.c
++++ b/arch/x86/kvm/hyperv.c
+@@ -25,6 +25,7 @@
+ #include "lapic.h"
+ #include "ioapic.h"
+ #include "hyperv.h"
++#include "cpuid.h"
+ 
+ #include <linux/kvm_host.h>
+ #include <linux/highmem.h>
+@@ -1008,6 +1009,55 @@ out_unlock:
+ 	mutex_unlock(&kvm->arch.hyperv.hv_lock);
+ }
+ 
++#define KVM_HV_WIN2016_GUEST_ID 0x1040a00003839
++#define KVM_HV_WIN2016_GUEST_ID_MASK (~GENMASK_ULL(23, 16)) /* mask out the service version */
++
++/*
++ * Hyper-V enabled Windows Server 2016 SMP VMs fail to boot in !XSAVES && XSAVEC
++ * configuration.
++ * Such configuration can result from, for example, AMD Erratum 1386 workaround.
++ *
++ * Print a notice so users aren't left wondering what's suddenly gone wrong.
++ */
++static void __kvm_hv_xsaves_xsavec_maybe_warn(struct kvm_vcpu *vcpu)
++{
++	struct kvm *kvm = vcpu->kvm;
++	struct kvm_hv *hv = &kvm->arch.hyperv;
++
++	/* Check again under the hv_lock.  */
++	if (hv->xsaves_xsavec_checked)
++		return;
++
++	if ((hv->hv_guest_os_id & KVM_HV_WIN2016_GUEST_ID_MASK) !=
++	    KVM_HV_WIN2016_GUEST_ID)
++		return;
++
++	hv->xsaves_xsavec_checked = true;
++
++	/* UP configurations aren't affected */
++	if (atomic_read(&kvm->online_vcpus) < 2)
++		return;
++
++	if (guest_cpuid_has(vcpu, X86_FEATURE_XSAVES) ||
++	    !guest_cpuid_has(vcpu, X86_FEATURE_XSAVEC))
++		return;
++
++	pr_notice_ratelimited("Booting SMP Windows KVM VM with !XSAVES && XSAVEC. "
++			      "If it fails to boot try disabling XSAVEC in the VM config.\n");
++}
++
++void kvm_hv_xsaves_xsavec_maybe_warn(struct kvm_vcpu *vcpu)
++{
++	struct kvm_hv *hv = &vcpu->kvm->arch.hyperv;
++
++	if (hv->xsaves_xsavec_checked)
++		return;
++
++	mutex_lock(&hv->hv_lock);
++	__kvm_hv_xsaves_xsavec_maybe_warn(vcpu);
++	mutex_unlock(&hv->hv_lock);
++}
++
+ static int kvm_hv_set_msr_pw(struct kvm_vcpu *vcpu, u32 msr, u64 data,
+ 			     bool host)
+ {
+--- a/arch/x86/kvm/hyperv.h
++++ b/arch/x86/kvm/hyperv.h
+@@ -92,6 +92,7 @@ void kvm_hv_process_stimers(struct kvm_v
+ void kvm_hv_setup_tsc_page(struct kvm *kvm,
+ 			   struct pvclock_vcpu_time_info *hv_clock);
+ 
++void kvm_hv_xsaves_xsavec_maybe_warn(struct kvm_vcpu *vcpu);
+ void kvm_hv_init_vm(struct kvm *kvm);
+ void kvm_hv_destroy_vm(struct kvm *kvm);
+ int kvm_vm_ioctl_hv_eventfd(struct kvm *kvm, struct kvm_hyperv_eventfd *args);
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -1211,6 +1211,10 @@ static int set_efer(struct kvm_vcpu *vcp
+ 	if ((efer ^ old_efer) & EFER_NX)
+ 		kvm_mmu_reset_context(vcpu);
+ 
++	if (!static_cpu_has(X86_FEATURE_XSAVES) &&
++	    (efer & EFER_SVME))
++		kvm_hv_xsaves_xsavec_maybe_warn(vcpu);
++
+ 	return 0;
+ }
+ 
