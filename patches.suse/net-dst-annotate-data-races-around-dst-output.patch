@@ -1,0 +1,66 @@
+From: Eric Dumazet <edumazet@google.com>
+Date: Mon, 30 Jun 2025 12:19:29 +0000
+Subject: net: dst: annotate data-races around dst->output
+Patch-mainline: v6.17-rc1
+Git-commit: 2dce8c52a98995c4719def6f88629ab1581c0b82
+References: CVE-2025-40074 bsc#1252794
+
+dst_dev_put() can overwrite dst->output while other
+cpus might read this field (for instance from dst_output())
+
+Add READ_ONCE()/WRITE_ONCE() annotations to suppress
+potential issues.
+
+We will likely need RCU protection in the future.
+
+Fixes: 4a6ce2b6f2ec ("net: introduce a new function dst_dev_put()")
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Reviewed-by: Kuniyuki Iwashima <kuniyu@google.com>
+Link: https://patch.msgid.link/20250630121934.3399505-6-edumazet@google.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Michal Kubecek <mkubecek@suse.cz>
+
+---
+ include/net/dst.h | 5 ++++-
+ net/core/dst.c    | 2 +-
+ net/ipv4/route.c  | 4 ++--
+ 3 files changed, 7 insertions(+), 4 deletions(-)
+
+--- a/include/net/dst.h
++++ b/include/net/dst.h
+@@ -468,7 +468,10 @@ static inline void dst_set_expires(struct dst_entry *dst, int timeout)
+ /* Output packet to network from transport.  */
+ static inline int dst_output(struct net *net, struct sock *sk, struct sk_buff *skb)
+ {
+-	return skb_dst(skb)->output(net, sk, skb);
++	int (*skb_output)(struct net *net, struct sock *sk, struct sk_buff *skb);
++
++	skb_output = READ_ONCE(skb_dst(skb)->output);
++	return skb_output(net, sk, skb);
+ }
+ 
+ /* Input packet from network to transport.  */
+--- a/net/core/dst.c
++++ b/net/core/dst.c
+@@ -163,7 +163,7 @@ void dst_dev_put(struct dst_entry *dst)
+ 	if (dst->ops->ifdown)
+ 		dst->ops->ifdown(dst, dev, true);
+ 	WRITE_ONCE(dst->input, dst_discard);
+-	dst->output = dst_discard_out;
++	WRITE_ONCE(dst->output, dst_discard_out);
+ 	dst->dev = dev_net(dst->dev)->loopback_dev;
+ 	dev_hold(dst->dev);
+ 	dev_put(dev);
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@ -1723,8 +1723,8 @@ static void ip_handle_martian_source(struct net_device *dev,
+ static void set_lwt_redirect(struct rtable *rth)
+ {
+ 	if (lwtunnel_output_redirect(rth->dst.lwtstate)) {
+-		rth->dst.lwtstate->orig_output = rth->dst.output;
+-		rth->dst.output = lwtunnel_output;
++		rth->dst.lwtstate->orig_output = READ_ONCE(rth->dst.output);
++		WRITE_ONCE(rth->dst.output, lwtunnel_output);
+ 	}
+ 
+ 	if (lwtunnel_input_redirect(rth->dst.lwtstate)) {
