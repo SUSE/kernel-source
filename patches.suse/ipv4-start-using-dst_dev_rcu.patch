@@ -1,0 +1,131 @@
+From: Eric Dumazet <edumazet@google.com>
+Date: Thu, 28 Aug 2025 19:58:23 +0000
+Subject: ipv4: start using dst_dev_rcu()
+Patch-mainline: v6.18-rc1
+Git-commit: 6ad8de3cefdb6ffa6708b21c567df0dbf82c43a8
+References: CVE-2025-40074 bsc#1252794
+
+Change icmpv4_xrlim_allow(), ip_defrag() to prevent possible UAF.
+
+Change ipmr_prepare_xmit(), ipmr_queue_fwd_xmit(), ip_mr_output(),
+ipv4_neigh_lookup() to use lockdep enabled dst_dev_rcu().
+
+Fixes: 4a6ce2b6f2ec ("net: introduce a new function dst_dev_put()")
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Reviewed-by: David Ahern <dsahern@kernel.org>
+Link: https://patch.msgid.link/20250828195823.3958522-9-edumazet@google.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Michal Kubecek <mkubecek@suse.cz>
+
+---
+ net/ipv4/icmp.c        |  4 +++-
+ net/ipv4/ip_fragment.c |  9 +++++++--
+ net/ipv4/ipmr.c        |  4 ++--
+ net/ipv4/route.c       | 12 ++++++++----
+ 4 files changed, 20 insertions(+), 9 deletions(-)
+
+--- a/net/ipv4/icmp.c
++++ b/net/ipv4/icmp.c
+@@ -346,7 +346,8 @@ static bool icmpv4_xrlim_allow(struct net *net, struct rtable *rt,
+ 		return true;
+ 
+ 	/* No rate limit on loopback */
+-	dev = dst_dev(dst);
++	rcu_read_lock();
++	dev = dst_dev_rcu(dst);
+ 	if (dev && (dev->flags & IFF_LOOPBACK))
+ 		goto out;
+ 
+@@ -359,6 +360,7 @@ static bool icmpv4_xrlim_allow(struct net *net, struct rtable *rt,
+ out:
+  	if (rc)
+ 		icmp_global_consume();
++	rcu_read_unlock();
+ 	return rc;
+ }
+ 
+--- a/net/ipv4/ip_fragment.c
++++ b/net/ipv4/ip_fragment.c
+@@ -468,13 +468,16 @@ static int ip_frag_reasm(struct ipq *qp, struct sk_buff *skb,
+ /* Process an incoming IP datagram fragment. */
+ int ip_defrag(struct net *net, struct sk_buff *skb, u32 user)
+ {
+-	struct net_device *dev = skb->dev ? : skb_dst_dev(skb);
+-	int vif = l3mdev_master_ifindex_rcu(dev);
++	struct net_device *dev;
+ 	struct ipq *qp;
++	int vif;
+ 
+ 	__IP_INC_STATS(net, IPSTATS_MIB_REASMREQDS);
+ 
+ 	/* Lookup (or create) queue header */
++	rcu_read_lock();
++	dev = skb->dev ? : skb_dst_dev_rcu(skb);
++	vif = l3mdev_master_ifindex_rcu(dev);
+ 	qp = ip_find(net, ip_hdr(skb), user, vif);
+ 	if (qp) {
+ 		int ret;
+@@ -484,9 +487,11 @@ int ip_defrag(struct net *net, struct sk_buff *skb, u32 user)
+ 		ret = ip_frag_queue(qp, skb);
+ 
+ 		spin_unlock(&qp->q.lock);
++		rcu_read_unlock();
+ 		ipq_put(qp);
+ 		return ret;
+ 	}
++	rcu_read_unlock();
+ 
+ 	__IP_INC_STATS(net, IPSTATS_MIB_REASMFAILS);
+ 	kfree_skb(skb);
+--- a/net/ipv4/ipmr.c
++++ b/net/ipv4/ipmr.c
+@@ -1907,7 +1907,7 @@ static void ipmr_queue_xmit(struct net *net, struct mr_table *mrt,
+ 		goto out_free;
+ 	}
+ 
+-	encap += LL_RESERVED_SPACE(rt->dst.dev) + rt->dst.header_len;
++	encap += LL_RESERVED_SPACE(dst_dev_rcu(&rt->dst)) + rt->dst.header_len;
+ 
+ 	if (skb_cow(skb, encap)) {
+ 		ip_rt_put(rt);
+@@ -1944,7 +1944,7 @@ static void ipmr_queue_xmit(struct net *net, struct mr_table *mrt,
+ 	 * result in receiving multiple packets.
+ 	 */
+ 	NF_HOOK(NFPROTO_IPV4, NF_INET_FORWARD,
+-		net, NULL, skb, skb->dev, rt->dst.dev,
++		net, NULL, skb, skb->dev, dst_dev_rcu(&rt->dst),
+ 		ipmr_forward_finish);
+ 	return;
+ 
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@ -455,11 +455,13 @@ static struct neighbour *ipv4_neigh_lookup(const struct dst_entry *dst,
+ 					   struct sk_buff *skb,
+ 					   const void *daddr)
+ {
+-	struct net_device *dev = dst_dev(dst);
++	struct net_device *dev;
+ 	const __be32 *pkey = daddr;
+ 	const struct rtable *rt;
+ 	struct neighbour *n;
+ 
++	rcu_read_lock_bh();
++	dev = dst_dev_rcu(dst);
+ 	rt = (const struct rtable *) dst;
+ 	if (rt->rt_gateway)
+ 		pkey = (const __be32 *) &rt->rt_gateway;
+@@ -467,9 +469,11 @@ static struct neighbour *ipv4_neigh_lookup(const struct dst_entry *dst,
+ 		pkey = &ip_hdr(skb)->daddr;
+ 
+ 	n = __ipv4_neigh_lookup(dev, *(__force u32 *)pkey);
+-	if (n)
+-		return n;
+-	return neigh_create(&arp_tbl, pkey, dev);
++	if (!n)
++		n = neigh_create(&arp_tbl, pkey, dev);
++	rcu_read_unlock_bh();
++
++	return n;
+ }
+ 
+ static void ipv4_confirm_neigh(const struct dst_entry *dst, const void *daddr)
