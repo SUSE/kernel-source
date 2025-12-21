@@ -1,0 +1,113 @@
+From: Eric Dumazet <edumazet@google.com>
+Date: Thu, 28 Aug 2025 19:58:20 +0000
+Subject: net: use dst_dev_rcu() in sk_setup_caps()
+Patch-mainline: v6.18-rc1
+Git-commit: 99a2ace61b211b0be861b07fbaa062fca4b58879
+References: CVE-2025-40170 bsc#1253413
+
+Use RCU to protect accesses to dst->dev from sk_setup_caps()
+and sk_dst_gso_max_size().
+
+Also use dst_dev_rcu() in ip6_dst_mtu_maybe_forward(),
+and ip_dst_mtu_maybe_forward().
+
+ip4_dst_hoplimit() can use dst_dev_net_rcu().
+
+SLE12-SP5: part patching ip6_dst_mtu_maybe_forward() is applied to
+ip6_dst_mtu_forward() in net/ipv6/ip6_output.c
+
+Fixes: 4a6ce2b6f2ec ("net: introduce a new function dst_dev_put()")
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Reviewed-by: David Ahern <dsahern@kernel.org>
+Link: https://patch.msgid.link/20250828195823.3958522-6-edumazet@google.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Michal Kubecek <mkubecek@suse.cz>
+
+---
+ include/net/ip.h      |  6 ++++--
+ include/net/route.h   |  2 +-
+ net/core/sock.c       | 10 +++++++---
+ net/ipv6/ip6_output.c |  2 +-
+ 4 files changed, 13 insertions(+), 7 deletions(-)
+
+--- a/include/net/ip.h
++++ b/include/net/ip.h
+@@ -359,12 +359,14 @@ static inline unsigned int ip_dst_mtu_maybe_forward(const struct dst_entry *dst,
+ 						    bool forwarding)
+ {
+ 	const struct rtable *rt = container_of(dst, struct rtable, dst);
++	const struct net_device *dev;
+ 	unsigned int mtu, res;
+ 	struct net *net;
+ 
+ 	rcu_read_lock();
+ 
+-	net = dev_net_rcu(dst_dev(dst));
++	dev = dst_dev_rcu(dst);
++	net = dev_net_rcu(dev);
+ 	if (READ_ONCE(net->ipv4.sysctl_ip_fwd_use_pmtu) ||
+ 	    ip_mtu_locked(dst) ||
+ 	    !forwarding) {
+@@ -378,7 +380,7 @@ static inline unsigned int ip_dst_mtu_maybe_forward(const struct dst_entry *dst,
+ 	if (mtu)
+ 		goto out;
+ 
+-	mtu = READ_ONCE(dst_dev(dst)->mtu);
++	mtu = READ_ONCE(dev->mtu);
+ 
+ 	if (unlikely(ip_mtu_locked(dst))) {
+ 		if (rt->rt_uses_gateway && mtu > 576)
+--- a/include/net/route.h
++++ b/include/net/route.h
+@@ -341,7 +341,7 @@ static inline int ip4_dst_hoplimit(const struct dst_entry *dst)
+ 		const struct net *net;
+ 
+ 		rcu_read_lock();
+-		net = dev_net_rcu(dst_dev(dst));
++		net = dst_dev_net_rcu(dst);
+ 		hoplimit = READ_ONCE(net->ipv4.sysctl_ip_default_ttl);
+ 		rcu_read_unlock();
+ 	}
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@ -1702,9 +1702,12 @@ EXPORT_SYMBOL_GPL(sk_free_unlock_clone);
+ 
+ void sk_setup_caps(struct sock *sk, struct dst_entry *dst)
+ {
++	const struct net_device *dev;
+ 	u32 max_segs = 1;
+ 
+-	sk->sk_route_caps = dst_dev(dst)->features;
++	rcu_read_lock();
++	dev = dst_dev_rcu(dst);
++	sk->sk_route_caps = dev->features;
+ 	if (sk->sk_route_caps & NETIF_F_GSO)
+ 		sk->sk_route_caps |= NETIF_F_GSO_SOFTWARE;
+ 	sk->sk_route_caps &= ~sk->sk_route_nocaps;
+@@ -1713,12 +1716,13 @@ void sk_setup_caps(struct sock *sk, struct dst_entry *dst)
+ 			sk->sk_route_caps &= ~NETIF_F_GSO_MASK;
+ 		} else {
+ 			sk->sk_route_caps |= NETIF_F_SG | NETIF_F_HW_CSUM;
+-			sk->sk_gso_max_size = dst_dev(dst)->gso_max_size;
+-			max_segs = max_t(u32, dst_dev(dst)->gso_max_segs, 1);
++			sk->sk_gso_max_size = dev->gso_max_size;
++			max_segs = max_t(u32, dev->gso_max_segs, 1);
+ 		}
+ 	}
+ 	sk->sk_gso_max_segs = max_segs;
+ 	sk_dst_set(sk, dst);
++	rcu_read_unlock();
+ }
+ EXPORT_SYMBOL_GPL(sk_setup_caps);
+ 
+--- a/net/ipv6/ip6_output.c
++++ b/net/ipv6/ip6_output.c
+@@ -410,7 +410,7 @@ static unsigned int ip6_dst_mtu_forward(const struct dst_entry *dst)
+ 
+ 	mtu = IPV6_MIN_MTU;
+ 	rcu_read_lock();
+-	idev = __in6_dev_get(dst_dev(dst));
++	idev = __in6_dev_get(dst_dev_rcu(dst));
+ 	if (idev)
+ 		mtu = idev->cnf.mtu6;
+ 	rcu_read_unlock();
