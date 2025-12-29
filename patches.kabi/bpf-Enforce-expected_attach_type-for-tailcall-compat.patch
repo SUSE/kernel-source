@@ -1,0 +1,114 @@
+From: Hoyeon Lee <hoyeon.lee@suse.com>
+Date: Mon Dec 29 08:42:44 AM UTC 2025
+Subject: kABI workaround for bpf: Enforce expected_attach_type for tailcall compatibility
+Patch-mainline: Never, kabi workaround
+References: CVE-2025-40123 bsc#1253365
+
+Backport of upstream commit 4540aed51b12 ("bpf: Enforce expected_attach_type
+for tailcall compatibility") break kABI by introducing a 'enum bpf_attach_type
+expected_attach_type' field into 'struct bpf_map.owner'. Unlike with the
+SL-16.0 or fixes/linux-6.4 approach, SLE12-SP5 kernel predates back significantly,
+and there is no sufficient hole within 'struct bpf_array_aux.owner' (where owner
+originally resided).
+
+Instead, we could use the cacheline padding within bpf_map, which is enough for
+the enum bpf_attach_type. So here simply wraps the new field in __GENKSYMS__,
+and use suse_kabi_static_assert() to ensure there whether new field is kept intact
+within cacheline padding.
+
+Signed-off-by: Hoyeon Lee <hoyeon.lee@suse.com>
+Reviewed-by: Shung-Hsi Yu <shung-hsi.yu@suse.com>
+---
+ include/linux/bpf.h |   40 +++++++++++++++++++++++++++++++++++++++-
+ kernel/bpf/core.c   |    4 ++--
+ 2 files changed, 41 insertions(+), 3 deletions(-)
+
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -16,6 +16,7 @@
+ #include <linux/rbtree_latch.h>
+ #include <linux/numa.h>
+ #include <linux/wait.h>
++#include <linux/build_bug.h>
+ 
+ struct bpf_verifier_env;
+ struct perf_event;
+@@ -75,6 +76,42 @@ struct bpf_map {
+ 	struct btf *btf;
+ 	bool unpriv_array;
+ 	/* 55 bytes hole */
++#ifndef __GENKSYMS__
++	enum bpf_attach_type owner_expected_attach_type;
++#endif
++
++	/* The 3rd and 4th cacheline with misc members to avoid false sharing
++	 * particularly with refcounting.
++	 */
++	struct user_struct *user ____cacheline_aligned;
++	atomic_t refcnt;
++	atomic_t usercnt;
++	struct work_struct work;
++	char name[BPF_OBJ_NAME_LEN];
++};
++
++struct __orig_bpf_map {
++	/* The first two cachelines with read-mostly members of which some
++	 * are also accessed in fast-path (e.g. ops, max_entries).
++	 */
++	const struct bpf_map_ops *ops ____cacheline_aligned;
++	struct bpf_map *inner_map_meta;
++#ifdef CONFIG_SECURITY
++	void *security;
++#endif
++	enum bpf_map_type map_type;
++	u32 key_size;
++	u32 value_size;
++	u32 max_entries;
++	u32 map_flags;
++	u32 pages;
++	u32 id;
++	int numa_node;
++	u32 btf_key_type_id;
++	u32 btf_value_type_id;
++	struct btf *btf;
++	bool unpriv_array;
++	/* 55 bytes hole */
+ 
+ 	/* The 3rd and 4th cacheline with misc members to avoid false sharing
+ 	 * particularly with refcounting.
+@@ -86,6 +123,8 @@ struct bpf_map {
+ 	char name[BPF_OBJ_NAME_LEN];
+ };
+ 
++suse_kabi_static_assert(offsetof(struct bpf_map, user) == offsetof(struct __orig_bpf_map, user));
++
+ struct bpf_offload_dev;
+ struct bpf_offloaded_map;
+ 
+@@ -304,7 +343,6 @@ struct bpf_array_aux {
+ 		spinlock_t lock;
+ 		enum bpf_prog_type type;
+ 		bool jited;
+-		enum bpf_attach_type expected_attach_type;
+ 	} owner;
+ };
+ 
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -1519,14 +1519,14 @@ bool bpf_prog_array_compatible(struct bp
+ 		 */
+ 		array->aux->owner.type  = fp->type;
+ 		array->aux->owner.jited = fp->jited;
+-		array->aux->owner.expected_attach_type = fp->expected_attach_type;
++		array->map.owner_expected_attach_type = fp->expected_attach_type;
+ 		ret = true;
+ 	} else {
+ 		ret = array->aux->owner.type  == fp->type &&
+ 		      array->aux->owner.jited == fp->jited;
+ 		if (ret &&
+ 		    array->map.map_type == BPF_MAP_TYPE_PROG_ARRAY &&
+-		    array->aux->owner.expected_attach_type != fp->expected_attach_type)
++		    array->map.owner_expected_attach_type != fp->expected_attach_type)
+ 			ret = false;
+ 	}
+ 
