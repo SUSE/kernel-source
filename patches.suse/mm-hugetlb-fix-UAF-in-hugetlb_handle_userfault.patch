@@ -1,0 +1,107 @@
+From 958f32ce832ba781ac20e11bb2d12a9352ea28fc Mon Sep 17 00:00:00 2001
+From: Liu Shixin <liushixin2@huawei.com>
+Date: Fri, 23 Sep 2022 12:21:13 +0800
+Subject: [PATCH] mm: hugetlb: fix UAF in hugetlb_handle_userfault
+References: CVE-2022-50630 bsc#1254785
+Git-commit: 958f32ce832ba781ac20e11bb2d12a9352ea28fc
+Patch-mainline: v6.1-rc1
+
+The vma_lock and hugetlb_fault_mutex are dropped before handling userfault
+and reacquire them again after handle_userfault(), but reacquire the
+vma_lock could lead to UAF[1,2] due to the following race,
+
+hugetlb_fault
+  hugetlb_no_page
+    /*unlock vma_lock */
+    hugetlb_handle_userfault
+      handle_userfault
+        /* unlock mm->mmap_lock*/
+                                           vm_mmap_pgoff
+                                             do_mmap
+                                               mmap_region
+                                                 munmap_vma_range
+                                                   /* clean old vma */
+        /* lock vma_lock again  <--- UAF */
+    /* unlock vma_lock */
+
+Since the vma_lock will unlock immediately after
+hugetlb_handle_userfault(), let's drop the unneeded lock and unlock in
+hugetlb_handle_userfault() to fix the issue.
+
+[1] https://lore.kernel.org/linux-mm/000000000000d5e00a05e834962e@google.com/
+[2] https://lore.kernel.org/linux-mm/20220921014457.1668-1-liuzixian4@huawei.com/
+Link: https://lkml.kernel.org/r/20220923042113.137273-1-liushixin2@huawei.com
+Fixes: 1a1aad8a9b7b ("userfaultfd: hugetlbfs: add userfaultfd hugetlb hook")
+Signed-off-by: Liu Shixin <liushixin2@huawei.com>
+Signed-off-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Reported-by: syzbot+193f9cee8638750b23cf@syzkaller.appspotmail.com
+Reported-by: Liu Zixian <liuzixian4@huawei.com>
+Reviewed-by: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: Muchun Song <songmuchun@bytedance.com>
+Cc: Sidhartha Kumar <sidhartha.kumar@oracle.com>
+Cc: <stable@vger.kernel.org>    [4.14+]
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Oscar Salvador <osalvador@suse.de>
+---
+ mm/hugetlb.c | 14 +++++++-------
+ 1 file changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index 0905d6ba4f16f..a86532723d2dd 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -3780,6 +3780,8 @@ static int hugetlb_no_page(struct mm_struct *mm, struct vm_area_struct *vma,
+ 	struct page *page;
+ 	pte_t new_pte;
+ 	spinlock_t *ptl;
++	u32 hash = hugetlb_fault_mutex_hash(h, mm, vma, mapping,
++							idx, address);
+ 
+ 	/*
+ 	 * Currently, we are forced to kill the process in the event the
+@@ -3789,7 +3791,7 @@ static int hugetlb_no_page(struct mm_struct *mm, struct vm_area_struct *vma,
+ 	if (is_vma_resv_set(vma, HPAGE_RESV_UNMAPPED)) {
+ 		pr_warn_ratelimited("PID %d killed due to inadequate hugepage pool\n",
+ 			   current->pid);
+-		return ret;
++		goto out;
+ 	}
+ 
+ 	/*
+@@ -3807,7 +3809,6 @@ static int hugetlb_no_page(struct mm_struct *mm, struct vm_area_struct *vma,
+ 		 * Check for page in userfault range
+ 		 */
+ 		if (userfaultfd_missing(vma)) {
+-			u32 hash;
+ 			struct vm_fault vmf = {
+ 				.vma = vma,
+ 				.address = address,
+@@ -3826,12 +3827,9 @@ static int hugetlb_no_page(struct mm_struct *mm, struct vm_area_struct *vma,
+ 			 * handling userfault.  Reacquire after handling
+ 			 * fault to make calling code simpler.
+ 			 */
+-			hash = hugetlb_fault_mutex_hash(h, mm, vma, mapping,
+-							idx, address);
+ 			mutex_unlock(&hugetlb_fault_mutex_table[hash]);
+-			ret = handle_userfault(&vmf, VM_UFFD_MISSING);
+-			mutex_lock(&hugetlb_fault_mutex_table[hash]);
+-			goto out;
++			i_mmap_unlock_read(mapping);
++			return handle_userfault(&vmf, VM_UFFD_MISSING);
+ 		}
+ 
+ 		page = alloc_huge_page(vma, address, 0);
+@@ -3918,6 +3916,8 @@ static int hugetlb_no_page(struct mm_struct *mm, struct vm_area_struct *vma,
+ 	spin_unlock(ptl);
+ 	unlock_page(page);
+ out:
++	mutex_unlock(&hugetlb_fault_mutex_table[hash]);
++	i_mmap_unlock_read(mapping);
+ 	return ret;
+ 
+ backout:
+-- 
+2.52.0
+
