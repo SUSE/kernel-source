@@ -1,0 +1,81 @@
+From 38431d5747cb4b0d6fb438985f153a4d3fc8c3c2 Mon Sep 17 00:00:00 2001
+From: Harish Kasiviswanathan <Harish.Kasiviswanathan@amd.com>
+Date: Fri, 26 Jan 2018 15:36:06 -0500
+Subject: drm/amdgpu: Remove explicit wait after VM validate
+Git-commit: 9130cc01d1fda46009529d04303c6ed958d9e3d1
+Patch-mainline: v5.0-rc1
+References: bsc#1255428
+
+PD or PT might have to be moved during validation and this move has to be
+completed before updating it. If page table updates are done using SDMA
+then this serializing is done by SDMA command submission.
+
+And if PD/PT updates are done by CPU, then explicit waiting for PD/PT
+updates are done in amdgpu VM amdgpu_vm_wait_pd function.
+
+Sync to PD BO moving fence to handle corner case where none of the PTs
+are updated but PD is evicted.
+
+Signed-off-by: Harish Kasiviswanathan <Harish.Kasiviswanathan@amd.com>
+Reviewed-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Acked-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+(cherry picked from commit 9130cc01d1fda46009529d04303c6ed958d9e3d1)
+Acked-by: Thomas Zimmermann <tzimmermann@suse.com>
+---
+ .../gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c  | 31 ++++++++++++++-----
+ 1 file changed, 24 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+index 370bdf5087291..2c45a362257f8 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+@@ -906,6 +906,26 @@ static int process_validate_vms(struct amdkfd_process_info *process_info)
+ 	return 0;
+ }
+ 
++static int process_sync_pds_resv(struct amdkfd_process_info *process_info,
++				 struct amdgpu_sync *sync)
++{
++	struct amdgpu_vm *peer_vm;
++	int ret;
++
++	list_for_each_entry(peer_vm, &process_info->vm_list_head,
++			    vm_list_node) {
++		struct amdgpu_bo *pd = peer_vm->root.base.bo;
++
++		ret = amdgpu_sync_resv(amdgpu_ttm_adev(pd->tbo.bdev),
++					sync, pd->tbo.resv,
++					AMDGPU_FENCE_OWNER_UNDEFINED, false);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
+ static int process_update_pds(struct amdkfd_process_info *process_info,
+ 			      struct amdgpu_sync *sync)
+ {
+@@ -2026,13 +2046,10 @@ int amdgpu_amdkfd_gpuvm_restore_process_bos(void *info, struct dma_fence **ef)
+ 	if (ret)
+ 		goto validate_map_fail;
+ 
+-	/* Wait for PD/PTs validate to finish */
+-	/* FIXME: I think this isn't needed */
+-	list_for_each_entry(peer_vm, &process_info->vm_list_head,
+-			    vm_list_node) {
+-		struct amdgpu_bo *bo = peer_vm->root.base.bo;
+-
+-		ttm_bo_wait(&bo->tbo, false, false);
++	ret = process_sync_pds_resv(process_info, &sync_obj);
++	if (ret) {
++		pr_debug("Memory eviction: Failed to sync to PD BO moving fence. Try again\n");
++		goto validate_map_fail;
+ 	}
+ 
+ 	/* Validate BOs and map them to GPUVM (update VM page tables). */
+-- 
+2.52.0
+
