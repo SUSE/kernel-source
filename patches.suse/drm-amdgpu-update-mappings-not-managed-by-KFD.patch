@@ -1,0 +1,79 @@
+From 9f4a86ed454d81a88fb2e71291e07c789be4856f Mon Sep 17 00:00:00 2001
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Wed, 16 Mar 2022 18:46:56 -0400
+Subject: drm/amdgpu: update mappings not managed by KFD
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: e6ed364efae39455cb1d6b1895a1d31599608a2b
+Patch-mainline: v6.8-rc1
+References: bsc#1255428
+
+When restoring after an eviction, use amdgpu_vm_handle_moved to update
+BO VA mappings in KFD VMs that are not managed through the KFD API. This
+should allow using the render node API to create more flexible memory
+mappings in KFD VMs.
+
+v2: rebase on drm_exec changes (Alex)
+
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Acked-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+(cherry picked from commit e6ed364efae39455cb1d6b1895a1d31599608a2b)
+Acked-by: Thomas Zimmermann <tzimmermann@suse.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c |   29 ++++++++++++++++++-----
+ 1 file changed, 23 insertions(+), 6 deletions(-)
+
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+@@ -2046,12 +2046,6 @@ int amdgpu_amdkfd_gpuvm_restore_process_
+ 	if (ret)
+ 		goto validate_map_fail;
+ 
+-	ret = process_sync_pds_resv(process_info, &sync_obj);
+-	if (ret) {
+-		pr_debug("Memory eviction: Failed to sync to PD BO moving fence. Try again\n");
+-		goto validate_map_fail;
+-	}
+-
+ 	/* Validate BOs and map them to GPUVM (update VM page tables). */
+ 	list_for_each_entry(mem, &process_info->kfd_bo_list,
+ 			    validate_list.head) {
+@@ -2079,6 +2073,19 @@ int amdgpu_amdkfd_gpuvm_restore_process_
+ 		}
+ 	}
+ 
++	/* Update mappings not managed by KFD */
++	list_for_each_entry(peer_vm, &process_info->vm_list_head,
++			vm_list_node) {
++		struct amdgpu_device *adev = amdgpu_ttm_adev(
++			peer_vm->root.base.bo->tbo.bdev);
++
++		ret = amdgpu_vm_handle_moved(adev, peer_vm);
++		if (ret) {
++			pr_debug("Memory eviction: handle moved failed. Try again\n");
++			goto validate_map_fail;
++		}
++	}
++
+ 	/* Update page directories */
+ 	ret = process_update_pds(process_info, &sync_obj);
+ 	if (ret) {
+@@ -2086,6 +2093,16 @@ int amdgpu_amdkfd_gpuvm_restore_process_
+ 		goto validate_map_fail;
+ 	}
+ 
++	/* Sync with fences on all the page tables. They implicitly depend on any
++	 * move fences from amdgpu_vm_handle_moved above.
++	 */
++	ret = process_sync_pds_resv(process_info, &sync_obj);
++	if (ret) {
++		pr_debug("Memory eviction: Failed to sync to PD BO moving fence. Try again\n");
++		goto validate_map_fail;
++	}
++
++	/* Wait for validate and PT updates to finish */
+ 	amdgpu_sync_wait(&sync_obj, false);
+ 
+ 	/* Release old eviction fence and create new one, because fence only
