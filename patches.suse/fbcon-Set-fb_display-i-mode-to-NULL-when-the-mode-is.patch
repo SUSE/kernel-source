@@ -1,0 +1,136 @@
+From c6bcdf829e7e7f551fbd31b154791f6acc090cc5 Mon Sep 17 00:00:00 2001
+From: Quanmin Yan <yanquanmin1@huawei.com>
+Date: Fri, 10 Oct 2025 16:16:59 +0800
+Subject: fbcon: Set fb_display[i]->mode to NULL when the mode is released
+Git-commit: a1f3058930745d2b938b6b4f5bd9630dc74b26b7
+Patch-mainline: v6.18-rc4
+References: bsc#1255094 CVE-2025-40323
+
+Recently, we discovered the following issue through syzkaller:
+
+BUG: KASAN: slab-use-after-free in fb_mode_is_equal+0x285/0x2f0
+Read of size 4 at addr ff11000001b3c69c by task syz.xxx
+...
+Call Trace:
+ <TASK>
+ dump_stack_lvl+0xab/0xe0
+ print_address_description.constprop.0+0x2c/0x390
+ print_report+0xb9/0x280
+ kasan_report+0xb8/0xf0
+ fb_mode_is_equal+0x285/0x2f0
+ fbcon_mode_deleted+0x129/0x180
+ fb_set_var+0xe7f/0x11d0
+ do_fb_ioctl+0x6a0/0x750
+ fb_ioctl+0xe0/0x140
+ __x64_sys_ioctl+0x193/0x210
+ do_syscall_64+0x5f/0x9c0
+ entry_SYSCALL_64_after_hwframe+0x76/0x7e
+
+Based on experimentation and analysis, during framebuffer unregistration,
+only the memory of fb_info->modelist is freed, without setting the
+corresponding fb_display[i]->mode to NULL for the freed modes. This leads
+to UAF issues during subsequent accesses. Here's an example of reproduction
+steps:
+1. With /dev/fb0 already registered in the system, load a kernel module
+   to register a new device /dev/fb1;
+2. Set fb1's mode to the global fb_display[] array (via FBIOPUT_CON2FBMAP);
+3. Switch console from fb to VGA (to allow normal rmmod of the ko);
+4. Unload the kernel module, at this point fb1's modelist is freed, leaving
+   a wild pointer in fb_display[];
+5. Trigger the bug via system calls through fb0 attempting to delete a mode
+   from fb0.
+
+Add a check in do_unregister_framebuffer(): if the mode to be freed exists
+in fb_display[], set the corresponding mode pointer to NULL.
+
+Backporting notes:
+
+Calling directly into fbcon from fbdev builds a cyclic dependency among
+the involved modules. Hence fbcon sets a pointer in fbdev for fbdev to call.
+
+Signed-off-by: Quanmin Yan <yanquanmin1@huawei.com>
+Reviewed-by: Thomas Zimmermann <tzimmermann@suse.de>
+Signed-off-by: Helge Deller <deller@gmx.de>
+Cc: stable@vger.kernel.org
+(cherry picked from commit a1f3058930745d2b938b6b4f5bd9630dc74b26b7)
+Acked-by: Thomas Zimmermann <tzimmermann@suse.com>
+---
+ drivers/video/console/fbcon.c    |   22 ++++++++++++++++++++++
+ drivers/video/fbdev/core/fbmem.c |    4 ++++
+ include/linux/fb.h               |    2 ++
+ 3 files changed, 28 insertions(+)
+
+--- a/drivers/video/console/fbcon.c
++++ b/drivers/video/console/fbcon.c
+@@ -2765,6 +2765,26 @@ static int fbcon_mode_deleted(struct fb_
+ 	return found;
+ }
+ 
++static void fbcon_delete_mode(struct fb_videomode *m)
++{
++	struct display *p;
++	int i;
++
++	for (i = first_fb_vc; i <= last_fb_vc; i++) {
++		p = &fb_display[i];
++		if (p->mode == m)
++			p->mode = NULL;
++	}
++}
++
++static void __fbcon_delete_modelist(struct list_head *head)
++{
++	struct fb_modelist *modelist;
++
++	list_for_each_entry(modelist, head, list)
++		fbcon_delete_mode(&modelist->mode);
++}
++
+ #ifdef CONFIG_VT_HW_CONSOLE_BINDING
+ static int fbcon_unbind(void)
+ {
+@@ -3384,6 +3404,7 @@ static int __init fb_console_init(void)
+ 	int i;
+ 
+ 	console_lock();
++	fbcon_delete_modelist = __fbcon_delete_modelist;
+ 	fb_register_client(&fbcon_event_notifier);
+ 	fbcon_device = device_create(fb_class, NULL, MKDEV(0, 0), NULL,
+ 				     "fbcon");
+@@ -3424,6 +3445,7 @@ static void __exit fb_console_exit(void)
+ {
+ 	console_lock();
+ 	fb_unregister_client(&fbcon_event_notifier);
++	fbcon_delete_modelist = NULL;
+ 	fbcon_deinit_device();
+ 	device_destroy(fb_class, MKDEV(0, 0));
+ 	fbcon_exit();
+--- a/drivers/video/fbdev/core/fbmem.c
++++ b/drivers/video/fbdev/core/fbmem.c
+@@ -36,6 +36,8 @@
+ 
+ #include <asm/fb.h>
+ 
++void (*fbcon_delete_modelist)(struct list_head *head) = NULL;
++EXPORT_SYMBOL(fbcon_delete_modelist);
+ 
+     /*
+      *  Frame buffer device initialization and setup routines
+@@ -1805,6 +1807,8 @@ static int do_unregister_framebuffer(str
+ 	if (fb_info->pixmap.addr &&
+ 	    (fb_info->pixmap.flags & FB_PIXMAP_DEFAULT))
+ 		kfree(fb_info->pixmap.addr);
++	if (fbcon_delete_modelist)
++		fbcon_delete_modelist(&fb_info->modelist);
+ 	fb_destroy_modelist(&fb_info->modelist);
+ 	registered_fb[fb_info->node] = NULL;
+ 	num_registered_fb--;
+--- a/include/linux/fb.h
++++ b/include/linux/fb.h
+@@ -841,4 +841,6 @@ extern int fb_find_mode(struct fb_var_sc
+ #define fb_dbg(fb_info, fmt, ...)					\
+ 	pr_debug("fb%d: " fmt, (fb_info)->node, ##__VA_ARGS__)
+ 
++extern void (*fbcon_delete_modelist)(struct list_head *head);
++
+ #endif /* _LINUX_FB_H */
