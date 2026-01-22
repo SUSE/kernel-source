@@ -1,0 +1,145 @@
+From: Sean Christopherson <seanjc@google.com>
+Date: Tue, 10 Jun 2025 15:57:18 -0700
+Subject: KVM: SVM: Add helpers for accessing MSR bitmap that don't rely on
+ offsets
+Patch-mainline: v6.17-rc1
+Git-commit: c38595ad69cef0898f31421e115e5176d29c14be
+References: jsc#PED-15123
+
+Add macro-built helpers for testing, setting, and clearing MSRPM entries
+without relying on precomputed offsets.  This sets the stage for eventually
+removing general KVM use of precomputed offsets, which are quite confusing
+and rather inefficient for the vast majority of KVM's usage.
+
+Outside of merging L0 and L1 bitmaps for nested SVM, using u32-indexed
+offsets and accesses is at best unnecessary, and at worst introduces extra
+operations to retrieve the individual bit from within the offset u32 value.
+And simply calling them "offsets" is very confusing, as the "unit" of the
+offset isn't immediately obvious.
+
+Use the new helpers in set_msr_interception_bitmap() and
+msr_write_intercepted() to verify the math and operations, but keep the
+existing offset-based logic in set_msr_interception_bitmap() to sanity
+check the "clear" and "set" operations.  Manipulating MSR interceptions
+isn't a hot path and no kernel release is ever expected to contain this
+specific version of set_msr_interception_bitmap() (it will be removed
+entirely in the near future).
+
+Link: https://lore.kernel.org/r/20250610225737.156318-14-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Acked-by: Carlos López <clopez@suse.de>
+---
+ arch/x86/kvm/svm/svm.c |   30 ++++++++++++++----------------
+ arch/x86/kvm/svm/svm.h |   44 ++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 58 insertions(+), 16 deletions(-)
+
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -797,11 +797,6 @@ static bool valid_msr_intercept(u32 inde
+ 
+ static bool msr_write_intercepted(struct kvm_vcpu *vcpu, u32 msr)
+ {
+-	u8 bit_write;
+-	unsigned long tmp;
+-	u32 offset;
+-	u32 *msrpm;
+-
+ 	/*
+ 	 * For non-nested case:
+ 	 * If the L01 MSR bitmap does not intercept the MSR, then we need to
+@@ -811,17 +806,10 @@ static bool msr_write_intercepted(struct
+ 	 * If the L02 MSR bitmap does not intercept the MSR, then we need to
+ 	 * save it.
+ 	 */
+-	msrpm = is_guest_mode(vcpu) ? to_svm(vcpu)->nested.msrpm:
+-				      to_svm(vcpu)->msrpm;
+-
+-	offset    = svm_msrpm_offset(msr);
+-	if (KVM_BUG_ON(offset == MSR_INVALID, vcpu->kvm))
+-		return false;
++	void *msrpm = is_guest_mode(vcpu) ? to_svm(vcpu)->nested.msrpm :
++					    to_svm(vcpu)->msrpm;
+ 
+-	bit_write = 2 * (msr & 0x0f) + 1;
+-	tmp       = msrpm[offset];
+-
+-	return test_bit(bit_write, &tmp);
++	return svm_test_msr_bitmap_write(msrpm, msr);
+ }
+ 
+ static void set_msr_interception_bitmap(struct kvm_vcpu *vcpu, u32 *msrpm,
+@@ -856,7 +844,17 @@ static void set_msr_interception_bitmap(
+ 	read  ? __clear_bit(bit_read,  &tmp) : __set_bit(bit_read,  &tmp);
+ 	write ? __clear_bit(bit_write, &tmp) : __set_bit(bit_write, &tmp);
+ 
+-	msrpm[offset] = tmp;
++	if (read)
++		svm_clear_msr_bitmap_read((void *)msrpm, msr);
++	else
++		svm_set_msr_bitmap_read((void *)msrpm, msr);
++
++	if (write)
++		svm_clear_msr_bitmap_write((void *)msrpm, msr);
++	else
++		svm_set_msr_bitmap_write((void *)msrpm, msr);
++
++	WARN_ON_ONCE(msrpm[offset] != (u32)tmp);
+ 
+ 	svm_hv_vmcb_dirty_nested_enlightenments(vcpu);
+ 	svm->nested.force_msr_bitmap_recalc = true;
+--- a/arch/x86/kvm/svm/svm.h
++++ b/arch/x86/kvm/svm/svm.h
+@@ -595,9 +595,53 @@ static inline bool is_vnmi_enabled(struc
+ #define SVM_MSRS_PER_BYTE (BITS_PER_BYTE / SVM_BITS_PER_MSR)
+ #define SVM_MSRS_PER_RANGE (SVM_MSRPM_BYTES_PER_RANGE * SVM_MSRS_PER_BYTE)
+ static_assert(SVM_MSRS_PER_RANGE == 8192);
++#define SVM_MSRPM_OFFSET_MASK (SVM_MSRS_PER_RANGE - 1)
+ 
+ #define MSR_INVALID				0xffffffffU
+ 
++static __always_inline u32 svm_msrpm_bit_nr(u32 msr)
++{
++	int range_nr;
++
++	switch (msr & ~SVM_MSRPM_OFFSET_MASK) {
++	case 0:
++		range_nr = 0;
++		break;
++	case 0xc0000000:
++		range_nr = 1;
++		break;
++	case 0xc0010000:
++		range_nr = 2;
++		break;
++	default:
++		return MSR_INVALID;
++	}
++
++	return range_nr * SVM_MSRPM_BYTES_PER_RANGE * BITS_PER_BYTE +
++	       (msr & SVM_MSRPM_OFFSET_MASK) * SVM_BITS_PER_MSR;
++}
++
++#define __BUILD_SVM_MSR_BITMAP_HELPER(rtype, action, bitop, access, bit_rw)	\
++static inline rtype svm_##action##_msr_bitmap_##access(unsigned long *bitmap,	\
++						       u32 msr)			\
++{										\
++	u32 bit_nr;								\
++										\
++	bit_nr = svm_msrpm_bit_nr(msr);						\
++	if (bit_nr == MSR_INVALID)								\
++		return (rtype)true;						\
++										\
++	return bitop##_bit(bit_nr + bit_rw, bitmap);				\
++}
++
++#define BUILD_SVM_MSR_BITMAP_HELPERS(ret_type, action, bitop)			\
++	__BUILD_SVM_MSR_BITMAP_HELPER(ret_type, action, bitop, read,  0)	\
++	__BUILD_SVM_MSR_BITMAP_HELPER(ret_type, action, bitop, write, 1)
++
++BUILD_SVM_MSR_BITMAP_HELPERS(bool, test, test)
++BUILD_SVM_MSR_BITMAP_HELPERS(void, clear, __clear)
++BUILD_SVM_MSR_BITMAP_HELPERS(void, set, __set)
++
+ #define DEBUGCTL_RESERVED_BITS (~DEBUGCTLMSR_LBR)
+ 
+ /* svm.c */
