@@ -1,0 +1,157 @@
+From: Sean Christopherson <seanjc@google.com>
+Date: Tue, 10 Jun 2025 15:57:15 -0700
+Subject: KVM: nSVM: Use dedicated array of MSRPM offsets to merge L0 and L1
+ bitmaps
+Patch-mainline: v6.17-rc1
+Git-commit: 9b72c3d59f4245dd2d3fa19025e2789e85ce0f47
+References: jsc#PED-15123
+
+Use a dedicated array of MSRPM offsets to merge L0 and L1 bitmaps, i.e. to
+merge KVM's vmcb01 bitmap with L1's vmcb12 bitmap.  This will eventually
+allow for the removal of direct_access_msrs, as the only path where
+tracking the offsets is truly justified is the merge for nested SVM, where
+merging in chunks is an easy way to batch uaccess reads/writes.
+
+Opportunistically omit the x2APIC MSRs from the merge-specific array
+instead of filtering them out at runtime.
+
+Note, disabling interception of DEBUGCTL, XSS, EFER, PAT, GHCB, and
+TSC_AUX is mutually exclusive with nested virtualization, as KVM passes
+through those MSRs only for SEV-ES guests, and KVM doesn't support nested
+virtualization for SEV+ guests.  Defer removing those MSRs to a future
+cleanup in order to make this refactoring as benign as possible.
+
+Link: https://lore.kernel.org/r/20250610225737.156318-11-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Acked-by: Carlos López <clopez@suse.de>
+---
+ arch/x86/kvm/svm/nested.c |   83 +++++++++++++++++++++++++++++++++++++++-------
+ arch/x86/kvm/svm/svm.c    |    4 ++
+ arch/x86/kvm/svm/svm.h    |    2 +
+ 3 files changed, 78 insertions(+), 11 deletions(-)
+
+--- a/arch/x86/kvm/svm/nested.c
++++ b/arch/x86/kvm/svm/nested.c
+@@ -185,6 +185,75 @@ void recalc_intercepts(struct vcpu_svm *
+ }
+ 
+ /*
++ * This array (and its actual size) holds the set of offsets (indexing by chunk
++ * size) to process when merging vmcb12's MSRPM with vmcb01's MSRPM.  Note, the
++ * set of MSRs for which interception is disabled in vmcb01 is per-vCPU, e.g.
++ * based on CPUID features.  This array only tracks MSRs that *might* be passed
++ * through to the guest.
++ *
++ * Hardcode the capacity of the array based on the maximum number of _offsets_.
++ * MSRs are batched together, so there are fewer offsets than MSRs.
++ */
++static int nested_svm_msrpm_merge_offsets[9] __ro_after_init;
++static int nested_svm_nr_msrpm_merge_offsets __ro_after_init;
++
++int __init nested_svm_init_msrpm_merge_offsets(void)
++{
++	static const u32 merge_msrs[] __initconst = {
++		MSR_STAR,
++		MSR_IA32_SYSENTER_CS,
++		MSR_IA32_SYSENTER_EIP,
++		MSR_IA32_SYSENTER_ESP,
++	#ifdef CONFIG_X86_64
++		MSR_GS_BASE,
++		MSR_FS_BASE,
++		MSR_KERNEL_GS_BASE,
++		MSR_LSTAR,
++		MSR_CSTAR,
++		MSR_SYSCALL_MASK,
++	#endif
++		MSR_IA32_SPEC_CTRL,
++		MSR_IA32_PRED_CMD,
++		MSR_IA32_FLUSH_CMD,
++		MSR_IA32_LASTBRANCHFROMIP,
++		MSR_IA32_LASTBRANCHTOIP,
++		MSR_IA32_LASTINTFROMIP,
++		MSR_IA32_LASTINTTOIP,
++
++		MSR_IA32_DEBUGCTLMSR,
++		MSR_IA32_XSS,
++		MSR_EFER,
++		MSR_IA32_CR_PAT,
++		MSR_AMD64_SEV_ES_GHCB,
++		MSR_TSC_AUX,
++	};
++	int i, j;
++
++	for (i = 0; i < ARRAY_SIZE(merge_msrs); i++) {
++		u32 offset = svm_msrpm_offset(merge_msrs[i]);
++
++		if (WARN_ON(offset == MSR_INVALID))
++			return -EIO;
++
++		for (j = 0; j < nested_svm_nr_msrpm_merge_offsets; j++) {
++			if (nested_svm_msrpm_merge_offsets[j] == offset)
++				break;
++		}
++
++		if (j < nested_svm_nr_msrpm_merge_offsets)
++			continue;
++
++		if (WARN_ON(j >= ARRAY_SIZE(nested_svm_msrpm_merge_offsets)))
++			return -EIO;
++
++		nested_svm_msrpm_merge_offsets[j] = offset;
++		nested_svm_nr_msrpm_merge_offsets++;
++	}
++
++	return 0;
++}
++
++/*
+  * Merge L0's (KVM) and L1's (Nested VMCB) MSR permission bitmaps. The function
+  * is optimized in that it only merges the parts where KVM MSR permission bitmap
+  * may contain zero bits.
+@@ -216,19 +285,11 @@ static bool nested_svm_merge_msrpm(struc
+ 	if (!(vmcb12_is_intercept(&svm->nested.ctl, INTERCEPT_MSR_PROT)))
+ 		return true;
+ 
+-	for (i = 0; i < MSRPM_OFFSETS; i++) {
+-		u32 value, p;
++	for (i = 0; i < nested_svm_nr_msrpm_merge_offsets; i++) {
++		const int p = nested_svm_msrpm_merge_offsets[i];
++		u32 value;
+ 		u64 offset;
+ 
+-		if (msrpm_offsets[i] == 0xffffffff)
+-			break;
+-
+-		p      = msrpm_offsets[i];
+-
+-		/* x2apic msrs are intercepted always for the nested guest */
+-		if (is_x2apic_msrpm_offset(p))
+-			continue;
+-
+ 		offset = svm->nested.ctl.msrpm_base_pa + (p * 4);
+ 
+ 		if (kvm_vcpu_read_guest(vcpu, offset, &value, 4))
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -5469,6 +5469,10 @@ static __init int svm_hardware_setup(voi
+ 	if (nested) {
+ 		pr_info("Nested Virtualization enabled\n");
+ 		kvm_enable_efer_bits(EFER_SVME | EFER_LMSLE);
++
++		r = nested_svm_init_msrpm_merge_offsets();
++		if (r)
++			return r;
+ 	}
+ 
+ 	/*
+--- a/arch/x86/kvm/svm/svm.h
++++ b/arch/x86/kvm/svm/svm.h
+@@ -654,6 +654,8 @@ static inline bool nested_exit_on_nmi(st
+ 	return vmcb12_is_intercept(&svm->nested.ctl, INTERCEPT_NMI);
+ }
+ 
++int __init nested_svm_init_msrpm_merge_offsets(void);
++
+ int enter_svm_guest_mode(struct kvm_vcpu *vcpu,
+ 			 u64 vmcb_gpa, struct vmcb *vmcb12, bool from_vmrun);
+ void svm_leave_nested(struct kvm_vcpu *vcpu);
