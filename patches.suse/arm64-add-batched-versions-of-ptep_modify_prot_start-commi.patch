@@ -1,0 +1,130 @@
+From: Dev Jain <dev.jain@arm.com>
+Date: Fri, 18 Jul 2025 14:32:44 +0530
+Subject: arm64: add batched versions of ptep_modify_prot_start/commit
+Git-commit: 7efa1cd5f89b53e15659f84efb2c7a21076df04f
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13757
+
+Override the generic definition of modify_prot_start_ptes() to use
+get_and_clear_full_ptes().  This helper does a TLBI only for the starting
+and ending contpte block of the range, whereas the current implementation
+will call ptep_get_and_clear() for every contpte block, thus doing a TLBI
+on every contpte block.  Therefore, we have a performance win.
+
+The arm64 definition of pte_accessible() allows us to batch in the
+errata specific case:
+
+#define pte_accessible(mm, pte)	\
+	(mm_tlb_flush_pending(mm) ? pte_present(pte) : pte_valid(pte))
+
+All ptes are obviously present in the folio batch, and they are also valid.
+
+Override the generic definition of modify_prot_commit_ptes() to simply use
+set_ptes() to map the new ptes into the pagetable.
+
+Link: https://lkml.kernel.org/r/20250718090244.21092-8-dev.jain@arm.com
+Signed-off-by: Dev Jain <dev.jain@arm.com>
+Reviewed-by: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Anshuman Khandual <anshuman.khandual@arm.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Christophe Leroy <christophe.leroy@csgroup.eu>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Jann Horn <jannh@google.com>
+Cc: Joey Gouly <joey.gouly@arm.com>
+Cc: Kevin Brodsky <kevin.brodsky@arm.com>
+Cc: Lance Yang <ioworker0@gmail.com>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Will Deacon <will@kernel.org>
+Cc: Yang Shi <yang@os.amperecomputing.com>
+Cc: Yicong Yang <yangyicong@hisilicon.com>
+Cc: Zhenhua Huang <quic_zhenhuah@quicinc.com>
+Cc: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Acked-by: Ivan T. Ivanov <iivanov@suse.de>
+---
+ arch/arm64/include/asm/pgtable.h |   10 ++++++++++
+ arch/arm64/mm/mmu.c              |   28 +++++++++++++++++++++++-----
+ 2 files changed, 33 insertions(+), 5 deletions(-)
+
+--- a/arch/arm64/include/asm/pgtable.h
++++ b/arch/arm64/include/asm/pgtable.h
+@@ -1596,6 +1596,16 @@ extern void ptep_modify_prot_commit(stru
+ 				    unsigned long addr, pte_t *ptep,
+ 				    pte_t old_pte, pte_t new_pte);
+ 
++#define modify_prot_start_ptes modify_prot_start_ptes
++extern pte_t modify_prot_start_ptes(struct vm_area_struct *vma,
++				    unsigned long addr, pte_t *ptep,
++				    unsigned int nr);
++
++#define modify_prot_commit_ptes modify_prot_commit_ptes
++extern void modify_prot_commit_ptes(struct vm_area_struct *vma, unsigned long addr,
++				    pte_t *ptep, pte_t old_pte, pte_t pte,
++				    unsigned int nr);
++
+ #ifdef CONFIG_ARM64_CONTPTE
+ 
+ /*
+--- a/arch/arm64/mm/mmu.c
++++ b/arch/arm64/mm/mmu.c
+@@ -26,6 +26,7 @@
+ #include <linux/set_memory.h>
+ #include <linux/kfence.h>
+ #include <linux/pkeys.h>
++#include <linux/mm_inline.h>
+ 
+ #include <asm/barrier.h>
+ #include <asm/cputype.h>
+@@ -1524,24 +1525,41 @@ static int __init prevent_bootmem_remove
+ early_initcall(prevent_bootmem_remove_init);
+ #endif
+ 
+-pte_t ptep_modify_prot_start(struct vm_area_struct *vma, unsigned long addr, pte_t *ptep)
++pte_t modify_prot_start_ptes(struct vm_area_struct *vma, unsigned long addr,
++			     pte_t *ptep, unsigned int nr)
+ {
++	pte_t pte = get_and_clear_full_ptes(vma->vm_mm, addr, ptep, nr, /* full = */ 0);
++
+ 	if (alternative_has_cap_unlikely(ARM64_WORKAROUND_2645198)) {
+ 		/*
+ 		 * Break-before-make (BBM) is required for all user space mappings
+ 		 * when the permission changes from executable to non-executable
+ 		 * in cases where cpu is affected with errata #2645198.
+ 		 */
+-		if (pte_user_exec(ptep_get(ptep)))
+-			return ptep_clear_flush(vma, addr, ptep);
++		if (pte_accessible(vma->vm_mm, pte) && pte_user_exec(pte))
++			__flush_tlb_range(vma, addr, nr * PAGE_SIZE,
++					  PAGE_SIZE, true, 3);
+ 	}
+-	return ptep_get_and_clear(vma->vm_mm, addr, ptep);
++
++	return pte;
++}
++
++pte_t ptep_modify_prot_start(struct vm_area_struct *vma, unsigned long addr, pte_t *ptep)
++{
++	return modify_prot_start_ptes(vma, addr, ptep, 1);
++}
++
++void modify_prot_commit_ptes(struct vm_area_struct *vma, unsigned long addr,
++			     pte_t *ptep, pte_t old_pte, pte_t pte,
++			     unsigned int nr)
++{
++	set_ptes(vma->vm_mm, addr, ptep, pte, nr);
+ }
+ 
+ void ptep_modify_prot_commit(struct vm_area_struct *vma, unsigned long addr, pte_t *ptep,
+ 			     pte_t old_pte, pte_t pte)
+ {
+-	set_pte_at(vma->vm_mm, addr, ptep, pte);
++	modify_prot_commit_ptes(vma, addr, ptep, old_pte, pte, 1);
+ }
+ 
+ /*
