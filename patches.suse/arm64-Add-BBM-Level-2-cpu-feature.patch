@@ -1,0 +1,120 @@
+From: =?utf-8?q?Miko=C5=82aj_Lenczewski_=3Cmiko=2Elenczewski=40arm=2Ecom=3E?=
+Date: Wed, 25 Jun 2025 11:34:33 +0000
+Subject: arm64: Add BBM Level 2 cpu feature
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: 5aa4b625762e5a1caf2e43aa52e55b7b507783e2
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13757
+
+The Break-Before-Make cpu feature supports multiple levels (levels 0-2),
+and this commit adds a dedicated BBML2 cpufeature to test against
+support for.
+
+To support BBML2 in as wide a range of contexts as we can, we want not
+only the architectural guarantees that BBML2 makes, but additionally
+want BBML2 to not create TLB conflict aborts. Not causing aborts avoids
+us having to prove that no recursive faults can be induced in any path
+that uses BBML2, allowing its use for arbitrary kernel mappings.
+
+This feature builds on the previous ARM64_CPUCAP_EARLY_LOCAL_CPU_FEATURE,
+as all early cpus must support BBML2 for us to enable it (and any later
+cpus must also support it to be onlined).
+
+Not onlining late cpus that do not support BBML2 is unavoidable, as we
+might currently be using BBML2 semantics for kernel memory regions. This
+could cause faults in the late cpus, and would be difficult to unwind,
+so let us avoid the case altogether.
+
+Signed-off-by: Mikołaj Lenczewski <miko.lenczewski@arm.com>
+Reviewed-by: Catalin Marinas <catalin.marinas@arm.com>
+Reviewed-by: Suzuki K Poulose <suzuki.poulose@arm.com>
+Reviewed-by: Ryan Roberts <ryan.roberts@arm.com>
+Link: https://lore.kernel.org/r/20250625113435.26849-3-miko.lenczewski@arm.com
+Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+Acked-by: Ivan T. Ivanov <iivanov@suse.de>
+---
+ arch/arm64/include/asm/cpufeature.h |    5 ++++
+ arch/arm64/kernel/cpufeature.c      |   38 ++++++++++++++++++++++++++++++++++++
+ arch/arm64/tools/cpucaps            |    1 
+ 3 files changed, 44 insertions(+)
+
+--- a/arch/arm64/include/asm/cpufeature.h
++++ b/arch/arm64/include/asm/cpufeature.h
+@@ -878,6 +878,11 @@ static __always_inline bool system_suppo
+ 	return alternative_has_cap_unlikely(ARM64_MPAM_HCR);
+ }
+ 
++static inline bool system_supports_bbml2_noabort(void)
++{
++	return alternative_has_cap_unlikely(ARM64_HAS_BBML2_NOABORT);
++}
++
+ int do_emulate_mrs(struct pt_regs *regs, u32 sys_reg, u32 rt);
+ bool try_emulate_mrs(struct pt_regs *regs, u32 isn);
+ 
+--- a/arch/arm64/kernel/cpufeature.c
++++ b/arch/arm64/kernel/cpufeature.c
+@@ -2166,6 +2166,38 @@ static bool hvhe_possible(const struct a
+ 	return arm64_test_sw_feature_override(ARM64_SW_FEATURE_OVERRIDE_HVHE);
+ }
+ 
++static bool has_bbml2_noabort(const struct arm64_cpu_capabilities *caps, int scope)
++{
++	/*
++	 * We want to allow usage of BBML2 in as wide a range of kernel contexts
++	 * as possible. This list is therefore an allow-list of known-good
++	 * implementations that both support BBML2 and additionally, fulfill the
++	 * extra constraint of never generating TLB conflict aborts when using
++	 * the relaxed BBML2 semantics (such aborts make use of BBML2 in certain
++	 * kernel contexts difficult to prove safe against recursive aborts).
++	 *
++	 * Note that implementations can only be considered "known-good" if their
++	 * implementors attest to the fact that the implementation never raises
++	 * TLB conflict aborts for BBML2 mapping granularity changes.
++	 */
++	static const struct midr_range supports_bbml2_noabort_list[] = {
++		MIDR_REV_RANGE(MIDR_CORTEX_X4, 0, 3, 0xf),
++		MIDR_REV_RANGE(MIDR_NEOVERSE_V3, 0, 2, 0xf),
++		{}
++	};
++
++	/* Does our cpu guarantee to never raise TLB conflict aborts? */
++	if (!is_midr_in_range_list(supports_bbml2_noabort_list))
++		return false;
++
++	/*
++	 * We currently ignore the ID_AA64MMFR2_EL1 register, and only care
++	 * about whether the MIDR check passes.
++	 */
++
++	return true;
++}
++
+ #ifdef CONFIG_ARM64_PAN
+ static void cpu_enable_pan(const struct arm64_cpu_capabilities *__unused)
+ {
+@@ -2904,6 +2936,12 @@ static const struct arm64_cpu_capabiliti
+ 		ARM64_CPUID_FIELDS(ID_AA64MMFR2_EL1, EVT, IMP)
+ 	},
+ 	{
++		.desc = "BBM Level 2 without TLB conflict abort",
++		.capability = ARM64_HAS_BBML2_NOABORT,
++		.type = ARM64_CPUCAP_EARLY_LOCAL_CPU_FEATURE,
++		.matches = has_bbml2_noabort,
++	},
++	{
+ 		.desc = "52-bit Virtual Addressing for KVM (LPA2)",
+ 		.capability = ARM64_HAS_LPA2,
+ 		.type = ARM64_CPUCAP_SYSTEM_FEATURE,
+--- a/arch/arm64/tools/cpucaps
++++ b/arch/arm64/tools/cpucaps
+@@ -43,6 +43,7 @@ HAS_LPA2
+ HAS_LSE_ATOMICS
+ HAS_MOPS
+ HAS_NESTED_VIRT
++HAS_BBML2_NOABORT
+ HAS_PAN
+ HAS_S1PIE
+ HAS_S1POE
