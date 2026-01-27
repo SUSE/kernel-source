@@ -1,0 +1,221 @@
+From 8ab05a5456bb9556bbf7d500a4b1b3b261ed6894 Mon Sep 17 00:00:00 2001
+From: Vlad Dumitrescu <vdumitrescu@nvidia.com>
+Date: Mon, 30 Jun 2025 13:16:44 +0300
+Subject: [PATCH 1/1] IB/cm: Use separate agent w/o flow control for REP
+Git-commit: 8ab05a5456bb9556bbf7d500a4b1b3b261ed6894
+Patch-mainline: v6.17-rc1
+References: jsc#PED-15314
+
+Most responses (e.g., RTU) are not subject to flow control, as there is
+no further response expected.  However, REPs are both requests (waiting
+for RTUs) and responses (being waited by REQs).
+
+With agent-level flow control added to the MAD layer, REPs can get
+delayed by outstanding REQs.  This can cause a problem in a scenario
+such as 2 hosts connecting to each other at the same time.  Both hosts
+fill the flow control outstanding slots with REQs.  The corresponding
+REPs are now blocked behind those REQs, and neither side can make
+progress until REQs time out.
+
+Add a separate MAD agent which is only used to send REPs.  This agent
+does not have a recv_handler as it doesn't process responses nor does it
+register to receive requests.  Disable flow control for agents w/o a
+recv_handler, as they aren't waiting for responses.  This allows the
+newly added REP agent to send even when clients are slow to generate
+RTU, which would be needed to unblock flow control outstanding slots.
+
+Relax check in ib_post_send_mad to allow retries for this agent.  REPs
+will be retried by the MAD layer until CM layer receives a response
+(e.g., RTU) on the normal agent and cancels them.
+
+Suggested-by: Sean Hefty <shefty@nvidia.com>
+Reviewed-by: Maher Sanalla <msanalla@nvidia.com>
+Reviewed-by: Sean Hefty <shefty@nvidia.com>
+Signed-off-by: Vlad Dumitrescu <vdumitrescu@nvidia.com>
+Signed-off-by: Or Har-Toov <ohartoov@nvidia.com>
+Link: https://patch.msgid.link/9ac12d0842b849e2c8537d6e291ee0af9f79855c.1751278420.git.leon@kernel.org
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Acked-by: Nicolas Morey <nmorey@suse.com>
+---
+ drivers/infiniband/core/cm.c  | 47 ++++++++++++++++++++++++++++++-----
+ drivers/infiniband/core/mad.c |  7 +++---
+ 2 files changed, 44 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/infiniband/core/cm.c b/drivers/infiniband/core/cm.c
+index 8670e58675c6..92678e438ff4 100644
+--- a/drivers/infiniband/core/cm.c
++++ b/drivers/infiniband/core/cm.c
+@@ -161,6 +161,7 @@ struct cm_counter_attribute {
+ struct cm_port {
+ 	struct cm_device *cm_dev;
+ 	struct ib_mad_agent *mad_agent;
++	struct ib_mad_agent *rep_agent;
+ 	u32 port_num;
+ 	atomic_long_t counters[CM_COUNTER_GROUPS][CM_ATTR_COUNT];
+ };
+@@ -274,7 +275,8 @@ static inline void cm_deref_id(struct cm_id_private *cm_id_priv)
+ 		complete(&cm_id_priv->comp);
+ }
+ 
+-static struct ib_mad_send_buf *cm_alloc_msg(struct cm_id_private *cm_id_priv)
++static struct ib_mad_send_buf *
++cm_alloc_msg_agent(struct cm_id_private *cm_id_priv, bool rep_agent)
+ {
+ 	struct ib_mad_agent *mad_agent;
+ 	struct ib_mad_send_buf *m;
+@@ -286,7 +288,8 @@ static struct ib_mad_send_buf *cm_alloc_msg(struct cm_id_private *cm_id_priv)
+ 		return ERR_PTR(-EINVAL);
+ 
+ 	read_lock(&cm_id_priv->av.port->cm_dev->mad_agent_lock);
+-	mad_agent = cm_id_priv->av.port->mad_agent;
++	mad_agent = rep_agent ? cm_id_priv->av.port->rep_agent :
++				cm_id_priv->av.port->mad_agent;
+ 	if (!mad_agent) {
+ 		m = ERR_PTR(-EINVAL);
+ 		goto out;
+@@ -315,6 +318,11 @@ static struct ib_mad_send_buf *cm_alloc_msg(struct cm_id_private *cm_id_priv)
+ 	return m;
+ }
+ 
++static struct ib_mad_send_buf *cm_alloc_msg(struct cm_id_private *cm_id_priv)
++{
++	return cm_alloc_msg_agent(cm_id_priv, false);
++}
++
+ static void cm_free_msg(struct ib_mad_send_buf *msg)
+ {
+ 	if (msg->ah)
+@@ -323,13 +331,14 @@ static void cm_free_msg(struct ib_mad_send_buf *msg)
+ }
+ 
+ static struct ib_mad_send_buf *
+-cm_alloc_priv_msg(struct cm_id_private *cm_id_priv, enum ib_cm_state state)
++cm_alloc_priv_msg_rep(struct cm_id_private *cm_id_priv, enum ib_cm_state state,
++		      bool rep_agent)
+ {
+ 	struct ib_mad_send_buf *msg;
+ 
+ 	lockdep_assert_held(&cm_id_priv->lock);
+ 
+-	msg = cm_alloc_msg(cm_id_priv);
++	msg = cm_alloc_msg_agent(cm_id_priv, rep_agent);
+ 	if (IS_ERR(msg))
+ 		return msg;
+ 
+@@ -344,6 +353,12 @@ cm_alloc_priv_msg(struct cm_id_private *cm_id_priv, enum ib_cm_state state)
+ 	return msg;
+ }
+ 
++static struct ib_mad_send_buf *
++cm_alloc_priv_msg(struct cm_id_private *cm_id_priv, enum ib_cm_state state)
++{
++	return cm_alloc_priv_msg_rep(cm_id_priv, state, false);
++}
++
+ static void cm_free_priv_msg(struct ib_mad_send_buf *msg)
+ {
+ 	struct cm_id_private *cm_id_priv = msg->context[0];
+@@ -2295,7 +2310,7 @@ int ib_send_cm_rep(struct ib_cm_id *cm_id,
+ 		goto out;
+ 	}
+ 
+-	msg = cm_alloc_priv_msg(cm_id_priv, IB_CM_REP_SENT);
++	msg = cm_alloc_priv_msg_rep(cm_id_priv, IB_CM_REP_SENT, true);
+ 	if (IS_ERR(msg)) {
+ 		ret = PTR_ERR(msg);
+ 		goto out;
+@@ -4380,9 +4395,22 @@ static int cm_add_one(struct ib_device *ib_device)
+ 			goto error2;
+ 		}
+ 
++		port->rep_agent = ib_register_mad_agent(ib_device, i,
++							IB_QPT_GSI,
++							NULL,
++							0,
++							cm_send_handler,
++							NULL,
++							port,
++							0);
++		if (IS_ERR(port->rep_agent)) {
++			ret = PTR_ERR(port->rep_agent);
++			goto error3;
++		}
++
+ 		ret = ib_modify_port(ib_device, i, 0, &port_modify);
+ 		if (ret)
+-			goto error3;
++			goto error4;
+ 
+ 		count++;
+ 	}
+@@ -4397,6 +4425,8 @@ static int cm_add_one(struct ib_device *ib_device)
+ 	write_unlock_irqrestore(&cm.device_lock, flags);
+ 	return 0;
+ 
++error4:
++	ib_unregister_mad_agent(port->rep_agent);
+ error3:
+ 	ib_unregister_mad_agent(port->mad_agent);
+ error2:
+@@ -4410,6 +4440,7 @@ static int cm_add_one(struct ib_device *ib_device)
+ 
+ 		port = cm_dev->port[i-1];
+ 		ib_modify_port(ib_device, port->port_num, 0, &port_modify);
++		ib_unregister_mad_agent(port->rep_agent);
+ 		ib_unregister_mad_agent(port->mad_agent);
+ 		ib_port_unregister_client_groups(ib_device, i,
+ 						 cm_counter_groups);
+@@ -4439,12 +4470,14 @@ static void cm_remove_one(struct ib_device *ib_device, void *client_data)
+ 
+ 	rdma_for_each_port (ib_device, i) {
+ 		struct ib_mad_agent *mad_agent;
++		struct ib_mad_agent *rep_agent;
+ 
+ 		if (!rdma_cap_ib_cm(ib_device, i))
+ 			continue;
+ 
+ 		port = cm_dev->port[i-1];
+ 		mad_agent = port->mad_agent;
++		rep_agent = port->rep_agent;
+ 		ib_modify_port(ib_device, port->port_num, 0, &port_modify);
+ 		/*
+ 		 * We flush the queue here after the going_down set, this
+@@ -4458,8 +4491,10 @@ static void cm_remove_one(struct ib_device *ib_device, void *client_data)
+ 		 */
+ 		write_lock(&cm_dev->mad_agent_lock);
+ 		port->mad_agent = NULL;
++		port->rep_agent = NULL;
+ 		write_unlock(&cm_dev->mad_agent_lock);
+ 		ib_unregister_mad_agent(mad_agent);
++		ib_unregister_mad_agent(rep_agent);
+ 		ib_port_unregister_client_groups(ib_device, i,
+ 						 cm_counter_groups);
+ 	}
+diff --git a/drivers/infiniband/core/mad.c b/drivers/infiniband/core/mad.c
+index 183667038cf2..8f26bfb69586 100644
+--- a/drivers/infiniband/core/mad.c
++++ b/drivers/infiniband/core/mad.c
+@@ -424,7 +424,8 @@ struct ib_mad_agent *ib_register_mad_agent(struct ib_device *device,
+ 	mad_agent_priv->sol_fc_send_count = 0;
+ 	mad_agent_priv->sol_fc_wait_count = 0;
+ 	mad_agent_priv->sol_fc_max =
+-		get_sol_fc_max_outstanding(mad_reg_req);
++		recv_handler ? get_sol_fc_max_outstanding(mad_reg_req) : 0;
++
+ 	ret2 = ib_mad_agent_security_setup(&mad_agent_priv->agent, qp_type);
+ 	if (ret2) {
+ 		ret = ERR_PTR(ret2);
+@@ -1280,9 +1281,7 @@ int ib_post_send_mad(struct ib_mad_send_buf *send_buf,
+ 		if (ret)
+ 			goto error;
+ 
+-		if (!send_buf->mad_agent->send_handler ||
+-		    (send_buf->timeout_ms &&
+-		     !send_buf->mad_agent->recv_handler)) {
++		if (!send_buf->mad_agent->send_handler) {
+ 			ret = -EINVAL;
+ 			goto error;
+ 		}
+-- 
+2.52.0
+
