@@ -1,0 +1,453 @@
+From 426370c860e8a276000144dd6470de4f1a96f8ee Mon Sep 17 00:00:00 2001
+From: Eric Biggers <ebiggers@google.com>
+Date: Wed, 26 Feb 2025 21:12:07 -0800
+Subject: [PATCH 1/1] RDMA/siw: Switch to using the crc32c library
+Git-commit: 426370c860e8a276000144dd6470de4f1a96f8ee
+Patch-mainline: v6.15-rc1
+References: jsc#PED-15314
+
+Now that the crc32c() library function directly takes advantage of
+architecture-specific optimizations, it is unnecessary to go through the
+crypto API.  Just use crc32c().  This is much simpler, and it improves
+performance due to eliminating the crypto API overhead.
+
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+Link: https://patch.msgid.link/20250227051207.19470-1-ebiggers@kernel.org
+Acked-by: Bernard Metzler <bmt@zurich.ibm.com>
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Acked-by: Nicolas Morey <nmorey@suse.com>
+---
+ drivers/infiniband/sw/siw/Kconfig     |  4 +-
+ drivers/infiniband/sw/siw/siw.h       | 37 +++++++++++++++---
+ drivers/infiniband/sw/siw/siw_main.c  | 22 +----------
+ drivers/infiniband/sw/siw/siw_qp.c    | 54 ++++++---------------------
+ drivers/infiniband/sw/siw/siw_qp_rx.c | 23 ++++++------
+ drivers/infiniband/sw/siw/siw_qp_tx.c | 44 ++++++++++------------
+ drivers/infiniband/sw/siw/siw_verbs.c |  3 --
+ 7 files changed, 74 insertions(+), 113 deletions(-)
+
+diff --git a/drivers/infiniband/sw/siw/Kconfig b/drivers/infiniband/sw/siw/Kconfig
+index 81b70a3eeb87..ae4a953e2a03 100644
+--- a/drivers/infiniband/sw/siw/Kconfig
++++ b/drivers/infiniband/sw/siw/Kconfig
+@@ -2,9 +2,7 @@ config RDMA_SIW
+ 	tristate "Software RDMA over TCP/IP (iWARP) driver"
+ 	depends on INET && INFINIBAND
+ 	depends on INFINIBAND_VIRT_DMA
+-	select LIBCRC32C
+-	select CRYPTO
+-	select CRYPTO_CRC32C
++	select CRC32
+ 	help
+ 	This driver implements the iWARP RDMA transport over
+ 	the Linux TCP/IP network stack. It enables a system with a
+diff --git a/drivers/infiniband/sw/siw/siw.h b/drivers/infiniband/sw/siw/siw.h
+index ea5eee50dc39..21238746716a 100644
+--- a/drivers/infiniband/sw/siw/siw.h
++++ b/drivers/infiniband/sw/siw/siw.h
+@@ -10,9 +10,9 @@
+ #include <rdma/restrack.h>
+ #include <linux/socket.h>
+ #include <linux/skbuff.h>
+-#include <crypto/hash.h>
+ #include <linux/crc32.h>
+ #include <linux/crc32c.h>
++#include <linux/unaligned.h>
+ 
+ #include <rdma/siw-abi.h>
+ #include "iwarp.h"
+@@ -289,7 +289,8 @@ struct siw_rx_stream {
+ 
+ 	union iwarp_hdr hdr;
+ 	struct mpa_trailer trailer;
+-	struct shash_desc *mpa_crc_hd;
++	u32 mpa_crc;
++	bool mpa_crc_enabled;
+ 
+ 	/*
+ 	 * For each FPDU, main RX loop runs through 3 stages:
+@@ -390,7 +391,8 @@ struct siw_iwarp_tx {
+ 	int burst;
+ 	int bytes_unsent; /* ddp payload bytes */
+ 
+-	struct shash_desc *mpa_crc_hd;
++	u32 mpa_crc;
++	bool mpa_crc_enabled;
+ 
+ 	u8 do_crc : 1; /* do crc for segment */
+ 	u8 use_sendpage : 1; /* send w/o copy */
+@@ -496,7 +498,6 @@ extern u_char mpa_version;
+ extern const bool peer_to_peer;
+ extern struct task_struct *siw_tx_thread[];
+ 
+-extern struct crypto_shash *siw_crypto_shash;
+ extern struct iwarp_msg_info iwarp_pktinfo[RDMAP_TERMINATE + 1];
+ 
+ /* QP general functions */
+@@ -668,6 +669,30 @@ static inline struct siw_sqe *irq_alloc_free(struct siw_qp *qp)
+ 	return NULL;
+ }
+ 
++static inline void siw_crc_init(u32 *crc)
++{
++	*crc = ~0;
++}
++
++static inline void siw_crc_update(u32 *crc, const void *data, size_t len)
++{
++	*crc = crc32c(*crc, data, len);
++}
++
++static inline void siw_crc_final(u32 *crc, u8 out[4])
++{
++	put_unaligned_le32(~*crc, out);
++}
++
++static inline void siw_crc_oneshot(const void *data, size_t len, u8 out[4])
++{
++	u32 crc;
++
++	siw_crc_init(&crc);
++	siw_crc_update(&crc, data, len);
++	return siw_crc_final(&crc, out);
++}
++
+ static inline __wsum siw_csum_update(const void *buff, int len, __wsum sum)
+ {
+ 	return (__force __wsum)crc32c((__force __u32)sum, buff, len);
+@@ -686,11 +711,11 @@ static inline void siw_crc_skb(struct siw_rx_stream *srx, unsigned int len)
+ 		.update = siw_csum_update,
+ 		.combine = siw_csum_combine,
+ 	};
+-	__wsum crc = *(u32 *)shash_desc_ctx(srx->mpa_crc_hd);
++	__wsum crc = (__force __wsum)srx->mpa_crc;
+ 
+ 	crc = __skb_checksum(srx->skb, srx->skb_offset, len, crc,
+ 			     &siw_cs_ops);
+-	*(u32 *)shash_desc_ctx(srx->mpa_crc_hd) = crc;
++	srx->mpa_crc = (__force u32)crc;
+ }
+ 
+ #define siw_dbg(ibdev, fmt, ...)                                               \
+diff --git a/drivers/infiniband/sw/siw/siw_main.c b/drivers/infiniband/sw/siw/siw_main.c
+index b17752bd1ecc..5168307229a9 100644
+--- a/drivers/infiniband/sw/siw/siw_main.c
++++ b/drivers/infiniband/sw/siw/siw_main.c
+@@ -59,7 +59,6 @@ u_char mpa_version = MPA_REVISION_2;
+ const bool peer_to_peer;
+ 
+ struct task_struct *siw_tx_thread[NR_CPUS];
+-struct crypto_shash *siw_crypto_shash;
+ 
+ static int siw_device_register(struct siw_device *sdev, const char *name)
+ {
+@@ -467,20 +466,7 @@ static __init int siw_init_module(void)
+ 		rv = -ENOMEM;
+ 		goto out_error;
+ 	}
+-	/*
+-	 * Locate CRC32 algorithm. If unsuccessful, fail
+-	 * loading siw only, if CRC is required.
+-	 */
+-	siw_crypto_shash = crypto_alloc_shash("crc32c", 0, 0);
+-	if (IS_ERR(siw_crypto_shash)) {
+-		pr_info("siw: Loading CRC32c failed: %ld\n",
+-			PTR_ERR(siw_crypto_shash));
+-		siw_crypto_shash = NULL;
+-		if (mpa_crc_required) {
+-			rv = -EOPNOTSUPP;
+-			goto out_error;
+-		}
+-	}
++
+ 	rv = register_netdevice_notifier(&siw_netdev_nb);
+ 	if (rv)
+ 		goto out_error;
+@@ -493,9 +479,6 @@ static __init int siw_init_module(void)
+ out_error:
+ 	siw_stop_tx_threads();
+ 
+-	if (siw_crypto_shash)
+-		crypto_free_shash(siw_crypto_shash);
+-
+ 	pr_info("SoftIWARP attach failed. Error: %d\n", rv);
+ 
+ 	siw_cm_exit();
+@@ -516,9 +499,6 @@ static void __exit siw_exit_module(void)
+ 
+ 	siw_destroy_cpulist(siw_cpu_info.num_nodes);
+ 
+-	if (siw_crypto_shash)
+-		crypto_free_shash(siw_crypto_shash);
+-
+ 	pr_info("SoftiWARP detached\n");
+ }
+ 
+diff --git a/drivers/infiniband/sw/siw/siw_qp.c b/drivers/infiniband/sw/siw/siw_qp.c
+index da92cfa2073d..c1e6e7d6e32f 100644
+--- a/drivers/infiniband/sw/siw/siw_qp.c
++++ b/drivers/infiniband/sw/siw/siw_qp.c
+@@ -226,33 +226,6 @@ static int siw_qp_readq_init(struct siw_qp *qp, int irq_size, int orq_size)
+ 	return 0;
+ }
+ 
+-static int siw_qp_enable_crc(struct siw_qp *qp)
+-{
+-	struct siw_rx_stream *c_rx = &qp->rx_stream;
+-	struct siw_iwarp_tx *c_tx = &qp->tx_ctx;
+-	int size;
+-
+-	if (siw_crypto_shash == NULL)
+-		return -ENOENT;
+-
+-	size = crypto_shash_descsize(siw_crypto_shash) +
+-		sizeof(struct shash_desc);
+-
+-	c_tx->mpa_crc_hd = kzalloc(size, GFP_KERNEL);
+-	c_rx->mpa_crc_hd = kzalloc(size, GFP_KERNEL);
+-	if (!c_tx->mpa_crc_hd || !c_rx->mpa_crc_hd) {
+-		kfree(c_tx->mpa_crc_hd);
+-		kfree(c_rx->mpa_crc_hd);
+-		c_tx->mpa_crc_hd = NULL;
+-		c_rx->mpa_crc_hd = NULL;
+-		return -ENOMEM;
+-	}
+-	c_tx->mpa_crc_hd->tfm = siw_crypto_shash;
+-	c_rx->mpa_crc_hd->tfm = siw_crypto_shash;
+-
+-	return 0;
+-}
+-
+ /*
+  * Send a non signalled READ or WRITE to peer side as negotiated
+  * with MPAv2 P2P setup protocol. The work request is only created
+@@ -583,20 +556,15 @@ void siw_send_terminate(struct siw_qp *qp)
+ 
+ 	term->ctrl.mpa_len =
+ 		cpu_to_be16(len_terminate - (MPA_HDR_SIZE + MPA_CRC_SIZE));
+-	if (qp->tx_ctx.mpa_crc_hd) {
+-		crypto_shash_init(qp->tx_ctx.mpa_crc_hd);
+-		if (crypto_shash_update(qp->tx_ctx.mpa_crc_hd,
+-					(u8 *)iov[0].iov_base,
+-					iov[0].iov_len))
+-			goto out;
+-
++	if (qp->tx_ctx.mpa_crc_enabled) {
++		siw_crc_init(&qp->tx_ctx.mpa_crc);
++		siw_crc_update(&qp->tx_ctx.mpa_crc,
++			       iov[0].iov_base, iov[0].iov_len);
+ 		if (num_frags == 3) {
+-			if (crypto_shash_update(qp->tx_ctx.mpa_crc_hd,
+-						(u8 *)iov[1].iov_base,
+-						iov[1].iov_len))
+-				goto out;
++			siw_crc_update(&qp->tx_ctx.mpa_crc,
++				       iov[1].iov_base, iov[1].iov_len);
+ 		}
+-		crypto_shash_final(qp->tx_ctx.mpa_crc_hd, (u8 *)&crc);
++		siw_crc_final(&qp->tx_ctx.mpa_crc, (u8 *)&crc);
+ 	}
+ 
+ 	rv = kernel_sendmsg(s, &msg, iov, num_frags, len_terminate);
+@@ -604,7 +572,6 @@ void siw_send_terminate(struct siw_qp *qp)
+ 		   rv == len_terminate ? "success" : "failure",
+ 		   __rdmap_term_layer(term), __rdmap_term_etype(term),
+ 		   __rdmap_term_ecode(term), rv);
+-out:
+ 	kfree(term);
+ 	kfree(err_hdr);
+ }
+@@ -643,9 +610,10 @@ static int siw_qp_nextstate_from_idle(struct siw_qp *qp,
+ 	switch (attrs->state) {
+ 	case SIW_QP_STATE_RTS:
+ 		if (attrs->flags & SIW_MPA_CRC) {
+-			rv = siw_qp_enable_crc(qp);
+-			if (rv)
+-				break;
++			siw_crc_init(&qp->tx_ctx.mpa_crc);
++			qp->tx_ctx.mpa_crc_enabled = true;
++			siw_crc_init(&qp->rx_stream.mpa_crc);
++			qp->rx_stream.mpa_crc_enabled = true;
+ 		}
+ 		if (!(mask & SIW_QP_ATTR_LLP_HANDLE)) {
+ 			siw_dbg_qp(qp, "no socket\n");
+diff --git a/drivers/infiniband/sw/siw/siw_qp_rx.c b/drivers/infiniband/sw/siw/siw_qp_rx.c
+index ed4fc39718b4..32554eba1eac 100644
+--- a/drivers/infiniband/sw/siw/siw_qp_rx.c
++++ b/drivers/infiniband/sw/siw/siw_qp_rx.c
+@@ -67,10 +67,10 @@ static int siw_rx_umem(struct siw_rx_stream *srx, struct siw_umem *umem,
+ 
+ 			return -EFAULT;
+ 		}
+-		if (srx->mpa_crc_hd) {
++		if (srx->mpa_crc_enabled) {
+ 			if (rdma_is_kernel_res(&rx_qp(srx)->base_qp.res)) {
+-				crypto_shash_update(srx->mpa_crc_hd,
+-					(u8 *)(dest + pg_off), bytes);
++				siw_crc_update(&srx->mpa_crc, dest + pg_off,
++					       bytes);
+ 				kunmap_atomic(dest);
+ 			} else {
+ 				kunmap_atomic(dest);
+@@ -114,8 +114,8 @@ static int siw_rx_kva(struct siw_rx_stream *srx, void *kva, int len)
+ 
+ 		return rv;
+ 	}
+-	if (srx->mpa_crc_hd)
+-		crypto_shash_update(srx->mpa_crc_hd, (u8 *)kva, len);
++	if (srx->mpa_crc_enabled)
++		siw_crc_update(&srx->mpa_crc, kva, len);
+ 
+ 	srx->skb_offset += len;
+ 	srx->skb_copied += len;
+@@ -966,16 +966,16 @@ static int siw_get_trailer(struct siw_qp *qp, struct siw_rx_stream *srx)
+ 	if (srx->fpdu_part_rem)
+ 		return -EAGAIN;
+ 
+-	if (!srx->mpa_crc_hd)
++	if (!srx->mpa_crc_enabled)
+ 		return 0;
+ 
+ 	if (srx->pad)
+-		crypto_shash_update(srx->mpa_crc_hd, tbuf, srx->pad);
++		siw_crc_update(&srx->mpa_crc, tbuf, srx->pad);
+ 	/*
+ 	 * CRC32 is computed, transmitted and received directly in NBO,
+ 	 * so there's never a reason to convert byte order.
+ 	 */
+-	crypto_shash_final(srx->mpa_crc_hd, (u8 *)&crc_own);
++	siw_crc_final(&srx->mpa_crc, (u8 *)&crc_own);
+ 	crc_in = (__force __wsum)srx->trailer.crc;
+ 
+ 	if (unlikely(crc_in != crc_own)) {
+@@ -1093,13 +1093,12 @@ static int siw_get_hdr(struct siw_rx_stream *srx)
+ 	 * (tagged/untagged). E.g., a WRITE can get intersected by a SEND,
+ 	 * but not by a READ RESPONSE etc.
+ 	 */
+-	if (srx->mpa_crc_hd) {
++	if (srx->mpa_crc_enabled) {
+ 		/*
+ 		 * Restart CRC computation
+ 		 */
+-		crypto_shash_init(srx->mpa_crc_hd);
+-		crypto_shash_update(srx->mpa_crc_hd, (u8 *)c_hdr,
+-				    srx->fpdu_part_rcvd);
++		siw_crc_init(&srx->mpa_crc);
++		siw_crc_update(&srx->mpa_crc, c_hdr, srx->fpdu_part_rcvd);
+ 	}
+ 	if (frx->more_ddp_segs) {
+ 		frx->first_ddp_seg = 0;
+diff --git a/drivers/infiniband/sw/siw/siw_qp_tx.c b/drivers/infiniband/sw/siw/siw_qp_tx.c
+index a034264c5669..6432bce7d083 100644
+--- a/drivers/infiniband/sw/siw/siw_qp_tx.c
++++ b/drivers/infiniband/sw/siw/siw_qp_tx.c
+@@ -248,10 +248,8 @@ static int siw_qp_prepare_tx(struct siw_iwarp_tx *c_tx)
+ 		/*
+ 		 * Do complete CRC if enabled and short packet
+ 		 */
+-		if (c_tx->mpa_crc_hd &&
+-		    crypto_shash_digest(c_tx->mpa_crc_hd, (u8 *)&c_tx->pkt,
+-					c_tx->ctrl_len, (u8 *)crc) != 0)
+-			return -EINVAL;
++		if (c_tx->mpa_crc_enabled)
++			siw_crc_oneshot(&c_tx->pkt, c_tx->ctrl_len, (u8 *)crc);
+ 		c_tx->ctrl_len += MPA_CRC_SIZE;
+ 
+ 		return PKT_COMPLETE;
+@@ -482,9 +480,8 @@ static int siw_tx_hdt(struct siw_iwarp_tx *c_tx, struct socket *s)
+ 			iov[seg].iov_len = sge_len;
+ 
+ 			if (do_crc)
+-				crypto_shash_update(c_tx->mpa_crc_hd,
+-						    iov[seg].iov_base,
+-						    sge_len);
++				siw_crc_update(&c_tx->mpa_crc,
++					       iov[seg].iov_base, sge_len);
+ 			sge_off += sge_len;
+ 			data_len -= sge_len;
+ 			seg++;
+@@ -516,15 +513,14 @@ static int siw_tx_hdt(struct siw_iwarp_tx *c_tx, struct socket *s)
+ 					iov[seg].iov_len = plen;
+ 
+ 					if (do_crc)
+-						crypto_shash_update(
+-							c_tx->mpa_crc_hd,
++						siw_crc_update(
++							&c_tx->mpa_crc,
+ 							iov[seg].iov_base,
+ 							plen);
+ 				} else if (do_crc) {
+ 					kaddr = kmap_local_page(p);
+-					crypto_shash_update(c_tx->mpa_crc_hd,
+-							    kaddr + fp_off,
+-							    plen);
++					siw_crc_update(&c_tx->mpa_crc,
++						       kaddr + fp_off, plen);
+ 					kunmap_local(kaddr);
+ 				}
+ 			} else {
+@@ -536,10 +532,9 @@ static int siw_tx_hdt(struct siw_iwarp_tx *c_tx, struct socket *s)
+ 
+ 				page_array[seg] = ib_virt_dma_to_page(va);
+ 				if (do_crc)
+-					crypto_shash_update(
+-						c_tx->mpa_crc_hd,
+-						ib_virt_dma_to_ptr(va),
+-						plen);
++					siw_crc_update(&c_tx->mpa_crc,
++						       ib_virt_dma_to_ptr(va),
++						       plen);
+ 			}
+ 
+ 			sge_len -= plen;
+@@ -576,14 +571,14 @@ static int siw_tx_hdt(struct siw_iwarp_tx *c_tx, struct socket *s)
+ 	if (c_tx->pad) {
+ 		*(u32 *)c_tx->trailer.pad = 0;
+ 		if (do_crc)
+-			crypto_shash_update(c_tx->mpa_crc_hd,
+-				(u8 *)&c_tx->trailer.crc - c_tx->pad,
+-				c_tx->pad);
++			siw_crc_update(&c_tx->mpa_crc,
++				       (u8 *)&c_tx->trailer.crc - c_tx->pad,
++				       c_tx->pad);
+ 	}
+-	if (!c_tx->mpa_crc_hd)
++	if (!c_tx->mpa_crc_enabled)
+ 		c_tx->trailer.crc = 0;
+ 	else if (do_crc)
+-		crypto_shash_final(c_tx->mpa_crc_hd, (u8 *)&c_tx->trailer.crc);
++		siw_crc_final(&c_tx->mpa_crc, (u8 *)&c_tx->trailer.crc);
+ 
+ 	data_len = c_tx->bytes_unsent;
+ 
+@@ -736,10 +731,9 @@ static void siw_prepare_fpdu(struct siw_qp *qp, struct siw_wqe *wqe)
+ 	/*
+ 	 * Init MPA CRC computation
+ 	 */
+-	if (c_tx->mpa_crc_hd) {
+-		crypto_shash_init(c_tx->mpa_crc_hd);
+-		crypto_shash_update(c_tx->mpa_crc_hd, (u8 *)&c_tx->pkt,
+-				    c_tx->ctrl_len);
++	if (c_tx->mpa_crc_enabled) {
++		siw_crc_init(&c_tx->mpa_crc);
++		siw_crc_update(&c_tx->mpa_crc, &c_tx->pkt, c_tx->ctrl_len);
+ 		c_tx->do_crc = 1;
+ 	}
+ }
+diff --git a/drivers/infiniband/sw/siw/siw_verbs.c b/drivers/infiniband/sw/siw/siw_verbs.c
+index 5ac8bd450d24..fd7b266a221b 100644
+--- a/drivers/infiniband/sw/siw/siw_verbs.c
++++ b/drivers/infiniband/sw/siw/siw_verbs.c
+@@ -631,9 +631,6 @@ int siw_destroy_qp(struct ib_qp *base_qp, struct ib_udata *udata)
+ 	}
+ 	up_write(&qp->state_lock);
+ 
+-	kfree(qp->tx_ctx.mpa_crc_hd);
+-	kfree(qp->rx_stream.mpa_crc_hd);
+-
+ 	qp->scq = qp->rcq = NULL;
+ 
+ 	siw_qp_put(qp);
+-- 
+2.52.0
+
