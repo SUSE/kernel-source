@@ -1,0 +1,155 @@
+From 02007e3ddc0790ed5a6a504892d7aa1a917076bc Mon Sep 17 00:00:00 2001
+From: Junxian Huang <huangjunxian6@hisilicon.com>
+Date: Mon, 21 Apr 2025 21:27:45 +0800
+Subject: [PATCH 1/1] RDMA/hns: Add trace for flush CQE
+Git-commit: 02007e3ddc0790ed5a6a504892d7aa1a917076bc
+Patch-mainline: v6.16-rc1
+References: jsc#PED-15314
+
+Add trace to print the producer index of QP when triggering flush CQE.
+
+Output example:
+$ cat /sys/kernel/debug/tracing/trace
+  tracer: nop
+
+  entries-in-buffer/entries-written: 2/2   #P:128
+
+                                 _-----=> irqs-off/BH-disabled
+                                / _----=> need-resched
+                               | / _---=> hardirq/softirq
+                               || / _--=> preempt-depth
+                               ||| / _-=> migrate-disable
+                               |||| /     delay
+            TASK-PID     CPU#  |||||  TIMESTAMP  FUNCTION
+               | |         |   |||||     |         |
+      ib_send_bw-11474   [075] d..1.  2393.434738: hns_sq_flush_cqe: SQ 0x2 flush head 0xb5c7.
+      ib_send_bw-11474   [075] d..1.  2393.434739: hns_rq_flush_cqe: RQ 0x2 flush head 0.
+
+Signed-off-by: Junxian Huang <huangjunxian6@hisilicon.com>
+Link: https://patch.msgid.link/20250421132750.1363348-2-huangjunxian6@hisilicon.com
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Acked-by: Nicolas Morey <nmorey@suse.com>
+---
+ drivers/infiniband/hw/hns/hns_roce_device.h | 17 +++++++
+ drivers/infiniband/hw/hns/hns_roce_hw_v2.c  |  5 +++
+ drivers/infiniband/hw/hns/hns_roce_trace.h  | 50 +++++++++++++++++++++
+ 3 files changed, 72 insertions(+)
+ create mode 100644 drivers/infiniband/hw/hns/hns_roce_trace.h
+
+diff --git a/drivers/infiniband/hw/hns/hns_roce_device.h b/drivers/infiniband/hw/hns/hns_roce_device.h
+index 560a1d9de408..080bd049b0f8 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_device.h
++++ b/drivers/infiniband/hw/hns/hns_roce_device.h
+@@ -1027,6 +1027,23 @@ struct hns_roce_dev {
+ 	atomic64_t *dfx_cnt;
+ };
+ 
++enum hns_roce_trace_type {
++	TRACE_SQ,
++	TRACE_RQ,
++};
++
++static inline const char *trace_type_to_str(enum hns_roce_trace_type type)
++{
++	switch (type) {
++	case TRACE_SQ:
++		return "SQ";
++	case TRACE_RQ:
++		return "RQ";
++	default:
++		return "UNKNOWN";
++	}
++}
++
+ static inline struct hns_roce_dev *to_hr_dev(struct ib_device *ib_dev)
+ {
+ 	return container_of(ib_dev, struct hns_roce_dev, ib_dev);
+diff --git a/drivers/infiniband/hw/hns/hns_roce_hw_v2.c b/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+index c6399490e3a5..e1c27c9556fd 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
++++ b/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+@@ -50,6 +50,9 @@
+ #include "hns_roce_hem.h"
+ #include "hns_roce_hw_v2.h"
+ 
++#define CREATE_TRACE_POINTS
++#include "hns_roce_trace.h"
++
+ enum {
+ 	CMD_RST_PRC_OTHERS,
+ 	CMD_RST_PRC_SUCCESS,
+@@ -5312,6 +5315,7 @@ static void v2_set_flushed_fields(struct ib_qp *ibqp,
+ 		return;
+ 
+ 	spin_lock_irqsave(&hr_qp->sq.lock, sq_flag);
++	trace_hns_sq_flush_cqe(hr_qp->qpn, hr_qp->sq.head, TRACE_SQ);
+ 	hr_reg_write(context, QPC_SQ_PRODUCER_IDX, hr_qp->sq.head);
+ 	hr_reg_clear(qpc_mask, QPC_SQ_PRODUCER_IDX);
+ 	hr_qp->state = IB_QPS_ERR;
+@@ -5321,6 +5325,7 @@ static void v2_set_flushed_fields(struct ib_qp *ibqp,
+ 		return;
+ 
+ 	spin_lock_irqsave(&hr_qp->rq.lock, rq_flag);
++	trace_hns_rq_flush_cqe(hr_qp->qpn, hr_qp->rq.head, TRACE_RQ);
+ 	hr_reg_write(context, QPC_RQ_PRODUCER_IDX, hr_qp->rq.head);
+ 	hr_reg_clear(qpc_mask, QPC_RQ_PRODUCER_IDX);
+ 	spin_unlock_irqrestore(&hr_qp->rq.lock, rq_flag);
+diff --git a/drivers/infiniband/hw/hns/hns_roce_trace.h b/drivers/infiniband/hw/hns/hns_roce_trace.h
+new file mode 100644
+index 000000000000..3deace357fb7
+--- /dev/null
++++ b/drivers/infiniband/hw/hns/hns_roce_trace.h
+@@ -0,0 +1,50 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Copyright (c) 2025 Hisilicon Limited.
++ */
++
++#undef TRACE_SYSTEM
++#define TRACE_SYSTEM hns_roce
++
++#if !defined(__HNS_ROCE_TRACE_H) || defined(TRACE_HEADER_MULTI_READ)
++#define __HNS_ROCE_TRACE_H
++
++#include <linux/tracepoint.h>
++#include "hns_roce_device.h"
++
++DECLARE_EVENT_CLASS(flush_head_template,
++		    TP_PROTO(unsigned long qpn, u32 pi,
++			     enum hns_roce_trace_type type),
++		    TP_ARGS(qpn, pi, type),
++
++		    TP_STRUCT__entry(__field(unsigned long, qpn)
++				     __field(u32, pi)
++				     __field(enum hns_roce_trace_type, type)
++		    ),
++
++		    TP_fast_assign(__entry->qpn = qpn;
++				   __entry->pi = pi;
++				   __entry->type = type;
++		    ),
++
++		    TP_printk("%s 0x%lx flush head 0x%x.",
++			      trace_type_to_str(__entry->type),
++			      __entry->qpn, __entry->pi)
++);
++
++DEFINE_EVENT(flush_head_template, hns_sq_flush_cqe,
++	     TP_PROTO(unsigned long qpn, u32 pi,
++		      enum hns_roce_trace_type type),
++	     TP_ARGS(qpn, pi, type));
++DEFINE_EVENT(flush_head_template, hns_rq_flush_cqe,
++	     TP_PROTO(unsigned long qpn, u32 pi,
++		      enum hns_roce_trace_type type),
++	     TP_ARGS(qpn, pi, type));
++
++#endif /* __HNS_ROCE_TRACE_H */
++
++#undef TRACE_INCLUDE_FILE
++#define TRACE_INCLUDE_FILE hns_roce_trace
++#undef TRACE_INCLUDE_PATH
++#define TRACE_INCLUDE_PATH .
++#include <trace/define_trace.h>
+-- 
+2.52.0
+
