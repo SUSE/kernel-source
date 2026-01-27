@@ -1,0 +1,115 @@
+From 6bd18dabf1c94653b9a96402544bb980a7ca7ce1 Mon Sep 17 00:00:00 2001
+From: Junxian Huang <huangjunxian6@hisilicon.com>
+Date: Mon, 21 Apr 2025 21:27:50 +0800
+Subject: [PATCH 1/1] RDMA/hns: Add trace for CMDQ dumping
+Git-commit: 6bd18dabf1c94653b9a96402544bb980a7ca7ce1
+Patch-mainline: v6.16-rc1
+References: jsc#PED-15314
+
+Add trace for CMDQ dumping.
+
+Output example:
+$ cat /sys/kernel/debug/tracing/trace
+  tracer: nop
+
+  entries-in-buffer/entries-written: 2/2   #P:128
+
+                                 _-----=> irqs-off/BH-disabled
+                               / _----=> need-resched
+                               | / _---=> hardirq/softirq
+                               || / _--=> preempt-depth
+                               ||| / _-=> migrate-disable
+                               |||| /     delay
+            TASK-PID     CPU#  |||||  TIMESTAMP  FUNCTION
+               | |         |   |||||     |         |
+  kworker/u512:1-14003   [089] b..1. 50737.238304: hns_cmdq_req: 0000:bd:00.0 cmdq opcode:0x8500, flag:0x1, retval:0x0, data:{0x2,0x0,0x0,0xffff0000,0x32323232,0x0}
+
+  kworker/u512:1-14003   [089] b..1. 50737.238316: hns_cmdq_resp: 0000:bd:00.0 cmdq opcode:0x8500, flag:0x2, retval:0x0, data:{0x2,0x0,0x0,0xffff0000,0x32323232,0x0}
+
+Signed-off-by: Junxian Huang <huangjunxian6@hisilicon.com>
+Link: https://patch.msgid.link/20250421132750.1363348-7-huangjunxian6@hisilicon.com
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Acked-by: Nicolas Morey <nmorey@suse.com>
+---
+ drivers/infiniband/hw/hns/hns_roce_hw_v2.c |  4 +++
+ drivers/infiniband/hw/hns/hns_roce_trace.h | 35 ++++++++++++++++++++++
+ 2 files changed, 39 insertions(+)
+
+diff --git a/drivers/infiniband/hw/hns/hns_roce_hw_v2.c b/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+index 9cb9fe6a0a98..fa8747656f25 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
++++ b/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+@@ -1321,6 +1321,8 @@ static int __hns_roce_cmq_send_one(struct hns_roce_dev *hr_dev,
+ 	tail = csq->head;
+ 
+ 	for (i = 0; i < num; i++) {
++		trace_hns_cmdq_req(hr_dev, &desc[i]);
++
+ 		csq->desc[csq->head++] = desc[i];
+ 		if (csq->head == csq->desc_num)
+ 			csq->head = 0;
+@@ -1335,6 +1337,8 @@ static int __hns_roce_cmq_send_one(struct hns_roce_dev *hr_dev,
+ 	if (hns_roce_cmq_csq_done(hr_dev)) {
+ 		ret = 0;
+ 		for (i = 0; i < num; i++) {
++			trace_hns_cmdq_resp(hr_dev, &csq->desc[tail]);
++
+ 			/* check the result of hardware write back */
+ 			desc_ret = le16_to_cpu(csq->desc[tail++].retval);
+ 			if (tail == csq->desc_num)
+diff --git a/drivers/infiniband/hw/hns/hns_roce_trace.h b/drivers/infiniband/hw/hns/hns_roce_trace.h
+index b0bc22b9cc28..23cbdbaeffaa 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_trace.h
++++ b/drivers/infiniband/hw/hns/hns_roce_trace.h
+@@ -12,6 +12,7 @@
+ #include <linux/tracepoint.h>
+ #include <linux/string_choices.h>
+ #include "hns_roce_device.h"
++#include "hns_roce_hw_v2.h"
+ 
+ DECLARE_EVENT_CLASS(flush_head_template,
+ 		    TP_PROTO(unsigned long qpn, u32 pi,
+@@ -169,6 +170,40 @@ TRACE_EVENT(hns_buf_attr,
+ 		      __entry->region2_size, __entry->region2_hopnum)
+ );
+ 
++DECLARE_EVENT_CLASS(cmdq,
++		    TP_PROTO(struct hns_roce_dev *hr_dev,
++			     struct hns_roce_cmq_desc *desc),
++		    TP_ARGS(hr_dev, desc),
++
++		    TP_STRUCT__entry(__string(dev_name, dev_name(hr_dev->dev))
++				     __field(u16, opcode)
++				     __field(u16, flag)
++				     __field(u16, retval)
++				     __array(__le32, data, 6)
++		    ),
++
++		    TP_fast_assign(__assign_str(dev_name);
++				   __entry->opcode = le16_to_cpu(desc->opcode);
++				   __entry->flag = le16_to_cpu(desc->flag);
++				   __entry->retval = le16_to_cpu(desc->retval);
++				   memcpy(__entry->data, desc->data, 6 * sizeof(__le32));
++		    ),
++
++		    TP_printk("%s cmdq opcode:0x%x, flag:0x%x, retval:0x%x, data:%s\n",
++			      __get_str(dev_name), __entry->opcode,
++			      __entry->flag, __entry->retval,
++			      __print_array(__entry->data, 6, sizeof(__le32)))
++);
++
++DEFINE_EVENT(cmdq, hns_cmdq_req,
++	     TP_PROTO(struct hns_roce_dev *hr_dev,
++		      struct hns_roce_cmq_desc *desc),
++	     TP_ARGS(hr_dev, desc));
++DEFINE_EVENT(cmdq, hns_cmdq_resp,
++	     TP_PROTO(struct hns_roce_dev *hr_dev,
++		      struct hns_roce_cmq_desc *desc),
++	     TP_ARGS(hr_dev, desc));
++
+ #endif /* __HNS_ROCE_TRACE_H */
+ 
+ #undef TRACE_INCLUDE_FILE
+-- 
+2.52.0
+
