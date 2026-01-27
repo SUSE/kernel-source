@@ -1,0 +1,201 @@
+From 1a40c362ae265ca4004f7373b34c22af6810f6cb Mon Sep 17 00:00:00 2001
+From: Michael Margolin <mrgolin@amazon.com>
+Date: Tue, 8 Jul 2025 20:23:06 +0000
+Subject: [PATCH 1/1] RDMA/uverbs: Add a common way to create CQ with umem
+Git-commit: 1a40c362ae265ca4004f7373b34c22af6810f6cb
+Patch-mainline: v6.17-rc1
+References: jsc#PED-15314
+
+Add ioctl command attributes and a common handling for the option to
+create CQs with memory buffers passed from userspace. When required
+attributes are supplied, create umem and provide it for driver's use.
+The extension enables creation of CQs on top of preallocated CPU
+virtual or device memory buffers, by supplying VA or dmabuf fd, in a
+common way.
+Drivers can support this flow by initializing a new create_cq_umem fp
+field in their ops struct, with a function that can handle the new
+parameter.
+
+Signed-off-by: Michael Margolin <mrgolin@amazon.com>
+Link: https://patch.msgid.link/20250708202308.24783-2-mrgolin@amazon.com
+Reviewed-by: Jason Gunthorpe <jgg@nvidia.com>
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Acked-by: Nicolas Morey <nmorey@suse.com>
+---
+ drivers/infiniband/core/device.c              |  1 +
+ drivers/infiniband/core/uverbs_std_types_cq.c | 87 +++++++++++++++++--
+ include/rdma/ib_verbs.h                       |  4 +
+ include/uapi/rdma/ib_user_ioctl_cmds.h        |  4 +
+ 4 files changed, 90 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/infiniband/core/device.c b/drivers/infiniband/core/device.c
+index 1ca6a9b7ba1a..f301cdce1728 100644
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@ -2728,6 +2728,7 @@ void ib_set_device_ops(struct ib_device *dev, const struct ib_device_ops *ops)
+ 	SET_DEVICE_OP(dev_ops, create_ah);
+ 	SET_DEVICE_OP(dev_ops, create_counters);
+ 	SET_DEVICE_OP(dev_ops, create_cq);
++	SET_DEVICE_OP(dev_ops, create_cq_umem);
+ 	SET_DEVICE_OP(dev_ops, create_flow);
+ 	SET_DEVICE_OP(dev_ops, create_qp);
+ 	SET_DEVICE_OP(dev_ops, create_rwq_ind_table);
+diff --git a/drivers/infiniband/core/uverbs_std_types_cq.c b/drivers/infiniband/core/uverbs_std_types_cq.c
+index 432054f0a8a4..37cd37556510 100644
+--- a/drivers/infiniband/core/uverbs_std_types_cq.c
++++ b/drivers/infiniband/core/uverbs_std_types_cq.c
+@@ -64,15 +64,21 @@ static int UVERBS_HANDLER(UVERBS_METHOD_CQ_CREATE)(
+ 	struct ib_ucq_object *obj = container_of(
+ 		uverbs_attr_get_uobject(attrs, UVERBS_ATTR_CREATE_CQ_HANDLE),
+ 		typeof(*obj), uevent.uobject);
++	struct ib_uverbs_completion_event_file *ev_file = NULL;
+ 	struct ib_device *ib_dev = attrs->context->device;
+-	int ret;
+-	u64 user_handle;
++	struct ib_umem_dmabuf *umem_dmabuf;
+ 	struct ib_cq_init_attr attr = {};
+-	struct ib_cq                   *cq;
+-	struct ib_uverbs_completion_event_file    *ev_file = NULL;
+ 	struct ib_uobject *ev_file_uobj;
++	struct ib_umem *umem = NULL;
++	u64 buffer_length;
++	u64 buffer_offset;
++	struct ib_cq *cq;
++	u64 user_handle;
++	u64 buffer_va;
++	int buffer_fd;
++	int ret;
+ 
+-	if (!ib_dev->ops.create_cq || !ib_dev->ops.destroy_cq)
++	if ((!ib_dev->ops.create_cq && !ib_dev->ops.create_cq_umem) || !ib_dev->ops.destroy_cq)
+ 		return -EOPNOTSUPP;
+ 
+ 	ret = uverbs_copy_from(&attr.comp_vector, attrs,
+@@ -112,9 +118,66 @@ static int UVERBS_HANDLER(UVERBS_METHOD_CQ_CREATE)(
+ 	INIT_LIST_HEAD(&obj->comp_list);
+ 	INIT_LIST_HEAD(&obj->uevent.event_list);
+ 
++	if (uverbs_attr_is_valid(attrs, UVERBS_ATTR_CREATE_CQ_BUFFER_VA)) {
++
++		ret = uverbs_copy_from(&buffer_va, attrs, UVERBS_ATTR_CREATE_CQ_BUFFER_VA);
++		if (ret)
++			goto err_event_file;
++
++		ret = uverbs_copy_from(&buffer_length, attrs, UVERBS_ATTR_CREATE_CQ_BUFFER_LENGTH);
++		if (ret)
++			goto err_event_file;
++
++		if (uverbs_attr_is_valid(attrs, UVERBS_ATTR_CREATE_CQ_BUFFER_FD) ||
++		    uverbs_attr_is_valid(attrs, UVERBS_ATTR_CREATE_CQ_BUFFER_OFFSET) ||
++		    !ib_dev->ops.create_cq_umem) {
++			ret = -EINVAL;
++			goto err_event_file;
++		}
++
++		umem = ib_umem_get(ib_dev, buffer_va, buffer_length, IB_ACCESS_LOCAL_WRITE);
++		if (IS_ERR(umem)) {
++			ret = PTR_ERR(umem);
++			goto err_event_file;
++		}
++	} else if (uverbs_attr_is_valid(attrs, UVERBS_ATTR_CREATE_CQ_BUFFER_FD)) {
++
++		ret = uverbs_get_raw_fd(&buffer_fd, attrs, UVERBS_ATTR_CREATE_CQ_BUFFER_FD);
++		if (ret)
++			goto err_event_file;
++
++		ret = uverbs_copy_from(&buffer_offset, attrs, UVERBS_ATTR_CREATE_CQ_BUFFER_OFFSET);
++		if (ret)
++			goto err_event_file;
++
++		ret = uverbs_copy_from(&buffer_length, attrs, UVERBS_ATTR_CREATE_CQ_BUFFER_LENGTH);
++		if (ret)
++			goto err_event_file;
++
++		if (uverbs_attr_is_valid(attrs, UVERBS_ATTR_CREATE_CQ_BUFFER_VA) ||
++		    !ib_dev->ops.create_cq_umem) {
++			ret = -EINVAL;
++			goto err_event_file;
++		}
++
++		umem_dmabuf = ib_umem_dmabuf_get_pinned(ib_dev, buffer_offset, buffer_length,
++							buffer_fd, IB_ACCESS_LOCAL_WRITE);
++		if (IS_ERR(umem_dmabuf)) {
++			ret = PTR_ERR(umem_dmabuf);
++			goto err_event_file;
++		}
++		umem = &umem_dmabuf->umem;
++	} else if (uverbs_attr_is_valid(attrs, UVERBS_ATTR_CREATE_CQ_BUFFER_OFFSET) ||
++		   uverbs_attr_is_valid(attrs, UVERBS_ATTR_CREATE_CQ_BUFFER_LENGTH) ||
++		   !ib_dev->ops.create_cq) {
++		ret = -EINVAL;
++		goto err_event_file;
++	}
++
+ 	cq = rdma_zalloc_drv_obj(ib_dev, ib_cq);
+ 	if (!cq) {
+ 		ret = -ENOMEM;
++		ib_umem_release(umem);
+ 		goto err_event_file;
+ 	}
+ 
+@@ -128,7 +191,8 @@ static int UVERBS_HANDLER(UVERBS_METHOD_CQ_CREATE)(
+ 	rdma_restrack_new(&cq->res, RDMA_RESTRACK_CQ);
+ 	rdma_restrack_set_name(&cq->res, NULL);
+ 
+-	ret = ib_dev->ops.create_cq(cq, &attr, attrs);
++	ret = umem ? ib_dev->ops.create_cq_umem(cq, &attr, umem, attrs) :
++		ib_dev->ops.create_cq(cq, &attr, attrs);
+ 	if (ret)
+ 		goto err_free;
+ 
+@@ -180,6 +244,17 @@ DECLARE_UVERBS_NAMED_METHOD(
+ 		       UVERBS_OBJECT_ASYNC_EVENT,
+ 		       UVERBS_ACCESS_READ,
+ 		       UA_OPTIONAL),
++	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_CREATE_CQ_BUFFER_VA,
++			   UVERBS_ATTR_TYPE(u64),
++			   UA_OPTIONAL),
++	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_CREATE_CQ_BUFFER_LENGTH,
++			   UVERBS_ATTR_TYPE(u64),
++			   UA_OPTIONAL),
++	UVERBS_ATTR_RAW_FD(UVERBS_ATTR_CREATE_CQ_BUFFER_FD,
++			   UA_OPTIONAL),
++	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_CREATE_CQ_BUFFER_OFFSET,
++			   UVERBS_ATTR_TYPE(u64),
++			   UA_OPTIONAL),
+ 	UVERBS_ATTR_UHW());
+ 
+ static int UVERBS_HANDLER(UVERBS_METHOD_CQ_DESTROY)(
+diff --git a/include/rdma/ib_verbs.h b/include/rdma/ib_verbs.h
+index 1d123812a1f9..3fb1c963eeb0 100644
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -2486,6 +2486,10 @@ struct ib_device_ops {
+ 	int (*destroy_qp)(struct ib_qp *qp, struct ib_udata *udata);
+ 	int (*create_cq)(struct ib_cq *cq, const struct ib_cq_init_attr *attr,
+ 			 struct uverbs_attr_bundle *attrs);
++	int (*create_cq_umem)(struct ib_cq *cq,
++			      const struct ib_cq_init_attr *attr,
++			      struct ib_umem *umem,
++			      struct uverbs_attr_bundle *attrs);
+ 	int (*modify_cq)(struct ib_cq *cq, u16 cq_count, u16 cq_period);
+ 	int (*destroy_cq)(struct ib_cq *cq, struct ib_udata *udata);
+ 	int (*resize_cq)(struct ib_cq *cq, int cqe, struct ib_udata *udata);
+diff --git a/include/uapi/rdma/ib_user_ioctl_cmds.h b/include/uapi/rdma/ib_user_ioctl_cmds.h
+index ac7b162611ed..5f3e5bee51b2 100644
+--- a/include/uapi/rdma/ib_user_ioctl_cmds.h
++++ b/include/uapi/rdma/ib_user_ioctl_cmds.h
+@@ -105,6 +105,10 @@ enum uverbs_attrs_create_cq_cmd_attr_ids {
+ 	UVERBS_ATTR_CREATE_CQ_FLAGS,
+ 	UVERBS_ATTR_CREATE_CQ_RESP_CQE,
+ 	UVERBS_ATTR_CREATE_CQ_EVENT_FD,
++	UVERBS_ATTR_CREATE_CQ_BUFFER_VA,
++	UVERBS_ATTR_CREATE_CQ_BUFFER_LENGTH,
++	UVERBS_ATTR_CREATE_CQ_BUFFER_FD,
++	UVERBS_ATTR_CREATE_CQ_BUFFER_OFFSET,
+ };
+ 
+ enum uverbs_attrs_destroy_cq_cmd_attr_ids {
+-- 
+2.52.0
+
