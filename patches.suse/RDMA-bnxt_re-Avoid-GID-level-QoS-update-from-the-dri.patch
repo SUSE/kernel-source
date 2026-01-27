@@ -1,0 +1,236 @@
+From eba165b2909716c690351d21d9b6b6d95b9e1f59 Mon Sep 17 00:00:00 2001
+From: Shravya KN <shravya.k-n@broadcom.com>
+Date: Mon, 8 Sep 2025 15:15:16 +0530
+Subject: [PATCH 1/1] RDMA/bnxt_re: Avoid GID level QoS update from the driver
+Git-commit: eba165b2909716c690351d21d9b6b6d95b9e1f59
+Patch-mainline: v6.18-rc1
+References: jsc#PED-15349
+
+The driver inserts a VLAN header into RoCE packets when the
+traffic was untagged by modifying the existing GID entries.
+This has caused the firmware to enforce only VLAN-based
+priority mappings, ignoring other valid priority configurations
+set via APP TLVs (e.g., DSCP selectors).
+
+Driver now has support for selecting the service level (vlan id)
+and traffic class (dscp) during modify_qp. So no need to override
+the priority update using the update gid method. Hence removing
+the code that handles the above operation.
+
+Signed-off-by: Shravya KN <shravya.k-n@broadcom.com>
+Link: https://patch.msgid.link/20250908094516.18222-3-kalesh-anakkur.purayil@broadcom.com
+Reviewed-by: Saravanan Vajravel <saravanan.vajravel@broadcom.com>
+Reviewed-by: Selvin Xavier <selvin.xavier@broadcom.com>
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Acked-by: Nicolas Morey <nmorey@suse.com>
+---
+ drivers/infiniband/hw/bnxt_re/bnxt_re.h  |  4 -
+ drivers/infiniband/hw/bnxt_re/main.c     | 97 ------------------------
+ drivers/infiniband/hw/bnxt_re/qplib_sp.c | 40 ----------
+ 3 files changed, 141 deletions(-)
+
+diff --git a/drivers/infiniband/hw/bnxt_re/bnxt_re.h b/drivers/infiniband/hw/bnxt_re/bnxt_re.h
+index ac0944b28ca0..3485e495ac6a 100644
+--- a/drivers/infiniband/hw/bnxt_re/bnxt_re.h
++++ b/drivers/infiniband/hw/bnxt_re/bnxt_re.h
+@@ -175,7 +175,6 @@ struct bnxt_re_dev {
+ #define BNXT_RE_FLAG_STATS_CTX3_ALLOC		1
+ #define BNXT_RE_FLAG_HAVE_L2_REF		3
+ #define BNXT_RE_FLAG_RCFW_CHANNEL_EN		4
+-#define BNXT_RE_FLAG_QOS_WORK_REG		5
+ #define BNXT_RE_FLAG_RESOURCES_ALLOCATED	7
+ #define BNXT_RE_FLAG_RESOURCES_INITIALIZED	8
+ #define BNXT_RE_FLAG_ERR_DEVICE_DETACHED       17
+@@ -188,9 +187,6 @@ struct bnxt_re_dev {
+ 
+ 	int				id;
+ 
+-	struct delayed_work		worker;
+-	u8				cur_prio_map;
+-
+ 	/* RCFW Channel */
+ 	struct bnxt_qplib_rcfw		rcfw;
+ 
+diff --git a/drivers/infiniband/hw/bnxt_re/main.c b/drivers/infiniband/hw/bnxt_re/main.c
+index bdc9022c19e1..d8d3999d329e 100644
+--- a/drivers/infiniband/hw/bnxt_re/main.c
++++ b/drivers/infiniband/hw/bnxt_re/main.c
+@@ -1927,81 +1927,6 @@ static void bnxt_re_dev_stop(struct bnxt_re_dev *rdev)
+ 	mutex_unlock(&rdev->qp_lock);
+ }
+ 
+-static int bnxt_re_update_gid(struct bnxt_re_dev *rdev)
+-{
+-	struct bnxt_qplib_sgid_tbl *sgid_tbl = &rdev->qplib_res.sgid_tbl;
+-	struct bnxt_qplib_gid gid;
+-	u16 gid_idx, index;
+-	int rc = 0;
+-
+-	if (!ib_device_try_get(&rdev->ibdev))
+-		return 0;
+-
+-	for (index = 0; index < sgid_tbl->active; index++) {
+-		gid_idx = sgid_tbl->hw_id[index];
+-
+-		if (!memcmp(&sgid_tbl->tbl[index], &bnxt_qplib_gid_zero,
+-			    sizeof(bnxt_qplib_gid_zero)))
+-			continue;
+-		/* need to modify the VLAN enable setting of non VLAN GID only
+-		 * as setting is done for VLAN GID while adding GID
+-		 */
+-		if (sgid_tbl->vlan[index])
+-			continue;
+-
+-		memcpy(&gid, &sgid_tbl->tbl[index], sizeof(gid));
+-
+-		rc = bnxt_qplib_update_sgid(sgid_tbl, &gid, gid_idx,
+-					    rdev->qplib_res.netdev->dev_addr);
+-	}
+-
+-	ib_device_put(&rdev->ibdev);
+-	return rc;
+-}
+-
+-static u32 bnxt_re_get_priority_mask(struct bnxt_re_dev *rdev)
+-{
+-	u32 prio_map = 0, tmp_map = 0;
+-	struct net_device *netdev;
+-	struct dcb_app app = {};
+-
+-	netdev = rdev->netdev;
+-
+-	app.selector = IEEE_8021QAZ_APP_SEL_ETHERTYPE;
+-	app.protocol = ETH_P_IBOE;
+-	tmp_map = dcb_ieee_getapp_mask(netdev, &app);
+-	prio_map = tmp_map;
+-
+-	app.selector = IEEE_8021QAZ_APP_SEL_DGRAM;
+-	app.protocol = ROCE_V2_UDP_DPORT;
+-	tmp_map = dcb_ieee_getapp_mask(netdev, &app);
+-	prio_map |= tmp_map;
+-
+-	return prio_map;
+-}
+-
+-static int bnxt_re_setup_qos(struct bnxt_re_dev *rdev)
+-{
+-	u8 prio_map = 0;
+-
+-	/* Get priority for roce */
+-	prio_map = bnxt_re_get_priority_mask(rdev);
+-
+-	if (prio_map == rdev->cur_prio_map)
+-		return 0;
+-	rdev->cur_prio_map = prio_map;
+-	/* Actual priorities are not programmed as they are already
+-	 * done by L2 driver; just enable or disable priority vlan tagging
+-	 */
+-	if ((prio_map == 0 && rdev->qplib_res.prio) ||
+-	    (prio_map != 0 && !rdev->qplib_res.prio)) {
+-		rdev->qplib_res.prio = prio_map;
+-		bnxt_re_update_gid(rdev);
+-	}
+-
+-	return 0;
+-}
+-
+ static void bnxt_re_net_unregister_async_event(struct bnxt_re_dev *rdev)
+ {
+ 	if (rdev->is_virtfn)
+@@ -2197,9 +2122,6 @@ static void bnxt_re_dev_uninit(struct bnxt_re_dev *rdev, u8 op_type)
+ 	bnxt_re_net_unregister_async_event(rdev);
+ 	bnxt_re_uninit_dcb_wq(rdev);
+ 
+-	if (test_and_clear_bit(BNXT_RE_FLAG_QOS_WORK_REG, &rdev->flags))
+-		cancel_delayed_work_sync(&rdev->worker);
+-
+ 	bnxt_re_put_stats3_ctx(rdev);
+ 
+ 	bnxt_re_free_gid_ctx(rdev);
+@@ -2234,16 +2156,6 @@ static void bnxt_re_dev_uninit(struct bnxt_re_dev *rdev, u8 op_type)
+ 	}
+ }
+ 
+-/* worker thread for polling periodic events. Now used for QoS programming*/
+-static void bnxt_re_worker(struct work_struct *work)
+-{
+-	struct bnxt_re_dev *rdev = container_of(work, struct bnxt_re_dev,
+-						worker.work);
+-
+-	bnxt_re_setup_qos(rdev);
+-	schedule_delayed_work(&rdev->worker, msecs_to_jiffies(30000));
+-}
+-
+ static int bnxt_re_dev_init(struct bnxt_re_dev *rdev, u8 op_type)
+ {
+ 	struct bnxt_re_ring_attr rattr = {};
+@@ -2399,15 +2311,6 @@ static int bnxt_re_dev_init(struct bnxt_re_dev *rdev, u8 op_type)
+ 		if (rc)
+ 			ibdev_warn(&rdev->ibdev, "Failed to query CC defaults\n");
+ 
+-		rc = bnxt_re_setup_qos(rdev);
+-		if (rc)
+-			ibdev_info(&rdev->ibdev,
+-				   "RoCE priority not yet configured\n");
+-
+-		INIT_DELAYED_WORK(&rdev->worker, bnxt_re_worker);
+-		set_bit(BNXT_RE_FLAG_QOS_WORK_REG, &rdev->flags);
+-		schedule_delayed_work(&rdev->worker, msecs_to_jiffies(30000));
+-
+ 		if (!(rdev->qplib_res.en_dev->flags & BNXT_EN_FLAG_ROCE_VF_RES_MGMT))
+ 			bnxt_re_vf_res_config(rdev);
+ 	}
+diff --git a/drivers/infiniband/hw/bnxt_re/qplib_sp.c b/drivers/infiniband/hw/bnxt_re/qplib_sp.c
+index 698fcad9f034..9ef581ed785c 100644
+--- a/drivers/infiniband/hw/bnxt_re/qplib_sp.c
++++ b/drivers/infiniband/hw/bnxt_re/qplib_sp.c
+@@ -400,46 +400,6 @@ int bnxt_qplib_add_sgid(struct bnxt_qplib_sgid_tbl *sgid_tbl,
+ 	return 0;
+ }
+ 
+-int bnxt_qplib_update_sgid(struct bnxt_qplib_sgid_tbl *sgid_tbl,
+-			   struct bnxt_qplib_gid *gid, u16 gid_idx,
+-			   const u8 *smac)
+-{
+-	struct bnxt_qplib_res *res = to_bnxt_qplib(sgid_tbl,
+-						   struct bnxt_qplib_res,
+-						   sgid_tbl);
+-	struct bnxt_qplib_rcfw *rcfw = res->rcfw;
+-	struct creq_modify_gid_resp resp = {};
+-	struct bnxt_qplib_cmdqmsg msg = {};
+-	struct cmdq_modify_gid req = {};
+-	int rc;
+-
+-	bnxt_qplib_rcfw_cmd_prep((struct cmdq_base *)&req,
+-				 CMDQ_BASE_OPCODE_MODIFY_GID,
+-				 sizeof(req));
+-
+-	req.gid[0] = cpu_to_be32(((u32 *)gid->data)[3]);
+-	req.gid[1] = cpu_to_be32(((u32 *)gid->data)[2]);
+-	req.gid[2] = cpu_to_be32(((u32 *)gid->data)[1]);
+-	req.gid[3] = cpu_to_be32(((u32 *)gid->data)[0]);
+-	if (res->prio) {
+-		req.vlan |= cpu_to_le16
+-			(CMDQ_ADD_GID_VLAN_TPID_TPID_8100 |
+-			 CMDQ_ADD_GID_VLAN_VLAN_EN);
+-	}
+-
+-	/* MAC in network format */
+-	req.src_mac[0] = cpu_to_be16(((u16 *)smac)[0]);
+-	req.src_mac[1] = cpu_to_be16(((u16 *)smac)[1]);
+-	req.src_mac[2] = cpu_to_be16(((u16 *)smac)[2]);
+-
+-	req.gid_index = cpu_to_le16(gid_idx);
+-
+-	bnxt_qplib_fill_cmdqmsg(&msg, &req, &resp, NULL, sizeof(req),
+-				sizeof(resp), 0);
+-	rc = bnxt_qplib_rcfw_send_message(rcfw, &msg);
+-	return rc;
+-}
+-
+ /* AH */
+ int bnxt_qplib_create_ah(struct bnxt_qplib_res *res, struct bnxt_qplib_ah *ah,
+ 			 bool block)
+-- 
+2.52.0
+
