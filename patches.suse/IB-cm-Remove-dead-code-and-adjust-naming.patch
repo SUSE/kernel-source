@@ -1,0 +1,276 @@
+From 45611fe821af0e09cb9dc2dfd2418b2e1e1831f3 Mon Sep 17 00:00:00 2001
+From: Vlad Dumitrescu <vdumitrescu@nvidia.com>
+Date: Wed, 21 May 2025 14:34:17 +0300
+Subject: [PATCH 1/1] IB/cm: Remove dead code and adjust naming
+Git-commit: 45611fe821af0e09cb9dc2dfd2418b2e1e1831f3
+Patch-mainline: v6.16-rc1
+References: jsc#PED-15314
+
+Drop ib_send_cm_mra parameters which are always constant. Remove branch
+which is never taken. Adjust name to ib_prepare_cm_mra, which better
+reflects its functionality - no MRA is actually sent. Adjust name of
+related tracepoints. Push setting of the constant service timeout to
+cm.c and drop IB_CM_MRA_FLAG_DELAY.
+
+Signed-off-by: Vlad Dumitrescu <vdumitrescu@nvidia.com>
+Reviewed-by: Sean Hefty <shefty@nvidia.com>
+Link: https://patch.msgid.link/cdd2a237acf2b495c19ce02e4b1c42c41c6751c2.1747827207.git.leon@kernel.org
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Acked-by: Nicolas Morey <nmorey@suse.com>
+---
+ drivers/infiniband/core/cm.c        | 59 +++++------------------------
+ drivers/infiniband/core/cm_trace.h  |  2 +-
+ drivers/infiniband/core/cma.c       |  9 ++---
+ drivers/infiniband/core/cma_trace.h |  2 +-
+ include/rdma/ib_cm.h                | 17 ++-------
+ 5 files changed, 19 insertions(+), 70 deletions(-)
+
+diff --git a/drivers/infiniband/core/cm.c b/drivers/infiniband/core/cm.c
+index e64cbd034a2a..8670e58675c6 100644
+--- a/drivers/infiniband/core/cm.c
++++ b/drivers/infiniband/core/cm.c
+@@ -36,6 +36,7 @@ MODULE_LICENSE("Dual BSD/GPL");
+ 
+ #define CM_DESTROY_ID_WAIT_TIMEOUT 10000 /* msecs */
+ #define CM_DIRECT_RETRY_CTX ((void *) 1UL)
++#define CM_MRA_SETTING 24 /* 4.096us * 2^24 = ~68.7 seconds */
+ 
+ static const char * const ibcm_rej_reason_strs[] = {
+ 	[IB_CM_REJ_NO_QP]			= "no QP",
+@@ -241,7 +242,6 @@ struct cm_id_private {
+ 	u8 initiator_depth;
+ 	u8 retry_count;
+ 	u8 rnr_retry_count;
+-	u8 service_timeout;
+ 	u8 target_ack_delay;
+ 
+ 	struct list_head work_list;
+@@ -1872,7 +1872,7 @@ static void cm_process_work(struct cm_id_private *cm_id_priv,
+ 
+ static void cm_format_mra(struct cm_mra_msg *mra_msg,
+ 			  struct cm_id_private *cm_id_priv,
+-			  enum cm_msg_response msg_mraed, u8 service_timeout,
++			  enum cm_msg_response msg_mraed,
+ 			  const void *private_data, u8 private_data_len)
+ {
+ 	cm_format_mad_hdr(&mra_msg->hdr, CM_MRA_ATTR_ID, cm_id_priv->tid);
+@@ -1881,7 +1881,7 @@ static void cm_format_mra(struct cm_mra_msg *mra_msg,
+ 		be32_to_cpu(cm_id_priv->id.local_id));
+ 	IBA_SET(CM_MRA_REMOTE_COMM_ID, mra_msg,
+ 		be32_to_cpu(cm_id_priv->id.remote_id));
+-	IBA_SET(CM_MRA_SERVICE_TIMEOUT, mra_msg, service_timeout);
++	IBA_SET(CM_MRA_SERVICE_TIMEOUT, mra_msg, CM_MRA_SETTING);
+ 
+ 	if (private_data && private_data_len)
+ 		IBA_SET_MEM(CM_MRA_PRIVATE_DATA, mra_msg, private_data,
+@@ -1960,7 +1960,7 @@ static void cm_dup_req_handler(struct cm_work *work,
+ 	switch (cm_id_priv->id.state) {
+ 	case IB_CM_MRA_REQ_SENT:
+ 		cm_format_mra((struct cm_mra_msg *) msg->mad, cm_id_priv,
+-			      CM_MSG_RESPONSE_REQ, cm_id_priv->service_timeout,
++			      CM_MSG_RESPONSE_REQ,
+ 			      cm_id_priv->private_data,
+ 			      cm_id_priv->private_data_len);
+ 		break;
+@@ -2454,7 +2454,7 @@ static void cm_dup_rep_handler(struct cm_work *work)
+ 			      cm_id_priv->private_data_len);
+ 	else if (cm_id_priv->id.state == IB_CM_MRA_REP_SENT)
+ 		cm_format_mra((struct cm_mra_msg *) msg->mad, cm_id_priv,
+-			      CM_MSG_RESPONSE_REP, cm_id_priv->service_timeout,
++			      CM_MSG_RESPONSE_REP,
+ 			      cm_id_priv->private_data,
+ 			      cm_id_priv->private_data_len);
+ 	else
+@@ -3094,26 +3094,13 @@ static int cm_rej_handler(struct cm_work *work)
+ 	return -EINVAL;
+ }
+ 
+-int ib_send_cm_mra(struct ib_cm_id *cm_id,
+-		   u8 service_timeout,
+-		   const void *private_data,
+-		   u8 private_data_len)
++int ib_prepare_cm_mra(struct ib_cm_id *cm_id)
+ {
+ 	struct cm_id_private *cm_id_priv;
+-	struct ib_mad_send_buf *msg;
+ 	enum ib_cm_state cm_state;
+ 	enum ib_cm_lap_state lap_state;
+-	enum cm_msg_response msg_response;
+-	void *data;
+ 	unsigned long flags;
+-	int ret;
+-
+-	if (private_data && private_data_len > IB_CM_MRA_PRIVATE_DATA_SIZE)
+-		return -EINVAL;
+-
+-	data = cm_copy_private_data(private_data, private_data_len);
+-	if (IS_ERR(data))
+-		return PTR_ERR(data);
++	int ret = 0;
+ 
+ 	cm_id_priv = container_of(cm_id, struct cm_id_private, id);
+ 
+@@ -3122,58 +3109,33 @@ int ib_send_cm_mra(struct ib_cm_id *cm_id,
+ 	case IB_CM_REQ_RCVD:
+ 		cm_state = IB_CM_MRA_REQ_SENT;
+ 		lap_state = cm_id->lap_state;
+-		msg_response = CM_MSG_RESPONSE_REQ;
+ 		break;
+ 	case IB_CM_REP_RCVD:
+ 		cm_state = IB_CM_MRA_REP_SENT;
+ 		lap_state = cm_id->lap_state;
+-		msg_response = CM_MSG_RESPONSE_REP;
+ 		break;
+ 	case IB_CM_ESTABLISHED:
+ 		if (cm_id->lap_state == IB_CM_LAP_RCVD) {
+ 			cm_state = cm_id->state;
+ 			lap_state = IB_CM_MRA_LAP_SENT;
+-			msg_response = CM_MSG_RESPONSE_OTHER;
+ 			break;
+ 		}
+ 		fallthrough;
+ 	default:
+-		trace_icm_send_mra_unknown_err(&cm_id_priv->id);
++		trace_icm_prepare_mra_unknown_err(&cm_id_priv->id);
+ 		ret = -EINVAL;
+ 		goto error_unlock;
+ 	}
+ 
+-	if (!(service_timeout & IB_CM_MRA_FLAG_DELAY)) {
+-		msg = cm_alloc_msg(cm_id_priv);
+-		if (IS_ERR(msg)) {
+-			ret = PTR_ERR(msg);
+-			goto error_unlock;
+-		}
+-
+-		cm_format_mra((struct cm_mra_msg *) msg->mad, cm_id_priv,
+-			      msg_response, service_timeout,
+-			      private_data, private_data_len);
+-		trace_icm_send_mra(cm_id);
+-		ret = ib_post_send_mad(msg, NULL);
+-		if (ret)
+-			goto error_free_msg;
+-	}
+-
+ 	cm_id->state = cm_state;
+ 	cm_id->lap_state = lap_state;
+-	cm_id_priv->service_timeout = service_timeout;
+-	cm_set_private_data(cm_id_priv, data, private_data_len);
+-	spin_unlock_irqrestore(&cm_id_priv->lock, flags);
+-	return 0;
++	cm_set_private_data(cm_id_priv, NULL, 0);
+ 
+-error_free_msg:
+-	cm_free_msg(msg);
+ error_unlock:
+ 	spin_unlock_irqrestore(&cm_id_priv->lock, flags);
+-	kfree(data);
+ 	return ret;
+ }
+-EXPORT_SYMBOL(ib_send_cm_mra);
++EXPORT_SYMBOL(ib_prepare_cm_mra);
+ 
+ static struct cm_id_private *cm_acquire_mraed_id(struct cm_mra_msg *mra_msg)
+ {
+@@ -3377,7 +3339,6 @@ static int cm_lap_handler(struct cm_work *work)
+ 
+ 		cm_format_mra((struct cm_mra_msg *) msg->mad, cm_id_priv,
+ 			      CM_MSG_RESPONSE_OTHER,
+-			      cm_id_priv->service_timeout,
+ 			      cm_id_priv->private_data,
+ 			      cm_id_priv->private_data_len);
+ 		spin_unlock_irq(&cm_id_priv->lock);
+diff --git a/drivers/infiniband/core/cm_trace.h b/drivers/infiniband/core/cm_trace.h
+index 944d9071245d..4a4987da69d4 100644
+--- a/drivers/infiniband/core/cm_trace.h
++++ b/drivers/infiniband/core/cm_trace.h
+@@ -229,7 +229,7 @@ DEFINE_CM_ERR_EVENT(send_drep);
+ DEFINE_CM_ERR_EVENT(dreq_unknown);
+ DEFINE_CM_ERR_EVENT(send_unknown_rej);
+ DEFINE_CM_ERR_EVENT(rej_unknown);
+-DEFINE_CM_ERR_EVENT(send_mra_unknown);
++DEFINE_CM_ERR_EVENT(prepare_mra_unknown);
+ DEFINE_CM_ERR_EVENT(mra_unknown);
+ DEFINE_CM_ERR_EVENT(qp_init);
+ DEFINE_CM_ERR_EVENT(qp_rtr);
+diff --git a/drivers/infiniband/core/cma.c b/drivers/infiniband/core/cma.c
+index cd7df623161d..ccd0d9cf1dda 100644
+--- a/drivers/infiniband/core/cma.c
++++ b/drivers/infiniband/core/cma.c
+@@ -46,7 +46,6 @@ MODULE_LICENSE("Dual BSD/GPL");
+ 
+ #define CMA_CM_RESPONSE_TIMEOUT 20
+ #define CMA_MAX_CM_RETRIES 15
+-#define CMA_CM_MRA_SETTING (IB_CM_MRA_FLAG_DELAY | 24)
+ #define CMA_IBOE_PACKET_LIFETIME 16
+ #define CMA_PREFERRED_ROCE_GID_TYPE IB_GID_TYPE_ROCE_UDP_ENCAP
+ 
+@@ -2198,8 +2197,8 @@ static int cma_ib_handler(struct ib_cm_id *cm_id,
+ 	case IB_CM_REP_RECEIVED:
+ 		if (state == RDMA_CM_CONNECT &&
+ 		    (id_priv->id.qp_type != IB_QPT_UD)) {
+-			trace_cm_send_mra(id_priv);
+-			ib_send_cm_mra(cm_id, CMA_CM_MRA_SETTING, NULL, 0);
++			trace_cm_prepare_mra(id_priv);
++			ib_prepare_cm_mra(cm_id);
+ 		}
+ 		if (id_priv->id.qp) {
+ 			event.status = cma_rep_recv(id_priv);
+@@ -2460,8 +2459,8 @@ static int cma_ib_req_handler(struct ib_cm_id *cm_id,
+ 
+ 	if (READ_ONCE(conn_id->state) == RDMA_CM_CONNECT &&
+ 	    conn_id->id.qp_type != IB_QPT_UD) {
+-		trace_cm_send_mra(cm_id->context);
+-		ib_send_cm_mra(cm_id, CMA_CM_MRA_SETTING, NULL, 0);
++		trace_cm_prepare_mra(cm_id->context);
++		ib_prepare_cm_mra(cm_id);
+ 	}
+ 	mutex_unlock(&conn_id->handler_mutex);
+ 
+diff --git a/drivers/infiniband/core/cma_trace.h b/drivers/infiniband/core/cma_trace.h
+index dc622f3778be..3456d5f3aa47 100644
+--- a/drivers/infiniband/core/cma_trace.h
++++ b/drivers/infiniband/core/cma_trace.h
+@@ -55,7 +55,7 @@ DECLARE_EVENT_CLASS(cma_fsm_class,
+ 
+ DEFINE_CMA_FSM_EVENT(send_rtu);
+ DEFINE_CMA_FSM_EVENT(send_rej);
+-DEFINE_CMA_FSM_EVENT(send_mra);
++DEFINE_CMA_FSM_EVENT(prepare_mra);
+ DEFINE_CMA_FSM_EVENT(send_sidr_req);
+ DEFINE_CMA_FSM_EVENT(send_sidr_rep);
+ DEFINE_CMA_FSM_EVENT(disconnect);
+diff --git a/include/rdma/ib_cm.h b/include/rdma/ib_cm.h
+index a2ac62b4a6cf..1fa3786f82f4 100644
+--- a/include/rdma/ib_cm.h
++++ b/include/rdma/ib_cm.h
+@@ -480,23 +480,12 @@ int ib_send_cm_rej(struct ib_cm_id *cm_id,
+ 		   const void *private_data,
+ 		   u8 private_data_len);
+ 
+-#define IB_CM_MRA_FLAG_DELAY 0x80  /* Send MRA only after a duplicate msg */
+-
+ /**
+- * ib_send_cm_mra - Sends a message receipt acknowledgement to a connection
+- *   message.
++ * ib_prepare_cm_mra - Prepares to send a message receipt acknowledgment to a
++     connection message in case duplicates are received.
+  * @cm_id: Connection identifier associated with the connection message.
+- * @service_timeout: The lower 5-bits specify the maximum time required for
+- *   the sender to reply to the connection message.  The upper 3-bits
+- *   specify additional control flags.
+- * @private_data: Optional user-defined private data sent with the
+- *   message receipt acknowledgement.
+- * @private_data_len: Size of the private data buffer, in bytes.
+  */
+-int ib_send_cm_mra(struct ib_cm_id *cm_id,
+-		   u8 service_timeout,
+-		   const void *private_data,
+-		   u8 private_data_len);
++int ib_prepare_cm_mra(struct ib_cm_id *cm_id);
+ 
+ /**
+  * ib_cm_init_qp_attr - Initializes the QP attributes for use in transitioning
+-- 
+2.52.0
+
