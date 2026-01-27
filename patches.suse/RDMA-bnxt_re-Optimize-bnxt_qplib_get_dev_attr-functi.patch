@@ -1,0 +1,101 @@
+From 832fc9e1614e00bb9d7b8350c65b4637a9941cdf Mon Sep 17 00:00:00 2001
+From: Damodharam Ammepalli <damodharam.ammepalli@broadcom.com>
+Date: Thu, 14 Aug 2025 16:55:51 +0530
+Subject: [PATCH 1/1] RDMA/bnxt_re: Optimize bnxt_qplib_get_dev_attr function
+Git-commit: 832fc9e1614e00bb9d7b8350c65b4637a9941cdf
+Patch-mainline: v6.18-rc1
+References: jsc#PED-15349
+
+Optimize bnxt_qplib_get_dev_attr() by separating out query_version which
+uses creq notification method to host. Due to serialization of cmdq by
+firmware, expected latency in response to heavy multi-threaded rdma
+applications might be observed.
+
+This patch separates the version_query logic out of device attribute
+query and called only during rdma driver init.
+
+Signed-off-by: Damodharam Ammepalli <damodharam.ammepalli@broadcom.com>
+Reviewed-by: Hongguang Gao <hongguang.gao@broadcom.com>
+Signed-off-by: Kalesh AP <kalesh-anakkur.purayil@broadcom.com>
+Link: https://patch.msgid.link/20250814112555.221665-6-kalesh-anakkur.purayil@broadcom.com
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Acked-by: Nicolas Morey <nmorey@suse.com>
+---
+ drivers/infiniband/hw/bnxt_re/main.c     |  1 +
+ drivers/infiniband/hw/bnxt_re/qplib_sp.c | 15 +++++++--------
+ drivers/infiniband/hw/bnxt_re/qplib_sp.h |  1 +
+ 3 files changed, 9 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/infiniband/hw/bnxt_re/main.c b/drivers/infiniband/hw/bnxt_re/main.c
+index 059cc1a15165..10dd498bd206 100644
+--- a/drivers/infiniband/hw/bnxt_re/main.c
++++ b/drivers/infiniband/hw/bnxt_re/main.c
+@@ -2178,6 +2178,7 @@ static int bnxt_re_dev_init(struct bnxt_re_dev *rdev, u8 op_type)
+ 	if (rc)
+ 		goto disable_rcfw;
+ 
++	bnxt_qplib_query_version(&rdev->rcfw);
+ 	bnxt_re_set_resource_limits(rdev);
+ 
+ 	rc = bnxt_qplib_alloc_ctx(&rdev->qplib_res, &rdev->qplib_ctx, 0,
+diff --git a/drivers/infiniband/hw/bnxt_re/qplib_sp.c b/drivers/infiniband/hw/bnxt_re/qplib_sp.c
+index 68981399598d..b602a1da19cd 100644
+--- a/drivers/infiniband/hw/bnxt_re/qplib_sp.c
++++ b/drivers/infiniband/hw/bnxt_re/qplib_sp.c
+@@ -66,14 +66,15 @@ static bool bnxt_qplib_is_atomic_cap(struct bnxt_qplib_rcfw *rcfw)
+ 	return (pcie_ctl2 & PCI_EXP_DEVCTL2_ATOMIC_REQ);
+ }
+ 
+-static void bnxt_qplib_query_version(struct bnxt_qplib_rcfw *rcfw,
+-				     char *fw_ver)
++void bnxt_qplib_query_version(struct bnxt_qplib_rcfw *rcfw)
+ {
+ 	struct creq_query_version_resp resp = {};
+ 	struct bnxt_qplib_cmdqmsg msg = {};
+ 	struct cmdq_query_version req = {};
++	struct bnxt_qplib_dev_attr *attr;
+ 	int rc;
+ 
++	attr = rcfw->res->dattr;
+ 	bnxt_qplib_rcfw_cmd_prep((struct cmdq_base *)&req,
+ 				 CMDQ_BASE_OPCODE_QUERY_VERSION,
+ 				 sizeof(req));
+@@ -82,10 +83,10 @@ static void bnxt_qplib_query_version(struct bnxt_qplib_rcfw *rcfw,
+ 	rc = bnxt_qplib_rcfw_send_message(rcfw, &msg);
+ 	if (rc)
+ 		return;
+-	fw_ver[0] = resp.fw_maj;
+-	fw_ver[1] = resp.fw_minor;
+-	fw_ver[2] = resp.fw_bld;
+-	fw_ver[3] = resp.fw_rsvd;
++	attr->fw_ver[0] = resp.fw_maj;
++	attr->fw_ver[1] = resp.fw_minor;
++	attr->fw_ver[2] = resp.fw_bld;
++	attr->fw_ver[3] = resp.fw_rsvd;
+ }
+ 
+ int bnxt_qplib_get_dev_attr(struct bnxt_qplib_rcfw *rcfw)
+@@ -179,8 +180,6 @@ int bnxt_qplib_get_dev_attr(struct bnxt_qplib_rcfw *rcfw)
+ 	if (_is_max_srq_ext_supported(attr->dev_cap_flags2))
+ 		attr->max_srq += le16_to_cpu(sb->max_srq_ext);
+ 
+-	bnxt_qplib_query_version(rcfw, attr->fw_ver);
+-
+ 	for (i = 0; i < MAX_TQM_ALLOC_REQ / 4; i++) {
+ 		temp = le32_to_cpu(sb->tqm_alloc_reqs[i]);
+ 		tqm_alloc = (u8 *)&temp;
+diff --git a/drivers/infiniband/hw/bnxt_re/qplib_sp.h b/drivers/infiniband/hw/bnxt_re/qplib_sp.h
+index 09faf4a1e849..e9834e7fc383 100644
+--- a/drivers/infiniband/hw/bnxt_re/qplib_sp.h
++++ b/drivers/infiniband/hw/bnxt_re/qplib_sp.h
+@@ -358,6 +358,7 @@ int bnxt_qplib_read_context(struct bnxt_qplib_rcfw *rcfw, u8 type, u32 xid,
+ 			    u32 resp_size, void *resp_va);
+ int bnxt_qplib_query_cc_param(struct bnxt_qplib_res *res,
+ 			      struct bnxt_qplib_cc_param *cc_param);
++void bnxt_qplib_query_version(struct bnxt_qplib_rcfw *rcfw);
+ 
+ #define BNXT_VAR_MAX_WQE       4352
+ #define BNXT_VAR_MAX_SLOT_ALIGN 256
+-- 
+2.52.0
+
