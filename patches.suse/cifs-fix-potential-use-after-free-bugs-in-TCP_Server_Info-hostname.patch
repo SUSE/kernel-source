@@ -1,0 +1,117 @@
+From: Paulo Alcantara <pc@manguebit.com>
+Date: Fri, 21 Apr 2023 15:52:32 -0300
+Subject: [PATCH] cifs: fix potential use-after-free bugs in
+ TCP_Server_Info::hostname
+Git-commit: 90c49fce1c43e1cc152695e20363ff5087897c09
+References: bsc#1254986, CVE-2023-53751
+Patch-mainline: v6.4-rc1
+
+TCP_Server_Info::hostname may be updated once or many times during
+reconnect, so protect its access outside reconnect path as well and
+then prevent any potential use-after-free bugs.
+
+Cc: stable@vger.kernel.org
+Signed-off-by: Paulo Alcantara (SUSE) <pc@manguebit.com>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Acked-by: Enzo Matsumiya <ematsumiya@suse.de>
+---
+ fs/cifs/cifs_debug.c |    5 ++++-
+ fs/cifs/cifs_debug.h |   12 ++++++------
+ fs/cifs/connect.c    |   12 +++++++++---
+ 3 files changed, 19 insertions(+), 10 deletions(-)
+
+--- a/fs/cifs/cifs_debug.c
++++ b/fs/cifs/cifs_debug.c
+@@ -570,10 +570,13 @@
+ 				server->fastest_cmd[j],
+ 				server->slowest_cmd[j]);
+ 		for (j = 0; j < NUMBER_OF_SMB2_COMMANDS; j++)
+-			if (atomic_read(&server->smb2slowcmd[j]))
++			if (atomic_read(&server->smb2slowcmd[j])) {
++				spin_lock(&server->srv_lock);
+ 				seq_printf(m, "  %d slow responses from %s for command %d\n",
+ 					atomic_read(&server->smb2slowcmd[j]),
+ 					server->hostname, j);
++				spin_unlock(&server->srv_lock);
++			}
+ #endif /* STATS2 */
+ 		list_for_each(tmp2, &server->smb_ses_list) {
+ 			ses = list_entry(tmp2, struct cifs_ses,
+--- a/fs/cifs/cifs_debug.h
++++ b/fs/cifs/cifs_debug.h
+@@ -96,19 +96,19 @@
+ 
+ #define cifs_server_dbg_func(ratefunc, type, fmt, ...)		\
+ do {								\
+-	const char *sn = "";					\
+-	if (server && server->hostname)				\
+-		sn = server->hostname;				\
++	spin_lock(&server->srv_lock);				\
+ 	if ((type) & FYI && cifsFYI & CIFS_INFO) {		\
+ 		pr_debug_ ## ratefunc("%s: \\\\%s "	fmt,	\
+-			__FILE__, sn, ##__VA_ARGS__);		\
++			__FILE__, server->hostname,		\
++			##__VA_ARGS__);				\
+ 	} else if ((type) & VFS) {				\
+ 		pr_err_ ## ratefunc("CIFS VFS: \\\\%s " fmt,	\
+-			sn, ##__VA_ARGS__);			\
++			server->hostname, ##__VA_ARGS__);	\
+ 	} else if ((type) & NOISY && (NOISY != 0)) {		\
+ 		pr_debug_ ## ratefunc("\\\\%s " fmt,		\
+-			sn, ##__VA_ARGS__);			\
++			server->hostname, ##__VA_ARGS__);	\
+ 	}							\
++	spin_unlock(&server->srv_lock);				\
+ } while (0)
+ 
+ #define cifs_server_dbg(type, fmt, ...)			\
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@ -549,13 +549,17 @@
+ 	if (server->hostname != target) {
+ 		hostname = extract_hostname(target);
+ 		if (!IS_ERR(hostname)) {
++			spin_lock(&server->srv_lock);
+ 			kfree(server->hostname);
+ 			server->hostname = hostname;
++			spin_unlock(&server->srv_lock);
+ 		} else {
+ 			cifs_dbg(FYI, "%s: couldn't extract hostname or address from dfs target: %ld\n",
+ 				 __func__, PTR_ERR(hostname));
++			spin_lock(&server->srv_lock);
+ 			cifs_dbg(FYI, "%s: default to last target server: %s\n", __func__,
+ 				 server->hostname);
++			spin_unlock(&server->srv_lock);
+ 		}
+ 		/* resolve the hostname again to make sure that IP address is up-to-date. */
+ 		rc = reconn_set_ipaddr_from_hostname(server);
+@@ -710,9 +714,7 @@
+ 		goto requeue_echo;
+ 
+ 	rc = server->ops->echo ? server->ops->echo(server) : -ENOSYS;
+-	if (rc)
+-		cifs_dbg(FYI, "Unable to send echo request to server: %s\n",
+-			 server->hostname);
++	cifs_server_dbg(FYI, "send echo request: rc = %d\n", rc);
+ 
+ requeue_echo:
+ 	queue_delayed_work(cifsiod_wq, &server->echo, server->echo_interval);
+@@ -2695,6 +2697,8 @@
+ {
+ 	struct sockaddr *addr = (struct sockaddr *)&vol->dstaddr;
+ 
++	lockdep_assert_held(&server->srv_lock);
++
+ 	if (vol->nosharesock)
+ 		return 0;
+ 
+@@ -3054,7 +3058,9 @@
+ 	if (tcon == NULL)
+ 		return -ENOMEM;
+ 
++	spin_lock(&server->srv_lock);
+ 	scnprintf(unc, sizeof(unc), "\\\\%s\\IPC$", server->hostname);
++	spin_unlock(&server->srv_lock);
+ 
+ 	/* cannot fail */
+ 	nls_codepage = load_nls_default();
