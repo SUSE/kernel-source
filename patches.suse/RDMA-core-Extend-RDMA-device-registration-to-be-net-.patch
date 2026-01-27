@@ -1,0 +1,114 @@
+From 8cffca866ba86cbf0d097e56521b17d830956d4a Mon Sep 17 00:00:00 2001
+From: Mark Bloch <mbloch@nvidia.com>
+Date: Tue, 17 Jun 2025 11:44:01 +0300
+Subject: [PATCH 1/1] RDMA/core: Extend RDMA device registration to be net
+ namespace aware
+Git-commit: 8cffca866ba86cbf0d097e56521b17d830956d4a
+Patch-mainline: v6.17-rc1
+References: jsc#PED-15314
+
+Presently, RDMA devices are always registered within the init network
+namespace, even if the associated devlink device's namespace was
+changed via a devlink reload. This mismatch leads to discrepancies
+between the network namespace of the devlink device and that of the
+RDMA device.
+
+Therefore, extend the RDMA device allocation API to optionally take
+the net namespace. This isn't limited to devices that support devlink
+but allows all users to provide the network namespace if they need to
+do so.
+
+If a network namespace is provided during device allocation, it's up
+to the caller to make sure the namespace stays valid until
+ib_register_device() is called.
+
+Signed-off-by: Shay Drory <shayd@nvidia.com>
+Signed-off-by: Mark Bloch <mbloch@nvidia.com>
+Signed-off-by: Leon Romanovsky <leonro@nvidia.com>
+Acked-by: Nicolas Morey <nmorey@suse.com>
+---
+ drivers/infiniband/core/device.c  | 14 ++++++++++++--
+ drivers/infiniband/sw/rdmavt/vt.c |  2 +-
+ include/rdma/ib_verbs.h           | 11 +++++++++--
+ 3 files changed, 22 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/infiniband/core/device.c b/drivers/infiniband/core/device.c
+index 468ed6bd4722..c0f8b8cba7c0 100644
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@ -557,6 +557,8 @@ static void rdma_init_coredev(struct ib_core_device *coredev,
+ /**
+  * _ib_alloc_device - allocate an IB device struct
+  * @size:size of structure to allocate
++ * @net: network namespace device should be located in, namespace
++ *       must stay valid until ib_register_device() is completed.
+  *
+  * Low-level drivers should use ib_alloc_device() to allocate &struct
+  * ib_device.  @size is the size of the structure to be allocated,
+@@ -564,7 +566,7 @@ static void rdma_init_coredev(struct ib_core_device *coredev,
+  * ib_dealloc_device() must be used to free structures allocated with
+  * ib_alloc_device().
+  */
+-struct ib_device *_ib_alloc_device(size_t size)
++struct ib_device *_ib_alloc_device(size_t size, struct net *net)
+ {
+ 	struct ib_device *device;
+ 	unsigned int i;
+@@ -581,7 +583,15 @@ struct ib_device *_ib_alloc_device(size_t size)
+ 		return NULL;
+ 	}
+ 
+-	rdma_init_coredev(&device->coredev, device, &init_net);
++	/* ib_devices_shared_netns can't change while we have active namespaces
++	 * in the system which means either init_net is passed or the user has
++	 * no idea what they are doing.
++	 *
++	 * To avoid breaking backward compatibility, when in shared mode,
++	 * force to init the device in the init_net.
++	 */
++	net = ib_devices_shared_netns ? &init_net : net;
++	rdma_init_coredev(&device->coredev, device, net);
+ 
+ 	INIT_LIST_HEAD(&device->event_handler_list);
+ 	spin_lock_init(&device->qp_open_list_lock);
+diff --git a/drivers/infiniband/sw/rdmavt/vt.c b/drivers/infiniband/sw/rdmavt/vt.c
+index 5499025e8a0a..d22d610c2696 100644
+--- a/drivers/infiniband/sw/rdmavt/vt.c
++++ b/drivers/infiniband/sw/rdmavt/vt.c
+@@ -49,7 +49,7 @@ struct rvt_dev_info *rvt_alloc_device(size_t size, int nports)
+ {
+ 	struct rvt_dev_info *rdi;
+ 
+-	rdi = container_of(_ib_alloc_device(size), struct rvt_dev_info, ibdev);
++	rdi = container_of(_ib_alloc_device(size, &init_net), struct rvt_dev_info, ibdev);
+ 	if (!rdi)
+ 		return rdi;
+ 
+diff --git a/include/rdma/ib_verbs.h b/include/rdma/ib_verbs.h
+index 38f68d245fa6..b91a81234832 100644
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -2914,11 +2914,18 @@ struct ib_block_iter {
+ 	unsigned int __pg_bit;		/* alignment of current block */
+ };
+ 
+-struct ib_device *_ib_alloc_device(size_t size);
++struct ib_device *_ib_alloc_device(size_t size, struct net *net);
+ #define ib_alloc_device(drv_struct, member)                                    \
+ 	container_of(_ib_alloc_device(sizeof(struct drv_struct) +              \
+ 				      BUILD_BUG_ON_ZERO(offsetof(              \
+-					      struct drv_struct, member))),    \
++					      struct drv_struct, member)),     \
++				      &init_net),			       \
++		     struct drv_struct, member)
++
++#define ib_alloc_device_with_net(drv_struct, member, net)		       \
++	container_of(_ib_alloc_device(sizeof(struct drv_struct) +              \
++				      BUILD_BUG_ON_ZERO(offsetof(              \
++					struct drv_struct, member)), net),     \
+ 		     struct drv_struct, member)
+ 
+ void ib_dealloc_device(struct ib_device *device);
+-- 
+2.52.0
+
