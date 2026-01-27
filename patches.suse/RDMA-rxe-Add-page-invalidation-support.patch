@@ -1,0 +1,92 @@
+From b601792392f9fe8d9d1ae9028ca61d0f70ffb986 Mon Sep 17 00:00:00 2001
+From: Daisuke Matsuda <matsuda-daisuke@fujitsu.com>
+Date: Fri, 20 Dec 2024 19:09:33 +0900
+Subject: [PATCH 1/1] RDMA/rxe: Add page invalidation support
+Git-commit: b601792392f9fe8d9d1ae9028ca61d0f70ffb986
+Patch-mainline: v6.15-rc1
+References: jsc#PED-15314
+
+On page invalidation, an MMU notifier callback is invoked to unmap DMA
+addresses and update the driver page table(umem_odp->dma_list). The
+callback is registered when an ODP-enabled MR is created.
+
+Link: https://patch.msgid.link/r/20241220100936.2193541-3-matsuda-daisuke@fujitsu.com
+Signed-off-by: Daisuke Matsuda <matsuda-daisuke@fujitsu.com>
+Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+Acked-by: Nicolas Morey <nmorey@suse.com>
+---
+ drivers/infiniband/sw/rxe/Makefile  |  2 ++
+ drivers/infiniband/sw/rxe/rxe_loc.h |  3 +++
+ drivers/infiniband/sw/rxe/rxe_odp.c | 38 +++++++++++++++++++++++++++++
+ 3 files changed, 43 insertions(+)
+ create mode 100644 drivers/infiniband/sw/rxe/rxe_odp.c
+
+diff --git a/drivers/infiniband/sw/rxe/Makefile b/drivers/infiniband/sw/rxe/Makefile
+index 5395a581f4bb..93134f1d1d0c 100644
+--- a/drivers/infiniband/sw/rxe/Makefile
++++ b/drivers/infiniband/sw/rxe/Makefile
+@@ -23,3 +23,5 @@ rdma_rxe-y := \
+ 	rxe_task.o \
+ 	rxe_net.o \
+ 	rxe_hw_counters.o
++
++rdma_rxe-$(CONFIG_INFINIBAND_ON_DEMAND_PAGING) += rxe_odp.o
+diff --git a/drivers/infiniband/sw/rxe/rxe_loc.h b/drivers/infiniband/sw/rxe/rxe_loc.h
+index 738d3bca8d4f..465ab188c109 100644
+--- a/drivers/infiniband/sw/rxe/rxe_loc.h
++++ b/drivers/infiniband/sw/rxe/rxe_loc.h
+@@ -181,4 +181,7 @@ static inline unsigned int wr_opcode_mask(int opcode, struct rxe_qp *qp)
+ 	return rxe_wr_opcode_info[opcode].mask[qp->ibqp.qp_type];
+ }
+ 
++/* rxe_odp.c */
++extern const struct mmu_interval_notifier_ops rxe_mn_ops;
++
+ #endif /* RXE_LOC_H */
+diff --git a/drivers/infiniband/sw/rxe/rxe_odp.c b/drivers/infiniband/sw/rxe/rxe_odp.c
+new file mode 100644
+index 000000000000..2be8066db012
+--- /dev/null
++++ b/drivers/infiniband/sw/rxe/rxe_odp.c
+@@ -0,0 +1,38 @@
++// SPDX-License-Identifier: GPL-2.0 OR Linux-OpenIB
++/*
++ * Copyright (c) 2022-2023 Fujitsu Ltd. All rights reserved.
++ */
++
++#include <linux/hmm.h>
++
++#include <rdma/ib_umem_odp.h>
++
++#include "rxe.h"
++
++static bool rxe_ib_invalidate_range(struct mmu_interval_notifier *mni,
++				    const struct mmu_notifier_range *range,
++				    unsigned long cur_seq)
++{
++	struct ib_umem_odp *umem_odp =
++		container_of(mni, struct ib_umem_odp, notifier);
++	unsigned long start, end;
++
++	if (!mmu_notifier_range_blockable(range))
++		return false;
++
++	mutex_lock(&umem_odp->umem_mutex);
++	mmu_interval_set_seq(mni, cur_seq);
++
++	start = max_t(u64, ib_umem_start(umem_odp), range->start);
++	end = min_t(u64, ib_umem_end(umem_odp), range->end);
++
++	/* update umem_odp->dma_list */
++	ib_umem_odp_unmap_dma_pages(umem_odp, start, end);
++
++	mutex_unlock(&umem_odp->umem_mutex);
++	return true;
++}
++
++const struct mmu_interval_notifier_ops rxe_mn_ops = {
++	.invalidate = rxe_ib_invalidate_range,
++};
+-- 
+2.52.0
+
