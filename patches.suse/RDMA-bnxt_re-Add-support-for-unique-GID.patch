@@ -1,0 +1,255 @@
+From af7f9d0d5745fb4831c71d981a93f44f8fd3f10d Mon Sep 17 00:00:00 2001
+From: Saravanan Vajravel <saravanan.vajravel@broadcom.com>
+Date: Fri, 22 Aug 2025 09:37:56 +0530
+Subject: [PATCH 1/1] RDMA/bnxt_re: Add support for unique GID
+Git-commit: af7f9d0d5745fb4831c71d981a93f44f8fd3f10d
+Patch-mainline: v6.18-rc1
+References: jsc#PED-15349
+
+- RawEth QP requires unique GID so that per function stats_ctx
+  is not polluted by packets mirrored to RoCE vnic.
+- Added support to add unique GID when RawEth type QP is created.
+- Added support to destroy unique GID when RawEth type QP is
+  destroyed.
+- Allocated exclusive stats_ctx to use for RawEth type QP.
+
+Signed-off-by: Saravanan Vajravel <saravanan.vajravel@broadcom.com>
+Reviewed-by: Kashyap Desai <kashyap.desai@broadcom.com>
+Reviewed-by: Selvin Xavier <selvin.xavier@broadcom.com>
+Signed-off-by: Kalesh AP <kalesh-anakkur.purayil@broadcom.com>
+Link: https://patch.msgid.link/20250822040801.776196-6-kalesh-anakkur.purayil@broadcom.com
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Acked-by: Nicolas Morey <nmorey@suse.com>
+---
+ drivers/infiniband/hw/bnxt_re/ib_verbs.c  | 57 ++++++++++++++++++++++-
+ drivers/infiniband/hw/bnxt_re/main.c      | 43 +++++++++++++++++
+ drivers/infiniband/hw/bnxt_re/qplib_res.h |  1 +
+ drivers/infiniband/hw/bnxt_re/qplib_sp.c  |  6 ++-
+ drivers/infiniband/hw/bnxt_re/qplib_sp.h  |  3 +-
+ 5 files changed, 106 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/infiniband/hw/bnxt_re/ib_verbs.c b/drivers/infiniband/hw/bnxt_re/ib_verbs.c
+index ebe6318106d5..f035c7560334 100644
+--- a/drivers/infiniband/hw/bnxt_re/ib_verbs.c
++++ b/drivers/infiniband/hw/bnxt_re/ib_verbs.c
+@@ -288,7 +288,9 @@ int bnxt_re_query_port(struct ib_device *ibdev, u32 port_num,
+ 	}
+ 	port_attr->max_mtu = IB_MTU_4096;
+ 	port_attr->active_mtu = iboe_get_mtu(rdev->netdev->mtu);
+-	port_attr->gid_tbl_len = dev_attr->max_sgid;
++	/* One GID is reserved for RawEth QP. Report one less */
++	port_attr->gid_tbl_len = (rdev->rcfw.roce_mirror ? (dev_attr->max_sgid - 1) :
++				  dev_attr->max_sgid);
+ 	port_attr->port_cap_flags = IB_PORT_CM_SUP | IB_PORT_REINIT_SUP |
+ 				    IB_PORT_DEVICE_MGMT_SUP |
+ 				    IB_PORT_VENDOR_CLASS_SUP;
+@@ -429,7 +431,7 @@ int bnxt_re_add_gid(const struct ib_gid_attr *attr, void **context)
+ 
+ 	rc = bnxt_qplib_add_sgid(sgid_tbl, (struct bnxt_qplib_gid *)&attr->gid,
+ 				 rdev->qplib_res.netdev->dev_addr,
+-				 vlan_id, true, &tbl_idx);
++				 vlan_id, true, &tbl_idx, false, 0);
+ 	if (rc == -EALREADY) {
+ 		ctx_tbl = sgid_tbl->ctx;
+ 		ctx_tbl[tbl_idx]->refcnt++;
+@@ -950,6 +952,20 @@ static void bnxt_re_destroy_gsi_sqp(struct bnxt_re_qp *qp)
+ 	return rc;
+ }
+ 
++static void bnxt_re_del_unique_gid(struct bnxt_re_dev *rdev)
++{
++	int rc;
++
++	if (!rdev->rcfw.roce_mirror)
++		return;
++
++	rc = bnxt_qplib_del_sgid(&rdev->qplib_res.sgid_tbl,
++				 (struct bnxt_qplib_gid *)&rdev->ugid,
++				 0xFFFF, true);
++	if (rc)
++		dev_err(rdev_to_dev(rdev), "Failed to delete unique GID, rc: %d\n", rc);
++}
++
+ /* Queue Pairs */
+ int bnxt_re_destroy_qp(struct ib_qp *ib_qp, struct ib_udata *udata)
+ {
+@@ -989,6 +1005,9 @@ int bnxt_re_destroy_qp(struct ib_qp *ib_qp, struct ib_udata *udata)
+ 	else if (qp->qplib_qp.type == CMDQ_CREATE_QP_TYPE_UD)
+ 		atomic_dec(&rdev->stats.res.ud_qp_count);
+ 
++	if (qp->qplib_qp.type == CMDQ_CREATE_QP_TYPE_RAW_ETHERTYPE)
++		bnxt_re_del_unique_gid(rdev);
++
+ 	ib_umem_release(qp->rumem);
+ 	ib_umem_release(qp->sumem);
+ 
+@@ -1590,6 +1609,29 @@ static bool bnxt_re_test_qp_limits(struct bnxt_re_dev *rdev,
+ 	return rc;
+ }
+ 
++static int bnxt_re_add_unique_gid(struct bnxt_re_dev *rdev)
++{
++	struct bnxt_qplib_ctx *hctx = &rdev->qplib_ctx;
++	struct bnxt_qplib_res *res = &rdev->qplib_res;
++	int rc;
++
++	if (!rdev->rcfw.roce_mirror)
++		return 0;
++
++	rdev->ugid.global.subnet_prefix = cpu_to_be64(0xfe8000000000abcdLL);
++	addrconf_ifid_eui48(&rdev->ugid.raw[8], rdev->netdev);
++
++	rc = bnxt_qplib_add_sgid(&res->sgid_tbl,
++				 (struct bnxt_qplib_gid *)&rdev->ugid,
++				 rdev->qplib_res.netdev->dev_addr,
++				 0xFFFF, true, &rdev->ugid_index, true,
++				 hctx->stats3.fw_id);
++	if (rc)
++		dev_err(rdev_to_dev(rdev), "Failed to add unique GID. rc = %d\n", rc);
++
++	return rc;
++}
++
+ int bnxt_re_create_qp(struct ib_qp *ib_qp, struct ib_qp_init_attr *qp_init_attr,
+ 		      struct ib_udata *udata)
+ {
+@@ -1651,6 +1693,17 @@ int bnxt_re_create_qp(struct ib_qp *ib_qp, struct ib_qp_init_attr *qp_init_attr,
+ 		}
+ 	}
+ 
++	/* Support for RawEth QP is added to capture TCP pkt dump.
++	 * So unique SGID is used to avoid incorrect statistics on per
++	 * function stats_ctx
++	 */
++	if (qp->qplib_qp.type == CMDQ_CREATE_QP_TYPE_RAW_ETHERTYPE) {
++		rc = bnxt_re_add_unique_gid(rdev);
++		if (rc)
++			goto qp_destroy;
++		qp->qplib_qp.ugid_index = rdev->ugid_index;
++	}
++
+ 	qp->ib_qp.qp_num = qp->qplib_qp.id;
+ 	if (qp_init_attr->qp_type == IB_QPT_GSI)
+ 		rdev->gsi_ctx.gsi_qp = qp;
+diff --git a/drivers/infiniband/hw/bnxt_re/main.c b/drivers/infiniband/hw/bnxt_re/main.c
+index 77aa7ff7c7c3..1c67c1bdeeac 100644
+--- a/drivers/infiniband/hw/bnxt_re/main.c
++++ b/drivers/infiniband/hw/bnxt_re/main.c
+@@ -2061,6 +2061,42 @@ static int bnxt_re_get_stats_ctx(struct bnxt_re_dev *rdev)
+ 	return rc;
+ }
+ 
++static int bnxt_re_get_stats3_ctx(struct bnxt_re_dev *rdev)
++{
++	struct bnxt_qplib_ctx *hctx = &rdev->qplib_ctx;
++	struct bnxt_qplib_res *res = &rdev->qplib_res;
++	int rc;
++
++	if (!rdev->rcfw.roce_mirror)
++		return 0;
++
++	rc = bnxt_qplib_alloc_stats_ctx(res->pdev, res->cctx, &hctx->stats3);
++	if (rc)
++		return rc;
++
++	rc = bnxt_re_net_stats_ctx_alloc(rdev, &hctx->stats3);
++	if (rc)
++		goto free_stat_mem;
++
++	return 0;
++free_stat_mem:
++	bnxt_qplib_free_stats_ctx(res->pdev, &hctx->stats3);
++
++	return rc;
++}
++
++static void bnxt_re_put_stats3_ctx(struct bnxt_re_dev *rdev)
++{
++	struct bnxt_qplib_ctx *hctx = &rdev->qplib_ctx;
++	struct bnxt_qplib_res *res = &rdev->qplib_res;
++
++	if (!rdev->rcfw.roce_mirror)
++		return;
++
++	bnxt_re_net_stats_ctx_free(rdev, hctx->stats3.fw_id);
++	bnxt_qplib_free_stats_ctx(res->pdev, &hctx->stats3);
++}
++
+ static void bnxt_re_put_stats_ctx(struct bnxt_re_dev *rdev)
+ {
+ 	struct bnxt_qplib_ctx *hctx = &rdev->qplib_ctx;
+@@ -2083,7 +2119,10 @@ static void bnxt_re_dev_uninit(struct bnxt_re_dev *rdev, u8 op_type)
+ 	if (test_and_clear_bit(BNXT_RE_FLAG_QOS_WORK_REG, &rdev->flags))
+ 		cancel_delayed_work_sync(&rdev->worker);
+ 
++	bnxt_re_put_stats3_ctx(rdev);
++
+ 	bnxt_re_free_gid_ctx(rdev);
++
+ 	if (test_and_clear_bit(BNXT_RE_FLAG_RESOURCES_INITIALIZED,
+ 			       &rdev->flags))
+ 		bnxt_re_cleanup_res(rdev);
+@@ -2304,6 +2343,10 @@ static int bnxt_re_dev_init(struct bnxt_re_dev *rdev, u8 op_type)
+ 	bnxt_re_init_dcb_wq(rdev);
+ 	bnxt_re_net_register_async_event(rdev);
+ 
++	rc = bnxt_re_get_stats3_ctx(rdev);
++	if (rc)
++		goto fail;
++
+ 	return 0;
+ free_sctx:
+ 	bnxt_re_net_stats_ctx_free(rdev, rdev->qplib_ctx.stats.fw_id);
+diff --git a/drivers/infiniband/hw/bnxt_re/qplib_res.h b/drivers/infiniband/hw/bnxt_re/qplib_res.h
+index ed1be06c2c60..2ea3b7f232a3 100644
+--- a/drivers/infiniband/hw/bnxt_re/qplib_res.h
++++ b/drivers/infiniband/hw/bnxt_re/qplib_res.h
+@@ -304,6 +304,7 @@ struct bnxt_qplib_ctx {
+ 	struct bnxt_qplib_hwq		tim_tbl;
+ 	struct bnxt_qplib_tqm_ctx	tqm_ctx;
+ 	struct bnxt_qplib_stats		stats;
++	struct bnxt_qplib_stats		stats3;
+ 	struct bnxt_qplib_vf_res	vf_res;
+ };
+ 
+diff --git a/drivers/infiniband/hw/bnxt_re/qplib_sp.c b/drivers/infiniband/hw/bnxt_re/qplib_sp.c
+index b602a1da19cd..3d68e44a2dce 100644
+--- a/drivers/infiniband/hw/bnxt_re/qplib_sp.c
++++ b/drivers/infiniband/hw/bnxt_re/qplib_sp.c
+@@ -308,7 +308,8 @@ int bnxt_qplib_del_sgid(struct bnxt_qplib_sgid_tbl *sgid_tbl,
+ 
+ int bnxt_qplib_add_sgid(struct bnxt_qplib_sgid_tbl *sgid_tbl,
+ 			struct bnxt_qplib_gid *gid, const u8 *smac,
+-			u16 vlan_id, bool update, u32 *index)
++			u16 vlan_id, bool update, u32 *index,
++			bool is_ugid, u32 stats_ctx_id)
+ {
+ 	struct bnxt_qplib_res *res = to_bnxt_qplib(sgid_tbl,
+ 						   struct bnxt_qplib_res,
+@@ -373,6 +374,9 @@ int bnxt_qplib_add_sgid(struct bnxt_qplib_sgid_tbl *sgid_tbl,
+ 		req.src_mac[1] = cpu_to_be16(((u16 *)smac)[1]);
+ 		req.src_mac[2] = cpu_to_be16(((u16 *)smac)[2]);
+ 
++		req.stats_ctx = cpu_to_le16(CMDQ_ADD_GID_STATS_CTX_STATS_CTX_VALID |
++					    (u16)stats_ctx_id);
++
+ 		bnxt_qplib_fill_cmdqmsg(&msg, &req, &resp, NULL, sizeof(req),
+ 					sizeof(resp), 0);
+ 		rc = bnxt_qplib_rcfw_send_message(rcfw, &msg);
+diff --git a/drivers/infiniband/hw/bnxt_re/qplib_sp.h b/drivers/infiniband/hw/bnxt_re/qplib_sp.h
+index e9834e7fc383..58f90f3e57f7 100644
+--- a/drivers/infiniband/hw/bnxt_re/qplib_sp.h
++++ b/drivers/infiniband/hw/bnxt_re/qplib_sp.h
+@@ -323,7 +323,8 @@ int bnxt_qplib_del_sgid(struct bnxt_qplib_sgid_tbl *sgid_tbl,
+ 			struct bnxt_qplib_gid *gid, u16 vlan_id, bool update);
+ int bnxt_qplib_add_sgid(struct bnxt_qplib_sgid_tbl *sgid_tbl,
+ 			struct bnxt_qplib_gid *gid, const u8 *mac, u16 vlan_id,
+-			bool update, u32 *index);
++			bool update, u32 *index,
++			bool is_ugid, u32 stats_ctx_id);
+ int bnxt_qplib_update_sgid(struct bnxt_qplib_sgid_tbl *sgid_tbl,
+ 			   struct bnxt_qplib_gid *gid, u16 gid_idx,
+ 			   const u8 *smac);
+-- 
+2.52.0
+
