@@ -1,0 +1,85 @@
+From de41cbc64d02ae85d56078764616b6ba75a55a48 Mon Sep 17 00:00:00 2001
+From: Stefan Metzmacher <metze@samba.org>
+Date: Fri, 19 Dec 2025 15:04:08 +0100
+Subject: [PATCH 1/1] RDMA/rxe: let rxe_reclassify_recv_socket() call
+ sk_owner_put()
+Git-commit: de41cbc64d02ae85d56078764616b6ba75a55a48
+Patch-mainline: v6.19-rc4
+References: jsc#PED-15314
+
+On kernels build with CONFIG_PROVE_LOCKING, CONFIG_MODULES
+and CONFIG_DEBUG_LOCK_ALLOC 'rmmod rdma_rxe' is no longer
+possible.
+
+For the global recv sockets rxe_net_exit() is where we
+call rxe_release_udp_tunnel-> udp_tunnel_sock_release(),
+which means the sockets are destroyed before 'rmmod rdma_rxe'
+finishes, so there's no need to protect against
+rxe_recv_slock_key and rxe_recv_sk_key disappearing
+while the sockets are still alive.
+
+Fixes: 80a85a771deb ("RDMA/rxe: reclassify sockets in order to avoid false positives from lockdep")
+Cc: Zhu Yanjun <zyjzyj2000@gmail.com>
+Cc: Jason Gunthorpe <jgg@ziepe.ca>
+Cc: Leon Romanovsky <leon@kernel.org>
+Cc: Shinichiro Kawasaki <shinichiro.kawasaki@wdc.com>
+Cc: linux-rdma@vger.kernel.org
+Cc: netdev@vger.kernel.org
+Cc: linux-cifs@vger.kernel.org
+Signed-off-by: Stefan Metzmacher <metze@samba.org>
+Link: https://patch.msgid.link/20251219140408.2300163-1-metze@samba.org
+Reviewed-by: Zhu Yanjun <yanjun.zhu@linux.dev>
+Tested-by: Shin'ichiro Kawasaki <shinichiro.kawasaki@wdc.com>
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Acked-by: Nicolas Morey <nmorey@suse.com>
+---
+ drivers/infiniband/sw/rxe/rxe_net.c | 32 +++++++++++++++++++++++++++++
+ 1 file changed, 32 insertions(+)
+
+diff --git a/drivers/infiniband/sw/rxe/rxe_net.c b/drivers/infiniband/sw/rxe/rxe_net.c
+index 0195d361e5e3..0bd0902b11f7 100644
+--- a/drivers/infiniband/sw/rxe/rxe_net.c
++++ b/drivers/infiniband/sw/rxe/rxe_net.c
+@@ -64,7 +64,39 @@ static inline void rxe_reclassify_recv_socket(struct socket *sock)
+ 		break;
+ 	default:
+ 		WARN_ON_ONCE(1);
++		return;
+ 	}
++	/*
++	 * sock_lock_init_class_and_name() calls
++	 * sk_owner_set(sk, THIS_MODULE); in order
++	 * to make sure the referenced global
++	 * variables rxe_recv_slock_key and
++	 * rxe_recv_sk_key are not removed
++	 * before the socket is closed.
++	 *
++	 * However this prevents rxe_net_exit()
++	 * from being called and 'rmmod rdma_rxe'
++	 * is refused because of the references.
++	 *
++	 * For the global sockets in recv_sockets,
++	 * we are sure that rxe_net_exit() will call
++	 * rxe_release_udp_tunnel -> udp_tunnel_sock_release.
++	 *
++	 * So we don't need the additional reference to
++	 * our own (THIS_MODULE).
++	 */
++	sk_owner_put(sk);
++	/*
++	 * We also call sk_owner_clear() otherwise
++	 * sk_owner_put(sk) in sk_prot_free will
++	 * fail, which is called via
++	 * sk_free -> __sk_free -> sk_destruct
++	 * and sk_destruct calls __sk_destruct
++	 * directly or via call_rcu()
++	 * so sk_prot_free() might be called
++	 * after rxe_net_exit().
++	 */
++	sk_owner_clear(sk);
+ #endif /* CONFIG_DEBUG_LOCK_ALLOC */
+ }
+ 
+-- 
+2.52.0
+
