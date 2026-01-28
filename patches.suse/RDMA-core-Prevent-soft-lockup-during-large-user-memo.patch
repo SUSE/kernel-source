@@ -1,0 +1,82 @@
+From d056bc45b62b5981ebcd18c4303a915490b8ebe9 Mon Sep 17 00:00:00 2001
+From: Li RongQing <lirongqing@baidu.com>
+Date: Thu, 13 Nov 2025 17:53:17 +0800
+Subject: [PATCH 1/1] RDMA/core: Prevent soft lockup during large user memory
+ region cleanup
+Git-commit: d056bc45b62b5981ebcd18c4303a915490b8ebe9
+Patch-mainline: v6.19-rc1
+References: jsc#PED-15314
+
+When a process exits with numerous large, pinned memory regions consisting
+of 4KB pages, the cleanup of the memory region through __ib_umem_release()
+may cause soft lockups. This is because unpin_user_page_range_dirty_lock()
+is called in a tight loop for unpin and releasing page without yielding the
+CPU.
+
+ watchdog: BUG: soft lockup - CPU#44 stuck for 26s! [python3:73464]
+ Kernel panic - not syncing: softlockup: hung tasks
+ CPU: 44 PID: 73464 Comm: python3 Tainted: G           OEL
+
+ asm_sysvec_apic_timer_interrupt+0x1b/0x20
+ RIP: 0010:free_unref_page+0xff/0x190
+
+  ? free_unref_page+0xe3/0x190
+  __put_page+0x77/0xe0
+  put_compound_head+0xed/0x100
+  unpin_user_page_range_dirty_lock+0xb2/0x180
+  __ib_umem_release+0x57/0xb0 [ib_core]
+  ib_umem_release+0x3f/0xd0 [ib_core]
+  mlx5_ib_dereg_mr+0x2e9/0x440 [mlx5_ib]
+  ib_dereg_mr_user+0x43/0xb0 [ib_core]
+  uverbs_free_mr+0x15/0x20 [ib_uverbs]
+  destroy_hw_idr_uobject+0x21/0x60 [ib_uverbs]
+  uverbs_destroy_uobject+0x38/0x1b0 [ib_uverbs]
+  __uverbs_cleanup_ufile+0xd1/0x150 [ib_uverbs]
+  uverbs_destroy_ufile_hw+0x3f/0x100 [ib_uverbs]
+  ib_uverbs_close+0x1f/0xb0 [ib_uverbs]
+  __fput+0x9c/0x280
+  ____fput+0xe/0x20
+  task_work_run+0x6a/0xb0
+  do_exit+0x217/0x3c0
+  do_group_exit+0x3b/0xb0
+  get_signal+0x150/0x900
+  arch_do_signal_or_restart+0xde/0x100
+  exit_to_user_mode_loop+0xc4/0x160
+  exit_to_user_mode_prepare+0xa0/0xb0
+  syscall_exit_to_user_mode+0x27/0x50
+  do_syscall_64+0x63/0xb0
+
+Fix soft lockup issues by incorporating cond_resched() calls within
+__ib_umem_release(), and this SG entries are typically grouped in 2MB
+chunks on x86_64, adding cond_resched() should has minimal performance
+impact.
+
+Signed-off-by: Li RongQing <lirongqing@baidu.com>
+Link: https://patch.msgid.link/20251113095317.2628-1-lirongqing@baidu.com
+Acked-by: Junxian Huang <huangjunxian6@hisilicon.com>
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Acked-by: Nicolas Morey <nmorey@suse.com>
+---
+ drivers/infiniband/core/umem.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/infiniband/core/umem.c b/drivers/infiniband/core/umem.c
+index c5b686394760..8fd84aa37289 100644
+--- a/drivers/infiniband/core/umem.c
++++ b/drivers/infiniband/core/umem.c
+@@ -55,9 +55,11 @@ static void __ib_umem_release(struct ib_device *dev, struct ib_umem *umem, int d
+ 		ib_dma_unmap_sgtable_attrs(dev, &umem->sgt_append.sgt,
+ 					   DMA_BIDIRECTIONAL, 0);
+ 
+-	for_each_sgtable_sg(&umem->sgt_append.sgt, sg, i)
++	for_each_sgtable_sg(&umem->sgt_append.sgt, sg, i) {
+ 		unpin_user_page_range_dirty_lock(sg_page(sg),
+ 			DIV_ROUND_UP(sg->length, PAGE_SIZE), make_dirty);
++		cond_resched();
++	}
+ 
+ 	sg_free_append_table(&umem->sgt_append);
+ }
+-- 
+2.52.0
+
