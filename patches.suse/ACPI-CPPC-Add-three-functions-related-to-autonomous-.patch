@@ -1,0 +1,166 @@
+From: Lifeng Zheng <zhenglifeng1@huawei.com>
+Date: Fri, 11 Apr 2025 17:38:55 +0800
+Subject: ACPI: CPPC: Add three functions related to autonomous selection
+Patch-mainline: v6.16-rc1
+Git-commit: f35e5b3ccfd3516bc36b08e101678b036309397c
+References: jsc#PED-14260
+
+cppc_set_epp() - write energy performance preference register value,
+based on ACPI 6.5, s8.4.6.1.7
+
+cppc_get_auto_act_window() - read autonomous activity window register
+value, based on ACPI 6.5, s8.4.6.1.6
+
+cppc_set_auto_act_window() - write autonomous activity window register
+value, based on ACPI 6.5, s8.4.6.1.6
+
+Reviewed-by: Pierre Gondois <pierre.gondois@arm.com>
+Signed-off-by: Lifeng Zheng <zhenglifeng1@huawei.com>
+Reviewed-by: Mario Limonciello <mario.limonciello@amd.com>
+Link: https://patch.msgid.link/20250411093855.982491-9-zhenglifeng1@huawei.com
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Acked-by: Chun-Yi Lee <jlee@suse.com>
+---
+ drivers/acpi/cppc_acpi.c |   83 +++++++++++++++++++++++++++++++++++++++++++++++
+ include/acpi/cppc_acpi.h |   24 +++++++++++++
+ 2 files changed, 107 insertions(+)
+
+--- a/drivers/acpi/cppc_acpi.c
++++ b/drivers/acpi/cppc_acpi.c
+@@ -1602,6 +1602,89 @@ int cppc_set_epp_perf(int cpu, struct cp
+ EXPORT_SYMBOL_GPL(cppc_set_epp_perf);
+ 
+ /**
++ * cppc_set_epp() - Write the EPP register.
++ * @cpu: CPU on which to write register.
++ * @epp_val: Value to write to the EPP register.
++ */
++int cppc_set_epp(int cpu, u64 epp_val)
++{
++	if (epp_val > CPPC_ENERGY_PERF_MAX)
++		return -EINVAL;
++
++	return cppc_set_reg_val(cpu, ENERGY_PERF, epp_val);
++}
++EXPORT_SYMBOL_GPL(cppc_set_epp);
++
++/**
++ * cppc_get_auto_act_window() - Read autonomous activity window register.
++ * @cpu: CPU from which to read register.
++ * @auto_act_window: Return address.
++ *
++ * According to ACPI 6.5, s8.4.6.1.6, the value read from the autonomous
++ * activity window register consists of two parts: a 7 bits value indicate
++ * significand and a 3 bits value indicate exponent.
++ */
++int cppc_get_auto_act_window(int cpu, u64 *auto_act_window)
++{
++	unsigned int exp;
++	u64 val, sig;
++	int ret;
++
++	if (auto_act_window == NULL)
++		return -EINVAL;
++
++	ret = cppc_get_reg_val(cpu, AUTO_ACT_WINDOW, &val);
++	if (ret)
++		return ret;
++
++	sig = val & CPPC_AUTO_ACT_WINDOW_MAX_SIG;
++	exp = (val >> CPPC_AUTO_ACT_WINDOW_SIG_BIT_SIZE) & CPPC_AUTO_ACT_WINDOW_MAX_EXP;
++	*auto_act_window = sig * int_pow(10, exp);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(cppc_get_auto_act_window);
++
++/**
++ * cppc_set_auto_act_window() - Write autonomous activity window register.
++ * @cpu: CPU on which to write register.
++ * @auto_act_window: usec value to write to the autonomous activity window register.
++ *
++ * According to ACPI 6.5, s8.4.6.1.6, the value to write to the autonomous
++ * activity window register consists of two parts: a 7 bits value indicate
++ * significand and a 3 bits value indicate exponent.
++ */
++int cppc_set_auto_act_window(int cpu, u64 auto_act_window)
++{
++	/* The max value to store is 1270000000 */
++	u64 max_val = CPPC_AUTO_ACT_WINDOW_MAX_SIG * int_pow(10, CPPC_AUTO_ACT_WINDOW_MAX_EXP);
++	int exp = 0;
++	u64 val;
++
++	if (auto_act_window > max_val)
++		return -EINVAL;
++
++	/*
++	 * The max significand is 127, when auto_act_window is larger than
++	 * 129, discard the precision of the last digit and increase the
++	 * exponent by 1.
++	 */
++	while (auto_act_window > CPPC_AUTO_ACT_WINDOW_SIG_CARRY_THRESH) {
++		auto_act_window /= 10;
++		exp += 1;
++	}
++
++	/* For 128 and 129, cut it to 127. */
++	if (auto_act_window > CPPC_AUTO_ACT_WINDOW_MAX_SIG)
++		auto_act_window = CPPC_AUTO_ACT_WINDOW_MAX_SIG;
++
++	val = (exp << CPPC_AUTO_ACT_WINDOW_SIG_BIT_SIZE) + auto_act_window;
++
++	return cppc_set_reg_val(cpu, AUTO_ACT_WINDOW, val);
++}
++EXPORT_SYMBOL_GPL(cppc_set_auto_act_window);
++
++/**
+  * cppc_get_auto_sel() - Read autonomous selection register.
+  * @cpu: CPU from which to read register.
+  * @enable: Return address.
+--- a/include/acpi/cppc_acpi.h
++++ b/include/acpi/cppc_acpi.h
+@@ -32,6 +32,15 @@
+ #define	CMD_READ 0
+ #define	CMD_WRITE 1
+ 
++#define CPPC_AUTO_ACT_WINDOW_SIG_BIT_SIZE	(7)
++#define CPPC_AUTO_ACT_WINDOW_EXP_BIT_SIZE	(3)
++#define CPPC_AUTO_ACT_WINDOW_MAX_SIG	((1 << CPPC_AUTO_ACT_WINDOW_SIG_BIT_SIZE) - 1)
++#define CPPC_AUTO_ACT_WINDOW_MAX_EXP	((1 << CPPC_AUTO_ACT_WINDOW_EXP_BIT_SIZE) - 1)
++/* CPPC_AUTO_ACT_WINDOW_MAX_SIG is 127, so 128 and 129 will decay to 127 when writing */
++#define CPPC_AUTO_ACT_WINDOW_SIG_CARRY_THRESH 129
++
++#define CPPC_ENERGY_PERF_MAX	(0xFF)
++
+ /* Each register has the folowing format. */
+ struct cpc_reg {
+ 	u8 descriptor;
+@@ -159,6 +168,9 @@ extern int cpc_read_ffh(int cpunum, stru
+ extern int cpc_write_ffh(int cpunum, struct cpc_reg *reg, u64 val);
+ extern int cppc_get_epp_perf(int cpunum, u64 *epp_perf);
+ extern int cppc_set_epp_perf(int cpu, struct cppc_perf_ctrls *perf_ctrls, bool enable);
++extern int cppc_set_epp(int cpu, u64 epp_val);
++extern int cppc_get_auto_act_window(int cpu, u64 *auto_act_window);
++extern int cppc_set_auto_act_window(int cpu, u64 auto_act_window);
+ extern int cppc_get_auto_sel(int cpu, bool *enable);
+ extern int cppc_set_auto_sel(int cpu, bool enable);
+ extern int amd_get_highest_perf(unsigned int cpu, u32 *highest_perf);
+@@ -229,6 +241,18 @@ static inline int cppc_get_epp_perf(int
+ {
+ 	return -EOPNOTSUPP;
+ }
++static inline int cppc_set_epp(int cpu, u64 epp_val)
++{
++	return -EOPNOTSUPP;
++}
++static inline int cppc_get_auto_act_window(int cpu, u64 *auto_act_window)
++{
++	return -EOPNOTSUPP;
++}
++static inline int cppc_set_auto_act_window(int cpu, u64 auto_act_window)
++{
++	return -EOPNOTSUPP;
++}
+ static inline int cppc_get_auto_sel(int cpu, bool *enable)
+ {
+ 	return -EOPNOTSUPP;
