@@ -1,0 +1,125 @@
+From: Cedric Xing <cedric.xing@intel.com>
+Date: Tue, 6 May 2025 17:57:12 -0500
+Subject: virt: tdx-guest: Refactor and streamline TDREPORT generation
+Git-commit: 850972bc61eba68552763c937892abb66a114da1
+Patch-mainline: v6.16-rc1
+References: bsc#1257504
+
+Consolidate instances (code segments) of TDREPORT generation to improve
+readability and maintainability, by refactoring each instance into invoking
+a unified subroutine throughout the TDX guest driver. Implement proper
+locking around TDG.MR.REPORT and TDG.MR.RTMR.EXTEND to avoid race inside
+the TDX module. Preallocate TDREPORT buffer to reduce overhead in
+subsequent TDREPORT generation.
+
+Signed-off-by: Cedric Xing <cedric.xing@intel.com>
+Acked-by: Dionna Amalie Glaze <dionnaglaze@google.com>
+Link: https://patch.msgid.link/20250506-tdx-rtmr-v6-6-ac6ff5e9d58a@intel.com
+Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+Acked-by: Nikolay Borisov <nik.borisov@suse.com>
+---
+ drivers/virt/coco/tdx-guest/tdx-guest.c | 63 ++++-----------------------------
+ 1 file changed, 7 insertions(+), 56 deletions(-)
+
+diff --git a/drivers/virt/coco/tdx-guest/tdx-guest.c b/drivers/virt/coco/tdx-guest/tdx-guest.c
+index 15810fb02d98..34125c501833 100644
+--- a/drivers/virt/coco/tdx-guest/tdx-guest.c
++++ b/drivers/virt/coco/tdx-guest/tdx-guest.c
+@@ -202,37 +202,8 @@ static u32 getquote_timeout = 30;
+ 
+ static long tdx_get_report0(struct tdx_report_req __user *req)
+ {
+-	u8 *reportdata, *tdreport;
+-	long ret;
+-
+-	reportdata = kmalloc(TDX_REPORTDATA_LEN, GFP_KERNEL);
+-	if (!reportdata)
+-		return -ENOMEM;
+-
+-	tdreport = kzalloc(TDX_REPORT_LEN, GFP_KERNEL);
+-	if (!tdreport) {
+-		ret = -ENOMEM;
+-		goto out;
+-	}
+-
+-	if (copy_from_user(reportdata, req->reportdata, TDX_REPORTDATA_LEN)) {
+-		ret = -EFAULT;
+-		goto out;
+-	}
+-
+-	/* Generate TDREPORT0 using "TDG.MR.REPORT" TDCALL */
+-	ret = tdx_mcall_get_report0(reportdata, tdreport);
+-	if (ret)
+-		goto out;
+-
+-	if (copy_to_user(req->tdreport, tdreport, TDX_REPORT_LEN))
+-		ret = -EFAULT;
+-
+-out:
+-	kfree(reportdata);
+-	kfree(tdreport);
+-
+-	return ret;
++	return tdx_do_report(USER_SOCKPTR(req->reportdata),
++			     USER_SOCKPTR(req->tdreport));
+ }
+ 
+ static void free_quote_buf(void *buf)
+@@ -293,7 +264,7 @@ static int wait_for_quote_completion(struct tdx_quote_buf *quote_buf, u32 timeou
+ 
+ static int tdx_report_new(struct tsm_report *report, void *data)
+ {
+-	u8 *buf, *reportdata = NULL, *tdreport = NULL;
++	u8 *buf;
+ 	struct tdx_quote_buf *quote_buf = quote_data;
+ 	struct tsm_desc *desc = &report->desc;
+ 	int ret;
+@@ -318,34 +289,16 @@ static int tdx_report_new(struct tsm_report *report, void *data)
+ 		goto done;
+ 	}
+ 
+-	reportdata = kmalloc(TDX_REPORTDATA_LEN, GFP_KERNEL);
+-	if (!reportdata) {
+-		ret = -ENOMEM;
+-		goto done;
+-	}
+-
+-	tdreport = kzalloc(TDX_REPORT_LEN, GFP_KERNEL);
+-	if (!tdreport) {
+-		ret = -ENOMEM;
+-		goto done;
+-	}
+-
+-	memcpy(reportdata, desc->inblob, desc->inblob_len);
+-
+-	/* Generate TDREPORT0 using "TDG.MR.REPORT" TDCALL */
+-	ret = tdx_mcall_get_report0(reportdata, tdreport);
+-	if (ret) {
+-		pr_err("GetReport call failed\n");
+-		goto done;
+-	}
+-
+ 	memset(quote_data, 0, GET_QUOTE_BUF_SIZE);
+ 
+ 	/* Update Quote buffer header */
+ 	quote_buf->version = GET_QUOTE_CMD_VER;
+ 	quote_buf->in_len = TDX_REPORT_LEN;
+ 
+-	memcpy(quote_buf->data, tdreport, TDX_REPORT_LEN);
++	ret = tdx_do_report(KERNEL_SOCKPTR(desc->inblob),
++			    KERNEL_SOCKPTR(quote_buf->data));
++	if (ret)
++		goto done;
+ 
+ 	err = tdx_hcall_get_quote(quote_data, GET_QUOTE_BUF_SIZE);
+ 	if (err) {
+@@ -375,8 +328,6 @@ static int tdx_report_new(struct tsm_report *report, void *data)
+ 	 */
+ done:
+ 	mutex_unlock(&quote_lock);
+-	kfree(reportdata);
+-	kfree(tdreport);
+ 
+ 	return ret;
+ }
+
