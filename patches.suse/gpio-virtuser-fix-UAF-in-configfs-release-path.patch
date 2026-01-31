@@ -1,0 +1,53 @@
+From 53ad4a948a4586359b841d607c08fb16c5503230 Mon Sep 17 00:00:00 2001
+From: Yuhao Huang <nekowong743@gmail.com>
+Date: Mon, 26 Jan 2026 12:03:48 +0800
+Subject: [PATCH] gpio: virtuser: fix UAF in configfs release path
+Git-commit: 53ad4a948a4586359b841d607c08fb16c5503230
+Patch-mainline: v6.19-rc8
+References: git-fixes
+
+The gpio-virtuser configfs release path uses guard(mutex) to protect
+the device structure. However, the device is freed before the guard
+cleanup runs, causing mutex_unlock() to operate on freed memory.
+
+Specifically, gpio_virtuser_device_config_group_release() destroys
+the mutex and frees the device while still inside the guard(mutex)
+scope. When the function returns, the guard cleanup invokes
+mutex_unlock(&dev->lock), resulting in a slab use-after-free.
+
+Limit the mutex lifetime by using a scoped_guard() only around the
+activation check, so that the lock is released before mutex_destroy()
+and kfree() are called.
+
+Fixes: 91581c4b3f29 ("gpio: virtuser: new virtual testing driver for the GPIO API")
+Signed-off-by: Yuhao Huang <nekowong743@gmail.com>
+Link: https://lore.kernel.org/r/20260126040348.11167-1-yuhaohuang@YuhaodeMacBook-Pro.local
+Signed-off-by: Bartosz Golaszewski <bartosz.golaszewski@oss.qualcomm.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpio/gpio-virtuser.c | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpio/gpio-virtuser.c b/drivers/gpio/gpio-virtuser.c
+index 37f2ce20f1ae..098e67d70ffa 100644
+--- a/drivers/gpio/gpio-virtuser.c
++++ b/drivers/gpio/gpio-virtuser.c
+@@ -1682,10 +1682,10 @@ static void gpio_virtuser_device_config_group_release(struct config_item *item)
+ {
+ 	struct gpio_virtuser_device *dev = to_gpio_virtuser_device(item);
+ 
+-	guard(mutex)(&dev->lock);
+-
+-	if (gpio_virtuser_device_is_live(dev))
+-		gpio_virtuser_device_deactivate(dev);
++	scoped_guard(mutex, &dev->lock) {
++		if (gpio_virtuser_device_is_live(dev))
++			gpio_virtuser_device_deactivate(dev);
++	}
+ 
+ 	mutex_destroy(&dev->lock);
+ 	ida_free(&gpio_virtuser_ida, dev->id);
+-- 
+2.52.0
+
