@@ -1,0 +1,176 @@
+From: Paul Benoit <paul@os.amperecomputing.com>
+Date: Tue, 18 Feb 2025 16:59:32 -0800
+Subject: firmware: smccc: Support optional Arm SMCCC SOC_ID name
+Git-commit: 5f9c23abc47744f2578af4a362655c31254c93b5
+Patch-mainline: v6.15-rc1
+References: jsc#PED-13628
+
+Issue Number 1.6 of the Arm SMC Calling Convention introduces an optional
+SOC_ID name string.  If implemented, point the 'machine' field of the SoC
+Device Attributes at this string so that it will appear under
+/sys/bus/soc/devices/soc0/machine.
+
+On Arm SMC compliant SoCs, this will allow things like 'lscpu' to
+eventually get a SoC provider model name from there rather than each
+tool/utility needing to get a possibly inconsistent, obsolete, or incorrect
+model/machine name from its own hardcoded model/machine name table.
+
+Signed-off-by: Paul Benoit <paul@os.amperecomputing.com>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Lorenzo Pieralisi <lpieralisi@kernel.org>
+Cc: Sudeep Holla <sudeep.holla@arm.com>
+Cc: linux-arm-kernel@lists.infradead.org
+Acked-by: Mark Rutland <mark.rutland@arm.com>
+Message-Id: <20250219005932.3466-1-paul@os.amperecomputing.com>
+(sudeep.holla: Dropped regsize variable and used 8 instead as Mark suggested)
+Signed-off-by: Sudeep Holla <sudeep.holla@arm.com>
+Acked-by: Ivan T. Ivanov <iivanov@suse.de>
+---
+ drivers/firmware/smccc/soc_id.c |   80 ++++++++++++++++++++++++++++++++++++++++
+ include/linux/arm-smccc.h       |   40 ++++++++++++++++++++
+ 2 files changed, 120 insertions(+)
+
+--- a/drivers/firmware/smccc/soc_id.c
++++ b/drivers/firmware/smccc/soc_id.c
+@@ -32,6 +32,85 @@
+ static struct soc_device *soc_dev;
+ static struct soc_device_attribute *soc_dev_attr;
+ 
++#ifdef CONFIG_ARM64
++
++static char __ro_after_init smccc_soc_id_name[136] = "";
++
++static inline void str_fragment_from_reg(char *dst, unsigned long reg)
++{
++	dst[0] = (reg >> 0)  & 0xff;
++	dst[1] = (reg >> 8)  & 0xff;
++	dst[2] = (reg >> 16) & 0xff;
++	dst[3] = (reg >> 24) & 0xff;
++	dst[4] = (reg >> 32) & 0xff;
++	dst[5] = (reg >> 40) & 0xff;
++	dst[6] = (reg >> 48) & 0xff;
++	dst[7] = (reg >> 56) & 0xff;
++}
++
++static char __init *smccc_soc_name_init(void)
++{
++	struct arm_smccc_1_2_regs args;
++	struct arm_smccc_1_2_regs res;
++	size_t len;
++
++	/*
++	 * Issue Number 1.6 of the Arm SMC Calling Convention
++	 * specification introduces an optional "name" string
++	 * to the ARM_SMCCC_ARCH_SOC_ID function.  Fetch it if
++	 * available.
++	 */
++	args.a0 = ARM_SMCCC_ARCH_SOC_ID;
++	args.a1 = 2;    /* SOC_ID name */
++	arm_smccc_1_2_invoke(&args, &res);
++
++	if ((u32)res.a0 == 0) {
++		/*
++		 * Copy res.a1..res.a17 to the smccc_soc_id_name string
++		 * 8 bytes at a time.  As per Issue 1.6 of the Arm SMC
++		 * Calling Convention, the string will be NUL terminated
++		 * and padded, from the end of the string to the end of the
++		 * 136 byte buffer, with NULs.
++		 */
++		str_fragment_from_reg(smccc_soc_id_name + 8 * 0, res.a1);
++		str_fragment_from_reg(smccc_soc_id_name + 8 * 1, res.a2);
++		str_fragment_from_reg(smccc_soc_id_name + 8 * 2, res.a3);
++		str_fragment_from_reg(smccc_soc_id_name + 8 * 3, res.a4);
++		str_fragment_from_reg(smccc_soc_id_name + 8 * 4, res.a5);
++		str_fragment_from_reg(smccc_soc_id_name + 8 * 5, res.a6);
++		str_fragment_from_reg(smccc_soc_id_name + 8 * 6, res.a7);
++		str_fragment_from_reg(smccc_soc_id_name + 8 * 7, res.a8);
++		str_fragment_from_reg(smccc_soc_id_name + 8 * 8, res.a9);
++		str_fragment_from_reg(smccc_soc_id_name + 8 * 9, res.a10);
++		str_fragment_from_reg(smccc_soc_id_name + 8 * 10, res.a11);
++		str_fragment_from_reg(smccc_soc_id_name + 8 * 11, res.a12);
++		str_fragment_from_reg(smccc_soc_id_name + 8 * 12, res.a13);
++		str_fragment_from_reg(smccc_soc_id_name + 8 * 13, res.a14);
++		str_fragment_from_reg(smccc_soc_id_name + 8 * 14, res.a15);
++		str_fragment_from_reg(smccc_soc_id_name + 8 * 15, res.a16);
++		str_fragment_from_reg(smccc_soc_id_name + 8 * 16, res.a17);
++
++		len = strnlen(smccc_soc_id_name, sizeof(smccc_soc_id_name));
++		if (len) {
++			if (len == sizeof(smccc_soc_id_name))
++				pr_warn(FW_BUG "Ignoring improperly formatted name\n");
++			else
++				return smccc_soc_id_name;
++		}
++	}
++
++	return NULL;
++}
++
++#else
++
++static char __init *smccc_soc_name_init(void)
++{
++	return NULL;
++}
++
++#endif
++
+ static int __init smccc_soc_init(void)
+ {
+ 	int soc_id_rev, soc_id_version;
+@@ -72,6 +151,7 @@ static int __init smccc_soc_init(void)
+ 	soc_dev_attr->soc_id = soc_id_str;
+ 	soc_dev_attr->revision = soc_id_rev_str;
+ 	soc_dev_attr->family = soc_id_jep106_id_str;
++	soc_dev_attr->machine = smccc_soc_name_init();
+ 
+ 	soc_dev = soc_device_register(soc_dev_attr);
+ 	if (IS_ERR(soc_dev)) {
+--- a/include/linux/arm-smccc.h
++++ b/include/linux/arm-smccc.h
+@@ -654,5 +654,45 @@ asmlinkage void __arm_smccc_hvc(unsigned
+ 		method;							\
+ 	})
+ 
++#ifdef CONFIG_ARM64
++
++#define __fail_smccc_1_2(___res)					\
++	do {								\
++		if (___res)						\
++			___res->a0 = SMCCC_RET_NOT_SUPPORTED;		\
++	} while (0)
++
++/*
++ * arm_smccc_1_2_invoke() - make an SMCCC v1.2 compliant call
++ *
++ * @args: SMC args are in the a0..a17 fields of the arm_smcc_1_2_regs structure
++ * @res: result values from registers 0 to 17
++ *
++ * This macro will make either an HVC call or an SMC call depending on the
++ * current SMCCC conduit. If no valid conduit is available then -1
++ * (SMCCC_RET_NOT_SUPPORTED) is returned in @res.a0 (if supplied).
++ *
++ * The return value also provides the conduit that was used.
++ */
++#define arm_smccc_1_2_invoke(args, res) ({				\
++		struct arm_smccc_1_2_regs *__args = args;		\
++		struct arm_smccc_1_2_regs *__res = res;			\
++		int method = arm_smccc_1_1_get_conduit();		\
++		switch (method) {					\
++		case SMCCC_CONDUIT_HVC:					\
++			arm_smccc_1_2_hvc(__args, __res);		\
++			break;						\
++		case SMCCC_CONDUIT_SMC:					\
++			arm_smccc_1_2_smc(__args, __res);		\
++			break;						\
++		default:						\
++			__fail_smccc_1_2(__res);			\
++			method = SMCCC_CONDUIT_NONE;			\
++			break;						\
++		}							\
++		method;							\
++	})
++#endif /*CONFIG_ARM64*/
++
+ #endif /*__ASSEMBLY__*/
+ #endif /*__LINUX_ARM_SMCCC_H*/
