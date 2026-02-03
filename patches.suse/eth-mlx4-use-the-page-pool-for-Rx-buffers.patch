@@ -1,0 +1,201 @@
+From: Jakub Kicinski <kuba@kernel.org>
+Date: Wed, 12 Feb 2025 17:06:35 -0800
+Subject: eth: mlx4: use the page pool for Rx buffers
+Patch-mainline: v6.15-rc1
+Git-commit: 82b023c97f602970af6e1f77914cbba5f63b3936
+References: jsc#PED-15317 jsc#PED-15316
+
+Simple conversion to page pool. Preserve the current fragmentation
+logic / page splitting. Each page starts with a single frag reference,
+and then we bump that when attaching to skbs. This can likely be
+optimized further.
+
+Reviewed-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://patch.msgid.link/20250213010635.1354034-5-kuba@kernel.org
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx4/en_rx.c   |   55 +++++++++------------------
+ drivers/net/ethernet/mellanox/mlx4/en_tx.c   |    8 ++-
+ drivers/net/ethernet/mellanox/mlx4/mlx4_en.h |    1 
+ 3 files changed, 25 insertions(+), 39 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx4/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_rx.c
+@@ -52,57 +52,39 @@
+ 
+ #include "mlx4_en.h"
+ 
+-static int mlx4_alloc_page(struct mlx4_en_priv *priv,
+-			   struct mlx4_en_rx_alloc *frag,
+-			   gfp_t gfp)
+-{
+-	struct page *page;
+-	dma_addr_t dma;
+-
+-	page = alloc_page(gfp);
+-	if (unlikely(!page))
+-		return -ENOMEM;
+-	dma = dma_map_page(priv->ddev, page, 0, PAGE_SIZE, priv->dma_dir);
+-	if (unlikely(dma_mapping_error(priv->ddev, dma))) {
+-		__free_page(page);
+-		return -ENOMEM;
+-	}
+-	frag->page = page;
+-	frag->dma = dma;
+-	frag->page_offset = priv->rx_headroom;
+-	return 0;
+-}
+-
+ static int mlx4_en_alloc_frags(struct mlx4_en_priv *priv,
+ 			       struct mlx4_en_rx_ring *ring,
+ 			       struct mlx4_en_rx_desc *rx_desc,
+ 			       struct mlx4_en_rx_alloc *frags,
+ 			       gfp_t gfp)
+ {
++	dma_addr_t dma;
+ 	int i;
+ 
+ 	for (i = 0; i < priv->num_frags; i++, frags++) {
+ 		if (!frags->page) {
+-			if (mlx4_alloc_page(priv, frags, gfp)) {
++			frags->page = page_pool_alloc_pages(ring->pp, gfp);
++			if (!frags->page) {
+ 				ring->alloc_fail++;
+ 				return -ENOMEM;
+ 			}
++			page_pool_fragment_page(frags->page, 1);
++			frags->page_offset = priv->rx_headroom;
++
+ 			ring->rx_alloc_pages++;
+ 		}
+-		rx_desc->data[i].addr = cpu_to_be64(frags->dma +
+-						    frags->page_offset);
++		dma = page_pool_get_dma_addr(frags->page);
++		rx_desc->data[i].addr = cpu_to_be64(dma + frags->page_offset);
+ 	}
+ 	return 0;
+ }
+ 
+ static void mlx4_en_free_frag(const struct mlx4_en_priv *priv,
++			      struct mlx4_en_rx_ring *ring,
+ 			      struct mlx4_en_rx_alloc *frag)
+ {
+-	if (frag->page) {
+-		dma_unmap_page(priv->ddev, frag->dma,
+-			       PAGE_SIZE, priv->dma_dir);
+-		__free_page(frag->page);
+-	}
++	if (frag->page)
++		page_pool_put_full_page(ring->pp, frag->page, false);
+ 	/* We need to clear all fields, otherwise a change of priv->log_rx_info
+ 	 * could lead to see garbage later in frag->page.
+ 	 */
+@@ -167,7 +149,7 @@ static void mlx4_en_free_rx_desc(const s
+ 	frags = ring->rx_info + (index << priv->log_rx_info);
+ 	for (nr = 0; nr < priv->num_frags; nr++) {
+ 		en_dbg(DRV, priv, "Freeing fragment:%d\n", nr);
+-		mlx4_en_free_frag(priv, frags + nr);
++		mlx4_en_free_frag(priv, ring, frags + nr);
+ 	}
+ }
+ 
+@@ -469,7 +451,7 @@ static int mlx4_en_complete_rx_desc(stru
+ 		if (unlikely(!page))
+ 			goto fail;
+ 
+-		dma = frags->dma;
++		dma = page_pool_get_dma_addr(page);
+ 		dma_sync_single_range_for_cpu(priv->ddev, dma, frags->page_offset,
+ 					      frag_size, priv->dma_dir);
+ 
+@@ -480,6 +462,7 @@ static int mlx4_en_complete_rx_desc(stru
+ 		if (frag_info->frag_stride == PAGE_SIZE / 2) {
+ 			frags->page_offset ^= PAGE_SIZE / 2;
+ 			release = page_count(page) != 1 ||
++				  atomic_long_read(&page->pp_ref_count) != 1 ||
+ 				  page_is_pfmemalloc(page) ||
+ 				  page_to_nid(page) != numa_mem_id();
+ 		} else if (!priv->rx_headroom) {
+@@ -493,10 +476,9 @@ static int mlx4_en_complete_rx_desc(stru
+ 			release = frags->page_offset + frag_info->frag_size > PAGE_SIZE;
+ 		}
+ 		if (release) {
+-			dma_unmap_page(priv->ddev, dma, PAGE_SIZE, priv->dma_dir);
+ 			frags->page = NULL;
+ 		} else {
+-			page_ref_inc(page);
++			page_pool_ref_page(page);
+ 		}
+ 
+ 		nr++;
+@@ -766,7 +748,8 @@ int mlx4_en_process_rx_cq(struct net_dev
+ 			/* Get pointer to first fragment since we haven't
+ 			 * skb yet and cast it to ethhdr struct
+ 			 */
+-			dma = frags[0].dma + frags[0].page_offset;
++			dma = page_pool_get_dma_addr(frags[0].page);
++			dma += frags[0].page_offset;
+ 			dma_sync_single_for_cpu(priv->ddev, dma, sizeof(*ethh),
+ 						DMA_FROM_DEVICE);
+ 
+@@ -805,7 +788,8 @@ int mlx4_en_process_rx_cq(struct net_dev
+ 			void *orig_data;
+ 			u32 act;
+ 
+-			dma = frags[0].dma + frags[0].page_offset;
++			dma = page_pool_get_dma_addr(frags[0].page);
++			dma += frags[0].page_offset;
+ 			dma_sync_single_for_cpu(priv->ddev, dma,
+ 						priv->frag_info[0].frag_size,
+ 						DMA_FROM_DEVICE);
+@@ -868,6 +852,7 @@ xdp_drop_no_cnt:
+ 		skb = napi_get_frags(&cq->napi);
+ 		if (unlikely(!skb))
+ 			goto next;
++		skb_mark_for_recycle(skb);
+ 
+ 		if (unlikely(ring->hwtstamp_rx_filter == HWTSTAMP_FILTER_ALL)) {
+ 			u64 timestamp = mlx4_en_get_cqe_ts(cqe);
+--- a/drivers/net/ethernet/mellanox/mlx4/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_tx.c
+@@ -44,6 +44,7 @@
+ #include <linux/ipv6.h>
+ #include <linux/indirect_call_wrapper.h>
+ #include <net/ipv6.h>
++#include <net/page_pool/helpers.h>
+ 
+ #include "mlx4_en.h"
+ 
+@@ -350,9 +351,10 @@ u32 mlx4_en_recycle_tx_desc(struct mlx4_
+ 			    int napi_mode)
+ {
+ 	struct mlx4_en_tx_info *tx_info = &ring->tx_info[index];
++	struct page_pool *pool = ring->recycle_ring->pp;
+ 
+-	dma_unmap_page(priv->ddev, tx_info->map0_dma, PAGE_SIZE, priv->dma_dir);
+-	put_page(tx_info->page);
++	/* Note that napi_mode = 0 means ndo_close() path, not budget = 0 */
++	page_pool_put_full_page(pool, tx_info->page, !!napi_mode);
+ 
+ 	return tx_info->nr_txbb;
+ }
+@@ -1189,7 +1191,7 @@ netdev_tx_t mlx4_en_xmit_frame(struct ml
+ 	tx_desc = ring->buf + (index << LOG_TXBB_SIZE);
+ 	data = &tx_desc->data;
+ 
+-	dma = frame->dma;
++	dma = page_pool_get_dma_addr(frame->page);
+ 
+ 	tx_info->page = frame->page;
+ 	frame->page = NULL;
+--- a/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
++++ b/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+@@ -247,7 +247,6 @@ struct mlx4_en_tx_desc {
+ 
+ struct mlx4_en_rx_alloc {
+ 	struct page	*page;
+-	dma_addr_t	dma;
+ 	u32		page_offset;
+ };
+ 
