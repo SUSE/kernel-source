@@ -1,0 +1,199 @@
+From: "Maciej S. Szmigiero" <mail@maciej.szmigiero.name>
+Date: Sun, 3 Aug 2025 21:18:12 +0200
+Subject: ACPI: PM: Add HP EliteBook 855 G7 WWAN modem power resource quirk
+Patch-mainline: v6.18-rc1
+Git-commit: 0467ed880a17c276c52e442c2454c7c16973a902
+References: jsc#PED-14260
+
+This laptop (and possibly similar models too) has power resource called
+"GP12.PXP_" for its Intel XMM7360 WWAN modem.
+
+For this power resource to turn ON power for the modem it needs certain
+internal flag called "ONEN" to be set:
+
+Method (_ON, 0, NotSerialized) // _ON_: Power On
+{
+	If (^^^LPCB.EC0.ECRG)
+	{
+		If ((ONEN == Zero))
+		{
+                        Return (Zero)
+		}
+(..)
+	}
+}
+
+This flag only gets set from this power resource _OFF method, while
+the actual modem power gets turned off during suspend by "GP12.PTS"
+method called from the global _PTS (Prepare To Sleep) method.
+
+In fact, this power resource _OFF method implementation just sets the
+aforementioned flag:
+
+Method (_OFF, 0, NotSerialized) // _OFF: Power Off
+{
+	OFEN = Zero
+	ONEN = One
+}
+
+Upon hibernation finish, the kernel tries to set this power resource
+back ON since its _STA method returns 0 and the resource is still
+considered in use as it is declared as required for D0 for both the
+modem ACPI device (GP12.PWAN) and its parent PCIe port ACPI device
+object (GP12).  But the _ON method won't do anything since that "ONEN"
+flag is not set.
+
+Overall, this means the modem is dead after hibernation finish until the
+laptop is rebooted since the modem power has been cut by _PTS and its
+PCI configuration was lost and not able to be restored.
+
+The easiest way to workaround this issue is to call this power resource
+_OFF method before calling the _ON method to make sure the "ONEN" flag
+gets properly set.
+
+This makes the modem alive once again after hibernation finish - with
+properly restored PCI configuration space.
+
+Since this platform does *not* support S3 the fact that
+acpi_resume_power_resources() is also called during resume from S3 is
+not a problem there.
+
+Do the DMI based quirk matching and quirk flag initialization just
+once - in acpi_power_resources_init() function.
+
+This way the whole resume path overhead of this change on other systems
+amounts to simple hp_eb_gp12pxp_quirk flag comparison.
+
+Signed-off-by: Maciej S. Szmigiero <mail@maciej.szmigiero.name>
+Link: https://patch.msgid.link/c6ff6931c5d27592052f30339de1b9cc298c43f0.1754243159.git.mail@maciej.szmigiero.name
+[ rjw: Changelog edits ]
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Acked-by: Chun-Yi Lee <jlee@suse.com>
+---
+ drivers/acpi/power.c |   80 +++++++++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 78 insertions(+), 2 deletions(-)
+
+--- a/drivers/acpi/power.c
++++ b/drivers/acpi/power.c
+@@ -23,6 +23,7 @@
+ 
+ #define pr_fmt(fmt) "ACPI: PM: " fmt
+ 
++#include <linux/delay.h>
+ #include <linux/dmi.h>
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+@@ -63,6 +64,7 @@ struct acpi_power_resource_entry {
+ 	struct acpi_power_resource *resource;
+ };
+ 
++static bool hp_eb_gp12pxp_quirk;
+ static bool unused_power_resources_quirk;
+ 
+ static LIST_HEAD(acpi_power_resource_list);
+@@ -994,6 +996,38 @@ struct acpi_device *acpi_add_power_resou
+ }
+ 
+ #ifdef CONFIG_ACPI_SLEEP
++static bool resource_is_gp12pxp(acpi_handle handle)
++{
++	const char *path;
++	bool ret;
++
++	path = acpi_handle_path(handle);
++	ret = path && strcmp(path, "\\_SB_.PCI0.GP12.PXP_") == 0;
++	kfree(path);
++
++	return ret;
++}
++
++static void acpi_resume_on_eb_gp12pxp(struct acpi_power_resource *resource)
++{
++	acpi_handle_notice(resource->device.handle,
++			   "HP EB quirk - turning OFF then ON\n");
++
++	__acpi_power_off(resource);
++	__acpi_power_on(resource);
++
++	/*
++	 * Use the same delay as DSDT uses in modem _RST method.
++	 *
++	 * Otherwise we get "Unable to change power state from unknown to D0,
++	 * device inaccessible" error for the modem PCI device after thaw.
++	 *
++	 * This power resource is normally being enabled only during thaw (once)
++	 * so this wait is not a performance issue.
++	 */
++	msleep(200);
++}
++
+ void acpi_resume_power_resources(void)
+ {
+ 	struct acpi_power_resource *resource;
+@@ -1015,8 +1049,14 @@ void acpi_resume_power_resources(void)
+ 
+ 		if (state == ACPI_POWER_RESOURCE_STATE_OFF
+ 		    && resource->ref_count) {
+-			acpi_handle_debug(resource->device.handle, "Turning ON\n");
+-			__acpi_power_on(resource);
++			if (hp_eb_gp12pxp_quirk &&
++			    resource_is_gp12pxp(resource->device.handle)) {
++				acpi_resume_on_eb_gp12pxp(resource);
++			} else {
++				acpi_handle_debug(resource->device.handle,
++						  "Turning ON\n");
++				__acpi_power_on(resource);
++			}
+ 		}
+ 
+ 		mutex_unlock(&resource->resource_lock);
+@@ -1026,6 +1066,41 @@ void acpi_resume_power_resources(void)
+ }
+ #endif
+ 
++static const struct dmi_system_id dmi_hp_elitebook_gp12pxp_quirk[] = {
++/*
++ * This laptop (and possibly similar models too) has power resource called
++ * "GP12.PXP_" for its WWAN modem.
++ *
++ * For this power resource to turn ON power for the modem it needs certain
++ * internal flag called "ONEN" to be set.
++ * This flag only gets set from this power resource "_OFF" method, while the
++ * actual modem power gets turned off during suspend by "GP12.PTS" method
++ * called from the global "_PTS" (Prepare To Sleep) method.
++ * On the other hand, this power resource "_OFF" method implementation just
++ * sets the aforementioned flag without actually doing anything else (it
++ * doesn't contain any code to actually turn off power).
++ *
++ * The above means that when upon hibernation finish we try to set this
++ * power resource back ON since its "_STA" method returns 0 (while the resource
++ * is still considered in use) its "_ON" method won't do anything since
++ * that "ONEN" flag is not set.
++ * Overall, this means the modem is dead until laptop is rebooted since its
++ * power has been cut by "_PTS" and its PCI configuration was lost and not able
++ * to be restored.
++ *
++ * The easiest way to workaround the issue is to call this power resource
++ * "_OFF" method before calling the "_ON" method to make sure the "ONEN"
++ * flag gets properly set.
++ */
++	{
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "HP"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "HP EliteBook 855 G7 Notebook PC"),
++		},
++	},
++	{}
++};
++
+ static const struct dmi_system_id dmi_leave_unused_power_resources_on[] = {
+ 	{
+ 		/*
+@@ -1070,6 +1145,7 @@ void acpi_turn_off_unused_power_resource
+ 
+ void __init acpi_power_resources_init(void)
+ {
++	hp_eb_gp12pxp_quirk = dmi_check_system(dmi_hp_elitebook_gp12pxp_quirk);
+ 	unused_power_resources_quirk =
+ 		dmi_check_system(dmi_leave_unused_power_resources_on);
+ }
