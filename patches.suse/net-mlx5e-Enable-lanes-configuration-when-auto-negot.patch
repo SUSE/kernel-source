@@ -1,0 +1,239 @@
+From: Shahar Shitrit <shshitrit@nvidia.com>
+Date: Tue, 4 Mar 2025 18:06:17 +0200
+Subject: net/mlx5e: Enable lanes configuration when auto-negotiation is off
+Patch-mainline: v6.15-rc1
+Git-commit: 7e959797f0218f8b8a5e38068a55661610eb935e
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+Currently, when auto-negotiation is disabled, the driver retrieves
+the speed and converts it into all link modes that correspond to
+that speed. With this patch, we add the ability to set the number
+of lanes, so that the combination of speed and lanes corresponds to
+exactly one specific link mode for the extended bit map.
+
+For the legacy bit map the driver sets all link modes correspond to
+speed and lanes.
+
+This change provides users with the option to set a specific link
+mode, rather than enabling all link modes associated with a given
+speed when auto-negotiation is off.
+
+Signed-off-by: Shahar Shitrit <shshitrit@nvidia.com>
+Reviewed-by: Carolina Jubran <cjubran@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://patch.msgid.link/20250304160620.417580-4-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c |   23 +++-
+ drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h  |    1 
+ drivers/net/ethernet/mellanox/mlx5/core/port.c       |   98 +++++++++----------
+ 3 files changed, 67 insertions(+), 55 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+@@ -42,6 +42,9 @@
+ #include "lib/clock.h"
+ #include "en/fs_ethtool.h"
+ 
++#define LANES_UNKNOWN		 0
++#define MAX_LANES		 8
++
+ void mlx5e_ethtool_get_drvinfo(struct mlx5e_priv *priv,
+ 			       struct ethtool_drvinfo *drvinfo)
+ {
+@@ -1076,15 +1079,16 @@ static void ptys2ethtool_supported_adver
+ 	}
+ }
+ 
+-static void get_speed_duplex(struct net_device *netdev,
+-			     u32 eth_proto_oper, bool force_legacy,
+-			     u16 data_rate_oper,
+-			     struct ethtool_link_ksettings *link_ksettings)
++static void get_link_properties(struct net_device *netdev,
++				u32 eth_proto_oper, bool force_legacy,
++				u16 data_rate_oper,
++				struct ethtool_link_ksettings *link_ksettings)
+ {
+ 	struct mlx5e_priv *priv = netdev_priv(netdev);
+ 	const struct mlx5_link_info *info;
+ 	u8 duplex = DUPLEX_UNKNOWN;
+ 	u32 speed = SPEED_UNKNOWN;
++	u32 lanes = LANES_UNKNOWN;
+ 
+ 	if (!netif_carrier_ok(netdev))
+ 		goto out;
+@@ -1092,14 +1096,17 @@ static void get_speed_duplex(struct net_
+ 	info = mlx5_port_ptys2info(priv->mdev, eth_proto_oper, force_legacy);
+ 	if (info) {
+ 		speed = info->speed;
++		lanes = info->lanes;
+ 		duplex = DUPLEX_FULL;
+ 	} else if (data_rate_oper) {
+ 		speed = 100 * data_rate_oper;
++		lanes = MAX_LANES;
+ 	}
+ 
+ out:
+-	link_ksettings->base.speed = speed;
+ 	link_ksettings->base.duplex = duplex;
++	link_ksettings->base.speed = speed;
++	link_ksettings->lanes = lanes;
+ }
+ 
+ static void get_supported(struct mlx5_core_dev *mdev, u32 eth_proto_cap,
+@@ -1236,8 +1243,8 @@ static int mlx5e_ethtool_get_link_ksetti
+ 	get_supported(mdev, eth_proto_cap, link_ksettings);
+ 	get_advertising(eth_proto_admin, tx_pause, rx_pause, link_ksettings,
+ 			admin_ext);
+-	get_speed_duplex(priv->netdev, eth_proto_oper, !admin_ext,
+-			 data_rate_oper, link_ksettings);
++	get_link_properties(priv->netdev, eth_proto_oper, !admin_ext,
++			    data_rate_oper, link_ksettings);
+ 
+ 	eth_proto_oper = eth_proto_oper ? eth_proto_oper : eth_proto_cap;
+ 	connector_type = connector_type < MLX5E_CONNECTOR_TYPE_NUMBER ?
+@@ -1366,6 +1373,7 @@ static int mlx5e_ethtool_set_link_ksetti
+ 	adver = link_ksettings->link_modes.advertising;
+ 	autoneg = link_ksettings->base.autoneg;
+ 	info.speed = link_ksettings->base.speed;
++	info.lanes = link_ksettings->lanes;
+ 
+ 	ext_supported = mlx5_ptys_ext_supported(mdev);
+ 	ext_requested = ext_link_mode_requested(adver);
+@@ -2613,6 +2621,7 @@ static void mlx5e_get_ts_stats(struct ne
+ }
+ 
+ const struct ethtool_ops mlx5e_ethtool_ops = {
++	.cap_link_lanes_supported = true,
+ 	.cap_rss_ctx_supported	= true,
+ 	.rxfh_per_ctx_key	= true,
+ 	.supported_coalesce_params = ETHTOOL_COALESCE_USECS |
+--- a/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
+@@ -131,6 +131,7 @@ struct mlx5_module_eeprom_query_params {
+ 
+ struct mlx5_link_info {
+ 	u32 speed;
++	u32 lanes;
+ };
+ 
+ static inline void mlx5_printk(struct mlx5_core_dev *dev, int level, const char *format, ...)
+--- a/drivers/net/ethernet/mellanox/mlx5/core/port.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/port.c
+@@ -1039,56 +1039,56 @@ out:
+ 
+ /* speed in units of 1Mb */
+ static const struct mlx5_link_info mlx5e_link_info[MLX5E_LINK_MODES_NUMBER] = {
+-	[MLX5E_1000BASE_CX_SGMII] = {.speed = 1000},
+-	[MLX5E_1000BASE_KX]       = {.speed = 1000},
+-	[MLX5E_10GBASE_CX4]       = {.speed = 10000},
+-	[MLX5E_10GBASE_KX4]       = {.speed = 10000},
+-	[MLX5E_10GBASE_KR]        = {.speed = 10000},
+-	[MLX5E_20GBASE_KR2]       = {.speed = 20000},
+-	[MLX5E_40GBASE_CR4]       = {.speed = 40000},
+-	[MLX5E_40GBASE_KR4]       = {.speed = 40000},
+-	[MLX5E_56GBASE_R4]        = {.speed = 56000},
+-	[MLX5E_10GBASE_CR]        = {.speed = 10000},
+-	[MLX5E_10GBASE_SR]        = {.speed = 10000},
+-	[MLX5E_10GBASE_ER]        = {.speed = 10000},
+-	[MLX5E_40GBASE_SR4]       = {.speed = 40000},
+-	[MLX5E_40GBASE_LR4]       = {.speed = 40000},
+-	[MLX5E_50GBASE_SR2]       = {.speed = 50000},
+-	[MLX5E_100GBASE_CR4]      = {.speed = 100000},
+-	[MLX5E_100GBASE_SR4]      = {.speed = 100000},
+-	[MLX5E_100GBASE_KR4]      = {.speed = 100000},
+-	[MLX5E_100GBASE_LR4]      = {.speed = 100000},
+-	[MLX5E_100BASE_TX]        = {.speed = 100},
+-	[MLX5E_1000BASE_T]        = {.speed = 1000},
+-	[MLX5E_10GBASE_T]         = {.speed = 10000},
+-	[MLX5E_25GBASE_CR]        = {.speed = 25000},
+-	[MLX5E_25GBASE_KR]        = {.speed = 25000},
+-	[MLX5E_25GBASE_SR]        = {.speed = 25000},
+-	[MLX5E_50GBASE_CR2]       = {.speed = 50000},
+-	[MLX5E_50GBASE_KR2]       = {.speed = 50000},
++	[MLX5E_1000BASE_CX_SGMII]	= {.speed = 1000, .lanes = 1},
++	[MLX5E_1000BASE_KX]		= {.speed = 1000, .lanes = 1},
++	[MLX5E_10GBASE_CX4]		= {.speed = 10000, .lanes = 4},
++	[MLX5E_10GBASE_KX4]		= {.speed = 10000, .lanes = 4},
++	[MLX5E_10GBASE_KR]		= {.speed = 10000, .lanes = 1},
++	[MLX5E_20GBASE_KR2]		= {.speed = 20000, .lanes = 2},
++	[MLX5E_40GBASE_CR4]		= {.speed = 40000, .lanes = 4},
++	[MLX5E_40GBASE_KR4]		= {.speed = 40000, .lanes = 4},
++	[MLX5E_56GBASE_R4]		= {.speed = 56000, .lanes = 4},
++	[MLX5E_10GBASE_CR]		= {.speed = 10000, .lanes = 1},
++	[MLX5E_10GBASE_SR]		= {.speed = 10000, .lanes = 1},
++	[MLX5E_10GBASE_ER]		= {.speed = 10000, .lanes = 1},
++	[MLX5E_40GBASE_SR4]		= {.speed = 40000, .lanes = 4},
++	[MLX5E_40GBASE_LR4]		= {.speed = 40000, .lanes = 4},
++	[MLX5E_50GBASE_SR2]		= {.speed = 50000, .lanes = 2},
++	[MLX5E_100GBASE_CR4]		= {.speed = 100000, .lanes = 4},
++	[MLX5E_100GBASE_SR4]		= {.speed = 100000, .lanes = 4},
++	[MLX5E_100GBASE_KR4]		= {.speed = 100000, .lanes = 4},
++	[MLX5E_100GBASE_LR4]		= {.speed = 100000, .lanes = 4},
++	[MLX5E_100BASE_TX]		= {.speed = 100, .lanes = 1},
++	[MLX5E_1000BASE_T]		= {.speed = 1000, .lanes = 1},
++	[MLX5E_10GBASE_T]		= {.speed = 10000, .lanes = 1},
++	[MLX5E_25GBASE_CR]		= {.speed = 25000, .lanes = 1},
++	[MLX5E_25GBASE_KR]		= {.speed = 25000, .lanes = 1},
++	[MLX5E_25GBASE_SR]		= {.speed = 25000, .lanes = 1},
++	[MLX5E_50GBASE_CR2]		= {.speed = 50000, .lanes = 2},
++	[MLX5E_50GBASE_KR2]		= {.speed = 50000, .lanes = 2},
+ };
+ 
+ static const struct mlx5_link_info
+ mlx5e_ext_link_info[MLX5E_EXT_LINK_MODES_NUMBER] = {
+-	[MLX5E_SGMII_100M]			= {.speed = 100},
+-	[MLX5E_1000BASE_X_SGMII]		= {.speed = 1000},
+-	[MLX5E_5GBASE_R]			= {.speed = 5000},
+-	[MLX5E_10GBASE_XFI_XAUI_1]		= {.speed = 10000},
+-	[MLX5E_40GBASE_XLAUI_4_XLPPI_4]		= {.speed = 40000},
+-	[MLX5E_25GAUI_1_25GBASE_CR_KR]		= {.speed = 25000},
+-	[MLX5E_50GAUI_2_LAUI_2_50GBASE_CR2_KR2] = {.speed = 50000},
+-	[MLX5E_50GAUI_1_LAUI_1_50GBASE_CR_KR]	= {.speed = 50000},
+-	[MLX5E_CAUI_4_100GBASE_CR4_KR4]		= {.speed = 100000},
+-	[MLX5E_100GAUI_2_100GBASE_CR2_KR2]	= {.speed = 100000},
+-	[MLX5E_200GAUI_4_200GBASE_CR4_KR4]	= {.speed = 200000},
+-	[MLX5E_400GAUI_8_400GBASE_CR8]		= {.speed = 400000},
+-	[MLX5E_100GAUI_1_100GBASE_CR_KR]	= {.speed = 100000},
+-	[MLX5E_200GAUI_2_200GBASE_CR2_KR2]	= {.speed = 200000},
+-	[MLX5E_400GAUI_4_400GBASE_CR4_KR4]	= {.speed = 400000},
+-	[MLX5E_800GAUI_8_800GBASE_CR8_KR8]	= {.speed = 800000},
+-	[MLX5E_200GAUI_1_200GBASE_CR1_KR1]	= {.speed = 200000},
+-	[MLX5E_400GAUI_2_400GBASE_CR2_KR2]	= {.speed = 400000},
+-	[MLX5E_800GAUI_4_800GBASE_CR4_KR4]	= {.speed = 800000},
++	[MLX5E_SGMII_100M]			= {.speed = 100, .lanes = 1},
++	[MLX5E_1000BASE_X_SGMII]		= {.speed = 1000, .lanes = 1},
++	[MLX5E_5GBASE_R]			= {.speed = 5000, .lanes = 1},
++	[MLX5E_10GBASE_XFI_XAUI_1]		= {.speed = 10000, .lanes = 1},
++	[MLX5E_40GBASE_XLAUI_4_XLPPI_4]		= {.speed = 40000, .lanes = 4},
++	[MLX5E_25GAUI_1_25GBASE_CR_KR]		= {.speed = 25000, .lanes = 1},
++	[MLX5E_50GAUI_2_LAUI_2_50GBASE_CR2_KR2]	= {.speed = 50000, .lanes = 2},
++	[MLX5E_50GAUI_1_LAUI_1_50GBASE_CR_KR]	= {.speed = 50000, .lanes = 1},
++	[MLX5E_CAUI_4_100GBASE_CR4_KR4]		= {.speed = 100000, .lanes = 4},
++	[MLX5E_100GAUI_2_100GBASE_CR2_KR2]	= {.speed = 100000, .lanes = 2},
++	[MLX5E_200GAUI_4_200GBASE_CR4_KR4]	= {.speed = 200000, .lanes = 4},
++	[MLX5E_400GAUI_8_400GBASE_CR8]		= {.speed = 400000, .lanes = 8},
++	[MLX5E_100GAUI_1_100GBASE_CR_KR]	= {.speed = 100000, .lanes = 1},
++	[MLX5E_200GAUI_2_200GBASE_CR2_KR2]	= {.speed = 200000, .lanes = 2},
++	[MLX5E_400GAUI_4_400GBASE_CR4_KR4]	= {.speed = 400000, .lanes = 4},
++	[MLX5E_800GAUI_8_800GBASE_CR8_KR8]	= {.speed = 800000, .lanes = 8},
++	[MLX5E_200GAUI_1_200GBASE_CR1_KR1]	= {.speed = 200000, .lanes = 1},
++	[MLX5E_400GAUI_2_400GBASE_CR2_KR2]	= {.speed = 400000, .lanes = 2},
++	[MLX5E_800GAUI_4_800GBASE_CR4_KR4]	= {.speed = 800000, .lanes = 4},
+ };
+ 
+ int mlx5_port_query_eth_proto(struct mlx5_core_dev *dev, u8 port, bool ext,
+@@ -1168,8 +1168,10 @@ u32 mlx5_port_info2linkmodes(struct mlx5
+ 	mlx5e_port_get_link_mode_info_arr(mdev, &table, &max_size,
+ 					  force_legacy);
+ 	for (i = 0; i < max_size; ++i) {
+-		if (table[i].speed == info->speed)
+-			link_modes |= MLX5E_PROT_MASK(i);
++		if (table[i].speed == info->speed) {
++			if (!info->lanes || table[i].lanes == info->lanes)
++				link_modes |= MLX5E_PROT_MASK(i);
++		}
+ 	}
+ 	return link_modes;
+ }
