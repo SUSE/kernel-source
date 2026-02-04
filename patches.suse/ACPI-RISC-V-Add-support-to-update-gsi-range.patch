@@ -1,0 +1,129 @@
+From: Sunil V L <sunilvl@ventanamicro.com>
+Date: Mon, 18 Aug 2025 09:39:14 +0530
+Subject: ACPI: RISC-V: Add support to update gsi range
+Patch-mainline: v6.18-rc1
+Git-commit: 4d185fdeef67d0c2c5d4a142392cf1ade3786dd2
+References: jsc#PED-14260
+
+Some RISC-V interrupt controllers like RPMI based system MSI interrupt
+controllers do not have MADT entry defined. These interrupt controllers
+exist only in the namespace. ACPI spec defines _GSB method to get the
+GSI base of the interrupt controller, However, there is no such standard
+method to get the GSI range. To support such interrupt controllers, set
+the GSI range of such interrupt controllers to non-overlapping range and
+provide API for interrupt controller driver to update it with proper
+value.
+
+Signed-off-by: Sunil V L <sunilvl@ventanamicro.com>
+Signed-off-by: Anup Patel <apatel@ventanamicro.com>
+Acked-by: Jassi Brar <jassisinghbrar@gmail.com>
+Link: https://lore.kernel.org/r/20250818040920.272664-19-apatel@ventanamicro.com
+Signed-off-by: Paul Walmsley <pjw@kernel.org>
+Acked-by: Chun-Yi Lee <jlee@suse.com>
+---
+ arch/riscv/include/asm/irq.h |    5 +++++
+ drivers/acpi/riscv/irq.c     |   38 ++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 41 insertions(+), 2 deletions(-)
+
+--- a/arch/riscv/include/asm/irq.h
++++ b/arch/riscv/include/asm/irq.h
+@@ -40,6 +40,7 @@ unsigned long acpi_rintc_ext_parent_to_h
+ unsigned int acpi_rintc_get_plic_nr_contexts(unsigned int plic_id);
+ unsigned int acpi_rintc_get_plic_context(unsigned int plic_id, unsigned int ctxt_idx);
+ int __init acpi_rintc_get_imsic_mmio_info(u32 index, struct resource *res);
++int riscv_acpi_update_gsi_range(u32 gsi_base, u32 nr_irqs);
+ 
+ #else
+ static inline int riscv_acpi_get_gsi_info(struct fwnode_handle *fwnode, u32 *gsi_base,
+@@ -74,6 +75,10 @@ static inline int __init acpi_rintc_get_
+ 	return 0;
+ }
+ 
++static inline int riscv_acpi_update_gsi_range(u32 gsi_base, u32 nr_irqs)
++{
++	return -ENODEV;
++}
+ #endif /* CONFIG_ACPI */
+ 
+ #endif /* _ASM_RISCV_IRQ_H */
+--- a/drivers/acpi/riscv/irq.c
++++ b/drivers/acpi/riscv/irq.c
+@@ -10,6 +10,8 @@
+ 
+ #include "init.h"
+ 
++#define RISCV_ACPI_INTC_FLAG_PENDING BIT(0)
++
+ struct riscv_ext_intc_list {
+ 	acpi_handle		handle;
+ 	u32			gsi_base;
+@@ -17,6 +19,7 @@ struct riscv_ext_intc_list {
+ 	u32			nr_idcs;
+ 	u32			id;
+ 	u32			type;
++	u32			flag;
+ 	struct list_head	list;
+ };
+ 
+@@ -69,6 +72,22 @@ static acpi_status riscv_acpi_update_gsi
+ 	return AE_NOT_FOUND;
+ }
+ 
++int riscv_acpi_update_gsi_range(u32 gsi_base, u32 nr_irqs)
++{
++	struct riscv_ext_intc_list *ext_intc_element;
++
++	list_for_each_entry(ext_intc_element, &ext_intc_list, list) {
++		if (gsi_base == ext_intc_element->gsi_base &&
++		    (ext_intc_element->flag & RISCV_ACPI_INTC_FLAG_PENDING)) {
++			ext_intc_element->nr_irqs = nr_irqs;
++			ext_intc_element->flag &= ~RISCV_ACPI_INTC_FLAG_PENDING;
++			return 0;
++		}
++	}
++
++	return -ENODEV;
++}
++
+ int riscv_acpi_get_gsi_info(struct fwnode_handle *fwnode, u32 *gsi_base,
+ 			    u32 *id, u32 *nr_irqs, u32 *nr_idcs)
+ {
+@@ -115,14 +134,22 @@ struct fwnode_handle *riscv_acpi_get_gsi
+ static int __init riscv_acpi_register_ext_intc(u32 gsi_base, u32 nr_irqs, u32 nr_idcs,
+ 					       u32 id, u32 type)
+ {
+-	struct riscv_ext_intc_list *ext_intc_element, *node;
++	struct riscv_ext_intc_list *ext_intc_element, *node, *prev;
+ 
+ 	ext_intc_element = kzalloc(sizeof(*ext_intc_element), GFP_KERNEL);
+ 	if (!ext_intc_element)
+ 		return -ENOMEM;
+ 
+ 	ext_intc_element->gsi_base = gsi_base;
+-	ext_intc_element->nr_irqs = nr_irqs;
++
++	/* If nr_irqs is zero, indicate it in flag and set to max range possible */
++	if (nr_irqs) {
++		ext_intc_element->nr_irqs = nr_irqs;
++	} else {
++		ext_intc_element->flag |= RISCV_ACPI_INTC_FLAG_PENDING;
++		ext_intc_element->nr_irqs = U32_MAX - ext_intc_element->gsi_base;
++	}
++
+ 	ext_intc_element->nr_idcs = nr_idcs;
+ 	ext_intc_element->id = id;
+ 	list_for_each_entry(node, &ext_intc_list, list) {
+@@ -130,6 +157,13 @@ static int __init riscv_acpi_register_ex
+ 			break;
+ 	}
+ 
++	/* Adjust the previous node's GSI range if that has pending registration */
++	prev = list_prev_entry(node, list);
++	if (!list_entry_is_head(prev, &ext_intc_list, list)) {
++		if (prev->flag & RISCV_ACPI_INTC_FLAG_PENDING)
++			prev->nr_irqs = ext_intc_element->gsi_base - prev->gsi_base;
++	}
++
+ 	list_add_tail(&ext_intc_element->list, &node->list);
+ 	return 0;
+ }
