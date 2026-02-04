@@ -1,0 +1,140 @@
+From 4d6d35d3417dcab14a9b1b9771c3cd62e8ed442b Mon Sep 17 00:00:00 2001
+From: "Yo-Jung (Leo) Lin" <leo.lin@canonical.com>
+Date: Wed, 30 Apr 2025 19:26:16 +0800
+Subject: [PATCH] i2c: smbus: introduce Write Disable-aware SPD instantiating functions
+Git-commit: 4d6d35d3417dcab14a9b1b9771c3cd62e8ed442b
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13784
+
+Some SMBus controllers may restrict writes to addresses where SPD sensors
+may reside. This may lead to some SPD sensors not functioning correctly,
+and might need extra handling. Introduce new SPD-instantiating functions
+that are aware of this, and use them instead.
+
+Signed-off-by: Yo-Jung Lin (Leo) <leo.lin@canonical.com>
+Reviewed-by: Guenter Roeck <linux@roeck-us.net>
+Link: https://lore.kernel.org/r/20250430-for-upstream-i801-spd5118-no-instantiate-v2-1-2f54d91ae2c7@canonical.com
+Signed-off-by: Andi Shyti <andi.shyti@kernel.org>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/i2c/busses/i2c-i801.c  |  4 ++--
+ drivers/i2c/busses/i2c-piix4.c |  2 +-
+ drivers/i2c/i2c-smbus.c        | 21 +++++++++++++++++++--
+ include/linux/i2c-smbus.h      |  6 ++++--
+ 4 files changed, 26 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/i2c/busses/i2c-i801.c b/drivers/i2c/busses/i2c-i801.c
+index 48e1af544b75..a7f89946dad4 100644
+--- a/drivers/i2c/busses/i2c-i801.c
++++ b/drivers/i2c/busses/i2c-i801.c
+@@ -1180,7 +1180,7 @@ static void i801_probe_optional_targets(struct i801_priv *priv)
+ #ifdef CONFIG_I2C_I801_MUX
+ 	if (!priv->mux_pdev)
+ #endif
+-		i2c_register_spd(&priv->adapter);
++		i2c_register_spd_write_enable(&priv->adapter);
+ }
+ #else
+ static void __init input_apanel_init(void) {}
+@@ -1283,7 +1283,7 @@ static int i801_notifier_call(struct notifier_block *nb, unsigned long action,
+ 		return NOTIFY_DONE;
+ 
+ 	/* Call i2c_register_spd for muxed child segments */
+-	i2c_register_spd(to_i2c_adapter(dev));
++	i2c_register_spd_write_enable(to_i2c_adapter(dev));
+ 
+ 	return NOTIFY_OK;
+ }
+diff --git a/drivers/i2c/busses/i2c-piix4.c b/drivers/i2c/busses/i2c-piix4.c
+index dd75916157f0..56839557ec6c 100644
+--- a/drivers/i2c/busses/i2c-piix4.c
++++ b/drivers/i2c/busses/i2c-piix4.c
+@@ -971,7 +971,7 @@ static int piix4_add_adapter(struct pci_dev *dev, unsigned short smba,
+ 	 * This would allow the ee1004 to be probed incorrectly.
+ 	 */
+ 	if (port == 0)
+-		i2c_register_spd(adap);
++		i2c_register_spd_write_enable(adap);
+ 
+ 	*padap = adap;
+ 	return 0;
+diff --git a/drivers/i2c/i2c-smbus.c b/drivers/i2c/i2c-smbus.c
+index 7d40e7aa3799..0316b347f9e7 100644
+--- a/drivers/i2c/i2c-smbus.c
++++ b/drivers/i2c/i2c-smbus.c
+@@ -372,12 +372,13 @@ EXPORT_SYMBOL_GPL(i2c_free_slave_host_notify_device);
+  *  - Only works on systems with 1 to 8 memory slots
+  */
+ #if IS_ENABLED(CONFIG_DMI)
+-void i2c_register_spd(struct i2c_adapter *adap)
++static void i2c_register_spd(struct i2c_adapter *adap, bool write_disabled)
+ {
+ 	int n, slot_count = 0, dimm_count = 0;
+ 	u16 handle;
+ 	u8 common_mem_type = 0x0, mem_type;
+ 	u64 mem_size;
++	bool instantiate = true;
+ 	const char *name;
+ 
+ 	while ((handle = dmi_memdev_handle(slot_count)) != 0xffff) {
+@@ -438,6 +439,7 @@ void i2c_register_spd(struct i2c_adapter *adap)
+ 	case 0x22:	/* DDR5 */
+ 	case 0x23:	/* LPDDR5 */
+ 		name = "spd5118";
++		instantiate = !write_disabled;
+ 		break;
+ 	default:
+ 		dev_info(&adap->dev,
+@@ -461,6 +463,9 @@ void i2c_register_spd(struct i2c_adapter *adap)
+ 		addr_list[0] = 0x50 + n;
+ 		addr_list[1] = I2C_CLIENT_END;
+ 
++		if (!instantiate)
++			continue;
++
+ 		if (!IS_ERR(i2c_new_scanned_device(adap, &info, addr_list, NULL))) {
+ 			dev_info(&adap->dev,
+ 				 "Successfully instantiated SPD at 0x%hx\n",
+@@ -469,7 +474,19 @@ void i2c_register_spd(struct i2c_adapter *adap)
+ 		}
+ 	}
+ }
+-EXPORT_SYMBOL_GPL(i2c_register_spd);
++
++void i2c_register_spd_write_disable(struct i2c_adapter *adap)
++{
++	i2c_register_spd(adap, true);
++}
++EXPORT_SYMBOL_GPL(i2c_register_spd_write_disable);
++
++void i2c_register_spd_write_enable(struct i2c_adapter *adap)
++{
++	i2c_register_spd(adap, false);
++}
++EXPORT_SYMBOL_GPL(i2c_register_spd_write_enable);
++
+ #endif
+ 
+ MODULE_AUTHOR("Jean Delvare <jdelvare@suse.de>");
+diff --git a/include/linux/i2c-smbus.h b/include/linux/i2c-smbus.h
+index ced1c6ead52a..dc1bd2ab4c13 100644
+--- a/include/linux/i2c-smbus.h
++++ b/include/linux/i2c-smbus.h
+@@ -44,9 +44,11 @@ static inline void i2c_free_slave_host_notify_device(struct i2c_client *client)
+ #endif
+ 
+ #if IS_ENABLED(CONFIG_I2C_SMBUS) && IS_ENABLED(CONFIG_DMI)
+-void i2c_register_spd(struct i2c_adapter *adap);
++void i2c_register_spd_write_disable(struct i2c_adapter *adap);
++void i2c_register_spd_write_enable(struct i2c_adapter *adap);
+ #else
+-static inline void i2c_register_spd(struct i2c_adapter *adap) { }
++static inline void i2c_register_spd_write_disable(struct i2c_adapter *adap) { }
++static inline void i2c_register_spd_write_enable(struct i2c_adapter *adap) { }
+ #endif
+ 
+ #endif /* _LINUX_I2C_SMBUS_H */
+-- 
+2.52.0
+
