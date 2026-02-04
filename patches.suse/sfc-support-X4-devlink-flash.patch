@@ -1,0 +1,124 @@
+From: Edward Cree <ecree.xilinx@gmail.com>
+Date: Thu, 20 Mar 2025 17:57:12 +0000
+Subject: sfc: support X4 devlink flash
+Patch-mainline: v6.15-rc1
+Git-commit: 5726a15499daf619eb3e67d615a0252ca69b84b9
+References: jsc#PED-15342
+
+Unlike X2 and EF100, we do not attempt to parse the firmware file to
+ find an image within it; we simply hand the entire file to the MC,
+ which is responsible for understanding any container formats we might
+ use and validating that the firmware file is applicable to this NIC.
+
+Signed-off-by: Edward Cree <ecree.xilinx@gmail.com>
+Link: https://patch.msgid.link/9a72a74002a7819c780b0a18ce9294c9d4e1db12.1742493017.git.ecree.xilinx@gmail.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/sfc/ef10.c        |    1 
+ drivers/net/ethernet/sfc/efx_reflash.c |   54 ++++++++++++++++++---------------
+ drivers/net/ethernet/sfc/net_driver.h  |    3 +
+ 3 files changed, 35 insertions(+), 23 deletions(-)
+
+--- a/drivers/net/ethernet/sfc/ef10.c
++++ b/drivers/net/ethernet/sfc/ef10.c
+@@ -4419,6 +4419,7 @@ const struct efx_nic_type efx_x4_nic_typ
+ 	.can_rx_scatter = true,
+ 	.always_rx_scatter = true,
+ 	.option_descriptors = true,
++	.flash_auto_partition = true,
+ 	.min_interrupt_mode = EFX_INT_MODE_MSIX,
+ 	.timer_period_max = 1 << ERF_DD_EVQ_IND_TIMER_VAL_WIDTH,
+ 	.offload_features = EF10_OFFLOAD_FEATURES,
+--- a/drivers/net/ethernet/sfc/efx_reflash.c
++++ b/drivers/net/ethernet/sfc/efx_reflash.c
+@@ -407,31 +407,40 @@ int efx_reflash_flash_firmware(struct ef
+ 		return -EOPNOTSUPP;
+ 	}
+ 
+-	devlink_flash_update_status_notify(devlink, "Checking update", NULL, 0, 0);
+-
+-	rc = efx_reflash_parse_firmware_data(fw, &type, &data_subtype, &data,
+-					     &data_size);
+-	if (rc) {
+-		NL_SET_ERR_MSG_MOD(extack,
+-				   "Firmware image validation check failed");
+-		goto out;
+-	}
+-
+ 	mutex_lock(&efx->reflash_mutex);
+ 
+-	rc = efx_mcdi_nvram_metadata(efx, type, &subtype, NULL, NULL, 0);
+-	if (rc) {
+-		NL_SET_ERR_MSG_FMT_MOD(extack,
+-				       "Metadata query for NVRAM partition %#x failed",
+-				       type);
+-		goto out_unlock;
+-	}
++	devlink_flash_update_status_notify(devlink, "Checking update", NULL, 0, 0);
+ 
+-	if (subtype != data_subtype) {
+-		NL_SET_ERR_MSG_MOD(extack,
+-				   "Firmware image is not appropriate for this adapter");
+-		rc = -EINVAL;
+-		goto out_unlock;
++	if (efx->type->flash_auto_partition) {
++		/* NIC wants entire FW file including headers;
++		 * FW will validate 'subtype' if there is one
++		 */
++		type = NVRAM_PARTITION_TYPE_AUTO;
++		data = fw->data;
++		data_size = fw->size;
++	} else {
++		rc = efx_reflash_parse_firmware_data(fw, &type, &data_subtype, &data,
++						     &data_size);
++		if (rc) {
++			NL_SET_ERR_MSG_MOD(extack,
++					   "Firmware image validation check failed");
++			goto out_unlock;
++		}
++
++		rc = efx_mcdi_nvram_metadata(efx, type, &subtype, NULL, NULL, 0);
++		if (rc) {
++			NL_SET_ERR_MSG_FMT_MOD(extack,
++					       "Metadata query for NVRAM partition %#x failed",
++					       type);
++			goto out_unlock;
++		}
++
++		if (subtype != data_subtype) {
++			NL_SET_ERR_MSG_MOD(extack,
++					   "Firmware image is not appropriate for this adapter");
++			rc = -EINVAL;
++			goto out_unlock;
++		}
+ 	}
+ 
+ 	rc = efx_mcdi_nvram_info(efx, type, &size, &erase_align, &write_align,
+@@ -506,7 +515,6 @@ out_update_finish:
+ 		rc = efx_mcdi_nvram_update_finish_polled(efx, type);
+ out_unlock:
+ 	mutex_unlock(&efx->reflash_mutex);
+-out:
+ 	devlink_flash_update_status_notify(devlink, rc ? "Update failed" :
+ 							 "Update complete",
+ 					   NULL, 0, 0);
+--- a/drivers/net/ethernet/sfc/net_driver.h
++++ b/drivers/net/ethernet/sfc/net_driver.h
+@@ -1381,6 +1381,8 @@ struct efx_udp_tunnel {
+  * @can_rx_scatter: NIC is able to scatter packets to multiple buffers
+  * @always_rx_scatter: NIC will always scatter packets to multiple buffers
+  * @option_descriptors: NIC supports TX option descriptors
++ * @flash_auto_partition: firmware flash uses AUTO partition, driver does
++ *	not need to perform image parsing
+  * @min_interrupt_mode: Lowest capability interrupt mode supported
+  *	from &enum efx_int_mode.
+  * @timer_period_max: Maximum period of interrupt timer (in ticks)
+@@ -1557,6 +1559,7 @@ struct efx_nic_type {
+ 	bool can_rx_scatter;
+ 	bool always_rx_scatter;
+ 	bool option_descriptors;
++	bool flash_auto_partition;
+ 	unsigned int min_interrupt_mode;
+ 	unsigned int timer_period_max;
+ 	netdev_features_t offload_features;
