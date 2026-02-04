@@ -1,0 +1,171 @@
+From: Huisong Li <lihuisong@huawei.com>
+Date: Mon, 28 Jul 2025 15:06:12 +0800
+Subject: ACPI: processor: idle: Optimize ACPI idle driver registration
+Patch-mainline: v6.18-rc1
+Git-commit: 7a8c994cbb2db3c5335cee35fd486557f5aaf7e1
+References: jsc#PED-14260
+
+Currently, the ACPI idle driver is registered from within a CPU
+hotplug callback. Although this didn't cause any functional issues,
+this is questionable and confusing. And it is better to register
+the cpuidle driver when all of the CPUs have been brought up.
+
+So add a new function to initialize acpi_idle_driver based on the
+power management information of an available CPU and register cpuidle
+driver in acpi_processor_driver_init().
+
+Signed-off-by: Huisong Li <lihuisong@huawei.com>
+Link: https://patch.msgid.link/20250728070612.1260859-3-lihuisong@huawei.com
+[ rjw: Added missing inline modifiers ]
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Acked-by: Chun-Yi Lee <jlee@suse.com>
+---
+ drivers/acpi/processor_driver.c |    3 +
+ drivers/acpi/processor_idle.c   |   65 +++++++++++++++++++++++++---------------
+ include/acpi/processor.h        |    8 ++++
+ 3 files changed, 53 insertions(+), 23 deletions(-)
+
+--- a/drivers/acpi/processor_driver.c
++++ b/drivers/acpi/processor_driver.c
+@@ -263,6 +263,8 @@ static int __init acpi_processor_driver_
+ 	if (result < 0)
+ 		return result;
+ 
++	acpi_processor_register_idle_driver();
++
+ 	result = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN,
+ 				   "acpi/cpu-drv:online",
+ 				   acpi_soft_cpu_online, NULL);
+@@ -301,6 +303,7 @@ static void __exit acpi_processor_driver
+ 
+ 	cpuhp_remove_state_nocalls(hp_online);
+ 	cpuhp_remove_state_nocalls(CPUHP_ACPI_CPUDRV_DEAD);
++	acpi_processor_unregister_idle_driver();
+ 	driver_unregister(&acpi_processor_driver);
+ }
+ 
+--- a/drivers/acpi/processor_idle.c
++++ b/drivers/acpi/processor_idle.c
+@@ -1363,7 +1363,48 @@ int acpi_processor_power_state_has_chang
+ 	return 0;
+ }
+ 
+-static int acpi_processor_registered;
++void acpi_processor_register_idle_driver(void)
++{
++	struct acpi_processor *pr;
++	int ret = -ENODEV;
++	int cpu;
++
++	/*
++	 * Acpi idle driver is used by all possible CPUs.
++	 * Install the idle handler by the processor power info of one in them.
++	 * Note that we use previously set idle handler will be used on
++	 * platforms that only support C1.
++	 */
++	for_each_cpu(cpu, (struct cpumask *)cpu_possible_mask) {
++		pr = per_cpu(processors, cpu);
++		if (!pr)
++			continue;
++
++		ret = acpi_processor_get_power_info(pr);
++		if (!ret) {
++			pr->flags.power_setup_done = 1;
++			acpi_processor_setup_cpuidle_states(pr);
++			break;
++		}
++	}
++
++	if (ret) {
++		pr_debug("No ACPI power information from any CPUs.\n");
++		return;
++	}
++
++	ret = cpuidle_register_driver(&acpi_idle_driver);
++	if (ret) {
++		pr_debug("register %s failed.\n", acpi_idle_driver.name);
++		return;
++	}
++	pr_debug("%s registered with cpuidle.\n", acpi_idle_driver.name);
++}
++
++void acpi_processor_unregister_idle_driver(void)
++{
++	cpuidle_unregister_driver(&acpi_idle_driver);
++}
+ 
+ int acpi_processor_power_init(struct acpi_processor *pr)
+ {
+@@ -1378,22 +1419,7 @@ int acpi_processor_power_init(struct acp
+ 	if (!acpi_processor_get_power_info(pr))
+ 		pr->flags.power_setup_done = 1;
+ 
+-	/*
+-	 * Install the idle handler if processor power management is supported.
+-	 * Note that we use previously set idle handler will be used on
+-	 * platforms that only support C1.
+-	 */
+ 	if (pr->flags.power) {
+-		/* Register acpi_idle_driver if not already registered */
+-		if (!acpi_processor_registered) {
+-			acpi_processor_setup_cpuidle_states(pr);
+-			retval = cpuidle_register_driver(&acpi_idle_driver);
+-			if (retval)
+-				return retval;
+-			pr_debug("%s registered with cpuidle\n",
+-				 acpi_idle_driver.name);
+-		}
+-
+ 		dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+ 		if (!dev)
+ 			return -ENOMEM;
+@@ -1406,14 +1432,11 @@ int acpi_processor_power_init(struct acp
+ 		 */
+ 		retval = cpuidle_register_device(dev);
+ 		if (retval) {
+-			if (acpi_processor_registered == 0)
+-				cpuidle_unregister_driver(&acpi_idle_driver);
+ 
+ 			per_cpu(acpi_cpuidle_device, pr->id) = NULL;
+ 			kfree(dev);
+ 			return retval;
+ 		}
+-		acpi_processor_registered++;
+ 	}
+ 	return 0;
+ }
+@@ -1427,10 +1450,6 @@ int acpi_processor_power_exit(struct acp
+ 
+ 	if (pr->flags.power) {
+ 		cpuidle_unregister_device(dev);
+-		acpi_processor_registered--;
+-		if (acpi_processor_registered == 0)
+-			cpuidle_unregister_driver(&acpi_idle_driver);
+-
+ 		kfree(dev);
+ 	}
+ 
+--- a/include/acpi/processor.h
++++ b/include/acpi/processor.h
+@@ -423,6 +423,8 @@ int acpi_processor_power_init(struct acp
+ int acpi_processor_power_exit(struct acpi_processor *pr);
+ int acpi_processor_power_state_has_changed(struct acpi_processor *pr);
+ int acpi_processor_hotplug(struct acpi_processor *pr);
++void acpi_processor_register_idle_driver(void);
++void acpi_processor_unregister_idle_driver(void);
+ #else
+ static inline int acpi_processor_power_init(struct acpi_processor *pr)
+ {
+@@ -443,6 +445,12 @@ static inline int acpi_processor_hotplug
+ {
+ 	return -ENODEV;
+ }
++static inline void acpi_processor_register_idle_driver(void)
++{
++}
++static inline void acpi_processor_unregister_idle_driver(void)
++{
++}
+ #endif /* CONFIG_ACPI_PROCESSOR_IDLE */
+ 
+ /* in processor_thermal.c */
