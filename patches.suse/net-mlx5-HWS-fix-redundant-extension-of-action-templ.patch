@@ -1,0 +1,162 @@
+From: Yevgeny Kliteynik <kliteyn@nvidia.com>
+Date: Sun, 11 May 2025 22:38:08 +0300
+Subject: net/mlx5: HWS, fix redundant extension of action templates
+Patch-mainline: v6.16-rc1
+Git-commit: 041861b40f599311214a52075140db8be29fd27f
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+When a rule is inserted into a matcher, we search for the suitable
+action template. If such template is not found, action template array
+is extended with the new template. However, when several threads are
+performing this in parallel, there is a race - we can end up with
+extending the action templates array with the same template.
+
+This patch is doing the following:
+ - refactor the code to find action template index in rule create and
+   update, have the common code in an auxiliary function
+ - after locking all the queues, check again if the action template
+   array still needs to be extended
+
+Signed-off-by: Vlad Dogaru <vdogaru@nvidia.com>
+Signed-off-by: Yevgeny Kliteynik <kliteyn@nvidia.com>
+Reviewed-by: Mark Bloch <mbloch@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://patch.msgid.link/1746992290-568936-9-git-send-email-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/steering/hws/bwc.c |  105 ++++++-------
+ 1 file changed, 54 insertions(+), 51 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/bwc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/bwc.c
+@@ -789,6 +789,53 @@ hws_bwc_matcher_rehash_size(struct mlx5h
+ 	return hws_bwc_matcher_move(bwc_matcher);
+ }
+ 
++static int hws_bwc_rule_get_at_idx(struct mlx5hws_bwc_rule *bwc_rule,
++				   struct mlx5hws_rule_action rule_actions[],
++				   u16 bwc_queue_idx)
++{
++	struct mlx5hws_bwc_matcher *bwc_matcher = bwc_rule->bwc_matcher;
++	struct mlx5hws_context *ctx = bwc_matcher->matcher->tbl->ctx;
++	struct mutex *queue_lock; /* Protect the queue */
++	int at_idx, ret;
++
++	/* check if rehash needed due to missing action template */
++	at_idx = hws_bwc_matcher_find_at(bwc_matcher, rule_actions);
++	if (likely(at_idx >= 0))
++		return at_idx;
++
++	/* we need to extend BWC matcher action templates array */
++	queue_lock = hws_bwc_get_queue_lock(ctx, bwc_queue_idx);
++	mutex_unlock(queue_lock);
++	hws_bwc_lock_all_queues(ctx);
++
++	/* check again - perhaps other thread already did extend_at */
++	at_idx = hws_bwc_matcher_find_at(bwc_matcher, rule_actions);
++	if (at_idx >= 0)
++		goto out;
++
++	ret = hws_bwc_matcher_extend_at(bwc_matcher, rule_actions);
++	if (unlikely(ret)) {
++		mlx5hws_err(ctx, "BWC rule: failed extending AT (%d)", ret);
++		at_idx = -EINVAL;
++		goto out;
++	}
++
++	/* action templates array was extended, we need the last idx */
++	at_idx = bwc_matcher->num_of_at - 1;
++	ret = mlx5hws_matcher_attach_at(bwc_matcher->matcher,
++					bwc_matcher->at[at_idx]);
++	if (unlikely(ret)) {
++		mlx5hws_err(ctx, "BWC rule: failed attaching new AT (%d)", ret);
++		at_idx = -EINVAL;
++		goto out;
++	}
++
++out:
++	hws_bwc_unlock_all_queues(ctx);
++	mutex_lock(queue_lock);
++	return at_idx;
++}
++
+ int mlx5hws_bwc_rule_create_simple(struct mlx5hws_bwc_rule *bwc_rule,
+ 				   u32 *match_param,
+ 				   struct mlx5hws_rule_action rule_actions[],
+@@ -809,31 +856,12 @@ int mlx5hws_bwc_rule_create_simple(struc
+ 
+ 	mutex_lock(queue_lock);
+ 
+-	/* check if rehash needed due to missing action template */
+-	at_idx = hws_bwc_matcher_find_at(bwc_matcher, rule_actions);
++	at_idx = hws_bwc_rule_get_at_idx(bwc_rule, rule_actions, bwc_queue_idx);
+ 	if (unlikely(at_idx < 0)) {
+-		/* we need to extend BWC matcher action templates array */
+ 		mutex_unlock(queue_lock);
+-		hws_bwc_lock_all_queues(ctx);
+-
+-		ret = hws_bwc_matcher_extend_at(bwc_matcher, rule_actions);
+-		if (unlikely(ret)) {
+-			hws_bwc_unlock_all_queues(ctx);
+-			return ret;
+-		}
+-
+-		/* action templates array was extended, we need the last idx */
+-		at_idx = bwc_matcher->num_of_at - 1;
+-
+-		ret = mlx5hws_matcher_attach_at(bwc_matcher->matcher,
+-						bwc_matcher->at[at_idx]);
+-		if (unlikely(ret)) {
+-			hws_bwc_unlock_all_queues(ctx);
+-			return ret;
+-		}
+-
+-		hws_bwc_unlock_all_queues(ctx);
+-		mutex_lock(queue_lock);
++		mlx5hws_err(ctx, "BWC rule create: failed getting AT (%d)",
++			    ret);
++		return -EINVAL;
+ 	}
+ 
+ 	/* check if number of rules require rehash */
+@@ -971,36 +999,11 @@ hws_bwc_rule_action_update(struct mlx5hw
+ 
+ 	mutex_lock(queue_lock);
+ 
+-	/* check if rehash needed due to missing action template */
+-	at_idx = hws_bwc_matcher_find_at(bwc_matcher, rule_actions);
++	at_idx = hws_bwc_rule_get_at_idx(bwc_rule, rule_actions, idx);
+ 	if (unlikely(at_idx < 0)) {
+-		/* we need to extend BWC matcher action templates array */
+ 		mutex_unlock(queue_lock);
+-		hws_bwc_lock_all_queues(ctx);
+-
+-		/* check again - perhaps other thread already did extend_at */
+-		at_idx = hws_bwc_matcher_find_at(bwc_matcher, rule_actions);
+-		if (likely(at_idx < 0)) {
+-			ret = hws_bwc_matcher_extend_at(bwc_matcher, rule_actions);
+-			if (unlikely(ret)) {
+-				hws_bwc_unlock_all_queues(ctx);
+-				mlx5hws_err(ctx, "BWC rule update: failed extending AT (%d)", ret);
+-				return -EINVAL;
+-			}
+-
+-			/* action templates array was extended, we need the last idx */
+-			at_idx = bwc_matcher->num_of_at - 1;
+-
+-			ret = mlx5hws_matcher_attach_at(bwc_matcher->matcher,
+-							bwc_matcher->at[at_idx]);
+-			if (unlikely(ret)) {
+-				hws_bwc_unlock_all_queues(ctx);
+-				return ret;
+-			}
+-		}
+-
+-		hws_bwc_unlock_all_queues(ctx);
+-		mutex_lock(queue_lock);
++		mlx5hws_err(ctx, "BWC rule update: failed getting AT\n");
++		return -EINVAL;
+ 	}
+ 
+ 	ret = hws_bwc_rule_update_sync(bwc_rule,
