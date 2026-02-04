@@ -111,8 +111,9 @@ class OBSAPI(api.API):
             if 'keyring' in config or 'gnome_keyring' in config or cmc == 'osc.credentials.KeyringCredentialsManager:keyring.backends.SecretService.Keyring':
                 assert self.url.startswith('https://')
                 host = self.url[       len('https://'):]
-                passw = subprocess.check_output('secret-tool', 'lookup', 'service', host, 'username', self.user)
+                passw = subprocess.check_output(['secret-tool', 'lookup', 'service', host, 'username', self.user])
                 assert len(passw) > 0
+                passw = passw.decode()
             else:
                 raise RuntimeError('No password found in ' + self.url + ' configuration. Authentication type ' + str(cmc) + ' not supported.')
         self.passw = passw
