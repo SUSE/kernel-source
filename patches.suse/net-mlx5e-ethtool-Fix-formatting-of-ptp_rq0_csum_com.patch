@@ -1,0 +1,89 @@
+From: Kees Cook <kees@kernel.org>
+Date: Tue, 15 Apr 2025 19:01:14 -0700
+Subject: net/mlx5e: ethtool: Fix formatting of ptp_rq0_csum_complete_tail_slow
+Patch-mainline: v6.16-rc1
+Git-commit: cfba1d1b61ae3f32e4bc06e9860711a4488d98b7
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+The new GCC 15 warning -Wunterminated-string-initialization reports:
+
+In file included from drivers/net/ethernet/mellanox/mlx5/core/en.h:55,
+                 from drivers/net/ethernet/mellanox/mlx5/core/en_stats.c:34:
+drivers/net/ethernet/mellanox/mlx5/core/en_stats.h:57:46: warning: initializer-string for array of 'char' truncates NUL terminator but destination lacks 'nonstring' attribute (33 chars into 32 available) [-Wunterminated-string-initialization]
+   57 | #define MLX5E_DECLARE_PTP_RQ_STAT(type, fld) "ptp_rq%d_"#fld, offsetof(type, fld)
+      |                                              ^~~~~~~~~~~
+drivers/net/ethernet/mellanox/mlx5/core/en_stats.c:2279:11: note: in expansion of macro 'MLX5E_DECLARE_PTP_RQ_STAT'
+ 2279 |         { MLX5E_DECLARE_PTP_RQ_STAT(struct mlx5e_rq_stats, csum_complete_tail_slow) },
+      |           ^~~~~~~~~~~~~~~~~~~~~~~~~
+
+This stat string is being used in ethtool_sprintf(), so it must be a
+valid NUL-terminated string. Currently the string lacks the final NUL
+byte (as GCC warns), but by absolute luck, the next byte in memory is a
+space (decimal 32) followed by a NUL. "format" is immediately followed
+by little-endian size_t:
+
+struct counter_desc {
+        char                       format[32];           /*     0    32 */
+        size_t                     offset;               /*    32     8 */
+};
+
+The "offset" member is populated by the stats member offset:
+
+ #define MLX5E_DECLARE_PTP_RQ_STAT(type, fld) "ptp_rq%d_"#fld, offsetof(type, fld)
+
+which for this struct mlx5e_rq_stats member, csum_complete_tail_slow, is
+32, or space, and then the rest of the "offset" bytes are NULs.
+
+struct mlx5e_rq_stats {
+	...
+        u64                        csum_complete_tail_slow; /* 32     8 */
+
+The use of vsnprintf(), within ethtool_sprintf(), reads past the end of
+"format" and sees the format string as "ptp_rq%d_csum_complete_tail_slow ",
+with %d getting resolved by MLX5E_PTP_CHANNEL_IX (value 0):
+
+                       ethtool_sprintf(data, ptp_rq_stats_desc[i].format,
+                                       MLX5E_PTP_CHANNEL_IX);
+
+With an output result of "ptp_rq0_csum_complete_tail_slow", which gets
+precisely truncated to 31 characters with a trailing NUL.
+
+So, instead of accidentally getting this correct due to the NUL bytes
+at the end of the size_t that happens to follow the format string, just
+make the string initializer 1 byte shorter by replacing "%d" with "0",
+since MLX5E_PTP_CHANNEL_IX is already hard-coded. This results in no
+initializer truncation and no need to call sprintf().
+
+Signed-off-by: Kees Cook <kees@kernel.org>
+Reviewed-by: Dragos Tatulea <dtatulea@nvidia.com>
+Link: https://patch.msgid.link/20250416020109.work.297-kees@kernel.org
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en_stats.c |    3 +--
+ drivers/net/ethernet/mellanox/mlx5/core/en_stats.h |    2 +-
+ 2 files changed, 2 insertions(+), 3 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
+@@ -2424,8 +2424,7 @@ static MLX5E_DECLARE_STATS_GRP_OP_FILL_S
+ 	}
+ 	if (priv->rx_ptp_opened) {
+ 		for (i = 0; i < NUM_PTP_RQ_STATS; i++)
+-			ethtool_sprintf(data, ptp_rq_stats_desc[i].format,
+-					MLX5E_PTP_CHANNEL_IX);
++			ethtool_puts(data, ptp_rq_stats_desc[i].format);
+ 	}
+ }
+ 
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
+@@ -54,7 +54,7 @@
+ #define MLX5E_DECLARE_PTP_TX_STAT(type, fld) "ptp_tx%d_"#fld, offsetof(type, fld)
+ #define MLX5E_DECLARE_PTP_CH_STAT(type, fld) "ptp_ch_"#fld, offsetof(type, fld)
+ #define MLX5E_DECLARE_PTP_CQ_STAT(type, fld) "ptp_cq%d_"#fld, offsetof(type, fld)
+-#define MLX5E_DECLARE_PTP_RQ_STAT(type, fld) "ptp_rq%d_"#fld, offsetof(type, fld)
++#define MLX5E_DECLARE_PTP_RQ_STAT(type, fld) "ptp_rq0_"#fld, offsetof(type, fld)
+ 
+ #define MLX5E_DECLARE_QOS_TX_STAT(type, fld) "qos_tx%d_"#fld, offsetof(type, fld)
+ 
