@@ -1,0 +1,93 @@
+From: Zaid Alali <zaidal@os.amperecomputing.com>
+Date: Tue, 17 Jun 2025 12:30:23 -0700
+Subject: ACPI: APEI: EINJ: Discover EINJv2 parameters
+Patch-mainline: v6.17-rc1
+Git-commit: 691a0f0a557b19316ef533f9ca34c72ab6c7ae56
+References: jsc#PED-14260
+
+The EINJv2 set_error_type_with_address structure has a flex array
+to hold the component IDs and syndrome values used when injecting
+multiple errors at once.
+
+Discover the size of this array by taking the address from the
+ACPI_EINJ_SET_ERROR_TYPE_WITH_ADDRESS entry in the EINJ table
+and reading the BIOS copy of the structure.
+
+Derive the maximum number of components from the length field
+in the einjv2_extension_struct at the end of the BIOS copy.
+
+Map the whole of the structure into kernel memory (and unmap
+on module unload).
+
+[Tony: Code unchanged from Zaid's original. New commit message]
+
+Reviewed-by: Tony Luck <tony.luck@intel.com>
+Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+Signed-off-by: Zaid Alali <zaidal@os.amperecomputing.com>
+Link: https://patch.msgid.link/20250617193026.637510-5-zaidal@os.amperecomputing.com
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Acked-by: Chun-Yi Lee <jlee@suse.com>
+---
+ drivers/acpi/apei/einj-core.c |   26 ++++++++++++++++++++++++--
+ 1 file changed, 24 insertions(+), 2 deletions(-)
+
+--- a/drivers/acpi/apei/einj-core.c
++++ b/drivers/acpi/apei/einj-core.c
+@@ -108,6 +108,7 @@ static struct debugfs_blob_wrapper vendo
+ static struct debugfs_blob_wrapper vendor_errors;
+ static char vendor_dev[64];
+ 
++static u32 max_nr_components;
+ static u32 available_error_type;
+ static u32 available_error_type_v2;
+ 
+@@ -178,6 +179,7 @@ static DEFINE_MUTEX(einj_mutex);
+ bool einj_initialized __ro_after_init;
+ 
+ static void __iomem *einj_param;
++static u32 v5param_size;
+ 
+ static void einj_exec_ctx_init(struct apei_exec_context *ctx)
+ {
+@@ -302,11 +304,31 @@ static void __iomem *einj_get_parameter_
+ 		struct set_error_type_with_address v5param;
+ 		struct set_error_type_with_address __iomem *p;
+ 
++		v5param_size = sizeof(v5param);
+ 		p = acpi_os_map_iomem(pa_v5, sizeof(*p));
+ 		if (p) {
+-			memcpy_fromio(&v5param, p, sizeof(v5param));
++			int offset, len;
++
++			memcpy_fromio(&v5param, p, v5param_size);
+ 			acpi5 = 1;
+ 			check_vendor_extension(pa_v5, &v5param);
++			if (available_error_type & ACPI65_EINJV2_SUPP) {
++				len = v5param.einjv2_struct.length;
++				offset = offsetof(struct einjv2_extension_struct, component_arr);
++				max_nr_components = (len - offset) /
++						sizeof(v5param.einjv2_struct.component_arr[0]);
++				/*
++				 * The first call to acpi_os_map_iomem above does not include the
++				 * component array, instead it is used to read and calculate maximum
++				 * number of components supported by the system. Below, the mapping
++				 * is expanded to include the component array.
++				 */
++				acpi_os_unmap_iomem(p, v5param_size);
++				offset = offsetof(struct set_error_type_with_address, einjv2_struct);
++				v5param_size = offset + struct_size(&v5param.einjv2_struct,
++					component_arr, max_nr_components);
++				p = acpi_os_map_iomem(pa_v5, v5param_size);
++			}
+ 			return p;
+ 		}
+ 	}
+@@ -933,7 +955,7 @@ static void __exit einj_remove(struct fa
+ 
+ 	if (einj_param) {
+ 		acpi_size size = (acpi5) ?
+-			sizeof(struct set_error_type_with_address) :
++			v5param_size :
+ 			sizeof(struct einj_parameter);
+ 
+ 		acpi_os_unmap_iomem(einj_param, size);
