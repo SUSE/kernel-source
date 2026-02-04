@@ -1,0 +1,141 @@
+From: Karol Kolacinski <karol.kolacinski@intel.com>
+Date: Mon, 30 Sep 2024 14:12:43 +0200
+Subject: ice: Refactor ice_ptp_init_tx_*
+Patch-mainline: v6.15-rc1
+Git-commit: 381d5779623aaa1266a3c33d2aec99f34312f0cb
+References: jsc#PED-14404 jsc#PED-15079
+
+Unify ice_ptp_init_tx_* functions for most of the MAC types except E82X.
+This simplifies the code for the future use with new MAC types.
+
+Reviewed-by: Przemek Kitszel <przemyslaw.kitszel@intel.com>
+Signed-off-by: Karol Kolacinski <karol.kolacinski@intel.com>
+Tested-by: Pucha Himasekhar Reddy <himasekharx.reddy.pucha@intel.com> (A Contingent worker at Intel)
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/ice/ice_ptp.c |   56 ++++++++++---------------------
+ drivers/net/ethernet/intel/ice/ice_ptp.h |    3 -
+ 2 files changed, 20 insertions(+), 39 deletions(-)
+
+--- a/drivers/net/ethernet/intel/ice/ice_ptp.c
++++ b/drivers/net/ethernet/intel/ice/ice_ptp.c
+@@ -972,28 +972,6 @@ ice_ptp_release_tx_tracker(struct ice_pf
+ }
+ 
+ /**
+- * ice_ptp_init_tx_eth56g - Initialize tracking for Tx timestamps
+- * @pf: Board private structure
+- * @tx: the Tx tracking structure to initialize
+- * @port: the port this structure tracks
+- *
+- * Initialize the Tx timestamp tracker for this port. ETH56G PHYs
+- * have independent memory blocks for all ports.
+- *
+- * Return: 0 for success, -ENOMEM when failed to allocate Tx tracker
+- */
+-static int ice_ptp_init_tx_eth56g(struct ice_pf *pf, struct ice_ptp_tx *tx,
+-				  u8 port)
+-{
+-	tx->block = port;
+-	tx->offset = 0;
+-	tx->len = INDEX_PER_PORT_ETH56G;
+-	tx->has_ready_bitmap = 1;
+-
+-	return ice_ptp_alloc_tx_tracker(tx);
+-}
+-
+-/**
+  * ice_ptp_init_tx_e82x - Initialize tracking for Tx timestamps
+  * @pf: Board private structure
+  * @tx: the Tx tracking structure to initialize
+@@ -1003,9 +981,11 @@ static int ice_ptp_init_tx_eth56g(struct
+  * the timestamp block is shared for all ports in the same quad. To avoid
+  * ports using the same timestamp index, logically break the block of
+  * registers into chunks based on the port number.
++ *
++ * Return: 0 on success, -ENOMEM when out of memory
+  */
+-static int
+-ice_ptp_init_tx_e82x(struct ice_pf *pf, struct ice_ptp_tx *tx, u8 port)
++static int ice_ptp_init_tx_e82x(struct ice_pf *pf, struct ice_ptp_tx *tx,
++				u8 port)
+ {
+ 	tx->block = ICE_GET_QUAD_NUM(port);
+ 	tx->offset = (port % ICE_PORTS_PER_QUAD) * INDEX_PER_PORT_E82X;
+@@ -1016,24 +996,27 @@ ice_ptp_init_tx_e82x(struct ice_pf *pf,
+ }
+ 
+ /**
+- * ice_ptp_init_tx_e810 - Initialize tracking for Tx timestamps
++ * ice_ptp_init_tx - Initialize tracking for Tx timestamps
+  * @pf: Board private structure
+  * @tx: the Tx tracking structure to initialize
++ * @port: the port this structure tracks
++ *
++ * Initialize the Tx timestamp tracker for this PF. For all PHYs except E82X,
++ * each port has its own block of timestamps, independent of the other ports.
+  *
+- * Initialize the Tx timestamp tracker for this PF. For E810 devices, each
+- * port has its own block of timestamps, independent of the other ports.
++ * Return: 0 on success, -ENOMEM when out of memory
+  */
+-static int
+-ice_ptp_init_tx_e810(struct ice_pf *pf, struct ice_ptp_tx *tx)
++static int ice_ptp_init_tx(struct ice_pf *pf, struct ice_ptp_tx *tx, u8 port)
+ {
+-	tx->block = pf->hw.port_info->lport;
++	tx->block = port;
+ 	tx->offset = 0;
+-	tx->len = INDEX_PER_PORT_E810;
++	tx->len = INDEX_PER_PORT;
++
+ 	/* The E810 PHY does not provide a timestamp ready bitmap. Instead,
+ 	 * verify new timestamps against cached copy of the last read
+ 	 * timestamp.
+ 	 */
+-	tx->has_ready_bitmap = 0;
++	tx->has_ready_bitmap = pf->hw.mac_type != ICE_MAC_E810;
+ 
+ 	return ice_ptp_alloc_tx_tracker(tx);
+ }
+@@ -3235,6 +3218,8 @@ static int ice_ptp_init_work(struct ice_
+  * ice_ptp_init_port - Initialize PTP port structure
+  * @pf: Board private structure
+  * @ptp_port: PTP port structure
++ *
++ * Return: 0 on success, -ENODEV on invalid MAC type, -ENOMEM on failed alloc.
+  */
+ static int ice_ptp_init_port(struct ice_pf *pf, struct ice_ptp_port *ptp_port)
+ {
+@@ -3244,16 +3229,13 @@ static int ice_ptp_init_port(struct ice_
+ 
+ 	switch (hw->mac_type) {
+ 	case ICE_MAC_E810:
+-		return ice_ptp_init_tx_e810(pf, &ptp_port->tx);
++	case ICE_MAC_GENERIC_3K_E825:
++		return ice_ptp_init_tx(pf, &ptp_port->tx, ptp_port->port_num);
+ 	case ICE_MAC_GENERIC:
+ 		kthread_init_delayed_work(&ptp_port->ov_work,
+ 					  ice_ptp_wait_for_offsets);
+-
+ 		return ice_ptp_init_tx_e82x(pf, &ptp_port->tx,
+ 					    ptp_port->port_num);
+-	case ICE_MAC_GENERIC_3K_E825:
+-		return ice_ptp_init_tx_eth56g(pf, &ptp_port->tx,
+-					      ptp_port->port_num);
+ 	default:
+ 		return -ENODEV;
+ 	}
+--- a/drivers/net/ethernet/intel/ice/ice_ptp.h
++++ b/drivers/net/ethernet/intel/ice/ice_ptp.h
+@@ -128,8 +128,7 @@ struct ice_ptp_tx {
+ /* Quad and port information for initializing timestamp blocks */
+ #define INDEX_PER_QUAD			64
+ #define INDEX_PER_PORT_E82X		16
+-#define INDEX_PER_PORT_E810		64
+-#define INDEX_PER_PORT_ETH56G		64
++#define INDEX_PER_PORT			64
+ 
+ /**
+  * struct ice_ptp_port - data used to initialize an external port for PTP
