@@ -1,0 +1,166 @@
+From: Tariq Toukan <tariqt@nvidia.com>
+Date: Wed, 19 Mar 2025 15:42:26 +0200
+Subject: net/mlx5e: TX, Utilize WQ fragments edge for multi-packet WQEs
+Patch-mainline: v6.15-rc1
+Git-commit: 9da10c2d69c31eb88cb2df8599953eddd5371617
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+For simplicity reasons, the driver avoids crossing work queue fragment
+boundaries within the same TX WQE (Work-Queue Element). Until today, as
+the number of packets in a TX MPWQE (Multi-Packet WQE) descriptor is not
+known in advance, the driver pre-prepared contiguous memory for the
+largest possible WQE. For this, when getting too close to the fragment
+edge, having no room for the largest WQE possible, the driver was
+filling the fragment remainder with NOP descriptors, aligning the next
+descriptor to the beginning of the next fragment.
+
+Generating and handling these NOPs wastes resources, like: CPU cycles,
+work-queue entries fetched to the device, and PCI bandwidth.
+
+In this patch, we replace this NOPs filling mechanism in the TX MPWQE
+flow. Instead, we utilize the remaining entries of the fragment with a
+TX MPWQE. If this room turns out to be too small, we simply open an
+additional descriptor starting at the beginning of the next fragment.
+
+Performance benchmark:
+uperf test, single server against 3 clients.
+TCP multi-stream, bidir, traffic profile "2x350B read, 1400B write".
+Bottleneck is in inbound PCI bandwidth (device POV).
+
++---------------+------------+------------+--------+
+|               | Before     | After      |        |
++---------------+------------+------------+--------+
+| BW            | 117.4 Gbps | 121.1 Gbps | +3.1%  |
++---------------+------------+------------+--------+
+| tx_packets    | 15 M/sec   | 15.5 M/sec | +3.3%  |
++---------------+------------+------------+--------+
+| tx_nops       | 3  M/sec   | 0          | -100%  |
++---------------+------------+------------+--------+
+
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Reviewed-by: Dragos Tatulea <dtatulea@nvidia.com>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Link: https://patch.msgid.link/1742391746-118647-1-git-send-email-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en.h      |    1 +
+ drivers/net/ethernet/mellanox/mlx5/core/en/txrx.h |   17 +++++++++++++++--
+ drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c  |    3 ++-
+ drivers/net/ethernet/mellanox/mlx5/core/en/xdp.h  |    6 +++---
+ drivers/net/ethernet/mellanox/mlx5/core/en_tx.c   |    7 ++++---
+ 5 files changed, 25 insertions(+), 9 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -398,6 +398,7 @@ struct mlx5e_tx_mpwqe {
+ 	struct mlx5e_tx_wqe *wqe;
+ 	u32 bytes_count;
+ 	u8 ds_count;
++	u8 ds_count_max;
+ 	u8 pkt_count;
+ 	u8 inline_on;
+ };
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/txrx.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/txrx.h
+@@ -214,6 +214,19 @@ static inline u16 mlx5e_txqsq_get_next_p
+ 	return pi;
+ }
+ 
++static inline u16 mlx5e_txqsq_get_next_pi_anysize(struct mlx5e_txqsq *sq,
++						  u16 *size)
++{
++	struct mlx5_wq_cyc *wq = &sq->wq;
++	u16 pi, contig_wqebbs;
++
++	pi = mlx5_wq_cyc_ctr2ix(wq, sq->pc);
++	contig_wqebbs = mlx5_wq_cyc_get_contig_wqebbs(wq, pi);
++	*size = min_t(u16, contig_wqebbs, sq->max_sq_mpw_wqebbs);
++
++	return pi;
++}
++
+ void mlx5e_txqsq_wake(struct mlx5e_txqsq *sq);
+ 
+ static inline u16 mlx5e_shampo_get_cqe_header_index(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe)
+@@ -358,9 +371,9 @@ mlx5e_tx_dma_unmap(struct device *pdev,
+ 
+ void mlx5e_tx_mpwqe_ensure_complete(struct mlx5e_txqsq *sq);
+ 
+-static inline bool mlx5e_tx_mpwqe_is_full(struct mlx5e_tx_mpwqe *session, u8 max_sq_mpw_wqebbs)
++static inline bool mlx5e_tx_mpwqe_is_full(struct mlx5e_tx_mpwqe *session)
+ {
+-	return session->ds_count == max_sq_mpw_wqebbs * MLX5_SEND_WQEBB_NUM_DS;
++	return session->ds_count == session->ds_count_max;
+ }
+ 
+ static inline void mlx5e_rqwq_reset(struct mlx5e_rq *rq)
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c
+@@ -390,6 +390,7 @@ static void mlx5e_xdp_mpwqe_session_star
+ 		.wqe = wqe,
+ 		.bytes_count = 0,
+ 		.ds_count = MLX5E_TX_WQE_EMPTY_DS_COUNT,
++		.ds_count_max = sq->max_sq_mpw_wqebbs * MLX5_SEND_WQEBB_NUM_DS,
+ 		.pkt_count = 0,
+ 		.inline_on = mlx5e_xdp_get_inline_state(sq, session->inline_on),
+ 	};
+@@ -501,7 +502,7 @@ mlx5e_xmit_xdp_frame_mpwqe(struct mlx5e_
+ 
+ 	mlx5e_xdp_mpwqe_add_dseg(sq, p, stats);
+ 
+-	if (unlikely(mlx5e_xdp_mpwqe_is_full(session, sq->max_sq_mpw_wqebbs)))
++	if (unlikely(mlx5e_xdp_mpwqe_is_full(session)))
+ 		mlx5e_xdp_mpwqe_complete(sq);
+ 
+ 	stats->xmit++;
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.h
+@@ -182,13 +182,13 @@ static inline bool mlx5e_xdp_get_inline_
+ 	return cur;
+ }
+ 
+-static inline bool mlx5e_xdp_mpwqe_is_full(struct mlx5e_tx_mpwqe *session, u8 max_sq_mpw_wqebbs)
++static inline bool mlx5e_xdp_mpwqe_is_full(struct mlx5e_tx_mpwqe *session)
+ {
+ 	if (session->inline_on)
+ 		return session->ds_count + MLX5E_XDP_INLINE_WQE_MAX_DS_CNT >
+-		       max_sq_mpw_wqebbs * MLX5_SEND_WQEBB_NUM_DS;
++		       session->ds_count_max;
+ 
+-	return mlx5e_tx_mpwqe_is_full(session, max_sq_mpw_wqebbs);
++	return mlx5e_tx_mpwqe_is_full(session);
+ }
+ 
+ struct mlx5e_xdp_wqe_info {
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+@@ -525,9 +525,9 @@ static void mlx5e_tx_mpwqe_session_start
+ {
+ 	struct mlx5e_tx_mpwqe *session = &sq->mpwqe;
+ 	struct mlx5e_tx_wqe *wqe;
+-	u16 pi;
++	u16 pi, num_wqebbs;
+ 
+-	pi = mlx5e_txqsq_get_next_pi(sq, sq->max_sq_mpw_wqebbs);
++	pi = mlx5e_txqsq_get_next_pi_anysize(sq, &num_wqebbs);
+ 	wqe = MLX5E_TX_FETCH_WQE(sq, pi);
+ 	net_prefetchw(wqe->data);
+ 
+@@ -535,6 +535,7 @@ static void mlx5e_tx_mpwqe_session_start
+ 		.wqe = wqe,
+ 		.bytes_count = 0,
+ 		.ds_count = MLX5E_TX_WQE_EMPTY_DS_COUNT,
++		.ds_count_max = num_wqebbs * MLX5_SEND_WQEBB_NUM_DS,
+ 		.pkt_count = 0,
+ 		.inline_on = 0,
+ 	};
+@@ -626,7 +627,7 @@ mlx5e_sq_xmit_mpwqe(struct mlx5e_txqsq *
+ 	mlx5e_tx_mpwqe_add_dseg(sq, &txd);
+ 	mlx5e_tx_skb_update_hwts_flags(skb);
+ 
+-	if (unlikely(mlx5e_tx_mpwqe_is_full(&sq->mpwqe, sq->max_sq_mpw_wqebbs))) {
++	if (unlikely(mlx5e_tx_mpwqe_is_full(&sq->mpwqe))) {
+ 		/* Might stop the queue and affect the retval of __netdev_tx_sent_queue. */
+ 		cseg = mlx5e_tx_mpwqe_session_complete(sq);
+ 
