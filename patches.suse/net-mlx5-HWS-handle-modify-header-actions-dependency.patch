@@ -1,0 +1,217 @@
+From: Yevgeny Kliteynik <kliteyn@nvidia.com>
+Date: Tue, 20 May 2025 21:46:42 +0300
+Subject: net/mlx5: HWS, handle modify header actions dependency
+Patch-mainline: v6.16-rc1
+Git-commit: 01e035fd0380b285d72725adb5a45f1d73549db8
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+Having adjacent accelerated modify header actions (so-called
+pattern-argument actions) may result in inconsistent outcome.
+These inconsistencies can take the form of writes to the same
+field or a read coupled with a write to the same field. The
+solution is to detect such dependencies and insert nops between
+the offending actions.
+
+The existing implementation had a few issues, which pretty much
+required a complete rewrite of the code that handles these
+dependencies.
+
+In the new implementation we're doing the following:
+
+* Checking any two adjacent actions for conflicts (not just
+  odd-even pairs).
+* Marking 'set' and 'add' action fields as destination, rather
+  than source, for the purposes of checking for conflicts.
+* Checking all types of actions ('add', 'set', 'copy') for
+  dependencies.
+* Managing offsets of the args in the buffer - copy the action
+  args to the right place in the buffer.
+* Checking that after inserting nops we're still within the number
+  of supported actions - return an error otherwise.
+
+Signed-off-by: Vlad Dogaru <vdogaru@nvidia.com>
+Signed-off-by: Yevgeny Kliteynik <kliteyn@nvidia.com>
+Reviewed-by: Mark Bloch <mbloch@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://patch.msgid.link/1747766802-958178-5-git-send-email-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/steering/hws/action.c  |   21 +-
+ drivers/net/ethernet/mellanox/mlx5/core/steering/hws/pat_arg.c |   74 +++++-----
+ drivers/net/ethernet/mellanox/mlx5/core/steering/hws/pat_arg.h |    6 
+ 3 files changed, 55 insertions(+), 46 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/action.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/action.c
+@@ -1190,14 +1190,15 @@ hws_action_create_modify_header_hws(stru
+ 				    struct mlx5hws_action_mh_pattern *pattern,
+ 				    u32 log_bulk_size)
+ {
++	u16 num_actions, max_mh_actions = 0, hw_max_actions;
+ 	struct mlx5hws_context *ctx = action->ctx;
+-	u16 num_actions, max_mh_actions = 0;
+ 	int i, ret, size_in_bytes;
+ 	u32 pat_id, arg_id = 0;
+ 	__be64 *new_pattern;
+ 	size_t pat_max_sz;
+ 
+ 	pat_max_sz = MLX5HWS_ARG_CHUNK_SIZE_MAX * MLX5HWS_ARG_DATA_SIZE;
++	hw_max_actions = pat_max_sz / MLX5HWS_MODIFY_ACTION_SIZE;
+ 	size_in_bytes = pat_max_sz * sizeof(__be64);
+ 	new_pattern = kcalloc(num_of_patterns, size_in_bytes, GFP_KERNEL);
+ 	if (!new_pattern)
+@@ -1211,10 +1212,14 @@ hws_action_create_modify_header_hws(stru
+ 
+ 		cur_num_actions = pattern[i].sz / MLX5HWS_MODIFY_ACTION_SIZE;
+ 
+-		mlx5hws_pat_calc_nop(pattern[i].data, cur_num_actions,
+-				     pat_max_sz / MLX5HWS_MODIFY_ACTION_SIZE,
+-				     &new_num_actions, &nop_locations,
+-				     &new_pattern[i * pat_max_sz]);
++		ret = mlx5hws_pat_calc_nop(pattern[i].data, cur_num_actions,
++					   hw_max_actions, &new_num_actions,
++					   &nop_locations,
++					   &new_pattern[i * pat_max_sz]);
++		if (ret) {
++			mlx5hws_err(ctx, "Too many actions after nop insertion\n");
++			goto free_new_pat;
++		}
+ 
+ 		action[i].modify_header.nop_locations = nop_locations;
+ 		action[i].modify_header.num_of_actions = new_num_actions;
+@@ -2116,10 +2121,12 @@ static void hws_action_modify_write(stru
+ 		if (unlikely(!new_arg_data))
+ 			return;
+ 
+-		for (i = 0, j = 0; i < num_of_actions; i++, j++) {
+-			memcpy(&new_arg_data[j], arg_data, MLX5HWS_MODIFY_ACTION_SIZE);
++		for (i = 0, j = 0; j < num_of_actions; i++, j++) {
+ 			if (BIT(i) & nop_locations)
+ 				j++;
++			memcpy(&new_arg_data[j * MLX5HWS_MODIFY_ACTION_SIZE],
++			       &arg_data[i * MLX5HWS_MODIFY_ACTION_SIZE],
++			       MLX5HWS_MODIFY_ACTION_SIZE);
+ 		}
+ 	}
+ 
+--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/pat_arg.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/pat_arg.c
+@@ -490,8 +490,8 @@ hws_action_modify_get_target_fields(u8 a
+ 	switch (action_type) {
+ 	case MLX5_ACTION_TYPE_SET:
+ 	case MLX5_ACTION_TYPE_ADD:
+-		*src_field = MLX5_GET(set_action_in, pattern, field);
+-		*dst_field = INVALID_FIELD;
++		*src_field = INVALID_FIELD;
++		*dst_field = MLX5_GET(set_action_in, pattern, field);
+ 		break;
+ 	case MLX5_ACTION_TYPE_COPY:
+ 		*src_field = MLX5_GET(copy_action_in, pattern, src_field);
+@@ -522,57 +522,59 @@ bool mlx5hws_pat_verify_actions(struct m
+ 	return true;
+ }
+ 
+-void mlx5hws_pat_calc_nop(__be64 *pattern, size_t num_actions,
+-			  size_t max_actions, size_t *new_size,
+-			  u32 *nop_locations, __be64 *new_pat)
++int mlx5hws_pat_calc_nop(__be64 *pattern, size_t num_actions,
++			 size_t max_actions, size_t *new_size,
++			 u32 *nop_locations, __be64 *new_pat)
+ {
+-	u16 prev_src_field = 0, prev_dst_field = 0;
++	u16 prev_src_field = INVALID_FIELD, prev_dst_field = INVALID_FIELD;
+ 	u16 src_field, dst_field;
+ 	u8 action_type;
++	bool dependent;
+ 	size_t i, j;
+ 
+ 	*new_size = num_actions;
+ 	*nop_locations = 0;
+ 
+ 	if (num_actions == 1)
+-		return;
++		return 0;
+ 
+ 	for (i = 0, j = 0; i < num_actions; i++, j++) {
+-		action_type = MLX5_GET(set_action_in, &pattern[i], action_type);
++		if (j >= max_actions)
++			return -EINVAL;
+ 
++		action_type = MLX5_GET(set_action_in, &pattern[i], action_type);
+ 		hws_action_modify_get_target_fields(action_type, &pattern[i],
+ 						    &src_field, &dst_field);
+-		if (i % 2) {
+-			if (action_type == MLX5_ACTION_TYPE_COPY &&
+-			    (prev_src_field == src_field ||
+-			     prev_dst_field == dst_field)) {
+-				/* need Nop */
+-				*new_size += 1;
+-				*nop_locations |= BIT(i);
+-				memset(&new_pat[j], 0, MLX5HWS_MODIFY_ACTION_SIZE);
+-				MLX5_SET(set_action_in, &new_pat[j],
+-					 action_type,
+-					 MLX5_MODIFICATION_TYPE_NOP);
+-				j++;
+-			} else if (prev_src_field == src_field) {
+-				/* need Nop */
+-				*new_size += 1;
+-				*nop_locations |= BIT(i);
+-				MLX5_SET(set_action_in, &new_pat[j],
+-					 action_type,
+-					 MLX5_MODIFICATION_TYPE_NOP);
+-				j++;
+-			}
+-		}
+-		memcpy(&new_pat[j], &pattern[i], MLX5HWS_MODIFY_ACTION_SIZE);
+-		/* check if no more space */
+-		if (j > max_actions) {
+-			*new_size = num_actions;
+-			*nop_locations = 0;
+-			return;
++
++		/* For every action, look at it and the previous one. The two
++		 * actions are dependent if:
++		 */
++		dependent =
++			(i > 0) &&
++			/* At least one of the actions is a write and */
++			(dst_field != INVALID_FIELD ||
++			 prev_dst_field != INVALID_FIELD) &&
++			/* One reads from the other's source */
++			(dst_field == prev_src_field ||
++			 src_field == prev_dst_field ||
++			 /* Or both write to the same destination */
++			 dst_field == prev_dst_field);
++
++		if (dependent) {
++			*new_size += 1;
++			*nop_locations |= BIT(i);
++			memset(&new_pat[j], 0, MLX5HWS_MODIFY_ACTION_SIZE);
++			MLX5_SET(set_action_in, &new_pat[j], action_type,
++				 MLX5_MODIFICATION_TYPE_NOP);
++			j++;
++			if (j >= max_actions)
++				return -EINVAL;
+ 		}
+ 
++		memcpy(&new_pat[j], &pattern[i], MLX5HWS_MODIFY_ACTION_SIZE);
+ 		prev_src_field = src_field;
+ 		prev_dst_field = dst_field;
+ 	}
++
++	return 0;
+ }
+--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/pat_arg.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/pat_arg.h
+@@ -96,7 +96,7 @@ int mlx5hws_arg_write_inline_arg_data(st
+ 				      u8 *arg_data,
+ 				      size_t data_size);
+ 
+-void mlx5hws_pat_calc_nop(__be64 *pattern, size_t num_actions,
+-			  size_t max_actions, size_t *new_size,
+-			  u32 *nop_locations, __be64 *new_pat);
++int mlx5hws_pat_calc_nop(__be64 *pattern, size_t num_actions,
++			 size_t max_actions, size_t *new_size,
++			 u32 *nop_locations, __be64 *new_pat);
+ #endif /* MLX5HWS_PAT_ARG_H_ */
