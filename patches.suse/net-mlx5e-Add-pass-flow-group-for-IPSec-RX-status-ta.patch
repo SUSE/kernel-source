@@ -1,0 +1,118 @@
+From: Jianbo Liu <jianbol@nvidia.com>
+Date: Thu, 20 Feb 2025 23:39:57 +0200
+Subject: net/mlx5e: Add pass flow group for IPSec RX status table
+Patch-mainline: v6.15-rc1
+Git-commit: 78e77a41e4019bc4538d09a3738180077220fa77
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+This flow group is added for the pass rules for both crypto offload
+and packet offload. It is placed at the end of the table, and right
+before the miss group. There are two entries, and the default pass
+rules for both offloads are added in this group.
+
+Signed-off-by: Jianbo Liu <jianbol@nvidia.com>
+Reviewed-by: Leon Romanovsky <leonro@nvidia.com>
+Reviewed-by: Patrisious Haddad <phaddad@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://patch.msgid.link/20250220213959.504304-8-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec_fs.c |   51 +++++++++++-
+ 1 file changed, 50 insertions(+), 1 deletion(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec_fs.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec_fs.c
+@@ -41,6 +41,7 @@ struct mlx5e_ipsec_tx {
+ };
+ 
+ struct mlx5e_ipsec_status_checks {
++	struct mlx5_flow_group *pass_group;
+ 	struct mlx5_flow_handle *packet_offload_pass_rule;
+ 	struct mlx5_flow_handle *crypto_offload_pass_rule;
+ 	struct mlx5_flow_group *drop_all_group;
+@@ -397,6 +398,47 @@ err_out:
+ 	return err;
+ }
+ 
++static int ipsec_rx_status_pass_group_create(struct mlx5e_ipsec *ipsec,
++					     struct mlx5e_ipsec_rx *rx)
++{
++	int inlen = MLX5_ST_SZ_BYTES(create_flow_group_in);
++	struct mlx5_flow_table *ft = rx->ft.status;
++	struct mlx5_flow_group *fg;
++	void *match_criteria;
++	u32 *flow_group_in;
++	int err = 0;
++
++	flow_group_in = kvzalloc(inlen, GFP_KERNEL);
++	if (!flow_group_in)
++		return -ENOMEM;
++
++	MLX5_SET(create_flow_group_in, flow_group_in, match_criteria_enable,
++		 MLX5_MATCH_MISC_PARAMETERS_2);
++	match_criteria = MLX5_ADDR_OF(create_flow_group_in, flow_group_in,
++				      match_criteria);
++	MLX5_SET_TO_ONES(fte_match_param, match_criteria,
++			 misc_parameters_2.ipsec_syndrome);
++	MLX5_SET_TO_ONES(fte_match_param, match_criteria,
++			 misc_parameters_2.metadata_reg_c_4);
++
++	MLX5_SET(create_flow_group_in, flow_group_in,
++		 start_flow_index, ft->max_fte - 3);
++	MLX5_SET(create_flow_group_in, flow_group_in,
++		 end_flow_index, ft->max_fte - 2);
++
++	fg = mlx5_create_flow_group(ft, flow_group_in);
++	if (IS_ERR(fg)) {
++		err = PTR_ERR(fg);
++		mlx5_core_warn(ipsec->mdev,
++			       "Failed to create rx status pass flow group, err=%d\n",
++			       err);
++	}
++	rx->status_checks.pass_group = fg;
++
++	kvfree(flow_group_in);
++	return err;
++}
++
+ static struct mlx5_flow_handle *
+ ipsec_rx_status_pass_create(struct mlx5e_ipsec *ipsec,
+ 			    struct mlx5e_ipsec_rx *rx,
+@@ -446,6 +488,7 @@ static void mlx5_ipsec_rx_status_destroy
+ 					 struct mlx5e_ipsec_rx *rx)
+ {
+ 	ipsec_rx_status_pass_destroy(ipsec, rx);
++	mlx5_destroy_flow_group(rx->status_checks.pass_group);
+ 	ipsec_rx_status_drop_destroy(ipsec, rx);
+ }
+ 
+@@ -461,6 +504,10 @@ static int mlx5_ipsec_rx_status_create(s
+ 	if (err)
+ 		return err;
+ 
++	err = ipsec_rx_status_pass_group_create(ipsec, rx);
++	if (err)
++		goto err_pass_group_create;
++
+ 	rule = ipsec_rx_status_pass_create(ipsec, rx, dest,
+ 					   MLX5_IPSEC_ASO_SW_CRYPTO_OFFLOAD);
+ 	if (IS_ERR(rule)) {
+@@ -485,6 +532,8 @@ static int mlx5_ipsec_rx_status_create(s
+ err_packet_offload_pass_create:
+ 	mlx5_del_flow_rules(rx->status_checks.crypto_offload_pass_rule);
+ err_crypto_offload_pass_create:
++	mlx5_destroy_flow_group(rx->status_checks.pass_group);
++err_pass_group_create:
+ 	ipsec_rx_status_drop_destroy(ipsec, rx);
+ 	return err;
+ }
+@@ -858,7 +907,7 @@ static int rx_create(struct mlx5_core_de
+ 	if (err)
+ 		return err;
+ 
+-	ft = ipsec_ft_create(attr.ns, attr.status_level, attr.prio, 1, 3, 0);
++	ft = ipsec_ft_create(attr.ns, attr.status_level, attr.prio, 3, 3, 0);
+ 	if (IS_ERR(ft)) {
+ 		err = PTR_ERR(ft);
+ 		goto err_fs_ft_status;
