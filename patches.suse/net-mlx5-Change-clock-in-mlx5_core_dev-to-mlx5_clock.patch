@@ -1,0 +1,489 @@
+From: Jianbo Liu <jianbol@nvidia.com>
+Date: Mon, 3 Feb 2025 23:35:06 +0200
+Subject: net/mlx5: Change clock in mlx5_core_dev to mlx5_clock pointer
+Patch-mainline: v6.15-rc1
+Git-commit: f9beaf4fac64c84631ba9a2eb864cea6b52032a2
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+Change clock member in mlx5_core_dev to a pointer, so it can point to
+a clock shared by multiple functions in later patch.
+
+For now, each function has its own clock, so mdev in mlx5_clock_priv
+is the back pointer to the function. Later it points to one (normally
+the first one) of the multiple functions sharing the same clock.
+
+Change mlx5_init_clock() to return error if mlx5_clock is not
+allocated. Besides, a null clock is defined and used when hardware
+clock is not supported. So, the clock pointer is always pointing to
+something valid.
+
+Signed-off-by: Jianbo Liu <jianbol@nvidia.com>
+Reviewed-by: Carolina Jubran <cjubran@nvidia.com>
+Reviewed-by: Dragos Tatulea <dtatulea@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en/ptp.c       |    4 
+ drivers/net/ethernet/mellanox/mlx5/core/en/trap.c      |    2 
+ drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c       |    4 
+ drivers/net/ethernet/mellanox/mlx5/core/en/xsk/setup.c |    2 
+ drivers/net/ethernet/mellanox/mlx5/core/en_main.c      |    4 
+ drivers/net/ethernet/mellanox/mlx5/core/lib/clock.c    |   87 ++++++++++++-----
+ drivers/net/ethernet/mellanox/mlx5/core/lib/clock.h    |   35 ++++++
+ drivers/net/ethernet/mellanox/mlx5/core/main.c         |   11 +-
+ include/linux/mlx5/driver.h                            |   31 ------
+ 9 files changed, 116 insertions(+), 64 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/ptp.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/ptp.c
+@@ -326,7 +326,7 @@ static int mlx5e_ptp_alloc_txqsq(struct
+ 	int node;
+ 
+ 	sq->pdev      = c->pdev;
+-	sq->clock     = &mdev->clock;
++	sq->clock     = mdev->clock;
+ 	sq->mkey_be   = c->mkey_be;
+ 	sq->netdev    = c->netdev;
+ 	sq->priv      = c->priv;
+@@ -696,7 +696,7 @@ static int mlx5e_init_ptp_rq(struct mlx5
+ 	rq->pdev         = c->pdev;
+ 	rq->netdev       = priv->netdev;
+ 	rq->priv         = priv;
+-	rq->clock        = &mdev->clock;
++	rq->clock        = mdev->clock;
+ 	rq->tstamp       = &priv->tstamp;
+ 	rq->mdev         = mdev;
+ 	rq->hw_mtu       = MLX5E_SW2HW_MTU(params, params->sw_mtu);
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/trap.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/trap.c
+@@ -46,7 +46,7 @@ static void mlx5e_init_trap_rq(struct ml
+ 	rq->pdev         = t->pdev;
+ 	rq->netdev       = priv->netdev;
+ 	rq->priv         = priv;
+-	rq->clock        = &mdev->clock;
++	rq->clock        = mdev->clock;
+ 	rq->tstamp       = &priv->tstamp;
+ 	rq->mdev         = mdev;
+ 	rq->hw_mtu       = MLX5E_SW2HW_MTU(params, params->sw_mtu);
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c
+@@ -289,9 +289,9 @@ static u64 mlx5e_xsk_fill_timestamp(void
+ 	ts = get_cqe_ts(priv->cqe);
+ 
+ 	if (mlx5_is_real_time_rq(priv->cq->mdev) || mlx5_is_real_time_sq(priv->cq->mdev))
+-		return mlx5_real_time_cyc2time(&priv->cq->mdev->clock, ts);
++		return mlx5_real_time_cyc2time(priv->cq->mdev->clock, ts);
+ 
+-	return  mlx5_timecounter_cyc2time(&priv->cq->mdev->clock, ts);
++	return  mlx5_timecounter_cyc2time(priv->cq->mdev->clock, ts);
+ }
+ 
+ static void mlx5e_xsk_request_checksum(u16 csum_start, u16 csum_offset, void *priv)
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/xsk/setup.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/xsk/setup.c
+@@ -72,7 +72,7 @@ static int mlx5e_init_xsk_rq(struct mlx5
+ 	rq->netdev       = c->netdev;
+ 	rq->priv         = c->priv;
+ 	rq->tstamp       = c->tstamp;
+-	rq->clock        = &mdev->clock;
++	rq->clock        = mdev->clock;
+ 	rq->icosq        = &c->icosq;
+ 	rq->ix           = c->ix;
+ 	rq->channel      = c;
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -737,7 +737,7 @@ static int mlx5e_init_rxq_rq(struct mlx5
+ 	rq->netdev       = c->netdev;
+ 	rq->priv         = c->priv;
+ 	rq->tstamp       = c->tstamp;
+-	rq->clock        = &mdev->clock;
++	rq->clock        = mdev->clock;
+ 	rq->icosq        = &c->icosq;
+ 	rq->ix           = c->ix;
+ 	rq->channel      = c;
+@@ -1614,7 +1614,7 @@ static int mlx5e_alloc_txqsq(struct mlx5
+ 	int err;
+ 
+ 	sq->pdev      = c->pdev;
+-	sq->clock     = &mdev->clock;
++	sq->clock     = mdev->clock;
+ 	sq->mkey_be   = c->mkey_be;
+ 	sq->netdev    = c->netdev;
+ 	sq->mdev      = c->mdev;
+--- a/drivers/net/ethernet/mellanox/mlx5/core/lib/clock.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/lib/clock.c
+@@ -77,9 +77,19 @@ enum {
+ 	MLX5_MTUTC_OPERATION_ADJUST_TIME_EXTENDED_MAX = 200000,
+ };
+ 
++struct mlx5_clock_priv {
++	struct mlx5_clock clock;
++	struct mlx5_core_dev *mdev;
++};
++
++static struct mlx5_clock_priv *clock_priv(struct mlx5_clock *clock)
++{
++	return container_of(clock, struct mlx5_clock_priv, clock);
++}
++
+ static struct mlx5_core_dev *mlx5_clock_mdev_get(struct mlx5_clock *clock)
+ {
+-	return container_of(clock, struct mlx5_core_dev, clock);
++	return clock_priv(clock)->mdev;
+ }
+ 
+ static bool mlx5_real_time_mode(struct mlx5_core_dev *mdev)
+@@ -219,7 +229,7 @@ static int mlx5_mtctr_syncdevicetime(kti
+ 	if (real_time_mode)
+ 		*device_time = ns_to_ktime(REAL_TIME_TO_NS(device >> 32, device & U32_MAX));
+ 	else
+-		*device_time = mlx5_timecounter_cyc2time(&mdev->clock, device);
++		*device_time = mlx5_timecounter_cyc2time(mdev->clock, device);
+ 
+ 	return 0;
+ }
+@@ -281,7 +291,7 @@ static u64 read_internal_timer(const str
+ static void mlx5_update_clock_info_page(struct mlx5_core_dev *mdev)
+ {
+ 	struct mlx5_ib_clock_info *clock_info = mdev->clock_info;
+-	struct mlx5_clock *clock = &mdev->clock;
++	struct mlx5_clock *clock = mdev->clock;
+ 	struct mlx5_timer *timer;
+ 	u32 sign;
+ 
+@@ -599,7 +609,7 @@ static int mlx5_extts_configure(struct p
+ 
+ static u64 find_target_cycles(struct mlx5_core_dev *mdev, s64 target_ns)
+ {
+-	struct mlx5_clock *clock = &mdev->clock;
++	struct mlx5_clock *clock = mdev->clock;
+ 	u64 cycles_now, cycles_delta;
+ 	u64 nsec_now, nsec_delta;
+ 	struct mlx5_timer *timer;
+@@ -658,7 +668,7 @@ static int mlx5_perout_conf_out_pulse_du
+ 					       struct ptp_clock_request *rq,
+ 					       u32 *out_pulse_duration_ns)
+ {
+-	struct mlx5_pps *pps_info = &mdev->clock.pps_info;
++	struct mlx5_pps *pps_info = &mdev->clock->pps_info;
+ 	u32 out_pulse_duration;
+ 	struct timespec64 ts;
+ 
+@@ -691,7 +701,7 @@ static int perout_conf_npps_real_time(st
+ 				      u32 *field_select, u32 *out_pulse_duration_ns,
+ 				      u64 *period, u64 *time_stamp)
+ {
+-	struct mlx5_pps *pps_info = &mdev->clock.pps_info;
++	struct mlx5_pps *pps_info = &mdev->clock->pps_info;
+ 	struct ptp_clock_time *time = &rq->perout.start;
+ 	struct timespec64 ts;
+ 
+@@ -901,7 +911,7 @@ static int mlx5_get_pps_pin_mode(struct
+ 
+ static void mlx5_init_pin_config(struct mlx5_core_dev *mdev)
+ {
+-	struct mlx5_clock *clock = &mdev->clock;
++	struct mlx5_clock *clock = mdev->clock;
+ 	int i;
+ 
+ 	if (!clock->ptp_info.n_pins)
+@@ -929,8 +939,8 @@ static void mlx5_init_pin_config(struct
+ 
+ static void mlx5_get_pps_caps(struct mlx5_core_dev *mdev)
+ {
+-	struct mlx5_clock *clock = &mdev->clock;
+ 	u32 out[MLX5_ST_SZ_DW(mtpps_reg)] = {0};
++	struct mlx5_clock *clock = mdev->clock;
+ 
+ 	mlx5_query_mtpps(mdev, out, sizeof(out));
+ 
+@@ -1025,7 +1035,7 @@ static int mlx5_pps_event(struct notifie
+ 
+ static void mlx5_timecounter_init(struct mlx5_core_dev *mdev)
+ {
+-	struct mlx5_clock *clock = &mdev->clock;
++	struct mlx5_clock *clock = mdev->clock;
+ 	struct mlx5_timer *timer = &clock->timer;
+ 	u32 dev_freq;
+ 
+@@ -1044,7 +1054,7 @@ static void mlx5_timecounter_init(struct
+ static void mlx5_init_overflow_period(struct mlx5_core_dev *mdev)
+ {
+ 	struct mlx5_ib_clock_info *clock_info = mdev->clock_info;
+-	struct mlx5_clock *clock = &mdev->clock;
++	struct mlx5_clock *clock = mdev->clock;
+ 	struct mlx5_timer *timer = &clock->timer;
+ 	u64 overflow_cycles;
+ 	u64 frac = 0;
+@@ -1077,7 +1087,7 @@ static void mlx5_init_overflow_period(st
+ 
+ static void mlx5_init_clock_info(struct mlx5_core_dev *mdev)
+ {
+-	struct mlx5_clock *clock = &mdev->clock;
++	struct mlx5_clock *clock = mdev->clock;
+ 	struct mlx5_ib_clock_info *info;
+ 	struct mlx5_timer *timer;
+ 
+@@ -1100,7 +1110,7 @@ static void mlx5_init_clock_info(struct
+ 
+ static void mlx5_init_timer_max_freq_adjustment(struct mlx5_core_dev *mdev)
+ {
+-	struct mlx5_clock *clock = &mdev->clock;
++	struct mlx5_clock *clock = mdev->clock;
+ 	u32 out[MLX5_ST_SZ_DW(mtutc_reg)] = {};
+ 	u32 in[MLX5_ST_SZ_DW(mtutc_reg)] = {};
+ 	u8 log_max_freq_adjustment = 0;
+@@ -1119,7 +1129,7 @@ static void mlx5_init_timer_max_freq_adj
+ 
+ static void mlx5_init_timer_clock(struct mlx5_core_dev *mdev)
+ {
+-	struct mlx5_clock *clock = &mdev->clock;
++	struct mlx5_clock *clock = mdev->clock;
+ 
+ 	/* Configure the PHC */
+ 	clock->ptp_info = mlx5_ptp_clock_info;
+@@ -1156,7 +1166,7 @@ static void mlx5_init_pps(struct mlx5_co
+ 
+ static void mlx5_init_clock_dev(struct mlx5_core_dev *mdev)
+ {
+-	struct mlx5_clock *clock = &mdev->clock;
++	struct mlx5_clock *clock = mdev->clock;
+ 
+ 	seqlock_init(&clock->lock);
+ 
+@@ -1180,7 +1190,7 @@ static void mlx5_init_clock_dev(struct m
+ 
+ static void mlx5_destroy_clock_dev(struct mlx5_core_dev *mdev)
+ {
+-	struct mlx5_clock *clock = &mdev->clock;
++	struct mlx5_clock *clock = mdev->clock;
+ 
+ 	if (clock->ptp) {
+ 		ptp_clock_unregister(clock->ptp);
+@@ -1195,25 +1205,60 @@ static void mlx5_destroy_clock_dev(struc
+ 	kfree(clock->ptp_info.pin_config);
+ }
+ 
+-void mlx5_init_clock(struct mlx5_core_dev *mdev)
++static void mlx5_clock_free(struct mlx5_core_dev *mdev)
++{
++	struct mlx5_clock_priv *cpriv = clock_priv(mdev->clock);
++
++	mlx5_destroy_clock_dev(mdev);
++	kfree(cpriv);
++	mdev->clock = NULL;
++}
++
++static int mlx5_clock_alloc(struct mlx5_core_dev *mdev)
++{
++	struct mlx5_clock_priv *cpriv;
++	struct mlx5_clock *clock;
++
++	cpriv = kzalloc(sizeof(*cpriv), GFP_KERNEL);
++	if (!cpriv)
++		return -ENOMEM;
++
++	cpriv->mdev = mdev;
++	clock = &cpriv->clock;
++	mdev->clock = clock;
++	mlx5_init_clock_dev(mdev);
++
++	return 0;
++}
++
++static struct mlx5_clock null_clock;
++
++int mlx5_init_clock(struct mlx5_core_dev *mdev)
+ {
+-	struct mlx5_clock *clock = &mdev->clock;
++	struct mlx5_clock *clock;
++	int err;
+ 
+ 	if (!MLX5_CAP_GEN(mdev, device_frequency_khz)) {
++		mdev->clock = &null_clock;
+ 		mlx5_core_warn(mdev, "invalid device_frequency_khz, aborting HW clock init\n");
+-		return;
++		return 0;
+ 	}
+ 
+-	mlx5_init_clock_dev(mdev);
++	err = mlx5_clock_alloc(mdev);
++	if (err)
++		return err;
++	clock = mdev->clock;
+ 
+ 	INIT_WORK(&clock->pps_info.out_work, mlx5_pps_out);
+ 	MLX5_NB_INIT(&clock->pps_nb, mlx5_pps_event, PPS_EVENT);
+ 	mlx5_eq_notifier_register(mdev, &clock->pps_nb);
++
++	return 0;
+ }
+ 
+ void mlx5_cleanup_clock(struct mlx5_core_dev *mdev)
+ {
+-	struct mlx5_clock *clock = &mdev->clock;
++	struct mlx5_clock *clock = mdev->clock;
+ 
+ 	if (!MLX5_CAP_GEN(mdev, device_frequency_khz))
+ 		return;
+@@ -1221,5 +1266,5 @@ void mlx5_cleanup_clock(struct mlx5_core
+ 	mlx5_eq_notifier_unregister(mdev, &clock->pps_nb);
+ 	cancel_work_sync(&clock->pps_info.out_work);
+ 
+-	mlx5_destroy_clock_dev(mdev);
++	mlx5_clock_free(mdev);
+ }
+--- a/drivers/net/ethernet/mellanox/mlx5/core/lib/clock.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/lib/clock.h
+@@ -33,6 +33,35 @@
+ #ifndef __LIB_CLOCK_H__
+ #define __LIB_CLOCK_H__
+ 
++#include <linux/ptp_clock_kernel.h>
++
++#define MAX_PIN_NUM	8
++struct mlx5_pps {
++	u8                         pin_caps[MAX_PIN_NUM];
++	struct work_struct         out_work;
++	u64                        start[MAX_PIN_NUM];
++	u8                         enabled;
++	u64                        min_npps_period;
++	u64                        min_out_pulse_duration_ns;
++};
++
++struct mlx5_timer {
++	struct cyclecounter        cycles;
++	struct timecounter         tc;
++	u32                        nominal_c_mult;
++	unsigned long              overflow_period;
++};
++
++struct mlx5_clock {
++	struct mlx5_nb             pps_nb;
++	seqlock_t                  lock;
++	struct hwtstamp_config     hwtstamp_config;
++	struct ptp_clock          *ptp;
++	struct ptp_clock_info      ptp_info;
++	struct mlx5_pps            pps_info;
++	struct mlx5_timer          timer;
++};
++
+ static inline bool mlx5_is_real_time_rq(struct mlx5_core_dev *mdev)
+ {
+ 	u8 rq_ts_format_cap = MLX5_CAP_GEN(mdev, rq_ts_format);
+@@ -54,12 +83,12 @@ static inline bool mlx5_is_real_time_sq(
+ typedef ktime_t (*cqe_ts_to_ns)(struct mlx5_clock *, u64);
+ 
+ #if IS_ENABLED(CONFIG_PTP_1588_CLOCK)
+-void mlx5_init_clock(struct mlx5_core_dev *mdev);
++int mlx5_init_clock(struct mlx5_core_dev *mdev);
+ void mlx5_cleanup_clock(struct mlx5_core_dev *mdev);
+ 
+ static inline int mlx5_clock_get_ptp_index(struct mlx5_core_dev *mdev)
+ {
+-	return mdev->clock.ptp ? ptp_clock_index(mdev->clock.ptp) : -1;
++	return mdev->clock->ptp ? ptp_clock_index(mdev->clock->ptp) : -1;
+ }
+ 
+ static inline ktime_t mlx5_timecounter_cyc2time(struct mlx5_clock *clock,
+@@ -87,7 +116,7 @@ static inline ktime_t mlx5_real_time_cyc
+ 	return ns_to_ktime(time);
+ }
+ #else
+-static inline void mlx5_init_clock(struct mlx5_core_dev *mdev) {}
++static inline int mlx5_init_clock(struct mlx5_core_dev *mdev) { return 0; }
+ static inline void mlx5_cleanup_clock(struct mlx5_core_dev *mdev) {}
+ static inline int mlx5_clock_get_ptp_index(struct mlx5_core_dev *mdev)
+ {
+--- a/drivers/net/ethernet/mellanox/mlx5/core/main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/main.c
+@@ -1038,7 +1038,11 @@ static int mlx5_init_once(struct mlx5_co
+ 
+ 	mlx5_init_reserved_gids(dev);
+ 
+-	mlx5_init_clock(dev);
++	err = mlx5_init_clock(dev);
++	if (err) {
++		mlx5_core_err(dev, "failed to initialize hardware clock\n");
++		goto err_tables_cleanup;
++	}
+ 
+ 	dev->vxlan = mlx5_vxlan_create(dev);
+ 	dev->geneve = mlx5_geneve_create(dev);
+@@ -1046,7 +1050,7 @@ static int mlx5_init_once(struct mlx5_co
+ 	err = mlx5_init_rl_table(dev);
+ 	if (err) {
+ 		mlx5_core_err(dev, "Failed to init rate limiting\n");
+-		goto err_tables_cleanup;
++		goto err_clock_cleanup;
+ 	}
+ 
+ 	err = mlx5_mpfs_init(dev);
+@@ -1123,10 +1127,11 @@ err_mpfs_cleanup:
+ 	mlx5_mpfs_cleanup(dev);
+ err_rl_cleanup:
+ 	mlx5_cleanup_rl_table(dev);
+-err_tables_cleanup:
++err_clock_cleanup:
+ 	mlx5_geneve_destroy(dev->geneve);
+ 	mlx5_vxlan_destroy(dev->vxlan);
+ 	mlx5_cleanup_clock(dev);
++err_tables_cleanup:
+ 	mlx5_cleanup_reserved_gids(dev);
+ 	mlx5_cq_debugfs_cleanup(dev);
+ 	mlx5_fw_reset_cleanup(dev);
+--- a/include/linux/mlx5/driver.h
++++ b/include/linux/mlx5/driver.h
+@@ -54,7 +54,6 @@
+ #include <linux/mlx5/doorbell.h>
+ #include <linux/mlx5/eq.h>
+ #include <linux/timecounter.h>
+-#include <linux/ptp_clock_kernel.h>
+ #include <net/devlink.h>
+ 
+ #define MLX5_ADEV_NAME "mlx5_core"
+@@ -679,33 +678,7 @@ struct mlx5_rsvd_gids {
+ 	struct ida ida;
+ };
+ 
+-#define MAX_PIN_NUM	8
+-struct mlx5_pps {
+-	u8                         pin_caps[MAX_PIN_NUM];
+-	struct work_struct         out_work;
+-	u64                        start[MAX_PIN_NUM];
+-	u8                         enabled;
+-	u64                        min_npps_period;
+-	u64                        min_out_pulse_duration_ns;
+-};
+-
+-struct mlx5_timer {
+-	struct cyclecounter        cycles;
+-	struct timecounter         tc;
+-	u32                        nominal_c_mult;
+-	unsigned long              overflow_period;
+-};
+-
+-struct mlx5_clock {
+-	struct mlx5_nb             pps_nb;
+-	seqlock_t                  lock;
+-	struct hwtstamp_config     hwtstamp_config;
+-	struct ptp_clock          *ptp;
+-	struct ptp_clock_info      ptp_info;
+-	struct mlx5_pps            pps_info;
+-	struct mlx5_timer          timer;
+-};
+-
++struct mlx5_clock;
+ struct mlx5_dm;
+ struct mlx5_fw_tracer;
+ struct mlx5_vxlan;
+@@ -789,7 +762,7 @@ struct mlx5_core_dev {
+ #ifdef CONFIG_MLX5_FPGA
+ 	struct mlx5_fpga_device *fpga;
+ #endif
+-	struct mlx5_clock        clock;
++	struct mlx5_clock       *clock;
+ 	struct mlx5_ib_clock_info  *clock_info;
+ 	struct mlx5_fw_tracer   *tracer;
+ 	struct mlx5_rsc_dump    *rsc_dump;
