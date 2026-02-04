@@ -1,0 +1,232 @@
+From: Vlad Dogaru <vdogaru@nvidia.com>
+Date: Tue, 20 May 2025 21:46:40 +0300
+Subject: net/mlx5: HWS, register reformat actions with fw
+Patch-mainline: v6.16-rc1
+Git-commit: b206d9ec19dfc2db706883ff6b46b259831a033d
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+Hardware steering handles actions differently from firmware, but for
+termination rules that use encapsulation the firmware needs to be aware
+of the action.
+
+Fix this by registering reformat actions with the firmware the first
+time this is needed. To do this, add a third possible owner for an
+action, and also a lock to protect against registration of the same
+action from different threads.
+
+Signed-off-by: Vlad Dogaru <vdogaru@nvidia.com>
+Signed-off-by: Yevgeny Kliteynik <kliteyn@nvidia.com>
+Reviewed-by: Mark Bloch <mbloch@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://patch.msgid.link/1747766802-958178-3-git-send-email-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/fs_core.c              |    2 
+ drivers/net/ethernet/mellanox/mlx5/core/fs_core.h              |    1 
+ drivers/net/ethernet/mellanox/mlx5/core/steering/hws/action.c  |    5 
+ drivers/net/ethernet/mellanox/mlx5/core/steering/hws/fs_hws.c  |   71 +++++++++-
+ drivers/net/ethernet/mellanox/mlx5/core/steering/hws/fs_hws.h  |   16 ++
+ drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws.h |    9 +
+ 6 files changed, 97 insertions(+), 7 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
+@@ -1839,6 +1839,8 @@ int mlx5_fs_get_packet_reformat_id(struc
+ 		return 0;
+ 	case MLX5_FLOW_RESOURCE_OWNER_SW:
+ 		return mlx5_fs_dr_action_get_pkt_reformat_id(pkt_reformat, id);
++	case MLX5_FLOW_RESOURCE_OWNER_HWS:
++		return mlx5_fs_hws_action_get_pkt_reformat_id(pkt_reformat, id);
+ 	default:
+ 		return -EINVAL;
+ 	}
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_core.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_core.h
+@@ -58,6 +58,7 @@ struct mlx5_flow_definer {
+ enum mlx5_flow_resource_owner {
+ 	MLX5_FLOW_RESOURCE_OWNER_FW,
+ 	MLX5_FLOW_RESOURCE_OWNER_SW,
++	MLX5_FLOW_RESOURCE_OWNER_HWS,
+ };
+ 
+ struct mlx5_modify_hdr {
+--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/action.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/action.c
+@@ -72,6 +72,11 @@ enum mlx5hws_action_type mlx5hws_action_
+ 	return action->type;
+ }
+ 
++struct mlx5_core_dev *mlx5hws_action_get_dev(struct mlx5hws_action *action)
++{
++	return action->ctx->mdev;
++}
++
+ static int hws_action_get_shared_stc_nic(struct mlx5hws_context *ctx,
+ 					 enum mlx5hws_context_shared_stc_type stc_type,
+ 					 u8 tbl_type)
+--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/fs_hws.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/fs_hws.c
+@@ -1081,13 +1081,8 @@ static int mlx5_cmd_hws_create_fte(struc
+ 	struct mlx5hws_bwc_rule *rule;
+ 	int err = 0;
+ 
+-	if (mlx5_fs_cmd_is_fw_term_table(ft)) {
+-		/* Packet reformat on terminamtion table not supported yet */
+-		if (fte->act_dests.action.action &
+-		    MLX5_FLOW_CONTEXT_ACTION_PACKET_REFORMAT)
+-			return -EOPNOTSUPP;
++	if (mlx5_fs_cmd_is_fw_term_table(ft))
+ 		return mlx5_fs_cmd_get_fw_cmds()->create_fte(ns, ft, group, fte);
+-	}
+ 
+ 	err = mlx5_fs_fte_get_hws_actions(ns, ft, group, fte, &ractions);
+ 	if (err)
+@@ -1362,7 +1357,7 @@ mlx5_cmd_hws_packet_reformat_alloc(struc
+ 		pkt_reformat->fs_hws_action.pr_data = pr_data;
+ 	}
+ 
+-	pkt_reformat->owner = MLX5_FLOW_RESOURCE_OWNER_SW;
++	pkt_reformat->owner = MLX5_FLOW_RESOURCE_OWNER_HWS;
+ 	pkt_reformat->fs_hws_action.hws_action = hws_action;
+ 	return 0;
+ 
+@@ -1380,6 +1375,15 @@ static void mlx5_cmd_hws_packet_reformat
+ 	struct mlx5_fs_hws_pr *pr_data;
+ 	struct mlx5_fs_pool *pr_pool;
+ 
++	if (pkt_reformat->fs_hws_action.fw_reformat_id != 0) {
++		struct mlx5_pkt_reformat fw_pkt_reformat = { 0 };
++
++		fw_pkt_reformat.id = pkt_reformat->fs_hws_action.fw_reformat_id;
++		mlx5_fs_cmd_get_fw_cmds()->
++			packet_reformat_dealloc(ns, &fw_pkt_reformat);
++		pkt_reformat->fs_hws_action.fw_reformat_id = 0;
++	}
++
+ 	if (pkt_reformat->reformat_type == MLX5_REFORMAT_TYPE_REMOVE_HDR)
+ 		return;
+ 
+@@ -1499,6 +1503,7 @@ static int mlx5_cmd_hws_modify_header_al
+ 		err = -ENOMEM;
+ 		goto release_mh;
+ 	}
++	mutex_init(&modify_hdr->fs_hws_action.lock);
+ 	modify_hdr->fs_hws_action.mh_data = mh_data;
+ 	modify_hdr->fs_hws_action.fs_pool = pool;
+ 	modify_hdr->owner = MLX5_FLOW_RESOURCE_OWNER_SW;
+@@ -1532,6 +1537,58 @@ static void mlx5_cmd_hws_modify_header_d
+ 	modify_hdr->fs_hws_action.mh_data = NULL;
+ }
+ 
++int
++mlx5_fs_hws_action_get_pkt_reformat_id(struct mlx5_pkt_reformat *pkt_reformat,
++				       u32 *reformat_id)
++{
++	enum mlx5_flow_namespace_type ns_type = pkt_reformat->ns_type;
++	struct mutex *lock = &pkt_reformat->fs_hws_action.lock;
++	u32 *id = &pkt_reformat->fs_hws_action.fw_reformat_id;
++	struct mlx5_pkt_reformat fw_pkt_reformat = { 0 };
++	struct mlx5_pkt_reformat_params params = { 0 };
++	struct mlx5_flow_root_namespace *ns;
++	struct mlx5_core_dev *dev;
++	int ret;
++
++	mutex_lock(lock);
++
++	if (*id != 0) {
++		*reformat_id = *id;
++		ret = 0;
++		goto unlock;
++	}
++
++	dev = mlx5hws_action_get_dev(pkt_reformat->fs_hws_action.hws_action);
++	if (!dev) {
++		ret = -EINVAL;
++		goto unlock;
++	}
++
++	ns = mlx5_get_root_namespace(dev, ns_type);
++	if (!ns) {
++		ret = -EINVAL;
++		goto unlock;
++	}
++
++	params.type = pkt_reformat->reformat_type;
++	params.size = pkt_reformat->fs_hws_action.pr_data->data_size;
++	params.data = pkt_reformat->fs_hws_action.pr_data->data;
++
++	ret = mlx5_fs_cmd_get_fw_cmds()->
++		packet_reformat_alloc(ns, &params, ns_type, &fw_pkt_reformat);
++	if (ret)
++		goto unlock;
++
++	*id = fw_pkt_reformat.id;
++	*reformat_id = *id;
++	ret = 0;
++
++unlock:
++	mutex_unlock(lock);
++
++	return ret;
++}
++
+ static int mlx5_cmd_hws_create_match_definer(struct mlx5_flow_root_namespace *ns,
+ 					     u16 format_id, u32 *match_mask)
+ {
+--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/fs_hws.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/fs_hws.h
+@@ -41,6 +41,11 @@ struct mlx5_fs_hws_action {
+ 	struct mlx5_fs_pool *fs_pool;
+ 	struct mlx5_fs_hws_pr *pr_data;
+ 	struct mlx5_fs_hws_mh *mh_data;
++	u32 fw_reformat_id;
++	/* Protect `fw_reformat_id` against being initialized from multiple
++	 * threads.
++	 */
++	struct mutex lock;
+ };
+ 
+ struct mlx5_fs_hws_matcher {
+@@ -84,12 +89,23 @@ void mlx5_fs_put_hws_action(struct mlx5_
+ 
+ #ifdef CONFIG_MLX5_HW_STEERING
+ 
++int
++mlx5_fs_hws_action_get_pkt_reformat_id(struct mlx5_pkt_reformat *pkt_reformat,
++				       u32 *reformat_id);
++
+ bool mlx5_fs_hws_is_supported(struct mlx5_core_dev *dev);
+ 
+ const struct mlx5_flow_cmds *mlx5_fs_cmd_get_hws_cmds(void);
+ 
+ #else
+ 
++static inline int
++mlx5_fs_hws_action_get_pkt_reformat_id(struct mlx5_pkt_reformat *pkt_reformat,
++				       u32 *reformat_id)
++{
++	return -EOPNOTSUPP;
++}
++
+ static inline bool mlx5_fs_hws_is_supported(struct mlx5_core_dev *dev)
+ {
+ 	return false;
+--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws.h
+@@ -504,6 +504,15 @@ enum mlx5hws_action_type
+ mlx5hws_action_get_type(struct mlx5hws_action *action);
+ 
+ /**
++ * mlx5hws_action_get_dev - Get mlx5 core device.
++ *
++ * @action: The action to get the device from.
++ *
++ * Return: mlx5 core device.
++ */
++struct mlx5_core_dev *mlx5hws_action_get_dev(struct mlx5hws_action *action);
++
++/**
+  * mlx5hws_action_create_dest_drop - Create a direct rule drop action.
+  *
+  * @ctx: The context in which the new action will be created.
