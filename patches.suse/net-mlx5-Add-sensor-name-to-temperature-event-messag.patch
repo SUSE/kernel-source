@@ -1,0 +1,108 @@
+From: Shahar Shitrit <shshitrit@nvidia.com>
+Date: Thu, 13 Feb 2025 11:46:41 +0200
+Subject: net/mlx5: Add sensor name to temperature event message
+Patch-mainline: v6.15-rc1
+Git-commit: 46fd50cfcc12368bed9ae5257cc3beaea5b3c193
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+Previously, a temperature event message included a bitmap indicating
+which sensors detect high temperatures.
+
+To enhance clarity, we modify the message format to explicitly list
+the names of the overheating sensors, alongside the sensors bitmap.
+If HWMON is not configured, the event message remains unchanged.
+
+Signed-off-by: Shahar Shitrit <shshitrit@nvidia.com>
+Reviewed-by: Carolina Jubran <cjubran@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Link: https://patch.msgid.link/20250213094641.226501-5-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/events.c |   31 ++++++++++++++++++++---
+ drivers/net/ethernet/mellanox/mlx5/core/hwmon.c  |    5 +++
+ drivers/net/ethernet/mellanox/mlx5/core/hwmon.h  |    1 
+ 3 files changed, 34 insertions(+), 3 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/events.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/events.c
+@@ -6,6 +6,7 @@
+ #include "mlx5_core.h"
+ #include "lib/eq.h"
+ #include "lib/events.h"
++#include "hwmon.h"
+ 
+ struct mlx5_event_nb {
+ 	struct mlx5_nb  nb;
+@@ -153,11 +154,28 @@ static int any_notifier(struct notifier_
+ 	return NOTIFY_OK;
+ }
+ 
++#if IS_ENABLED(CONFIG_HWMON)
++static void print_sensor_names_in_bit_set(struct mlx5_core_dev *dev, struct mlx5_hwmon *hwmon,
++					  u64 bit_set, int bit_set_offset)
++{
++	unsigned long *bit_set_ptr = (unsigned long *)&bit_set;
++	int num_bits = sizeof(bit_set) * BITS_PER_BYTE;
++	int i;
++
++	for_each_set_bit(i, bit_set_ptr, num_bits) {
++		const char *sensor_name = hwmon_get_sensor_name(hwmon, i + bit_set_offset);
++
++		mlx5_core_warn(dev, "Sensor name[%d]: %s\n", i + bit_set_offset, sensor_name);
++	}
++}
++#endif /* CONFIG_HWMON */
++
+ /* type == MLX5_EVENT_TYPE_TEMP_WARN_EVENT */
+ static int temp_warn(struct notifier_block *nb, unsigned long type, void *data)
+ {
+ 	struct mlx5_event_nb *event_nb = mlx5_nb_cof(nb, struct mlx5_event_nb, nb);
+ 	struct mlx5_events   *events   = event_nb->ctx;
++	struct mlx5_core_dev *dev      = events->dev;
+ 	struct mlx5_eqe      *eqe      = data;
+ 	u64 value_lsb;
+ 	u64 value_msb;
+@@ -169,10 +187,17 @@ static int temp_warn(struct notifier_blo
+ 	value_lsb &= 0x1;
+ 	value_msb = be64_to_cpu(eqe->data.temp_warning.sensor_warning_msb);
+ 
+-	if (net_ratelimit())
+-		mlx5_core_warn(events->dev,
+-			       "High temperature on sensors with bit set %#llx %#llx",
++	if (net_ratelimit()) {
++		mlx5_core_warn(dev, "High temperature on sensors with bit set %#llx %#llx.\n",
+ 			       value_msb, value_lsb);
++#if IS_ENABLED(CONFIG_HWMON)
++		if (dev->hwmon) {
++			print_sensor_names_in_bit_set(dev, dev->hwmon, value_lsb, 0);
++			print_sensor_names_in_bit_set(dev, dev->hwmon, value_msb,
++						      sizeof(value_lsb) * BITS_PER_BYTE);
++		}
++#endif
++	}
+ 
+ 	return NOTIFY_OK;
+ }
+--- a/drivers/net/ethernet/mellanox/mlx5/core/hwmon.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/hwmon.c
+@@ -416,3 +416,8 @@ void mlx5_hwmon_dev_unregister(struct ml
+ 	mlx5_hwmon_free(hwmon);
+ 	mdev->hwmon = NULL;
+ }
++
++const char *hwmon_get_sensor_name(struct mlx5_hwmon *hwmon, int channel)
++{
++	return hwmon->temp_channel_desc[channel].sensor_name;
++}
+--- a/drivers/net/ethernet/mellanox/mlx5/core/hwmon.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/hwmon.h
+@@ -10,6 +10,7 @@
+ 
+ int mlx5_hwmon_dev_register(struct mlx5_core_dev *mdev);
+ void mlx5_hwmon_dev_unregister(struct mlx5_core_dev *mdev);
++const char *hwmon_get_sensor_name(struct mlx5_hwmon *hwmon, int channel);
+ 
+ #else
+ static inline int mlx5_hwmon_dev_register(struct mlx5_core_dev *mdev)
