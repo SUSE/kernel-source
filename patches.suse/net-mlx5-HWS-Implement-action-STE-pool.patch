@@ -1,0 +1,570 @@
+From: Vlad Dogaru <vdogaru@nvidia.com>
+Date: Thu, 10 Apr 2025 22:17:38 +0300
+Subject: net/mlx5: HWS, Implement action STE pool
+Patch-mainline: v6.16-rc1
+Git-commit: 983d01b2ce0ac688bb42489f33a29a02274366d5
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+Implement a per-queue pool of action STEs that match STEs can link to,
+regardless of matcher.
+
+The code relies on hints to optimize whether a given rule is added to
+rx-only, tx-only or both. Correspondingly, action STEs need to be added
+to different RTC for ingress or egress paths. For rx-and-tx rules, the
+current rule implementation dictates that the offsets for a given rule
+must be the same in both RTCs.
+
+To avoid wasting STEs, each action STE pool element holds 3 pools:
+rx-only, tx-only, and rx-and-tx, corresponding to the possible values of
+the pool optimization enum. The implementation then chooses at rule
+creation / update which of these elements to allocate from.
+
+Each element holds multiple action STE tables, which wrap an RTC, an STE
+range, the logic to buddy-allocate offsets from the range, and an STC
+that allows match STEs to point to this table. When allocating offsets
+from an element, we iterate through available action STE tables and, if
+needed, create a new table.
+
+Similar to the previous implementation, this iteration does not free any
+resources. This is implemented in a subsequent patch.
+
+Signed-off-by: Vlad Dogaru <vdogaru@nvidia.com>
+Reviewed-by: Yevgeny Kliteynik <kliteyn@nvidia.com>
+Reviewed-by: Mark Bloch <mbloch@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Reviewed-by: Michal Kubiak <michal.kubiak@intel.com>
+Link: https://patch.msgid.link/1744312662-356571-9-git-send-email-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/Makefile                       |    3 
+ drivers/net/ethernet/mellanox/mlx5/core/steering/hws/action_ste_pool.c |  387 ++++++++++
+ drivers/net/ethernet/mellanox/mlx5/core/steering/hws/action_ste_pool.h |   58 +
+ drivers/net/ethernet/mellanox/mlx5/core/steering/hws/context.c         |    7 
+ drivers/net/ethernet/mellanox/mlx5/core/steering/hws/context.h         |    1 
+ drivers/net/ethernet/mellanox/mlx5/core/steering/hws/internal.h        |    1 
+ drivers/net/ethernet/mellanox/mlx5/core/steering/hws/pool.h            |    1 
+ 7 files changed, 457 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/net/ethernet/mellanox/mlx5/core/steering/hws/action_ste_pool.c
+ create mode 100644 drivers/net/ethernet/mellanox/mlx5/core/steering/hws/action_ste_pool.h
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/Makefile
++++ b/drivers/net/ethernet/mellanox/mlx5/core/Makefile
+@@ -154,7 +154,8 @@ mlx5_core-$(CONFIG_MLX5_HW_STEERING) +=
+ 					steering/hws/vport.o \
+ 					steering/hws/bwc_complex.o \
+ 					steering/hws/fs_hws_pools.o \
+-					steering/hws/fs_hws.o
++					steering/hws/fs_hws.o \
++					steering/hws/action_ste_pool.o
+ 
+ #
+ # SF device
+--- /dev/null
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/action_ste_pool.c
+@@ -0,0 +1,387 @@
++// SPDX-License-Identifier: GPL-2.0 OR Linux-OpenIB
++/* Copyright (c) 2025 NVIDIA Corporation & Affiliates */
++
++#include "internal.h"
++
++static const char *
++hws_pool_opt_to_str(enum mlx5hws_pool_optimize opt)
++{
++	switch (opt) {
++	case MLX5HWS_POOL_OPTIMIZE_NONE:
++		return "rx-and-tx";
++	case MLX5HWS_POOL_OPTIMIZE_ORIG:
++		return "rx-only";
++	case MLX5HWS_POOL_OPTIMIZE_MIRROR:
++		return "tx-only";
++	default:
++		return "unknown";
++	}
++}
++
++static int
++hws_action_ste_table_create_pool(struct mlx5hws_context *ctx,
++				 struct mlx5hws_action_ste_table *action_tbl,
++				 enum mlx5hws_pool_optimize opt, size_t log_sz)
++{
++	struct mlx5hws_pool_attr pool_attr = { 0 };
++
++	pool_attr.pool_type = MLX5HWS_POOL_TYPE_STE;
++	pool_attr.table_type = MLX5HWS_TABLE_TYPE_FDB;
++	pool_attr.flags = MLX5HWS_POOL_FLAG_BUDDY;
++	pool_attr.opt_type = opt;
++	pool_attr.alloc_log_sz = log_sz;
++
++	action_tbl->pool = mlx5hws_pool_create(ctx, &pool_attr);
++	if (!action_tbl->pool) {
++		mlx5hws_err(ctx, "Failed to allocate STE pool\n");
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int hws_action_ste_table_create_single_rtc(
++	struct mlx5hws_context *ctx,
++	struct mlx5hws_action_ste_table *action_tbl,
++	enum mlx5hws_pool_optimize opt, size_t log_sz, bool tx)
++{
++	struct mlx5hws_cmd_rtc_create_attr rtc_attr = { 0 };
++	u32 *rtc_id;
++
++	rtc_attr.log_depth = 0;
++	rtc_attr.update_index_mode = MLX5_IFC_RTC_STE_UPDATE_MODE_BY_OFFSET;
++	/* Action STEs use the default always hit definer. */
++	rtc_attr.match_definer_0 = ctx->caps->trivial_match_definer;
++	rtc_attr.is_frst_jumbo = false;
++	rtc_attr.miss_ft_id = 0;
++	rtc_attr.pd = ctx->pd_num;
++	rtc_attr.reparse_mode = mlx5hws_context_get_reparse_mode(ctx);
++
++	if (tx) {
++		rtc_attr.table_type = FS_FT_FDB_TX;
++		rtc_attr.ste_base =
++			mlx5hws_pool_get_base_mirror_id(action_tbl->pool);
++		rtc_attr.stc_base =
++			mlx5hws_pool_get_base_mirror_id(ctx->stc_pool);
++		rtc_attr.log_size =
++			opt == MLX5HWS_POOL_OPTIMIZE_ORIG ? 0 : log_sz;
++		rtc_id = &action_tbl->rtc_1_id;
++	} else {
++		rtc_attr.table_type = FS_FT_FDB_RX;
++		rtc_attr.ste_base = mlx5hws_pool_get_base_id(action_tbl->pool);
++		rtc_attr.stc_base = mlx5hws_pool_get_base_id(ctx->stc_pool);
++		rtc_attr.log_size =
++			opt == MLX5HWS_POOL_OPTIMIZE_MIRROR ? 0 : log_sz;
++		rtc_id = &action_tbl->rtc_0_id;
++	}
++
++	return mlx5hws_cmd_rtc_create(ctx->mdev, &rtc_attr, rtc_id);
++}
++
++static int
++hws_action_ste_table_create_rtcs(struct mlx5hws_context *ctx,
++				 struct mlx5hws_action_ste_table *action_tbl,
++				 enum mlx5hws_pool_optimize opt, size_t log_sz)
++{
++	int err;
++
++	err = hws_action_ste_table_create_single_rtc(ctx, action_tbl, opt,
++						     log_sz, false);
++	if (err)
++		return err;
++
++	err = hws_action_ste_table_create_single_rtc(ctx, action_tbl, opt,
++						     log_sz, true);
++	if (err) {
++		mlx5hws_cmd_rtc_destroy(ctx->mdev, action_tbl->rtc_0_id);
++		return err;
++	}
++
++	return 0;
++}
++
++static void
++hws_action_ste_table_destroy_rtcs(struct mlx5hws_action_ste_table *action_tbl)
++{
++	mlx5hws_cmd_rtc_destroy(action_tbl->pool->ctx->mdev,
++				action_tbl->rtc_1_id);
++	mlx5hws_cmd_rtc_destroy(action_tbl->pool->ctx->mdev,
++				action_tbl->rtc_0_id);
++}
++
++static int
++hws_action_ste_table_create_stc(struct mlx5hws_context *ctx,
++				struct mlx5hws_action_ste_table *action_tbl)
++{
++	struct mlx5hws_cmd_stc_modify_attr stc_attr = { 0 };
++
++	stc_attr.action_offset = MLX5HWS_ACTION_OFFSET_HIT;
++	stc_attr.action_type = MLX5_IFC_STC_ACTION_TYPE_JUMP_TO_STE_TABLE;
++	stc_attr.reparse_mode = MLX5_IFC_STC_REPARSE_IGNORE;
++	stc_attr.ste_table.ste_pool = action_tbl->pool;
++	stc_attr.ste_table.match_definer_id = ctx->caps->trivial_match_definer;
++
++	return mlx5hws_action_alloc_single_stc(ctx, &stc_attr,
++					       MLX5HWS_TABLE_TYPE_FDB,
++					       &action_tbl->stc);
++}
++
++static struct mlx5hws_action_ste_table *
++hws_action_ste_table_alloc(struct mlx5hws_action_ste_pool_element *parent_elem)
++{
++	enum mlx5hws_pool_optimize opt = parent_elem->opt;
++	struct mlx5hws_context *ctx = parent_elem->ctx;
++	struct mlx5hws_action_ste_table *action_tbl;
++	size_t log_sz;
++	int err;
++
++	log_sz = min(parent_elem->log_sz ?
++			     parent_elem->log_sz +
++				     MLX5HWS_ACTION_STE_TABLE_STEP_LOG_SZ :
++				   MLX5HWS_ACTION_STE_TABLE_INIT_LOG_SZ,
++		     MLX5HWS_ACTION_STE_TABLE_MAX_LOG_SZ);
++
++	action_tbl = kzalloc(sizeof(*action_tbl), GFP_KERNEL);
++	if (!action_tbl)
++		return ERR_PTR(-ENOMEM);
++
++	err = hws_action_ste_table_create_pool(ctx, action_tbl, opt, log_sz);
++	if (err)
++		goto free_tbl;
++
++	err = hws_action_ste_table_create_rtcs(ctx, action_tbl, opt, log_sz);
++	if (err)
++		goto destroy_pool;
++
++	err = hws_action_ste_table_create_stc(ctx, action_tbl);
++	if (err)
++		goto destroy_rtcs;
++
++	action_tbl->parent_elem = parent_elem;
++	INIT_LIST_HEAD(&action_tbl->list_node);
++	list_add(&action_tbl->list_node, &parent_elem->available);
++	parent_elem->log_sz = log_sz;
++
++	mlx5hws_dbg(ctx,
++		    "Allocated %s action STE table log_sz %zu; STEs (%d, %d); RTCs (%d, %d); STC %d\n",
++		    hws_pool_opt_to_str(opt), log_sz,
++		    mlx5hws_pool_get_base_id(action_tbl->pool),
++		    mlx5hws_pool_get_base_mirror_id(action_tbl->pool),
++		    action_tbl->rtc_0_id, action_tbl->rtc_1_id,
++		    action_tbl->stc.offset);
++
++	return action_tbl;
++
++destroy_rtcs:
++	hws_action_ste_table_destroy_rtcs(action_tbl);
++destroy_pool:
++	mlx5hws_pool_destroy(action_tbl->pool);
++free_tbl:
++	kfree(action_tbl);
++
++	return ERR_PTR(err);
++}
++
++static void
++hws_action_ste_table_destroy(struct mlx5hws_action_ste_table *action_tbl)
++{
++	struct mlx5hws_context *ctx = action_tbl->parent_elem->ctx;
++
++	mlx5hws_dbg(ctx,
++		    "Destroying %s action STE table: STEs (%d, %d); RTCs (%d, %d); STC %d\n",
++		    hws_pool_opt_to_str(action_tbl->parent_elem->opt),
++		    mlx5hws_pool_get_base_id(action_tbl->pool),
++		    mlx5hws_pool_get_base_mirror_id(action_tbl->pool),
++		    action_tbl->rtc_0_id, action_tbl->rtc_1_id,
++		    action_tbl->stc.offset);
++
++	mlx5hws_action_free_single_stc(ctx, MLX5HWS_TABLE_TYPE_FDB,
++				       &action_tbl->stc);
++	hws_action_ste_table_destroy_rtcs(action_tbl);
++	mlx5hws_pool_destroy(action_tbl->pool);
++
++	list_del(&action_tbl->list_node);
++	kfree(action_tbl);
++}
++
++static int
++hws_action_ste_pool_element_init(struct mlx5hws_context *ctx,
++				 struct mlx5hws_action_ste_pool_element *elem,
++				 enum mlx5hws_pool_optimize opt)
++{
++	elem->ctx = ctx;
++	elem->opt = opt;
++	INIT_LIST_HEAD(&elem->available);
++	INIT_LIST_HEAD(&elem->full);
++
++	return 0;
++}
++
++static void hws_action_ste_pool_element_destroy(
++	struct mlx5hws_action_ste_pool_element *elem)
++{
++	struct mlx5hws_action_ste_table *action_tbl, *p;
++
++	/* This should be empty, but attempt to free its elements anyway. */
++	list_for_each_entry_safe(action_tbl, p, &elem->full, list_node)
++		hws_action_ste_table_destroy(action_tbl);
++
++	list_for_each_entry_safe(action_tbl, p, &elem->available, list_node)
++		hws_action_ste_table_destroy(action_tbl);
++}
++
++static int hws_action_ste_pool_init(struct mlx5hws_context *ctx,
++				    struct mlx5hws_action_ste_pool *pool)
++{
++	enum mlx5hws_pool_optimize opt;
++	int err;
++
++	/* Rules which are added for both RX and TX must use the same action STE
++	 * indices for both. If we were to use a single table, then RX-only and
++	 * TX-only rules would waste the unused entries. Thus, we use separate
++	 * table sets for the three cases.
++	 */
++	for (opt = MLX5HWS_POOL_OPTIMIZE_NONE; opt < MLX5HWS_POOL_OPTIMIZE_MAX;
++	     opt++) {
++		err = hws_action_ste_pool_element_init(ctx, &pool->elems[opt],
++						       opt);
++		if (err)
++			goto destroy_elems;
++	}
++
++	return 0;
++
++destroy_elems:
++	while (opt-- > MLX5HWS_POOL_OPTIMIZE_NONE)
++		hws_action_ste_pool_element_destroy(&pool->elems[opt]);
++
++	return err;
++}
++
++static void hws_action_ste_pool_destroy(struct mlx5hws_action_ste_pool *pool)
++{
++	int opt;
++
++	for (opt = MLX5HWS_POOL_OPTIMIZE_MAX - 1;
++	     opt >= MLX5HWS_POOL_OPTIMIZE_NONE; opt--)
++		hws_action_ste_pool_element_destroy(&pool->elems[opt]);
++}
++
++int mlx5hws_action_ste_pool_init(struct mlx5hws_context *ctx)
++{
++	struct mlx5hws_action_ste_pool *pool;
++	size_t queues = ctx->queues;
++	int i, err;
++
++	pool = kcalloc(queues, sizeof(*pool), GFP_KERNEL);
++	if (!pool)
++		return -ENOMEM;
++
++	for (i = 0; i < queues; i++) {
++		err = hws_action_ste_pool_init(ctx, &pool[i]);
++		if (err)
++			goto free_pool;
++	}
++
++	ctx->action_ste_pool = pool;
++
++	return 0;
++
++free_pool:
++	while (i--)
++		hws_action_ste_pool_destroy(&pool[i]);
++	kfree(pool);
++
++	return err;
++}
++
++void mlx5hws_action_ste_pool_uninit(struct mlx5hws_context *ctx)
++{
++	size_t queues = ctx->queues;
++	int i;
++
++	for (i = 0; i < queues; i++)
++		hws_action_ste_pool_destroy(&ctx->action_ste_pool[i]);
++
++	kfree(ctx->action_ste_pool);
++}
++
++static struct mlx5hws_action_ste_pool_element *
++hws_action_ste_choose_elem(struct mlx5hws_action_ste_pool *pool,
++			   bool skip_rx, bool skip_tx)
++{
++	if (skip_rx)
++		return &pool->elems[MLX5HWS_POOL_OPTIMIZE_MIRROR];
++
++	if (skip_tx)
++		return &pool->elems[MLX5HWS_POOL_OPTIMIZE_ORIG];
++
++	return &pool->elems[MLX5HWS_POOL_OPTIMIZE_NONE];
++}
++
++static int
++hws_action_ste_table_chunk_alloc(struct mlx5hws_action_ste_table *action_tbl,
++				 struct mlx5hws_action_ste_chunk *chunk)
++{
++	int err;
++
++	err = mlx5hws_pool_chunk_alloc(action_tbl->pool, &chunk->ste);
++	if (err)
++		return err;
++
++	chunk->action_tbl = action_tbl;
++
++	return 0;
++}
++
++int mlx5hws_action_ste_chunk_alloc(struct mlx5hws_action_ste_pool *pool,
++				   bool skip_rx, bool skip_tx,
++				   struct mlx5hws_action_ste_chunk *chunk)
++{
++	struct mlx5hws_action_ste_pool_element *elem;
++	struct mlx5hws_action_ste_table *action_tbl;
++	bool found;
++	int err;
++
++	if (skip_rx && skip_tx)
++		return -EINVAL;
++
++	elem = hws_action_ste_choose_elem(pool, skip_rx, skip_tx);
++
++	mlx5hws_dbg(elem->ctx,
++		    "Allocating action STEs skip_rx %d skip_tx %d order %d\n",
++		    skip_rx, skip_tx, chunk->ste.order);
++
++	found = false;
++	list_for_each_entry(action_tbl, &elem->available, list_node) {
++		if (!hws_action_ste_table_chunk_alloc(action_tbl, chunk)) {
++			found = true;
++			break;
++		}
++	}
++
++	if (!found) {
++		action_tbl = hws_action_ste_table_alloc(elem);
++		if (IS_ERR(action_tbl))
++			return PTR_ERR(action_tbl);
++
++		err = hws_action_ste_table_chunk_alloc(action_tbl, chunk);
++		if (err)
++			return err;
++	}
++
++	if (mlx5hws_pool_empty(action_tbl->pool))
++		list_move(&action_tbl->list_node, &elem->full);
++
++	return 0;
++}
++
++void mlx5hws_action_ste_chunk_free(struct mlx5hws_action_ste_chunk *chunk)
++{
++	mlx5hws_dbg(chunk->action_tbl->pool->ctx,
++		    "Freeing action STEs offset %d order %d\n",
++		    chunk->ste.offset, chunk->ste.order);
++	mlx5hws_pool_chunk_free(chunk->action_tbl->pool, &chunk->ste);
++	list_move(&chunk->action_tbl->list_node,
++		  &chunk->action_tbl->parent_elem->available);
++}
+--- /dev/null
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/action_ste_pool.h
+@@ -0,0 +1,58 @@
++/* SPDX-License-Identifier: GPL-2.0 OR Linux-OpenIB */
++/* Copyright (c) 2025 NVIDIA Corporation & Affiliates */
++
++#ifndef ACTION_STE_POOL_H_
++#define ACTION_STE_POOL_H_
++
++#define MLX5HWS_ACTION_STE_TABLE_INIT_LOG_SZ 10
++#define MLX5HWS_ACTION_STE_TABLE_STEP_LOG_SZ 1
++#define MLX5HWS_ACTION_STE_TABLE_MAX_LOG_SZ 20
++
++struct mlx5hws_action_ste_pool_element;
++
++struct mlx5hws_action_ste_table {
++	struct mlx5hws_action_ste_pool_element *parent_elem;
++	/* Wraps the RTC and STE range for this given action. */
++	struct mlx5hws_pool *pool;
++	/* Match STEs use this STC to jump to this pool's RTC. */
++	struct mlx5hws_pool_chunk stc;
++	u32 rtc_0_id;
++	u32 rtc_1_id;
++	struct list_head list_node;
++};
++
++struct mlx5hws_action_ste_pool_element {
++	struct mlx5hws_context *ctx;
++	size_t log_sz;  /* Size of the largest table so far. */
++	enum mlx5hws_pool_optimize opt;
++	struct list_head available;
++	struct list_head full;
++};
++
++/* Central repository of action STEs. The context contains one of these pools
++ * per queue.
++ */
++struct mlx5hws_action_ste_pool {
++	struct mlx5hws_action_ste_pool_element elems[MLX5HWS_POOL_OPTIMIZE_MAX];
++};
++
++/* A chunk of STEs and the table it was allocated from. Used by rules. */
++struct mlx5hws_action_ste_chunk {
++	struct mlx5hws_action_ste_table *action_tbl;
++	struct mlx5hws_pool_chunk ste;
++};
++
++int mlx5hws_action_ste_pool_init(struct mlx5hws_context *ctx);
++
++void mlx5hws_action_ste_pool_uninit(struct mlx5hws_context *ctx);
++
++/* Callers are expected to fill chunk->ste.order. On success, this function
++ * populates chunk->tbl and chunk->ste.offset.
++ */
++int mlx5hws_action_ste_chunk_alloc(struct mlx5hws_action_ste_pool *pool,
++				   bool skip_rx, bool skip_tx,
++				   struct mlx5hws_action_ste_chunk *chunk);
++
++void mlx5hws_action_ste_chunk_free(struct mlx5hws_action_ste_chunk *chunk);
++
++#endif /* ACTION_STE_POOL_H_ */
+--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/context.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/context.c
+@@ -158,10 +158,16 @@ static int hws_context_init_hws(struct m
+ 	if (ret)
+ 		goto pools_uninit;
+ 
++	ret = mlx5hws_action_ste_pool_init(ctx);
++	if (ret)
++		goto close_queues;
++
+ 	INIT_LIST_HEAD(&ctx->tbl_list);
+ 
+ 	return 0;
+ 
++close_queues:
++	mlx5hws_send_queues_close(ctx);
+ pools_uninit:
+ 	hws_context_pools_uninit(ctx);
+ uninit_pd:
+@@ -174,6 +180,7 @@ static void hws_context_uninit_hws(struc
+ 	if (!(ctx->flags & MLX5HWS_CONTEXT_FLAG_HWS_SUPPORT))
+ 		return;
+ 
++	mlx5hws_action_ste_pool_uninit(ctx);
+ 	mlx5hws_send_queues_close(ctx);
+ 	hws_context_pools_uninit(ctx);
+ 	hws_context_uninit_pd(ctx);
+--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/context.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/context.h
+@@ -39,6 +39,7 @@ struct mlx5hws_context {
+ 	struct mlx5hws_cmd_query_caps *caps;
+ 	u32 pd_num;
+ 	struct mlx5hws_pool *stc_pool;
++	struct mlx5hws_action_ste_pool *action_ste_pool; /* One per queue */
+ 	struct mlx5hws_context_common_res common_res;
+ 	struct mlx5hws_pattern_cache *pattern_cache;
+ 	struct mlx5hws_definer_cache *definer_cache;
+--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/internal.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/internal.h
+@@ -17,6 +17,7 @@
+ #include "context.h"
+ #include "table.h"
+ #include "send.h"
++#include "action_ste_pool.h"
+ #include "rule.h"
+ #include "cmd.h"
+ #include "action.h"
+--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/pool.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/pool.h
+@@ -33,6 +33,7 @@ enum mlx5hws_pool_optimize {
+ 	MLX5HWS_POOL_OPTIMIZE_NONE = 0x0,
+ 	MLX5HWS_POOL_OPTIMIZE_ORIG = 0x1,
+ 	MLX5HWS_POOL_OPTIMIZE_MIRROR = 0x2,
++	MLX5HWS_POOL_OPTIMIZE_MAX = 0x3,
+ };
+ 
+ struct mlx5hws_pool_attr {
