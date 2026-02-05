@@ -1,0 +1,98 @@
+From: Namhyung Kim <namhyung@kernel.org>
+Date: Thu, 10 Oct 2024 16:25:04 -0700
+Subject: mm/bpf: Add bpf_get_kmem_cache() kfunc
+Patch-mainline: v6.13-rc1
+Git-commit: a992d7a3979120fbd7c13435d27b3da8d9ed095a
+References: jsc#PED-14653
+
+The bpf_get_kmem_cache() is to get a slab cache information from a
+virtual address like virt_to_cache().  If the address is a pointer
+to a slab object, it'd return a valid kmem_cache pointer, otherwise
+NULL is returned.
+
+It doesn't grab a reference count of the kmem_cache so the caller is
+responsible to manage the access.  The returned point is marked as
+PTR_UNTRUSTED.
+
+The intended use case for now is to symbolize locks in slab objects
+from the lock contention tracepoints.
+
+Suggested-by: Vlastimil Babka <vbabka@suse.cz>
+Acked-by: Roman Gushchin <roman.gushchin@linux.dev> (mm/*)
+Acked-by: Vlastimil Babka <vbabka@suse.cz> #mm/slab
+Signed-off-by: Namhyung Kim <namhyung@kernel.org>
+Link: https://lore.kernel.org/r/20241010232505.1339892-3-namhyung@kernel.org
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ kernel/bpf/helpers.c  |    1 +
+ kernel/bpf/verifier.c |    5 +++++
+ mm/slab_common.c      |   19 +++++++++++++++++++
+ 3 files changed, 25 insertions(+)
+
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -3124,6 +3124,7 @@ BTF_ID_FLAGS(func, bpf_iter_bits_new, KF
+ BTF_ID_FLAGS(func, bpf_iter_bits_next, KF_ITER_NEXT | KF_RET_NULL)
+ BTF_ID_FLAGS(func, bpf_iter_bits_destroy, KF_ITER_DESTROY)
+ BTF_ID_FLAGS(func, bpf_copy_from_user_str, KF_SLEEPABLE)
++BTF_ID_FLAGS(func, bpf_get_kmem_cache)
+ BTF_KFUNCS_END(common_btf_ids)
+ 
+ static const struct btf_kfunc_id_set common_kfunc_set = {
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -11252,6 +11252,7 @@ enum special_kfunc_type {
+ 	KF_bpf_preempt_enable,
+ 	KF_bpf_iter_css_task_new,
+ 	KF_bpf_session_cookie,
++	KF_bpf_get_kmem_cache,
+ };
+ 
+ BTF_SET_START(special_kfunc_set)
+@@ -11317,6 +11318,7 @@ BTF_ID(func, bpf_session_cookie)
+ #else
+ BTF_ID_UNUSED
+ #endif
++BTF_ID(func, bpf_get_kmem_cache)
+ 
+ static bool is_kfunc_ret_null(struct bpf_kfunc_call_arg_meta *meta)
+ {
+@@ -12827,6 +12829,9 @@ static int check_kfunc_call(struct bpf_v
+ 			regs[BPF_REG_0].type = PTR_TO_BTF_ID;
+ 			regs[BPF_REG_0].btf_id = ptr_type_id;
+ 
++			if (meta.func_id == special_kfunc_list[KF_bpf_get_kmem_cache])
++				regs[BPF_REG_0].type |= PTR_UNTRUSTED;
++
+ 			if (is_iter_next_kfunc(&meta)) {
+ 				struct bpf_reg_state *cur_iter;
+ 
+--- a/mm/slab_common.c
++++ b/mm/slab_common.c
+@@ -1332,6 +1332,25 @@ size_t ksize(const void *objp)
+ }
+ EXPORT_SYMBOL(ksize);
+ 
++#ifdef CONFIG_BPF_SYSCALL
++#include <linux/btf.h>
++
++__bpf_kfunc_start_defs();
++
++__bpf_kfunc struct kmem_cache *bpf_get_kmem_cache(u64 addr)
++{
++	struct slab *slab;
++
++	if (!virt_addr_valid((void *)(long)addr))
++		return NULL;
++
++	slab = virt_to_slab((void *)(long)addr);
++	return slab ? slab->slab_cache : NULL;
++}
++
++__bpf_kfunc_end_defs();
++#endif /* CONFIG_BPF_SYSCALL */
++
+ /* Tracepoints definitions. */
+ EXPORT_TRACEPOINT_SYMBOL(kmalloc);
+ EXPORT_TRACEPOINT_SYMBOL(kmem_cache_alloc);
