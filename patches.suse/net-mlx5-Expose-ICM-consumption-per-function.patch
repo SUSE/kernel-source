@@ -1,0 +1,109 @@
+From: Akiva Goldberger <agoldberger@nvidia.com>
+Date: Sun, 9 Feb 2025 12:17:11 +0200
+Subject: net/mlx5: Expose ICM consumption per function
+Patch-mainline: v6.15-rc1
+Git-commit: b820864335c8b39b0e90d04ecbebdeed4d3d6dfd
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+ICM is a portion of the host's memory assigned to a function by the OS
+through requests made by the NIC's firmware.
+
+PF ICM consumption can be accessed directly, while VF/SF ICM consumption
+can be accessed through their representors in switchdev mode.
+
+The value is exposed to the user in granularity of 4KB through the vnic
+health reporter as follows:
+
+$ devlink health diagnose pci/0000:08:00.0 reporter vnic
+ vNIC env counters:
+     total_error_queues: 0 send_queue_priority_update_flow: 0
+     comp_eq_overrun: 0 async_eq_overrun: 0 cq_overrun: 0
+     invalid_command: 0 quota_exceeded_command: 0
+     nic_receive_steering_discard: 0 icm_consumption: 1032
+
+Signed-off-by: Akiva Goldberger <agoldberger@nvidia.com>
+Reviewed-by: Moshe Shemesh <moshe@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://patch.msgid.link/20250209101716.112774-11-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ Documentation/networking/devlink/mlx5.rst                    |    4 
+ drivers/net/ethernet/mellanox/mlx5/core/diag/reporter_vnic.c |   46 +++++++++++
+ 2 files changed, 50 insertions(+)
+
+--- a/Documentation/networking/devlink/mlx5.rst
++++ b/Documentation/networking/devlink/mlx5.rst
+@@ -280,6 +280,10 @@ Description of the vnic counters:
+ 	number of packets handled by the VNIC experiencing unexpected steering
+ 	failure (at any point in steering flow owned by the VNIC, including the FDB
+ 	for the eswitch owner).
++- icm_consumption
++        amount of Interconnect Host Memory (ICM) consumed by the vnic in
++        granularity of 4KB. ICM is host memory allocated by SW upon HCA request
++        and is used for storing data structures that control HCA operation.
+ 
+ User commands examples:
+ 
+--- a/drivers/net/ethernet/mellanox/mlx5/core/diag/reporter_vnic.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/diag/reporter_vnic.c
+@@ -13,6 +13,50 @@ struct mlx5_vnic_diag_stats {
+ 	__be64 query_vnic_env_out[MLX5_ST_SZ_QW(query_vnic_env_out)];
+ };
+ 
++static void mlx5_reporter_vnic_diagnose_counter_icm(struct mlx5_core_dev *dev,
++						    struct devlink_fmsg *fmsg,
++						    u16 vport_num, bool other_vport)
++{
++	u32 out_icm_reg[MLX5_ST_SZ_DW(vhca_icm_ctrl_reg)] = {};
++	u32 in_icm_reg[MLX5_ST_SZ_DW(vhca_icm_ctrl_reg)] = {};
++	u32 out_reg[MLX5_ST_SZ_DW(nic_cap_reg)] = {};
++	u32 in_reg[MLX5_ST_SZ_DW(nic_cap_reg)] = {};
++	u32 cur_alloc_icm;
++	int vhca_icm_ctrl;
++	u16 vhca_id;
++	int err;
++
++	err = mlx5_core_access_reg(dev, in_reg, sizeof(in_reg), out_reg,
++				   sizeof(out_reg), MLX5_REG_NIC_CAP, 0, 0);
++	if (err) {
++		mlx5_core_warn(dev, "Reading nic_cap_reg failed. err = %d\n", err);
++		return;
++	}
++	vhca_icm_ctrl = MLX5_GET(nic_cap_reg, out_reg, vhca_icm_ctrl);
++	if (!vhca_icm_ctrl)
++		return;
++
++	MLX5_SET(vhca_icm_ctrl_reg, in_icm_reg, vhca_id_valid, other_vport);
++	if (other_vport) {
++		err = mlx5_vport_get_vhca_id(dev, vport_num, &vhca_id);
++		if (err) {
++			mlx5_core_warn(dev, "vport to vhca_id failed. vport_num = %d, err = %d\n",
++				       vport_num, err);
++			return;
++		}
++		MLX5_SET(vhca_icm_ctrl_reg, in_icm_reg, vhca_id, vhca_id);
++	}
++	err = mlx5_core_access_reg(dev, in_icm_reg, sizeof(in_icm_reg),
++				   out_icm_reg, sizeof(out_icm_reg),
++				   MLX5_REG_VHCA_ICM_CTRL, 0, 0);
++	if (err) {
++		mlx5_core_warn(dev, "Reading vhca_icm_ctrl failed. err = %d\n", err);
++		return;
++	}
++	cur_alloc_icm = MLX5_GET(vhca_icm_ctrl_reg, out_icm_reg, cur_alloc_icm);
++	devlink_fmsg_u32_pair_put(fmsg, "icm_consumption", cur_alloc_icm);
++}
++
+ void mlx5_reporter_vnic_diagnose_counters(struct mlx5_core_dev *dev,
+ 					  struct devlink_fmsg *fmsg,
+ 					  u16 vport_num, bool other_vport)
+@@ -59,6 +103,8 @@ void mlx5_reporter_vnic_diagnose_counter
+ 		devlink_fmsg_u64_pair_put(fmsg, "handled_pkt_steering_fail",
+ 					  VNIC_ENV_GET64(&vnic, handled_pkt_steering_fail));
+ 	}
++	if (MLX5_CAP_GEN(dev, nic_cap_reg))
++		mlx5_reporter_vnic_diagnose_counter_icm(dev, fmsg, vport_num, other_vport);
+ 
+ 	devlink_fmsg_obj_nest_end(fmsg);
+ 	devlink_fmsg_pair_nest_end(fmsg);

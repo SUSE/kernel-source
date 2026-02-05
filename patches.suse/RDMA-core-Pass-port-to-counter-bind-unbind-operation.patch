@@ -1,0 +1,178 @@
+From: Patrisious Haddad <phaddad@nvidia.com>
+Date: Thu, 13 Mar 2025 16:18:44 +0200
+Subject: RDMA/core: Pass port to counter bind/unbind operations
+Patch-mainline: v6.15-rc1
+Git-commit: 88ae02feda84f0f78ff7243ef437e79624fdcd80
+References: jsc#PED-15334
+
+This will be useful for the next patches in the series since port number
+is needed for optional counters binding and unbinding.
+
+Note that this change is needed since when the operation is done qp->port
+isn't necessarily initialized yet and can't be used.
+
+Signed-off-by: Patrisious Haddad <phaddad@nvidia.com>
+Reviewed-by: Mark Bloch <mbloch@nvidia.com>
+Link: https://patch.msgid.link/b6f6797844acbd517358e8d2a270ea9b3e6ecba1.1741875070.git.leon@kernel.org
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/core/counters.c    |   20 ++++++++++----------
+ drivers/infiniband/core/verbs.c       |    2 +-
+ drivers/infiniband/hw/mlx5/counters.c |    4 ++--
+ include/rdma/ib_verbs.h               |    5 +++--
+ include/rdma/rdma_counter.h           |    2 +-
+ 5 files changed, 17 insertions(+), 16 deletions(-)
+
+--- a/drivers/infiniband/core/counters.c
++++ b/drivers/infiniband/core/counters.c
+@@ -89,7 +89,7 @@ static void auto_mode_init_counter(struc
+ }
+ 
+ static int __rdma_counter_bind_qp(struct rdma_counter *counter,
+-				  struct ib_qp *qp)
++				  struct ib_qp *qp, u32 port)
+ {
+ 	int ret;
+ 
+@@ -100,7 +100,7 @@ static int __rdma_counter_bind_qp(struct
+ 		return -EOPNOTSUPP;
+ 
+ 	mutex_lock(&counter->lock);
+-	ret = qp->device->ops.counter_bind_qp(counter, qp);
++	ret = qp->device->ops.counter_bind_qp(counter, qp, port);
+ 	mutex_unlock(&counter->lock);
+ 
+ 	return ret;
+@@ -190,7 +190,7 @@ static struct rdma_counter *alloc_and_bi
+ 	kref_init(&counter->kref);
+ 	mutex_init(&counter->lock);
+ 
+-	ret = __rdma_counter_bind_qp(counter, qp);
++	ret = __rdma_counter_bind_qp(counter, qp, port);
+ 	if (ret)
+ 		goto err_mode;
+ 
+@@ -240,7 +240,7 @@ static bool auto_mode_match(struct ib_qp
+ 	return match;
+ }
+ 
+-static int __rdma_counter_unbind_qp(struct ib_qp *qp)
++static int __rdma_counter_unbind_qp(struct ib_qp *qp, u32 port)
+ {
+ 	struct rdma_counter *counter = qp->counter;
+ 	int ret;
+@@ -249,7 +249,7 @@ static int __rdma_counter_unbind_qp(stru
+ 		return -EOPNOTSUPP;
+ 
+ 	mutex_lock(&counter->lock);
+-	ret = qp->device->ops.counter_unbind_qp(qp);
++	ret = qp->device->ops.counter_unbind_qp(qp, port);
+ 	mutex_unlock(&counter->lock);
+ 
+ 	return ret;
+@@ -341,7 +341,7 @@ int rdma_counter_bind_qp_auto(struct ib_
+ 
+ 	counter = rdma_get_counter_auto_mode(qp, port);
+ 	if (counter) {
+-		ret = __rdma_counter_bind_qp(counter, qp);
++		ret = __rdma_counter_bind_qp(counter, qp, port);
+ 		if (ret) {
+ 			kref_put(&counter->kref, counter_release);
+ 			return ret;
+@@ -360,7 +360,7 @@ int rdma_counter_bind_qp_auto(struct ib_
+  * @force:
+  *   true - Decrease the counter ref-count anyway (e.g., qp destroy)
+  */
+-int rdma_counter_unbind_qp(struct ib_qp *qp, bool force)
++int rdma_counter_unbind_qp(struct ib_qp *qp, u32 port, bool force)
+ {
+ 	struct rdma_counter *counter = qp->counter;
+ 	int ret;
+@@ -368,7 +368,7 @@ int rdma_counter_unbind_qp(struct ib_qp
+ 	if (!counter)
+ 		return -EINVAL;
+ 
+-	ret = __rdma_counter_unbind_qp(qp);
++	ret = __rdma_counter_unbind_qp(qp, port);
+ 	if (ret && !force)
+ 		return ret;
+ 
+@@ -515,7 +515,7 @@ int rdma_counter_bind_qpn(struct ib_devi
+ 		goto err_task;
+ 	}
+ 
+-	ret = __rdma_counter_bind_qp(counter, qp);
++	ret = __rdma_counter_bind_qp(counter, qp, port);
+ 	if (ret)
+ 		goto err_task;
+ 
+@@ -606,7 +606,7 @@ int rdma_counter_unbind_qpn(struct ib_de
+ 		goto out;
+ 	}
+ 
+-	ret = rdma_counter_unbind_qp(qp, false);
++	ret = rdma_counter_unbind_qp(qp, port, false);
+ 
+ out:
+ 	rdma_restrack_put(&qp->res);
+--- a/drivers/infiniband/core/verbs.c
++++ b/drivers/infiniband/core/verbs.c
+@@ -2105,7 +2105,7 @@ int ib_destroy_qp_user(struct ib_qp *qp,
+ 	if (!qp->uobject)
+ 		rdma_rw_cleanup_mrs(qp);
+ 
+-	rdma_counter_unbind_qp(qp, true);
++	rdma_counter_unbind_qp(qp, qp->port, true);
+ 	ret = qp->device->ops.destroy_qp(qp, udata);
+ 	if (ret) {
+ 		if (sec)
+--- a/drivers/infiniband/hw/mlx5/counters.c
++++ b/drivers/infiniband/hw/mlx5/counters.c
+@@ -562,7 +562,7 @@ static int mlx5_ib_counter_dealloc(struc
+ }
+ 
+ static int mlx5_ib_counter_bind_qp(struct rdma_counter *counter,
+-				   struct ib_qp *qp)
++				   struct ib_qp *qp, u32 port)
+ {
+ 	struct mlx5_ib_dev *dev = to_mdev(qp->device);
+ 	bool new = false;
+@@ -598,7 +598,7 @@ fail_set_counter:
+ 	return err;
+ }
+ 
+-static int mlx5_ib_counter_unbind_qp(struct ib_qp *qp)
++static int mlx5_ib_counter_unbind_qp(struct ib_qp *qp, u32 port)
+ {
+ 	return mlx5_ib_qp_set_counter(qp, NULL);
+ }
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -2626,12 +2626,13 @@ struct ib_device_ops {
+ 	 * @counter - The counter to be bound. If counter->id is zero then
+ 	 *   the driver needs to allocate a new counter and set counter->id
+ 	 */
+-	int (*counter_bind_qp)(struct rdma_counter *counter, struct ib_qp *qp);
++	int (*counter_bind_qp)(struct rdma_counter *counter, struct ib_qp *qp,
++			       u32 port);
+ 	/**
+ 	 * counter_unbind_qp - Unbind the qp from the dynamically-allocated
+ 	 *   counter and bind it onto the default one
+ 	 */
+-	int (*counter_unbind_qp)(struct ib_qp *qp);
++	int (*counter_unbind_qp)(struct ib_qp *qp, u32 port);
+ 	/**
+ 	 * counter_dealloc -De-allocate the hw counter
+ 	 */
+--- a/include/rdma/rdma_counter.h
++++ b/include/rdma/rdma_counter.h
+@@ -49,7 +49,7 @@ int rdma_counter_set_auto_mode(struct ib
+ 			       enum rdma_nl_counter_mask mask,
+ 			       struct netlink_ext_ack *extack);
+ int rdma_counter_bind_qp_auto(struct ib_qp *qp, u32 port);
+-int rdma_counter_unbind_qp(struct ib_qp *qp, bool force);
++int rdma_counter_unbind_qp(struct ib_qp *qp, u32 port, bool force);
+ 
+ int rdma_counter_query_stats(struct rdma_counter *counter);
+ u64 rdma_counter_get_hwstat_value(struct ib_device *dev, u32 port, u32 index);

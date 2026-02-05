@@ -1,0 +1,189 @@
+From: Mateusz Polchlopek <mateusz.polchlopek@intel.com>
+Date: Wed, 6 Nov 2024 12:37:29 -0500
+Subject: iavf: Implement checking DD desc field
+Patch-mainline: v6.15-rc1
+Git-commit: 8447357e7b04d09dde4ad04d93672b9f0f47a66c
+References: jsc#PED-15072
+
+Rx timestamping introduced in PF driver caused the need of refactoring
+the VF driver mechanism to check packet fields.
+
+The function to check errors in descriptor has been removed and from
+now only previously set struct fields are being checked. The field DD
+(descriptor done) needs to be checked at the very beginning, before
+extracting other fields.
+
+Reviewed-by: Rahul Rameshbabu <rrameshbabu@nvidia.com>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Tested-by: Rafal Romanowski <rafal.romanowski@intel.com>
+Signed-off-by: Mateusz Polchlopek <mateusz.polchlopek@intel.com>
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/iavf/iavf_txrx.c |   54 +++++++++++++++++++++-------
+ drivers/net/ethernet/intel/iavf/iavf_txrx.h |   16 --------
+ drivers/net/ethernet/intel/iavf/iavf_type.h |    2 +
+ 3 files changed, 43 insertions(+), 29 deletions(-)
+
+--- a/drivers/net/ethernet/intel/iavf/iavf_txrx.c
++++ b/drivers/net/ethernet/intel/iavf/iavf_txrx.c
+@@ -9,6 +9,25 @@
+ #include "iavf_trace.h"
+ #include "iavf_prototype.h"
+ 
++/**
++ * iavf_is_descriptor_done - tests DD bit in Rx descriptor
++ * @qw1: quad word 1 from descriptor to get Descriptor Done field from
++ * @flex: is the descriptor flex or legacy
++ *
++ * This function tests the descriptor done bit in specified descriptor. Because
++ * there are two types of descriptors (legacy and flex) the parameter rx_ring
++ * is used to distinguish.
++ *
++ * Return: true or false based on the state of DD bit in Rx descriptor.
++ */
++static bool iavf_is_descriptor_done(u64 qw1, bool flex)
++{
++	if (flex)
++		return FIELD_GET(IAVF_RXD_FLEX_DD_M, qw1);
++	else
++		return FIELD_GET(IAVF_RXD_LEGACY_DD_M, qw1);
++}
++
+ static __le64 build_ctob(u32 td_cmd, u32 td_offset, unsigned int size,
+ 			 u32 td_tag)
+ {
+@@ -1063,6 +1082,7 @@ static void iavf_flex_rx_hash(const stru
+  * @rx_desc: pointer to the EOP Rx descriptor
+  * @skb: pointer to current skb being populated
+  * @ptype: the packet type decoded by hardware
++ * @flex: is the descriptor flex or legacy
+  *
+  * This function checks the ring, descriptor, and packet information in
+  * order to populate the hash, checksum, VLAN, protocol, and
+@@ -1070,7 +1090,8 @@ static void iavf_flex_rx_hash(const stru
+  **/
+ static void iavf_process_skb_fields(const struct iavf_ring *rx_ring,
+ 				    const struct iavf_rx_desc *rx_desc,
+-				    struct sk_buff *skb, u32 ptype)
++				    struct sk_buff *skb, u32 ptype,
++				    bool flex)
+ {
+ 	struct libeth_rx_csum csum_bits;
+ 	struct libeth_rx_pt decoded_pt;
+@@ -1079,14 +1100,14 @@ static void iavf_process_skb_fields(cons
+ 
+ 	decoded_pt = libie_rx_pt_parse(ptype);
+ 
+-	if (rx_ring->rxdid == VIRTCHNL_RXDID_1_32B_BASE) {
+-		iavf_legacy_rx_hash(rx_ring, qw0, qw1, skb, decoded_pt);
+-		csum_bits = iavf_legacy_rx_csum(rx_ring->vsi, le64_to_cpu(qw1),
+-						decoded_pt);
+-	} else {
++	if (flex) {
+ 		iavf_flex_rx_hash(rx_ring, qw1, skb, decoded_pt);
+ 		csum_bits = iavf_flex_rx_csum(rx_ring->vsi, le64_to_cpu(qw1),
+ 					      decoded_pt);
++	} else {
++		iavf_legacy_rx_hash(rx_ring, qw0, qw1, skb, decoded_pt);
++		csum_bits = iavf_legacy_rx_csum(rx_ring->vsi, le64_to_cpu(qw1),
++						decoded_pt);
+ 	}
+ 	iavf_rx_csum(rx_ring->vsi, skb, decoded_pt, csum_bits);
+ 
+@@ -1296,12 +1317,13 @@ iavf_extract_flex_rx_fields(const struct
+ 
+ static struct libeth_rqe_info
+ iavf_extract_rx_fields(const struct iavf_ring *rx_ring,
+-		       const struct iavf_rx_desc *rx_desc)
++		       const struct iavf_rx_desc *rx_desc,
++		       bool flex)
+ {
+-	if (rx_ring->rxdid == VIRTCHNL_RXDID_1_32B_BASE)
+-		return iavf_extract_legacy_rx_fields(rx_ring, rx_desc);
+-	else
++	if (flex)
+ 		return iavf_extract_flex_rx_fields(rx_ring, rx_desc);
++	else
++		return iavf_extract_legacy_rx_fields(rx_ring, rx_desc);
+ }
+ 
+ /**
+@@ -1318,6 +1340,7 @@ iavf_extract_rx_fields(const struct iavf
+  **/
+ static int iavf_clean_rx_irq(struct iavf_ring *rx_ring, int budget)
+ {
++	bool flex = rx_ring->rxdid == VIRTCHNL_RXDID_2_FLEX_SQ_NIC;
+ 	unsigned int total_rx_bytes = 0, total_rx_packets = 0;
+ 	struct sk_buff *skb = rx_ring->skb;
+ 	u16 cleaned_count = IAVF_DESC_UNUSED(rx_ring);
+@@ -1327,6 +1350,7 @@ static int iavf_clean_rx_irq(struct iavf
+ 		struct libeth_rqe_info fields;
+ 		struct libeth_fqe *rx_buffer;
+ 		struct iavf_rx_desc *rx_desc;
++		u64 qw1;
+ 
+ 		/* return some buffers to hardware, one at a time is too slow */
+ 		if (cleaned_count >= IAVF_RX_BUFFER_WRITE) {
+@@ -1343,10 +1367,14 @@ static int iavf_clean_rx_irq(struct iavf
+ 		 */
+ 		dma_rmb();
+ 
+-		if (!iavf_test_staterr(rx_desc, IAVF_RXD_FLEX_DD_M))
++		qw1 = le64_to_cpu(rx_desc->qw1);
++		/* If DD field (descriptor done) is unset then other fields are
++		 * not valid
++		 */
++		if (!iavf_is_descriptor_done(qw1, flex))
+ 			break;
+ 
+-		fields = iavf_extract_rx_fields(rx_ring, rx_desc);
++		fields = iavf_extract_rx_fields(rx_ring, rx_desc, flex);
+ 
+ 		iavf_trace(clean_rx_irq, rx_ring, rx_desc, skb);
+ 
+@@ -1391,7 +1419,7 @@ skip_data:
+ 		total_rx_bytes += skb->len;
+ 
+ 		/* populate checksum, VLAN, and protocol */
+-		iavf_process_skb_fields(rx_ring, rx_desc, skb, fields.ptype);
++		iavf_process_skb_fields(rx_ring, rx_desc, skb, fields.ptype, flex);
+ 
+ 		iavf_trace(clean_rx_irq_rx, rx_ring, rx_desc, skb);
+ 		iavf_receive_skb(rx_ring, skb, fields.vlan);
+--- a/drivers/net/ethernet/intel/iavf/iavf_txrx.h
++++ b/drivers/net/ethernet/intel/iavf/iavf_txrx.h
+@@ -80,22 +80,6 @@ enum iavf_dyn_idx_t {
+ 	BIT_ULL(IAVF_FILTER_PCTYPE_NONF_UNICAST_IPV6_UDP) | \
+ 	BIT_ULL(IAVF_FILTER_PCTYPE_NONF_MULTICAST_IPV6_UDP))
+ 
+-/**
+- * iavf_test_staterr - tests bits in Rx descriptor status and error fields
+- * @rx_desc: pointer to receive descriptor (in le64 format)
+- * @stat_err_bits: value to mask
+- *
+- * This function does some fast chicanery in order to return the
+- * value of the mask which is really only used for boolean tests.
+- * The status_error_len doesn't need to be shifted because it begins
+- * at offset zero.
+- */
+-static inline bool iavf_test_staterr(struct iavf_rx_desc *rx_desc,
+-				     const u64 stat_err_bits)
+-{
+-	return !!(rx_desc->qw1 & cpu_to_le64(stat_err_bits));
+-}
+-
+ /* How many Rx Buffers do we bundle into one write to the hardware ? */
+ #define IAVF_RX_INCREMENT(r, i) \
+ 	do {					\
+--- a/drivers/net/ethernet/intel/iavf/iavf_type.h
++++ b/drivers/net/ethernet/intel/iavf/iavf_type.h
+@@ -212,6 +212,8 @@ struct iavf_rx_desc {
+ #define IAVF_RXD_FLEX_PKT_LEN_M			GENMASK_ULL(45, 32)
+ 
+ 	aligned_le64 qw1;
++/* Descriptor done indication flag. */
++#define IAVF_RXD_LEGACY_DD_M			BIT(0)
+ /* End of packet. Set to 1 if this descriptor is the last one of the packet */
+ #define IAVF_RXD_LEGACY_EOP_M			BIT(1)
+ /* L2 TAG 1 presence indication */

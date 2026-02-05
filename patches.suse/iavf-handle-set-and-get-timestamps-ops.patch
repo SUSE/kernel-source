@@ -1,0 +1,223 @@
+From: Jacob Keller <jacob.e.keller@intel.com>
+Date: Wed, 6 Nov 2024 12:37:30 -0500
+Subject: iavf: handle set and get timestamps ops
+Patch-mainline: v6.15-rc1
+Git-commit: 51534239ef132afbc8cc65cf430aeaeec244a6ad
+References: jsc#PED-15072
+
+Add handlers for the .ndo_hwtstamp_get and .ndo_hwtstamp_set ops which
+allow userspace to request timestamp enablement for the device. This
+support allows standard Linux applications to request the timestamping
+desired.
+
+As with other devices that support timestamping all packets, the driver
+will upgrade any request for timestamping of a specific type of packet
+to HWTSTAMP_FILTER_ALL.
+
+The current configuration is stored, so that it can be retrieved by
+calling .ndo_hwtstamp_get
+
+The Tx timestamps are not implemented yet so calling set ops for
+Tx path will end with EOPNOTSUPP error code.
+
+Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+Reviewed-by: Rahul Rameshbabu <rrameshbabu@nvidia.com>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Reviewed-by: Alexander Lobakin <aleksander.lobakin@intel.com>
+Tested-by: Rafal Romanowski <rafal.romanowski@intel.com>
+Co-developed-by: Mateusz Polchlopek <mateusz.polchlopek@intel.com>
+Signed-off-by: Mateusz Polchlopek <mateusz.polchlopek@intel.com>
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/iavf/iavf_main.c |   21 +++++
+ drivers/net/ethernet/intel/iavf/iavf_ptp.c  |  100 ++++++++++++++++++++++++++++
+ drivers/net/ethernet/intel/iavf/iavf_ptp.h  |    9 ++
+ drivers/net/ethernet/intel/iavf/iavf_txrx.h |    1 
+ 4 files changed, 131 insertions(+)
+
+--- a/drivers/net/ethernet/intel/iavf/iavf_main.c
++++ b/drivers/net/ethernet/intel/iavf/iavf_main.c
+@@ -5174,6 +5174,25 @@ static netdev_features_t iavf_fix_featur
+ 	return iavf_fix_strip_features(adapter, features);
+ }
+ 
++static int iavf_hwstamp_get(struct net_device *netdev,
++			    struct kernel_hwtstamp_config *config)
++{
++	struct iavf_adapter *adapter = netdev_priv(netdev);
++
++	*config = adapter->ptp.hwtstamp_config;
++
++	return 0;
++}
++
++static int iavf_hwstamp_set(struct net_device *netdev,
++			    struct kernel_hwtstamp_config *config,
++			    struct netlink_ext_ack *extack)
++{
++	struct iavf_adapter *adapter = netdev_priv(netdev);
++
++	return iavf_ptp_set_ts_config(adapter, config, extack);
++}
++
+ static int
+ iavf_verify_shaper(struct net_shaper_binding *binding,
+ 		   const struct net_shaper *shaper,
+@@ -5282,6 +5301,8 @@ static const struct net_device_ops iavf_
+ 	.ndo_set_features	= iavf_set_features,
+ 	.ndo_setup_tc		= iavf_setup_tc,
+ 	.net_shaper_ops		= &iavf_shaper_ops,
++	.ndo_hwtstamp_get	= iavf_hwstamp_get,
++	.ndo_hwtstamp_set	= iavf_hwstamp_set,
+ };
+ 
+ /**
+--- a/drivers/net/ethernet/intel/iavf/iavf_ptp.c
++++ b/drivers/net/ethernet/intel/iavf/iavf_ptp.c
+@@ -8,6 +8,100 @@
+ 	container_of_const(info, struct iavf_adapter, ptp.info)
+ 
+ /**
++ * iavf_ptp_disable_rx_tstamp - Disable timestamping in Rx rings
++ * @adapter: private adapter structure
++ *
++ * Disable timestamp reporting for all Rx rings.
++ */
++static void iavf_ptp_disable_rx_tstamp(struct iavf_adapter *adapter)
++{
++	for (u32 i = 0; i < adapter->num_active_queues; i++)
++		adapter->rx_rings[i].flags &= ~IAVF_TXRX_FLAGS_HW_TSTAMP;
++}
++
++/**
++ * iavf_ptp_enable_rx_tstamp - Enable timestamping in Rx rings
++ * @adapter: private adapter structure
++ *
++ * Enable timestamp reporting for all Rx rings.
++ */
++static void iavf_ptp_enable_rx_tstamp(struct iavf_adapter *adapter)
++{
++	for (u32 i = 0; i < adapter->num_active_queues; i++)
++		adapter->rx_rings[i].flags |= IAVF_TXRX_FLAGS_HW_TSTAMP;
++}
++
++/**
++ * iavf_ptp_set_timestamp_mode - Set device timestamping mode
++ * @adapter: private adapter structure
++ * @config: pointer to kernel_hwtstamp_config
++ *
++ * Set the timestamping mode requested from the userspace.
++ *
++ * Note: this function always translates Rx timestamp requests for any packet
++ * category into HWTSTAMP_FILTER_ALL.
++ *
++ * Return: 0 on success, negative error code otherwise.
++ */
++static int iavf_ptp_set_timestamp_mode(struct iavf_adapter *adapter,
++				       struct kernel_hwtstamp_config *config)
++{
++	/* Reserved for future extensions. */
++	if (config->flags)
++		return -EINVAL;
++
++	switch (config->tx_type) {
++	case HWTSTAMP_TX_OFF:
++		break;
++	case HWTSTAMP_TX_ON:
++		return -EOPNOTSUPP;
++	default:
++		return -ERANGE;
++	}
++
++	if (config->rx_filter == HWTSTAMP_FILTER_NONE) {
++		iavf_ptp_disable_rx_tstamp(adapter);
++		return 0;
++	} else if (config->rx_filter > HWTSTAMP_FILTER_NTP_ALL) {
++		return -ERANGE;
++	} else if (!(iavf_ptp_cap_supported(adapter,
++					    VIRTCHNL_1588_PTP_CAP_RX_TSTAMP))) {
++		return -EOPNOTSUPP;
++	}
++
++	config->rx_filter = HWTSTAMP_FILTER_ALL;
++	iavf_ptp_enable_rx_tstamp(adapter);
++
++	return 0;
++}
++
++/**
++ * iavf_ptp_set_ts_config - Set timestamping configuration
++ * @adapter: private adapter structure
++ * @config: pointer to kernel_hwtstamp_config structure
++ * @extack: pointer to netlink_ext_ack structure
++ *
++ * Program the requested timestamping configuration to the device.
++ *
++ * Return: 0 on success, negative error code otherwise.
++ */
++int iavf_ptp_set_ts_config(struct iavf_adapter *adapter,
++			   struct kernel_hwtstamp_config *config,
++			   struct netlink_ext_ack *extack)
++{
++	int err;
++
++	err = iavf_ptp_set_timestamp_mode(adapter, config);
++	if (err)
++		return err;
++
++	/* Save successful settings for future reference */
++	adapter->ptp.hwtstamp_config = *config;
++
++	return 0;
++}
++
++/**
+  * iavf_ptp_cap_supported - Check if a PTP capability is supported
+  * @adapter: private adapter structure
+  * @cap: the capability bitmask to check
+@@ -321,4 +415,10 @@ void iavf_ptp_process_caps(struct iavf_a
+ 		iavf_ptp_release(adapter);
+ 	else if (!adapter->ptp.clock && phc)
+ 		iavf_ptp_init(adapter);
++
++	/* Check if the device lost access to Rx timestamp incoming packets */
++	if (!iavf_ptp_cap_supported(adapter, VIRTCHNL_1588_PTP_CAP_RX_TSTAMP)) {
++		adapter->ptp.hwtstamp_config.rx_filter = HWTSTAMP_FILTER_NONE;
++		iavf_ptp_disable_rx_tstamp(adapter);
++	}
+ }
+--- a/drivers/net/ethernet/intel/iavf/iavf_ptp.h
++++ b/drivers/net/ethernet/intel/iavf/iavf_ptp.h
+@@ -12,6 +12,9 @@ void iavf_ptp_release(struct iavf_adapte
+ void iavf_ptp_process_caps(struct iavf_adapter *adapter);
+ bool iavf_ptp_cap_supported(const struct iavf_adapter *adapter, u32 cap);
+ void iavf_virtchnl_send_ptp_cmd(struct iavf_adapter *adapter);
++int iavf_ptp_set_ts_config(struct iavf_adapter *adapter,
++			   struct kernel_hwtstamp_config *config,
++			   struct netlink_ext_ack *extack);
+ #else /* IS_ENABLED(CONFIG_PTP_1588_CLOCK) */
+ static inline void iavf_ptp_init(struct iavf_adapter *adapter) { }
+ static inline void iavf_ptp_release(struct iavf_adapter *adapter) { }
+@@ -23,5 +26,11 @@ static inline bool iavf_ptp_cap_supporte
+ }
+ 
+ static inline void iavf_virtchnl_send_ptp_cmd(struct iavf_adapter *adapter) { }
++static inline int iavf_ptp_set_ts_config(struct iavf_adapter *adapter,
++					 struct kernel_hwtstamp_config *config,
++					 struct netlink_ext_ack *extack)
++{
++	return -1;
++}
+ #endif /* IS_ENABLED(CONFIG_PTP_1588_CLOCK) */
+ #endif /* _IAVF_PTP_H_ */
+--- a/drivers/net/ethernet/intel/iavf/iavf_txrx.h
++++ b/drivers/net/ethernet/intel/iavf/iavf_txrx.h
+@@ -252,6 +252,7 @@ struct iavf_ring {
+ #define IAVF_TXRX_FLAGS_VLAN_TAG_LOC_L2TAG1	BIT(3)
+ #define IAVF_TXR_FLAGS_VLAN_TAG_LOC_L2TAG2	BIT(4)
+ #define IAVF_RXR_FLAGS_VLAN_TAG_LOC_L2TAG2_2	BIT(5)
++#define IAVF_TXRX_FLAGS_HW_TSTAMP		BIT(6)
+ 
+ 	/* stats structs */
+ 	struct iavf_queue_stats	stats;

@@ -1,0 +1,323 @@
+From: Moshe Shemesh <moshe@nvidia.com>
+Date: Sun, 9 Mar 2025 20:07:42 +0200
+Subject: net/mlx5: fs, add support for flow meters HWS action
+Patch-mainline: v6.15-rc1
+Git-commit: 82d3639ef7dc54d5b5cb454d9a13005202d7a701
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+Add support for HW Steering action of flow meter range. Flow meters
+range can use one HWS action for the whole range. Thus, share a cached
+HWS action among rules that use same flow meter object range. Hold
+refcount for each rule using the cached action.
+
+Signed-off-by: Moshe Shemesh <moshe@nvidia.com>
+Reviewed-by: Mark Bloch <mbloch@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Reviewed-by: Jacob Keller <jacob.e.keller@intel.com>
+Link: https://patch.msgid.link/1741543663-22123-3-git-send-email-tariqt@nvidia.com
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en/tc/meter.c         |    5 
+ drivers/net/ethernet/mellanox/mlx5/core/en/tc/meter.h         |   13 +
+ drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c    |    1 
+ drivers/net/ethernet/mellanox/mlx5/core/steering/hws/fs_hws.c |  120 +++++++++-
+ drivers/net/ethernet/mellanox/mlx5/core/steering/hws/fs_hws.h |    5 
+ include/linux/mlx5/fs.h                                       |    1 
+ 6 files changed, 135 insertions(+), 10 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/tc/meter.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/tc/meter.c
+@@ -593,3 +593,8 @@ mlx5e_tc_meter_get_stats(struct mlx5e_fl
+ 	*drops = packets2;
+ 	*lastuse = max_t(u64, lastuse1, lastuse2);
+ }
++
++int mlx5e_flow_meter_get_base_id(struct mlx5e_flow_meter_handle *meter)
++{
++	return meter->meters_obj->base_id;
++}
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/tc/meter.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/tc/meter.h
+@@ -72,4 +72,17 @@ void
+ mlx5e_tc_meter_get_stats(struct mlx5e_flow_meter_handle *meter,
+ 			 u64 *bytes, u64 *packets, u64 *drops, u64 *lastuse);
+ 
++#if IS_ENABLED(CONFIG_MLX5_CLS_ACT)
++
++int mlx5e_flow_meter_get_base_id(struct mlx5e_flow_meter_handle *meter);
++
++#else /* CONFIG_MLX5_CLS_ACT */
++
++static inline int
++mlx5e_flow_meter_get_base_id(struct mlx5e_flow_meter_handle *meter)
++{
++	return 0;
++}
++#endif /* CONFIG_MLX5_CLS_ACT */
++
+ #endif /* __MLX5_EN_FLOW_METER_H__ */
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@ -648,6 +648,7 @@ esw_setup_meter(struct mlx5_flow_attr *a
+ 	meter = attr->meter_attr.meter;
+ 	flow_act->exe_aso.type = attr->exe_aso_type;
+ 	flow_act->exe_aso.object_id = meter->obj_id;
++	flow_act->exe_aso.base_id = mlx5e_flow_meter_get_base_id(meter);
+ 	flow_act->exe_aso.flow_meter.meter_idx = meter->idx;
+ 	flow_act->exe_aso.flow_meter.init_color = MLX5_FLOW_METER_COLOR_GREEN;
+ 	/* use metadata reg 5 for packet color */
+--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/fs_hws.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/fs_hws.c
+@@ -66,6 +66,7 @@ static int mlx5_fs_init_hws_actions_pool
+ 	xa_init(&hws_pool->table_dests);
+ 	xa_init(&hws_pool->vport_dests);
+ 	xa_init(&hws_pool->vport_vhca_dests);
++	xa_init(&hws_pool->aso_meters);
+ 	return 0;
+ 
+ cleanup_insert_hdr:
+@@ -88,10 +89,14 @@ destroy_tag:
+ static void mlx5_fs_cleanup_hws_actions_pool(struct mlx5_fs_hws_context *fs_ctx)
+ {
+ 	struct mlx5_fs_hws_actions_pool *hws_pool = &fs_ctx->hws_pool;
++	struct mlx5_fs_hws_data *fs_hws_data;
+ 	struct mlx5hws_action *action;
+ 	struct mlx5_fs_pool *pool;
+ 	unsigned long i;
+ 
++	xa_for_each(&hws_pool->aso_meters, i, fs_hws_data)
++		kfree(fs_hws_data);
++	xa_destroy(&hws_pool->aso_meters);
+ 	xa_for_each(&hws_pool->vport_vhca_dests, i, action)
+ 		mlx5hws_action_destroy(action);
+ 	xa_destroy(&hws_pool->vport_vhca_dests);
+@@ -459,6 +464,70 @@ mlx5_fs_create_dest_action_range(struct
+ 						      flags);
+ }
+ 
++static struct mlx5_fs_hws_data *
++mlx5_fs_get_cached_hws_data(struct xarray *cache_xa, unsigned long index)
++{
++	struct mlx5_fs_hws_data *fs_hws_data;
++	int err;
++
++	xa_lock(cache_xa);
++	fs_hws_data = xa_load(cache_xa, index);
++	if (!fs_hws_data) {
++		fs_hws_data = kzalloc(sizeof(*fs_hws_data), GFP_ATOMIC);
++		if (!fs_hws_data) {
++			xa_unlock(cache_xa);
++			return NULL;
++		}
++		refcount_set(&fs_hws_data->hws_action_refcount, 0);
++		mutex_init(&fs_hws_data->lock);
++		err = __xa_insert(cache_xa, index, fs_hws_data, GFP_ATOMIC);
++		if (err) {
++			kfree(fs_hws_data);
++			xa_unlock(cache_xa);
++			return NULL;
++		}
++	}
++	xa_unlock(cache_xa);
++
++	return fs_hws_data;
++}
++
++static struct mlx5hws_action *
++mlx5_fs_get_action_aso_meter(struct mlx5_fs_hws_context *fs_ctx,
++			     struct mlx5_exe_aso *exe_aso)
++{
++	struct mlx5_fs_hws_create_action_ctx create_ctx;
++	struct mlx5hws_context *ctx = fs_ctx->hws_ctx;
++	struct mlx5_fs_hws_data *meter_hws_data;
++	u32 id = exe_aso->base_id;
++	struct xarray *meters_xa;
++
++	meters_xa = &fs_ctx->hws_pool.aso_meters;
++	meter_hws_data = mlx5_fs_get_cached_hws_data(meters_xa, id);
++	if (!meter_hws_data)
++		return NULL;
++
++	create_ctx.hws_ctx = ctx;
++	create_ctx.actions_type = MLX5HWS_ACTION_TYP_ASO_METER;
++	create_ctx.id = id;
++	create_ctx.return_reg_id = exe_aso->return_reg_id;
++
++	return mlx5_fs_get_hws_action(meter_hws_data, &create_ctx);
++}
++
++static void mlx5_fs_put_action_aso_meter(struct mlx5_fs_hws_context *fs_ctx,
++					 struct mlx5_exe_aso *exe_aso)
++{
++	struct mlx5_fs_hws_data *meter_hws_data;
++	struct xarray *meters_xa;
++
++	meters_xa = &fs_ctx->hws_pool.aso_meters;
++	meter_hws_data = xa_load(meters_xa, exe_aso->base_id);
++	if (!meter_hws_data)
++		return;
++	return mlx5_fs_put_hws_action(meter_hws_data);
++}
++
+ static struct mlx5hws_action *
+ mlx5_fs_create_action_dest_array(struct mlx5hws_context *ctx,
+ 				 struct mlx5hws_action_dest_attr *dests,
+@@ -528,6 +597,11 @@ mlx5_fs_create_hws_action(struct mlx5_fs
+ 	case MLX5HWS_ACTION_TYP_CTR:
+ 		return mlx5hws_action_create_counter(create_ctx->hws_ctx,
+ 						     create_ctx->id, flags);
++	case MLX5HWS_ACTION_TYP_ASO_METER:
++		return mlx5hws_action_create_aso_meter(create_ctx->hws_ctx,
++						       create_ctx->id,
++						       create_ctx->return_reg_id,
++						       flags);
+ 	default:
+ 		return NULL;
+ 	}
+@@ -576,26 +650,33 @@ void mlx5_fs_put_hws_action(struct mlx5_
+ 	mutex_unlock(&fs_hws_data->lock);
+ }
+ 
+-static void mlx5_fs_destroy_fs_action(struct mlx5_fs_hws_rule_action *fs_action)
++static void mlx5_fs_destroy_fs_action(struct mlx5_flow_root_namespace *ns,
++				      struct mlx5_fs_hws_rule_action *fs_action)
+ {
++	struct mlx5_fs_hws_context *fs_ctx = &ns->fs_hws_context;
++
+ 	switch (mlx5hws_action_get_type(fs_action->action)) {
+ 	case MLX5HWS_ACTION_TYP_CTR:
+ 		mlx5_fc_put_hws_action(fs_action->counter);
+ 		break;
++	case MLX5HWS_ACTION_TYP_ASO_METER:
++		mlx5_fs_put_action_aso_meter(fs_ctx, fs_action->exe_aso);
++		break;
+ 	default:
+ 		mlx5hws_action_destroy(fs_action->action);
+ 	}
+ }
+ 
+ static void
+-mlx5_fs_destroy_fs_actions(struct mlx5_fs_hws_rule_action **fs_actions,
++mlx5_fs_destroy_fs_actions(struct mlx5_flow_root_namespace *ns,
++			   struct mlx5_fs_hws_rule_action **fs_actions,
+ 			   int *num_fs_actions)
+ {
+ 	int i;
+ 
+ 	/* Free in reverse order to handle action dependencies */
+ 	for (i = *num_fs_actions - 1; i >= 0; i--)
+-		mlx5_fs_destroy_fs_action(*fs_actions + i);
++		mlx5_fs_destroy_fs_action(ns, *fs_actions + i);
+ 	*num_fs_actions = 0;
+ 	kfree(*fs_actions);
+ 	*fs_actions = NULL;
+@@ -792,8 +873,25 @@ static int mlx5_fs_fte_get_hws_actions(s
+ 	}
+ 
+ 	if (fte_action->action & MLX5_FLOW_CONTEXT_ACTION_EXECUTE_ASO) {
+-		err = -EOPNOTSUPP;
+-		goto free_actions;
++		if (fte_action->exe_aso.type != MLX5_EXE_ASO_FLOW_METER ||
++		    num_actions == MLX5_FLOW_CONTEXT_ACTION_MAX) {
++			err = -EOPNOTSUPP;
++			goto free_actions;
++		}
++
++		tmp_action = mlx5_fs_get_action_aso_meter(fs_ctx,
++							  &fte_action->exe_aso);
++		if (!tmp_action) {
++			err = -ENOMEM;
++			goto free_actions;
++		}
++		(*ractions)[num_actions].aso_meter.offset =
++			fte_action->exe_aso.flow_meter.meter_idx;
++		(*ractions)[num_actions].aso_meter.init_color =
++			fte_action->exe_aso.flow_meter.init_color;
++		(*ractions)[num_actions++].action = tmp_action;
++		fs_actions[num_fs_actions].action = tmp_action;
++		fs_actions[num_fs_actions++].exe_aso = &fte_action->exe_aso;
+ 	}
+ 
+ 	if (fte_action->action & MLX5_FLOW_CONTEXT_ACTION_DROP) {
+@@ -907,7 +1005,7 @@ static int mlx5_fs_fte_get_hws_actions(s
+ 	return 0;
+ 
+ free_actions:
+-	mlx5_fs_destroy_fs_actions(&fs_actions, &num_fs_actions);
++	mlx5_fs_destroy_fs_actions(ns, &fs_actions, &num_fs_actions);
+ free_dest_actions_alloc:
+ 	kfree(dest_actions);
+ free_fs_actions_alloc:
+@@ -957,7 +1055,7 @@ static int mlx5_cmd_hws_create_fte(struc
+ 	return 0;
+ 
+ free_actions:
+-	mlx5_fs_destroy_fs_actions(&fte->fs_hws_rule.hws_fs_actions,
++	mlx5_fs_destroy_fs_actions(ns, &fte->fs_hws_rule.hws_fs_actions,
+ 				   &fte->fs_hws_rule.num_fs_actions);
+ out_err:
+ 	mlx5_core_err(ns->dev, "Failed to create hws rule err(%d)\n", err);
+@@ -977,7 +1075,8 @@ static int mlx5_cmd_hws_delete_fte(struc
+ 	err = mlx5hws_bwc_rule_destroy(rule->bwc_rule);
+ 	rule->bwc_rule = NULL;
+ 
+-	mlx5_fs_destroy_fs_actions(&rule->hws_fs_actions, &rule->num_fs_actions);
++	mlx5_fs_destroy_fs_actions(ns, &rule->hws_fs_actions,
++				   &rule->num_fs_actions);
+ 
+ 	return err;
+ }
+@@ -1015,11 +1114,12 @@ static int mlx5_cmd_hws_update_fte(struc
+ 	if (ret)
+ 		goto restore_actions;
+ 
+-	mlx5_fs_destroy_fs_actions(&saved_hws_fs_actions, &saved_num_fs_actions);
++	mlx5_fs_destroy_fs_actions(ns, &saved_hws_fs_actions,
++				   &saved_num_fs_actions);
+ 	return ret;
+ 
+ restore_actions:
+-	mlx5_fs_destroy_fs_actions(&fte->fs_hws_rule.hws_fs_actions,
++	mlx5_fs_destroy_fs_actions(ns, &fte->fs_hws_rule.hws_fs_actions,
+ 				   &fte->fs_hws_rule.num_fs_actions);
+ 	fte->fs_hws_rule.hws_fs_actions = saved_hws_fs_actions;
+ 	fte->fs_hws_rule.num_fs_actions = saved_num_fs_actions;
+--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/fs_hws.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/fs_hws.h
+@@ -22,6 +22,7 @@ struct mlx5_fs_hws_actions_pool {
+ 	struct xarray table_dests;
+ 	struct xarray vport_vhca_dests;
+ 	struct xarray vport_dests;
++	struct xarray aso_meters;
+ };
+ 
+ struct mlx5_fs_hws_context {
+@@ -49,6 +50,7 @@ struct mlx5_fs_hws_rule_action {
+ 	struct mlx5hws_action *action;
+ 	union {
+ 		struct mlx5_fc *counter;
++		struct mlx5_exe_aso *exe_aso;
+ 	};
+ };
+ 
+@@ -68,6 +70,9 @@ struct mlx5_fs_hws_create_action_ctx {
+ 	enum mlx5hws_action_type actions_type;
+ 	struct mlx5hws_context *hws_ctx;
+ 	u32 id;
++	union {
++		u8 return_reg_id;
++	};
+ };
+ 
+ struct mlx5hws_action *
+--- a/include/linux/mlx5/fs.h
++++ b/include/linux/mlx5/fs.h
+@@ -244,6 +244,7 @@ void mlx5_destroy_flow_group(struct mlx5
+ 
+ struct mlx5_exe_aso {
+ 	u32 object_id;
++	int base_id;
+ 	u8 type;
+ 	u8 return_reg_id;
+ 	union {

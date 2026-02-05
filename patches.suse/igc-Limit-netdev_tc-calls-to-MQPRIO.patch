@@ -1,0 +1,97 @@
+From: Kurt Kanzenbach <kurt@linutronix.de>
+Date: Fri, 21 Mar 2025 14:52:38 +0100
+Subject: igc: Limit netdev_tc calls to MQPRIO
+Patch-mainline: v6.16-rc1
+Git-commit: 68f37f26b0ff28c93d94084178b946136da6d140
+References: jsc#PED-14402
+
+Limit netdev_tc calls to MQPRIO. Currently these calls are made in
+igc_tsn_enable_offload() and igc_tsn_disable_offload() which are used by
+TAPRIO and ETF as well. However, these are only required for MQPRIO.
+
+Signed-off-by: Kurt Kanzenbach <kurt@linutronix.de>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Tested-by: Mor Bar-Gabay <morx.bar.gabay@intel.com>
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/igc/igc_main.c |   18 +++++++++++++++++-
+ drivers/net/ethernet/intel/igc/igc_tsn.c  |   20 --------------------
+ 2 files changed, 17 insertions(+), 21 deletions(-)
+
+--- a/drivers/net/ethernet/intel/igc/igc_main.c
++++ b/drivers/net/ethernet/intel/igc/igc_main.c
+@@ -6681,13 +6681,14 @@ static int igc_tsn_enable_mqprio(struct
+ 				 struct tc_mqprio_qopt_offload *mqprio)
+ {
+ 	struct igc_hw *hw = &adapter->hw;
+-	int i;
++	int err, i;
+ 
+ 	if (hw->mac.type != igc_i225)
+ 		return -EOPNOTSUPP;
+ 
+ 	if (!mqprio->qopt.num_tc) {
+ 		adapter->strict_priority_enable = false;
++		netdev_reset_tc(adapter->netdev);
+ 		goto apply;
+ 	}
+ 
+@@ -6718,6 +6719,21 @@ static int igc_tsn_enable_mqprio(struct
+ 	igc_save_mqprio_params(adapter, mqprio->qopt.num_tc,
+ 			       mqprio->qopt.offset);
+ 
++	err = netdev_set_num_tc(adapter->netdev, adapter->num_tc);
++	if (err)
++		return err;
++
++	for (i = 0; i < adapter->num_tc; i++) {
++		err = netdev_set_tc_queue(adapter->netdev, i, 1,
++					  adapter->queue_per_tc[i]);
++		if (err)
++			return err;
++	}
++
++	/* In case the card is configured with less than four queues. */
++	for (; i < IGC_MAX_TX_QUEUES; i++)
++		adapter->queue_per_tc[i] = i;
++
+ 	mqprio->qopt.hw = TC_MQPRIO_HW_OFFLOAD_TCS;
+ 
+ apply:
+--- a/drivers/net/ethernet/intel/igc/igc_tsn.c
++++ b/drivers/net/ethernet/intel/igc/igc_tsn.c
+@@ -182,9 +182,6 @@ static int igc_tsn_disable_offload(struc
+ 	wr32(IGC_QBVCYCLET_S, 0);
+ 	wr32(IGC_QBVCYCLET, NSEC_PER_SEC);
+ 
+-	/* Reset mqprio TC configuration. */
+-	netdev_reset_tc(adapter->netdev);
+-
+ 	/* Restore the default Tx arbitration: Priority 0 has the highest
+ 	 * priority and is assigned to queue 0 and so on and so forth.
+ 	 */
+@@ -233,23 +230,6 @@ static int igc_tsn_enable_offload(struct
+ 		igc_tsn_set_retx_qbvfullthreshold(adapter);
+ 
+ 	if (adapter->strict_priority_enable) {
+-		int err;
+-
+-		err = netdev_set_num_tc(adapter->netdev, adapter->num_tc);
+-		if (err)
+-			return err;
+-
+-		for (i = 0; i < adapter->num_tc; i++) {
+-			err = netdev_set_tc_queue(adapter->netdev, i, 1,
+-						  adapter->queue_per_tc[i]);
+-			if (err)
+-				return err;
+-		}
+-
+-		/* In case the card is configured with less than four queues. */
+-		for (; i < IGC_MAX_TX_QUEUES; i++)
+-			adapter->queue_per_tc[i] = i;
+-
+ 		/* Configure queue priorities according to the user provided
+ 		 * mapping.
+ 		 */

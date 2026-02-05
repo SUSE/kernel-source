@@ -1,0 +1,195 @@
+From: "Gustavo A. R. Silva" <gustavoars@kernel.org>
+Date: Wed, 26 Feb 2025 13:47:32 +1030
+Subject: net/mlx5e: Avoid a hundred -Wflex-array-member-not-at-end warnings
+Patch-mainline: v6.15-rc1
+Git-commit: bf08fd32cc55961c720f6f48a0fe317f0c710f09
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+-Wflex-array-member-not-at-end was introduced in GCC-14, and we are
+getting ready to enable it, globally.
+
+So, in this particular case, we create a new `struct mlx5e_umr_wqe_hdr`
+to enclose the header part of flexible structure `struct mlx5e_umr_wqe`.
+This is, all the members except the flexible arrays `inline_mtts`,
+`inline_klms` and `inline_ksms` in the anonymous union. We then replace
+the header part with `struct mlx5e_umr_wqe_hdr hdr;` in `struct
+mlx5e_umr_wqe`, and change the type of the object currently causing
+trouble `umr_wqe` from `struct mlx5e_umr_wqe` to `struct
+mlx5e_umr_wqe_hdr` --this last bit gets rid of the flex-array-in-the-middle
+part and avoid the warnings.
+
+Also, no new members should be added to `struct mlx5e_umr_wqe`, instead
+any new members must be included in the header structure `struct
+mlx5e_umr_wqe_hdr`. To enforce this, we use `static_assert()`, ensuring
+that the memory layout of both the flexible structure and the newly
+created header struct remain consistent.
+
+The next step is to refactor the rest of the related code accordingly,
+which means adding a bunch of `hdr.` wherever needed.
+
+Lastly, we use `container_of()` whenever we need to retrieve a pointer
+to the flexible structure `struct mlx5e_umr_wqe`.
+
+So, with these changes, fix 125 of the following warnings:
+
+drivers/net/ethernet/mellanox/mlx5/core/en.h:664:48: warning: structure containing a flexible array member is not at the end of another structure [-Wflex-array-member-not-at-end]
+
+Signed-off-by: Gustavo A. R. Silva <gustavoars@kernel.org>
+Reviewed-by: Saeed Mahameed <saeedm@nvidia.com>
+Link: https://patch.msgid.link/Z76HzPW1dFTLOSSy@kspp
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en.h        |   10 +++++++--
+ drivers/net/ethernet/mellanox/mlx5/core/en/xsk/rx.c |    6 ++---
+ drivers/net/ethernet/mellanox/mlx5/core/en_main.c   |    8 ++++---
+ drivers/net/ethernet/mellanox/mlx5/core/en_rx.c     |   22 ++++++++++----------
+ 4 files changed, 27 insertions(+), 19 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -230,16 +230,22 @@ struct mlx5e_rx_wqe_cyc {
+ 	DECLARE_FLEX_ARRAY(struct mlx5_wqe_data_seg, data);
+ };
+ 
+-struct mlx5e_umr_wqe {
++struct mlx5e_umr_wqe_hdr {
+ 	struct mlx5_wqe_ctrl_seg       ctrl;
+ 	struct mlx5_wqe_umr_ctrl_seg   uctrl;
+ 	struct mlx5_mkey_seg           mkc;
++};
++
++struct mlx5e_umr_wqe {
++	struct mlx5e_umr_wqe_hdr hdr;
+ 	union {
+ 		DECLARE_FLEX_ARRAY(struct mlx5_mtt, inline_mtts);
+ 		DECLARE_FLEX_ARRAY(struct mlx5_klm, inline_klms);
+ 		DECLARE_FLEX_ARRAY(struct mlx5_ksm, inline_ksms);
+ 	};
+ };
++static_assert(offsetof(struct mlx5e_umr_wqe, inline_mtts) == sizeof(struct mlx5e_umr_wqe_hdr),
++	      "struct members should be included in struct mlx5e_umr_wqe_hdr, not in struct mlx5e_umr_wqe");
+ 
+ enum mlx5e_priv_flag {
+ 	MLX5E_PFLAG_RX_CQE_BASED_MODER,
+@@ -657,7 +663,7 @@ struct mlx5e_rq {
+ 		} wqe;
+ 		struct {
+ 			struct mlx5_wq_ll      wq;
+-			struct mlx5e_umr_wqe   umr_wqe;
++			struct mlx5e_umr_wqe_hdr umr_wqe;
+ 			struct mlx5e_mpw_info *info;
+ 			mlx5e_fp_skb_from_cqe_mpwrq skb_from_cqe_mpwrq;
+ 			__be32                 umr_mkey_be;
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/xsk/rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/xsk/rx.c
+@@ -123,7 +123,7 @@ int mlx5e_xsk_alloc_rx_mpwqe(struct mlx5
+ 	bitmap_zero(wi->skip_release_bitmap, rq->mpwqe.pages_per_wqe);
+ 	wi->consumed_strides = 0;
+ 
+-	umr_wqe->ctrl.opmod_idx_opcode =
++	umr_wqe->hdr.ctrl.opmod_idx_opcode =
+ 		cpu_to_be32((icosq->pc << MLX5_WQE_CTRL_WQE_INDEX_SHIFT) | MLX5_OPCODE_UMR);
+ 
+ 	/* Optimized for speed: keep in sync with mlx5e_mpwrq_umr_entry_size. */
+@@ -134,7 +134,7 @@ int mlx5e_xsk_alloc_rx_mpwqe(struct mlx5
+ 		offset = offset * sizeof(struct mlx5_klm) * 2 / MLX5_OCTWORD;
+ 	else if (unlikely(rq->mpwqe.umr_mode == MLX5E_MPWRQ_UMR_MODE_TRIPLE))
+ 		offset = offset * sizeof(struct mlx5_ksm) * 4 / MLX5_OCTWORD;
+-	umr_wqe->uctrl.xlt_offset = cpu_to_be16(offset);
++	umr_wqe->hdr.uctrl.xlt_offset = cpu_to_be16(offset);
+ 
+ 	icosq->db.wqe_info[pi] = (struct mlx5e_icosq_wqe_info) {
+ 		.wqe_type = MLX5E_ICOSQ_WQE_UMR_RX,
+@@ -144,7 +144,7 @@ int mlx5e_xsk_alloc_rx_mpwqe(struct mlx5
+ 
+ 	icosq->pc += rq->mpwqe.umr_wqebbs;
+ 
+-	icosq->doorbell_cseg = &umr_wqe->ctrl;
++	icosq->doorbell_cseg = &umr_wqe->hdr.ctrl;
+ 
+ 	return 0;
+ 
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -311,8 +311,8 @@ static inline void mlx5e_build_umr_wqe(s
+ 				       struct mlx5e_icosq *sq,
+ 				       struct mlx5e_umr_wqe *wqe)
+ {
+-	struct mlx5_wqe_ctrl_seg      *cseg = &wqe->ctrl;
+-	struct mlx5_wqe_umr_ctrl_seg *ucseg = &wqe->uctrl;
++	struct mlx5_wqe_ctrl_seg      *cseg = &wqe->hdr.ctrl;
++	struct mlx5_wqe_umr_ctrl_seg *ucseg = &wqe->hdr.uctrl;
+ 	u16 octowords;
+ 	u8 ds_cnt;
+ 
+@@ -393,7 +393,9 @@ static int mlx5e_rq_alloc_mpwqe_info(str
+ 		bitmap_fill(wi->skip_release_bitmap, rq->mpwqe.pages_per_wqe);
+ 	}
+ 
+-	mlx5e_build_umr_wqe(rq, rq->icosq, &rq->mpwqe.umr_wqe);
++	mlx5e_build_umr_wqe(rq, rq->icosq,
++			    container_of(&rq->mpwqe.umr_wqe,
++					 struct mlx5e_umr_wqe, hdr));
+ 
+ 	return 0;
+ }
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@ -631,16 +631,16 @@ static void build_ksm_umr(struct mlx5e_i
+ 			  __be32 key, u16 offset, u16 ksm_len)
+ {
+ 	memset(umr_wqe, 0, offsetof(struct mlx5e_umr_wqe, inline_ksms));
+-	umr_wqe->ctrl.opmod_idx_opcode =
++	umr_wqe->hdr.ctrl.opmod_idx_opcode =
+ 		cpu_to_be32((sq->pc << MLX5_WQE_CTRL_WQE_INDEX_SHIFT) |
+ 			     MLX5_OPCODE_UMR);
+-	umr_wqe->ctrl.umr_mkey = key;
+-	umr_wqe->ctrl.qpn_ds = cpu_to_be32((sq->sqn << MLX5_WQE_CTRL_QPN_SHIFT)
++	umr_wqe->hdr.ctrl.umr_mkey = key;
++	umr_wqe->hdr.ctrl.qpn_ds = cpu_to_be32((sq->sqn << MLX5_WQE_CTRL_QPN_SHIFT)
+ 					    | MLX5E_KSM_UMR_DS_CNT(ksm_len));
+-	umr_wqe->uctrl.flags = MLX5_UMR_TRANSLATION_OFFSET_EN | MLX5_UMR_INLINE;
+-	umr_wqe->uctrl.xlt_offset = cpu_to_be16(offset);
+-	umr_wqe->uctrl.xlt_octowords = cpu_to_be16(ksm_len);
+-	umr_wqe->uctrl.mkey_mask     = cpu_to_be64(MLX5_MKEY_MASK_FREE);
++	umr_wqe->hdr.uctrl.flags = MLX5_UMR_TRANSLATION_OFFSET_EN | MLX5_UMR_INLINE;
++	umr_wqe->hdr.uctrl.xlt_offset = cpu_to_be16(offset);
++	umr_wqe->hdr.uctrl.xlt_octowords = cpu_to_be16(ksm_len);
++	umr_wqe->hdr.uctrl.mkey_mask     = cpu_to_be64(MLX5_MKEY_MASK_FREE);
+ }
+ 
+ static struct mlx5e_frag_page *mlx5e_shampo_hd_to_frag_page(struct mlx5e_rq *rq, int header_index)
+@@ -704,7 +704,7 @@ static int mlx5e_build_shampo_hd_umr(str
+ 
+ 	shampo->pi = (shampo->pi + ksm_entries) & (shampo->hd_per_wq - 1);
+ 	sq->pc += wqe_bbs;
+-	sq->doorbell_cseg = &umr_wqe->ctrl;
++	sq->doorbell_cseg = &umr_wqe->hdr.ctrl;
+ 
+ 	return 0;
+ 
+@@ -814,12 +814,12 @@ static int mlx5e_alloc_rx_mpwqe(struct m
+ 	bitmap_zero(wi->skip_release_bitmap, rq->mpwqe.pages_per_wqe);
+ 	wi->consumed_strides = 0;
+ 
+-	umr_wqe->ctrl.opmod_idx_opcode =
++	umr_wqe->hdr.ctrl.opmod_idx_opcode =
+ 		cpu_to_be32((sq->pc << MLX5_WQE_CTRL_WQE_INDEX_SHIFT) |
+ 			    MLX5_OPCODE_UMR);
+ 
+ 	offset = (ix * rq->mpwqe.mtts_per_wqe) * sizeof(struct mlx5_mtt) / MLX5_OCTWORD;
+-	umr_wqe->uctrl.xlt_offset = cpu_to_be16(offset);
++	umr_wqe->hdr.uctrl.xlt_offset = cpu_to_be16(offset);
+ 
+ 	sq->db.wqe_info[pi] = (struct mlx5e_icosq_wqe_info) {
+ 		.wqe_type   = MLX5E_ICOSQ_WQE_UMR_RX,
+@@ -829,7 +829,7 @@ static int mlx5e_alloc_rx_mpwqe(struct m
+ 
+ 	sq->pc += rq->mpwqe.umr_wqebbs;
+ 
+-	sq->doorbell_cseg = &umr_wqe->ctrl;
++	sq->doorbell_cseg = &umr_wqe->hdr.ctrl;
+ 
+ 	return 0;
+ 

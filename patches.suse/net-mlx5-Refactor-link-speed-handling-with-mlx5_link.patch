@@ -1,0 +1,359 @@
+From: Shahar Shitrit <shshitrit@nvidia.com>
+Date: Tue, 4 Mar 2025 18:06:16 +0200
+Subject: net/mlx5: Refactor link speed handling with mlx5_link_info struct
+Patch-mainline: v6.15-rc1
+Git-commit: 65a5d3557184974608761b6abae0701f7e63a6de
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+Introduce struct mlx5_link_info with a speed field and change the
+types of mlx5e_link_speed and mlx5e_ext_link_speed from arrays of
+u32 to arrays of struct mlx5_link_info. These arrays are renamed
+to mlx5e_link_info and mlx5e_ext_link_info, respectively.
+
+This change prepares for a future patch that will introduce a lanes
+field in struct mlx5_link_info and add lanes mapping alongside the
+speed for each link mode in the two arrays.
+
+Additionally, rename function mlx5_port_speed2linkmodes() to
+mlx5_port_info2linkmodes() and function mlx5_port_ptys2speed()
+to mlx5_port_ptys2info() and update the speed parameter/return
+type to struct mlx5_link_info, in preparation for the upcoming
+patch where these functions will also utilize the lanes field.
+
+Signed-off-by: Shahar Shitrit <shshitrit@nvidia.com>
+Reviewed-by: Carolina Jubran <cjubran@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://patch.msgid.link/20250304160620.417580-3-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en/port.c    |    9 -
+ drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c |   24 +--
+ drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h  |   14 +
+ drivers/net/ethernet/mellanox/mlx5/core/port.c       |  144 +++++++++----------
+ 4 files changed, 103 insertions(+), 88 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/port.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/port.c
+@@ -80,6 +80,7 @@ int mlx5_port_set_eth_ptys(struct mlx5_c
+ int mlx5e_port_linkspeed(struct mlx5_core_dev *mdev, u32 *speed)
+ {
+ 	struct mlx5_port_eth_proto eproto;
++	const struct mlx5_link_info *info;
+ 	bool force_legacy = false;
+ 	bool ext;
+ 	int err;
+@@ -94,9 +95,13 @@ int mlx5e_port_linkspeed(struct mlx5_cor
+ 		if (err)
+ 			goto out;
+ 	}
+-	*speed = mlx5_port_ptys2speed(mdev, eproto.oper, force_legacy);
+-	if (!(*speed))
++	info = mlx5_port_ptys2info(mdev, eproto.oper, force_legacy);
++	if (!info) {
++		*speed = SPEED_UNKNOWN;
+ 		err = -EINVAL;
++		goto out;
++	}
++	*speed = info->speed;
+ 
+ out:
+ 	return err;
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+@@ -1082,23 +1082,21 @@ static void get_speed_duplex(struct net_
+ 			     struct ethtool_link_ksettings *link_ksettings)
+ {
+ 	struct mlx5e_priv *priv = netdev_priv(netdev);
+-	u32 speed = SPEED_UNKNOWN;
++	const struct mlx5_link_info *info;
+ 	u8 duplex = DUPLEX_UNKNOWN;
++	u32 speed = SPEED_UNKNOWN;
+ 
+ 	if (!netif_carrier_ok(netdev))
+ 		goto out;
+ 
+-	speed = mlx5_port_ptys2speed(priv->mdev, eth_proto_oper, force_legacy);
+-	if (!speed) {
+-		if (data_rate_oper)
+-			speed = 100 * data_rate_oper;
+-		else
+-			speed = SPEED_UNKNOWN;
+-		goto out;
++	info = mlx5_port_ptys2info(priv->mdev, eth_proto_oper, force_legacy);
++	if (info) {
++		speed = info->speed;
++		duplex = DUPLEX_FULL;
++	} else if (data_rate_oper) {
++		speed = 100 * data_rate_oper;
+ 	}
+ 
+-	duplex = DUPLEX_FULL;
+-
+ out:
+ 	link_ksettings->base.speed = speed;
+ 	link_ksettings->base.duplex = duplex;
+@@ -1349,6 +1347,7 @@ static int mlx5e_ethtool_set_link_ksetti
+ {
+ 	struct mlx5_core_dev *mdev = priv->mdev;
+ 	struct mlx5_port_eth_proto eproto;
++	struct mlx5_link_info info = {};
+ 	const unsigned long *adver;
+ 	bool an_changes = false;
+ 	u8 an_disable_admin;
+@@ -1359,7 +1358,6 @@ static int mlx5e_ethtool_set_link_ksetti
+ 	u32 link_modes;
+ 	u8 an_status;
+ 	u8 autoneg;
+-	u32 speed;
+ 	bool ext;
+ 	int err;
+ 
+@@ -1367,7 +1365,7 @@ static int mlx5e_ethtool_set_link_ksetti
+ 
+ 	adver = link_ksettings->link_modes.advertising;
+ 	autoneg = link_ksettings->base.autoneg;
+-	speed = link_ksettings->base.speed;
++	info.speed = link_ksettings->base.speed;
+ 
+ 	ext_supported = mlx5_ptys_ext_supported(mdev);
+ 	ext_requested = ext_link_mode_requested(adver);
+@@ -1384,7 +1382,7 @@ static int mlx5e_ethtool_set_link_ksetti
+ 		goto out;
+ 	}
+ 	link_modes = autoneg == AUTONEG_ENABLE ? ethtool2ptys_adver_func(adver) :
+-		mlx5_port_speed2linkmodes(mdev, speed, !ext);
++		mlx5_port_info2linkmodes(mdev, &info, !ext);
+ 
+ 	err = mlx5e_speed_validate(priv->netdev, ext, link_modes, autoneg);
+ 	if (err)
+--- a/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
+@@ -129,6 +129,10 @@ struct mlx5_module_eeprom_query_params {
+ 	u32 module_number;
+ };
+ 
++struct mlx5_link_info {
++	u32 speed;
++};
++
+ static inline void mlx5_printk(struct mlx5_core_dev *dev, int level, const char *format, ...)
+ {
+ 	struct device *device = dev->device;
+@@ -359,10 +363,12 @@ int mlx5_query_dscp2prio(struct mlx5_cor
+ int mlx5_port_query_eth_proto(struct mlx5_core_dev *dev, u8 port, bool ext,
+ 			      struct mlx5_port_eth_proto *eproto);
+ bool mlx5_ptys_ext_supported(struct mlx5_core_dev *mdev);
+-u32 mlx5_port_ptys2speed(struct mlx5_core_dev *mdev, u32 eth_proto_oper,
+-			 bool force_legacy);
+-u32 mlx5_port_speed2linkmodes(struct mlx5_core_dev *mdev, u32 speed,
+-			      bool force_legacy);
++const struct mlx5_link_info *mlx5_port_ptys2info(struct mlx5_core_dev *mdev,
++						 u32 eth_proto_oper,
++						 bool force_legacy);
++u32 mlx5_port_info2linkmodes(struct mlx5_core_dev *mdev,
++			     struct mlx5_link_info *info,
++			     bool force_legacy);
+ int mlx5_port_max_linkspeed(struct mlx5_core_dev *mdev, u32 *speed);
+ 
+ #define MLX5_PPS_CAP(mdev) (MLX5_CAP_GEN((mdev), pps) &&		\
+--- a/drivers/net/ethernet/mellanox/mlx5/core/port.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/port.c
+@@ -1038,56 +1038,57 @@ out:
+ }
+ 
+ /* speed in units of 1Mb */
+-static const u32 mlx5e_link_speed[MLX5E_LINK_MODES_NUMBER] = {
+-	[MLX5E_1000BASE_CX_SGMII] = 1000,
+-	[MLX5E_1000BASE_KX]       = 1000,
+-	[MLX5E_10GBASE_CX4]       = 10000,
+-	[MLX5E_10GBASE_KX4]       = 10000,
+-	[MLX5E_10GBASE_KR]        = 10000,
+-	[MLX5E_20GBASE_KR2]       = 20000,
+-	[MLX5E_40GBASE_CR4]       = 40000,
+-	[MLX5E_40GBASE_KR4]       = 40000,
+-	[MLX5E_56GBASE_R4]        = 56000,
+-	[MLX5E_10GBASE_CR]        = 10000,
+-	[MLX5E_10GBASE_SR]        = 10000,
+-	[MLX5E_10GBASE_ER]        = 10000,
+-	[MLX5E_40GBASE_SR4]       = 40000,
+-	[MLX5E_40GBASE_LR4]       = 40000,
+-	[MLX5E_50GBASE_SR2]       = 50000,
+-	[MLX5E_100GBASE_CR4]      = 100000,
+-	[MLX5E_100GBASE_SR4]      = 100000,
+-	[MLX5E_100GBASE_KR4]      = 100000,
+-	[MLX5E_100GBASE_LR4]      = 100000,
+-	[MLX5E_100BASE_TX]        = 100,
+-	[MLX5E_1000BASE_T]        = 1000,
+-	[MLX5E_10GBASE_T]         = 10000,
+-	[MLX5E_25GBASE_CR]        = 25000,
+-	[MLX5E_25GBASE_KR]        = 25000,
+-	[MLX5E_25GBASE_SR]        = 25000,
+-	[MLX5E_50GBASE_CR2]       = 50000,
+-	[MLX5E_50GBASE_KR2]       = 50000,
++static const struct mlx5_link_info mlx5e_link_info[MLX5E_LINK_MODES_NUMBER] = {
++	[MLX5E_1000BASE_CX_SGMII] = {.speed = 1000},
++	[MLX5E_1000BASE_KX]       = {.speed = 1000},
++	[MLX5E_10GBASE_CX4]       = {.speed = 10000},
++	[MLX5E_10GBASE_KX4]       = {.speed = 10000},
++	[MLX5E_10GBASE_KR]        = {.speed = 10000},
++	[MLX5E_20GBASE_KR2]       = {.speed = 20000},
++	[MLX5E_40GBASE_CR4]       = {.speed = 40000},
++	[MLX5E_40GBASE_KR4]       = {.speed = 40000},
++	[MLX5E_56GBASE_R4]        = {.speed = 56000},
++	[MLX5E_10GBASE_CR]        = {.speed = 10000},
++	[MLX5E_10GBASE_SR]        = {.speed = 10000},
++	[MLX5E_10GBASE_ER]        = {.speed = 10000},
++	[MLX5E_40GBASE_SR4]       = {.speed = 40000},
++	[MLX5E_40GBASE_LR4]       = {.speed = 40000},
++	[MLX5E_50GBASE_SR2]       = {.speed = 50000},
++	[MLX5E_100GBASE_CR4]      = {.speed = 100000},
++	[MLX5E_100GBASE_SR4]      = {.speed = 100000},
++	[MLX5E_100GBASE_KR4]      = {.speed = 100000},
++	[MLX5E_100GBASE_LR4]      = {.speed = 100000},
++	[MLX5E_100BASE_TX]        = {.speed = 100},
++	[MLX5E_1000BASE_T]        = {.speed = 1000},
++	[MLX5E_10GBASE_T]         = {.speed = 10000},
++	[MLX5E_25GBASE_CR]        = {.speed = 25000},
++	[MLX5E_25GBASE_KR]        = {.speed = 25000},
++	[MLX5E_25GBASE_SR]        = {.speed = 25000},
++	[MLX5E_50GBASE_CR2]       = {.speed = 50000},
++	[MLX5E_50GBASE_KR2]       = {.speed = 50000},
+ };
+ 
+-static const u32 mlx5e_ext_link_speed[MLX5E_EXT_LINK_MODES_NUMBER] = {
+-	[MLX5E_SGMII_100M] = 100,
+-	[MLX5E_1000BASE_X_SGMII] = 1000,
+-	[MLX5E_5GBASE_R] = 5000,
+-	[MLX5E_10GBASE_XFI_XAUI_1] = 10000,
+-	[MLX5E_40GBASE_XLAUI_4_XLPPI_4] = 40000,
+-	[MLX5E_25GAUI_1_25GBASE_CR_KR] = 25000,
+-	[MLX5E_50GAUI_2_LAUI_2_50GBASE_CR2_KR2] = 50000,
+-	[MLX5E_50GAUI_1_LAUI_1_50GBASE_CR_KR] = 50000,
+-	[MLX5E_CAUI_4_100GBASE_CR4_KR4] = 100000,
+-	[MLX5E_100GAUI_2_100GBASE_CR2_KR2] = 100000,
+-	[MLX5E_200GAUI_4_200GBASE_CR4_KR4] = 200000,
+-	[MLX5E_400GAUI_8_400GBASE_CR8] = 400000,
+-	[MLX5E_100GAUI_1_100GBASE_CR_KR] = 100000,
+-	[MLX5E_200GAUI_2_200GBASE_CR2_KR2] = 200000,
+-	[MLX5E_400GAUI_4_400GBASE_CR4_KR4] = 400000,
+-	[MLX5E_800GAUI_8_800GBASE_CR8_KR8] = 800000,
+-	[MLX5E_200GAUI_1_200GBASE_CR1_KR1] = 200000,
+-	[MLX5E_400GAUI_2_400GBASE_CR2_KR2] = 400000,
+-	[MLX5E_800GAUI_4_800GBASE_CR4_KR4] = 800000,
++static const struct mlx5_link_info
++mlx5e_ext_link_info[MLX5E_EXT_LINK_MODES_NUMBER] = {
++	[MLX5E_SGMII_100M]			= {.speed = 100},
++	[MLX5E_1000BASE_X_SGMII]		= {.speed = 1000},
++	[MLX5E_5GBASE_R]			= {.speed = 5000},
++	[MLX5E_10GBASE_XFI_XAUI_1]		= {.speed = 10000},
++	[MLX5E_40GBASE_XLAUI_4_XLPPI_4]		= {.speed = 40000},
++	[MLX5E_25GAUI_1_25GBASE_CR_KR]		= {.speed = 25000},
++	[MLX5E_50GAUI_2_LAUI_2_50GBASE_CR2_KR2] = {.speed = 50000},
++	[MLX5E_50GAUI_1_LAUI_1_50GBASE_CR_KR]	= {.speed = 50000},
++	[MLX5E_CAUI_4_100GBASE_CR4_KR4]		= {.speed = 100000},
++	[MLX5E_100GAUI_2_100GBASE_CR2_KR2]	= {.speed = 100000},
++	[MLX5E_200GAUI_4_200GBASE_CR4_KR4]	= {.speed = 200000},
++	[MLX5E_400GAUI_8_400GBASE_CR8]		= {.speed = 400000},
++	[MLX5E_100GAUI_1_100GBASE_CR_KR]	= {.speed = 100000},
++	[MLX5E_200GAUI_2_200GBASE_CR2_KR2]	= {.speed = 200000},
++	[MLX5E_400GAUI_4_400GBASE_CR4_KR4]	= {.speed = 400000},
++	[MLX5E_800GAUI_8_800GBASE_CR8_KR8]	= {.speed = 800000},
++	[MLX5E_200GAUI_1_200GBASE_CR1_KR1]	= {.speed = 200000},
++	[MLX5E_400GAUI_2_400GBASE_CR2_KR2]	= {.speed = 400000},
++	[MLX5E_800GAUI_4_800GBASE_CR4_KR4]	= {.speed = 800000},
+ };
+ 
+ int mlx5_port_query_eth_proto(struct mlx5_core_dev *dev, u8 port, bool ext,
+@@ -1125,44 +1126,49 @@ bool mlx5_ptys_ext_supported(struct mlx5
+ 	return !!eproto.cap;
+ }
+ 
+-static void mlx5e_port_get_speed_arr(struct mlx5_core_dev *mdev,
+-				     const u32 **arr, u32 *size,
+-				     bool force_legacy)
++static void mlx5e_port_get_link_mode_info_arr(struct mlx5_core_dev *mdev,
++					      const struct mlx5_link_info **arr,
++					      u32 *size,
++					      bool force_legacy)
+ {
+ 	bool ext = force_legacy ? false : mlx5_ptys_ext_supported(mdev);
+ 
+-	*size = ext ? ARRAY_SIZE(mlx5e_ext_link_speed) :
+-		      ARRAY_SIZE(mlx5e_link_speed);
+-	*arr  = ext ? mlx5e_ext_link_speed : mlx5e_link_speed;
++	*size = ext ? ARRAY_SIZE(mlx5e_ext_link_info) :
++		      ARRAY_SIZE(mlx5e_link_info);
++	*arr  = ext ? mlx5e_ext_link_info : mlx5e_link_info;
+ }
+ 
+-u32 mlx5_port_ptys2speed(struct mlx5_core_dev *mdev, u32 eth_proto_oper,
+-			 bool force_legacy)
++const struct mlx5_link_info *mlx5_port_ptys2info(struct mlx5_core_dev *mdev,
++						 u32 eth_proto_oper,
++						 bool force_legacy)
+ {
+ 	unsigned long temp = eth_proto_oper;
+-	const u32 *table;
+-	u32 speed = 0;
++	const struct mlx5_link_info *table;
+ 	u32 max_size;
+ 	int i;
+ 
+-	mlx5e_port_get_speed_arr(mdev, &table, &max_size, force_legacy);
++	mlx5e_port_get_link_mode_info_arr(mdev, &table, &max_size,
++					  force_legacy);
+ 	i = find_first_bit(&temp, max_size);
+ 	if (i < max_size)
+-		speed = table[i];
+-	return speed;
++		return &table[i];
++
++	return NULL;
+ }
+ 
+-u32 mlx5_port_speed2linkmodes(struct mlx5_core_dev *mdev, u32 speed,
+-			      bool force_legacy)
++u32 mlx5_port_info2linkmodes(struct mlx5_core_dev *mdev,
++			     struct mlx5_link_info *info,
++			     bool force_legacy)
+ {
++	const struct mlx5_link_info *table;
+ 	u32 link_modes = 0;
+-	const u32 *table;
+ 	u32 max_size;
+ 	int i;
+ 
+-	mlx5e_port_get_speed_arr(mdev, &table, &max_size, force_legacy);
++	mlx5e_port_get_link_mode_info_arr(mdev, &table, &max_size,
++					  force_legacy);
+ 	for (i = 0; i < max_size; ++i) {
+-		if (table[i] == speed)
++		if (table[i].speed == info->speed)
+ 			link_modes |= MLX5E_PROT_MASK(i);
+ 	}
+ 	return link_modes;
+@@ -1170,9 +1176,9 @@ u32 mlx5_port_speed2linkmodes(struct mlx
+ 
+ int mlx5_port_max_linkspeed(struct mlx5_core_dev *mdev, u32 *speed)
+ {
++	const struct mlx5_link_info *table;
+ 	struct mlx5_port_eth_proto eproto;
+ 	u32 max_speed = 0;
+-	const u32 *table;
+ 	u32 max_size;
+ 	bool ext;
+ 	int err;
+@@ -1183,10 +1189,10 @@ int mlx5_port_max_linkspeed(struct mlx5_
+ 	if (err)
+ 		return err;
+ 
+-	mlx5e_port_get_speed_arr(mdev, &table, &max_size, false);
++	mlx5e_port_get_link_mode_info_arr(mdev, &table, &max_size, false);
+ 	for (i = 0; i < max_size; ++i)
+ 		if (eproto.cap & MLX5E_PROT_MASK(i))
+-			max_speed = max(max_speed, table[i]);
++			max_speed = max(max_speed, table[i].speed);
+ 
+ 	*speed = max_speed;
+ 	return 0;

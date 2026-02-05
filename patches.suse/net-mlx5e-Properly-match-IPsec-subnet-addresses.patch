@@ -1,0 +1,199 @@
+From: Leon Romanovsky <leonro@nvidia.com>
+Date: Tue, 4 Mar 2025 18:06:20 +0200
+Subject: net/mlx5e: Properly match IPsec subnet addresses
+Patch-mainline: v6.15-rc1
+Git-commit: ca7992f52c2cb5ef61fbfa590a2d7c926f290237
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+Existing match criteria didn't allow to match whole subnet and
+only by specific addresses only. This caused to tunnel mode do not
+forward such traffic through relevant SA.
+
+In tunnel mode, policies look like this:
+src 192.169.0.0/16 dst 192.169.0.0/16
+        dir out priority 383615 ptype main
+        tmpl src 192.169.101.2 dst 192.169.101.1
+                proto esp spi 0xc5141c18 reqid 1 mode tunnel
+        crypto offload parameters: dev eth2 mode packet
+
+In this case, the XFRM core code handled all subnet calculations and
+forwarded network address to the drivers e.g. 192.169.0.0.
+
+For mlx5 devices, there is a need to set relevant prefix e.g. 0xFFFF00
+to perform flow steering match operation.
+
+Signed-off-by: Leon Romanovsky <leonro@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Reviewed-by: Michal Swiatkowski <michal.swiatkowski@linux.intel.com>
+Link: https://patch.msgid.link/20250304160620.417580-7-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.c    |   49 ++++++++++++
+ drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.h    |    9 +-
+ drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec_fs.c |   20 ++--
+ 3 files changed, 69 insertions(+), 9 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.c
+@@ -303,6 +303,16 @@ static void mlx5e_ipsec_init_macs(struct
+ 	neigh_release(n);
+ }
+ 
++static void mlx5e_ipsec_state_mask(struct mlx5e_ipsec_addr *addrs)
++{
++	/*
++	 * State doesn't have subnet prefixes in outer headers.
++	 * The match is performed for exaxt source/destination addresses.
++	 */
++	memset(addrs->smask.m6, 0xFF, sizeof(__be32) * 4);
++	memset(addrs->dmask.m6, 0xFF, sizeof(__be32) * 4);
++}
++
+ void mlx5e_ipsec_build_accel_xfrm_attrs(struct mlx5e_ipsec_sa_entry *sa_entry,
+ 					struct mlx5_accel_esp_xfrm_attrs *attrs)
+ {
+@@ -378,6 +388,7 @@ skip_replay_window:
+ 	       sizeof(attrs->addrs.saddr));
+ 	memcpy(&attrs->addrs.daddr, x->id.daddr.a6, sizeof(attrs->addrs.daddr));
+ 	attrs->addrs.family = x->props.family;
++	mlx5e_ipsec_state_mask(&attrs->addrs);
+ 	attrs->type = x->xso.type;
+ 	attrs->reqid = x->props.reqid;
+ 	attrs->upspec.dport = ntohs(x->sel.dport);
+@@ -1046,6 +1057,43 @@ static void mlx5e_xfrm_update_stats(stru
+ 	x->curlft.bytes += success_bytes - headers * success_packets;
+ }
+ 
++static __be32 word_to_mask(int prefix)
++{
++	if (prefix < 0)
++		return 0;
++
++	if (!prefix || prefix > 31)
++		return cpu_to_be32(0xFFFFFFFF);
++
++	return cpu_to_be32(((1U << prefix) - 1) << (32 - prefix));
++}
++
++static void mlx5e_ipsec_policy_mask(struct mlx5e_ipsec_addr *addrs,
++				    struct xfrm_selector *sel)
++{
++	int i;
++
++	if (addrs->family == AF_INET) {
++		addrs->smask.m4 = word_to_mask(sel->prefixlen_s);
++		addrs->saddr.a4 &= addrs->smask.m4;
++		addrs->dmask.m4 = word_to_mask(sel->prefixlen_d);
++		addrs->daddr.a4 &= addrs->dmask.m4;
++		return;
++	}
++
++	for (i = 0; i < 4; i++) {
++		if (sel->prefixlen_s != 32 * i)
++			addrs->smask.m6[i] =
++				word_to_mask(sel->prefixlen_s - 32 * i);
++		addrs->saddr.a6[i] &= addrs->smask.m6[i];
++
++		if (sel->prefixlen_d != 32 * i)
++			addrs->dmask.m6[i] =
++				word_to_mask(sel->prefixlen_d - 32 * i);
++		addrs->daddr.a6[i] &= addrs->dmask.m6[i];
++	}
++}
++
+ static int mlx5e_xfrm_validate_policy(struct mlx5_core_dev *mdev,
+ 				      struct xfrm_policy *x,
+ 				      struct netlink_ext_ack *extack)
+@@ -1121,6 +1169,7 @@ mlx5e_ipsec_build_accel_pol_attrs(struct
+ 	memcpy(&attrs->addrs.saddr, sel->saddr.a6, sizeof(attrs->addrs.saddr));
+ 	memcpy(&attrs->addrs.daddr, sel->daddr.a6, sizeof(attrs->addrs.daddr));
+ 	attrs->addrs.family = sel->family;
++	mlx5e_ipsec_policy_mask(&attrs->addrs, sel);
+ 	attrs->dir = x->xdo.dir;
+ 	attrs->action = x->action;
+ 	attrs->type = XFRM_DEV_OFFLOAD_PACKET;
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.h
+@@ -81,11 +81,18 @@ struct mlx5e_ipsec_addr {
+ 		__be32 a4;
+ 		__be32 a6[4];
+ 	} saddr;
+-
++	union {
++		__be32 m4;
++		__be32 m6[4];
++	} smask;
+ 	union {
+ 		__be32 a4;
+ 		__be32 a6[4];
+ 	} daddr;
++	union {
++		__be32 m4;
++		__be32 m6[4];
++	} dmask;
+ 	u8 family;
+ };
+ 
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec_fs.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec_fs.c
+@@ -1488,7 +1488,9 @@ static void setup_fte_addr4(struct mlx5_
+ 			    struct mlx5e_ipsec_addr *addrs)
+ {
+ 	__be32 *saddr = &addrs->saddr.a4;
++	__be32 *smask = &addrs->smask.m4;
+ 	__be32 *daddr = &addrs->daddr.a4;
++	__be32 *dmask = &addrs->dmask.m4;
+ 
+ 	if (!*saddr && !*daddr)
+ 		return;
+@@ -1501,15 +1503,15 @@ static void setup_fte_addr4(struct mlx5_
+ 	if (*saddr) {
+ 		memcpy(MLX5_ADDR_OF(fte_match_param, spec->match_value,
+ 				    outer_headers.src_ipv4_src_ipv6.ipv4_layout.ipv4), saddr, 4);
+-		MLX5_SET_TO_ONES(fte_match_param, spec->match_criteria,
+-				 outer_headers.src_ipv4_src_ipv6.ipv4_layout.ipv4);
++		memcpy(MLX5_ADDR_OF(fte_match_param, spec->match_criteria,
++				    outer_headers.src_ipv4_src_ipv6.ipv4_layout.ipv4), smask, 4);
+ 	}
+ 
+ 	if (*daddr) {
+ 		memcpy(MLX5_ADDR_OF(fte_match_param, spec->match_value,
+ 				    outer_headers.dst_ipv4_dst_ipv6.ipv4_layout.ipv4), daddr, 4);
+-		MLX5_SET_TO_ONES(fte_match_param, spec->match_criteria,
+-				 outer_headers.dst_ipv4_dst_ipv6.ipv4_layout.ipv4);
++		memcpy(MLX5_ADDR_OF(fte_match_param, spec->match_criteria,
++				    outer_headers.dst_ipv4_dst_ipv6.ipv4_layout.ipv4), dmask, 4);
+ 	}
+ }
+ 
+@@ -1517,7 +1519,9 @@ static void setup_fte_addr6(struct mlx5_
+ 			    struct mlx5e_ipsec_addr *addrs)
+ {
+ 	__be32 *saddr = addrs->saddr.a6;
++	__be32 *smask = addrs->smask.m6;
+ 	__be32 *daddr = addrs->daddr.a6;
++	__be32 *dmask = addrs->dmask.m6;
+ 
+ 	if (addr6_all_zero(saddr) && addr6_all_zero(daddr))
+ 		return;
+@@ -1530,15 +1534,15 @@ static void setup_fte_addr6(struct mlx5_
+ 	if (!addr6_all_zero(saddr)) {
+ 		memcpy(MLX5_ADDR_OF(fte_match_param, spec->match_value,
+ 				    outer_headers.src_ipv4_src_ipv6.ipv6_layout.ipv6), saddr, 16);
+-		memset(MLX5_ADDR_OF(fte_match_param, spec->match_criteria,
+-				    outer_headers.src_ipv4_src_ipv6.ipv6_layout.ipv6), 0xff, 16);
++		memcpy(MLX5_ADDR_OF(fte_match_param, spec->match_criteria,
++				    outer_headers.src_ipv4_src_ipv6.ipv6_layout.ipv6), dmask, 16);
+ 	}
+ 
+ 	if (!addr6_all_zero(daddr)) {
+ 		memcpy(MLX5_ADDR_OF(fte_match_param, spec->match_value,
+ 				    outer_headers.dst_ipv4_dst_ipv6.ipv6_layout.ipv6), daddr, 16);
+-		memset(MLX5_ADDR_OF(fte_match_param, spec->match_criteria,
+-				    outer_headers.dst_ipv4_dst_ipv6.ipv6_layout.ipv6), 0xff, 16);
++		memcpy(MLX5_ADDR_OF(fte_match_param, spec->match_criteria,
++				    outer_headers.dst_ipv4_dst_ipv6.ipv6_layout.ipv6), smask, 16);
+ 	}
+ }
+ 

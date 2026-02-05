@@ -1,0 +1,131 @@
+From: Karol Kolacinski <karol.kolacinski@intel.com>
+Date: Mon, 30 Sep 2024 14:12:41 +0200
+Subject: ice: Process TSYN IRQ in a separate function
+Patch-mainline: v6.15-rc1
+Git-commit: f9472aaabd1f38954938838a1146db4855ad88e8
+References: jsc#PED-14404 jsc#PED-15079
+
+Simplify TSYN IRQ processing by moving it to a separate function and
+having appropriate behavior per PHY model, instead of multiple
+conditions not related to HW, but to specific timestamping modes.
+
+When PTP is not enabled in the kernel, don't process timestamps and
+return IRQ_HANDLED.
+
+Reviewed-by: Przemek Kitszel <przemyslaw.kitszel@intel.com>
+Signed-off-by: Karol Kolacinski <karol.kolacinski@intel.com>
+Tested-by: Pucha Himasekhar Reddy <himasekharx.reddy.pucha@intel.com> (A Contingent worker at Intel)
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/ice/ice_main.c |   16 ---------
+ drivers/net/ethernet/intel/ice/ice_ptp.c  |   49 ++++++++++++++++++++++++++++++
+ drivers/net/ethernet/intel/ice/ice_ptp.h  |    6 +++
+ 3 files changed, 56 insertions(+), 15 deletions(-)
+
+--- a/drivers/net/ethernet/intel/ice/ice_main.c
++++ b/drivers/net/ethernet/intel/ice/ice_main.c
+@@ -3304,22 +3304,8 @@ static irqreturn_t ice_misc_intr(int __a
+ 
+ 	if (oicr & PFINT_OICR_TSYN_TX_M) {
+ 		ena_mask &= ~PFINT_OICR_TSYN_TX_M;
+-		if (ice_pf_state_is_nominal(pf) &&
+-		    pf->hw.dev_caps.ts_dev_info.ts_ll_int_read) {
+-			struct ice_ptp_tx *tx = &pf->ptp.port.tx;
+-			unsigned long flags;
+-			u8 idx;
+ 
+-			spin_lock_irqsave(&tx->lock, flags);
+-			idx = find_next_bit_wrap(tx->in_use, tx->len,
+-						 tx->last_ll_ts_idx_read + 1);
+-			if (idx != tx->len)
+-				ice_ptp_req_tx_single_tstamp(tx, idx);
+-			spin_unlock_irqrestore(&tx->lock, flags);
+-		} else if (ice_ptp_pf_handles_tx_interrupt(pf)) {
+-			set_bit(ICE_MISC_THREAD_TX_TSTAMP, pf->misc_thread);
+-			ret = IRQ_WAKE_THREAD;
+-		}
++		ret = ice_ptp_ts_irq(pf);
+ 	}
+ 
+ 	if (oicr & PFINT_OICR_TSYN_EVNT_M) {
+--- a/drivers/net/ethernet/intel/ice/ice_ptp.c
++++ b/drivers/net/ethernet/intel/ice/ice_ptp.c
+@@ -2764,6 +2764,55 @@ enum ice_tx_tstamp_work ice_ptp_process_
+ }
+ 
+ /**
++ * ice_ptp_ts_irq - Process the PTP Tx timestamps in IRQ context
++ * @pf: Board private structure
++ *
++ * Return: IRQ_WAKE_THREAD if Tx timestamp read has to be handled in the bottom
++ *         half of the interrupt and IRQ_HANDLED otherwise.
++ */
++irqreturn_t ice_ptp_ts_irq(struct ice_pf *pf)
++{
++	struct ice_hw *hw = &pf->hw;
++
++	switch (hw->mac_type) {
++	case ICE_MAC_E810:
++		/* E810 capable of low latency timestamping with interrupt can
++		 * request a single timestamp in the top half and wait for
++		 * a second LL TS interrupt from the FW when it's ready.
++		 */
++		if (hw->dev_caps.ts_dev_info.ts_ll_int_read) {
++			struct ice_ptp_tx *tx = &pf->ptp.port.tx;
++			u8 idx;
++
++			if (!ice_pf_state_is_nominal(pf))
++				return IRQ_HANDLED;
++
++			spin_lock(&tx->lock);
++			idx = find_next_bit_wrap(tx->in_use, tx->len,
++						 tx->last_ll_ts_idx_read + 1);
++			if (idx != tx->len)
++				ice_ptp_req_tx_single_tstamp(tx, idx);
++			spin_unlock(&tx->lock);
++
++			return IRQ_HANDLED;
++		}
++		fallthrough; /* non-LL_TS E810 */
++	case ICE_MAC_GENERIC:
++	case ICE_MAC_GENERIC_3K_E825:
++		/* All other devices process timestamps in the bottom half due
++		 * to sleeping or polling.
++		 */
++		if (!ice_ptp_pf_handles_tx_interrupt(pf))
++			return IRQ_HANDLED;
++
++		set_bit(ICE_MISC_THREAD_TX_TSTAMP, pf->misc_thread);
++		return IRQ_WAKE_THREAD;
++	default:
++		return IRQ_HANDLED;
++	}
++}
++
++/**
+  * ice_ptp_maybe_trigger_tx_interrupt - Trigger Tx timstamp interrupt
+  * @pf: Board private structure
+  *
+--- a/drivers/net/ethernet/intel/ice/ice_ptp.h
++++ b/drivers/net/ethernet/intel/ice/ice_ptp.h
+@@ -304,6 +304,7 @@ s8 ice_ptp_request_ts(struct ice_ptp_tx
+ void ice_ptp_req_tx_single_tstamp(struct ice_ptp_tx *tx, u8 idx);
+ void ice_ptp_complete_tx_single_tstamp(struct ice_ptp_tx *tx);
+ enum ice_tx_tstamp_work ice_ptp_process_ts(struct ice_pf *pf);
++irqreturn_t ice_ptp_ts_irq(struct ice_pf *pf);
+ 
+ u64 ice_ptp_get_rx_hwts(const union ice_32b_rx_flex_desc *rx_desc,
+ 			const struct ice_pkt_ctx *pkt_ctx);
+@@ -342,6 +343,11 @@ static inline bool ice_ptp_process_ts(st
+ 	return true;
+ }
+ 
++static inline irqreturn_t ice_ptp_ts_irq(struct ice_pf *pf)
++{
++	return IRQ_HANDLED;
++}
++
+ static inline u64
+ ice_ptp_get_rx_hwts(const union ice_32b_rx_flex_desc *rx_desc,
+ 		    const struct ice_pkt_ctx *pkt_ctx)

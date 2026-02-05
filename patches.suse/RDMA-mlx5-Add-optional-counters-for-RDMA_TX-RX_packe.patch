@@ -1,0 +1,328 @@
+From: Patrisious Haddad <phaddad@nvidia.com>
+Date: Thu, 13 Mar 2025 16:18:41 +0200
+Subject: RDMA/mlx5: Add optional counters for RDMA_TX/RX_packets/bytes
+Patch-mainline: v6.15-rc1
+Git-commit: d375db42a8effdfeb7973d4f1b0b5985e066fd28
+References: jsc#PED-15334
+
+Add the following optional counters:
+rdma_tx_packets,rdma_rx_bytes,rdma_rx_packets,rdma_tx_bytes.
+
+Which counts all RDMA packets/bytes sent and received per link.
+
+Note that since each direction packet and byte counter are shared,
+the counter is only reset when both counters of that direction
+are removed. But from user-perspective each can be enabled/disabled separately.
+
+The counters can be enabled using:
+sudo rdma stat set link rocep8s0f0/1 optional-counters rdma_tx_packets
+And can be seen using:
+rdma stat -j show link rocep8s0f0/1
+
+Signed-off-by: Patrisious Haddad <phaddad@nvidia.com>
+Reviewed-by: Mark Bloch <mbloch@nvidia.com>
+Link: https://patch.msgid.link/9f2753ad636f21704416df64b47395c8991d1123.1741875070.git.leon@kernel.org
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/hw/mlx5/counters.c |   86 ++++++++++++++++++++++++++++++++--
+ drivers/infiniband/hw/mlx5/fs.c       |   46 +++++++++++++++++-
+ drivers/infiniband/hw/mlx5/mlx5_ib.h  |    4 +
+ include/linux/mlx5/device.h           |    4 -
+ 4 files changed, 133 insertions(+), 7 deletions(-)
+
+--- a/drivers/infiniband/hw/mlx5/counters.c
++++ b/drivers/infiniband/hw/mlx5/counters.c
+@@ -140,6 +140,13 @@ static const struct mlx5_ib_counter rdma
+ 	INIT_OP_COUNTER(cc_tx_cnp_pkts, CC_TX_CNP_PKTS),
+ };
+ 
++static const struct mlx5_ib_counter packets_op_cnts[] = {
++	INIT_OP_COUNTER(rdma_tx_packets, RDMA_TX_PACKETS),
++	INIT_OP_COUNTER(rdma_tx_bytes, RDMA_TX_BYTES),
++	INIT_OP_COUNTER(rdma_rx_packets, RDMA_RX_PACKETS),
++	INIT_OP_COUNTER(rdma_rx_bytes, RDMA_RX_BYTES),
++};
++
+ static int mlx5_ib_read_counters(struct ib_counters *counters,
+ 				 struct ib_counters_read_attr *read_attr,
+ 				 struct uverbs_attr_bundle *attrs)
+@@ -427,6 +434,15 @@ done:
+ 	return num_counters;
+ }
+ 
++static bool is_rdma_bytes_counter(u32 type)
++{
++	if (type == MLX5_IB_OPCOUNTER_RDMA_TX_BYTES ||
++	    type == MLX5_IB_OPCOUNTER_RDMA_RX_BYTES)
++		return true;
++
++	return false;
++}
++
+ static int do_get_op_stat(struct ib_device *ibdev,
+ 			  struct rdma_hw_stats *stats,
+ 			  u32 port_num, int index)
+@@ -434,7 +450,7 @@ static int do_get_op_stat(struct ib_devi
+ 	struct mlx5_ib_dev *dev = to_mdev(ibdev);
+ 	const struct mlx5_ib_counters *cnts;
+ 	const struct mlx5_ib_op_fc *opfcs;
+-	u64 packets = 0, bytes;
++	u64 packets, bytes;
+ 	u32 type;
+ 	int ret;
+ 
+@@ -453,8 +469,11 @@ static int do_get_op_stat(struct ib_devi
+ 	if (ret)
+ 		return ret;
+ 
++	if (is_rdma_bytes_counter(type))
++		stats->value[index] = bytes;
++	else
++		stats->value[index] = packets;
+ out:
+-	stats->value[index] = packets;
+ 	return index;
+ }
+ 
+@@ -681,6 +700,12 @@ static void mlx5_ib_fill_counters(struct
+ 			descs[j].priv = &rdmatx_cnp_op_cnts[i].type;
+ 		}
+ 	}
++
++	for (i = 0; i < ARRAY_SIZE(packets_op_cnts); i++, j++) {
++		descs[j].name = packets_op_cnts[i].name;
++		descs[j].flags |= IB_STAT_FLAG_OPTIONAL;
++		descs[j].priv = &packets_op_cnts[i].type;
++	}
+ }
+ 
+ 
+@@ -731,6 +756,8 @@ static int __mlx5_ib_alloc_counters(stru
+ 
+ 	num_op_counters = ARRAY_SIZE(basic_op_cnts);
+ 
++	num_op_counters += ARRAY_SIZE(packets_op_cnts);
++
+ 	if (MLX5_CAP_FLOWTABLE(dev->mdev,
+ 			       ft_field_support_2_nic_receive_rdma.bth_opcode))
+ 		num_op_counters += ARRAY_SIZE(rdmarx_cnp_op_cnts);
+@@ -760,10 +787,47 @@ err:
+ 	return -ENOMEM;
+ }
+ 
++/*
++ * Checks if the given flow counter type should be sharing the same flow counter
++ * with another type and if it should, checks if that other type flow counter
++ * was already created, if both conditions are met return true and the counter
++ * else return false.
++ */
++static bool mlx5r_is_opfc_shared_and_in_use(struct mlx5_ib_op_fc *opfcs,
++					    u32 type,
++					    struct mlx5_ib_op_fc **opfc)
++{
++	u32 shared_fc_type;
++
++	switch (type) {
++	case MLX5_IB_OPCOUNTER_RDMA_TX_PACKETS:
++		shared_fc_type = MLX5_IB_OPCOUNTER_RDMA_TX_BYTES;
++		break;
++	case MLX5_IB_OPCOUNTER_RDMA_TX_BYTES:
++		shared_fc_type = MLX5_IB_OPCOUNTER_RDMA_TX_PACKETS;
++		break;
++	case MLX5_IB_OPCOUNTER_RDMA_RX_PACKETS:
++		shared_fc_type = MLX5_IB_OPCOUNTER_RDMA_RX_BYTES;
++		break;
++	case MLX5_IB_OPCOUNTER_RDMA_RX_BYTES:
++		shared_fc_type = MLX5_IB_OPCOUNTER_RDMA_RX_PACKETS;
++		break;
++	default:
++		return false;
++	}
++
++	*opfc = &opfcs[shared_fc_type];
++	if (!(*opfc)->fc)
++		return false;
++
++	return true;
++}
++
+ static void mlx5_ib_dealloc_counters(struct mlx5_ib_dev *dev)
+ {
+ 	u32 in[MLX5_ST_SZ_DW(dealloc_q_counter_in)] = {};
+ 	int num_cnt_ports = dev->num_ports;
++	struct mlx5_ib_op_fc *in_use_opfc;
+ 	int i, j;
+ 
+ 	if (is_mdev_switchdev_mode(dev->mdev))
+@@ -785,11 +849,16 @@ static void mlx5_ib_dealloc_counters(str
+ 			if (!dev->port[i].cnts.opfcs[j].fc)
+ 				continue;
+ 
++			if (mlx5r_is_opfc_shared_and_in_use(
++				    dev->port[i].cnts.opfcs, j, &in_use_opfc))
++				goto skip;
++
+ 			if (IS_ENABLED(CONFIG_INFINIBAND_USER_ACCESS))
+ 				mlx5_ib_fs_remove_op_fc(dev,
+ 					&dev->port[i].cnts.opfcs[j], j);
+ 			mlx5_fc_destroy(dev->mdev,
+ 					dev->port[i].cnts.opfcs[j].fc);
++skip:
+ 			dev->port[i].cnts.opfcs[j].fc = NULL;
+ 		}
+ 	}
+@@ -983,8 +1052,8 @@ static int mlx5_ib_modify_stat(struct ib
+ 			       unsigned int index, bool enable)
+ {
+ 	struct mlx5_ib_dev *dev = to_mdev(device);
++	struct mlx5_ib_op_fc *opfc, *in_use_opfc;
+ 	struct mlx5_ib_counters *cnts;
+-	struct mlx5_ib_op_fc *opfc;
+ 	u32 num_hw_counters, type;
+ 	int ret;
+ 
+@@ -1008,6 +1077,13 @@ static int mlx5_ib_modify_stat(struct ib
+ 		if (opfc->fc)
+ 			return -EEXIST;
+ 
++		if (mlx5r_is_opfc_shared_and_in_use(cnts->opfcs, type,
++						    &in_use_opfc)) {
++			opfc->fc = in_use_opfc->fc;
++			opfc->rule[0] = in_use_opfc->rule[0];
++			return 0;
++		}
++
+ 		opfc->fc = mlx5_fc_create(dev->mdev, false);
+ 		if (IS_ERR(opfc->fc))
+ 			return PTR_ERR(opfc->fc);
+@@ -1023,8 +1099,12 @@ static int mlx5_ib_modify_stat(struct ib
+ 	if (!opfc->fc)
+ 		return -EINVAL;
+ 
++	if (mlx5r_is_opfc_shared_and_in_use(cnts->opfcs, type, &in_use_opfc))
++		goto out;
++
+ 	mlx5_ib_fs_remove_op_fc(dev, opfc, type);
+ 	mlx5_fc_destroy(dev->mdev, opfc->fc);
++out:
+ 	opfc->fc = NULL;
+ 	return 0;
+ }
+--- a/drivers/infiniband/hw/mlx5/fs.c
++++ b/drivers/infiniband/hw/mlx5/fs.c
+@@ -800,10 +800,12 @@ static struct mlx5_ib_flow_prio *get_flo
+ enum {
+ 	RDMA_RX_ECN_OPCOUNTER_PRIO,
+ 	RDMA_RX_CNP_OPCOUNTER_PRIO,
++	RDMA_RX_PKTS_BYTES_OPCOUNTER_PRIO,
+ };
+ 
+ enum {
+ 	RDMA_TX_CNP_OPCOUNTER_PRIO,
++	RDMA_TX_PKTS_BYTES_OPCOUNTER_PRIO,
+ };
+ 
+ static int set_vhca_port_spec(struct mlx5_ib_dev *dev, u32 port_num,
+@@ -867,6 +869,29 @@ static int set_cnp_spec(struct mlx5_ib_d
+ 	return 0;
+ }
+ 
++/* Returns the prio we should use for the given optional counter type,
++ * whereas for bytes type we use the packet type, since they share the same
++ * resources.
++ */
++static struct mlx5_ib_flow_prio *get_opfc_prio(struct mlx5_ib_dev *dev,
++					       u32 type)
++{
++	u32 prio_type;
++
++	switch (type) {
++	case MLX5_IB_OPCOUNTER_RDMA_TX_BYTES:
++		prio_type = MLX5_IB_OPCOUNTER_RDMA_TX_PACKETS;
++		break;
++	case MLX5_IB_OPCOUNTER_RDMA_RX_BYTES:
++		prio_type = MLX5_IB_OPCOUNTER_RDMA_RX_PACKETS;
++		break;
++	default:
++		prio_type = type;
++	}
++
++	return &dev->flow_db->opfcs[prio_type];
++}
++
+ int mlx5_ib_fs_add_op_fc(struct mlx5_ib_dev *dev, u32 port_num,
+ 			 struct mlx5_ib_op_fc *opfc,
+ 			 enum mlx5_ib_optional_counter_type type)
+@@ -921,6 +946,20 @@ int mlx5_ib_fs_add_op_fc(struct mlx5_ib_
+ 		priority = RDMA_TX_CNP_OPCOUNTER_PRIO;
+ 		break;
+ 
++	case MLX5_IB_OPCOUNTER_RDMA_TX_PACKETS:
++	case MLX5_IB_OPCOUNTER_RDMA_TX_BYTES:
++		spec_num = 1;
++		fn_type = MLX5_FLOW_NAMESPACE_RDMA_TX_COUNTERS;
++		priority = RDMA_TX_PKTS_BYTES_OPCOUNTER_PRIO;
++		break;
++
++	case MLX5_IB_OPCOUNTER_RDMA_RX_PACKETS:
++	case MLX5_IB_OPCOUNTER_RDMA_RX_BYTES:
++		spec_num = 1;
++		fn_type = MLX5_FLOW_NAMESPACE_RDMA_RX_COUNTERS;
++		priority = RDMA_RX_PKTS_BYTES_OPCOUNTER_PRIO;
++		break;
++
+ 	default:
+ 		err = -EOPNOTSUPP;
+ 		goto free;
+@@ -932,7 +971,7 @@ int mlx5_ib_fs_add_op_fc(struct mlx5_ib_
+ 		goto free;
+ 	}
+ 
+-	prio = &dev->flow_db->opfcs[type];
++	prio = get_opfc_prio(dev, type);
+ 	if (!prio->flow_table) {
+ 		prio = _get_prio(dev, ns, prio, priority,
+ 				 dev->num_ports * MAX_OPFC_RULES, 1, 0);
+@@ -974,11 +1013,14 @@ void mlx5_ib_fs_remove_op_fc(struct mlx5
+ 			     struct mlx5_ib_op_fc *opfc,
+ 			     enum mlx5_ib_optional_counter_type type)
+ {
++	struct mlx5_ib_flow_prio *prio;
+ 	int i;
+ 
++	prio = get_opfc_prio(dev, type);
++
+ 	for (i = 0; i < MAX_OPFC_RULES && opfc->rule[i]; i++) {
+ 		mlx5_del_flow_rules(opfc->rule[i]);
+-		put_flow_table(dev, &dev->flow_db->opfcs[type], true);
++		put_flow_table(dev, prio, true);
+ 	}
+ }
+ 
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@ -293,6 +293,10 @@ enum mlx5_ib_optional_counter_type {
+ 	MLX5_IB_OPCOUNTER_CC_RX_CE_PKTS,
+ 	MLX5_IB_OPCOUNTER_CC_RX_CNP_PKTS,
+ 	MLX5_IB_OPCOUNTER_CC_TX_CNP_PKTS,
++	MLX5_IB_OPCOUNTER_RDMA_TX_PACKETS,
++	MLX5_IB_OPCOUNTER_RDMA_TX_BYTES,
++	MLX5_IB_OPCOUNTER_RDMA_RX_PACKETS,
++	MLX5_IB_OPCOUNTER_RDMA_RX_BYTES,
+ 
+ 	MLX5_IB_OPCOUNTER_MAX,
+ };
+--- a/include/linux/mlx5/device.h
++++ b/include/linux/mlx5/device.h
+@@ -1533,8 +1533,8 @@ static inline u16 mlx5_to_sw_pkey_sz(int
+ 	return MLX5_MIN_PKEY_TABLE_SIZE << pkey_sz;
+ }
+ 
+-#define MLX5_RDMA_RX_NUM_COUNTERS_PRIOS 2
+-#define MLX5_RDMA_TX_NUM_COUNTERS_PRIOS 1
++#define MLX5_RDMA_RX_NUM_COUNTERS_PRIOS 3
++#define MLX5_RDMA_TX_NUM_COUNTERS_PRIOS 2
+ #define MLX5_BY_PASS_NUM_REGULAR_PRIOS 16
+ #define MLX5_BY_PASS_NUM_DONT_TRAP_PRIOS 16
+ #define MLX5_BY_PASS_NUM_MULTICAST_PRIOS 1

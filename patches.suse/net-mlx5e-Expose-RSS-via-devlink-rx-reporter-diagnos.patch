@@ -1,0 +1,243 @@
+From: Amir Tzin <amirtz@nvidia.com>
+Date: Sun, 9 Feb 2025 12:17:14 +0200
+Subject: net/mlx5e: Expose RSS via devlink rx reporter diagnose
+Patch-mainline: v6.15-rc1
+Git-commit: 896c92aa7429e1edd1418610e0b73120a89c7b07
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+Underneath "rx resources" tag expose RSS diagnostic information. For
+each RSS expose its rqtn, TIRs and inner TIRs.
+
+$ devlink health diagnose auxiliary/mlx5_core.eth.0/65535 reporter rx
+ .......
+RSS:
+    Index: 0 rqtn: 0
+    TIRs Numbers:
+        tt: TT_IPV4_TCP tirn: 0
+        tt: TT_IPV6_TCP tirn: 1
+        tt: TT_IPV4_UDP tirn: 2
+        tt: TT_IPV6_UDP tirn: 3
+        tt: TT_IPV4_IPSEC_AH tirn: 4
+        tt: TT_IPV6_IPSEC_AH tirn: 5
+        tt: TT_IPV4_IPSEC_ESP tirn: 6
+        tt: TT_IPV6_IPSEC_ESP tirn: 7
+        tt: TT_IPV4 tirn: 8
+        tt: TT_IPV6 tirn: 9
+    Inner TIRs Numbers:
+        tt: TT_IPV4_TCP tirn: 10
+        tt: TT_IPV6_TCP tirn: 11
+        tt: TT_IPV4_UDP tirn: 12
+        tt: TT_IPV6_UDP tirn: 13
+        tt: TT_IPV4_IPSEC_AH tirn: 14
+        tt: TT_IPV6_IPSEC_AH tirn: 15
+        tt: TT_IPV4_IPSEC_ESP tirn: 16
+        tt: TT_IPV6_IPSEC_ESP tirn: 17
+        tt: TT_IPV4 tirn: 18
+        tt: TT_IPV6 tirn: 19
+    Index: 2 rqtn: 27
+    TIRs Numbers:
+        tt: TT_IPV6_TCP tirn: 46
+
+Signed-off-by: Amir Tzin <amirtz@nvidia.com>
+Reviewed-by: Aya Levin <ayal@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://patch.msgid.link/20250209101716.112774-14-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en/reporter_rx.c |   58 +++++++++++++++
+ drivers/net/ethernet/mellanox/mlx5/core/en/rss.c         |   15 +++
+ drivers/net/ethernet/mellanox/mlx5/core/en/rss.h         |    3 
+ drivers/net/ethernet/mellanox/mlx5/core/en/rx_res.c      |    2 
+ drivers/net/ethernet/mellanox/mlx5/core/en/rx_res.h      |    3 
+ drivers/net/ethernet/mellanox/mlx5/core/lib/fs_ttc.c     |   19 ++++
+ drivers/net/ethernet/mellanox/mlx5/core/lib/fs_ttc.h     |    1 
+ 7 files changed, 99 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/reporter_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/reporter_rx.c
+@@ -359,6 +359,63 @@ static void mlx5e_rx_reporter_diagnose_r
+ 	devlink_fmsg_arr_pair_nest_end(fmsg);
+ }
+ 
++static void mlx5e_rx_reporter_diagnose_rx_res_rss_tirn(struct mlx5e_rss *rss, bool inner,
++						       struct devlink_fmsg *fmsg)
++{
++	bool found_valid_tir = false;
++	int tt;
++
++	for (tt = 0; tt < MLX5E_NUM_INDIR_TIRS; tt++) {
++		if (!mlx5e_rss_valid_tir(rss, tt, inner))
++			continue;
++
++		if (!found_valid_tir) {
++			char *tir_msg = inner ? "Inner TIRs Numbers" : "TIRs Numbers";
++
++			found_valid_tir = true;
++			devlink_fmsg_arr_pair_nest_start(fmsg, tir_msg);
++		}
++
++		devlink_fmsg_obj_nest_start(fmsg);
++		devlink_fmsg_string_pair_put(fmsg, "tt", mlx5_ttc_get_name(tt));
++		devlink_fmsg_u32_pair_put(fmsg, "tirn", mlx5e_rss_get_tirn(rss, tt, inner));
++		devlink_fmsg_obj_nest_end(fmsg);
++	}
++
++	if (found_valid_tir)
++		devlink_fmsg_arr_pair_nest_end(fmsg);
++}
++
++static void mlx5e_rx_reporter_diagnose_rx_res_rss_ix(struct mlx5e_rx_res *rx_res, u32 rss_idx,
++						     struct devlink_fmsg *fmsg)
++{
++	struct mlx5e_rss *rss = mlx5e_rx_res_rss_get(rx_res, rss_idx);
++
++	if (!rss)
++		return;
++
++	devlink_fmsg_obj_nest_start(fmsg);
++
++	devlink_fmsg_u32_pair_put(fmsg, "Index", rss_idx);
++	devlink_fmsg_u32_pair_put(fmsg, "rqtn", mlx5e_rss_get_rqtn(rss));
++	mlx5e_rx_reporter_diagnose_rx_res_rss_tirn(rss, false, fmsg);
++	if (mlx5e_rss_get_inner_ft_support(rss))
++		mlx5e_rx_reporter_diagnose_rx_res_rss_tirn(rss, true, fmsg);
++
++	devlink_fmsg_obj_nest_end(fmsg);
++}
++
++static void mlx5e_rx_reporter_diagnose_rx_res_rss(struct mlx5e_rx_res *rx_res,
++						  struct devlink_fmsg *fmsg)
++{
++	int rss_ix;
++
++	devlink_fmsg_arr_pair_nest_start(fmsg, "RSS");
++	for (rss_ix = 0; rss_ix < MLX5E_MAX_NUM_RSS; rss_ix++)
++		mlx5e_rx_reporter_diagnose_rx_res_rss_ix(rx_res, rss_ix, fmsg);
++	devlink_fmsg_arr_pair_nest_end(fmsg);
++}
++
+ static void mlx5e_rx_reporter_diagnose_rx_res(struct mlx5e_priv *priv,
+ 					      struct devlink_fmsg *fmsg)
+ {
+@@ -366,6 +423,7 @@ static void mlx5e_rx_reporter_diagnose_r
+ 
+ 	mlx5e_health_fmsg_named_obj_nest_start(fmsg, "RX resources");
+ 	mlx5e_rx_reporter_diagnose_rx_res_dir_tirns(rx_res, fmsg);
++	mlx5e_rx_reporter_diagnose_rx_res_rss(rx_res, fmsg);
+ 	mlx5e_health_fmsg_named_obj_nest_end(fmsg);
+ }
+ 
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/rss.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/rss.c
+@@ -81,6 +81,11 @@ struct mlx5e_rss {
+ 	refcount_t refcnt;
+ };
+ 
++bool mlx5e_rss_get_inner_ft_support(struct mlx5e_rss *rss)
++{
++	return rss->inner_ft_support;
++}
++
+ void mlx5e_rss_params_indir_modify_actual_size(struct mlx5e_rss *rss, u32 num_channels)
+ {
+ 	rss->indir.actual_table_size = mlx5e_rqt_size(rss->mdev, num_channels);
+@@ -449,6 +454,16 @@ u32 mlx5e_rss_get_tirn(struct mlx5e_rss
+ 	return mlx5e_tir_get_tirn(tir);
+ }
+ 
++u32 mlx5e_rss_get_rqtn(struct mlx5e_rss *rss)
++{
++	return mlx5e_rqt_get_rqtn(&rss->rqt);
++}
++
++bool mlx5e_rss_valid_tir(struct mlx5e_rss *rss, enum mlx5_traffic_types tt, bool inner)
++{
++	return !!rss_get_tir(rss, tt, inner);
++}
++
+ /* Fill the "tirn" output parameter.
+  * Create the requested TIR if it's its first usage.
+  */
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/rss.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/rss.h
+@@ -32,8 +32,11 @@ void mlx5e_rss_refcnt_inc(struct mlx5e_r
+ void mlx5e_rss_refcnt_dec(struct mlx5e_rss *rss);
+ unsigned int mlx5e_rss_refcnt_read(struct mlx5e_rss *rss);
+ 
++bool mlx5e_rss_get_inner_ft_support(struct mlx5e_rss *rss);
+ u32 mlx5e_rss_get_tirn(struct mlx5e_rss *rss, enum mlx5_traffic_types tt,
+ 		       bool inner);
++bool mlx5e_rss_valid_tir(struct mlx5e_rss *rss, enum mlx5_traffic_types tt, bool inner);
++u32 mlx5e_rss_get_rqtn(struct mlx5e_rss *rss);
+ int mlx5e_rss_obtain_tirn(struct mlx5e_rss *rss,
+ 			  enum mlx5_traffic_types tt,
+ 			  const struct mlx5e_packet_merge_param *init_pkt_merge_param,
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/rx_res.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/rx_res.c
+@@ -5,8 +5,6 @@
+ #include "channels.h"
+ #include "params.h"
+ 
+-#define MLX5E_MAX_NUM_RSS 16
+-
+ struct mlx5e_rx_res {
+ 	struct mlx5_core_dev *mdev; /* primary */
+ 	enum mlx5e_rx_res_features features;
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/rx_res.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/rx_res.h
+@@ -10,6 +10,8 @@
+ #include "fs.h"
+ #include "rss.h"
+ 
++#define MLX5E_MAX_NUM_RSS 16
++
+ struct mlx5e_rx_res;
+ 
+ struct mlx5e_channels;
+@@ -36,6 +38,7 @@ u32 mlx5e_rx_res_get_tirn_rss_inner(stru
+ u32 mlx5e_rx_res_get_tirn_ptp(struct mlx5e_rx_res *res);
+ u32 mlx5e_rx_res_get_rqtn_direct(struct mlx5e_rx_res *res, unsigned int ix);
+ unsigned int mlx5e_rx_res_get_max_nch(struct mlx5e_rx_res *res);
++bool mlx5_rx_res_rss_inner_ft_support(struct mlx5e_rx_res *res);
+ 
+ /* Activate/deactivate API */
+ void mlx5e_rx_res_channels_activate(struct mlx5e_rx_res *res, struct mlx5e_channels *chs);
+--- a/drivers/net/ethernet/mellanox/mlx5/core/lib/fs_ttc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/lib/fs_ttc.c
+@@ -61,6 +61,25 @@ static void mlx5_cleanup_ttc_rules(struc
+ 	}
+ }
+ 
++static const char *mlx5_traffic_types_names[MLX5_NUM_TT] = {
++	[MLX5_TT_IPV4_TCP] =  "TT_IPV4_TCP",
++	[MLX5_TT_IPV6_TCP] =  "TT_IPV6_TCP",
++	[MLX5_TT_IPV4_UDP] =  "TT_IPV4_UDP",
++	[MLX5_TT_IPV6_UDP] =  "TT_IPV6_UDP",
++	[MLX5_TT_IPV4_IPSEC_AH] = "TT_IPV4_IPSEC_AH",
++	[MLX5_TT_IPV6_IPSEC_AH] = "TT_IPV6_IPSEC_AH",
++	[MLX5_TT_IPV4_IPSEC_ESP] = "TT_IPV4_IPSEC_ESP",
++	[MLX5_TT_IPV6_IPSEC_ESP] = "TT_IPV6_IPSEC_ESP",
++	[MLX5_TT_IPV4] = "TT_IPV4",
++	[MLX5_TT_IPV6] = "TT_IPV6",
++	[MLX5_TT_ANY] = "TT_ANY"
++};
++
++const char *mlx5_ttc_get_name(enum mlx5_traffic_types tt)
++{
++	return mlx5_traffic_types_names[tt];
++}
++
+ struct mlx5_etype_proto {
+ 	u16 etype;
+ 	u8 proto;
+--- a/drivers/net/ethernet/mellanox/mlx5/core/lib/fs_ttc.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/lib/fs_ttc.h
+@@ -49,6 +49,7 @@ struct ttc_params {
+ 	struct mlx5_flow_destination tunnel_dests[MLX5_NUM_TUNNEL_TT];
+ };
+ 
++const char *mlx5_ttc_get_name(enum mlx5_traffic_types tt);
+ struct mlx5_flow_table *mlx5_get_ttc_flow_table(struct mlx5_ttc_table *ttc);
+ 
+ struct mlx5_ttc_table *mlx5_create_ttc_table(struct mlx5_core_dev *dev,

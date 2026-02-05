@@ -1,0 +1,182 @@
+From: Vlad Dogaru <vdogaru@nvidia.com>
+Date: Tue, 20 May 2025 21:46:39 +0300
+Subject: net/mlx5: SWS, fix reformat id error handling
+Patch-mainline: v6.16-rc1
+Git-commit: ca7690dae1269f454572c163ed5271feed060af5
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+The firmware reformat id is a u32 and can't safely be returned as an
+int. Because the functions also need a way to signal error, prefer to
+return the id as an output parameter and keep the return code only for
+success/error.
+
+While we're at it, also extract some duplicate code to fetch the
+reformat id from a more generic struct pkt_reformat.
+
+Signed-off-by: Vlad Dogaru <vdogaru@nvidia.com>
+Signed-off-by: Yevgeny Kliteynik <kliteyn@nvidia.com>
+Reviewed-by: Mark Bloch <mbloch@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://patch.msgid.link/1747766802-958178-2-git-send-email-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/fs_cmd.c             |   26 ++++-----
+ drivers/net/ethernet/mellanox/mlx5/core/fs_core.c            |   29 +++++++++--
+ drivers/net/ethernet/mellanox/mlx5/core/fs_core.h            |    3 +
+ drivers/net/ethernet/mellanox/mlx5/core/steering/sws/fs_dr.c |   10 +++
+ drivers/net/ethernet/mellanox/mlx5/core/steering/sws/fs_dr.h |   10 ++-
+ 5 files changed, 54 insertions(+), 24 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_cmd.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_cmd.c
+@@ -527,7 +527,7 @@ static int mlx5_cmd_set_fte(struct mlx5_
+ 	struct mlx5_flow_rule *dst;
+ 	void *in_flow_context, *vlan;
+ 	void *in_match_value;
+-	int reformat_id = 0;
++	u32 reformat_id = 0;
+ 	unsigned int inlen;
+ 	int dst_cnt_size;
+ 	u32 *in, action;
+@@ -580,23 +580,21 @@ static int mlx5_cmd_set_fte(struct mlx5_
+ 	MLX5_SET(flow_context, in_flow_context, action, action);
+ 
+ 	if (!extended_dest && fte->act_dests.action.pkt_reformat) {
+-		struct mlx5_pkt_reformat *pkt_reformat = fte->act_dests.action.pkt_reformat;
++		struct mlx5_pkt_reformat *pkt_reformat =
++			fte->act_dests.action.pkt_reformat;
+ 
+-		if (pkt_reformat->owner == MLX5_FLOW_RESOURCE_OWNER_SW) {
+-			reformat_id = mlx5_fs_dr_action_get_pkt_reformat_id(pkt_reformat);
+-			if (reformat_id < 0) {
+-				mlx5_core_err(dev,
+-					      "Unsupported SW-owned pkt_reformat type (%d) in FW-owned table\n",
+-					      pkt_reformat->reformat_type);
+-				err = reformat_id;
+-				goto err_out;
+-			}
+-		} else {
+-			reformat_id = fte->act_dests.action.pkt_reformat->id;
++		err = mlx5_fs_get_packet_reformat_id(pkt_reformat,
++						     &reformat_id);
++		if (err) {
++			mlx5_core_err(dev,
++				      "Unsupported pkt_reformat type (%d)\n",
++				      pkt_reformat->reformat_type);
++			goto err_out;
+ 		}
+ 	}
+ 
+-	MLX5_SET(flow_context, in_flow_context, packet_reformat_id, (u32)reformat_id);
++	MLX5_SET(flow_context, in_flow_context, packet_reformat_id,
++		 reformat_id);
+ 
+ 	if (fte->act_dests.action.modify_hdr) {
+ 		if (fte->act_dests.action.modify_hdr->owner == MLX5_FLOW_RESOURCE_OWNER_SW) {
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
+@@ -1830,14 +1830,33 @@ static int create_auto_flow_group(struct
+ 	return err;
+ }
+ 
++int mlx5_fs_get_packet_reformat_id(struct mlx5_pkt_reformat *pkt_reformat,
++				   u32 *id)
++{
++	switch (pkt_reformat->owner) {
++	case MLX5_FLOW_RESOURCE_OWNER_FW:
++		*id = pkt_reformat->id;
++		return 0;
++	case MLX5_FLOW_RESOURCE_OWNER_SW:
++		return mlx5_fs_dr_action_get_pkt_reformat_id(pkt_reformat, id);
++	default:
++		return -EINVAL;
++	}
++}
++
+ static bool mlx5_pkt_reformat_cmp(struct mlx5_pkt_reformat *p1,
+ 				  struct mlx5_pkt_reformat *p2)
+ {
+-	return p1->owner == p2->owner &&
+-		(p1->owner == MLX5_FLOW_RESOURCE_OWNER_FW ?
+-		 p1->id == p2->id :
+-		 mlx5_fs_dr_action_get_pkt_reformat_id(p1) ==
+-		 mlx5_fs_dr_action_get_pkt_reformat_id(p2));
++	int err1, err2;
++	u32 id1, id2;
++
++	if (p1->owner != p2->owner)
++		return false;
++
++	err1 = mlx5_fs_get_packet_reformat_id(p1, &id1);
++	err2 = mlx5_fs_get_packet_reformat_id(p2, &id2);
++
++	return !err1 && !err2 && id1 == id2;
+ }
+ 
+ static bool mlx5_flow_dests_cmp(struct mlx5_flow_destination *d1,
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_core.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_core.h
+@@ -386,6 +386,9 @@ u32 mlx5_fs_get_capabilities(struct mlx5
+ 
+ struct mlx5_flow_root_namespace *find_root(struct fs_node *node);
+ 
++int mlx5_fs_get_packet_reformat_id(struct mlx5_pkt_reformat *pkt_reformat,
++				   u32 *id);
++
+ #define fs_get_obj(v, _node)  {v = container_of((_node), typeof(*v), node); }
+ 
+ #define fs_list_for_each_entry(pos, root)		\
+--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/sws/fs_dr.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/sws/fs_dr.c
+@@ -833,15 +833,21 @@ static u32 mlx5_cmd_dr_get_capabilities(
+ 	return steering_caps;
+ }
+ 
+-int mlx5_fs_dr_action_get_pkt_reformat_id(struct mlx5_pkt_reformat *pkt_reformat)
++int
++mlx5_fs_dr_action_get_pkt_reformat_id(struct mlx5_pkt_reformat *pkt_reformat,
++				      u32 *reformat_id)
+ {
++	struct mlx5dr_action *dr_action;
++
+ 	switch (pkt_reformat->reformat_type) {
+ 	case MLX5_REFORMAT_TYPE_L2_TO_VXLAN:
+ 	case MLX5_REFORMAT_TYPE_L2_TO_NVGRE:
+ 	case MLX5_REFORMAT_TYPE_L2_TO_L2_TUNNEL:
+ 	case MLX5_REFORMAT_TYPE_L2_TO_L3_TUNNEL:
+ 	case MLX5_REFORMAT_TYPE_INSERT_HDR:
+-		return mlx5dr_action_get_pkt_reformat_id(pkt_reformat->fs_dr_action.dr_action);
++		dr_action = pkt_reformat->fs_dr_action.dr_action;
++		*reformat_id = mlx5dr_action_get_pkt_reformat_id(dr_action);
++		return 0;
+ 	}
+ 	return -EOPNOTSUPP;
+ }
+--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/sws/fs_dr.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/sws/fs_dr.h
+@@ -38,7 +38,9 @@ struct mlx5_fs_dr_table {
+ 
+ bool mlx5_fs_dr_is_supported(struct mlx5_core_dev *dev);
+ 
+-int mlx5_fs_dr_action_get_pkt_reformat_id(struct mlx5_pkt_reformat *pkt_reformat);
++int
++mlx5_fs_dr_action_get_pkt_reformat_id(struct mlx5_pkt_reformat *pkt_reformat,
++				      u32 *reformat_id);
+ 
+ const struct mlx5_flow_cmds *mlx5_fs_cmd_get_dr_cmds(void);
+ 
+@@ -49,9 +51,11 @@ static inline const struct mlx5_flow_cmd
+ 	return NULL;
+ }
+ 
+-static inline u32 mlx5_fs_dr_action_get_pkt_reformat_id(struct mlx5_pkt_reformat *pkt_reformat)
++static inline int
++mlx5_fs_dr_action_get_pkt_reformat_id(struct mlx5_pkt_reformat *pkt_reformat,
++				      u32 *reformat_id)
+ {
+-	return 0;
++	return -EOPNOTSUPP;
+ }
+ 
+ static inline bool mlx5_fs_dr_is_supported(struct mlx5_core_dev *dev)

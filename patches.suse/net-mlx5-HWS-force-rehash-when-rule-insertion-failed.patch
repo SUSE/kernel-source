@@ -1,0 +1,83 @@
+From: Yevgeny Kliteynik <kliteyn@nvidia.com>
+Date: Sun, 11 May 2025 22:38:06 +0300
+Subject: net/mlx5: HWS, force rehash when rule insertion failed
+Patch-mainline: v6.16-rc1
+Git-commit: 9d4024edce1063b616fa8bf7b2363290503cc322
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+Rules are inserted into hash table in accordance with their hash index.
+When a certain number of rules is reached, the table is rehashed:
+a bigger new table is allocated and all the rules are moved there.
+But sometimes a new rule can't be inserted into the hash table
+because its index is full, even though the number of rules in the
+table is well below the threshold. The hash function is not perfect,
+so such cases are not rare. When that happens, we want to do the same
+rehash, in order to increase the table size and lower the probability
+for such cases.
+
+This patch fixes the usecase where rule insertion was failing, but
+rehash couldn't be initiated due to low number of rules: it adds flag
+that denotes that rehash is required, even if the number of rules in
+the table is below the rehash threshold.
+
+Signed-off-by: Yevgeny Kliteynik <kliteyn@nvidia.com>
+Reviewed-by: Vlad Dogaru <vdogaru@nvidia.com>
+Reviewed-by: Mark Bloch <mbloch@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://patch.msgid.link/1746992290-568936-7-git-send-email-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/steering/hws/bwc.c |    8 ++++++--
+ drivers/net/ethernet/mellanox/mlx5/core/steering/hws/bwc.h |    1 +
+ 2 files changed, 7 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/bwc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/bwc.c
+@@ -169,6 +169,7 @@ mlx5hws_bwc_matcher_create(struct mlx5hw
+ 		return NULL;
+ 
+ 	atomic_set(&bwc_matcher->num_of_rules, 0);
++	atomic_set(&bwc_matcher->rehash_required, false);
+ 
+ 	/* Check if the required match params can be all matched
+ 	 * in single STE, otherwise complex matcher is needed.
+@@ -769,9 +770,9 @@ hws_bwc_matcher_rehash_size(struct mlx5h
+ 
+ 	/* It is possible that other rule has already performed rehash.
+ 	 * Need to check again if we really need rehash.
+-	 * If the reason for rehash was size, but not any more - skip rehash.
+ 	 */
+-	if (!hws_bwc_matcher_rehash_size_needed(bwc_matcher,
++	if (!atomic_read(&bwc_matcher->rehash_required) &&
++	    !hws_bwc_matcher_rehash_size_needed(bwc_matcher,
+ 						atomic_read(&bwc_matcher->num_of_rules)))
+ 		return 0;
+ 
+@@ -782,6 +783,8 @@ hws_bwc_matcher_rehash_size(struct mlx5h
+ 	 *  - destroy the old matcher
+ 	 */
+ 
++	atomic_set(&bwc_matcher->rehash_required, false);
++
+ 	ret = hws_bwc_matcher_extend_size(bwc_matcher);
+ 	if (ret)
+ 		return ret;
+@@ -875,6 +878,7 @@ int mlx5hws_bwc_rule_create_simple(struc
+ 	 * Try rehash by size and insert rule again - last chance.
+ 	 */
+ 
++	atomic_set(&bwc_matcher->rehash_required, true);
+ 	mutex_unlock(queue_lock);
+ 
+ 	hws_bwc_lock_all_queues(ctx);
+--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/bwc.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/bwc.h
+@@ -30,6 +30,7 @@ struct mlx5hws_bwc_matcher {
+ 	u8 size_log;
+ 	u32 priority;
+ 	atomic_t num_of_rules;
++	atomic_t rehash_required;
+ 	struct list_head *rules;
+ };
+ 

@@ -1,0 +1,245 @@
+From: Vlad Dogaru <vdogaru@nvidia.com>
+Date: Tue, 22 Apr 2025 12:25:40 +0300
+Subject: net/mlx5: HWS, Disallow matcher IP version mixing
+Patch-mainline: v6.16-rc1
+Git-commit: f41f3edf0b15d7ce0b0f71c00a6125e8d7ca735f
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+Signal clearly to the user, via an error, that mixing IPv4 and IPv6
+rules in the same matcher is not supported. Previously such cases
+silently failed by adding a rule that did not work correctly.
+
+Rules can specify an IP version by one of two fields: IP version or
+ethertype. At matcher creation, store whether the template matches on
+any of these two fields. If yes, inspect each rule for its corresponding
+match value and store the IP version inside the matcher to guard against
+inconsistencies with subsequent rules.
+
+Furthermore, also check rules for internal consistency, i.e. verify that
+the ethertype and IP version match values do not contradict each other.
+
+The logic applies to inner and outer headers independently, to account
+for tunneling.
+
+Rules that do not match on IP addresses are not affected.
+
+Signed-off-by: Vlad Dogaru <vdogaru@nvidia.com>
+Reviewed-by: Yevgeny Kliteynik <kliteyn@nvidia.com>
+Signed-off-by: Mark Bloch <mbloch@nvidia.com>
+Link: https://patch.msgid.link/20250422092540.182091-4-mbloch@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/steering/hws/matcher.c |   26 ++
+ drivers/net/ethernet/mellanox/mlx5/core/steering/hws/matcher.h |   12 
+ drivers/net/ethernet/mellanox/mlx5/core/steering/hws/rule.c    |  122 ++++++++++
+ 3 files changed, 160 insertions(+)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/matcher.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/matcher.c
+@@ -385,6 +385,30 @@ static int hws_matcher_bind_at(struct ml
+ 	return 0;
+ }
+ 
++static void hws_matcher_set_ip_version_match(struct mlx5hws_matcher *matcher)
++{
++	int i;
++
++	for (i = 0; i < matcher->mt->fc_sz; i++) {
++		switch (matcher->mt->fc[i].fname) {
++		case MLX5HWS_DEFINER_FNAME_ETH_TYPE_O:
++			matcher->matches_outer_ethertype = 1;
++			break;
++		case MLX5HWS_DEFINER_FNAME_ETH_L3_TYPE_O:
++			matcher->matches_outer_ip_version = 1;
++			break;
++		case MLX5HWS_DEFINER_FNAME_ETH_TYPE_I:
++			matcher->matches_inner_ethertype = 1;
++			break;
++		case MLX5HWS_DEFINER_FNAME_ETH_L3_TYPE_I:
++			matcher->matches_inner_ip_version = 1;
++			break;
++		default:
++			break;
++		}
++	}
++}
++
+ static int hws_matcher_bind_mt(struct mlx5hws_matcher *matcher)
+ {
+ 	struct mlx5hws_context *ctx = matcher->tbl->ctx;
+@@ -401,6 +425,8 @@ static int hws_matcher_bind_mt(struct ml
+ 		}
+ 	}
+ 
++	hws_matcher_set_ip_version_match(matcher);
++
+ 	/* Create an STE pool per matcher*/
+ 	pool_attr.table_type = matcher->tbl->type;
+ 	pool_attr.pool_type = MLX5HWS_POOL_TYPE_STE;
+--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/matcher.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/matcher.h
+@@ -50,6 +50,12 @@ struct mlx5hws_matcher_match_ste {
+ 	struct mlx5hws_pool *pool;
+ };
+ 
++enum {
++	MLX5HWS_MATCHER_IPV_UNSET = 0,
++	MLX5HWS_MATCHER_IPV_4 = 1,
++	MLX5HWS_MATCHER_IPV_6 = 2,
++};
++
+ struct mlx5hws_matcher {
+ 	struct mlx5hws_table *tbl;
+ 	struct mlx5hws_matcher_attr attr;
+@@ -61,6 +67,12 @@ struct mlx5hws_matcher {
+ 	u8 num_of_action_stes;
+ 	/* enum mlx5hws_matcher_flags */
+ 	u8 flags;
++	u8 matches_outer_ethertype:1;
++	u8 matches_outer_ip_version:1;
++	u8 matches_inner_ethertype:1;
++	u8 matches_inner_ip_version:1;
++	u8 outer_ip_version:2;
++	u8 inner_ip_version:2;
+ 	u32 end_ft_id;
+ 	struct mlx5hws_matcher *col_matcher;
+ 	struct mlx5hws_matcher *resize_dst;
+--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/rule.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/rule.c
+@@ -655,6 +655,124 @@ int mlx5hws_rule_move_hws_add(struct mlx
+ 	return 0;
+ }
+ 
++static u8 hws_rule_ethertype_to_matcher_ipv(u32 ethertype)
++{
++	switch (ethertype) {
++	case ETH_P_IP:
++		return MLX5HWS_MATCHER_IPV_4;
++	case ETH_P_IPV6:
++		return MLX5HWS_MATCHER_IPV_6;
++	default:
++		return MLX5HWS_MATCHER_IPV_UNSET;
++	}
++}
++
++static u8 hws_rule_ip_version_to_matcher_ipv(u32 ip_version)
++{
++	switch (ip_version) {
++	case 4:
++		return MLX5HWS_MATCHER_IPV_4;
++	case 6:
++		return MLX5HWS_MATCHER_IPV_6;
++	default:
++		return MLX5HWS_MATCHER_IPV_UNSET;
++	}
++}
++
++static int hws_rule_check_outer_ip_version(struct mlx5hws_matcher *matcher,
++					   u32 *match_param)
++{
++	struct mlx5hws_context *ctx = matcher->tbl->ctx;
++	u8 outer_ipv_ether = MLX5HWS_MATCHER_IPV_UNSET;
++	u8 outer_ipv_ip = MLX5HWS_MATCHER_IPV_UNSET;
++	u8 outer_ipv, ver;
++
++	if (matcher->matches_outer_ethertype) {
++		ver = MLX5_GET(fte_match_param, match_param,
++			       outer_headers.ethertype);
++		outer_ipv_ether = hws_rule_ethertype_to_matcher_ipv(ver);
++	}
++	if (matcher->matches_outer_ip_version) {
++		ver = MLX5_GET(fte_match_param, match_param,
++			       outer_headers.ip_version);
++		outer_ipv_ip = hws_rule_ip_version_to_matcher_ipv(ver);
++	}
++
++	if (outer_ipv_ether != MLX5HWS_MATCHER_IPV_UNSET &&
++	    outer_ipv_ip != MLX5HWS_MATCHER_IPV_UNSET &&
++	    outer_ipv_ether != outer_ipv_ip) {
++		mlx5hws_err(ctx, "Rule matches on inconsistent outer ethertype and ip version\n");
++		return -EINVAL;
++	}
++
++	outer_ipv = outer_ipv_ether != MLX5HWS_MATCHER_IPV_UNSET ?
++		    outer_ipv_ether : outer_ipv_ip;
++	if (outer_ipv != MLX5HWS_MATCHER_IPV_UNSET &&
++	    matcher->outer_ip_version != MLX5HWS_MATCHER_IPV_UNSET &&
++	    outer_ipv != matcher->outer_ip_version) {
++		mlx5hws_err(ctx, "Matcher and rule disagree on outer IP version\n");
++		return -EINVAL;
++	}
++	matcher->outer_ip_version = outer_ipv;
++
++	return 0;
++}
++
++static int hws_rule_check_inner_ip_version(struct mlx5hws_matcher *matcher,
++					   u32 *match_param)
++{
++	struct mlx5hws_context *ctx = matcher->tbl->ctx;
++	u8 inner_ipv_ether = MLX5HWS_MATCHER_IPV_UNSET;
++	u8 inner_ipv_ip = MLX5HWS_MATCHER_IPV_UNSET;
++	u8 inner_ipv, ver;
++
++	if (matcher->matches_inner_ethertype) {
++		ver = MLX5_GET(fte_match_param, match_param,
++			       inner_headers.ethertype);
++		inner_ipv_ether = hws_rule_ethertype_to_matcher_ipv(ver);
++	}
++	if (matcher->matches_inner_ip_version) {
++		ver = MLX5_GET(fte_match_param, match_param,
++			       inner_headers.ip_version);
++		inner_ipv_ip = hws_rule_ip_version_to_matcher_ipv(ver);
++	}
++
++	if (inner_ipv_ether != MLX5HWS_MATCHER_IPV_UNSET &&
++	    inner_ipv_ip != MLX5HWS_MATCHER_IPV_UNSET &&
++	    inner_ipv_ether != inner_ipv_ip) {
++		mlx5hws_err(ctx, "Rule matches on inconsistent inner ethertype and ip version\n");
++		return -EINVAL;
++	}
++
++	inner_ipv = inner_ipv_ether != MLX5HWS_MATCHER_IPV_UNSET ?
++		    inner_ipv_ether : inner_ipv_ip;
++	if (inner_ipv != MLX5HWS_MATCHER_IPV_UNSET &&
++	    matcher->inner_ip_version != MLX5HWS_MATCHER_IPV_UNSET &&
++	    inner_ipv != matcher->inner_ip_version) {
++		mlx5hws_err(ctx, "Matcher and rule disagree on inner IP version\n");
++		return -EINVAL;
++	}
++	matcher->inner_ip_version = inner_ipv;
++
++	return 0;
++}
++
++static int hws_rule_check_ip_version(struct mlx5hws_matcher *matcher,
++				     u32 *match_param)
++{
++	int ret;
++
++	ret = hws_rule_check_outer_ip_version(matcher, match_param);
++	if (unlikely(ret))
++		return ret;
++
++	ret = hws_rule_check_inner_ip_version(matcher, match_param);
++	if (unlikely(ret))
++		return ret;
++
++	return 0;
++}
++
+ int mlx5hws_rule_create(struct mlx5hws_matcher *matcher,
+ 			u8 mt_idx,
+ 			u32 *match_param,
+@@ -665,6 +783,10 @@ int mlx5hws_rule_create(struct mlx5hws_m
+ {
+ 	int ret;
+ 
++	ret = hws_rule_check_ip_version(matcher, match_param);
++	if (unlikely(ret))
++		return ret;
++
+ 	rule_handle->matcher = matcher;
+ 
+ 	ret = hws_rule_enqueue_precheck_create(rule_handle, attr);

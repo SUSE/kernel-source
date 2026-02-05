@@ -1,0 +1,683 @@
+From: Vlad Dogaru <vdogaru@nvidia.com>
+Date: Thu, 10 Apr 2025 22:17:33 +0300
+Subject: net/mlx5: HWS, Make pool single resource
+Patch-mainline: v6.16-rc1
+Git-commit: 38956bea7349ce75c1519b57c27cd97580b4c822
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+The pool implementation claimed to support multiple resources, but this
+does not really make sense in context. Callers always allocate a single
+STC or STE chunk of exactly the size provided.
+
+The code that handled multiple resources was unused (and likely buggy)
+due to the combination of flags passed by callers.
+
+Simplify the pool by having it handle a single resource. As a result of
+this simplification, chunks no longer contain a resource offset (there
+is now only one resource per pool), and the get_base_id functions no
+longer take a chunk parameter.
+
+Signed-off-by: Vlad Dogaru <vdogaru@nvidia.com>
+Reviewed-by: Yevgeny Kliteynik <kliteyn@nvidia.com>
+Reviewed-by: Mark Bloch <mbloch@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Reviewed-by: Michal Kubiak <michal.kubiak@intel.com>
+Link: https://patch.msgid.link/1744312662-356571-4-git-send-email-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/steering/hws/action.c  |   27 -
+ drivers/net/ethernet/mellanox/mlx5/core/steering/hws/debug.c   |   22 -
+ drivers/net/ethernet/mellanox/mlx5/core/steering/hws/matcher.c |   10 
+ drivers/net/ethernet/mellanox/mlx5/core/steering/hws/pool.c    |  174 ++--------
+ drivers/net/ethernet/mellanox/mlx5/core/steering/hws/pool.h    |   28 -
+ 5 files changed, 87 insertions(+), 174 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/action.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/action.c
+@@ -238,6 +238,7 @@ hws_action_fixup_stc_attr(struct mlx5hws
+ 			  enum mlx5hws_table_type table_type,
+ 			  bool is_mirror)
+ {
++	struct mlx5hws_pool *pool;
+ 	bool use_fixup = false;
+ 	u32 fw_tbl_type;
+ 	u32 base_id;
+@@ -253,13 +254,11 @@ hws_action_fixup_stc_attr(struct mlx5hws
+ 			use_fixup = true;
+ 			break;
+ 		}
++		pool = stc_attr->ste_table.ste_pool;
+ 		if (!is_mirror)
+-			base_id = mlx5hws_pool_chunk_get_base_id(stc_attr->ste_table.ste_pool,
+-								 &stc_attr->ste_table.ste);
++			base_id = mlx5hws_pool_get_base_id(pool);
+ 		else
+-			base_id =
+-				mlx5hws_pool_chunk_get_base_mirror_id(stc_attr->ste_table.ste_pool,
+-								      &stc_attr->ste_table.ste);
++			base_id = mlx5hws_pool_get_base_mirror_id(pool);
+ 
+ 		*fixup_stc_attr = *stc_attr;
+ 		fixup_stc_attr->ste_table.ste_obj_id = base_id;
+@@ -337,7 +336,7 @@ __must_hold(&ctx->ctrl_lock)
+ 	if (!mlx5hws_context_cap_dynamic_reparse(ctx))
+ 		stc_attr->reparse_mode = MLX5_IFC_STC_REPARSE_IGNORE;
+ 
+-	obj_0_id = mlx5hws_pool_chunk_get_base_id(stc_pool, stc);
++	obj_0_id = mlx5hws_pool_get_base_id(stc_pool);
+ 
+ 	/* According to table/action limitation change the stc_attr */
+ 	use_fixup = hws_action_fixup_stc_attr(ctx, stc_attr, &fixup_stc_attr, table_type, false);
+@@ -353,7 +352,7 @@ __must_hold(&ctx->ctrl_lock)
+ 	if (table_type == MLX5HWS_TABLE_TYPE_FDB) {
+ 		u32 obj_1_id;
+ 
+-		obj_1_id = mlx5hws_pool_chunk_get_base_mirror_id(stc_pool, stc);
++		obj_1_id = mlx5hws_pool_get_base_mirror_id(stc_pool);
+ 
+ 		use_fixup = hws_action_fixup_stc_attr(ctx, stc_attr,
+ 						      &fixup_stc_attr,
+@@ -393,11 +392,11 @@ __must_hold(&ctx->ctrl_lock)
+ 	stc_attr.action_type = MLX5_IFC_STC_ACTION_TYPE_DROP;
+ 	stc_attr.action_offset = MLX5HWS_ACTION_OFFSET_HIT;
+ 	stc_attr.stc_offset = stc->offset;
+-	obj_id = mlx5hws_pool_chunk_get_base_id(stc_pool, stc);
++	obj_id = mlx5hws_pool_get_base_id(stc_pool);
+ 	mlx5hws_cmd_stc_modify(ctx->mdev, obj_id, &stc_attr);
+ 
+ 	if (table_type == MLX5HWS_TABLE_TYPE_FDB) {
+-		obj_id = mlx5hws_pool_chunk_get_base_mirror_id(stc_pool, stc);
++		obj_id = mlx5hws_pool_get_base_mirror_id(stc_pool);
+ 		mlx5hws_cmd_stc_modify(ctx->mdev, obj_id, &stc_attr);
+ 	}
+ 
+@@ -1581,7 +1580,6 @@ hws_action_create_dest_match_range_table
+ 					 u32 miss_ft_id)
+ {
+ 	struct mlx5hws_cmd_rtc_create_attr rtc_attr = {0};
+-	struct mlx5hws_action_default_stc *default_stc;
+ 	struct mlx5hws_matcher_action_ste *table_ste;
+ 	struct mlx5hws_pool_attr pool_attr = {0};
+ 	struct mlx5hws_pool *ste_pool, *stc_pool;
+@@ -1629,7 +1627,7 @@ hws_action_create_dest_match_range_table
+ 	rtc_attr.fw_gen_wqe = true;
+ 	rtc_attr.is_scnd_range = true;
+ 
+-	obj_id = mlx5hws_pool_chunk_get_base_id(ste_pool, ste);
++	obj_id = mlx5hws_pool_get_base_id(ste_pool);
+ 
+ 	rtc_attr.pd = ctx->pd_num;
+ 	rtc_attr.ste_base = obj_id;
+@@ -1639,8 +1637,7 @@ hws_action_create_dest_match_range_table
+ 
+ 	/* STC is a single resource (obj_id), use any STC for the ID */
+ 	stc_pool = ctx->stc_pool;
+-	default_stc = ctx->common_res.default_stc;
+-	obj_id = mlx5hws_pool_chunk_get_base_id(stc_pool, &default_stc->default_hit);
++	obj_id = mlx5hws_pool_get_base_id(stc_pool);
+ 	rtc_attr.stc_base = obj_id;
+ 
+ 	ret = mlx5hws_cmd_rtc_create(ctx->mdev, &rtc_attr, rtc_0_id);
+@@ -1650,11 +1647,11 @@ hws_action_create_dest_match_range_table
+ 	}
+ 
+ 	/* Create mirror RTC */
+-	obj_id = mlx5hws_pool_chunk_get_base_mirror_id(ste_pool, ste);
++	obj_id = mlx5hws_pool_get_base_mirror_id(ste_pool);
+ 	rtc_attr.ste_base = obj_id;
+ 	rtc_attr.table_type = mlx5hws_table_get_res_fw_ft_type(MLX5HWS_TABLE_TYPE_FDB, true);
+ 
+-	obj_id = mlx5hws_pool_chunk_get_base_mirror_id(stc_pool, &default_stc->default_hit);
++	obj_id = mlx5hws_pool_get_base_mirror_id(stc_pool);
+ 	rtc_attr.stc_base = obj_id;
+ 
+ 	ret = mlx5hws_cmd_rtc_create(ctx->mdev, &rtc_attr, rtc_1_id);
+--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/debug.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/debug.c
+@@ -118,7 +118,6 @@ static int hws_debug_dump_matcher(struct
+ {
+ 	enum mlx5hws_table_type tbl_type = matcher->tbl->type;
+ 	struct mlx5hws_cmd_ft_query_attr ft_attr = {0};
+-	struct mlx5hws_pool_chunk *ste;
+ 	struct mlx5hws_pool *ste_pool;
+ 	u64 icm_addr_0 = 0;
+ 	u64 icm_addr_1 = 0;
+@@ -134,12 +133,11 @@ static int hws_debug_dump_matcher(struct
+ 		   matcher->end_ft_id,
+ 		   matcher->col_matcher ? HWS_PTR_TO_ID(matcher->col_matcher) : 0);
+ 
+-	ste = &matcher->match_ste.ste;
+ 	ste_pool = matcher->match_ste.pool;
+ 	if (ste_pool) {
+-		ste_0_id = mlx5hws_pool_chunk_get_base_id(ste_pool, ste);
++		ste_0_id = mlx5hws_pool_get_base_id(ste_pool);
+ 		if (tbl_type == MLX5HWS_TABLE_TYPE_FDB)
+-			ste_1_id = mlx5hws_pool_chunk_get_base_mirror_id(ste_pool, ste);
++			ste_1_id = mlx5hws_pool_get_base_mirror_id(ste_pool);
+ 	}
+ 
+ 	seq_printf(f, ",%d,%d,%d,%d",
+@@ -148,12 +146,11 @@ static int hws_debug_dump_matcher(struct
+ 		   matcher->match_ste.rtc_1_id,
+ 		   (int)ste_1_id);
+ 
+-	ste = &matcher->action_ste.ste;
+ 	ste_pool = matcher->action_ste.pool;
+ 	if (ste_pool) {
+-		ste_0_id = mlx5hws_pool_chunk_get_base_id(ste_pool, ste);
++		ste_0_id = mlx5hws_pool_get_base_id(ste_pool);
+ 		if (tbl_type == MLX5HWS_TABLE_TYPE_FDB)
+-			ste_1_id = mlx5hws_pool_chunk_get_base_mirror_id(ste_pool, ste);
++			ste_1_id = mlx5hws_pool_get_base_mirror_id(ste_pool);
+ 		else
+ 			ste_1_id = -1;
+ 	} else {
+@@ -387,14 +384,17 @@ static int hws_debug_dump_context_stc(st
+ 	if (!stc_pool)
+ 		return 0;
+ 
+-	if (stc_pool->resource[0]) {
+-		ret = hws_debug_dump_context_stc_resource(f, ctx, stc_pool->resource[0]);
++	if (stc_pool->resource) {
++		ret = hws_debug_dump_context_stc_resource(f, ctx,
++							  stc_pool->resource);
+ 		if (ret)
+ 			return ret;
+ 	}
+ 
+-	if (stc_pool->mirror_resource[0]) {
+-		ret = hws_debug_dump_context_stc_resource(f, ctx, stc_pool->mirror_resource[0]);
++	if (stc_pool->mirror_resource) {
++		struct mlx5hws_pool_resource *res = stc_pool->mirror_resource;
++
++		ret = hws_debug_dump_context_stc_resource(f, ctx, res);
+ 		if (ret)
+ 			return ret;
+ 	}
+--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/matcher.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/matcher.c
+@@ -223,7 +223,6 @@ static int hws_matcher_create_rtc(struct
+ 	struct mlx5hws_cmd_rtc_create_attr rtc_attr = {0};
+ 	struct mlx5hws_match_template *mt = matcher->mt;
+ 	struct mlx5hws_context *ctx = matcher->tbl->ctx;
+-	struct mlx5hws_action_default_stc *default_stc;
+ 	struct mlx5hws_matcher_action_ste *action_ste;
+ 	struct mlx5hws_table *tbl = matcher->tbl;
+ 	struct mlx5hws_pool *ste_pool, *stc_pool;
+@@ -305,7 +304,7 @@ static int hws_matcher_create_rtc(struct
+ 		return -EINVAL;
+ 	}
+ 
+-	obj_id = mlx5hws_pool_chunk_get_base_id(ste_pool, ste);
++	obj_id = mlx5hws_pool_get_base_id(ste_pool);
+ 
+ 	rtc_attr.pd = ctx->pd_num;
+ 	rtc_attr.ste_base = obj_id;
+@@ -316,8 +315,7 @@ static int hws_matcher_create_rtc(struct
+ 
+ 	/* STC is a single resource (obj_id), use any STC for the ID */
+ 	stc_pool = ctx->stc_pool;
+-	default_stc = ctx->common_res.default_stc;
+-	obj_id = mlx5hws_pool_chunk_get_base_id(stc_pool, &default_stc->default_hit);
++	obj_id = mlx5hws_pool_get_base_id(stc_pool);
+ 	rtc_attr.stc_base = obj_id;
+ 
+ 	ret = mlx5hws_cmd_rtc_create(ctx->mdev, &rtc_attr, rtc_0_id);
+@@ -328,11 +326,11 @@ static int hws_matcher_create_rtc(struct
+ 	}
+ 
+ 	if (tbl->type == MLX5HWS_TABLE_TYPE_FDB) {
+-		obj_id = mlx5hws_pool_chunk_get_base_mirror_id(ste_pool, ste);
++		obj_id = mlx5hws_pool_get_base_mirror_id(ste_pool);
+ 		rtc_attr.ste_base = obj_id;
+ 		rtc_attr.table_type = mlx5hws_table_get_res_fw_ft_type(tbl->type, true);
+ 
+-		obj_id = mlx5hws_pool_chunk_get_base_mirror_id(stc_pool, &default_stc->default_hit);
++		obj_id = mlx5hws_pool_get_base_mirror_id(stc_pool);
+ 		rtc_attr.stc_base = obj_id;
+ 		hws_matcher_set_rtc_attr_sz(matcher, &rtc_attr, rtc_type, true);
+ 
+--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/pool.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/pool.c
+@@ -20,15 +20,14 @@ static void hws_pool_free_one_resource(s
+ 	kfree(resource);
+ }
+ 
+-static void hws_pool_resource_free(struct mlx5hws_pool *pool,
+-				   int resource_idx)
++static void hws_pool_resource_free(struct mlx5hws_pool *pool)
+ {
+-	hws_pool_free_one_resource(pool->resource[resource_idx]);
+-	pool->resource[resource_idx] = NULL;
++	hws_pool_free_one_resource(pool->resource);
++	pool->resource = NULL;
+ 
+ 	if (pool->tbl_type == MLX5HWS_TABLE_TYPE_FDB) {
+-		hws_pool_free_one_resource(pool->mirror_resource[resource_idx]);
+-		pool->mirror_resource[resource_idx] = NULL;
++		hws_pool_free_one_resource(pool->mirror_resource);
++		pool->mirror_resource = NULL;
+ 	}
+ }
+ 
+@@ -78,7 +77,7 @@ free_resource:
+ }
+ 
+ static int
+-hws_pool_resource_alloc(struct mlx5hws_pool *pool, u32 log_range, int idx)
++hws_pool_resource_alloc(struct mlx5hws_pool *pool, u32 log_range)
+ {
+ 	struct mlx5hws_pool_resource *resource;
+ 	u32 fw_ft_type, opt_log_range;
+@@ -91,7 +90,7 @@ hws_pool_resource_alloc(struct mlx5hws_p
+ 		return -EINVAL;
+ 	}
+ 
+-	pool->resource[idx] = resource;
++	pool->resource = resource;
+ 
+ 	if (pool->tbl_type == MLX5HWS_TABLE_TYPE_FDB) {
+ 		struct mlx5hws_pool_resource *mirror_resource;
+@@ -102,10 +101,10 @@ hws_pool_resource_alloc(struct mlx5hws_p
+ 		if (!mirror_resource) {
+ 			mlx5hws_err(pool->ctx, "Failed allocating mirrored resource\n");
+ 			hws_pool_free_one_resource(resource);
+-			pool->resource[idx] = NULL;
++			pool->resource = NULL;
+ 			return -EINVAL;
+ 		}
+-		pool->mirror_resource[idx] = mirror_resource;
++		pool->mirror_resource = mirror_resource;
+ 	}
+ 
+ 	return 0;
+@@ -129,9 +128,9 @@ static void hws_pool_buddy_db_put_chunk(
+ {
+ 	struct mlx5hws_buddy_mem *buddy;
+ 
+-	buddy = pool->db.buddy_manager->buddies[chunk->resource_idx];
++	buddy = pool->db.buddy;
+ 	if (!buddy) {
+-		mlx5hws_err(pool->ctx, "No such buddy (%d)\n", chunk->resource_idx);
++		mlx5hws_err(pool->ctx, "Bad buddy state\n");
+ 		return;
+ 	}
+ 
+@@ -139,86 +138,50 @@ static void hws_pool_buddy_db_put_chunk(
+ }
+ 
+ static struct mlx5hws_buddy_mem *
+-hws_pool_buddy_get_next_buddy(struct mlx5hws_pool *pool, int idx,
+-			      u32 order, bool *is_new_buddy)
++hws_pool_buddy_get_buddy(struct mlx5hws_pool *pool, u32 order)
+ {
+ 	static struct mlx5hws_buddy_mem *buddy;
+ 	u32 new_buddy_size;
+ 
+-	buddy = pool->db.buddy_manager->buddies[idx];
++	buddy = pool->db.buddy;
+ 	if (buddy)
+ 		return buddy;
+ 
+ 	new_buddy_size = max(pool->alloc_log_sz, order);
+-	*is_new_buddy = true;
+ 	buddy = mlx5hws_buddy_create(new_buddy_size);
+ 	if (!buddy) {
+-		mlx5hws_err(pool->ctx, "Failed to create buddy order: %d index: %d\n",
+-			    new_buddy_size, idx);
++		mlx5hws_err(pool->ctx, "Failed to create buddy order: %d\n",
++			    new_buddy_size);
+ 		return NULL;
+ 	}
+ 
+-	if (hws_pool_resource_alloc(pool, new_buddy_size, idx) != 0) {
+-		mlx5hws_err(pool->ctx, "Failed to create resource type: %d: size %d index: %d\n",
+-			    pool->type, new_buddy_size, idx);
++	if (hws_pool_resource_alloc(pool, new_buddy_size) != 0) {
++		mlx5hws_err(pool->ctx, "Failed to create resource type: %d: size %d\n",
++			    pool->type, new_buddy_size);
+ 		mlx5hws_buddy_cleanup(buddy);
+ 		return NULL;
+ 	}
+ 
+-	pool->db.buddy_manager->buddies[idx] = buddy;
++	pool->db.buddy = buddy;
+ 
+ 	return buddy;
+ }
+ 
+ static int hws_pool_buddy_get_mem_chunk(struct mlx5hws_pool *pool,
+ 					int order,
+-					u32 *buddy_idx,
+ 					int *seg)
+ {
+ 	struct mlx5hws_buddy_mem *buddy;
+-	bool new_mem = false;
+-	int ret = 0;
+-	int i;
+ 
+-	*seg = -1;
++	buddy = hws_pool_buddy_get_buddy(pool, order);
++	if (!buddy)
++		return -ENOMEM;
+ 
+-	/* Find the next free place from the buddy array */
+-	while (*seg < 0) {
+-		for (i = 0; i < MLX5HWS_POOL_RESOURCE_ARR_SZ; i++) {
+-			buddy = hws_pool_buddy_get_next_buddy(pool, i,
+-							      order,
+-							      &new_mem);
+-			if (!buddy) {
+-				ret = -ENOMEM;
+-				goto out;
+-			}
+-
+-			*seg = mlx5hws_buddy_alloc_mem(buddy, order);
+-			if (*seg >= 0)
+-				goto found;
+-
+-			if (pool->flags & MLX5HWS_POOL_FLAGS_ONE_RESOURCE) {
+-				mlx5hws_err(pool->ctx,
+-					    "Fail to allocate seg for one resource pool\n");
+-				ret = -ENOMEM;
+-				goto out;
+-			}
+-
+-			if (new_mem) {
+-				/* We have new memory pool, should be place for us */
+-				mlx5hws_err(pool->ctx,
+-					    "No memory for order: %d with buddy no: %d\n",
+-					    order, i);
+-				ret = -ENOMEM;
+-				goto out;
+-			}
+-		}
+-	}
++	*seg = mlx5hws_buddy_alloc_mem(buddy, order);
++	if (*seg >= 0)
++		return 0;
+ 
+-found:
+-	*buddy_idx = i;
+-out:
+-	return ret;
++	return -ENOMEM;
+ }
+ 
+ static int hws_pool_buddy_db_get_chunk(struct mlx5hws_pool *pool,
+@@ -226,9 +189,7 @@ static int hws_pool_buddy_db_get_chunk(s
+ {
+ 	int ret = 0;
+ 
+-	/* Go over the buddies and find next free slot */
+ 	ret = hws_pool_buddy_get_mem_chunk(pool, chunk->order,
+-					   &chunk->resource_idx,
+ 					   &chunk->offset);
+ 	if (ret)
+ 		mlx5hws_err(pool->ctx, "Failed to get free slot for chunk with order: %d\n",
+@@ -240,33 +201,21 @@ static int hws_pool_buddy_db_get_chunk(s
+ static void hws_pool_buddy_db_uninit(struct mlx5hws_pool *pool)
+ {
+ 	struct mlx5hws_buddy_mem *buddy;
+-	int i;
+ 
+-	for (i = 0; i < MLX5HWS_POOL_RESOURCE_ARR_SZ; i++) {
+-		buddy = pool->db.buddy_manager->buddies[i];
+-		if (buddy) {
+-			mlx5hws_buddy_cleanup(buddy);
+-			kfree(buddy);
+-			pool->db.buddy_manager->buddies[i] = NULL;
+-		}
++	buddy = pool->db.buddy;
++	if (buddy) {
++		mlx5hws_buddy_cleanup(buddy);
++		kfree(buddy);
++		pool->db.buddy = NULL;
+ 	}
+-
+-	kfree(pool->db.buddy_manager);
+ }
+ 
+ static int hws_pool_buddy_db_init(struct mlx5hws_pool *pool, u32 log_range)
+ {
+-	pool->db.buddy_manager = kzalloc(sizeof(*pool->db.buddy_manager), GFP_KERNEL);
+-	if (!pool->db.buddy_manager)
+-		return -ENOMEM;
+-
+ 	if (pool->flags & MLX5HWS_POOL_FLAGS_ALLOC_MEM_ON_CREATE) {
+-		bool new_buddy;
+-
+-		if (!hws_pool_buddy_get_next_buddy(pool, 0, log_range, &new_buddy)) {
++		if (!hws_pool_buddy_get_buddy(pool, log_range)) {
+ 			mlx5hws_err(pool->ctx,
+ 				    "Failed allocating memory on create log_sz: %d\n", log_range);
+-			kfree(pool->db.buddy_manager);
+ 			return -ENOMEM;
+ 		}
+ 	}
+@@ -278,14 +227,13 @@ static int hws_pool_buddy_db_init(struct
+ 	return 0;
+ }
+ 
+-static int hws_pool_create_resource_on_index(struct mlx5hws_pool *pool,
+-					     u32 alloc_size, int idx)
++static int hws_pool_create_resource(struct mlx5hws_pool *pool, u32 alloc_size)
+ {
+-	int ret = hws_pool_resource_alloc(pool, alloc_size, idx);
++	int ret = hws_pool_resource_alloc(pool, alloc_size);
+ 
+ 	if (ret) {
+-		mlx5hws_err(pool->ctx, "Failed to create resource type: %d: size %d index: %d\n",
+-			    pool->type, alloc_size, idx);
++		mlx5hws_err(pool->ctx, "Failed to create resource type: %d: size %d\n",
++			    pool->type, alloc_size);
+ 		return ret;
+ 	}
+ 
+@@ -319,7 +267,7 @@ hws_pool_element_create_new_elem(struct
+ 		elem->log_size = alloc_size - order;
+ 	}
+ 
+-	if (hws_pool_create_resource_on_index(pool, alloc_size, 0)) {
++	if (hws_pool_create_resource(pool, alloc_size)) {
+ 		mlx5hws_err(pool->ctx, "Failed to create resource type: %d: size %d\n",
+ 			    pool->type, alloc_size);
+ 		goto free_db;
+@@ -355,7 +303,7 @@ static int hws_pool_element_find_seg(str
+ 
+ static int
+ hws_pool_onesize_element_get_mem_chunk(struct mlx5hws_pool *pool, u32 order,
+-				       u32 *idx, int *seg)
++				       int *seg)
+ {
+ 	struct mlx5hws_pool_elements *elem;
+ 
+@@ -370,7 +318,6 @@ hws_pool_onesize_element_get_mem_chunk(s
+ 		return -ENOMEM;
+ 	}
+ 
+-	*idx = 0;
+ 	elem->num_of_elements++;
+ 	return 0;
+ 
+@@ -379,21 +326,17 @@ err_no_elem:
+ 	return -ENOMEM;
+ }
+ 
+-static int
+-hws_pool_general_element_get_mem_chunk(struct mlx5hws_pool *pool, u32 order,
+-				       u32 *idx, int *seg)
++static int hws_pool_general_element_get_mem_chunk(struct mlx5hws_pool *pool,
++						  u32 order, int *seg)
+ {
+-	int ret, i;
++	int ret;
+ 
+-	for (i = 0; i < MLX5HWS_POOL_RESOURCE_ARR_SZ; i++) {
+-		if (!pool->resource[i]) {
+-			ret = hws_pool_create_resource_on_index(pool, order, i);
+-			if (ret)
+-				goto err_no_res;
+-			*idx = i;
+-			*seg = 0; /* One memory slot in that element */
+-			return 0;
+-		}
++	if (!pool->resource) {
++		ret = hws_pool_create_resource(pool, order);
++		if (ret)
++			goto err_no_res;
++		*seg = 0; /* One memory slot in that element */
++		return 0;
+ 	}
+ 
+ 	mlx5hws_err(pool->ctx, "No more resources (last request order: %d)\n", order);
+@@ -409,9 +352,7 @@ static int hws_pool_general_element_db_g
+ {
+ 	int ret;
+ 
+-	/* Go over all memory elements and find/allocate free slot */
+ 	ret = hws_pool_general_element_get_mem_chunk(pool, chunk->order,
+-						     &chunk->resource_idx,
+ 						     &chunk->offset);
+ 	if (ret)
+ 		mlx5hws_err(pool->ctx, "Failed to get free slot for chunk with order: %d\n",
+@@ -423,11 +364,8 @@ static int hws_pool_general_element_db_g
+ static void hws_pool_general_element_db_put_chunk(struct mlx5hws_pool *pool,
+ 						  struct mlx5hws_pool_chunk *chunk)
+ {
+-	if (unlikely(!pool->resource[chunk->resource_idx]))
+-		pr_warn("HWS: invalid resource with index %d\n", chunk->resource_idx);
+-
+ 	if (pool->flags & MLX5HWS_POOL_FLAGS_RELEASE_FREE_RESOURCE)
+-		hws_pool_resource_free(pool, chunk->resource_idx);
++		hws_pool_resource_free(pool);
+ }
+ 
+ static void hws_pool_general_element_db_uninit(struct mlx5hws_pool *pool)
+@@ -455,7 +393,7 @@ static void
+ hws_onesize_element_db_destroy_element(struct mlx5hws_pool *pool,
+ 				       struct mlx5hws_pool_elements *elem)
+ {
+-	hws_pool_resource_free(pool, 0);
++	hws_pool_resource_free(pool);
+ 	bitmap_free(elem->bitmap);
+ 	kfree(elem);
+ 	pool->db.element = NULL;
+@@ -466,12 +404,9 @@ static void hws_onesize_element_db_put_c
+ {
+ 	struct mlx5hws_pool_elements *elem;
+ 
+-	if (unlikely(chunk->resource_idx))
+-		pr_warn("HWS: invalid resource with index %d\n", chunk->resource_idx);
+-
+ 	elem = pool->db.element;
+ 	if (!elem) {
+-		mlx5hws_err(pool->ctx, "No such element (%d)\n", chunk->resource_idx);
++		mlx5hws_err(pool->ctx, "Pool element was not allocated\n");
+ 		return;
+ 	}
+ 
+@@ -489,9 +424,7 @@ static int hws_onesize_element_db_get_ch
+ {
+ 	int ret = 0;
+ 
+-	/* Go over all memory elements and find/allocate free slot */
+ 	ret = hws_pool_onesize_element_get_mem_chunk(pool, chunk->order,
+-						     &chunk->resource_idx,
+ 						     &chunk->offset);
+ 	if (ret)
+ 		mlx5hws_err(pool->ctx, "Failed to get free slot for chunk with order: %d\n",
+@@ -614,13 +547,10 @@ free_pool:
+ 
+ int mlx5hws_pool_destroy(struct mlx5hws_pool *pool)
+ {
+-	int i;
+-
+ 	mutex_destroy(&pool->lock);
+ 
+-	for (i = 0; i < MLX5HWS_POOL_RESOURCE_ARR_SZ; i++)
+-		if (pool->resource[i])
+-			hws_pool_resource_free(pool, i);
++	if (pool->resource)
++		hws_pool_resource_free(pool);
+ 
+ 	hws_pool_db_unint(pool);
+ 
+--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/pool.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/pool.h
+@@ -6,16 +6,12 @@
+ 
+ #define MLX5HWS_POOL_STC_LOG_SZ 15
+ 
+-#define MLX5HWS_POOL_RESOURCE_ARR_SZ 100
+-
+ enum mlx5hws_pool_type {
+ 	MLX5HWS_POOL_TYPE_STE,
+ 	MLX5HWS_POOL_TYPE_STC,
+ };
+ 
+ struct mlx5hws_pool_chunk {
+-	u32 resource_idx;
+-	/* Internal offset, relative to base index */
+ 	int offset;
+ 	int order;
+ };
+@@ -72,14 +68,10 @@ enum mlx5hws_db_type {
+ 	MLX5HWS_POOL_DB_TYPE_GENERAL_SIZE,
+ 	/* One resource only, all the elements are with same one size */
+ 	MLX5HWS_POOL_DB_TYPE_ONE_SIZE_RESOURCE,
+-	/* Many resources, the memory allocated with buddy mechanism */
++	/* Entries are managed using a buddy mechanism. */
+ 	MLX5HWS_POOL_DB_TYPE_BUDDY,
+ };
+ 
+-struct mlx5hws_buddy_manager {
+-	struct mlx5hws_buddy_mem *buddies[MLX5HWS_POOL_RESOURCE_ARR_SZ];
+-};
+-
+ struct mlx5hws_pool_elements {
+ 	u32 num_of_elements;
+ 	unsigned long *bitmap;
+@@ -91,7 +83,7 @@ struct mlx5hws_pool_db {
+ 	enum mlx5hws_db_type type;
+ 	union {
+ 		struct mlx5hws_pool_elements *element;
+-		struct mlx5hws_buddy_manager *buddy_manager;
++		struct mlx5hws_buddy_mem *buddy;
+ 	};
+ };
+ 
+@@ -109,8 +101,8 @@ struct mlx5hws_pool {
+ 	size_t alloc_log_sz;
+ 	enum mlx5hws_table_type tbl_type;
+ 	enum mlx5hws_pool_optimize opt_type;
+-	struct mlx5hws_pool_resource *resource[MLX5HWS_POOL_RESOURCE_ARR_SZ];
+-	struct mlx5hws_pool_resource *mirror_resource[MLX5HWS_POOL_RESOURCE_ARR_SZ];
++	struct mlx5hws_pool_resource *resource;
++	struct mlx5hws_pool_resource *mirror_resource;
+ 	/* DB */
+ 	struct mlx5hws_pool_db db;
+ 	/* Functions */
+@@ -131,17 +123,13 @@ int mlx5hws_pool_chunk_alloc(struct mlx5
+ void mlx5hws_pool_chunk_free(struct mlx5hws_pool *pool,
+ 			     struct mlx5hws_pool_chunk *chunk);
+ 
+-static inline u32
+-mlx5hws_pool_chunk_get_base_id(struct mlx5hws_pool *pool,
+-			       struct mlx5hws_pool_chunk *chunk)
++static inline u32 mlx5hws_pool_get_base_id(struct mlx5hws_pool *pool)
+ {
+-	return pool->resource[chunk->resource_idx]->base_id;
++	return pool->resource->base_id;
+ }
+ 
+-static inline u32
+-mlx5hws_pool_chunk_get_base_mirror_id(struct mlx5hws_pool *pool,
+-				      struct mlx5hws_pool_chunk *chunk)
++static inline u32 mlx5hws_pool_get_base_mirror_id(struct mlx5hws_pool *pool)
+ {
+-	return pool->mirror_resource[chunk->resource_idx]->base_id;
++	return pool->mirror_resource->base_id;
+ }
+ #endif /* MLX5HWS_POOL_H_ */

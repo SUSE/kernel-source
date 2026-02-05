@@ -1,0 +1,109 @@
+From: Jianbo Liu <jianbol@nvidia.com>
+Date: Mon, 3 Feb 2025 23:35:04 +0200
+Subject: net/mlx5: Add init and destruction functions for a single HW clock
+Patch-mainline: v6.15-rc1
+Git-commit: ccb717a88b2ed57e464c3099d2e8b0c9db7cef21
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+Move hardware clock initialization and destruction to the functions,
+which will be used for dynamically allocated clock. Such clock is
+shared by all the devices if the queried clock identities are same.
+
+The out_work is for PPS out event, which can't be triggered when clock
+is shared, so INIT_WORK is not moved to the initialization function.
+Besides, we still need to register notifier for each device.
+
+Signed-off-by: Jianbo Liu <jianbol@nvidia.com>
+Reviewed-by: Carolina Jubran <cjubran@nvidia.com>
+Reviewed-by: Dragos Tatulea <dtatulea@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/lib/clock.c |   48 ++++++++++++--------
+ 1 file changed, 31 insertions(+), 17 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/lib/clock.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/lib/clock.c
+@@ -1153,17 +1153,11 @@ static void mlx5_init_pps(struct mlx5_co
+ 	mlx5_init_pin_config(mdev);
+ }
+ 
+-void mlx5_init_clock(struct mlx5_core_dev *mdev)
++static void mlx5_init_clock_dev(struct mlx5_core_dev *mdev)
+ {
+ 	struct mlx5_clock *clock = &mdev->clock;
+ 
+-	if (!MLX5_CAP_GEN(mdev, device_frequency_khz)) {
+-		mlx5_core_warn(mdev, "invalid device_frequency_khz, aborting HW clock init\n");
+-		return;
+-	}
+-
+ 	seqlock_init(&clock->lock);
+-	INIT_WORK(&clock->pps_info.out_work, mlx5_pps_out);
+ 
+ 	/* Initialize the device clock */
+ 	mlx5_init_timer_clock(mdev);
+@@ -1179,28 +1173,19 @@ void mlx5_init_clock(struct mlx5_core_de
+ 		clock->ptp = NULL;
+ 	}
+ 
+-	MLX5_NB_INIT(&clock->pps_nb, mlx5_pps_event, PPS_EVENT);
+-	mlx5_eq_notifier_register(mdev, &clock->pps_nb);
+-
+ 	if (clock->ptp)
+ 		ptp_schedule_worker(clock->ptp, 0);
+ }
+ 
+-void mlx5_cleanup_clock(struct mlx5_core_dev *mdev)
++static void mlx5_destroy_clock_dev(struct mlx5_core_dev *mdev)
+ {
+ 	struct mlx5_clock *clock = &mdev->clock;
+ 
+-	if (!MLX5_CAP_GEN(mdev, device_frequency_khz))
+-		return;
+-
+-	mlx5_eq_notifier_unregister(mdev, &clock->pps_nb);
+ 	if (clock->ptp) {
+ 		ptp_clock_unregister(clock->ptp);
+ 		clock->ptp = NULL;
+ 	}
+ 
+-	cancel_work_sync(&clock->pps_info.out_work);
+-
+ 	if (mdev->clock_info) {
+ 		free_page((unsigned long)mdev->clock_info);
+ 		mdev->clock_info = NULL;
+@@ -1208,3 +1193,32 @@ void mlx5_cleanup_clock(struct mlx5_core
+ 
+ 	kfree(clock->ptp_info.pin_config);
+ }
++
++void mlx5_init_clock(struct mlx5_core_dev *mdev)
++{
++	struct mlx5_clock *clock = &mdev->clock;
++
++	if (!MLX5_CAP_GEN(mdev, device_frequency_khz)) {
++		mlx5_core_warn(mdev, "invalid device_frequency_khz, aborting HW clock init\n");
++		return;
++	}
++
++	mlx5_init_clock_dev(mdev);
++
++	INIT_WORK(&clock->pps_info.out_work, mlx5_pps_out);
++	MLX5_NB_INIT(&clock->pps_nb, mlx5_pps_event, PPS_EVENT);
++	mlx5_eq_notifier_register(mdev, &clock->pps_nb);
++}
++
++void mlx5_cleanup_clock(struct mlx5_core_dev *mdev)
++{
++	struct mlx5_clock *clock = &mdev->clock;
++
++	if (!MLX5_CAP_GEN(mdev, device_frequency_khz))
++		return;
++
++	mlx5_eq_notifier_unregister(mdev, &clock->pps_nb);
++	cancel_work_sync(&clock->pps_info.out_work);
++
++	mlx5_destroy_clock_dev(mdev);
++}
