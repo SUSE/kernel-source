@@ -1,0 +1,241 @@
+From: Vitaly Lifshits <vitaly.lifshits@intel.com>
+Date: Thu, 16 Oct 2025 23:08:43 -0700
+Subject: e1000e: Introduce private flag to disable K1
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Patch-mainline: v6.19-rc1
+Git-commit: 3c7bf5af2196087f394f9099b53e37569636b259
+References: jsc#PED-14412
+
+The K1 state reduces power consumption on ICH family network controllers
+during idle periods, similarly to L1 state on PCI Express NICs. Therefore,
+it is recommended and enabled by default.
+However, on some systems it has been observed to have adverse side
+effects, such as packet loss. It has been established through debug that
+the problem may be due to firmware misconfiguration of specific systems,
+interoperability with certain link partners, or marginal electrical
+conditions of specific units.
+
+These problems typically cannot be fixed in the field, and generic
+workarounds to resolve the side effects on all systems, while keeping K1
+enabled, were found infeasible.
+Therefore, add the option for users to globally disable K1 idle state on
+the adapter.
+
+Additionally, disable K1 by default for MTL and later platforms, due to
+issues reported with the current configuration.
+
+Link: https://lore.kernel.org/intel-wired-lan/CAMqyJG3LVqfgqMcTxeaPur_Jq0oQH7GgdxRuVtRX_6TTH2mX5Q@mail.gmail.com/
+Link: https://lore.kernel.org/intel-wired-lan/20250626153544.1853d106@onyx.my.domain/
+Link: https://lore.kernel.org/intel-wired-lan/Z_z9EjcKtwHCQcZR@mail-itl/
+Link: https://github.com/QubesOS/qubes-issues/issues/9896
+Link: https://bugs.launchpad.net/ubuntu/+source/linux/+bug/2115393
+
+Signed-off-by: Vitaly Lifshits <vitaly.lifshits@intel.com>
+Reviewed-by: Timo Teräs <timo.teras@iki.fi>
+Tested-by: Timo Teräs <timo.teras@iki.fi>
+Reviewed-by: Aleksandr Loktionov <aleksandr.loktionov@intel.com>
+Reviewed-by: Dima Ruinskiy <dima.ruinskiy@intel.com>
+Tested-by: Avraham Koren <Avrahamx.koren@intel.com>
+Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+Link: https://patch.msgid.link/20251016-jk-iwl-next-2025-10-15-v2-14-ff3a390d9fc6@intel.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/e1000e/e1000.h   |    1 
+ drivers/net/ethernet/intel/e1000e/ethtool.c |   45 ++++++++++++++++++++++++----
+ drivers/net/ethernet/intel/e1000e/ich8lan.c |   41 ++++++++++++++-----------
+ drivers/net/ethernet/intel/e1000e/netdev.c  |    3 +
+ 4 files changed, 67 insertions(+), 23 deletions(-)
+
+--- a/drivers/net/ethernet/intel/e1000e/e1000.h
++++ b/drivers/net/ethernet/intel/e1000e/e1000.h
+@@ -461,6 +461,7 @@ s32 e1000e_get_base_timinca(struct e1000
+ #define FLAG2_CHECK_RX_HWTSTAMP           BIT(13)
+ #define FLAG2_CHECK_SYSTIM_OVERFLOW       BIT(14)
+ #define FLAG2_ENABLE_S0IX_FLOWS           BIT(15)
++#define FLAG2_DISABLE_K1		   BIT(16)
+ 
+ #define E1000_RX_DESC_PS(R, i)	    \
+ 	(&(((union e1000_rx_desc_packet_split *)((R).desc))[i]))
+--- a/drivers/net/ethernet/intel/e1000e/ethtool.c
++++ b/drivers/net/ethernet/intel/e1000e/ethtool.c
+@@ -26,6 +26,8 @@ struct e1000_stats {
+ static const char e1000e_priv_flags_strings[][ETH_GSTRING_LEN] = {
+ #define E1000E_PRIV_FLAGS_S0IX_ENABLED	BIT(0)
+ 	"s0ix-enabled",
++#define E1000E_PRIV_FLAGS_DISABLE_K1	BIT(1)
++	"disable-k1",
+ };
+ 
+ #define E1000E_PRIV_FLAGS_STR_LEN ARRAY_SIZE(e1000e_priv_flags_strings)
+@@ -2308,26 +2310,59 @@ static u32 e1000e_get_priv_flags(struct
+ 	if (adapter->flags2 & FLAG2_ENABLE_S0IX_FLOWS)
+ 		priv_flags |= E1000E_PRIV_FLAGS_S0IX_ENABLED;
+ 
++	if (adapter->flags2 & FLAG2_DISABLE_K1)
++		priv_flags |= E1000E_PRIV_FLAGS_DISABLE_K1;
++
+ 	return priv_flags;
+ }
+ 
+ static int e1000e_set_priv_flags(struct net_device *netdev, u32 priv_flags)
+ {
+ 	struct e1000_adapter *adapter = netdev_priv(netdev);
++	struct e1000_hw *hw = &adapter->hw;
+ 	unsigned int flags2 = adapter->flags2;
++	unsigned int changed;
+ 
+-	flags2 &= ~FLAG2_ENABLE_S0IX_FLOWS;
+-	if (priv_flags & E1000E_PRIV_FLAGS_S0IX_ENABLED) {
+-		struct e1000_hw *hw = &adapter->hw;
++	flags2 &= ~(FLAG2_ENABLE_S0IX_FLOWS | FLAG2_DISABLE_K1);
+ 
+-		if (hw->mac.type < e1000_pch_cnp)
++	if (priv_flags & E1000E_PRIV_FLAGS_S0IX_ENABLED) {
++		if (hw->mac.type < e1000_pch_cnp) {
++			e_err("S0ix is not supported on this device\n");
+ 			return -EINVAL;
++		}
++
+ 		flags2 |= FLAG2_ENABLE_S0IX_FLOWS;
+ 	}
+ 
+-	if (flags2 != adapter->flags2)
++	if (priv_flags & E1000E_PRIV_FLAGS_DISABLE_K1) {
++		if (hw->mac.type < e1000_ich8lan) {
++			e_err("Disabling K1 is not supported on this device\n");
++			return -EINVAL;
++		}
++
++		flags2 |= FLAG2_DISABLE_K1;
++	}
++
++	changed = adapter->flags2 ^ flags2;
++	if (changed)
+ 		adapter->flags2 = flags2;
+ 
++	if (changed & FLAG2_DISABLE_K1) {
++		/* reset the hardware to apply the changes */
++		while (test_and_set_bit(__E1000_RESETTING,
++					&adapter->state))
++			usleep_range(1000, 2000);
++
++		if (netif_running(adapter->netdev)) {
++			e1000e_down(adapter, true);
++			e1000e_up(adapter);
++		} else {
++			e1000e_reset(adapter);
++		}
++
++		clear_bit(__E1000_RESETTING, &adapter->state);
++	}
++
+ 	return 0;
+ }
+ 
+--- a/drivers/net/ethernet/intel/e1000e/ich8lan.c
++++ b/drivers/net/ethernet/intel/e1000e/ich8lan.c
+@@ -286,21 +286,26 @@ static void e1000_toggle_lanphypc_pch_lp
+ }
+ 
+ /**
+- * e1000_reconfigure_k1_exit_timeout - reconfigure K1 exit timeout to
+- * align to MTP and later platform requirements.
++ * e1000_reconfigure_k1_params - reconfigure Kumeran K1 parameters.
+  * @hw: pointer to the HW structure
+  *
++ * By default K1 is enabled after MAC reset, so this function only
++ * disables it.
++ *
+  * Context: PHY semaphore must be held by caller.
+  * Return: 0 on success, negative on failure
+  */
+-static s32 e1000_reconfigure_k1_exit_timeout(struct e1000_hw *hw)
++static s32 e1000_reconfigure_k1_params(struct e1000_hw *hw)
+ {
+ 	u16 phy_timeout;
+ 	u32 fextnvm12;
+ 	s32 ret_val;
+ 
+-	if (hw->mac.type < e1000_pch_mtp)
++	if (hw->mac.type < e1000_pch_mtp) {
++		if (hw->adapter->flags2 & FLAG2_DISABLE_K1)
++			return e1000_configure_k1_ich8lan(hw, false);
+ 		return 0;
++	}
+ 
+ 	/* Change Kumeran K1 power down state from P0s to P1 */
+ 	fextnvm12 = er32(FEXTNVM12);
+@@ -310,6 +315,8 @@ static s32 e1000_reconfigure_k1_exit_tim
+ 
+ 	/* Wait for the interface the settle */
+ 	usleep_range(1000, 1100);
++	if (hw->adapter->flags2 & FLAG2_DISABLE_K1)
++		return e1000_configure_k1_ich8lan(hw, false);
+ 
+ 	/* Change K1 exit timeout */
+ 	ret_val = e1e_rphy_locked(hw, I217_PHY_TIMEOUTS_REG,
+@@ -373,8 +380,8 @@ static s32 e1000_init_phy_workarounds_pc
+ 		/* At this point the PHY might be inaccessible so don't
+ 		 * propagate the failure
+ 		 */
+-		if (e1000_reconfigure_k1_exit_timeout(hw))
+-			e_dbg("Failed to reconfigure K1 exit timeout\n");
++		if (e1000_reconfigure_k1_params(hw))
++			e_dbg("Failed to reconfigure K1 parameters\n");
+ 
+ 		fallthrough;
+ 	case e1000_pch_lpt:
+@@ -473,10 +480,10 @@ static s32 e1000_init_phy_workarounds_pc
+ 		if (hw->mac.type >= e1000_pch_mtp) {
+ 			ret_val = hw->phy.ops.acquire(hw);
+ 			if (ret_val) {
+-				e_err("Failed to reconfigure K1 exit timeout\n");
++				e_err("Failed to reconfigure K1 parameters\n");
+ 				goto out;
+ 			}
+-			ret_val = e1000_reconfigure_k1_exit_timeout(hw);
++			ret_val = e1000_reconfigure_k1_params(hw);
+ 			hw->phy.ops.release(hw);
+ 		}
+ 	}
+@@ -4948,17 +4955,15 @@ static s32 e1000_init_hw_ich8lan(struct
+ 	u16 i;
+ 
+ 	e1000_initialize_hw_bits_ich8lan(hw);
+-	if (hw->mac.type >= e1000_pch_mtp) {
+-		ret_val = hw->phy.ops.acquire(hw);
+-		if (ret_val)
+-			return ret_val;
++	ret_val = hw->phy.ops.acquire(hw);
++	if (ret_val)
++		return ret_val;
+ 
+-		ret_val = e1000_reconfigure_k1_exit_timeout(hw);
+-		hw->phy.ops.release(hw);
+-		if (ret_val) {
+-			e_dbg("Error failed to reconfigure K1 exit timeout\n");
+-			return ret_val;
+-		}
++	ret_val = e1000_reconfigure_k1_params(hw);
++	hw->phy.ops.release(hw);
++	if (ret_val) {
++		e_dbg("Error failed to reconfigure K1 parameters\n");
++		return ret_val;
+ 	}
+ 
+ 	/* Initialize identification LED */
+--- a/drivers/net/ethernet/intel/e1000e/netdev.c
++++ b/drivers/net/ethernet/intel/e1000e/netdev.c
+@@ -7673,6 +7673,9 @@ static int e1000_probe(struct pci_dev *p
+ 	/* init PTP hardware clock */
+ 	e1000e_ptp_init(adapter);
+ 
++	if (hw->mac.type >= e1000_pch_mtp)
++		adapter->flags2 |= FLAG2_DISABLE_K1;
++
+ 	/* reset the hardware with the new settings */
+ 	e1000e_reset(adapter);
+ 
