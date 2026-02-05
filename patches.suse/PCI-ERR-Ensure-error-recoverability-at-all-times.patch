@@ -1,0 +1,90 @@
+From: Lukas Wunner <lukas@wunner.de>
+Date: Wed, 19 Nov 2025 09:50:03 +0100
+Subject: PCI/ERR: Ensure error recoverability at all times
+Git-commit: a2f1e22390ac2ca7ac8d77aa0f78c068b6dd2208
+Patch-mainline: v6.19-rc1
+References: <48e48a86-f88a-49e3-a9a0-29f8f43175cf@amd.com>
+
+When the PCI core gained power management support in 2002, it introduced
+pci_save_state() and pci_restore_state() helpers to restore Config Space
+after a D3hot or D3cold transition, which implies a Soft or Fundamental
+Reset (PCIe r7.0 sec 5.8):
+
+  https://git.kernel.org/tglx/history/c/a5287abe398b
+
+In 2006, EEH and AER were introduced to recover from errors by performing
+a reset.  Because errors can occur at any time, drivers began calling
+pci_save_state() on probe to ensure recoverability.
+
+In 2009, recoverability was foiled by commit c82f63e411f1 ("PCI: check
+saved state before restore"):  It amended pci_restore_state() to bail out
+if the "state_saved" flag has been cleared.  The flag is cleared by
+pci_restore_state() itself, hence a saved state is now allowed to be
+restored only once and is then invalidated.  That doesn't seem to make
+sense because the saved state should be good enough to be reused.
+
+Soon after, drivers began to work around this behavior by calling
+pci_save_state() immediately after pci_restore_state(), see e.g. commit
+b94f2d775a71 ("igb: call pci_save_state after pci_restore_state").
+Hilariously, two drivers even set the "saved_state" flag to true before
+invoking pci_restore_state(), see ipr_reset_restore_cfg_space() and
+e1000_io_slot_reset().
+
+Despite these workarounds, recoverability at all times is not guaranteed:
+E.g. when a PCIe port goes through a runtime suspend and resume cycle,
+the "saved_state" flag is cleared by:
+
+  pci_pm_runtime_resume()
+    pci_pm_default_resume_early()
+      pci_restore_state()
+
+... and hence on a subsequent AER event, the port's Config Space cannot be
+restored.  Riana reports a recovery failure of a GPU-integrated PCIe
+switch and has root-caused it to the behavior of pci_restore_state().
+Another workaround would be necessary, namely calling pci_save_state() in
+pcie_port_device_runtime_resume().
+
+The motivation of commit c82f63e411f1 was to prevent restoring state if
+pci_save_state() hasn't been called before.  But that can be achieved by
+saving state already on device addition, after Config Space has been
+initialized.  A desirable side effect is that devices become recoverable
+even if no driver gets bound.  This renders the commit unnecessary, so
+revert it.
+
+Reported-by: Riana Tauro <riana.tauro@intel.com> # off-list
+Signed-off-by: Lukas Wunner <lukas@wunner.de>
+Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+Tested-by: Riana Tauro <riana.tauro@intel.com>
+Reviewed-by: Rafael J. Wysocki (Intel) <rafael@kernel.org>
+Link: https://patch.msgid.link/9e34ce61c5404e99ffdd29205122c6fb334b38aa.1763483367.git.lukas@wunner.de
+
+Acked-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/pci/bus.c |    3 +++
+ drivers/pci/pci.c |    3 ---
+ 2 files changed, 3 insertions(+), 3 deletions(-)
+
+--- a/drivers/pci/bus.c
++++ b/drivers/pci/bus.c
+@@ -357,6 +357,9 @@ void pci_bus_add_device(struct pci_dev *
+ 	pci_proc_attach_device(dev);
+ 	pci_bridge_d3_update(dev);
+ 
++	/* Save config space for error recoverability */
++	pci_save_state(dev);
++
+ 	/*
+ 	 * If the PCI device is associated with a pwrctrl device with a
+ 	 * power supply, create a device link between the PCI device and
+--- a/drivers/pci/pci.c
++++ b/drivers/pci/pci.c
+@@ -1855,9 +1855,6 @@ static void pci_restore_rebar_state(stru
+  */
+ void pci_restore_state(struct pci_dev *dev)
+ {
+-	if (!dev->state_saved)
+-		return;
+-
+ 	pci_restore_pcie_state(dev);
+ 	pci_restore_pasid_state(dev);
+ 	pci_restore_pri_state(dev);
