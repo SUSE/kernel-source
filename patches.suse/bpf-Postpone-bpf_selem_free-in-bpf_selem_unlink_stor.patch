@@ -1,0 +1,171 @@
+From: Martin KaFai Lau <martin.lau@kernel.org>
+Date: Wed, 23 Oct 2024 16:47:51 -0700
+Subject: bpf: Postpone bpf_selem_free() in bpf_selem_unlink_storage_nolock()
+Patch-mainline: v6.13-rc1
+Git-commit: 5bd5bab76669b1e1551f03f5fcbc165f3fa8d269
+References: jsc#PED-14653
+
+In a later patch, bpf_selem_free() will call unpin_user_page()
+through bpf_obj_free_fields(). unpin_user_page() may take spin_lock.
+However, some bpf_selem_free() call paths have held a raw_spin_lock.
+Like this:
+
+raw_spin_lock_irqsave()
+  bpf_selem_unlink_storage_nolock()
+    bpf_selem_free()
+      unpin_user_page()
+        spin_lock()
+
+To avoid spinlock nested in raw_spinlock, bpf_selem_free() should be
+done after releasing the raw_spinlock. The "bool reuse_now" arg is
+replaced with "struct hlist_head *free_selem_list" in
+bpf_selem_unlink_storage_nolock(). The bpf_selem_unlink_storage_nolock()
+will append the to-be-free selem at the free_selem_list. The caller of
+bpf_selem_unlink_storage_nolock() will need to call the new
+bpf_selem_free_list(free_selem_list, reuse_now) to free the selem
+after releasing the raw_spinlock.
+
+Note that the selem->snode cannot be reused for linking to
+the free_selem_list because the selem->snode is protected by the
+raw_spinlock that we want to avoid holding. A new
+"struct hlist_node free_node;" is union-ized with
+the rcu_head. Only the first one successfully
+hlist_del_init_rcu(&selem->snode) will be able
+to use the free_node. After succeeding hlist_del_init_rcu(&selem->snode),
+the free_node and rcu_head usage is serialized such that they
+can share the 16 bytes in a union.
+
+Signed-off-by: Martin KaFai Lau <martin.lau@kernel.org>
+Link: https://lore.kernel.org/r/20241023234759.860539-5-martin.lau@linux.dev
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ include/linux/bpf_local_storage.h |    8 +++++++-
+ kernel/bpf/bpf_local_storage.c    |   35 ++++++++++++++++++++++++++++++-----
+ 2 files changed, 37 insertions(+), 6 deletions(-)
+
+--- a/include/linux/bpf_local_storage.h
++++ b/include/linux/bpf_local_storage.h
+@@ -77,7 +77,13 @@ struct bpf_local_storage_elem {
+ 	struct hlist_node map_node;	/* Linked to bpf_local_storage_map */
+ 	struct hlist_node snode;	/* Linked to bpf_local_storage */
+ 	struct bpf_local_storage __rcu *local_storage;
+-	struct rcu_head rcu;
++	union {
++		struct rcu_head rcu;
++		struct hlist_node free_node;	/* used to postpone
++						 * bpf_selem_free
++						 * after raw_spin_unlock
++						 */
++	};
+ 	/* 8 bytes hole */
+ 	/* The data is stored in another cacheline to minimize
+ 	 * the number of cachelines access during a cache hit.
+--- a/kernel/bpf/bpf_local_storage.c
++++ b/kernel/bpf/bpf_local_storage.c
+@@ -246,13 +246,30 @@ void bpf_selem_free(struct bpf_local_sto
+ 	}
+ }
+ 
++static void bpf_selem_free_list(struct hlist_head *list, bool reuse_now)
++{
++	struct bpf_local_storage_elem *selem;
++	struct bpf_local_storage_map *smap;
++	struct hlist_node *n;
++
++	/* The "_safe" iteration is needed.
++	 * The loop is not removing the selem from the list
++	 * but bpf_selem_free will use the selem->rcu_head
++	 * which is union-ized with the selem->free_node.
++	 */
++	hlist_for_each_entry_safe(selem, n, list, free_node) {
++		smap = rcu_dereference_check(SDATA(selem)->smap, bpf_rcu_lock_held());
++		bpf_selem_free(selem, smap, reuse_now);
++	}
++}
++
+ /* local_storage->lock must be held and selem->local_storage == local_storage.
+  * The caller must ensure selem->smap is still valid to be
+  * dereferenced for its smap->elem_size and smap->cache_idx.
+  */
+ static bool bpf_selem_unlink_storage_nolock(struct bpf_local_storage *local_storage,
+ 					    struct bpf_local_storage_elem *selem,
+-					    bool uncharge_mem, bool reuse_now)
++					    bool uncharge_mem, struct hlist_head *free_selem_list)
+ {
+ 	struct bpf_local_storage_map *smap;
+ 	bool free_local_storage;
+@@ -296,7 +313,7 @@ static bool bpf_selem_unlink_storage_nol
+ 	    SDATA(selem))
+ 		RCU_INIT_POINTER(local_storage->cache[smap->cache_idx], NULL);
+ 
+-	bpf_selem_free(selem, smap, reuse_now);
++	hlist_add_head(&selem->free_node, free_selem_list);
+ 
+ 	if (rcu_access_pointer(local_storage->smap) == smap)
+ 		RCU_INIT_POINTER(local_storage->smap, NULL);
+@@ -345,6 +362,7 @@ static void bpf_selem_unlink_storage(str
+ 	struct bpf_local_storage_map *storage_smap;
+ 	struct bpf_local_storage *local_storage;
+ 	bool bpf_ma, free_local_storage = false;
++	HLIST_HEAD(selem_free_list);
+ 	unsigned long flags;
+ 
+ 	if (unlikely(!selem_linked_to_storage_lockless(selem)))
+@@ -360,9 +378,11 @@ static void bpf_selem_unlink_storage(str
+ 	raw_spin_lock_irqsave(&local_storage->lock, flags);
+ 	if (likely(selem_linked_to_storage(selem)))
+ 		free_local_storage = bpf_selem_unlink_storage_nolock(
+-			local_storage, selem, true, reuse_now);
++			local_storage, selem, true, &selem_free_list);
+ 	raw_spin_unlock_irqrestore(&local_storage->lock, flags);
+ 
++	bpf_selem_free_list(&selem_free_list, reuse_now);
++
+ 	if (free_local_storage)
+ 		bpf_local_storage_free(local_storage, storage_smap, bpf_ma, reuse_now);
+ }
+@@ -529,6 +549,7 @@ bpf_local_storage_update(void *owner, st
+ 	struct bpf_local_storage_data *old_sdata = NULL;
+ 	struct bpf_local_storage_elem *alloc_selem, *selem = NULL;
+ 	struct bpf_local_storage *local_storage;
++	HLIST_HEAD(old_selem_free_list);
+ 	unsigned long flags;
+ 	int err;
+ 
+@@ -624,11 +645,12 @@ bpf_local_storage_update(void *owner, st
+ 	if (old_sdata) {
+ 		bpf_selem_unlink_map(SELEM(old_sdata));
+ 		bpf_selem_unlink_storage_nolock(local_storage, SELEM(old_sdata),
+-						true, false);
++						true, &old_selem_free_list);
+ 	}
+ 
+ unlock:
+ 	raw_spin_unlock_irqrestore(&local_storage->lock, flags);
++	bpf_selem_free_list(&old_selem_free_list, false);
+ 	if (alloc_selem) {
+ 		mem_uncharge(smap, owner, smap->elem_size);
+ 		bpf_selem_free(alloc_selem, smap, true);
+@@ -706,6 +728,7 @@ void bpf_local_storage_destroy(struct bp
+ 	struct bpf_local_storage_map *storage_smap;
+ 	struct bpf_local_storage_elem *selem;
+ 	bool bpf_ma, free_storage = false;
++	HLIST_HEAD(free_selem_list);
+ 	struct hlist_node *n;
+ 	unsigned long flags;
+ 
+@@ -734,10 +757,12 @@ void bpf_local_storage_destroy(struct bp
+ 		 * of the loop will set the free_cgroup_storage to true.
+ 		 */
+ 		free_storage = bpf_selem_unlink_storage_nolock(
+-			local_storage, selem, true, true);
++			local_storage, selem, true, &free_selem_list);
+ 	}
+ 	raw_spin_unlock_irqrestore(&local_storage->lock, flags);
+ 
++	bpf_selem_free_list(&free_selem_list, true);
++
+ 	if (free_storage)
+ 		bpf_local_storage_free(local_storage, storage_smap, bpf_ma, true);
+ }
