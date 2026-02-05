@@ -1,0 +1,110 @@
+From: Kui-Feng Lee <thinker.li@gmail.com>
+Date: Wed, 23 Oct 2024 16:47:49 -0700
+Subject: bpf: Handle BPF_UPTR in verifier
+Patch-mainline: v6.13-rc1
+Git-commit: 99dde42e37497b3062516b1db7231f9dec744a00
+References: jsc#PED-14653
+
+This patch adds BPF_UPTR support to the verifier. Not that only the
+map_value will support the "__uptr" type tag.
+
+This patch enforces only BPF_LDX is allowed to the value of an uptr.
+After BPF_LDX, it will mark the dst_reg as PTR_TO_MEM | PTR_MAYBE_NULL
+with size deduced from the field.kptr.btf_id. This will make the
+dst_reg pointed memory to be readable and writable as scalar.
+
+There is a redundant "val_reg = reg_state(env, value_regno);" statement
+in the check_map_kptr_access(). This patch takes this chance to remove
+it also.
+
+Signed-off-by: Kui-Feng Lee <thinker.li@gmail.com>
+Signed-off-by: Martin KaFai Lau <martin.lau@kernel.org>
+Link: https://lore.kernel.org/r/20241023234759.860539-3-martin.lau@linux.dev
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ kernel/bpf/verifier.c |   39 +++++++++++++++++++++++++++++++++------
+ 1 file changed, 33 insertions(+), 6 deletions(-)
+
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -5491,6 +5491,22 @@ static u32 btf_ld_kptr_type(struct bpf_v
+ 	return ret;
+ }
+ 
++static int mark_uptr_ld_reg(struct bpf_verifier_env *env, u32 regno,
++			    struct btf_field *field)
++{
++	struct bpf_reg_state *reg;
++	const struct btf_type *t;
++
++	t = btf_type_by_id(field->kptr.btf, field->kptr.btf_id);
++	mark_reg_known_zero(env, cur_regs(env), regno);
++	reg = reg_state(env, regno);
++	reg->type = PTR_TO_MEM | PTR_MAYBE_NULL;
++	reg->mem_size = t->size;
++	reg->id = ++env->id_gen;
++
++	return 0;
++}
++
+ static int check_map_kptr_access(struct bpf_verifier_env *env, u32 regno,
+ 				 int value_regno, int insn_idx,
+ 				 struct btf_field *kptr_field)
+@@ -5519,9 +5535,15 @@ static int check_map_kptr_access(struct
+ 		verbose(env, "store to referenced kptr disallowed\n");
+ 		return -EACCES;
+ 	}
++	if (class != BPF_LDX && kptr_field->type == BPF_UPTR) {
++		verbose(env, "store to uptr disallowed\n");
++		return -EACCES;
++	}
+ 
+ 	if (class == BPF_LDX) {
+-		val_reg = reg_state(env, value_regno);
++		if (kptr_field->type == BPF_UPTR)
++			return mark_uptr_ld_reg(env, value_regno, kptr_field);
++
+ 		/* We can simply mark the value_regno receiving the pointer
+ 		 * value from map as PTR_TO_BTF_ID, with the correct type.
+ 		 */
+@@ -5579,21 +5601,26 @@ static int check_map_access(struct bpf_v
+ 			case BPF_KPTR_UNREF:
+ 			case BPF_KPTR_REF:
+ 			case BPF_KPTR_PERCPU:
++			case BPF_UPTR:
+ 				if (src != ACCESS_DIRECT) {
+-					verbose(env, "kptr cannot be accessed indirectly by helper\n");
++					verbose(env, "%s cannot be accessed indirectly by helper\n",
++						btf_field_type_name(field->type));
+ 					return -EACCES;
+ 				}
+ 				if (!tnum_is_const(reg->var_off)) {
+-					verbose(env, "kptr access cannot have variable offset\n");
++					verbose(env, "%s access cannot have variable offset\n",
++						btf_field_type_name(field->type));
+ 					return -EACCES;
+ 				}
+ 				if (p != off + reg->var_off.value) {
+-					verbose(env, "kptr access misaligned expected=%u off=%llu\n",
++					verbose(env, "%s access misaligned expected=%u off=%llu\n",
++						btf_field_type_name(field->type),
+ 						p, off + reg->var_off.value);
+ 					return -EACCES;
+ 				}
+ 				if (size != bpf_size_to_bytes(BPF_DW)) {
+-					verbose(env, "kptr access size must be BPF_DW\n");
++					verbose(env, "%s access size must be BPF_DW\n",
++						btf_field_type_name(field->type));
+ 					return -EACCES;
+ 				}
+ 				break;
+@@ -6949,7 +6976,7 @@ static int check_mem_access(struct bpf_v
+ 			return err;
+ 		if (tnum_is_const(reg->var_off))
+ 			kptr_field = btf_record_find(reg->map_ptr->record,
+-						     off + reg->var_off.value, BPF_KPTR);
++						     off + reg->var_off.value, BPF_KPTR | BPF_UPTR);
+ 		if (kptr_field) {
+ 			err = check_map_kptr_access(env, regno, value_regno, insn_idx, kptr_field);
+ 		} else if (t == BPF_READ && value_regno >= 0) {
