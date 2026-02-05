@@ -1,0 +1,442 @@
+From: "Daniel T. Lee" <danieltimlee@gmail.com>
+Date: Fri, 11 Oct 2024 04:48:45 +0000
+Subject: selftests/bpf: migrate cgroup sock create test for prohibiting
+ sockets
+Patch-mainline: v6.13-rc1
+Git-commit: 64a4658d6f766ca058e28277a4c2743525d7dc26
+References: jsc#PED-14653
+
+This patch continues the migration and removal process for cgroup
+sock_create tests to selftests.
+
+The test being migrated verifies the ability of cgroup BPF to block the
+creation of specific types of sockets using a verdict. Specifically, the
+test denies socket creation when the socket is of type AF_INET{6},
+SOCK_DGRAM, and IPPROTO_ICMP{V6}. If the requested socket type matches
+these attributes, the cgroup BPF verdict blocks the socket creation.
+
+As with the previous commit, this test currently lacks coverage in
+selftests, so this patch migrates the functionality into the sock_create
+tests under selftests. This migration ensures that the socket creation
+blocking behavior with cgroup bpf program is properly tested within the
+selftest framework.
+
+Signed-off-by: Daniel T. Lee <danieltimlee@gmail.com>
+Link: https://lore.kernel.org/r/20241011044847.51584-3-danieltimlee@gmail.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ samples/bpf/Makefile                                 |    3 
+ samples/bpf/sock_flags.bpf.c                         |   47 --------
+ samples/bpf/test_cgrp2_sock2.c                       |   95 -----------------
+ samples/bpf/test_cgrp2_sock2.sh                      |  103 -------------------
+ tools/testing/selftests/bpf/prog_tests/sock_create.c |   83 ++++++++++++++-
+ 5 files changed, 80 insertions(+), 251 deletions(-)
+ delete mode 100644 samples/bpf/sock_flags.bpf.c
+ delete mode 100644 samples/bpf/test_cgrp2_sock2.c
+ delete mode 100755 samples/bpf/test_cgrp2_sock2.sh
+
+--- a/samples/bpf/Makefile
++++ b/samples/bpf/Makefile
+@@ -27,7 +27,6 @@ tprogs-y += map_perf_test
+ tprogs-y += test_overhead
+ tprogs-y += test_cgrp2_array_pin
+ tprogs-y += test_cgrp2_attach
+-tprogs-y += test_cgrp2_sock2
+ tprogs-y += xdp_router_ipv4
+ tprogs-y += test_current_task_under_cgroup
+ tprogs-y += trace_event
+@@ -75,7 +74,6 @@ map_perf_test-objs := map_perf_test_user
+ test_overhead-objs := test_overhead_user.o
+ test_cgrp2_array_pin-objs := test_cgrp2_array_pin.o
+ test_cgrp2_attach-objs := test_cgrp2_attach.o
+-test_cgrp2_sock2-objs := test_cgrp2_sock2.o
+ test_current_task_under_cgroup-objs := $(CGROUP_HELPERS) \
+ 				       test_current_task_under_cgroup_user.o
+ trace_event-objs := trace_event_user.o $(TRACE_HELPERS)
+@@ -106,7 +104,6 @@ always-y += tracex4.bpf.o
+ always-y += tracex5.bpf.o
+ always-y += tracex6.bpf.o
+ always-y += tracex7.bpf.o
+-always-y += sock_flags.bpf.o
+ always-y += test_probe_write_user.bpf.o
+ always-y += trace_output.bpf.o
+ always-y += tcbpf1_kern.o
+--- a/samples/bpf/sock_flags.bpf.c
++++ /dev/null
+@@ -1,47 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0
+-#include "vmlinux.h"
+-#include "net_shared.h"
+-#include <bpf/bpf_helpers.h>
+-
+-SEC("cgroup/sock")
+-int bpf_prog1(struct bpf_sock *sk)
+-{
+-	char fmt[] = "socket: family %d type %d protocol %d\n";
+-	char fmt2[] = "socket: uid %u gid %u\n";
+-	__u64 gid_uid = bpf_get_current_uid_gid();
+-	__u32 uid = gid_uid & 0xffffffff;
+-	__u32 gid = gid_uid >> 32;
+-
+-	bpf_trace_printk(fmt, sizeof(fmt), sk->family, sk->type, sk->protocol);
+-	bpf_trace_printk(fmt2, sizeof(fmt2), uid, gid);
+-
+-	/* block AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6 sockets
+-	 * ie., make ping6 fail
+-	 */
+-	if (sk->family == AF_INET6 &&
+-	    sk->type == SOCK_DGRAM   &&
+-	    sk->protocol == IPPROTO_ICMPV6)
+-		return 0;
+-
+-	return 1;
+-}
+-
+-SEC("cgroup/sock")
+-int bpf_prog2(struct bpf_sock *sk)
+-{
+-	char fmt[] = "socket: family %d type %d protocol %d\n";
+-
+-	bpf_trace_printk(fmt, sizeof(fmt), sk->family, sk->type, sk->protocol);
+-
+-	/* block AF_INET, SOCK_DGRAM, IPPROTO_ICMP sockets
+-	 * ie., make ping fail
+-	 */
+-	if (sk->family == AF_INET &&
+-	    sk->type == SOCK_DGRAM  &&
+-	    sk->protocol == IPPROTO_ICMP)
+-		return 0;
+-
+-	return 1;
+-}
+-
+-char _license[] SEC("license") = "GPL";
+--- a/samples/bpf/test_cgrp2_sock2.c
++++ /dev/null
+@@ -1,95 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0
+-/* eBPF example program:
+- *
+- * - Loads eBPF program
+- *
+- *   The eBPF program loads a filter from file and attaches the
+- *   program to a cgroup using BPF_PROG_ATTACH
+- */
+-
+-#define _GNU_SOURCE
+-
+-#include <stdio.h>
+-#include <stdlib.h>
+-#include <stddef.h>
+-#include <string.h>
+-#include <unistd.h>
+-#include <assert.h>
+-#include <errno.h>
+-#include <fcntl.h>
+-#include <net/if.h>
+-#include <linux/bpf.h>
+-#include <bpf/bpf.h>
+-#include <bpf/libbpf.h>
+-
+-#include "bpf_insn.h"
+-
+-static int usage(const char *argv0)
+-{
+-	printf("Usage: %s cg-path filter-path [filter-id]\n", argv0);
+-	return EXIT_FAILURE;
+-}
+-
+-int main(int argc, char **argv)
+-{
+-	int cg_fd, err, ret = EXIT_FAILURE, filter_id = 0, prog_cnt = 0;
+-	const char *link_pin_path = "/sys/fs/bpf/test_cgrp2_sock2";
+-	struct bpf_link *link = NULL;
+-	struct bpf_program *progs[2];
+-	struct bpf_program *prog;
+-	struct bpf_object *obj;
+-
+-	if (argc < 3)
+-		return usage(argv[0]);
+-
+-	if (argc > 3)
+-		filter_id = atoi(argv[3]);
+-
+-	cg_fd = open(argv[1], O_DIRECTORY | O_RDONLY);
+-	if (cg_fd < 0) {
+-		printf("Failed to open cgroup path: '%s'\n", strerror(errno));
+-		return ret;
+-	}
+-
+-	obj = bpf_object__open_file(argv[2], NULL);
+-	if (libbpf_get_error(obj)) {
+-		printf("ERROR: opening BPF object file failed\n");
+-		return ret;
+-	}
+-
+-	bpf_object__for_each_program(prog, obj) {
+-		progs[prog_cnt] = prog;
+-		prog_cnt++;
+-	}
+-
+-	if (filter_id >= prog_cnt) {
+-		printf("Invalid program id; program not found in file\n");
+-		goto cleanup;
+-	}
+-
+-	/* load BPF program */
+-	if (bpf_object__load(obj)) {
+-		printf("ERROR: loading BPF object file failed\n");
+-		goto cleanup;
+-	}
+-
+-	link = bpf_program__attach_cgroup(progs[filter_id], cg_fd);
+-	if (libbpf_get_error(link)) {
+-		printf("ERROR: bpf_program__attach failed\n");
+-		link = NULL;
+-		goto cleanup;
+-	}
+-
+-	err = bpf_link__pin(link, link_pin_path);
+-	if (err < 0) {
+-		printf("ERROR: bpf_link__pin failed: %d\n", err);
+-		goto cleanup;
+-	}
+-
+-	ret = EXIT_SUCCESS;
+-
+-cleanup:
+-	bpf_link__destroy(link);
+-	bpf_object__close(obj);
+-	return ret;
+-}
+--- a/samples/bpf/test_cgrp2_sock2.sh
++++ /dev/null
+@@ -1,103 +0,0 @@
+-#!/bin/bash
+-# SPDX-License-Identifier: GPL-2.0
+-
+-BPFFS=/sys/fs/bpf
+-MY_DIR=$(dirname $0)
+-TEST=$MY_DIR/test_cgrp2_sock2
+-LINK_PIN=$BPFFS/test_cgrp2_sock2
+-BPF_PROG=$MY_DIR/sock_flags.bpf.o
+-
+-function config_device {
+-	ip netns add at_ns0
+-	ip link add veth0 type veth peer name veth0b
+-	ip link set veth0 netns at_ns0
+-	ip netns exec at_ns0 sysctl -q net.ipv6.conf.veth0.disable_ipv6=0
+-	ip netns exec at_ns0 ip addr add 172.16.1.100/24 dev veth0
+-	ip netns exec at_ns0 ip addr add 2401:db00::1/64 dev veth0 nodad
+-	ip netns exec at_ns0 ip link set dev veth0 up
+-	sysctl -q net.ipv6.conf.veth0b.disable_ipv6=0
+-	ip addr add 172.16.1.101/24 dev veth0b
+-	ip addr add 2401:db00::2/64 dev veth0b nodad
+-	ip link set veth0b up
+-}
+-
+-function config_cgroup {
+-	rm -rf /tmp/cgroupv2
+-	mkdir -p /tmp/cgroupv2
+-	mount -t cgroup2 none /tmp/cgroupv2
+-	mkdir -p /tmp/cgroupv2/foo
+-	echo $$ >> /tmp/cgroupv2/foo/cgroup.procs
+-}
+-
+-function config_bpffs {
+-	if mount | grep $BPFFS > /dev/null; then
+-		echo "bpffs already mounted"
+-	else
+-		echo "bpffs not mounted. Mounting..."
+-		mount -t bpf none $BPFFS
+-	fi
+-}
+-
+-function attach_bpf {
+-	$TEST /tmp/cgroupv2/foo $BPF_PROG $1
+-	[ $? -ne 0 ] && exit 1
+-}
+-
+-function cleanup {
+-	rm -rf $LINK_PIN
+-	ip link del veth0b
+-	ip netns delete at_ns0
+-	umount /tmp/cgroupv2
+-	rm -rf /tmp/cgroupv2
+-}
+-
+-cleanup 2>/dev/null
+-
+-set -e
+-config_device
+-config_cgroup
+-config_bpffs
+-set +e
+-
+-#
+-# Test 1 - fail ping6
+-#
+-attach_bpf 0
+-ping -c1 -w1 172.16.1.100
+-if [ $? -ne 0 ]; then
+-	echo "ping failed when it should succeed"
+-	cleanup
+-	exit 1
+-fi
+-
+-ping6 -c1 -w1 2401:db00::1
+-if [ $? -eq 0 ]; then
+-	echo "ping6 succeeded when it should not"
+-	cleanup
+-	exit 1
+-fi
+-
+-rm -rf $LINK_PIN
+-sleep 1                 # Wait for link detach
+-
+-#
+-# Test 2 - fail ping
+-#
+-attach_bpf 1
+-ping6 -c1 -w1 2401:db00::1
+-if [ $? -ne 0 ]; then
+-	echo "ping6 failed when it should succeed"
+-	cleanup
+-	exit 1
+-fi
+-
+-ping -c1 -w1 172.16.1.100
+-if [ $? -eq 0 ]; then
+-	echo "ping succeeded when it should not"
+-	cleanup
+-	exit 1
+-fi
+-
+-cleanup
+-echo
+-echo "*** PASS ***"
+--- a/tools/testing/selftests/bpf/prog_tests/sock_create.c
++++ b/tools/testing/selftests/bpf/prog_tests/sock_create.c
+@@ -6,6 +6,11 @@
+ static char bpf_log_buf[4096];
+ static bool verbose;
+ 
++enum sock_create_test_error {
++	OK = 0,
++	DENY_CREATE,
++};
++
+ static struct sock_create_test {
+ 	const char			*descr;
+ 	const struct bpf_insn		insns[64];
+@@ -14,9 +19,11 @@ static struct sock_create_test {
+ 
+ 	int				domain;
+ 	int				type;
++	int				protocol;
+ 
+ 	int				optname;
+ 	int				optval;
++	enum sock_create_test_error	error;
+ } tests[] = {
+ 	{
+ 		.descr = "AF_INET set priority",
+@@ -164,6 +171,72 @@ static struct sock_create_test {
+ 		.optname = SO_BINDTOIFINDEX,
+ 		.optval = 1,
+ 	},
++	{
++		.descr = "block AF_INET, SOCK_DGRAM, IPPROTO_ICMP socket",
++		.insns = {
++			BPF_MOV64_IMM(BPF_REG_0, 1),	/* r0 = verdict */
++
++			/* sock->family == AF_INET */
++			BPF_LDX_MEM(BPF_H, BPF_REG_2, BPF_REG_1,
++				    offsetof(struct bpf_sock, family)),
++			BPF_JMP_IMM(BPF_JNE, BPF_REG_2, AF_INET, 5),
++
++			/* sock->type == SOCK_DGRAM */
++			BPF_LDX_MEM(BPF_H, BPF_REG_2, BPF_REG_1,
++				    offsetof(struct bpf_sock, type)),
++			BPF_JMP_IMM(BPF_JNE, BPF_REG_2, SOCK_DGRAM, 3),
++
++			/* sock->protocol == IPPROTO_ICMP */
++			BPF_LDX_MEM(BPF_H, BPF_REG_2, BPF_REG_1,
++				    offsetof(struct bpf_sock, protocol)),
++			BPF_JMP_IMM(BPF_JNE, BPF_REG_2, IPPROTO_ICMP, 1),
++
++			/* return 0 (block) */
++			BPF_MOV64_IMM(BPF_REG_0, 0),
++			BPF_EXIT_INSN(),
++		},
++		.expected_attach_type = BPF_CGROUP_INET_SOCK_CREATE,
++		.attach_type = BPF_CGROUP_INET_SOCK_CREATE,
++
++		.domain = AF_INET,
++		.type = SOCK_DGRAM,
++		.protocol = IPPROTO_ICMP,
++
++		.error = DENY_CREATE,
++	},
++	{
++		.descr = "block AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6 socket",
++		.insns = {
++			BPF_MOV64_IMM(BPF_REG_0, 1),	/* r0 = verdict */
++
++			/* sock->family == AF_INET6 */
++			BPF_LDX_MEM(BPF_H, BPF_REG_2, BPF_REG_1,
++				    offsetof(struct bpf_sock, family)),
++			BPF_JMP_IMM(BPF_JNE, BPF_REG_2, AF_INET6, 5),
++
++			/* sock->type == SOCK_DGRAM */
++			BPF_LDX_MEM(BPF_H, BPF_REG_2, BPF_REG_1,
++				    offsetof(struct bpf_sock, type)),
++			BPF_JMP_IMM(BPF_JNE, BPF_REG_2, SOCK_DGRAM, 3),
++
++			/* sock->protocol == IPPROTO_ICMPV6 */
++			BPF_LDX_MEM(BPF_H, BPF_REG_2, BPF_REG_1,
++				    offsetof(struct bpf_sock, protocol)),
++			BPF_JMP_IMM(BPF_JNE, BPF_REG_2, IPPROTO_ICMPV6, 1),
++
++			/* return 0 (block) */
++			BPF_MOV64_IMM(BPF_REG_0, 0),
++			BPF_EXIT_INSN(),
++		},
++		.expected_attach_type = BPF_CGROUP_INET_SOCK_CREATE,
++		.attach_type = BPF_CGROUP_INET_SOCK_CREATE,
++
++		.domain = AF_INET,
++		.type = SOCK_DGRAM,
++		.protocol = IPPROTO_ICMPV6,
++
++		.error = DENY_CREATE,
++	},
+ };
+ 
+ static int load_prog(const struct bpf_insn *insns,
+@@ -208,9 +281,13 @@ static int run_test(int cgroup_fd, struc
+ 		goto close_prog_fd;
+ 	}
+ 
+-	sock_fd = socket(test->domain, test->type, 0);
++	sock_fd = socket(test->domain, test->type, test->protocol);
+ 	if (sock_fd < 0) {
+-		log_err("Failed to create socket");
++		if (test->error == DENY_CREATE)
++			ret = 0;
++		else
++			log_err("Failed to create socket");
++
+ 		goto detach_prog;
+ 	}
+ 
+@@ -226,7 +303,7 @@ static int run_test(int cgroup_fd, struc
+ 		goto cleanup;
+ 	}
+ 
+-	ret = 0;
++	ret = test->error != OK;
+ 
+ cleanup:
+ 	close(sock_fd);
