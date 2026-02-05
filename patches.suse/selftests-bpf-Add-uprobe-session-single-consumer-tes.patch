@@ -1,0 +1,125 @@
+From: Jiri Olsa <jolsa@kernel.org>
+Date: Fri, 8 Nov 2024 14:45:42 +0100
+Subject: selftests/bpf: Add uprobe session single consumer test
+Patch-mainline: v6.13-rc1
+Git-commit: c574bcd6229333c211dbf4ecba2988c3581b0f92
+References: jsc#PED-14653
+
+Testing that the session ret_handler bypass works on single
+uprobe with multiple consumers, each with different session
+ignore return value.
+
+Signed-off-by: Jiri Olsa <jolsa@kernel.org>
+Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+Acked-by: Andrii Nakryiko <andrii@kernel.org>
+Link: https://lore.kernel.org/bpf/20241108134544.480660-12-jolsa@kernel.org
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ tools/testing/selftests/bpf/prog_tests/uprobe_multi_test.c      |   33 +++++++
+ tools/testing/selftests/bpf/progs/uprobe_multi_session_single.c |   44 ++++++++++
+ 2 files changed, 77 insertions(+)
+ create mode 100644 tools/testing/selftests/bpf/progs/uprobe_multi_session_single.c
+
+--- a/tools/testing/selftests/bpf/prog_tests/uprobe_multi_test.c
++++ b/tools/testing/selftests/bpf/prog_tests/uprobe_multi_test.c
+@@ -9,6 +9,7 @@
+ #include "uprobe_multi_consumers.skel.h"
+ #include "uprobe_multi_pid_filter.skel.h"
+ #include "uprobe_multi_session.skel.h"
++#include "uprobe_multi_session_single.skel.h"
+ #include "uprobe_multi_session_cookie.skel.h"
+ #include "uprobe_multi_session_recursive.skel.h"
+ #include "uprobe_multi_verifier.skel.h"
+@@ -1071,6 +1072,36 @@ cleanup:
+ 	uprobe_multi_session__destroy(skel);
+ }
+ 
++static void test_session_single_skel_api(void)
++{
++	struct uprobe_multi_session_single *skel = NULL;
++	LIBBPF_OPTS(bpf_kprobe_multi_opts, opts);
++	int err;
++
++	skel = uprobe_multi_session_single__open_and_load();
++	if (!ASSERT_OK_PTR(skel, "uprobe_multi_session_single__open_and_load"))
++		goto cleanup;
++
++	skel->bss->pid = getpid();
++
++	err = uprobe_multi_session_single__attach(skel);
++	if (!ASSERT_OK(err, "uprobe_multi_session_single__attach"))
++		goto cleanup;
++
++	uprobe_multi_func_1();
++
++	/*
++	 * We expect consumer 0 and 2 to trigger just entry handler (value 1)
++	 * and consumer 1 to hit both (value 2).
++	 */
++	ASSERT_EQ(skel->bss->uprobe_session_result[0], 1, "uprobe_session_result_0");
++	ASSERT_EQ(skel->bss->uprobe_session_result[1], 2, "uprobe_session_result_1");
++	ASSERT_EQ(skel->bss->uprobe_session_result[2], 1, "uprobe_session_result_2");
++
++cleanup:
++	uprobe_multi_session_single__destroy(skel);
++}
++
+ static void test_session_cookie_skel_api(void)
+ {
+ 	struct uprobe_multi_session_cookie *skel = NULL;
+@@ -1245,6 +1276,8 @@ void test_uprobe_multi_test(void)
+ 		test_pid_filter_process(true);
+ 	if (test__start_subtest("session"))
+ 		test_session_skel_api();
++	if (test__start_subtest("session_single"))
++		test_session_single_skel_api();
+ 	if (test__start_subtest("session_cookie"))
+ 		test_session_cookie_skel_api();
+ 	if (test__start_subtest("session_cookie_recursive"))
+--- /dev/null
++++ b/tools/testing/selftests/bpf/progs/uprobe_multi_session_single.c
+@@ -0,0 +1,44 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <linux/bpf.h>
++#include <bpf/bpf_helpers.h>
++#include <bpf/bpf_tracing.h>
++#include <stdbool.h>
++#include "bpf_kfuncs.h"
++#include "bpf_misc.h"
++
++char _license[] SEC("license") = "GPL";
++
++__u64 uprobe_session_result[3] = {};
++int pid = 0;
++
++static int uprobe_multi_check(void *ctx, int idx)
++{
++	if (bpf_get_current_pid_tgid() >> 32 != pid)
++		return 1;
++
++	uprobe_session_result[idx]++;
++
++	/* only consumer 1 executes return probe */
++	if (idx == 0 || idx == 2)
++		return 1;
++
++	return 0;
++}
++
++SEC("uprobe.session//proc/self/exe:uprobe_multi_func_1")
++int uprobe_0(struct pt_regs *ctx)
++{
++	return uprobe_multi_check(ctx, 0);
++}
++
++SEC("uprobe.session//proc/self/exe:uprobe_multi_func_1")
++int uprobe_1(struct pt_regs *ctx)
++{
++	return uprobe_multi_check(ctx, 1);
++}
++
++SEC("uprobe.session//proc/self/exe:uprobe_multi_func_1")
++int uprobe_2(struct pt_regs *ctx)
++{
++	return uprobe_multi_check(ctx, 2);
++}
