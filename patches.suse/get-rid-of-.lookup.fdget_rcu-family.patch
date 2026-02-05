@@ -1,0 +1,280 @@
+From: Al Viro <viro@zeniv.linux.org.uk>
+Date: Wed, 31 Jul 2024 11:49:04 -0400
+Subject: get rid of ...lookup...fdget_rcu() family
+Patch-mainline: v6.13-rc1
+Git-commit: 8fd3395ec9051a52828fcca2328cb50a69dea8ef
+References: jsc#PED-14653
+
+Once upon a time, predecessors of those used to do file lookup
+without bumping a refcount, provided that caller held rcu_read_lock()
+across the lookup and whatever it wanted to read from the struct
+file found.  When struct file allocation switched to SLAB_TYPESAFE_BY_RCU,
+that stopped being feasible and these primitives started to bump the
+file refcount for lookup result, requiring the caller to call fput()
+afterwards.
+
+But that turned them pointless - e.g.
+	rcu_read_lock();
+	file = lookup_fdget_rcu(fd);
+	rcu_read_unlock();
+is equivalent to
+	file = fget_raw(fd);
+and all callers of lookup_fdget_rcu() are of that form.  Similarly,
+task_lookup_fdget_rcu() calls can be replaced with calling fget_task().
+task_lookup_next_fdget_rcu() doesn't have direct counterparts, but
+its callers would be happier if we replaced it with an analogue that
+deals with RCU internally.
+
+Reviewed-by: Christian Brauner <brauner@kernel.org>
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ arch/powerpc/platforms/cell/spufs/coredump.c |    4 ---
+ fs/file.c                                    |   28 +++------------------------
+ fs/gfs2/glock.c                              |   12 +----------
+ fs/notify/dnotify/dnotify.c                  |    5 ----
+ fs/proc/fd.c                                 |   12 ++---------
+ include/linux/fdtable.h                      |    4 ---
+ include/linux/file.h                         |    1 
+ kernel/bpf/task_iter.c                       |    6 -----
+ kernel/kcmp.c                                |    4 ---
+ 9 files changed, 14 insertions(+), 62 deletions(-)
+
+--- a/arch/powerpc/platforms/cell/spufs/coredump.c
++++ b/arch/powerpc/platforms/cell/spufs/coredump.c
+@@ -73,9 +73,7 @@ static struct spu_context *coredump_next
+ 		return NULL;
+ 	*fd = n - 1;
+ 
+-	rcu_read_lock();
+-	file = lookup_fdget_rcu(*fd);
+-	rcu_read_unlock();
++	file = fget_raw(*fd);
+ 	if (file) {
+ 		ctx = SPUFS_I(file_inode(file))->i_ctx;
+ 		get_spu_context(ctx);
+--- a/fs/file.c
++++ b/fs/file.c
+@@ -1037,29 +1037,7 @@ struct file *fget_task(struct task_struc
+ 	return file;
+ }
+ 
+-struct file *lookup_fdget_rcu(unsigned int fd)
+-{
+-	return __fget_files_rcu(current->files, fd, 0);
+-
+-}
+-EXPORT_SYMBOL_GPL(lookup_fdget_rcu);
+-
+-struct file *task_lookup_fdget_rcu(struct task_struct *task, unsigned int fd)
+-{
+-	/* Must be called with rcu_read_lock held */
+-	struct files_struct *files;
+-	struct file *file = NULL;
+-
+-	task_lock(task);
+-	files = task->files;
+-	if (files)
+-		file = __fget_files_rcu(files, fd, 0);
+-	task_unlock(task);
+-
+-	return file;
+-}
+-
+-struct file *task_lookup_next_fdget_rcu(struct task_struct *task, unsigned int *ret_fd)
++struct file *fget_task_next(struct task_struct *task, unsigned int *ret_fd)
+ {
+ 	/* Must be called with rcu_read_lock held */
+ 	struct files_struct *files;
+@@ -1069,17 +1047,19 @@ struct file *task_lookup_next_fdget_rcu(
+ 	task_lock(task);
+ 	files = task->files;
+ 	if (files) {
++		rcu_read_lock();
+ 		for (; fd < files_fdtable(files)->max_fds; fd++) {
+ 			file = __fget_files_rcu(files, fd, 0);
+ 			if (file)
+ 				break;
+ 		}
++		rcu_read_unlock();
+ 	}
+ 	task_unlock(task);
+ 	*ret_fd = fd;
+ 	return file;
+ }
+-EXPORT_SYMBOL(task_lookup_next_fdget_rcu);
++EXPORT_SYMBOL(fget_task_next);
+ 
+ /*
+  * Lightweight file lookup - no refcnt increment if fd table isn't shared.
+--- a/fs/gfs2/glock.c
++++ b/fs/gfs2/glock.c
+@@ -34,7 +34,6 @@
+ #include <linux/lockref.h>
+ #include <linux/rhashtable.h>
+ #include <linux/pid_namespace.h>
+-#include <linux/fdtable.h>
+ #include <linux/file.h>
+ 
+ #include "gfs2.h"
+@@ -2768,25 +2767,18 @@ static struct file *gfs2_glockfd_next_fi
+ 		i->file = NULL;
+ 	}
+ 
+-	rcu_read_lock();
+ 	for(;; i->fd++) {
+-		struct inode *inode;
+-
+-		i->file = task_lookup_next_fdget_rcu(i->task, &i->fd);
++		i->file = fget_task_next(i->task, &i->fd);
+ 		if (!i->file) {
+ 			i->fd = 0;
+ 			break;
+ 		}
+ 
+-		inode = file_inode(i->file);
+-		if (inode->i_sb == i->sb)
++		if (file_inode(i->file)->i_sb == i->sb)
+ 			break;
+ 
+-		rcu_read_unlock();
+ 		fput(i->file);
+-		rcu_read_lock();
+ 	}
+-	rcu_read_unlock();
+ 	return i->file;
+ }
+ 
+--- a/fs/notify/dnotify/dnotify.c
++++ b/fs/notify/dnotify/dnotify.c
+@@ -16,7 +16,6 @@
+ #include <linux/security.h>
+ #include <linux/spinlock.h>
+ #include <linux/slab.h>
+-#include <linux/fdtable.h>
+ #include <linux/fsnotify_backend.h>
+ 
+ static int dir_notify_enable __read_mostly = 1;
+@@ -347,9 +346,7 @@ int fcntl_dirnotify(int fd, struct file
+ 		new_fsn_mark = NULL;
+ 	}
+ 
+-	rcu_read_lock();
+-	f = lookup_fdget_rcu(fd);
+-	rcu_read_unlock();
++	f = fget_raw(fd);
+ 
+ 	/* if (f != filp) means that we lost a race and another task/thread
+ 	 * actually closed the fd we are still playing with before we grabbed
+--- a/fs/proc/fd.c
++++ b/fs/proc/fd.c
+@@ -116,9 +116,7 @@ static bool tid_fd_mode(struct task_stru
+ {
+ 	struct file *file;
+ 
+-	rcu_read_lock();
+-	file = task_lookup_fdget_rcu(task, fd);
+-	rcu_read_unlock();
++	file = fget_task(task, fd);
+ 	if (file) {
+ 		*mode = file->f_mode;
+ 		fput(file);
+@@ -258,19 +256,17 @@ static int proc_readfd_common(struct fil
+ 	if (!dir_emit_dots(file, ctx))
+ 		goto out;
+ 
+-	rcu_read_lock();
+ 	for (fd = ctx->pos - 2;; fd++) {
+ 		struct file *f;
+ 		struct fd_data data;
+ 		char name[10 + 1];
+ 		unsigned int len;
+ 
+-		f = task_lookup_next_fdget_rcu(p, &fd);
++		f = fget_task_next(p, &fd);
+ 		ctx->pos = fd + 2LL;
+ 		if (!f)
+ 			break;
+ 		data.mode = f->f_mode;
+-		rcu_read_unlock();
+ 		fput(f);
+ 		data.fd = fd;
+ 
+@@ -278,11 +274,9 @@ static int proc_readfd_common(struct fil
+ 		if (!proc_fill_cache(file, ctx,
+ 				     name, len, instantiate, p,
+ 				     &data))
+-			goto out;
++			break;
+ 		cond_resched();
+-		rcu_read_lock();
+ 	}
+-	rcu_read_unlock();
+ out:
+ 	put_task_struct(p);
+ 	return 0;
+--- a/include/linux/fdtable.h
++++ b/include/linux/fdtable.h
+@@ -92,10 +92,6 @@ static inline struct file *files_lookup_
+ 	return files_lookup_fd_raw(files, fd);
+ }
+ 
+-struct file *lookup_fdget_rcu(unsigned int fd);
+-struct file *task_lookup_fdget_rcu(struct task_struct *task, unsigned int fd);
+-struct file *task_lookup_next_fdget_rcu(struct task_struct *task, unsigned int *fd);
+-
+ static inline bool close_on_exec(unsigned int fd, const struct files_struct *files)
+ {
+ 	return test_bit(fd, files_fdtable(files)->close_on_exec);
+--- a/include/linux/file.h
++++ b/include/linux/file.h
+@@ -72,6 +72,7 @@ static inline void fdput(struct fd fd)
+ extern struct file *fget(unsigned int fd);
+ extern struct file *fget_raw(unsigned int fd);
+ extern struct file *fget_task(struct task_struct *task, unsigned int fd);
++extern struct file *fget_task_next(struct task_struct *task, unsigned int *fd);
+ extern void __f_unlock_pos(struct file *);
+ 
+ struct fd fdget(unsigned int fd);
+--- a/kernel/bpf/task_iter.c
++++ b/kernel/bpf/task_iter.c
+@@ -5,7 +5,6 @@
+ #include <linux/namei.h>
+ #include <linux/pid_namespace.h>
+ #include <linux/fs.h>
+-#include <linux/fdtable.h>
+ #include <linux/filter.h>
+ #include <linux/bpf_mem_alloc.h>
+ #include <linux/btf_ids.h>
+@@ -286,17 +285,14 @@ again:
+ 			curr_fd = 0;
+ 	}
+ 
+-	rcu_read_lock();
+-	f = task_lookup_next_fdget_rcu(curr_task, &curr_fd);
++	f = fget_task_next(curr_task, &curr_fd);
+ 	if (f) {
+ 		/* set info->fd */
+ 		info->fd = curr_fd;
+-		rcu_read_unlock();
+ 		return f;
+ 	}
+ 
+ 	/* the current task is done, go to the next task */
+-	rcu_read_unlock();
+ 	put_task_struct(curr_task);
+ 
+ 	if (info->common.type == BPF_TASK_ITER_TID) {
+--- a/kernel/kcmp.c
++++ b/kernel/kcmp.c
+@@ -63,9 +63,7 @@ get_file_raw_ptr(struct task_struct *tas
+ {
+ 	struct file *file;
+ 
+-	rcu_read_lock();
+-	file = task_lookup_fdget_rcu(task, idx);
+-	rcu_read_unlock();
++	file = fget_task(task, idx);
+ 	if (file)
+ 		fput(file);
+ 
