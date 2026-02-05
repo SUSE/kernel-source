@@ -1,0 +1,63 @@
+From 3f5f6321f129ad5a30aa03c99c196b4612be68a8 Mon Sep 17 00:00:00 2001
+From: Or Har-Toov <ohartoov@nvidia.com>
+Date: Mon, 16 Jun 2025 11:16:03 +0300
+Subject: [PATCH 1/1] IB/core: Annotate umem_mutex acquisition under fs_reclaim
+ for lockdep
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: 3f5f6321f129ad5a30aa03c99c196b4612be68a8
+Patch-mainline: v6.16-rc5
+References: jsc#PED-15314
+
+Following the fix in the previous commit ("IB/mlx5: Fix potential
+deadlock in MR deregistration"), teach lockdep explicitly about the
+locking order between fs_reclaim and umem_mutex.
+
+The previous commit resolved a potential deadlock scenario where
+kzalloc(GFP_KERNEL) was called while holding umem_mutex, which could
+lead to reclaim and eventually invoke the MMU notifier
+(mlx5_ib_invalidate_range()), causing a recursive acquisition of
+umem_mutex.
+
+To prevent such issues from reoccurring unnoticed in future code
+changes, add a lockdep annotation in ib_init_umem_odp() that simulates
+taking umem_mutex inside a reclaim context. This makes lockdep aware
+of this locking dependency and ensures that future violations—such as
+calling kzalloc() or any memory allocator that may enter reclaim while
+holding umem_mutex—will immediately raise a lockdep warning.
+
+Signed-off-by: Or Har-Toov <ohartoov@nvidia.com>
+Reviewed-by: Michael Guralnik <michaelgur@nvidia.com>
+Link: https://patch.msgid.link/9d31b9d8fe1db648a9f47cec3df6b8463319dee5.1750061698.git.leon@kernel.org
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Acked-by: Nicolas Morey <nmorey@suse.com>
+---
+ drivers/infiniband/core/umem_odp.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/drivers/infiniband/core/umem_odp.c b/drivers/infiniband/core/umem_odp.c
+index c752ae9fad6c..b1c44ec1a3f3 100644
+--- a/drivers/infiniband/core/umem_odp.c
++++ b/drivers/infiniband/core/umem_odp.c
+@@ -76,6 +76,17 @@ static int ib_init_umem_odp(struct ib_umem_odp *umem_odp,
+ 	end = ALIGN(end, page_size);
+ 	if (unlikely(end < page_size))
+ 		return -EOVERFLOW;
++	/*
++	 * The mmu notifier can be called within reclaim contexts and takes the
++	 * umem_mutex. This is rare to trigger in testing, teach lockdep about
++	 * it.
++	 */
++	if (IS_ENABLED(CONFIG_LOCKDEP)) {
++		fs_reclaim_acquire(GFP_KERNEL);
++		mutex_lock(&umem_odp->umem_mutex);
++		mutex_unlock(&umem_odp->umem_mutex);
++		fs_reclaim_release(GFP_KERNEL);
++	}
+ 
+ 	nr_entries = (end - start) >> PAGE_SHIFT;
+ 	if (!(nr_entries * PAGE_SIZE / page_size))
+-- 
+2.52.0
+

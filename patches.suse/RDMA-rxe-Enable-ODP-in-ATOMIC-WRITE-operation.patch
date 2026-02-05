@@ -1,0 +1,187 @@
+From b84001ad0ceeb34bc3fd6c383f197326d4fe8353 Mon Sep 17 00:00:00 2001
+From: Daisuke Matsuda <matsuda-daisuke@fujitsu.com>
+Date: Mon, 24 Mar 2025 16:56:49 +0900
+Subject: [PATCH 1/1] RDMA/rxe: Enable ODP in ATOMIC WRITE operation
+Git-commit: b84001ad0ceeb34bc3fd6c383f197326d4fe8353
+Patch-mainline: v6.16-rc1
+References: jsc#PED-15314
+
+Add rxe_odp_do_atomic_write() so that ODP specific steps are applied to
+ATOMIC WRITE requests.
+
+Signed-off-by: Daisuke Matsuda <matsuda-daisuke@fujitsu.com>
+Link: https://patch.msgid.link/20250324075649.3313968-3-matsuda-daisuke@fujitsu.com
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Acked-by: Nicolas Morey <nmorey@suse.com>
+---
+ drivers/infiniband/sw/rxe/rxe.c      |  1 +
+ drivers/infiniband/sw/rxe/rxe_loc.h  | 12 +++++++-
+ drivers/infiniband/sw/rxe/rxe_mr.c   | 12 --------
+ drivers/infiniband/sw/rxe/rxe_odp.c  | 46 ++++++++++++++++++++++++++++
+ drivers/infiniband/sw/rxe/rxe_resp.c | 11 ++++++-
+ include/rdma/ib_verbs.h              |  1 +
+ 6 files changed, 69 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/infiniband/sw/rxe/rxe.c b/drivers/infiniband/sw/rxe/rxe.c
+index bf711eb9440c..3a77d6db1720 100644
+--- a/drivers/infiniband/sw/rxe/rxe.c
++++ b/drivers/infiniband/sw/rxe/rxe.c
+@@ -102,6 +102,7 @@ static void rxe_init_device_param(struct rxe_dev *rxe, struct net_device *ndev)
+ 		rxe->attr.odp_caps.per_transport_caps.rc_odp_caps |= IB_ODP_SUPPORT_ATOMIC;
+ 		rxe->attr.odp_caps.per_transport_caps.rc_odp_caps |= IB_ODP_SUPPORT_SRQ_RECV;
+ 		rxe->attr.odp_caps.per_transport_caps.rc_odp_caps |= IB_ODP_SUPPORT_FLUSH;
++		rxe->attr.odp_caps.per_transport_caps.rc_odp_caps |= IB_ODP_SUPPORT_ATOMIC_WRITE;
+ 	}
+ }
+ 
+diff --git a/drivers/infiniband/sw/rxe/rxe_loc.h b/drivers/infiniband/sw/rxe/rxe_loc.h
+index 0012bebe96ef..6389d829b06a 100644
+--- a/drivers/infiniband/sw/rxe/rxe_loc.h
++++ b/drivers/infiniband/sw/rxe/rxe_loc.h
+@@ -187,7 +187,7 @@ static inline unsigned int wr_opcode_mask(int opcode, struct rxe_qp *qp)
+ /* rxe_odp.c */
+ extern const struct mmu_interval_notifier_ops rxe_mn_ops;
+ 
+-#ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
++#if defined CONFIG_INFINIBAND_ON_DEMAND_PAGING
+ int rxe_odp_mr_init_user(struct rxe_dev *rxe, u64 start, u64 length,
+ 			 u64 iova, int access_flags, struct rxe_mr *mr);
+ int rxe_odp_mr_copy(struct rxe_mr *mr, u64 iova, void *addr, int length,
+@@ -221,4 +221,14 @@ static inline int rxe_odp_flush_pmem_iova(struct rxe_mr *mr, u64 iova,
+ }
+ #endif /* CONFIG_INFINIBAND_ON_DEMAND_PAGING */
+ 
++#ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
++enum resp_states rxe_odp_do_atomic_write(struct rxe_mr *mr, u64 iova, u64 value);
++#else
++static inline enum resp_states rxe_odp_do_atomic_write(struct rxe_mr *mr,
++						       u64 iova, u64 value)
++{
++	return RESPST_ERR_UNSUPPORTED_OPCODE;
++}
++#endif /* CONFIG_INFINIBAND_ON_DEMAND_PAGING */
++
+ #endif /* RXE_LOC_H */
+diff --git a/drivers/infiniband/sw/rxe/rxe_mr.c b/drivers/infiniband/sw/rxe/rxe_mr.c
+index 93e4b5acd3ac..d40fbe10633f 100644
+--- a/drivers/infiniband/sw/rxe/rxe_mr.c
++++ b/drivers/infiniband/sw/rxe/rxe_mr.c
+@@ -547,16 +547,6 @@ int rxe_mr_do_atomic_write(struct rxe_mr *mr, u64 iova, u64 value)
+ 	struct page *page;
+ 	u64 *va;
+ 
+-	/* ODP is not supported right now. WIP. */
+-	if (is_odp_mr(mr))
+-		return RESPST_ERR_UNSUPPORTED_OPCODE;
+-
+-	/* See IBA oA19-28 */
+-	if (unlikely(mr->state != RXE_MR_STATE_VALID)) {
+-		rxe_dbg_mr(mr, "mr not in valid state\n");
+-		return RESPST_ERR_RKEY_VIOLATION;
+-	}
+-
+ 	if (mr->ibmr.type == IB_MR_TYPE_DMA) {
+ 		page_offset = iova & (PAGE_SIZE - 1);
+ 		page = ib_virt_dma_to_page(iova);
+@@ -584,10 +574,8 @@ int rxe_mr_do_atomic_write(struct rxe_mr *mr, u64 iova, u64 value)
+ 	}
+ 
+ 	va = kmap_local_page(page);
+-
+ 	/* Do atomic write after all prior operations have completed */
+ 	smp_store_release(&va[page_offset >> 3], value);
+-
+ 	kunmap_local(va);
+ 
+ 	return 0;
+diff --git a/drivers/infiniband/sw/rxe/rxe_odp.c b/drivers/infiniband/sw/rxe/rxe_odp.c
+index 9a9aae967486..02de05d759c6 100644
+--- a/drivers/infiniband/sw/rxe/rxe_odp.c
++++ b/drivers/infiniband/sw/rxe/rxe_odp.c
+@@ -378,3 +378,49 @@ int rxe_odp_flush_pmem_iova(struct rxe_mr *mr, u64 iova,
+ 
+ 	return 0;
+ }
++
++/* CONFIG_64BIT=y */
++enum resp_states rxe_odp_do_atomic_write(struct rxe_mr *mr, u64 iova, u64 value)
++{
++	struct ib_umem_odp *umem_odp = to_ib_umem_odp(mr->umem);
++	unsigned int page_offset;
++	unsigned long index;
++	struct page *page;
++	int err;
++	u64 *va;
++
++	/* See IBA oA19-28 */
++	err = mr_check_range(mr, iova, sizeof(value));
++	if (unlikely(err)) {
++		rxe_dbg_mr(mr, "iova out of range\n");
++		return RESPST_ERR_RKEY_VIOLATION;
++	}
++
++	err = rxe_odp_map_range_and_lock(mr, iova, sizeof(value),
++					 RXE_PAGEFAULT_DEFAULT);
++	if (err)
++		return RESPST_ERR_RKEY_VIOLATION;
++
++	page_offset = rxe_odp_iova_to_page_offset(umem_odp, iova);
++	index = rxe_odp_iova_to_index(umem_odp, iova);
++	page = hmm_pfn_to_page(umem_odp->pfn_list[index]);
++	if (!page) {
++		mutex_unlock(&umem_odp->umem_mutex);
++		return RESPST_ERR_RKEY_VIOLATION;
++	}
++	/* See IBA A19.4.2 */
++	if (unlikely(page_offset & 0x7)) {
++		mutex_unlock(&umem_odp->umem_mutex);
++		rxe_dbg_mr(mr, "misaligned address\n");
++		return RESPST_ERR_MISALIGNED_ATOMIC;
++	}
++
++	va = kmap_local_page(page);
++	/* Do atomic write after all prior operations have completed */
++	smp_store_release(&va[page_offset >> 3], value);
++	kunmap_local(va);
++
++	mutex_unlock(&umem_odp->umem_mutex);
++
++	return RESPST_NONE;
++}
+diff --git a/drivers/infiniband/sw/rxe/rxe_resp.c b/drivers/infiniband/sw/rxe/rxe_resp.c
+index 304e3de740ad..fd7bac5bce18 100644
+--- a/drivers/infiniband/sw/rxe/rxe_resp.c
++++ b/drivers/infiniband/sw/rxe/rxe_resp.c
+@@ -749,7 +749,16 @@ static enum resp_states atomic_write_reply(struct rxe_qp *qp,
+ 	value = *(u64 *)payload_addr(pkt);
+ 	iova = qp->resp.va + qp->resp.offset;
+ 
+-	err = rxe_mr_do_atomic_write(mr, iova, value);
++	/* See IBA oA19-28 */
++	if (unlikely(mr->state != RXE_MR_STATE_VALID)) {
++		rxe_dbg_mr(mr, "mr not in valid state\n");
++		return RESPST_ERR_RKEY_VIOLATION;
++	}
++
++	if (mr->umem->is_odp)
++		err = rxe_odp_do_atomic_write(mr, iova, value);
++	else
++		err = rxe_mr_do_atomic_write(mr, iova, value);
+ 	if (err)
+ 		return err;
+ 
+diff --git a/include/rdma/ib_verbs.h b/include/rdma/ib_verbs.h
+index 41bf98ccb275..0a7ccd08b365 100644
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -326,6 +326,7 @@ enum ib_odp_transport_cap_bits {
+ 	IB_ODP_SUPPORT_ATOMIC	= 1 << 4,
+ 	IB_ODP_SUPPORT_SRQ_RECV	= 1 << 5,
+ 	IB_ODP_SUPPORT_FLUSH	= 1 << 6,
++	IB_ODP_SUPPORT_ATOMIC_WRITE	= 1 << 7,
+ };
+ 
+ struct ib_odp_caps {
+-- 
+2.52.0
+

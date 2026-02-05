@@ -1,0 +1,205 @@
+From 9fb3dd85197f5e5901a81b104a0f8b513148d138 Mon Sep 17 00:00:00 2001
+From: Michael Margolin <mrgolin@amazon.com>
+Date: Tue, 8 Jul 2025 20:23:08 +0000
+Subject: [PATCH 1/1] RDMA/efa: Add CQ with external memory support
+Git-commit: 9fb3dd85197f5e5901a81b104a0f8b513148d138
+Patch-mainline: v6.17-rc1
+References: jsc#PED-15314
+
+Add an option to create CQ using external memory instead of allocating
+in the driver. The memory can be passed from userspace by dmabuf fd and
+an offset or a VA. One of the possible usages is creating CQs that
+reside in accelerator memory, allowing low latency asynchronous direct
+polling from the accelerator device. Add a capability bit to reflect on
+the feature support.
+
+Reviewed-by: Daniel Kranzdorf <dkkranzd@amazon.com>
+Reviewed-by: Yonatan Nachum <ynachum@amazon.com>
+Signed-off-by: Michael Margolin <mrgolin@amazon.com>
+Link: https://patch.msgid.link/20250708202308.24783-4-mrgolin@amazon.com
+Reviewed-by: Jason Gunthorpe <jgg@nvidia.com>
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Acked-by: Nicolas Morey <nmorey@suse.com>
+---
+ drivers/infiniband/hw/efa/efa.h       |  3 ++
+ drivers/infiniband/hw/efa/efa_main.c  |  1 +
+ drivers/infiniband/hw/efa/efa_verbs.c | 61 +++++++++++++++++++++------
+ include/uapi/rdma/efa-abi.h           |  3 +-
+ 4 files changed, 53 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/infiniband/hw/efa/efa.h b/drivers/infiniband/hw/efa/efa.h
+index 838182d0409c..3d49c1db928e 100644
+--- a/drivers/infiniband/hw/efa/efa.h
++++ b/drivers/infiniband/hw/efa/efa.h
+@@ -107,6 +107,7 @@ struct efa_cq {
+ 	u16 cq_idx;
+ 	/* NULL when no interrupts requested */
+ 	struct efa_eq *eq;
++	struct ib_umem *umem;
+ };
+ 
+ struct efa_qp {
+@@ -162,6 +163,8 @@ int efa_create_qp(struct ib_qp *ibqp, struct ib_qp_init_attr *init_attr,
+ int efa_destroy_cq(struct ib_cq *ibcq, struct ib_udata *udata);
+ int efa_create_cq(struct ib_cq *ibcq, const struct ib_cq_init_attr *attr,
+ 		  struct uverbs_attr_bundle *attrs);
++int efa_create_cq_umem(struct ib_cq *ibcq, const struct ib_cq_init_attr *attr,
++		       struct ib_umem *umem, struct uverbs_attr_bundle *attrs);
+ struct ib_mr *efa_reg_mr(struct ib_pd *ibpd, u64 start, u64 length,
+ 			 u64 virt_addr, int access_flags,
+ 			 struct ib_udata *udata);
+diff --git a/drivers/infiniband/hw/efa/efa_main.c b/drivers/infiniband/hw/efa/efa_main.c
+index 4f03c0ec819f..6c415b9adb5f 100644
+--- a/drivers/infiniband/hw/efa/efa_main.c
++++ b/drivers/infiniband/hw/efa/efa_main.c
+@@ -372,6 +372,7 @@ static const struct ib_device_ops efa_dev_ops = {
+ 	.alloc_pd = efa_alloc_pd,
+ 	.alloc_ucontext = efa_alloc_ucontext,
+ 	.create_cq = efa_create_cq,
++	.create_cq_umem = efa_create_cq_umem,
+ 	.create_qp = efa_create_qp,
+ 	.create_user_ah = efa_create_ah,
+ 	.dealloc_pd = efa_dealloc_pd,
+diff --git a/drivers/infiniband/hw/efa/efa_verbs.c b/drivers/infiniband/hw/efa/efa_verbs.c
+index 7c708029b4b4..0f68aec12883 100644
+--- a/drivers/infiniband/hw/efa/efa_verbs.c
++++ b/drivers/infiniband/hw/efa/efa_verbs.c
+@@ -254,6 +254,7 @@ int efa_query_device(struct ib_device *ibdev,
+ 		resp.max_rdma_size = dev_attr->max_rdma_size;
+ 
+ 		resp.device_caps |= EFA_QUERY_DEVICE_CAPS_CQ_WITH_SGID;
++		resp.device_caps |= EFA_QUERY_DEVICE_CAPS_CQ_WITH_EXT_MEM;
+ 		if (EFA_DEV_CAP(dev, RDMA_READ))
+ 			resp.device_caps |= EFA_QUERY_DEVICE_CAPS_RDMA_READ;
+ 
+@@ -1087,8 +1088,11 @@ int efa_destroy_cq(struct ib_cq *ibcq, struct ib_udata *udata)
+ 		xa_erase(&dev->cqs_xa, cq->cq_idx);
+ 		synchronize_irq(cq->eq->irq.irqn);
+ 	}
+-	efa_free_mapped(dev, cq->cpu_addr, cq->dma_addr, cq->size,
+-			DMA_FROM_DEVICE);
++
++	if (cq->umem)
++		ib_umem_release(cq->umem);
++	else
++		efa_free_mapped(dev, cq->cpu_addr, cq->dma_addr, cq->size, DMA_FROM_DEVICE);
+ 	return 0;
+ }
+ 
+@@ -1127,8 +1131,8 @@ static int cq_mmap_entries_setup(struct efa_dev *dev, struct efa_cq *cq,
+ 	return 0;
+ }
+ 
+-int efa_create_cq(struct ib_cq *ibcq, const struct ib_cq_init_attr *attr,
+-		  struct uverbs_attr_bundle *attrs)
++int efa_create_cq_umem(struct ib_cq *ibcq, const struct ib_cq_init_attr *attr,
++		       struct ib_umem *umem, struct uverbs_attr_bundle *attrs)
+ {
+ 	struct ib_udata *udata = &attrs->driver_udata;
+ 	struct efa_ucontext *ucontext = rdma_udata_to_drv_context(
+@@ -1207,11 +1211,30 @@ int efa_create_cq(struct ib_cq *ibcq, const struct ib_cq_init_attr *attr,
+ 
+ 	cq->ucontext = ucontext;
+ 	cq->size = PAGE_ALIGN(cmd.cq_entry_size * entries * cmd.num_sub_cqs);
+-	cq->cpu_addr = efa_zalloc_mapped(dev, &cq->dma_addr, cq->size,
+-					 DMA_FROM_DEVICE);
+-	if (!cq->cpu_addr) {
+-		err = -ENOMEM;
+-		goto err_out;
++
++	if (umem) {
++		if (umem->length < cq->size) {
++			ibdev_dbg(&dev->ibdev, "External memory too small\n");
++			err = -EINVAL;
++			goto err_free_mem;
++		}
++
++		if (!ib_umem_is_contiguous(umem)) {
++			ibdev_dbg(&dev->ibdev, "Non contiguous CQ unsupported\n");
++			err = -EINVAL;
++			goto err_free_mem;
++		}
++
++		cq->cpu_addr = NULL;
++		cq->dma_addr = ib_umem_start_dma_addr(umem);
++		cq->umem = umem;
++	} else {
++		cq->cpu_addr = efa_zalloc_mapped(dev, &cq->dma_addr, cq->size,
++						 DMA_FROM_DEVICE);
++		if (!cq->cpu_addr) {
++			err = -ENOMEM;
++			goto err_out;
++		}
+ 	}
+ 
+ 	params.uarn = cq->ucontext->uarn;
+@@ -1228,7 +1251,7 @@ int efa_create_cq(struct ib_cq *ibcq, const struct ib_cq_init_attr *attr,
+ 
+ 	err = efa_com_create_cq(&dev->edev, &params, &result);
+ 	if (err)
+-		goto err_free_mapped;
++		goto err_free_mem;
+ 
+ 	resp.db_off = result.db_off;
+ 	resp.cq_idx = result.cq_idx;
+@@ -1236,7 +1259,9 @@ int efa_create_cq(struct ib_cq *ibcq, const struct ib_cq_init_attr *attr,
+ 	cq->ibcq.cqe = result.actual_depth;
+ 	WARN_ON_ONCE(entries != result.actual_depth);
+ 
+-	err = cq_mmap_entries_setup(dev, cq, &resp, result.db_valid);
++	if (!umem)
++		err = cq_mmap_entries_setup(dev, cq, &resp, result.db_valid);
++
+ 	if (err) {
+ 		ibdev_dbg(ibdev, "Could not setup cq[%u] mmap entries\n",
+ 			  cq->cq_idx);
+@@ -1274,15 +1299,23 @@ int efa_create_cq(struct ib_cq *ibcq, const struct ib_cq_init_attr *attr,
+ 	efa_cq_user_mmap_entries_remove(cq);
+ err_destroy_cq:
+ 	efa_destroy_cq_idx(dev, cq->cq_idx);
+-err_free_mapped:
+-	efa_free_mapped(dev, cq->cpu_addr, cq->dma_addr, cq->size,
+-			DMA_FROM_DEVICE);
++err_free_mem:
++	if (umem)
++		ib_umem_release(umem);
++	else
++		efa_free_mapped(dev, cq->cpu_addr, cq->dma_addr, cq->size, DMA_FROM_DEVICE);
+ 
+ err_out:
+ 	atomic64_inc(&dev->stats.create_cq_err);
+ 	return err;
+ }
+ 
++int efa_create_cq(struct ib_cq *ibcq, const struct ib_cq_init_attr *attr,
++		  struct uverbs_attr_bundle *attrs)
++{
++	return efa_create_cq_umem(ibcq, attr, NULL, attrs);
++}
++
+ static int umem_to_page_list(struct efa_dev *dev,
+ 			     struct ib_umem *umem,
+ 			     u64 *page_list,
+diff --git a/include/uapi/rdma/efa-abi.h b/include/uapi/rdma/efa-abi.h
+index 11b94b0b035b..98b71b9979f8 100644
+--- a/include/uapi/rdma/efa-abi.h
++++ b/include/uapi/rdma/efa-abi.h
+@@ -1,6 +1,6 @@
+ /* SPDX-License-Identifier: ((GPL-2.0 WITH Linux-syscall-note) OR BSD-2-Clause) */
+ /*
+- * Copyright 2018-2024 Amazon.com, Inc. or its affiliates. All rights reserved.
++ * Copyright 2018-2025 Amazon.com, Inc. or its affiliates. All rights reserved.
+  */
+ 
+ #ifndef EFA_ABI_USER_H
+@@ -131,6 +131,7 @@ enum {
+ 	EFA_QUERY_DEVICE_CAPS_DATA_POLLING_128 = 1 << 4,
+ 	EFA_QUERY_DEVICE_CAPS_RDMA_WRITE = 1 << 5,
+ 	EFA_QUERY_DEVICE_CAPS_UNSOLICITED_WRITE_RECV = 1 << 6,
++	EFA_QUERY_DEVICE_CAPS_CQ_WITH_EXT_MEM = 1 << 7,
+ };
+ 
+ struct efa_ibv_ex_query_device_resp {
+-- 
+2.52.0
+

@@ -1,0 +1,202 @@
+From b5942828ea5f8ba5fcdde71b1ac5473bdb5004e2 Mon Sep 17 00:00:00 2001
+From: Kalesh AP <kalesh-anakkur.purayil@broadcom.com>
+Date: Fri, 22 Aug 2025 09:37:55 +0530
+Subject: [PATCH 1/1] RDMA/bnxt_re: Refactor stats context memory allocation
+Git-commit: b5942828ea5f8ba5fcdde71b1ac5473bdb5004e2
+Patch-mainline: v6.18-rc1
+References: jsc#PED-15349
+
+Moved the stats context allocation logic to a new function.
+The stats context memory allocation code has been moved from
+bnxt_qplib_alloc_hwctx() to the newly added bnxt_re_get_stats_ctx()
+function. Also, the code to send the firmware command has been moved.
+
+This patch is in preparation for other patches in this series.
+There is no functional changes intended.
+
+Signed-off-by: Kalesh AP <kalesh-anakkur.purayil@broadcom.com>
+Link: https://patch.msgid.link/20250822040801.776196-5-kalesh-anakkur.purayil@broadcom.com
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Acked-by: Nicolas Morey <nmorey@suse.com>
+---
+ drivers/infiniband/hw/bnxt_re/main.c      | 46 ++++++++++++++++++-----
+ drivers/infiniband/hw/bnxt_re/qplib_res.c | 21 +++--------
+ drivers/infiniband/hw/bnxt_re/qplib_res.h |  5 +++
+ 3 files changed, 47 insertions(+), 25 deletions(-)
+
+diff --git a/drivers/infiniband/hw/bnxt_re/main.c b/drivers/infiniband/hw/bnxt_re/main.c
+index cc75e79b93a6..6788f74ed8eb 100644
+--- a/drivers/infiniband/hw/bnxt_re/main.c
++++ b/drivers/infiniband/hw/bnxt_re/main.c
+@@ -935,8 +935,7 @@ static int bnxt_re_net_stats_ctx_free(struct bnxt_re_dev *rdev,
+ }
+ 
+ static int bnxt_re_net_stats_ctx_alloc(struct bnxt_re_dev *rdev,
+-				       dma_addr_t dma_map,
+-				       u32 *fw_stats_ctx_id)
++				       struct bnxt_qplib_stats *stats)
+ {
+ 	struct bnxt_qplib_chip_ctx *chip_ctx = rdev->chip_ctx;
+ 	struct hwrm_stat_ctx_alloc_output resp = {};
+@@ -945,21 +944,21 @@ static int bnxt_re_net_stats_ctx_alloc(struct bnxt_re_dev *rdev,
+ 	struct bnxt_fw_msg fw_msg = {};
+ 	int rc = -EINVAL;
+ 
+-	*fw_stats_ctx_id = INVALID_STATS_CTX_ID;
++	stats->fw_id = INVALID_STATS_CTX_ID;
+ 
+ 	if (!en_dev)
+ 		return rc;
+ 
+ 	bnxt_re_init_hwrm_hdr((void *)&req, HWRM_STAT_CTX_ALLOC);
+ 	req.update_period_ms = cpu_to_le32(1000);
+-	req.stats_dma_addr = cpu_to_le64(dma_map);
++	req.stats_dma_addr = cpu_to_le64(stats->dma_map);
+ 	req.stats_dma_length = cpu_to_le16(chip_ctx->hw_stats_size);
+ 	req.stat_ctx_flags = STAT_CTX_ALLOC_REQ_STAT_CTX_FLAGS_ROCE;
+ 	bnxt_re_fill_fw_msg(&fw_msg, (void *)&req, sizeof(req), (void *)&resp,
+ 			    sizeof(resp), DFLT_HWRM_CMD_TIMEOUT);
+ 	rc = bnxt_send_msg(en_dev, &fw_msg);
+ 	if (!rc)
+-		*fw_stats_ctx_id = le32_to_cpu(resp.stat_ctx_id);
++		stats->fw_id = le32_to_cpu(resp.stat_ctx_id);
+ 
+ 	return rc;
+ }
+@@ -2019,6 +2018,36 @@ static void bnxt_re_free_nqr_mem(struct bnxt_re_dev *rdev)
+ 	}
+ }
+ 
++static int bnxt_re_get_stats_ctx(struct bnxt_re_dev *rdev)
++{
++	struct bnxt_qplib_ctx *hctx = &rdev->qplib_ctx;
++	struct bnxt_qplib_res *res = &rdev->qplib_res;
++	int rc;
++
++	rc = bnxt_qplib_alloc_stats_ctx(res->pdev, res->cctx, &hctx->stats);
++	if (rc)
++		return rc;
++
++	rc = bnxt_re_net_stats_ctx_alloc(rdev, &hctx->stats);
++	if (rc)
++		goto free_stat_mem;
++
++	return 0;
++free_stat_mem:
++	bnxt_qplib_free_stats_ctx(res->pdev, &hctx->stats);
++
++	return rc;
++}
++
++static void bnxt_re_put_stats_ctx(struct bnxt_re_dev *rdev)
++{
++	struct bnxt_qplib_ctx *hctx = &rdev->qplib_ctx;
++	struct bnxt_qplib_res *res = &rdev->qplib_res;
++
++	bnxt_re_net_stats_ctx_free(rdev, hctx->stats.fw_id);
++	bnxt_qplib_free_stats_ctx(res->pdev, &hctx->stats);
++}
++
+ static void bnxt_re_dev_uninit(struct bnxt_re_dev *rdev, u8 op_type)
+ {
+ 	u8 type;
+@@ -2043,7 +2072,7 @@ static void bnxt_re_dev_uninit(struct bnxt_re_dev *rdev, u8 op_type)
+ 		if (rc)
+ 			ibdev_warn(&rdev->ibdev,
+ 				   "Failed to deinitialize RCFW: %#x", rc);
+-		bnxt_re_net_stats_ctx_free(rdev, rdev->qplib_ctx.stats.fw_id);
++		bnxt_re_put_stats_ctx(rdev);
+ 		bnxt_qplib_free_hwctx(&rdev->qplib_res, &rdev->qplib_ctx);
+ 		bnxt_qplib_disable_rcfw_channel(&rdev->rcfw);
+ 		type = bnxt_qplib_get_ring_type(rdev->chip_ctx);
+@@ -2191,9 +2220,8 @@ static int bnxt_re_dev_init(struct bnxt_re_dev *rdev, u8 op_type)
+ 			goto disable_rcfw;
+ 		}
+ 	}
+-	rc = bnxt_re_net_stats_ctx_alloc(rdev,
+-					 rdev->qplib_ctx.stats.dma_map,
+-					 &rdev->qplib_ctx.stats.fw_id);
++
++	rc = bnxt_re_get_stats_ctx(rdev);
+ 	if (rc) {
+ 		ibdev_err(&rdev->ibdev,
+ 			  "Failed to allocate stats context: %#x\n", rc);
+diff --git a/drivers/infiniband/hw/bnxt_re/qplib_res.c b/drivers/infiniband/hw/bnxt_re/qplib_res.c
+index db2ee7246861..8d04f98b2606 100644
+--- a/drivers/infiniband/hw/bnxt_re/qplib_res.c
++++ b/drivers/infiniband/hw/bnxt_re/qplib_res.c
+@@ -53,12 +53,6 @@
+ #include "qplib_sp.h"
+ #include "qplib_rcfw.h"
+ 
+-static void bnxt_qplib_free_stats_ctx(struct pci_dev *pdev,
+-				      struct bnxt_qplib_stats *stats);
+-static int bnxt_qplib_alloc_stats_ctx(struct pci_dev *pdev,
+-				      struct bnxt_qplib_chip_ctx *cctx,
+-				      struct bnxt_qplib_stats *stats);
+-
+ /* PBL */
+ static void __free_pbl(struct bnxt_qplib_res *res, struct bnxt_qplib_pbl *pbl,
+ 		       bool is_umem)
+@@ -365,7 +359,6 @@ void bnxt_qplib_free_hwctx(struct bnxt_qplib_res *res,
+ 	/* restore original pde level before destroy */
+ 	ctx->tqm_ctx.pde.level = ctx->tqm_ctx.pde_level;
+ 	bnxt_qplib_free_hwq(res, &ctx->tqm_ctx.pde);
+-	bnxt_qplib_free_stats_ctx(res->pdev, &ctx->stats);
+ }
+ 
+ static int bnxt_qplib_alloc_tqm_rings(struct bnxt_qplib_res *res,
+@@ -534,10 +527,6 @@ int bnxt_qplib_alloc_hwctx(struct bnxt_qplib_res *res,
+ 	hwq_attr.depth = ctx->qpc_count * 16;
+ 	hwq_attr.stride = 1;
+ 	rc = bnxt_qplib_alloc_init_hwq(&ctx->tim_tbl, &hwq_attr);
+-	if (rc)
+-		goto fail;
+-	/* Stats */
+-	rc = bnxt_qplib_alloc_stats_ctx(res->pdev, res->cctx, &ctx->stats);
+ 	if (rc)
+ 		goto fail;
+ 
+@@ -825,8 +814,8 @@ static int bnxt_qplib_alloc_dpi_tbl(struct bnxt_qplib_res *res,
+ }
+ 
+ /* Stats */
+-static void bnxt_qplib_free_stats_ctx(struct pci_dev *pdev,
+-				      struct bnxt_qplib_stats *stats)
++void bnxt_qplib_free_stats_ctx(struct pci_dev *pdev,
++			       struct bnxt_qplib_stats *stats)
+ {
+ 	if (stats->dma) {
+ 		dma_free_coherent(&pdev->dev, stats->size,
+@@ -836,9 +825,9 @@ static void bnxt_qplib_free_stats_ctx(struct pci_dev *pdev,
+ 	stats->fw_id = -1;
+ }
+ 
+-static int bnxt_qplib_alloc_stats_ctx(struct pci_dev *pdev,
+-				      struct bnxt_qplib_chip_ctx *cctx,
+-				      struct bnxt_qplib_stats *stats)
++int bnxt_qplib_alloc_stats_ctx(struct pci_dev *pdev,
++			       struct bnxt_qplib_chip_ctx *cctx,
++			       struct bnxt_qplib_stats *stats)
+ {
+ 	memset(stats, 0, sizeof(*stats));
+ 	stats->fw_id = -1;
+diff --git a/drivers/infiniband/hw/bnxt_re/qplib_res.h b/drivers/infiniband/hw/bnxt_re/qplib_res.h
+index 9d866cfdebab..ed1be06c2c60 100644
+--- a/drivers/infiniband/hw/bnxt_re/qplib_res.h
++++ b/drivers/infiniband/hw/bnxt_re/qplib_res.h
+@@ -441,6 +441,11 @@ int bnxt_qplib_map_db_bar(struct bnxt_qplib_res *res);
+ void bnxt_qplib_unmap_db_bar(struct bnxt_qplib_res *res);
+ 
+ int bnxt_qplib_determine_atomics(struct pci_dev *dev);
++int bnxt_qplib_alloc_stats_ctx(struct pci_dev *pdev,
++			       struct bnxt_qplib_chip_ctx *cctx,
++			       struct bnxt_qplib_stats *stats);
++void bnxt_qplib_free_stats_ctx(struct pci_dev *pdev,
++			       struct bnxt_qplib_stats *stats);
+ 
+ static inline void bnxt_qplib_hwq_incr_prod(struct bnxt_qplib_db_info *dbinfo,
+ 					    struct bnxt_qplib_hwq *hwq, u32 cnt)
+-- 
+2.52.0
+

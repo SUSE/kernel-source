@@ -1,0 +1,165 @@
+From a3c9d0fcd3715541bbf97da2ddde9d032e2fe6d5 Mon Sep 17 00:00:00 2001
+From: Mark Zhang <markzhang@nvidia.com>
+Date: Mon, 30 Jun 2025 13:52:35 +0300
+Subject: [PATCH 1/1] RDMA/ucma: Support write an event into a CM
+Git-commit: a3c9d0fcd3715541bbf97da2ddde9d032e2fe6d5
+Patch-mainline: v6.18-rc1
+References: jsc#PED-15314
+
+Enable user-space to inject an event into a CM through it's event
+channel. Two new events are added and supported: RDMA_CM_EVENT_USER and
+RDMA_CM_EVENT_INTERNAL. With these 2 events a new event parameter "arg"
+is supported, which is passed from sender to receiver transparently.
+
+With this feature an application is able to write an event into a CM
+channel with a new user-space rdmacm API. For example thread T1 could
+write an event with the API:
+    rdma_write_cm_event(cm_id, RDMA_CM_EVENT_USER, status, arg);
+and thread T2 could receive the event with rdma_get_cm_event().
+
+Signed-off-by: Mark Zhang <markzhang@nvidia.com>
+Reviewed-by: Vlad Dumitrescu <vdumitrescu@nvidia.com>
+Link: https://patch.msgid.link/fdf49d0b17a45933c5d8c1d90605c9447d9a3c73.1751279794.git.leonro@nvidia.com
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Acked-by: Nicolas Morey <nmorey@suse.com>
+---
+ drivers/infiniband/core/ucma.c   | 52 +++++++++++++++++++++++++++++++-
+ include/rdma/rdma_cm.h           |  5 ++-
+ include/uapi/rdma/rdma_user_cm.h | 16 +++++++++-
+ 3 files changed, 70 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/infiniband/core/ucma.c b/drivers/infiniband/core/ucma.c
+index 3b9ca6d7a21b..f86ece701db6 100644
+--- a/drivers/infiniband/core/ucma.c
++++ b/drivers/infiniband/core/ucma.c
+@@ -1745,6 +1745,55 @@ static ssize_t ucma_migrate_id(struct ucma_file *new_file,
+ 	return ret;
+ }
+ 
++static ssize_t ucma_write_cm_event(struct ucma_file *file,
++				   const char __user *inbuf, int in_len,
++				   int out_len)
++{
++	struct rdma_ucm_write_cm_event cmd;
++	struct rdma_cm_event event = {};
++	struct ucma_event *uevent;
++	struct ucma_context *ctx;
++	int ret = 0;
++
++	if (copy_from_user(&cmd, inbuf, sizeof(cmd)))
++		return -EFAULT;
++
++	if ((cmd.event != RDMA_CM_EVENT_USER) &&
++	    (cmd.event != RDMA_CM_EVENT_INTERNAL))
++		return -EINVAL;
++
++	ctx = ucma_get_ctx(file, cmd.id);
++	if (IS_ERR(ctx))
++		return PTR_ERR(ctx);
++
++	event.event = cmd.event;
++	event.status = cmd.status;
++	event.param.arg = cmd.param.arg;
++
++	uevent = kzalloc(sizeof(*uevent), GFP_KERNEL);
++	if (!uevent) {
++		ret = -ENOMEM;
++		goto out;
++	}
++
++	uevent->ctx = ctx;
++	uevent->resp.uid = ctx->uid;
++	uevent->resp.id = ctx->id;
++	uevent->resp.event = event.event;
++	uevent->resp.status = event.status;
++	memcpy(uevent->resp.param.arg32, &event.param.arg,
++	       sizeof(event.param.arg));
++
++	mutex_lock(&ctx->file->mut);
++	list_add_tail(&uevent->list, &ctx->file->event_list);
++	mutex_unlock(&ctx->file->mut);
++	wake_up_interruptible(&ctx->file->poll_wait);
++
++out:
++	ucma_put_ctx(ctx);
++	return ret;
++}
++
+ static ssize_t (*ucma_cmd_table[])(struct ucma_file *file,
+ 				   const char __user *inbuf,
+ 				   int in_len, int out_len) = {
+@@ -1771,7 +1820,8 @@ static ssize_t (*ucma_cmd_table[])(struct ucma_file *file,
+ 	[RDMA_USER_CM_CMD_BIND]		 = ucma_bind,
+ 	[RDMA_USER_CM_CMD_RESOLVE_ADDR]	 = ucma_resolve_addr,
+ 	[RDMA_USER_CM_CMD_JOIN_MCAST]	 = ucma_join_multicast,
+-	[RDMA_USER_CM_CMD_RESOLVE_IB_SERVICE] = ucma_resolve_ib_service
++	[RDMA_USER_CM_CMD_RESOLVE_IB_SERVICE] = ucma_resolve_ib_service,
++	[RDMA_USER_CM_CMD_WRITE_CM_EVENT] = ucma_write_cm_event,
+ };
+ 
+ static ssize_t ucma_write(struct file *filp, const char __user *buf,
+diff --git a/include/rdma/rdma_cm.h b/include/rdma/rdma_cm.h
+index 72d1568e4cfb..9bd930a83e6e 100644
+--- a/include/rdma/rdma_cm.h
++++ b/include/rdma/rdma_cm.h
+@@ -35,7 +35,9 @@ enum rdma_cm_event_type {
+ 	RDMA_CM_EVENT_ADDR_CHANGE,
+ 	RDMA_CM_EVENT_TIMEWAIT_EXIT,
+ 	RDMA_CM_EVENT_ADDRINFO_RESOLVED,
+-	RDMA_CM_EVENT_ADDRINFO_ERROR
++	RDMA_CM_EVENT_ADDRINFO_ERROR,
++	RDMA_CM_EVENT_USER,
++	RDMA_CM_EVENT_INTERNAL,
+ };
+ 
+ const char *__attribute_const__ rdma_event_msg(enum rdma_cm_event_type event);
+@@ -98,6 +100,7 @@ struct rdma_cm_event {
+ 	union {
+ 		struct rdma_conn_param	conn;
+ 		struct rdma_ud_param	ud;
++		u64			arg;
+ 	} param;
+ 	struct rdma_ucm_ece ece;
+ };
+diff --git a/include/uapi/rdma/rdma_user_cm.h b/include/uapi/rdma/rdma_user_cm.h
+index 00501da0567e..5ded174687ee 100644
+--- a/include/uapi/rdma/rdma_user_cm.h
++++ b/include/uapi/rdma/rdma_user_cm.h
+@@ -68,7 +68,8 @@ enum {
+ 	RDMA_USER_CM_CMD_BIND,
+ 	RDMA_USER_CM_CMD_RESOLVE_ADDR,
+ 	RDMA_USER_CM_CMD_JOIN_MCAST,
+-	RDMA_USER_CM_CMD_RESOLVE_IB_SERVICE
++	RDMA_USER_CM_CMD_RESOLVE_IB_SERVICE,
++	RDMA_USER_CM_CMD_WRITE_CM_EVENT,
+ };
+ 
+ /* See IBTA Annex A11, servies ID bytes 4 & 5 */
+@@ -304,6 +305,7 @@ struct rdma_ucm_event_resp {
+ 	union {
+ 		struct rdma_ucm_conn_param conn;
+ 		struct rdma_ucm_ud_param   ud;
++		__u32 arg32[2];
+ 	} param;
+ 	__u32 reserved;
+ 	struct rdma_ucm_ece ece;
+@@ -362,4 +364,16 @@ struct rdma_ucm_resolve_ib_service {
+ 	__u32 id;
+ 	struct rdma_ucm_ib_service ibs;
+ };
++
++struct rdma_ucm_write_cm_event {
++	__u32 id;
++	__u32 reserved;
++	__u32 event;
++	__u32 status;
++	union {
++		struct rdma_ucm_conn_param conn;
++		struct rdma_ucm_ud_param ud;
++		__u64 arg;
++	} param;
++};
+ #endif /* RDMA_USER_CM_H */
+-- 
+2.52.0
+

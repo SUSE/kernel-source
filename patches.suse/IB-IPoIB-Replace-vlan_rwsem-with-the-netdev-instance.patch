@@ -1,0 +1,375 @@
+From 463e5176969795a1d80205842e210c539c16fc81 Mon Sep 17 00:00:00 2001
+From: Cosmin Ratiu <cratiu@nvidia.com>
+Date: Wed, 21 May 2025 15:08:59 +0300
+Subject: [PATCH 1/1] IB/IPoIB: Replace vlan_rwsem with the netdev instance
+ lock
+Git-commit: 463e5176969795a1d80205842e210c539c16fc81
+Patch-mainline: v6.16-rc1
+References: jsc#PED-15314
+
+vlan_rwsem was added more than a decade ago to work around a deadlock
+involving the original mutex being acquired twice, once from the wq.
+Subsequent changes then tweaked it to partially protect access to
+ipoib_dev_priv->child_intfs together with the RTNL. Flushing the wq
+synchronously was also since then refactored to happen separately.
+
+This semaphore unfortunately prevents updating ipoib to work with
+devices that require the netdev lock, because of lock ordering issues
+between RTNL, vlan_rwsem and the netdev instance locks of parent and
+child devices.
+
+To uncomplicate things, this commit replaces vlan_rwsem with the netdev
+instance lock of the parent device. Both parent child_intfs list and the
+children's list membership in it require holding the parent netdev
+instance lock.
+
+All call paths were carefully reviewed and no-longer-needed ASSERT_RTNL
+calls were dropped. Some non-trivial changes:
+- ipoib_match_gid_pkey_addr() now only acquires the instance lock and
+  iterates through child_intfs for the first level of recursion (the
+  parent), as it's not possible to have multiple levels of nested
+  subinterfaces.
+- ipoib_open() and ipoib_stop() schedule tasks on the global workqueue
+  to open/stop child interfaces to avoid potentially acquiring nested
+  netdev instance locks. To avoid the device going away between the task
+  scheduling and execution, netdev_hold/netdev_put are used.
+
+Signed-off-by: Cosmin Ratiu <cratiu@nvidia.com>
+Reviewed-by: Carolina Jubran <cjubran@nvidia.com>
+Reviewed-by: Leon Romanovsky <leonro@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://patch.msgid.link/1747829342-1018757-3-git-send-email-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Nicolas Morey <nmorey@suse.com>
+---
+ drivers/infiniband/ulp/ipoib/ipoib.h      |  11 +--
+ drivers/infiniband/ulp/ipoib/ipoib_ib.c   |   4 +-
+ drivers/infiniband/ulp/ipoib/ipoib_main.c | 110 ++++++++++++++--------
+ drivers/infiniband/ulp/ipoib/ipoib_vlan.c |  19 ++--
+ 4 files changed, 87 insertions(+), 57 deletions(-)
+
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib.h b/drivers/infiniband/ulp/ipoib/ipoib.h
+index 2e05e9c9317d..91f866e3fb8b 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib.h
++++ b/drivers/infiniband/ulp/ipoib/ipoib.h
+@@ -329,14 +329,6 @@ struct ipoib_dev_priv {
+ 
+ 	unsigned long flags;
+ 
+-	/*
+-	 * This protects access to the child_intfs list.
+-	 * To READ from child_intfs the RTNL or vlan_rwsem read side must be
+-	 * held.  To WRITE RTNL and the vlan_rwsem write side must be held (in
+-	 * that order) This lock exists because we have a few contexts where
+-	 * we need the child_intfs, but do not want to grab the RTNL.
+-	 */
+-	struct rw_semaphore vlan_rwsem;
+ 	struct mutex mcast_mutex;
+ 
+ 	struct rb_root  path_tree;
+@@ -399,6 +391,9 @@ struct ipoib_dev_priv {
+ 	struct ib_event_handler event_handler;
+ 
+ 	struct net_device *parent;
++	/* 'child_intfs' and 'list' membership of all child devices are
++	 * protected by the netdev instance lock of 'dev'.
++	 */
+ 	struct list_head child_intfs;
+ 	struct list_head list;
+ 	int    child_type;
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_ib.c b/drivers/infiniband/ulp/ipoib/ipoib_ib.c
+index e0e7f600097d..dc670b4a191b 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_ib.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_ib.c
+@@ -1294,10 +1294,10 @@ void ipoib_queue_work(struct ipoib_dev_priv *priv,
+ 	if (!test_bit(IPOIB_FLAG_SUBINTERFACE, &priv->flags)) {
+ 		struct ipoib_dev_priv *cpriv;
+ 
+-		down_read(&priv->vlan_rwsem);
++		netdev_lock(priv->dev);
+ 		list_for_each_entry(cpriv, &priv->child_intfs, list)
+ 			ipoib_queue_work(cpriv, level);
+-		up_read(&priv->vlan_rwsem);
++		netdev_unlock(priv->dev);
+ 	}
+ 
+ 	switch (level) {
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_main.c b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+index 55b1f3cbee17..4879fd17e868 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_main.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+@@ -132,6 +132,52 @@ static int ipoib_netdev_event(struct notifier_block *this,
+ }
+ #endif
+ 
++struct ipoib_ifupdown_work {
++	struct work_struct work;
++	struct net_device *dev;
++	netdevice_tracker dev_tracker;
++	bool up;
++};
++
++static void ipoib_ifupdown_task(struct work_struct *work)
++{
++	struct ipoib_ifupdown_work *pwork =
++		container_of(work, struct ipoib_ifupdown_work, work);
++	struct net_device *dev = pwork->dev;
++	unsigned int flags;
++
++	rtnl_lock();
++	flags = dev->flags;
++	if (pwork->up)
++		flags |= IFF_UP;
++	else
++		flags &= ~IFF_UP;
++
++	if (dev->flags != flags)
++		dev_change_flags(dev, flags, NULL);
++	rtnl_unlock();
++	netdev_put(dev, &pwork->dev_tracker);
++	kfree(pwork);
++}
++
++static void ipoib_schedule_ifupdown_task(struct net_device *dev, bool up)
++{
++	struct ipoib_ifupdown_work *work;
++
++	if ((up && (dev->flags & IFF_UP)) ||
++	    (!up && !(dev->flags & IFF_UP)))
++		return;
++
++	work = kmalloc(sizeof(*work), GFP_KERNEL);
++	if (!work)
++		return;
++	work->dev = dev;
++	netdev_hold(dev, &work->dev_tracker, GFP_KERNEL);
++	work->up = up;
++	INIT_WORK(&work->work, ipoib_ifupdown_task);
++	queue_work(ipoib_workqueue, &work->work);
++}
++
+ int ipoib_open(struct net_device *dev)
+ {
+ 	struct ipoib_dev_priv *priv = ipoib_priv(dev);
+@@ -154,17 +200,10 @@ int ipoib_open(struct net_device *dev)
+ 		struct ipoib_dev_priv *cpriv;
+ 
+ 		/* Bring up any child interfaces too */
+-		down_read(&priv->vlan_rwsem);
+-		list_for_each_entry(cpriv, &priv->child_intfs, list) {
+-			int flags;
+-
+-			flags = cpriv->dev->flags;
+-			if (flags & IFF_UP)
+-				continue;
+-
+-			dev_change_flags(cpriv->dev, flags | IFF_UP, NULL);
+-		}
+-		up_read(&priv->vlan_rwsem);
++		netdev_lock(dev);
++		list_for_each_entry(cpriv, &priv->child_intfs, list)
++			ipoib_schedule_ifupdown_task(cpriv->dev, true);
++		netdev_unlock(dev);
+ 	} else if (priv->parent) {
+ 		struct ipoib_dev_priv *ppriv = ipoib_priv(priv->parent);
+ 
+@@ -199,17 +238,10 @@ static int ipoib_stop(struct net_device *dev)
+ 		struct ipoib_dev_priv *cpriv;
+ 
+ 		/* Bring down any child interfaces too */
+-		down_read(&priv->vlan_rwsem);
+-		list_for_each_entry(cpriv, &priv->child_intfs, list) {
+-			int flags;
+-
+-			flags = cpriv->dev->flags;
+-			if (!(flags & IFF_UP))
+-				continue;
+-
+-			dev_change_flags(cpriv->dev, flags & ~IFF_UP, NULL);
+-		}
+-		up_read(&priv->vlan_rwsem);
++		netdev_lock(dev);
++		list_for_each_entry(cpriv, &priv->child_intfs, list)
++			ipoib_schedule_ifupdown_task(cpriv->dev, false);
++		netdev_unlock(dev);
+ 	}
+ 
+ 	return 0;
+@@ -426,17 +458,20 @@ static int ipoib_match_gid_pkey_addr(struct ipoib_dev_priv *priv,
+ 		}
+ 	}
+ 
++	if (test_bit(IPOIB_FLAG_SUBINTERFACE, &priv->flags))
++		return matches;
++
+ 	/* Check child interfaces */
+-	down_read_nested(&priv->vlan_rwsem, nesting);
++	netdev_lock(priv->dev);
+ 	list_for_each_entry(child_priv, &priv->child_intfs, list) {
+ 		matches += ipoib_match_gid_pkey_addr(child_priv, gid,
+-						    pkey_index, addr,
+-						    nesting + 1,
+-						    found_net_dev);
++						     pkey_index, addr,
++						     nesting + 1,
++						     found_net_dev);
+ 		if (matches > 1)
+ 			break;
+ 	}
+-	up_read(&priv->vlan_rwsem);
++	netdev_unlock(priv->dev);
+ 
+ 	return matches;
+ }
+@@ -1992,9 +2027,9 @@ static int ipoib_ndo_init(struct net_device *ndev)
+ 
+ 		dev_hold(priv->parent);
+ 
+-		down_write(&ppriv->vlan_rwsem);
++		netdev_lock(priv->parent);
+ 		list_add_tail(&priv->list, &ppriv->child_intfs);
+-		up_write(&ppriv->vlan_rwsem);
++		netdev_unlock(priv->parent);
+ 	}
+ 
+ 	return 0;
+@@ -2004,8 +2039,6 @@ static void ipoib_ndo_uninit(struct net_device *dev)
+ {
+ 	struct ipoib_dev_priv *priv = ipoib_priv(dev);
+ 
+-	ASSERT_RTNL();
+-
+ 	/*
+ 	 * ipoib_remove_one guarantees the children are removed before the
+ 	 * parent, and that is the only place where a parent can be removed.
+@@ -2015,9 +2048,9 @@ static void ipoib_ndo_uninit(struct net_device *dev)
+ 	if (priv->parent) {
+ 		struct ipoib_dev_priv *ppriv = ipoib_priv(priv->parent);
+ 
+-		down_write(&ppriv->vlan_rwsem);
++		netdev_lock(ppriv->dev);
+ 		list_del(&priv->list);
+-		up_write(&ppriv->vlan_rwsem);
++		netdev_unlock(ppriv->dev);
+ 	}
+ 
+ 	ipoib_neigh_hash_uninit(dev);
+@@ -2167,7 +2200,6 @@ static void ipoib_build_priv(struct net_device *dev)
+ 
+ 	priv->dev = dev;
+ 	spin_lock_init(&priv->lock);
+-	init_rwsem(&priv->vlan_rwsem);
+ 	mutex_init(&priv->mcast_mutex);
+ 
+ 	INIT_LIST_HEAD(&priv->path_list);
+@@ -2372,10 +2404,10 @@ static void set_base_guid(struct ipoib_dev_priv *priv, union ib_gid *gid)
+ 	netif_addr_unlock_bh(netdev);
+ 
+ 	if (!test_bit(IPOIB_FLAG_SUBINTERFACE, &priv->flags)) {
+-		down_read(&priv->vlan_rwsem);
++		netdev_lock(priv->dev);
+ 		list_for_each_entry(child_priv, &priv->child_intfs, list)
+ 			set_base_guid(child_priv, gid);
+-		up_read(&priv->vlan_rwsem);
++		netdev_unlock(priv->dev);
+ 	}
+ }
+ 
+@@ -2418,10 +2450,10 @@ static int ipoib_set_mac(struct net_device *dev, void *addr)
+ 	if (!test_bit(IPOIB_FLAG_SUBINTERFACE, &priv->flags)) {
+ 		struct ipoib_dev_priv *cpriv;
+ 
+-		down_read(&priv->vlan_rwsem);
++		netdev_lock(dev);
+ 		list_for_each_entry(cpriv, &priv->child_intfs, list)
+ 			queue_work(ipoib_workqueue, &cpriv->flush_light);
+-		up_read(&priv->vlan_rwsem);
++		netdev_unlock(dev);
+ 	}
+ 	queue_work(ipoib_workqueue, &priv->flush_light);
+ 
+@@ -2632,9 +2664,11 @@ static void ipoib_remove_one(struct ib_device *device, void *client_data)
+ 
+ 		rtnl_lock();
+ 
++		netdev_lock(priv->dev);
+ 		list_for_each_entry_safe(cpriv, tcpriv, &priv->child_intfs,
+ 					 list)
+ 			unregister_netdevice_queue(cpriv->dev, &head);
++		netdev_unlock(priv->dev);
+ 		unregister_netdevice_queue(priv->dev, &head);
+ 		unregister_netdevice_many(&head);
+ 
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_vlan.c b/drivers/infiniband/ulp/ipoib/ipoib_vlan.c
+index 562df2b3ef18..243e8f555eca 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_vlan.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_vlan.c
+@@ -53,8 +53,7 @@ static bool is_child_unique(struct ipoib_dev_priv *ppriv,
+ 			    struct ipoib_dev_priv *priv)
+ {
+ 	struct ipoib_dev_priv *tpriv;
+-
+-	ASSERT_RTNL();
++	bool result = true;
+ 
+ 	/*
+ 	 * Since the legacy sysfs interface uses pkey for deletion it cannot
+@@ -73,13 +72,17 @@ static bool is_child_unique(struct ipoib_dev_priv *ppriv,
+ 	if (ppriv->pkey == priv->pkey)
+ 		return false;
+ 
++	netdev_lock(ppriv->dev);
+ 	list_for_each_entry(tpriv, &ppriv->child_intfs, list) {
+ 		if (tpriv->pkey == priv->pkey &&
+-		    tpriv->child_type == IPOIB_LEGACY_CHILD)
+-			return false;
++		    tpriv->child_type == IPOIB_LEGACY_CHILD) {
++			result = false;
++			break;
++		}
+ 	}
++	netdev_unlock(ppriv->dev);
+ 
+-	return true;
++	return result;
+ }
+ 
+ /*
+@@ -98,8 +101,6 @@ int __ipoib_vlan_add(struct ipoib_dev_priv *ppriv, struct ipoib_dev_priv *priv,
+ 	int result;
+ 	struct rdma_netdev *rn = netdev_priv(ndev);
+ 
+-	ASSERT_RTNL();
+-
+ 	/*
+ 	 * We do not need to touch priv if register_netdevice fails, so just
+ 	 * always use this flow.
+@@ -267,6 +268,7 @@ int ipoib_vlan_delete(struct net_device *pdev, unsigned short pkey)
+ 	ppriv = ipoib_priv(pdev);
+ 
+ 	rc = -ENODEV;
++	netdev_lock(ppriv->dev);
+ 	list_for_each_entry_safe(priv, tpriv, &ppriv->child_intfs, list) {
+ 		if (priv->pkey == pkey &&
+ 		    priv->child_type == IPOIB_LEGACY_CHILD) {
+@@ -278,9 +280,7 @@ int ipoib_vlan_delete(struct net_device *pdev, unsigned short pkey)
+ 				goto out;
+ 			}
+ 
+-			down_write(&ppriv->vlan_rwsem);
+ 			list_del_init(&priv->list);
+-			up_write(&ppriv->vlan_rwsem);
+ 			work->dev = priv->dev;
+ 			INIT_WORK(&work->work, ipoib_vlan_delete_task);
+ 			queue_work(ipoib_workqueue, &work->work);
+@@ -291,6 +291,7 @@ int ipoib_vlan_delete(struct net_device *pdev, unsigned short pkey)
+ 	}
+ 
+ out:
++	netdev_unlock(ppriv->dev);
+ 	rtnl_unlock();
+ 
+ 	return rc;
+-- 
+2.52.0
+

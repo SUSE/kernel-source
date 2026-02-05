@@ -1,0 +1,236 @@
+From d9d5c8ed98738f0e4e9ecbce1effa87a8569d35d Mon Sep 17 00:00:00 2001
+From: Preethi G <preethi.gurusiddalingeswaraswamy@broadcom.com>
+Date: Thu, 13 Mar 2025 01:44:24 -0700
+Subject: [PATCH 1/1] RDMA/bnxt_re: Support perf management counters
+Git-commit: d9d5c8ed98738f0e4e9ecbce1effa87a8569d35d
+Patch-mainline: v6.15-rc1
+References: jsc#PED-15349
+
+Add support for process_mad hook to retrieve the perf management counters.
+Supports IB_PMA_PORT_COUNTERS and IB_PMA_PORT_COUNTERS_EXT counters.
+Query the data from HW contexts and FW commands.
+
+Signed-off-by: Preethi G <preethi.gurusiddalingeswaraswamy@broadcom.com>
+Signed-off-by: Selvin Xavier <selvin.xavier@broadcom.com>
+Link: https://patch.msgid.link/1741855464-27921-1-git-send-email-selvin.xavier@broadcom.com
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Acked-by: Nicolas Morey <nmorey@suse.com>
+---
+ drivers/infiniband/hw/bnxt_re/bnxt_re.h     |  4 +
+ drivers/infiniband/hw/bnxt_re/hw_counters.c | 92 +++++++++++++++++++++
+ drivers/infiniband/hw/bnxt_re/ib_verbs.c    | 36 ++++++++
+ drivers/infiniband/hw/bnxt_re/ib_verbs.h    |  6 ++
+ drivers/infiniband/hw/bnxt_re/main.c        |  1 +
+ 5 files changed, 139 insertions(+)
+
+diff --git a/drivers/infiniband/hw/bnxt_re/bnxt_re.h b/drivers/infiniband/hw/bnxt_re/bnxt_re.h
+index b33b04e4f8e4..8bc023775c20 100644
+--- a/drivers/infiniband/hw/bnxt_re/bnxt_re.h
++++ b/drivers/infiniband/hw/bnxt_re/bnxt_re.h
+@@ -246,6 +246,10 @@ struct bnxt_re_dev {
+ #define BNXT_RE_CHECK_RC(x) ((x) && ((x) != -ETIMEDOUT))
+ void bnxt_re_pacing_alert(struct bnxt_re_dev *rdev);
+ 
++int bnxt_re_assign_pma_port_counters(struct bnxt_re_dev *rdev, struct ib_mad *out_mad);
++int bnxt_re_assign_pma_port_ext_counters(struct bnxt_re_dev *rdev,
++					 struct ib_mad *out_mad);
++
+ static inline struct device *rdev_to_dev(struct bnxt_re_dev *rdev)
+ {
+ 	if (rdev)
+diff --git a/drivers/infiniband/hw/bnxt_re/hw_counters.c b/drivers/infiniband/hw/bnxt_re/hw_counters.c
+index 3ac47f4e6122..3f53e5db9594 100644
+--- a/drivers/infiniband/hw/bnxt_re/hw_counters.c
++++ b/drivers/infiniband/hw/bnxt_re/hw_counters.c
+@@ -39,6 +39,8 @@
+ 
+ #include <linux/types.h>
+ #include <linux/pci.h>
++#include <rdma/ib_mad.h>
++#include <rdma/ib_pma.h>
+ 
+ #include "roce_hsi.h"
+ #include "qplib_res.h"
+@@ -285,6 +287,96 @@ static void bnxt_re_copy_db_pacing_stats(struct bnxt_re_dev *rdev,
+ 		readl(rdev->en_dev->bar0 + rdev->pacing.dbr_db_fifo_reg_off);
+ }
+ 
++int bnxt_re_assign_pma_port_ext_counters(struct bnxt_re_dev *rdev, struct ib_mad *out_mad)
++{
++	struct ib_pma_portcounters_ext *pma_cnt_ext;
++	struct bnxt_qplib_ext_stat *estat = &rdev->stats.rstat.ext_stat;
++	struct ctx_hw_stats *hw_stats = NULL;
++	int rc;
++
++	hw_stats = rdev->qplib_ctx.stats.dma;
++
++	pma_cnt_ext = (struct ib_pma_portcounters_ext *)(out_mad->data + 40);
++	if (_is_ext_stats_supported(rdev->dev_attr->dev_cap_flags)) {
++		u32 fid = PCI_FUNC(rdev->en_dev->pdev->devfn);
++
++		rc = bnxt_qplib_qext_stat(&rdev->rcfw, fid, estat);
++		if (rc)
++			return rc;
++	}
++
++	pma_cnt_ext = (struct ib_pma_portcounters_ext *)(out_mad->data + 40);
++	if ((bnxt_qplib_is_chip_gen_p5(rdev->chip_ctx) && rdev->is_virtfn) ||
++	    !bnxt_qplib_is_chip_gen_p5(rdev->chip_ctx)) {
++		pma_cnt_ext->port_xmit_data =
++			cpu_to_be64(le64_to_cpu(hw_stats->tx_ucast_bytes) / 4);
++		pma_cnt_ext->port_rcv_data =
++			cpu_to_be64(le64_to_cpu(hw_stats->rx_ucast_bytes) / 4);
++		pma_cnt_ext->port_xmit_packets =
++			cpu_to_be64(le64_to_cpu(hw_stats->tx_ucast_pkts));
++		pma_cnt_ext->port_rcv_packets =
++			cpu_to_be64(le64_to_cpu(hw_stats->rx_ucast_pkts));
++		pma_cnt_ext->port_unicast_rcv_packets =
++			cpu_to_be64(le64_to_cpu(hw_stats->rx_ucast_pkts));
++		pma_cnt_ext->port_unicast_xmit_packets =
++			cpu_to_be64(le64_to_cpu(hw_stats->tx_ucast_pkts));
++
++	} else {
++		pma_cnt_ext->port_rcv_packets = cpu_to_be64(estat->rx_roce_good_pkts);
++		pma_cnt_ext->port_rcv_data = cpu_to_be64(estat->rx_roce_good_bytes / 4);
++		pma_cnt_ext->port_xmit_packets = cpu_to_be64(estat->tx_roce_pkts);
++		pma_cnt_ext->port_xmit_data = cpu_to_be64(estat->tx_roce_bytes / 4);
++		pma_cnt_ext->port_unicast_rcv_packets = cpu_to_be64(estat->rx_roce_good_pkts);
++		pma_cnt_ext->port_unicast_xmit_packets = cpu_to_be64(estat->tx_roce_pkts);
++	}
++	return 0;
++}
++
++int bnxt_re_assign_pma_port_counters(struct bnxt_re_dev *rdev, struct ib_mad *out_mad)
++{
++	struct bnxt_qplib_ext_stat *estat = &rdev->stats.rstat.ext_stat;
++	struct ib_pma_portcounters *pma_cnt;
++	struct ctx_hw_stats *hw_stats = NULL;
++	int rc;
++
++	hw_stats = rdev->qplib_ctx.stats.dma;
++
++	pma_cnt = (struct ib_pma_portcounters *)(out_mad->data + 40);
++	if (_is_ext_stats_supported(rdev->dev_attr->dev_cap_flags)) {
++		u32 fid = PCI_FUNC(rdev->en_dev->pdev->devfn);
++
++		rc = bnxt_qplib_qext_stat(&rdev->rcfw, fid, estat);
++		if (rc)
++			return rc;
++	}
++	if ((bnxt_qplib_is_chip_gen_p5(rdev->chip_ctx) && rdev->is_virtfn) ||
++	    !bnxt_qplib_is_chip_gen_p5(rdev->chip_ctx)) {
++		pma_cnt->port_rcv_packets =
++			cpu_to_be32((u32)(le64_to_cpu(hw_stats->rx_ucast_pkts)) & 0xFFFFFFFF);
++		pma_cnt->port_rcv_data =
++			cpu_to_be32((u32)((le64_to_cpu(hw_stats->rx_ucast_bytes) &
++					   0xFFFFFFFF) / 4));
++		pma_cnt->port_xmit_packets =
++			cpu_to_be32((u32)(le64_to_cpu(hw_stats->tx_ucast_pkts)) & 0xFFFFFFFF);
++		pma_cnt->port_xmit_data =
++			cpu_to_be32((u32)((le64_to_cpu(hw_stats->tx_ucast_bytes)
++					   & 0xFFFFFFFF) / 4));
++	} else {
++		pma_cnt->port_rcv_packets = cpu_to_be32(estat->rx_roce_good_pkts);
++		pma_cnt->port_rcv_data = cpu_to_be32((estat->rx_roce_good_bytes / 4));
++		pma_cnt->port_xmit_packets = cpu_to_be32(estat->tx_roce_pkts);
++		pma_cnt->port_xmit_data = cpu_to_be32((estat->tx_roce_bytes / 4));
++	}
++	pma_cnt->port_rcv_constraint_errors = (u8)(le64_to_cpu(hw_stats->rx_discard_pkts) & 0xFF);
++	pma_cnt->port_rcv_errors = cpu_to_be16((u16)(le64_to_cpu(hw_stats->rx_error_pkts)
++						     & 0xFFFF));
++	pma_cnt->port_xmit_constraint_errors = (u8)(le64_to_cpu(hw_stats->tx_error_pkts) & 0xFF);
++	pma_cnt->port_xmit_discards = cpu_to_be16((u16)(le64_to_cpu(hw_stats->tx_discard_pkts)
++							& 0xFFFF));
++
++	return 0;
++}
++
+ int bnxt_re_ib_get_hw_stats(struct ib_device *ibdev,
+ 			    struct rdma_hw_stats *stats,
+ 			    u32 port, int index)
+diff --git a/drivers/infiniband/hw/bnxt_re/ib_verbs.c b/drivers/infiniband/hw/bnxt_re/ib_verbs.c
+index 2de101d6e825..37e58d48e22e 100644
+--- a/drivers/infiniband/hw/bnxt_re/ib_verbs.c
++++ b/drivers/infiniband/hw/bnxt_re/ib_verbs.c
+@@ -49,6 +49,7 @@
+ #include <rdma/ib_addr.h>
+ #include <rdma/ib_mad.h>
+ #include <rdma/ib_cache.h>
++#include <rdma/ib_pma.h>
+ #include <rdma/uverbs_ioctl.h>
+ #include <linux/hashtable.h>
+ 
+@@ -4489,6 +4490,41 @@ void bnxt_re_mmap_free(struct rdma_user_mmap_entry *rdma_entry)
+ 	kfree(bnxt_entry);
+ }
+ 
++int bnxt_re_process_mad(struct ib_device *ibdev, int mad_flags,
++			u32 port_num, const struct ib_wc *in_wc,
++			const struct ib_grh *in_grh,
++			const struct ib_mad *in_mad, struct ib_mad *out_mad,
++			size_t *out_mad_size, u16 *out_mad_pkey_index)
++{
++	struct bnxt_re_dev *rdev = to_bnxt_re_dev(ibdev, ibdev);
++	struct ib_class_port_info cpi = {};
++	int ret = IB_MAD_RESULT_SUCCESS;
++	int rc = 0;
++
++	if (in_mad->mad_hdr.mgmt_class != IB_MGMT_CLASS_PERF_MGMT)
++		return ret;
++
++	switch (in_mad->mad_hdr.attr_id) {
++	case IB_PMA_CLASS_PORT_INFO:
++		cpi.capability_mask = IB_PMA_CLASS_CAP_EXT_WIDTH;
++		memcpy((out_mad->data + 40), &cpi, sizeof(cpi));
++		break;
++	case IB_PMA_PORT_COUNTERS_EXT:
++		rc = bnxt_re_assign_pma_port_ext_counters(rdev, out_mad);
++		break;
++	case IB_PMA_PORT_COUNTERS:
++		rc = bnxt_re_assign_pma_port_counters(rdev, out_mad);
++		break;
++	default:
++		rc = -EINVAL;
++		break;
++	}
++	if (rc)
++		return IB_MAD_RESULT_FAILURE;
++	ret |= IB_MAD_RESULT_REPLY;
++	return ret;
++}
++
+ static int UVERBS_HANDLER(BNXT_RE_METHOD_NOTIFY_DRV)(struct uverbs_attr_bundle *attrs)
+ {
+ 	struct bnxt_re_ucontext *uctx;
+diff --git a/drivers/infiniband/hw/bnxt_re/ib_verbs.h b/drivers/infiniband/hw/bnxt_re/ib_verbs.h
+index fbb16a411d6a..22c9eb8e9cfc 100644
+--- a/drivers/infiniband/hw/bnxt_re/ib_verbs.h
++++ b/drivers/infiniband/hw/bnxt_re/ib_verbs.h
+@@ -268,6 +268,12 @@ void bnxt_re_dealloc_ucontext(struct ib_ucontext *context);
+ int bnxt_re_mmap(struct ib_ucontext *context, struct vm_area_struct *vma);
+ void bnxt_re_mmap_free(struct rdma_user_mmap_entry *rdma_entry);
+ 
++int bnxt_re_process_mad(struct ib_device *device, int process_mad_flags,
++			u32 port_num, const struct ib_wc *in_wc,
++			const struct ib_grh *in_grh,
++			const struct ib_mad *in_mad, struct ib_mad *out_mad,
++			size_t *out_mad_size, u16 *out_mad_pkey_index);
++
+ static inline u32 __to_ib_port_num(u16 port_id)
+ {
+ 	return (u32)port_id + 1;
+diff --git a/drivers/infiniband/hw/bnxt_re/main.c b/drivers/infiniband/hw/bnxt_re/main.c
+index e9e4da4dd576..59ddb366978a 100644
+--- a/drivers/infiniband/hw/bnxt_re/main.c
++++ b/drivers/infiniband/hw/bnxt_re/main.c
+@@ -1276,6 +1276,7 @@ static const struct ib_device_ops bnxt_re_dev_ops = {
+ 	.post_recv = bnxt_re_post_recv,
+ 	.post_send = bnxt_re_post_send,
+ 	.post_srq_recv = bnxt_re_post_srq_recv,
++	.process_mad = bnxt_re_process_mad,
+ 	.query_ah = bnxt_re_query_ah,
+ 	.query_device = bnxt_re_query_device,
+ 	.modify_device = bnxt_re_modify_device,
+-- 
+2.52.0
+

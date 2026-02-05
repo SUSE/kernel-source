@@ -1,0 +1,297 @@
+From 0a192745551cd2e999532075f21c0cfa174bc065 Mon Sep 17 00:00:00 2001
+From: Jay Bhat <jay.bhat@intel.com>
+Date: Thu, 30 Oct 2025 21:17:23 -0500
+Subject: [PATCH 1/1] RDMA/irdma: CQ size and shadow update changes for GEN3
+Git-commit: 0a192745551cd2e999532075f21c0cfa174bc065
+Patch-mainline: v6.19-rc1
+References: jsc#PED-14401
+
+CQ shadow area should not be updated at the end of a page (once every
+64th CQ entry), except when CQ has no more CQEs. SW must also increase
+the requested CQ size by 1 and make sure the CQ is not exactly one page
+in size. This is to address a quirk in the hardware.
+
+Signed-off-by: Jay Bhat <jay.bhat@intel.com>
+Signed-off-by: Tatyana Nikolova <tatyana.e.nikolova@intel.com>
+Link: https://patch.msgid.link/20251031021726.1003-4-tatyana.e.nikolova@intel.com
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Acked-by: Nicolas Morey <nmorey@suse.com>
+---
+ drivers/infiniband/hw/irdma/main.h  |  1 -
+ drivers/infiniband/hw/irdma/uk.c    | 26 +++++++++++++--
+ drivers/infiniband/hw/irdma/user.h  |  1 +
+ drivers/infiniband/hw/irdma/utils.c | 52 ++++++++++-------------------
+ drivers/infiniband/hw/irdma/verbs.c | 16 +++++++--
+ 5 files changed, 56 insertions(+), 40 deletions(-)
+
+diff --git a/drivers/infiniband/hw/irdma/main.h b/drivers/infiniband/hw/irdma/main.h
+index 886b30da188a..f22b1ee20fcc 100644
+--- a/drivers/infiniband/hw/irdma/main.h
++++ b/drivers/infiniband/hw/irdma/main.h
+@@ -564,7 +564,6 @@ int irdma_ah_cqp_op(struct irdma_pci_f *rf, struct irdma_sc_ah *sc_ah, u8 cmd,
+ 		    void (*callback_fcn)(struct irdma_cqp_request *cqp_request),
+ 		    void *cb_param);
+ void irdma_gsi_ud_qp_ah_cb(struct irdma_cqp_request *cqp_request);
+-bool irdma_cq_empty(struct irdma_cq *iwcq);
+ int irdma_inetaddr_event(struct notifier_block *notifier, unsigned long event,
+ 			 void *ptr);
+ int irdma_inet6addr_event(struct notifier_block *notifier, unsigned long event,
+diff --git a/drivers/infiniband/hw/irdma/uk.c b/drivers/infiniband/hw/irdma/uk.c
+index b3c6cbde797c..a006e7365f4d 100644
+--- a/drivers/infiniband/hw/irdma/uk.c
++++ b/drivers/infiniband/hw/irdma/uk.c
+@@ -1137,6 +1137,27 @@ void irdma_uk_cq_request_notification(struct irdma_cq_uk *cq,
+ 	writel(cq->cq_id, cq->cqe_alloc_db);
+ }
+ 
++/**
++ * irdma_uk_cq_empty - Check if CQ is empty
++ * @cq: hw cq
++ */
++bool irdma_uk_cq_empty(struct irdma_cq_uk *cq)
++{
++	__le64 *cqe;
++	u8 polarity;
++	u64 qword3;
++
++	if (cq->avoid_mem_cflct)
++		cqe = IRDMA_GET_CURRENT_EXTENDED_CQ_ELEM(cq);
++	else
++		cqe = IRDMA_GET_CURRENT_CQ_ELEM(cq);
++
++	get_64bit_val(cqe, 24, &qword3);
++	polarity = (u8)FIELD_GET(IRDMA_CQ_VALID, qword3);
++
++	return polarity != cq->polarity;
++}
++
+ /**
+  * irdma_uk_cq_poll_cmpl - get cq completion info
+  * @cq: hw cq
+@@ -1425,8 +1446,9 @@ int irdma_uk_cq_poll_cmpl(struct irdma_cq_uk *cq,
+ 		IRDMA_RING_MOVE_TAIL(cq->cq_ring);
+ 		if (!cq->avoid_mem_cflct && ext_valid)
+ 			IRDMA_RING_MOVE_TAIL(cq->cq_ring);
+-		set_64bit_val(cq->shadow_area, 0,
+-			      IRDMA_RING_CURRENT_HEAD(cq->cq_ring));
++		if (IRDMA_RING_CURRENT_HEAD(cq->cq_ring) & 0x3F || irdma_uk_cq_empty(cq))
++			set_64bit_val(cq->shadow_area, 0,
++				      IRDMA_RING_CURRENT_HEAD(cq->cq_ring));
+ 	} else {
+ 		qword3 &= ~IRDMA_CQ_WQEIDX;
+ 		qword3 |= FIELD_PREP(IRDMA_CQ_WQEIDX, pring->tail);
+diff --git a/drivers/infiniband/hw/irdma/user.h b/drivers/infiniband/hw/irdma/user.h
+index ee02c67ad313..6c29fa04e821 100644
+--- a/drivers/infiniband/hw/irdma/user.h
++++ b/drivers/infiniband/hw/irdma/user.h
+@@ -429,6 +429,7 @@ struct irdma_wqe_uk_ops {
+ 				   struct irdma_bind_window *op_info);
+ };
+ 
++bool irdma_uk_cq_empty(struct irdma_cq_uk *cq);
+ int irdma_uk_cq_poll_cmpl(struct irdma_cq_uk *cq,
+ 			  struct irdma_cq_poll_info *info);
+ void irdma_uk_cq_request_notification(struct irdma_cq_uk *cq,
+diff --git a/drivers/infiniband/hw/irdma/utils.c b/drivers/infiniband/hw/irdma/utils.c
+index 3b19e2b997b0..cc2a12f735d3 100644
+--- a/drivers/infiniband/hw/irdma/utils.c
++++ b/drivers/infiniband/hw/irdma/utils.c
+@@ -2353,24 +2353,6 @@ void irdma_ib_qp_event(struct irdma_qp *iwqp, enum irdma_qp_event_type event)
+ 	iwqp->ibqp.event_handler(&ibevent, iwqp->ibqp.qp_context);
+ }
+ 
+-bool irdma_cq_empty(struct irdma_cq *iwcq)
+-{
+-	struct irdma_cq_uk *ukcq;
+-	u64 qword3;
+-	__le64 *cqe;
+-	u8 polarity;
+-
+-	ukcq  = &iwcq->sc_cq.cq_uk;
+-	if (ukcq->avoid_mem_cflct)
+-		cqe = IRDMA_GET_CURRENT_EXTENDED_CQ_ELEM(ukcq);
+-	else
+-		cqe = IRDMA_GET_CURRENT_CQ_ELEM(ukcq);
+-	get_64bit_val(cqe, 24, &qword3);
+-	polarity = (u8)FIELD_GET(IRDMA_CQ_VALID, qword3);
+-
+-	return polarity != ukcq->polarity;
+-}
+-
+ void irdma_remove_cmpls_list(struct irdma_cq *iwcq)
+ {
+ 	struct irdma_cmpl_gen *cmpl_node;
+@@ -2432,6 +2414,8 @@ void irdma_generate_flush_completions(struct irdma_qp *iwqp)
+ 	struct irdma_qp_uk *qp = &iwqp->sc_qp.qp_uk;
+ 	struct irdma_ring *sq_ring = &qp->sq_ring;
+ 	struct irdma_ring *rq_ring = &qp->rq_ring;
++	struct irdma_cq *iwscq = iwqp->iwscq;
++	struct irdma_cq *iwrcq = iwqp->iwrcq;
+ 	struct irdma_cmpl_gen *cmpl;
+ 	__le64 *sw_wqe;
+ 	u64 wqe_qword;
+@@ -2439,8 +2423,8 @@ void irdma_generate_flush_completions(struct irdma_qp *iwqp)
+ 	bool compl_generated = false;
+ 	unsigned long flags1;
+ 
+-	spin_lock_irqsave(&iwqp->iwscq->lock, flags1);
+-	if (irdma_cq_empty(iwqp->iwscq)) {
++	spin_lock_irqsave(&iwscq->lock, flags1);
++	if (irdma_uk_cq_empty(&iwscq->sc_cq.cq_uk)) {
+ 		unsigned long flags2;
+ 
+ 		spin_lock_irqsave(&iwqp->lock, flags2);
+@@ -2448,7 +2432,7 @@ void irdma_generate_flush_completions(struct irdma_qp *iwqp)
+ 			cmpl = kzalloc(sizeof(*cmpl), GFP_ATOMIC);
+ 			if (!cmpl) {
+ 				spin_unlock_irqrestore(&iwqp->lock, flags2);
+-				spin_unlock_irqrestore(&iwqp->iwscq->lock, flags1);
++				spin_unlock_irqrestore(&iwscq->lock, flags1);
+ 				return;
+ 			}
+ 
+@@ -2467,24 +2451,24 @@ void irdma_generate_flush_completions(struct irdma_qp *iwqp)
+ 				kfree(cmpl);
+ 				continue;
+ 			}
+-			ibdev_dbg(iwqp->iwscq->ibcq.device,
++			ibdev_dbg(iwscq->ibcq.device,
+ 				  "DEV: %s: adding wr_id = 0x%llx SQ Completion to list qp_id=%d\n",
+ 				  __func__, cmpl->cpi.wr_id, qp->qp_id);
+-			list_add_tail(&cmpl->list, &iwqp->iwscq->cmpl_generated);
++			list_add_tail(&cmpl->list, &iwscq->cmpl_generated);
+ 			compl_generated = true;
+ 		}
+ 		spin_unlock_irqrestore(&iwqp->lock, flags2);
+-		spin_unlock_irqrestore(&iwqp->iwscq->lock, flags1);
++		spin_unlock_irqrestore(&iwscq->lock, flags1);
+ 		if (compl_generated)
+-			irdma_comp_handler(iwqp->iwscq);
++			irdma_comp_handler(iwscq);
+ 	} else {
+-		spin_unlock_irqrestore(&iwqp->iwscq->lock, flags1);
++		spin_unlock_irqrestore(&iwscq->lock, flags1);
+ 		mod_delayed_work(iwqp->iwdev->cleanup_wq, &iwqp->dwork_flush,
+ 				 msecs_to_jiffies(IRDMA_FLUSH_DELAY_MS));
+ 	}
+ 
+-	spin_lock_irqsave(&iwqp->iwrcq->lock, flags1);
+-	if (irdma_cq_empty(iwqp->iwrcq)) {
++	spin_lock_irqsave(&iwrcq->lock, flags1);
++	if (irdma_uk_cq_empty(&iwrcq->sc_cq.cq_uk)) {
+ 		unsigned long flags2;
+ 
+ 		spin_lock_irqsave(&iwqp->lock, flags2);
+@@ -2492,7 +2476,7 @@ void irdma_generate_flush_completions(struct irdma_qp *iwqp)
+ 			cmpl = kzalloc(sizeof(*cmpl), GFP_ATOMIC);
+ 			if (!cmpl) {
+ 				spin_unlock_irqrestore(&iwqp->lock, flags2);
+-				spin_unlock_irqrestore(&iwqp->iwrcq->lock, flags1);
++				spin_unlock_irqrestore(&iwrcq->lock, flags1);
+ 				return;
+ 			}
+ 
+@@ -2504,20 +2488,20 @@ void irdma_generate_flush_completions(struct irdma_qp *iwqp)
+ 			cmpl->cpi.q_type = IRDMA_CQE_QTYPE_RQ;
+ 			/* remove the RQ WR by moving RQ tail */
+ 			IRDMA_RING_SET_TAIL(*rq_ring, rq_ring->tail + 1);
+-			ibdev_dbg(iwqp->iwrcq->ibcq.device,
++			ibdev_dbg(iwrcq->ibcq.device,
+ 				  "DEV: %s: adding wr_id = 0x%llx RQ Completion to list qp_id=%d, wqe_idx=%d\n",
+ 				  __func__, cmpl->cpi.wr_id, qp->qp_id,
+ 				  wqe_idx);
+-			list_add_tail(&cmpl->list, &iwqp->iwrcq->cmpl_generated);
++			list_add_tail(&cmpl->list, &iwrcq->cmpl_generated);
+ 
+ 			compl_generated = true;
+ 		}
+ 		spin_unlock_irqrestore(&iwqp->lock, flags2);
+-		spin_unlock_irqrestore(&iwqp->iwrcq->lock, flags1);
++		spin_unlock_irqrestore(&iwrcq->lock, flags1);
+ 		if (compl_generated)
+-			irdma_comp_handler(iwqp->iwrcq);
++			irdma_comp_handler(iwrcq);
+ 	} else {
+-		spin_unlock_irqrestore(&iwqp->iwrcq->lock, flags1);
++		spin_unlock_irqrestore(&iwrcq->lock, flags1);
+ 		mod_delayed_work(iwqp->iwdev->cleanup_wq, &iwqp->dwork_flush,
+ 				 msecs_to_jiffies(IRDMA_FLUSH_DELAY_MS));
+ 	}
+diff --git a/drivers/infiniband/hw/irdma/verbs.c b/drivers/infiniband/hw/irdma/verbs.c
+index 9804deba513d..7eff07a329e7 100644
+--- a/drivers/infiniband/hw/irdma/verbs.c
++++ b/drivers/infiniband/hw/irdma/verbs.c
+@@ -2028,6 +2028,7 @@ static int irdma_resize_cq(struct ib_cq *ibcq, int entries,
+ 	struct irdma_pci_f *rf;
+ 	struct irdma_cq_buf *cq_buf = NULL;
+ 	unsigned long flags;
++	u8 cqe_size;
+ 	int ret;
+ 
+ 	iwdev = to_iwdev(ibcq->device);
+@@ -2044,7 +2045,7 @@ static int irdma_resize_cq(struct ib_cq *ibcq, int entries,
+ 		return -EINVAL;
+ 
+ 	if (!iwcq->user_mode) {
+-		entries++;
++		entries += 2;
+ 
+ 		if (!iwcq->sc_cq.cq_uk.avoid_mem_cflct &&
+ 		    dev->hw_attrs.uk_attrs.hw_rev >= IRDMA_GEN_2)
+@@ -2052,6 +2053,10 @@ static int irdma_resize_cq(struct ib_cq *ibcq, int entries,
+ 
+ 		if (entries & 1)
+ 			entries += 1; /* cq size must be an even number */
++
++		cqe_size = iwcq->sc_cq.cq_uk.avoid_mem_cflct ? 64 : 32;
++		if (entries * cqe_size == IRDMA_HW_PAGE_SIZE)
++			entries += 2;
+ 	}
+ 
+ 	info.cq_size = max(entries, 4);
+@@ -2482,6 +2487,7 @@ static int irdma_create_cq(struct ib_cq *ibcq,
+ 	int err_code;
+ 	int entries = attr->cqe;
+ 	bool cqe_64byte_ena;
++	u8 cqe_size;
+ 
+ 	err_code = cq_validate_flags(attr->flags, dev->hw_attrs.uk_attrs.hw_rev);
+ 	if (err_code)
+@@ -2507,6 +2513,7 @@ static int irdma_create_cq(struct ib_cq *ibcq,
+ 	ukinfo->cq_id = cq_num;
+ 	cqe_64byte_ena = dev->hw_attrs.uk_attrs.feature_flags & IRDMA_FEATURE_64_BYTE_CQE ?
+ 			 true : false;
++	cqe_size = cqe_64byte_ena ? 64 : 32;
+ 	ukinfo->avoid_mem_cflct = cqe_64byte_ena;
+ 	iwcq->ibcq.cqe = info.cq_uk_init_info.cq_size;
+ 	if (attr->comp_vector < rf->ceqs_count)
+@@ -2579,13 +2586,16 @@ static int irdma_create_cq(struct ib_cq *ibcq,
+ 			goto cq_free_rsrc;
+ 		}
+ 
+-		entries++;
++		entries += 2;
+ 		if (!cqe_64byte_ena && dev->hw_attrs.uk_attrs.hw_rev >= IRDMA_GEN_2)
+ 			entries *= 2;
+ 
+ 		if (entries & 1)
+ 			entries += 1; /* cq size must be an even number */
+ 
++		if (entries * cqe_size == IRDMA_HW_PAGE_SIZE)
++			entries += 2;
++
+ 		ukinfo->cq_size = entries;
+ 
+ 		if (cqe_64byte_ena)
+@@ -4500,7 +4510,7 @@ static int irdma_req_notify_cq(struct ib_cq *ibcq,
+ 	}
+ 
+ 	if ((notify_flags & IB_CQ_REPORT_MISSED_EVENTS) &&
+-	    (!irdma_cq_empty(iwcq) || !list_empty(&iwcq->cmpl_generated)))
++	    (!irdma_uk_cq_empty(ukcq) || !list_empty(&iwcq->cmpl_generated)))
+ 		ret = 1;
+ 	spin_unlock_irqrestore(&iwcq->lock, flags);
+ 
+-- 
+2.52.0
+

@@ -1,0 +1,187 @@
+From b55e9d29ec6a268c7d077d6796fd52f98e150a33 Mon Sep 17 00:00:00 2001
+From: Daisuke Matsuda <matsuda-daisuke@fujitsu.com>
+Date: Fri, 20 Dec 2024 19:09:36 +0900
+Subject: [PATCH 1/1] RDMA/rxe: Add support for the traditional Atomic
+ operations with ODP
+Git-commit: b55e9d29ec6a268c7d077d6796fd52f98e150a33
+Patch-mainline: v6.15-rc1
+References: jsc#PED-15314
+
+Enable 'fetch and add' and 'compare and swap' operations to be used with
+ODP. This is comprised of the following steps:
+ 1. Check the driver page table(umem_odp->dma_list) to see if the target
+    page is both readable and writable.
+ 2. If not, then trigger page fault to map the page.
+ 3. Convert its user space address to a kernel logical address using PFNs
+    in the driver page table(umem_odp->pfn_list).
+ 4. Execute the operation.
+
+Link: https://patch.msgid.link/r/20241220100936.2193541-6-matsuda-daisuke@fujitsu.com
+Signed-off-by: Daisuke Matsuda <matsuda-daisuke@fujitsu.com>
+Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+Acked-by: Nicolas Morey <nmorey@suse.com>
+---
+ drivers/infiniband/sw/rxe/rxe.c      |  1 +
+ drivers/infiniband/sw/rxe/rxe_loc.h  | 11 +++++
+ drivers/infiniband/sw/rxe/rxe_mr.c   |  2 +-
+ drivers/infiniband/sw/rxe/rxe_odp.c  | 69 ++++++++++++++++++++++++++++
+ drivers/infiniband/sw/rxe/rxe_resp.c |  5 +-
+ 5 files changed, 86 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/infiniband/sw/rxe/rxe.c b/drivers/infiniband/sw/rxe/rxe.c
+index d7daaafa8b32..4e56a371deb5 100644
+--- a/drivers/infiniband/sw/rxe/rxe.c
++++ b/drivers/infiniband/sw/rxe/rxe.c
+@@ -107,6 +107,7 @@ static void rxe_init_device_param(struct rxe_dev *rxe)
+ 		rxe->attr.odp_caps.per_transport_caps.rc_odp_caps |= IB_ODP_SUPPORT_RECV;
+ 		rxe->attr.odp_caps.per_transport_caps.rc_odp_caps |= IB_ODP_SUPPORT_WRITE;
+ 		rxe->attr.odp_caps.per_transport_caps.rc_odp_caps |= IB_ODP_SUPPORT_READ;
++		rxe->attr.odp_caps.per_transport_caps.rc_odp_caps |= IB_ODP_SUPPORT_ATOMIC;
+ 		rxe->attr.odp_caps.per_transport_caps.rc_odp_caps |= IB_ODP_SUPPORT_SRQ_RECV;
+ 	}
+ }
+diff --git a/drivers/infiniband/sw/rxe/rxe_loc.h b/drivers/infiniband/sw/rxe/rxe_loc.h
+index ec53ba2bd7d8..feb386d98d1d 100644
+--- a/drivers/infiniband/sw/rxe/rxe_loc.h
++++ b/drivers/infiniband/sw/rxe/rxe_loc.h
+@@ -81,6 +81,9 @@ int rxe_invalidate_mr(struct rxe_qp *qp, u32 key);
+ int rxe_reg_fast_mr(struct rxe_qp *qp, struct rxe_send_wqe *wqe);
+ void rxe_mr_cleanup(struct rxe_pool_elem *elem);
+ 
++/* defined in rxe_mr.c; used in rxe_mr.c and rxe_odp.c */
++extern spinlock_t atomic_ops_lock;
++
+ /* rxe_mw.c */
+ int rxe_alloc_mw(struct ib_mw *ibmw, struct ib_udata *udata);
+ int rxe_dealloc_mw(struct ib_mw *ibmw);
+@@ -189,6 +192,8 @@ int rxe_odp_mr_init_user(struct rxe_dev *rxe, u64 start, u64 length,
+ 			 u64 iova, int access_flags, struct rxe_mr *mr);
+ int rxe_odp_mr_copy(struct rxe_mr *mr, u64 iova, void *addr, int length,
+ 		    enum rxe_mr_copy_dir dir);
++int rxe_odp_atomic_op(struct rxe_mr *mr, u64 iova, int opcode,
++			 u64 compare, u64 swap_add, u64 *orig_val);
+ #else /* CONFIG_INFINIBAND_ON_DEMAND_PAGING */
+ static inline int
+ rxe_odp_mr_init_user(struct rxe_dev *rxe, u64 start, u64 length, u64 iova,
+@@ -201,6 +206,12 @@ static inline int rxe_odp_mr_copy(struct rxe_mr *mr, u64 iova, void *addr,
+ {
+ 	return -EOPNOTSUPP;
+ }
++static inline int
++rxe_odp_atomic_op(struct rxe_mr *mr, u64 iova, int opcode,
++		     u64 compare, u64 swap_add, u64 *orig_val)
++{
++	return RESPST_ERR_UNSUPPORTED_OPCODE;
++}
+ #endif /* CONFIG_INFINIBAND_ON_DEMAND_PAGING */
+ 
+ #endif /* RXE_LOC_H */
+diff --git a/drivers/infiniband/sw/rxe/rxe_mr.c b/drivers/infiniband/sw/rxe/rxe_mr.c
+index 6cd668a8dfb2..868d2f0b74e9 100644
+--- a/drivers/infiniband/sw/rxe/rxe_mr.c
++++ b/drivers/infiniband/sw/rxe/rxe_mr.c
+@@ -469,7 +469,7 @@ int rxe_flush_pmem_iova(struct rxe_mr *mr, u64 iova, unsigned int length)
+ }
+ 
+ /* Guarantee atomicity of atomic operations at the machine level. */
+-static DEFINE_SPINLOCK(atomic_ops_lock);
++DEFINE_SPINLOCK(atomic_ops_lock);
+ 
+ int rxe_mr_do_atomic_op(struct rxe_mr *mr, u64 iova, int opcode,
+ 			u64 compare, u64 swap_add, u64 *orig_val)
+diff --git a/drivers/infiniband/sw/rxe/rxe_odp.c b/drivers/infiniband/sw/rxe/rxe_odp.c
+index d3c67d18c173..a82e5011360c 100644
+--- a/drivers/infiniband/sw/rxe/rxe_odp.c
++++ b/drivers/infiniband/sw/rxe/rxe_odp.c
+@@ -253,3 +253,72 @@ int rxe_odp_mr_copy(struct rxe_mr *mr, u64 iova, void *addr, int length,
+ 
+ 	return err;
+ }
++
++static int rxe_odp_do_atomic_op(struct rxe_mr *mr, u64 iova, int opcode,
++				u64 compare, u64 swap_add, u64 *orig_val)
++{
++	struct ib_umem_odp *umem_odp = to_ib_umem_odp(mr->umem);
++	unsigned int page_offset;
++	struct page *page;
++	unsigned int idx;
++	u64 value;
++	u64 *va;
++	int err;
++
++	if (unlikely(mr->state != RXE_MR_STATE_VALID)) {
++		rxe_dbg_mr(mr, "mr not in valid state\n");
++		return RESPST_ERR_RKEY_VIOLATION;
++	}
++
++	err = mr_check_range(mr, iova, sizeof(value));
++	if (err) {
++		rxe_dbg_mr(mr, "iova out of range\n");
++		return RESPST_ERR_RKEY_VIOLATION;
++	}
++
++	idx = (iova - ib_umem_start(umem_odp)) >> umem_odp->page_shift;
++	page_offset = iova & (BIT(umem_odp->page_shift) - 1);
++	page = hmm_pfn_to_page(umem_odp->pfn_list[idx]);
++	if (!page)
++		return RESPST_ERR_RKEY_VIOLATION;
++
++	if (unlikely(page_offset & 0x7)) {
++		rxe_dbg_mr(mr, "iova not aligned\n");
++		return RESPST_ERR_MISALIGNED_ATOMIC;
++	}
++
++	va = kmap_local_page(page);
++
++	spin_lock_bh(&atomic_ops_lock);
++	value = *orig_val = va[page_offset >> 3];
++
++	if (opcode == IB_OPCODE_RC_COMPARE_SWAP) {
++		if (value == compare)
++			va[page_offset >> 3] = swap_add;
++	} else {
++		value += swap_add;
++		va[page_offset >> 3] = value;
++	}
++	spin_unlock_bh(&atomic_ops_lock);
++
++	kunmap_local(va);
++
++	return 0;
++}
++
++int rxe_odp_atomic_op(struct rxe_mr *mr, u64 iova, int opcode,
++			 u64 compare, u64 swap_add, u64 *orig_val)
++{
++	struct ib_umem_odp *umem_odp = to_ib_umem_odp(mr->umem);
++	int err;
++
++	err = rxe_odp_map_range_and_lock(mr, iova, sizeof(char), 0);
++	if (err < 0)
++		return err;
++
++	err = rxe_odp_do_atomic_op(mr, iova, opcode, compare, swap_add,
++				   orig_val);
++	mutex_unlock(&umem_odp->umem_mutex);
++
++	return err;
++}
+diff --git a/drivers/infiniband/sw/rxe/rxe_resp.c b/drivers/infiniband/sw/rxe/rxe_resp.c
+index e703a3ab82d4..54ba9ee1acc5 100644
+--- a/drivers/infiniband/sw/rxe/rxe_resp.c
++++ b/drivers/infiniband/sw/rxe/rxe_resp.c
+@@ -707,7 +707,10 @@ static enum resp_states atomic_reply(struct rxe_qp *qp,
+ 		u64 iova = qp->resp.va + qp->resp.offset;
+ 
+ 		if (mr->umem->is_odp)
+-			err = RESPST_ERR_UNSUPPORTED_OPCODE;
++			err = rxe_odp_atomic_op(mr, iova, pkt->opcode,
++						atmeth_comp(pkt),
++						atmeth_swap_add(pkt),
++						&res->atomic.orig_val);
+ 		else
+ 			err = rxe_mr_do_atomic_op(mr, iova, pkt->opcode,
+ 						  atmeth_comp(pkt),
+-- 
+2.52.0
+

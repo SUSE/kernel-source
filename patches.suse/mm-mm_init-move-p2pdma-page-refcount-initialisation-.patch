@@ -1,0 +1,181 @@
+From b7e2823787735ca009e63f35f164b46df0ef096c Mon Sep 17 00:00:00 2001
+From: Alistair Popple <apopple@nvidia.com>
+Date: Fri, 28 Feb 2025 14:31:05 +1100
+Subject: [PATCH 1/1] mm/mm_init: move p2pdma page refcount initialisation to
+ p2pdma
+Git-commit: b7e2823787735ca009e63f35f164b46df0ef096c
+Patch-mainline: v6.15-rc1
+References: jsc#PED-14199
+
+Currently ZONE_DEVICE page reference counts are initialised by core memory
+management code in __init_zone_device_page() as part of the memremap()
+call which driver modules make to obtain ZONE_DEVICE pages.  This
+initialises page refcounts to 1 before returning them to the driver.
+
+This was presumably done because it drivers had a reference of sorts on
+the page.  It also ensured the page could always be mapped with
+vm_insert_page() for example and would never get freed (ie.  have a zero
+refcount), freeing drivers of manipulating page reference counts.
+
+However it complicates figuring out whether or not a page is free from the
+mm perspective because it is no longer possible to just look at the
+refcount.  Instead the page type must be known and if GUP is used a
+secondary pgmap reference is also sometimes needed.
+
+To simplify this it is desirable to remove the page reference count for
+the driver, so core mm can just use the refcount without having to account
+for page type or do other types of tracking.  This is possible because
+drivers can always assume the page is valid as core kernel will never
+offline or remove the struct page.
+
+This means it is now up to drivers to initialise the page refcount as
+required.  P2PDMA uses vm_insert_page() to map the page, and that requires
+a non-zero reference count when initialising the page so set that when the
+page is first mapped.
+
+Link: https://lkml.kernel.org/r/6aedb0ac2886dcc4503cb705273db5b3863a0b66.1740713401.git-series.apopple@nvidia.com
+Signed-off-by: Alistair Popple <apopple@nvidia.com>
+Reviewed-by: Dan Williams <dan.j.williams@intel.com>
+Acked-by: David Hildenbrand <david@redhat.com>
+Tested-by: Alison Schofield <alison.schofield@intel.com>
+Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+Cc: Asahi Lina <lina@asahilina.net>
+Cc: Balbir Singh <balbirs@nvidia.com>
+Cc: Bjorn Helgaas <bhelgaas@google.com>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
+Cc: Christoph Hellwig <hch@lst.de>
+Cc: Chunyan Zhang <zhang.lyra@gmail.com>
+Cc: "Darrick J. Wong" <djwong@kernel.org>
+Cc: Dave Chinner <david@fromorbit.com>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: Dave Jiang <dave.jiang@intel.com>
+Cc: Gerald Schaefer <gerald.schaefer@linux.ibm.com>
+Cc: Heiko Carstens <hca@linux.ibm.com>
+Cc: Huacai Chen <chenhuacai@kernel.org>
+Cc: Ira Weiny <ira.weiny@intel.com>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Jason Gunthorpe <jgg@nvidia.com>
+Cc: Jason Gunthorpe <jgg@ziepe.ca>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: linmiaohe <linmiaohe@huawei.com>
+Cc: Logan Gunthorpe <logang@deltatee.com>
+Cc: Matthew Wilcow (Oracle) <willy@infradead.org>
+Cc: Michael "Camp Drill Sergeant" Ellerman <mpe@ellerman.id.au>
+Cc: Nicholas Piggin <npiggin@gmail.com>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Sven Schnelle <svens@linux.ibm.com>
+Cc: Ted Ts'o <tytso@mit.edu>
+Cc: Vasily Gorbik <gor@linux.ibm.com>
+Cc: Vishal Verma <vishal.l.verma@intel.com>
+Cc: Vivek Goyal <vgoyal@redhat.com>
+Cc: WANG Xuerui <kernel@xen0n.name>
+Cc: Will Deacon <will@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Acked-by: Nicolas Morey <nmorey@suse.com>
+---
+ drivers/pci/p2pdma.c | 13 +++++++++++--
+ mm/memremap.c        | 17 +++++++++++++----
+ mm/mm_init.c         | 22 ++++++++++++++++++----
+ 3 files changed, 42 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/pci/p2pdma.c b/drivers/pci/p2pdma.c
+index 0cb7e0aaba0e..04773a865819 100644
+--- a/drivers/pci/p2pdma.c
++++ b/drivers/pci/p2pdma.c
+@@ -140,13 +140,22 @@ static int p2pmem_alloc_mmap(struct file *filp, struct kobject *kobj,
+ 	rcu_read_unlock();
+ 
+ 	for (vaddr = vma->vm_start; vaddr < vma->vm_end; vaddr += PAGE_SIZE) {
+-		ret = vm_insert_page(vma, vaddr, virt_to_page(kaddr));
++		struct page *page = virt_to_page(kaddr);
++
++		/*
++		 * Initialise the refcount for the freshly allocated page. As
++		 * we have just allocated the page no one else should be
++		 * using it.
++		 */
++		VM_WARN_ON_ONCE_PAGE(!page_ref_count(page), page);
++		set_page_count(page, 1);
++		ret = vm_insert_page(vma, vaddr, page);
+ 		if (ret) {
+ 			gen_pool_free(p2pdma->pool, (uintptr_t)kaddr, len);
+ 			return ret;
+ 		}
+ 		percpu_ref_get(ref);
+-		put_page(virt_to_page(kaddr));
++		put_page(page);
+ 		kaddr += PAGE_SIZE;
+ 		len -= PAGE_SIZE;
+ 	}
+diff --git a/mm/memremap.c b/mm/memremap.c
+index 40d4547ce514..07bbe0eed084 100644
+--- a/mm/memremap.c
++++ b/mm/memremap.c
+@@ -488,15 +488,24 @@ void free_zone_device_folio(struct folio *folio)
+ 	folio->mapping = NULL;
+ 	folio->page.pgmap->ops->page_free(folio_page(folio, 0));
+ 
+-	if (folio->page.pgmap->type != MEMORY_DEVICE_PRIVATE &&
+-	    folio->page.pgmap->type != MEMORY_DEVICE_COHERENT)
++	switch (folio->page.pgmap->type) {
++	case MEMORY_DEVICE_PRIVATE:
++	case MEMORY_DEVICE_COHERENT:
++		put_dev_pagemap(folio->page.pgmap);
++		break;
++
++	case MEMORY_DEVICE_FS_DAX:
++	case MEMORY_DEVICE_GENERIC:
+ 		/*
+ 		 * Reset the refcount to 1 to prepare for handing out the page
+ 		 * again.
+ 		 */
+ 		folio_set_count(folio, 1);
+-	else
+-		put_dev_pagemap(folio->page.pgmap);
++		break;
++
++	case MEMORY_DEVICE_PCI_P2PDMA:
++		break;
++	}
+ }
+ 
+ void zone_device_page_init(struct page *page)
+diff --git a/mm/mm_init.c b/mm/mm_init.c
+index b5047c5ef7d6..dbb92fdf36fe 100644
+--- a/mm/mm_init.c
++++ b/mm/mm_init.c
+@@ -1026,12 +1026,26 @@ static void __ref __init_zone_device_page(struct page *page, unsigned long pfn,
+ 	}
+ 
+ 	/*
+-	 * ZONE_DEVICE pages are released directly to the driver page allocator
+-	 * which will set the page count to 1 when allocating the page.
++	 * ZONE_DEVICE pages other than MEMORY_TYPE_GENERIC and
++	 * MEMORY_TYPE_FS_DAX pages are released directly to the driver page
++	 * allocator which will set the page count to 1 when allocating the
++	 * page.
++	 *
++	 * MEMORY_TYPE_GENERIC and MEMORY_TYPE_FS_DAX pages automatically have
++	 * their refcount reset to one whenever they are freed (ie. after
++	 * their refcount drops to 0).
+ 	 */
+-	if (pgmap->type == MEMORY_DEVICE_PRIVATE ||
+-	    pgmap->type == MEMORY_DEVICE_COHERENT)
++	switch (pgmap->type) {
++	case MEMORY_DEVICE_PRIVATE:
++	case MEMORY_DEVICE_COHERENT:
++	case MEMORY_DEVICE_PCI_P2PDMA:
+ 		set_page_count(page, 0);
++		break;
++
++	case MEMORY_DEVICE_FS_DAX:
++	case MEMORY_DEVICE_GENERIC:
++		break;
++	}
+ }
+ 
+ /*
+-- 
+2.52.0
+
