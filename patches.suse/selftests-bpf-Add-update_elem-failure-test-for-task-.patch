@@ -1,0 +1,149 @@
+From: Martin KaFai Lau <martin.lau@kernel.org>
+Date: Wed, 23 Oct 2024 16:47:57 -0700
+Subject: selftests/bpf: Add update_elem failure test for task storage uptr
+Patch-mainline: v6.13-rc1
+Git-commit: cbf9f849a3e86f1b7c041dfbeeae1c1fff0ddc8d
+References: jsc#PED-14653
+
+This patch test the following failures in syscall update_elem
+1. The first update_elem(BPF_F_LOCK) should be EOPNOTSUPP. syscall.c takes
+   care of unpinning the uptr.
+2. The second update_elem(BPF_EXIST) fails. syscall.c takes care of
+   unpinning the uptr.
+3. The forth update_elem(BPF_NOEXIST) fails. bpf_local_storage_update
+   takes care of unpinning the uptr.
+
+Signed-off-by: Martin KaFai Lau <martin.lau@kernel.org>
+Link: https://lore.kernel.org/r/20241023234759.860539-11-martin.lau@linux.dev
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ tools/testing/selftests/bpf/prog_tests/task_local_storage.c |   45 ++++++++++++
+ tools/testing/selftests/bpf/progs/uptr_update_failure.c     |   42 +++++++++++
+ tools/testing/selftests/bpf/uptr_test_common.h              |    5 +
+ 3 files changed, 92 insertions(+)
+ create mode 100644 tools/testing/selftests/bpf/progs/uptr_update_failure.c
+
+--- a/tools/testing/selftests/bpf/prog_tests/task_local_storage.c
++++ b/tools/testing/selftests/bpf/prog_tests/task_local_storage.c
+@@ -17,6 +17,7 @@
+ #include "task_storage_nodeadlock.skel.h"
+ #include "uptr_test_common.h"
+ #include "task_ls_uptr.skel.h"
++#include "uptr_update_failure.skel.h"
+ 
+ static void test_sys_enter_exit(void)
+ {
+@@ -408,6 +409,48 @@ out:
+ 	munmap(mem, page_size * 2);
+ }
+ 
++static void test_uptr_update_failure(void)
++{
++	struct value_lock_type value = {};
++	struct uptr_update_failure *skel;
++	int err, task_fd, map_fd;
++
++	task_fd = sys_pidfd_open(getpid(), 0);
++	if (!ASSERT_OK_FD(task_fd, "task_fd"))
++		return;
++
++	skel = uptr_update_failure__open_and_load();
++	if (!ASSERT_OK_PTR(skel, "skel_open_and_load"))
++		goto out;
++
++	map_fd = bpf_map__fd(skel->maps.datamap);
++
++	value.udata = &udata;
++	err = bpf_map_update_elem(map_fd, &task_fd, &value, BPF_F_LOCK);
++	if (!ASSERT_ERR(err, "update_elem(udata, BPF_F_LOCK)"))
++		goto out;
++	ASSERT_EQ(errno, EOPNOTSUPP, "errno");
++
++	err = bpf_map_update_elem(map_fd, &task_fd, &value, BPF_EXIST);
++	if (!ASSERT_ERR(err, "update_elem(udata, BPF_EXIST)"))
++		goto out;
++	ASSERT_EQ(errno, ENOENT, "errno");
++
++	err = bpf_map_update_elem(map_fd, &task_fd, &value, BPF_NOEXIST);
++	if (!ASSERT_OK(err, "update_elem(udata, BPF_NOEXIST)"))
++		goto out;
++
++	value.udata = &udata2;
++	err = bpf_map_update_elem(map_fd, &task_fd, &value, BPF_NOEXIST);
++	if (!ASSERT_ERR(err, "update_elem(udata2, BPF_NOEXIST)"))
++		goto out;
++	ASSERT_EQ(errno, EEXIST, "errno");
++
++out:
++	uptr_update_failure__destroy(skel);
++	close(task_fd);
++}
++
+ void test_task_local_storage(void)
+ {
+ 	if (test__start_subtest("sys_enter_exit"))
+@@ -422,4 +465,6 @@ void test_task_local_storage(void)
+ 		test_uptr_basic();
+ 	if (test__start_subtest("uptr_across_pages"))
+ 		test_uptr_across_pages();
++	if (test__start_subtest("uptr_update_failure"))
++		test_uptr_update_failure();
+ }
+--- /dev/null
++++ b/tools/testing/selftests/bpf/progs/uptr_update_failure.c
+@@ -0,0 +1,42 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2024 Meta Platforms, Inc. and affiliates. */
++
++#include <vmlinux.h>
++#include <bpf/bpf_helpers.h>
++#include "uptr_test_common.h"
++
++struct {
++	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
++	__uint(map_flags, BPF_F_NO_PREALLOC);
++	__type(key, int);
++	__type(value, struct value_lock_type);
++} datamap SEC(".maps");
++
++/* load test only. not used */
++SEC("syscall")
++int not_used(void *ctx)
++{
++	struct value_lock_type *ptr;
++	struct task_struct *task;
++	struct user_data *udata;
++
++	task = bpf_get_current_task_btf();
++	ptr = bpf_task_storage_get(&datamap, task, 0, 0);
++	if (!ptr)
++		return 0;
++
++	bpf_spin_lock(&ptr->lock);
++
++	udata = ptr->udata;
++	if (!udata) {
++		bpf_spin_unlock(&ptr->lock);
++		return 0;
++	}
++	udata->result = MAGIC_VALUE + udata->a + udata->b;
++
++	bpf_spin_unlock(&ptr->lock);
++
++	return 0;
++}
++
++char _license[] SEC("license") = "GPL";
+--- a/tools/testing/selftests/bpf/uptr_test_common.h
++++ b/tools/testing/selftests/bpf/uptr_test_common.h
+@@ -32,4 +32,9 @@ struct value_type {
+ 	struct nested_udata nested;
+ };
+ 
++struct value_lock_type {
++	struct user_data __uptr *udata;
++	struct bpf_spin_lock lock;
++};
++
+ #endif
