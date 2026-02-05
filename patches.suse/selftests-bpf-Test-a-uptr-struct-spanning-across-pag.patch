@@ -1,0 +1,86 @@
+From: Martin KaFai Lau <martin.lau@kernel.org>
+Date: Wed, 23 Oct 2024 16:47:56 -0700
+Subject: selftests/bpf: Test a uptr struct spanning across pages.
+Patch-mainline: v6.13-rc1
+Git-commit: 51fff4083372381e680724dde7ac3e859f9e3a0a
+References: jsc#PED-14653
+
+This patch tests the case when uptr has a struct spanning across two
+pages. It is not supported now and EOPNOTSUPP is expected from the
+syscall update_elem.
+
+It also tests the whole uptr struct located exactly at the
+end of a page and ensures that this case is accepted by update_elem.
+
+Signed-off-by: Martin KaFai Lau <martin.lau@kernel.org>
+Link: https://lore.kernel.org/r/20241023234759.860539-10-martin.lau@linux.dev
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ tools/testing/selftests/bpf/prog_tests/task_local_storage.c |   43 ++++++++++++
+ 1 file changed, 43 insertions(+)
+
+--- a/tools/testing/selftests/bpf/prog_tests/task_local_storage.c
++++ b/tools/testing/selftests/bpf/prog_tests/task_local_storage.c
+@@ -8,6 +8,7 @@
+ #include <sys/syscall.h>   /* For SYS_xxx definitions */
+ #include <sys/types.h>
+ #include <sys/eventfd.h>
++#include <sys/mman.h>
+ #include <test_progs.h>
+ #include "task_local_storage_helpers.h"
+ #include "task_local_storage.skel.h"
+@@ -367,6 +368,46 @@ out:
+ 	close(parent_task_fd);
+ }
+ 
++static void test_uptr_across_pages(void)
++{
++	int page_size = getpagesize();
++	struct value_type value = {};
++	struct task_ls_uptr *skel;
++	int err, task_fd, map_fd;
++	void *mem;
++
++	task_fd = sys_pidfd_open(getpid(), 0);
++	if (!ASSERT_OK_FD(task_fd, "task_fd"))
++		return;
++
++	mem = mmap(NULL, page_size * 2, PROT_READ | PROT_WRITE,
++		   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++	if (!ASSERT_OK_PTR(mem, "mmap(page_size * 2)")) {
++		close(task_fd);
++		return;
++	}
++
++	skel = task_ls_uptr__open_and_load();
++	if (!ASSERT_OK_PTR(skel, "skel_open_and_load"))
++		goto out;
++
++	map_fd = bpf_map__fd(skel->maps.datamap);
++	value.udata = mem + page_size - offsetof(struct user_data, b);
++	err = bpf_map_update_elem(map_fd, &task_fd, &value, 0);
++	if (!ASSERT_ERR(err, "update_elem(udata)"))
++		goto out;
++	ASSERT_EQ(errno, EOPNOTSUPP, "errno");
++
++	value.udata = mem + page_size - sizeof(struct user_data);
++	err = bpf_map_update_elem(map_fd, &task_fd, &value, 0);
++	ASSERT_OK(err, "update_elem(udata)");
++
++out:
++	task_ls_uptr__destroy(skel);
++	close(task_fd);
++	munmap(mem, page_size * 2);
++}
++
+ void test_task_local_storage(void)
+ {
+ 	if (test__start_subtest("sys_enter_exit"))
+@@ -379,4 +420,6 @@ void test_task_local_storage(void)
+ 		test_nodeadlock();
+ 	if (test__start_subtest("uptr_basic"))
+ 		test_uptr_basic();
++	if (test__start_subtest("uptr_across_pages"))
++		test_uptr_across_pages();
+ }
