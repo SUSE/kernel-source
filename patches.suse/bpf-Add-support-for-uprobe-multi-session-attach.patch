@@ -1,0 +1,196 @@
+From: Jiri Olsa <jolsa@kernel.org>
+Date: Fri, 8 Nov 2024 14:45:34 +0100
+Subject: bpf: Add support for uprobe multi session attach
+Patch-mainline: v6.13-rc1
+Git-commit: d920179b3d4842a0e27cae54fdddbe5ef3977e73
+References: jsc#PED-14653
+
+Adding support to attach BPF program for entry and return probe
+of the same function. This is common use case which at the moment
+requires to create two uprobe multi links.
+
+Adding new BPF_TRACE_UPROBE_SESSION attach type that instructs
+kernel to attach single link program to both entry and exit probe.
+
+It's possible to control execution of the BPF program on return
+probe simply by returning zero or non zero from the entry BPF
+program execution to execute or not the BPF program on return
+probe respectively.
+
+Signed-off-by: Jiri Olsa <jolsa@kernel.org>
+Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+Acked-by: Andrii Nakryiko <andrii@kernel.org>
+Link: https://lore.kernel.org/bpf/20241108134544.480660-4-jolsa@kernel.org
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ include/uapi/linux/bpf.h       |    1 +
+ kernel/bpf/syscall.c           |    9 +++++++--
+ kernel/bpf/verifier.c          |    1 +
+ kernel/trace/bpf_trace.c       |   36 +++++++++++++++++++++++++++---------
+ tools/include/uapi/linux/bpf.h |    1 +
+ tools/lib/bpf/libbpf.c         |    1 +
+ 6 files changed, 38 insertions(+), 11 deletions(-)
+
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -1116,6 +1116,7 @@ enum bpf_attach_type {
+ 	BPF_NETKIT_PRIMARY,
+ 	BPF_NETKIT_PEER,
+ 	BPF_TRACE_KPROBE_SESSION,
++	BPF_TRACE_UPROBE_SESSION,
+ 	__MAX_BPF_ATTACH_TYPE
+ };
+ 
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -4103,10 +4103,14 @@ static int bpf_prog_attach_check_attach_
+ 		if (prog->expected_attach_type == BPF_TRACE_UPROBE_MULTI &&
+ 		    attach_type != BPF_TRACE_UPROBE_MULTI)
+ 			return -EINVAL;
++		if (prog->expected_attach_type == BPF_TRACE_UPROBE_SESSION &&
++		    attach_type != BPF_TRACE_UPROBE_SESSION)
++			return -EINVAL;
+ 		if (attach_type != BPF_PERF_EVENT &&
+ 		    attach_type != BPF_TRACE_KPROBE_MULTI &&
+ 		    attach_type != BPF_TRACE_KPROBE_SESSION &&
+-		    attach_type != BPF_TRACE_UPROBE_MULTI)
++		    attach_type != BPF_TRACE_UPROBE_MULTI &&
++		    attach_type != BPF_TRACE_UPROBE_SESSION)
+ 			return -EINVAL;
+ 		return 0;
+ 	case BPF_PROG_TYPE_SCHED_CLS:
+@@ -5359,7 +5363,8 @@ static int link_create(union bpf_attr *a
+ 		else if (attr->link_create.attach_type == BPF_TRACE_KPROBE_MULTI ||
+ 			 attr->link_create.attach_type == BPF_TRACE_KPROBE_SESSION)
+ 			ret = bpf_kprobe_multi_link_attach(attr, prog);
+-		else if (attr->link_create.attach_type == BPF_TRACE_UPROBE_MULTI)
++		else if (attr->link_create.attach_type == BPF_TRACE_UPROBE_MULTI ||
++			 attr->link_create.attach_type == BPF_TRACE_UPROBE_SESSION)
+ 			ret = bpf_uprobe_multi_link_attach(attr, prog);
+ 		break;
+ 	default:
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -16017,6 +16017,7 @@ static int check_return_code(struct bpf_
+ 	case BPF_PROG_TYPE_KPROBE:
+ 		switch (env->prog->expected_attach_type) {
+ 		case BPF_TRACE_KPROBE_SESSION:
++		case BPF_TRACE_UPROBE_SESSION:
+ 			range = retval_range(0, 1);
+ 			break;
+ 		default:
+--- a/kernel/trace/bpf_trace.c
++++ b/kernel/trace/bpf_trace.c
+@@ -1581,6 +1581,17 @@ static inline bool is_kprobe_session(con
+ 	return prog->expected_attach_type == BPF_TRACE_KPROBE_SESSION;
+ }
+ 
++static inline bool is_uprobe_multi(const struct bpf_prog *prog)
++{
++	return prog->expected_attach_type == BPF_TRACE_UPROBE_MULTI ||
++	       prog->expected_attach_type == BPF_TRACE_UPROBE_SESSION;
++}
++
++static inline bool is_uprobe_session(const struct bpf_prog *prog)
++{
++	return prog->expected_attach_type == BPF_TRACE_UPROBE_SESSION;
++}
++
+ static const struct bpf_func_proto *
+ kprobe_prog_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
+ {
+@@ -1598,13 +1609,13 @@ kprobe_prog_func_proto(enum bpf_func_id
+ 	case BPF_FUNC_get_func_ip:
+ 		if (is_kprobe_multi(prog))
+ 			return &bpf_get_func_ip_proto_kprobe_multi;
+-		if (prog->expected_attach_type == BPF_TRACE_UPROBE_MULTI)
++		if (is_uprobe_multi(prog))
+ 			return &bpf_get_func_ip_proto_uprobe_multi;
+ 		return &bpf_get_func_ip_proto_kprobe;
+ 	case BPF_FUNC_get_attach_cookie:
+ 		if (is_kprobe_multi(prog))
+ 			return &bpf_get_attach_cookie_proto_kmulti;
+-		if (prog->expected_attach_type == BPF_TRACE_UPROBE_MULTI)
++		if (is_uprobe_multi(prog))
+ 			return &bpf_get_attach_cookie_proto_umulti;
+ 		return &bpf_get_attach_cookie_proto_trace;
+ 	default:
+@@ -3096,6 +3107,7 @@ struct bpf_uprobe {
+ 	u64 cookie;
+ 	struct uprobe *uprobe;
+ 	struct uprobe_consumer consumer;
++	bool session;
+ };
+ 
+ struct bpf_uprobe_multi_link {
+@@ -3267,9 +3279,13 @@ uprobe_multi_link_handler(struct uprobe_
+ 			  __u64 *data)
+ {
+ 	struct bpf_uprobe *uprobe;
++	int ret;
+ 
+ 	uprobe = container_of(con, struct bpf_uprobe, consumer);
+-	return uprobe_prog_run(uprobe, instruction_pointer(regs), regs);
++	ret = uprobe_prog_run(uprobe, instruction_pointer(regs), regs);
++	if (uprobe->session)
++		return ret ? UPROBE_HANDLER_IGNORE : 0;
++	return 0;
+ }
+ 
+ static int
+@@ -3279,7 +3295,8 @@ uprobe_multi_link_ret_handler(struct upr
+ 	struct bpf_uprobe *uprobe;
+ 
+ 	uprobe = container_of(con, struct bpf_uprobe, consumer);
+-	return uprobe_prog_run(uprobe, func, regs);
++	uprobe_prog_run(uprobe, func, regs);
++	return 0;
+ }
+ 
+ static u64 bpf_uprobe_multi_entry_ip(struct bpf_run_ctx *ctx)
+@@ -3318,7 +3335,7 @@ int bpf_uprobe_multi_link_attach(const u
+ 	if (sizeof(u64) != sizeof(void *))
+ 		return -EOPNOTSUPP;
+ 
+-	if (prog->expected_attach_type != BPF_TRACE_UPROBE_MULTI)
++	if (!is_uprobe_multi(prog))
+ 		return -EINVAL;
+ 
+ 	flags = attr->link_create.uprobe_multi.flags;
+@@ -3394,11 +3411,12 @@ int bpf_uprobe_multi_link_attach(const u
+ 
+ 		uprobes[i].link = link;
+ 
+-		if (flags & BPF_F_UPROBE_MULTI_RETURN)
+-			uprobes[i].consumer.ret_handler = uprobe_multi_link_ret_handler;
+-		else
++		if (!(flags & BPF_F_UPROBE_MULTI_RETURN))
+ 			uprobes[i].consumer.handler = uprobe_multi_link_handler;
+-
++		if (flags & BPF_F_UPROBE_MULTI_RETURN || is_uprobe_session(prog))
++			uprobes[i].consumer.ret_handler = uprobe_multi_link_ret_handler;
++		if (is_uprobe_session(prog))
++			uprobes[i].session = true;
+ 		if (pid)
+ 			uprobes[i].consumer.filter = uprobe_multi_link_filter;
+ 	}
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@ -1116,6 +1116,7 @@ enum bpf_attach_type {
+ 	BPF_NETKIT_PRIMARY,
+ 	BPF_NETKIT_PEER,
+ 	BPF_TRACE_KPROBE_SESSION,
++	BPF_TRACE_UPROBE_SESSION,
+ 	__MAX_BPF_ATTACH_TYPE
+ };
+ 
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@ -133,6 +133,7 @@ static const char * const attach_type_na
+ 	[BPF_NETKIT_PRIMARY]		= "netkit_primary",
+ 	[BPF_NETKIT_PEER]		= "netkit_peer",
+ 	[BPF_TRACE_KPROBE_SESSION]	= "trace_kprobe_session",
++	[BPF_TRACE_UPROBE_SESSION]	= "trace_uprobe_session",
+ };
+ 
+ static const char * const link_type_name[] = {
