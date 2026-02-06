@@ -1,0 +1,79 @@
+From 7a3cedafccf8e7d038ad4cfec5b38052647ceac5 Mon Sep 17 00:00:00 2001
+From: Breno Leitao <leitao@debian.org>
+Date: Fri, 21 Mar 2025 02:30:49 -0700
+Subject: [PATCH] lockdep: Speed up lockdep_unregister_key() with expedited RCU
+ synchronization
+Git-commit: 7a3cedafccf8e7d038ad4cfec5b38052647ceac5
+Patch-mainline: v6.17-rc1
+References: bsc#1257818
+
+lockdep_unregister_key() is called from critical code paths, including
+sections where rtnl_lock() is held. For example, when replacing a qdisc
+in a network device, network egress traffic is disabled while
+__qdisc_destroy() is called for every network queue.
+
+If lockdep is enabled, __qdisc_destroy() calls lockdep_unregister_key(),
+which gets blocked waiting for synchronize_rcu() to complete.
+
+For example, a simple tc command to replace a qdisc could take 13
+seconds:
+
+  # time /usr/sbin/tc qdisc replace dev eth0 root handle 0x1: mq
+    real    0m13.195s
+    user    0m0.001s
+    sys     0m2.746s
+
+During this time, network egress is completely frozen while waiting for
+RCU synchronization.
+
+Use synchronize_rcu_expedited() instead to minimize the impact on
+critical operations like network connectivity changes.
+
+This improves 10x the function call to tc, when replacing the qdisc for
+a network card.
+
+   # time /usr/sbin/tc qdisc replace dev eth0 root handle 0x1: mq
+     real     0m1.789s
+     user     0m0.000s
+     sys      0m1.613s
+
+[boqun: Fixed the comment and add more information for the temporary
+workaround, and add TODO information for hazptr]
+
+Reported-by: Erik Lundgren <elundgren@meta.com>
+Signed-off-by: Breno Leitao <leitao@debian.org>
+Reviewed-by: Paul E. McKenney <paulmck@kernel.org>
+Reviewed-by: Eric Dumazet <edumazet@google.com>
+Signed-off-by: Boqun Feng <boqun.feng@gmail.com>
+Link: https://lore.kernel.org/r/20250321-lockdep-v1-1-78b732d195fb@debian.org
+Signed-off-by: Jiri Wiesner <jwiesner@suse.de>
+---
+ kernel/locking/lockdep.c | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/kernel/locking/lockdep.c b/kernel/locking/lockdep.c
+index 0c941418a215..2d4c5bab5af8 100644
+--- a/kernel/locking/lockdep.c
++++ b/kernel/locking/lockdep.c
+@@ -6616,8 +6616,16 @@ void lockdep_unregister_key(struct lock_class_key *key)
+ 	if (need_callback)
+ 		call_rcu(&delayed_free.rcu_head, free_zapped_rcu);
+ 
+-	/* Wait until is_dynamic_key() has finished accessing k->hash_entry. */
+-	synchronize_rcu();
++	/*
++	 * Wait until is_dynamic_key() has finished accessing k->hash_entry.
++	 *
++	 * Some operations like __qdisc_destroy() will call this in a debug
++	 * kernel, and the network traffic is disabled while waiting, hence
++	 * the delay of the wait matters in debugging cases. Currently use a
++	 * synchronize_rcu_expedited() to speed up the wait at the cost of
++	 * system IPIs. TODO: Replace RCU with hazptr for this.
++	 */
++	synchronize_rcu_expedited();
+ }
+ EXPORT_SYMBOL_GPL(lockdep_unregister_key);
+ 
+-- 
+2.51.0
+
