@@ -1,0 +1,79 @@
+From: Alexander Lobakin <aleksander.lobakin@intel.com>
+Date: Tue, 26 Aug 2025 17:55:06 +0200
+Subject: idpf: add support for .ndo_xdp_xmit()
+Patch-mainline: v6.18-rc1
+Git-commit: aaa3ac6480baeb7d26cd7f2c7886341872ad87b7
+References: jsc#PED-14403
+
+Use libeth XDP infra to implement .ndo_xdp_xmit() in idpf.
+The Tx callbacks are reused from XDP_TX code. XDP redirect target
+feature is set/cleared depending on the XDP prog presence, as for now
+we still don't allocate XDP Tx queues when there's no program.
+
+Reviewed-by: Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+Signed-off-by: Alexander Lobakin <aleksander.lobakin@intel.com>
+Tested-by: Ramu R <ramu.r@intel.com>
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/idpf/idpf_lib.c |    1 +
+ drivers/net/ethernet/intel/idpf/xdp.c      |   20 ++++++++++++++++++++
+ drivers/net/ethernet/intel/idpf/xdp.h      |    2 ++
+ 3 files changed, 23 insertions(+)
+
+--- a/drivers/net/ethernet/intel/idpf/idpf_lib.c
++++ b/drivers/net/ethernet/intel/idpf/idpf_lib.c
+@@ -2616,4 +2616,5 @@ static const struct net_device_ops idpf_
+ 	.ndo_hwtstamp_get = idpf_hwtstamp_get,
+ 	.ndo_hwtstamp_set = idpf_hwtstamp_set,
+ 	.ndo_bpf = idpf_xdp,
++	.ndo_xdp_xmit = idpf_xdp_xmit,
+ };
+--- a/drivers/net/ethernet/intel/idpf/xdp.c
++++ b/drivers/net/ethernet/intel/idpf/xdp.c
+@@ -322,8 +322,26 @@ LIBETH_XDP_DEFINE_START();
+ LIBETH_XDP_DEFINE_TIMER(static idpf_xdp_tx_timer, idpf_xdpsq_complete);
+ LIBETH_XDP_DEFINE_FLUSH_TX(idpf_xdp_tx_flush_bulk, idpf_xdp_tx_prep,
+ 			   idpf_xdp_tx_xmit);
++LIBETH_XDP_DEFINE_FLUSH_XMIT(static idpf_xdp_xmit_flush_bulk, idpf_xdp_tx_prep,
++			     idpf_xdp_tx_xmit);
+ LIBETH_XDP_DEFINE_END();
+ 
++int idpf_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames,
++		  u32 flags)
++{
++	const struct idpf_netdev_priv *np = netdev_priv(dev);
++	const struct idpf_vport *vport = np->vport;
++
++	if (unlikely(!netif_carrier_ok(dev) || !vport->link_up))
++		return -ENETDOWN;
++
++	return libeth_xdp_xmit_do_bulk(dev, n, frames, flags,
++				       &vport->txqs[vport->xdp_txq_offset],
++				       vport->num_xdp_txq,
++				       idpf_xdp_xmit_flush_bulk,
++				       idpf_xdp_tx_finalize);
++}
++
+ void idpf_xdp_set_features(const struct idpf_vport *vport)
+ {
+ 	if (!idpf_is_queue_model_split(vport->rxq_model))
+@@ -378,6 +396,8 @@ static int idpf_xdp_setup_prog(struct id
+ 	if (old)
+ 		bpf_prog_put(old);
+ 
++	libeth_xdp_set_redirect(vport->netdev, vport->xdp_prog);
++
+ 	return ret;
+ }
+ 
+--- a/drivers/net/ethernet/intel/idpf/xdp.h
++++ b/drivers/net/ethernet/intel/idpf/xdp.h
+@@ -102,5 +102,7 @@ static inline void idpf_xdp_tx_finalize(
+ void idpf_xdp_set_features(const struct idpf_vport *vport);
+ 
+ int idpf_xdp(struct net_device *dev, struct netdev_bpf *xdp);
++int idpf_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames,
++		  u32 flags);
+ 
+ #endif /* _IDPF_XDP_H_ */
