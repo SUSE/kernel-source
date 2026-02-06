@@ -1,0 +1,133 @@
+From: Jiaqi Yan <jiaqiyan@google.com>
+Date: Wed, 10 Sep 2025 04:45:31 +0000
+Subject: ACPI: APEI: EINJ: Allow more types of addresses except MMIO
+Patch-mainline: v6.18-rc1
+Git-commit: 7d444f50999709d52a18ec7e88649ac936ab62dc
+References: jsc#PED-14260
+
+EINJ driver today only allows injection request to go through for two
+kinds of IORESOURCE_MEM: IORES_DESC_PERSISTENT_MEMORY and
+IORES_DESC_SOFT_RESERVED. This check prevents user of EINJ to test
+memory corrupted in many interesting areas:
+
+ - Legacy persistent memory
+ - Memory claimed to be used by ACPI tables or NV storage
+ - Kernel crash memory and others
+
+There is need to test how kernel behaves when something consumes memory
+errors in these memory regions. For example, if certain ACPI table is
+corrupted, does kernel crash gracefully to prevent "silent data
+corruption". For another example, legacy persistent memory, when managed
+by Device DAX, does support recovering from Machine Check Exception
+raised by memory failure, hence worth to be tested.
+
+However, attempt to inject memory error via EINJ to legacy persistent
+memory or ACPI owned memory fails with -EINVAL.
+
+Allow EINJ to inject at address except it is MMIO. Leave it to the BIOS
+or firmware to decide what is a legitimate injection target.
+
+In addition to the test done in [1], on a machine having the following
+iomem resources:
+
+    ...
+    01000000-08ffffff : Crash kernel
+    768f0098-768f00a7 : APEI EINJ
+    ...
+  768f4000-77323fff : ACPI Non-volatile Storage
+  77324000-777fefff : ACPI Tables
+  777ff000-777fffff : System RAM
+  77800000-7fffffff : Reserved
+  80000000-8fffffff : PCI MMCONFIG 0000 [bus 00-ff]
+  90040000-957fffff : PCI Bus 0000:00
+  ...
+  300000000-3ffffffff : Persistent Memory (legacy)
+  ...
+
+I commented __einj_error_inject during the test and just tested when
+injecting a memory error at each start address shown above:
+- 0x80000000 and 0x90040000 both failed with EINVAL
+- request passed through for all other addresses
+
+Link: https://lore.kernel.org/linux-acpi/20250825223348.3780279-1-jiaqiyan@google.com [1]
+Signed-off-by: Jiaqi Yan <jiaqiyan@google.com>
+Reviewed-by: Hanjun Guo <guohanjun@huawei.com>
+Link: https://patch.msgid.link/20250910044531.264043-1-jiaqiyan@google.com
+[ rjw: Adding a link tag for the [1] reference ]
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Acked-by: Chun-Yi Lee <jlee@suse.com>
+---
+ drivers/acpi/apei/einj-core.c |   51 ++++++++++++++++++++++++++++++++++--------
+ 1 file changed, 42 insertions(+), 9 deletions(-)
+
+--- a/drivers/acpi/apei/einj-core.c
++++ b/drivers/acpi/apei/einj-core.c
+@@ -656,6 +656,43 @@ static int __einj_error_inject(u32 type,
+ 	return rc;
+ }
+ 
++/* Allow almost all types of address except MMIO. */
++static bool is_allowed_range(u64 base_addr, u64 size)
++{
++	int i;
++	/*
++	 * MMIO region is usually claimed with IORESOURCE_MEM + IORES_DESC_NONE.
++	 * However, IORES_DESC_NONE is treated like a wildcard when we check if
++	 * region intersects with known resource. So do an allow list check for
++	 * IORES_DESCs that definitely or most likely not MMIO.
++	 */
++	int non_mmio_desc[] = {
++		IORES_DESC_CRASH_KERNEL,
++		IORES_DESC_ACPI_TABLES,
++		IORES_DESC_ACPI_NV_STORAGE,
++		IORES_DESC_PERSISTENT_MEMORY,
++		IORES_DESC_PERSISTENT_MEMORY_LEGACY,
++		/* Treat IORES_DESC_DEVICE_PRIVATE_MEMORY as MMIO. */
++		IORES_DESC_RESERVED,
++		IORES_DESC_SOFT_RESERVED,
++	};
++
++	if (region_intersects(base_addr, size, IORESOURCE_SYSTEM_RAM, IORES_DESC_NONE)
++			      == REGION_INTERSECTS)
++		return true;
++
++	for (i = 0; i < ARRAY_SIZE(non_mmio_desc); ++i) {
++		if (region_intersects(base_addr, size, IORESOURCE_MEM, non_mmio_desc[i])
++				      == REGION_INTERSECTS)
++			return true;
++	}
++
++	if (arch_is_platform_page(base_addr))
++		return true;
++
++	return false;
++}
++
+ /* Inject the specified hardware error */
+ int einj_error_inject(u32 type, u32 flags, u64 param1, u64 param2, u64 param3,
+ 		      u64 param4)
+@@ -702,19 +739,15 @@ int einj_error_inject(u32 type, u32 flag
+ 	 * Disallow crazy address masks that give BIOS leeway to pick
+ 	 * injection address almost anywhere. Insist on page or
+ 	 * better granularity and that target address is normal RAM or
+-	 * NVDIMM.
++	 * as long as is not MMIO.
+ 	 */
+ 	base_addr = param1 & param2;
+ 	size = ~param2 + 1;
+ 
+-	if (((param2 & PAGE_MASK) != PAGE_MASK) ||
+-	    ((region_intersects(base_addr, size, IORESOURCE_SYSTEM_RAM, IORES_DESC_NONE)
+-				!= REGION_INTERSECTS) &&
+-	     (region_intersects(base_addr, size, IORESOURCE_MEM, IORES_DESC_PERSISTENT_MEMORY)
+-				!= REGION_INTERSECTS) &&
+-	     (region_intersects(base_addr, size, IORESOURCE_MEM, IORES_DESC_SOFT_RESERVED)
+-				!= REGION_INTERSECTS) &&
+-	     !arch_is_platform_page(base_addr)))
++	if ((param2 & PAGE_MASK) != PAGE_MASK)
++		return -EINVAL;
++
++	if (!is_allowed_range(base_addr, size))
+ 		return -EINVAL;
+ 
+ 	if (is_zero_pfn(base_addr >> PAGE_SHIFT))

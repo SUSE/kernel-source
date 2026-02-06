@@ -1,0 +1,87 @@
+From: Kaushlendra Kumar <kaushlendra.kumar@intel.com>
+Date: Thu, 30 Oct 2025 08:02:28 +0530
+Subject: ACPI: MRRM: Fix memory leaks and improve error handling
+Patch-mainline: v6.18-rc6
+Git-commit: 4b93d211bbffd3dce76664d95f2306d23e7215ce
+References: jsc#PED-14260
+
+Add proper error handling and resource cleanup to prevent memory leaks
+in add_boot_memory_ranges(). The function now checks for NULL return
+from kobject_create_and_add(), uses local buffer for range names to
+avoid dynamic allocation, and implements a cleanup path that removes
+previously created sysfs groups and kobjects on failure.
+
+This prevents resource leaks when kobject creation or sysfs group
+creation fails during boot memory range initialization.
+
+Signed-off-by: Kaushlendra Kumar <kaushlendra.kumar@intel.com>
+Reviewed-by: Tony Luck <tony.luck@intel.com>
+Link: https://patch.msgid.link/20251030023228.3956296-1-kaushlendra.kumar@intel.com
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Acked-by: Chun-Yi Lee <jlee@suse.com>
+---
+ drivers/acpi/acpi_mrrm.c |   43 +++++++++++++++++++++++++++++++++----------
+ 1 file changed, 33 insertions(+), 10 deletions(-)
+
+--- a/drivers/acpi/acpi_mrrm.c
++++ b/drivers/acpi/acpi_mrrm.c
+@@ -152,26 +152,49 @@ ATTRIBUTE_GROUPS(memory_range);
+ 
+ static __init int add_boot_memory_ranges(void)
+ {
+-	struct kobject *pkobj, *kobj;
++	struct kobject *pkobj, *kobj, **kobjs;
+ 	int ret = -EINVAL;
+-	char *name;
++	char name[16];
++	int i;
+ 
+ 	pkobj = kobject_create_and_add("memory_ranges", acpi_kobj);
++	if (!pkobj)
++		return -ENOMEM;
+ 
+-	for (int i = 0; i < mrrm_mem_entry_num; i++) {
+-		name = kasprintf(GFP_KERNEL, "range%d", i);
+-		if (!name) {
+-			ret = -ENOMEM;
+-			break;
+-		}
++	kobjs = kcalloc(mrrm_mem_entry_num, sizeof(*kobjs), GFP_KERNEL);
++	if (!kobjs) {
++		kobject_put(pkobj);
++		return -ENOMEM;
++	}
+ 
++	for (i = 0; i < mrrm_mem_entry_num; i++) {
++		scnprintf(name, sizeof(name), "range%d", i);
+ 		kobj = kobject_create_and_add(name, pkobj);
++		if (!kobj) {
++			ret = -ENOMEM;
++			goto cleanup;
++		}
+ 
+ 		ret = sysfs_create_groups(kobj, memory_range_groups);
+-		if (ret)
+-			return ret;
++		if (ret) {
++			kobject_put(kobj);
++			goto cleanup;
++		}
++		kobjs[i] = kobj;
+ 	}
+ 
++	kfree(kobjs);
++	return 0;
++
++cleanup:
++	for (int j = 0; j < i; j++) {
++		if (kobjs[j]) {
++			sysfs_remove_groups(kobjs[j], memory_range_groups);
++			kobject_put(kobjs[j]);
++		}
++	}
++	kfree(kobjs);
++	kobject_put(pkobj);
+ 	return ret;
+ }
+ 

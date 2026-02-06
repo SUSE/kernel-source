@@ -1,0 +1,141 @@
+From: "Rafael J. Wysocki" <rafael.j.wysocki@intel.com>
+Date: Fri, 26 Sep 2025 12:29:50 +0200
+Subject: ACPI: CPPC: Do not use CPUFREQ_ETERNAL as an error value
+Patch-mainline: v6.18-rc1
+Git-commit: c28a280bd465690981099cd6e43dfcfa5c28b133
+References: jsc#PED-14260
+
+Instead of using CPUFREQ_ETERNAL for signaling an error condition
+in cppc_get_transition_latency(), change the return value type of
+that function to int and make it return a proper negative error
+code on failures.
+
+No intentional functional impact.
+
+Reviewed-by: Mario Limonciello (AMD) <superm1@kernel.org>
+Reviewed-by: Jie Zhan <zhanjie9@hisilicon.com>
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Acked-by: Viresh Kumar <viresh.kumar@linaro.org>
+Reviewed-by: Qais Yousef <qyousef@layalina.io>
+Acked-by: Chun-Yi Lee <jlee@suse.com>
+---
+ drivers/acpi/cppc_acpi.c       |   16 +++++++---------
+ drivers/cpufreq/amd-pstate.c   |    8 ++++----
+ drivers/cpufreq/cppc_cpufreq.c |    4 ++--
+ include/acpi/cppc_acpi.h       |    6 +++---
+ 4 files changed, 16 insertions(+), 18 deletions(-)
+
+--- a/drivers/acpi/cppc_acpi.c
++++ b/drivers/acpi/cppc_acpi.c
+@@ -1876,7 +1876,7 @@ EXPORT_SYMBOL_GPL(cppc_set_perf);
+  * If desired_reg is in the SystemMemory or SystemIo ACPI address space,
+  * then assume there is no latency.
+  */
+-unsigned int cppc_get_transition_latency(int cpu_num)
++int cppc_get_transition_latency(int cpu_num)
+ {
+ 	/*
+ 	 * Expected transition latency is based on the PCCT timing values
+@@ -1889,31 +1889,29 @@ unsigned int cppc_get_transition_latency
+ 	 *              completion of a command before issuing the next command,
+ 	 *              in microseconds.
+ 	 */
+-	unsigned int latency_ns = 0;
+ 	struct cpc_desc *cpc_desc;
+ 	struct cpc_register_resource *desired_reg;
+ 	int pcc_ss_id = per_cpu(cpu_pcc_subspace_idx, cpu_num);
+ 	struct cppc_pcc_data *pcc_ss_data;
++	int latency_ns = 0;
+ 
+ 	cpc_desc = per_cpu(cpc_desc_ptr, cpu_num);
+ 	if (!cpc_desc)
+-		return CPUFREQ_ETERNAL;
++		return -ENODATA;
+ 
+ 	desired_reg = &cpc_desc->cpc_regs[DESIRED_PERF];
+ 	if (CPC_IN_SYSTEM_MEMORY(desired_reg) || CPC_IN_SYSTEM_IO(desired_reg))
+ 		return 0;
+-	else if (!CPC_IN_PCC(desired_reg))
+-		return CPUFREQ_ETERNAL;
+ 
+-	if (pcc_ss_id < 0)
+-		return CPUFREQ_ETERNAL;
++	if (!CPC_IN_PCC(desired_reg) || pcc_ss_id < 0)
++		return -ENODATA;
+ 
+ 	pcc_ss_data = pcc_data[pcc_ss_id];
+ 	if (pcc_ss_data->pcc_mpar)
+ 		latency_ns = 60 * (1000 * 1000 * 1000 / pcc_ss_data->pcc_mpar);
+ 
+-	latency_ns = max(latency_ns, pcc_ss_data->pcc_nominal * 1000);
+-	latency_ns = max(latency_ns, pcc_ss_data->pcc_mrtt * 1000);
++	latency_ns = max_t(int, latency_ns, pcc_ss_data->pcc_nominal * 1000);
++	latency_ns = max_t(int, latency_ns, pcc_ss_data->pcc_mrtt * 1000);
+ 
+ 	return latency_ns;
+ }
+--- a/drivers/cpufreq/amd-pstate.c
++++ b/drivers/cpufreq/amd-pstate.c
+@@ -866,10 +866,10 @@ static void amd_pstate_update_limits(uns
+  */
+ static u32 amd_pstate_get_transition_delay_us(unsigned int cpu)
+ {
+-	u32 transition_delay_ns;
++	int transition_delay_ns;
+ 
+ 	transition_delay_ns = cppc_get_transition_latency(cpu);
+-	if (transition_delay_ns == CPUFREQ_ETERNAL) {
++	if (transition_delay_ns < 0) {
+ 		if (cpu_feature_enabled(X86_FEATURE_AMD_FAST_CPPC))
+ 			return AMD_PSTATE_FAST_CPPC_TRANSITION_DELAY;
+ 		else
+@@ -885,10 +885,10 @@ static u32 amd_pstate_get_transition_del
+  */
+ static u32 amd_pstate_get_transition_latency(unsigned int cpu)
+ {
+-	u32 transition_latency;
++	int transition_latency;
+ 
+ 	transition_latency = cppc_get_transition_latency(cpu);
+-	if (transition_latency  == CPUFREQ_ETERNAL)
++	if (transition_latency < 0)
+ 		return AMD_PSTATE_TRANSITION_LATENCY;
+ 
+ 	return transition_latency;
+--- a/drivers/cpufreq/cppc_cpufreq.c
++++ b/drivers/cpufreq/cppc_cpufreq.c
+@@ -341,9 +341,9 @@ static int cppc_verify_policy(struct cpu
+ 
+ static unsigned int __cppc_cpufreq_get_transition_delay_us(unsigned int cpu)
+ {
+-	unsigned int transition_latency_ns = cppc_get_transition_latency(cpu);
++	int transition_latency_ns = cppc_get_transition_latency(cpu);
+ 
+-	if (transition_latency_ns == CPUFREQ_ETERNAL)
++	if (transition_latency_ns < 0)
+ 		return CPUFREQ_DEFAULT_TRANSITION_LATENCY_NS / NSEC_PER_USEC;
+ 
+ 	return transition_latency_ns / NSEC_PER_USEC;
+--- a/include/acpi/cppc_acpi.h
++++ b/include/acpi/cppc_acpi.h
+@@ -161,7 +161,7 @@ extern unsigned int cppc_khz_to_perf(str
+ extern bool acpi_cpc_valid(void);
+ extern bool cppc_allow_fast_switch(void);
+ extern int acpi_get_psd_map(unsigned int cpu, struct cppc_cpudata *cpu_data);
+-extern unsigned int cppc_get_transition_latency(int cpu);
++extern int cppc_get_transition_latency(int cpu);
+ extern bool cpc_ffh_supported(void);
+ extern bool cpc_supported_by_cpu(void);
+ extern int cpc_read_ffh(int cpunum, struct cpc_reg *reg, u64 *val);
+@@ -217,9 +217,9 @@ static inline bool cppc_allow_fast_switc
+ {
+ 	return false;
+ }
+-static inline unsigned int cppc_get_transition_latency(int cpu)
++static inline int cppc_get_transition_latency(int cpu)
+ {
+-	return CPUFREQ_ETERNAL;
++	return -ENODATA;
+ }
+ static inline bool cpc_ffh_supported(void)
+ {
