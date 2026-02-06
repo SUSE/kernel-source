@@ -1,0 +1,99 @@
+From: JP Kobryn <inwardvessel@gmail.com>
+Date: Sat, 31 Jan 2026 23:13:46 -0800
+Subject: [PATCH] btrfs: prevent use-after-free on folio private data in
+ btrfs_subpage_clear_uptodate()
+References: bsc#1234429
+Patch-mainline: 6.12.69
+Git-commit: 22b10cbb9a2e144f6eacbc9e6eb0a26af1de5bb7
+
+This is a stable-only patch. The issue was inadvertently fixed in 6.17 [0]
+as part of a refactoring, but this patch serves as a minimal targeted fix
+for prior kernels.
+
+Users of filemap_lock_folio() need to guard against the situation where
+release_folio() has been invoked during reclaim but the folio was
+ultimately not removed from the page cache. This patch covers one location
+that was overlooked.
+
+After acquiring the folio, use set_folio_extent_mapped() to ensure the
+folio private state is valid. This is especially important in the subpage
+case, where the private field is an allocated struct containing bitmap and
+lock data.
+
+Without this protection, the race below is possible:
+
+[mm] page cache reclaim path        [fs] relocation in subpage mode
+shrink_folio_list()
+  folio_trylock() /* lock acquired */
+  filemap_release_folio()
+    mapping->a_ops->release_folio()
+      btrfs_release_folio()
+        __btrfs_release_folio()
+          clear_folio_extent_mapped()
+            btrfs_detach_subpage()
+              subpage = folio_detach_private(folio)
+              btrfs_free_subpage(subpage)
+                kfree(subpage) /* point A */
+
+                                   prealloc_file_extent_cluster()
+                                     filemap_lock_folio()
+                                       folio_try_get() /* inc refcount */
+                                       folio_lock() /* wait for lock */
+
+  if (...)
+    ...
+  else if (!mapping || !__remove_mapping(..))
+    /*
+     * __remove_mapping() returns zero when
+     * folio_ref_freeze(folio, refcount) fails /* point B */
+     */
+    goto keep_locked /* folio remains in cache */
+
+keep_locked:
+  folio_unlock(folio) /* lock released */
+
+                                   /* lock acquired */
+                                   btrfs_subpage_clear_uptodate()
+                                     /* use-after-free */
+                                     subpage = folio_get_private(folio)
+
+[0] 4e346baee95f ("btrfs: reloc: unconditionally invalidate the page cache for each cluster")
+
+Fixes: 9d9ea1e68a05 ("btrfs: subpage: fix relocation potentially overwriting last page data")
+Cc: stable@vger.kernel.org # 6.10-6.16
+Signed-off-by: JP Kobryn <inwardvessel@gmail.com>
+Reviewed-by: Qu Wenruo <wqu@suse.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ fs/btrfs/relocation.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/fs/btrfs/relocation.c b/fs/btrfs/relocation.c
+index 0d5a3846811a..43e8c331168e 100644
+--- a/fs/btrfs/relocation.c
++++ b/fs/btrfs/relocation.c
+@@ -2811,6 +2811,20 @@ static noinline_for_stack int prealloc_file_extent_cluster(struct reloc_control
+ 		 * will re-read the whole page anyway.
+ 		 */
+ 		if (!IS_ERR(folio)) {
++			/*
++			 * release_folio() could have cleared the folio private data
++			 * while we were not holding the lock. Reset the mapping if
++			 * needed so subpage operations can access a valid private
++			 * folio state.
++			 */
++			ret = set_folio_extent_mapped(folio);
++			if (ret) {
++				folio_unlock(folio);
++				folio_put(folio);
++
++				return ret;
++			}
++
+ 			btrfs_subpage_clear_uptodate(fs_info, folio, i_size,
+ 					round_up(i_size, PAGE_SIZE) - i_size);
+ 			folio_unlock(folio);
+-- 
+2.51.0
+
