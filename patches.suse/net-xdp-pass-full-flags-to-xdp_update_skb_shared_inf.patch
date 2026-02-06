@@ -1,0 +1,313 @@
+From: Jakub Kicinski <kuba@kernel.org>
+Date: Fri, 5 Sep 2025 15:15:38 -0700
+Subject: net: xdp: pass full flags to xdp_update_skb_shared_info()
+Patch-mainline: v6.18-rc1
+Git-commit: 1827f773e416842bb0a1be93f313e02591e0b0c2
+References: jsc#PED-14404 jsc#PED-15079
+
+xdp_update_skb_shared_info() needs to update skb state which
+was maintained in xdp_buff / frame. Pass full flags into it,
+instead of breaking it out bit by bit. We will need to add
+a bit for unreadable frags (even tho XDP doesn't support
+those the driver paths may be common), at which point almost
+all call sites would become:
+
+    xdp_update_skb_shared_info(skb, num_frags,
+                               sinfo->xdp_frags_size,
+                               MY_PAGE_SIZE * num_frags,
+                               xdp_buff_is_frag_pfmemalloc(xdp),
+                               xdp_buff_is_frag_unreadable(xdp));
+
+Keep a helper for accessing the flags, in case we need to
+transform them somehow in the future (e.g. to cover up xdp_buff
+vs xdp_frame differences).
+
+While we are touching call callers - rename the helper to
+xdp_update_skb_frags_info(), previous name may have implied that
+it's shinfo that's updated. We are updating flags in struct sk_buff
+based on frags that got attched.
+
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Jesper Dangaard Brouer <hawk@kernel.org>
+Link: https://patch.msgid.link/20250905221539.2930285-2-kuba@kernel.org
+Acked-by: Stanislav Fomichev <sdf@fomichev.me>
+Reviewed-by: Alexander Lobakin <aleksander.lobakin@intel.com>
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c   |    7 +++----
+ drivers/net/ethernet/intel/i40e/i40e_txrx.c     |   15 +++++++--------
+ drivers/net/ethernet/intel/ice/ice_txrx.c       |   15 +++++++--------
+ drivers/net/ethernet/marvell/mvneta.c           |    7 +++----
+ drivers/net/ethernet/mellanox/mlx5/core/en_rx.c |   23 +++++++++++------------
+ drivers/net/virtio_net.c                        |    7 +++----
+ include/net/xdp.h                               |   23 +++++++++++------------
+ net/core/xdp.c                                  |   21 ++++++++++-----------
+ 8 files changed, 55 insertions(+), 63 deletions(-)
+
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c
+@@ -466,9 +466,8 @@ bnxt_xdp_build_skb(struct bnxt *bp, stru
+ 	if (!skb)
+ 		return NULL;
+ 
+-	xdp_update_skb_shared_info(skb, num_frags,
+-				   sinfo->xdp_frags_size,
+-				   BNXT_RX_PAGE_SIZE * num_frags,
+-				   xdp_buff_is_frag_pfmemalloc(xdp));
++	xdp_update_skb_frags_info(skb, num_frags, sinfo->xdp_frags_size,
++				  BNXT_RX_PAGE_SIZE * num_frags,
++				  xdp_buff_get_skb_flags(xdp));
+ 	return skb;
+ }
+--- a/drivers/net/ethernet/intel/i40e/i40e_txrx.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_txrx.c
+@@ -2148,10 +2148,10 @@ static struct sk_buff *i40e_construct_sk
+ 		memcpy(&skinfo->frags[skinfo->nr_frags], &sinfo->frags[0],
+ 		       sizeof(skb_frag_t) * nr_frags);
+ 
+-		xdp_update_skb_shared_info(skb, skinfo->nr_frags + nr_frags,
+-					   sinfo->xdp_frags_size,
+-					   nr_frags * xdp->frame_sz,
+-					   xdp_buff_is_frag_pfmemalloc(xdp));
++		xdp_update_skb_frags_info(skb, skinfo->nr_frags + nr_frags,
++					  sinfo->xdp_frags_size,
++					  nr_frags * xdp->frame_sz,
++					  xdp_buff_get_skb_flags(xdp));
+ 
+ 		/* First buffer has already been processed, so bump ntc */
+ 		if (++rx_ring->next_to_clean == rx_ring->count)
+@@ -2203,10 +2203,9 @@ static struct sk_buff *i40e_build_skb(st
+ 		skb_metadata_set(skb, metasize);
+ 
+ 	if (unlikely(xdp_buff_has_frags(xdp))) {
+-		xdp_update_skb_shared_info(skb, nr_frags,
+-					   sinfo->xdp_frags_size,
+-					   nr_frags * xdp->frame_sz,
+-					   xdp_buff_is_frag_pfmemalloc(xdp));
++		xdp_update_skb_frags_info(skb, nr_frags, sinfo->xdp_frags_size,
++					  nr_frags * xdp->frame_sz,
++					  xdp_buff_get_skb_flags(xdp));
+ 
+ 		i40e_process_rx_buffs(rx_ring, I40E_XDP_PASS, xdp);
+ 	} else {
+--- a/drivers/net/ethernet/intel/ice/ice_txrx.c
++++ b/drivers/net/ethernet/intel/ice/ice_txrx.c
+@@ -1031,10 +1031,9 @@ ice_build_skb(struct ice_rx_ring *rx_rin
+ 		skb_metadata_set(skb, metasize);
+ 
+ 	if (unlikely(xdp_buff_has_frags(xdp)))
+-		xdp_update_skb_shared_info(skb, nr_frags,
+-					   sinfo->xdp_frags_size,
+-					   nr_frags * xdp->frame_sz,
+-					   xdp_buff_is_frag_pfmemalloc(xdp));
++		xdp_update_skb_frags_info(skb, nr_frags, sinfo->xdp_frags_size,
++					  nr_frags * xdp->frame_sz,
++					  xdp_buff_get_skb_flags(xdp));
+ 
+ 	return skb;
+ }
+@@ -1111,10 +1110,10 @@ ice_construct_skb(struct ice_rx_ring *rx
+ 		memcpy(&skinfo->frags[skinfo->nr_frags], &sinfo->frags[0],
+ 		       sizeof(skb_frag_t) * nr_frags);
+ 
+-		xdp_update_skb_shared_info(skb, skinfo->nr_frags + nr_frags,
+-					   sinfo->xdp_frags_size,
+-					   nr_frags * xdp->frame_sz,
+-					   xdp_buff_is_frag_pfmemalloc(xdp));
++		xdp_update_skb_frags_info(skb, skinfo->nr_frags + nr_frags,
++					  sinfo->xdp_frags_size,
++					  nr_frags * xdp->frame_sz,
++					  xdp_buff_get_skb_flags(xdp));
+ 	}
+ 
+ 	return skb;
+--- a/drivers/net/ethernet/marvell/mvneta.c
++++ b/drivers/net/ethernet/marvell/mvneta.c
+@@ -2413,10 +2413,9 @@ mvneta_swbm_build_skb(struct mvneta_port
+ 	skb->ip_summed = mvneta_rx_csum(pp, desc_status);
+ 
+ 	if (unlikely(xdp_buff_has_frags(xdp)))
+-		xdp_update_skb_shared_info(skb, num_frags,
+-					   sinfo->xdp_frags_size,
+-					   num_frags * xdp->frame_sz,
+-					   xdp_buff_is_frag_pfmemalloc(xdp));
++		xdp_update_skb_frags_info(skb, num_frags, sinfo->xdp_frags_size,
++					  num_frags * xdp->frame_sz,
++					  xdp_buff_get_skb_flags(xdp));
+ 
+ 	return skb;
+ }
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@ -1789,10 +1789,9 @@ mlx5e_skb_from_cqe_nonlinear(struct mlx5
+ 
+ 	if (xdp_buff_has_frags(&mxbuf->xdp)) {
+ 		/* sinfo->nr_frags is reset by build_skb, calculate again. */
+-		xdp_update_skb_shared_info(skb, wi - head_wi - 1,
+-					   sinfo->xdp_frags_size, truesize,
+-					   xdp_buff_is_frag_pfmemalloc(
+-						&mxbuf->xdp));
++		xdp_update_skb_frags_info(skb, wi - head_wi - 1,
++					  sinfo->xdp_frags_size, truesize,
++					  xdp_buff_get_skb_flags(&mxbuf->xdp));
+ 
+ 		for (struct mlx5e_wqe_frag_info *pwi = head_wi + 1; pwi < wi; pwi++)
+ 			pwi->frag_page->frags++;
+@@ -2094,10 +2093,10 @@ mlx5e_skb_from_cqe_mpwrq_nonlinear(struc
+ 			struct mlx5e_frag_page *pagep;
+ 
+ 			/* sinfo->nr_frags is reset by build_skb, calculate again. */
+-			xdp_update_skb_shared_info(skb, frag_page - head_page,
+-						   sinfo->xdp_frags_size, truesize,
+-						   xdp_buff_is_frag_pfmemalloc(
+-							&mxbuf->xdp));
++			xdp_update_skb_frags_info(skb, frag_page - head_page,
++						  sinfo->xdp_frags_size,
++						  truesize,
++						  xdp_buff_get_skb_flags(&mxbuf->xdp));
+ 
+ 			pagep = head_page;
+ 			do
+@@ -2111,10 +2110,10 @@ mlx5e_skb_from_cqe_mpwrq_nonlinear(struc
+ 		if (xdp_buff_has_frags(&mxbuf->xdp)) {
+ 			struct mlx5e_frag_page *pagep;
+ 
+-			xdp_update_skb_shared_info(skb, sinfo->nr_frags,
+-						   sinfo->xdp_frags_size, truesize,
+-						   xdp_buff_is_frag_pfmemalloc(
+-							&mxbuf->xdp));
++			xdp_update_skb_frags_info(skb, sinfo->nr_frags,
++						  sinfo->xdp_frags_size,
++						  truesize,
++						  xdp_buff_get_skb_flags(&mxbuf->xdp));
+ 
+ 			pagep = frag_page - sinfo->nr_frags;
+ 			do
+--- a/drivers/net/virtio_net.c
++++ b/drivers/net/virtio_net.c
+@@ -2004,10 +2004,9 @@ static struct sk_buff *build_skb_from_xd
+ 		skb_metadata_set(skb, metasize);
+ 
+ 	if (unlikely(xdp_buff_has_frags(xdp)))
+-		xdp_update_skb_shared_info(skb, nr_frags,
+-					   sinfo->xdp_frags_size,
+-					   xdp_frags_truesz,
+-					   xdp_buff_is_frag_pfmemalloc(xdp));
++		xdp_update_skb_frags_info(skb, nr_frags, sinfo->xdp_frags_size,
++					  xdp_frags_truesz,
++					  xdp_buff_get_skb_flags(xdp));
+ 
+ 	return skb;
+ }
+--- a/include/net/xdp.h
++++ b/include/net/xdp.h
+@@ -116,15 +116,14 @@ static __always_inline void xdp_buff_cle
+ 	xdp->flags &= ~XDP_FLAGS_HAS_FRAGS;
+ }
+ 
+-static __always_inline bool
+-xdp_buff_is_frag_pfmemalloc(const struct xdp_buff *xdp)
++static __always_inline void xdp_buff_set_frag_pfmemalloc(struct xdp_buff *xdp)
+ {
+-	return !!(xdp->flags & XDP_FLAGS_FRAGS_PF_MEMALLOC);
++	xdp->flags |= XDP_FLAGS_FRAGS_PF_MEMALLOC;
+ }
+ 
+-static __always_inline void xdp_buff_set_frag_pfmemalloc(struct xdp_buff *xdp)
++static __always_inline u32 xdp_buff_get_skb_flags(const struct xdp_buff *xdp)
+ {
+-	xdp->flags |= XDP_FLAGS_FRAGS_PF_MEMALLOC;
++	return xdp->flags;
+ }
+ 
+ static __always_inline void
+@@ -294,10 +293,10 @@ static __always_inline bool xdp_frame_ha
+ 	return !!(frame->flags & XDP_FLAGS_HAS_FRAGS);
+ }
+ 
+-static __always_inline bool
+-xdp_frame_is_frag_pfmemalloc(const struct xdp_frame *frame)
++static __always_inline u32
++xdp_frame_get_skb_flags(const struct xdp_frame *frame)
+ {
+-	return !!(frame->flags & XDP_FLAGS_FRAGS_PF_MEMALLOC);
++	return frame->flags;
+ }
+ 
+ #define XDP_BULK_QUEUE_SIZE	16
+@@ -334,9 +333,9 @@ static inline void xdp_scrub_frame(struc
+ }
+ 
+ static inline void
+-xdp_update_skb_shared_info(struct sk_buff *skb, u8 nr_frags,
+-			   unsigned int size, unsigned int truesize,
+-			   bool pfmemalloc)
++xdp_update_skb_frags_info(struct sk_buff *skb, u8 nr_frags,
++			  unsigned int size, unsigned int truesize,
++			  u32 xdp_flags)
+ {
+ 	struct skb_shared_info *sinfo = skb_shinfo(skb);
+ 
+@@ -350,7 +349,7 @@ xdp_update_skb_shared_info(struct sk_buf
+ 	skb->len += size;
+ 	skb->data_len += size;
+ 	skb->truesize += truesize;
+-	skb->pfmemalloc |= pfmemalloc;
++	skb->pfmemalloc |= !!(xdp_flags & XDP_FLAGS_FRAGS_PF_MEMALLOC);
+ }
+ 
+ /* Avoids inlining WARN macro in fast-path */
+--- a/net/core/xdp.c
++++ b/net/core/xdp.c
+@@ -672,9 +672,8 @@ struct sk_buff *xdp_build_skb_from_buff(
+ 		u32 tsize;
+ 
+ 		tsize = sinfo->xdp_frags_truesize ? : nr_frags * xdp->frame_sz;
+-		xdp_update_skb_shared_info(skb, nr_frags,
+-					   sinfo->xdp_frags_size, tsize,
+-					   xdp_buff_is_frag_pfmemalloc(xdp));
++		xdp_update_skb_frags_info(skb, nr_frags, sinfo->xdp_frags_size,
++					  tsize, xdp_buff_get_skb_flags(xdp));
+ 	}
+ 
+ 	skb->protocol = eth_type_trans(skb, rxq->dev);
+@@ -701,7 +700,7 @@ static noinline bool xdp_copy_frags_from
+ 	struct skb_shared_info *sinfo = skb_shinfo(skb);
+ 	const struct skb_shared_info *xinfo;
+ 	u32 nr_frags, tsize = 0;
+-	bool pfmemalloc = false;
++	u32 flags = 0;
+ 
+ 	xinfo = xdp_get_shared_info_from_buff(xdp);
+ 	nr_frags = xinfo->nr_frags;
+@@ -723,11 +722,12 @@ static noinline bool xdp_copy_frags_from
+ 		__skb_fill_netmem_desc_noacc(sinfo, i, netmem, offset, len);
+ 
+ 		tsize += truesize;
+-		pfmemalloc |= netmem_is_pfmemalloc(netmem);
++		if (netmem_is_pfmemalloc(netmem))
++			flags |= XDP_FLAGS_FRAGS_PF_MEMALLOC;
+ 	}
+ 
+-	xdp_update_skb_shared_info(skb, nr_frags, xinfo->xdp_frags_size,
+-				   tsize, pfmemalloc);
++	xdp_update_skb_frags_info(skb, nr_frags, xinfo->xdp_frags_size, tsize,
++				  flags);
+ 
+ 	return true;
+ }
+@@ -827,10 +827,9 @@ struct sk_buff *__xdp_build_skb_from_fra
+ 		skb_metadata_set(skb, xdpf->metasize);
+ 
+ 	if (unlikely(xdp_frame_has_frags(xdpf)))
+-		xdp_update_skb_shared_info(skb, nr_frags,
+-					   sinfo->xdp_frags_size,
+-					   nr_frags * xdpf->frame_sz,
+-					   xdp_frame_is_frag_pfmemalloc(xdpf));
++		xdp_update_skb_frags_info(skb, nr_frags, sinfo->xdp_frags_size,
++					  nr_frags * xdpf->frame_sz,
++					  xdp_frame_get_skb_flags(xdpf));
+ 
+ 	/* Essential SKB info: protocol and skb->dev */
+ 	skb->protocol = eth_type_trans(skb, dev);
