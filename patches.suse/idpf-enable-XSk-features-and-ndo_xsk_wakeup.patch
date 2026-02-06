@@ -1,0 +1,198 @@
+From: Alexander Lobakin <aleksander.lobakin@intel.com>
+Date: Thu, 11 Sep 2025 18:22:33 +0200
+Subject: idpf: enable XSk features and ndo_xsk_wakeup
+Patch-mainline: v6.18-rc1
+Git-commit: 96da9d67da780c9fc10edc8822dcc69d62898d8d
+References: jsc#PED-14403
+
+Now that AF_XDP functionality is fully implemented, advertise XSk XDP
+feature and add .ndo_xsk_wakeup() callback to be able to use it with
+this driver.
+
+Co-developed-by: Michal Kubiak <michal.kubiak@intel.com>
+Signed-off-by: Michal Kubiak <michal.kubiak@intel.com>
+Signed-off-by: Alexander Lobakin <aleksander.lobakin@intel.com>
+Tested-by: Ramu R <ramu.r@intel.com>
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/idpf/idpf.h      |    7 ++++++
+ drivers/net/ethernet/intel/idpf/idpf_lib.c  |    2 +
+ drivers/net/ethernet/intel/idpf/idpf_txrx.c |    3 ++
+ drivers/net/ethernet/intel/idpf/idpf_txrx.h |   10 ++++++---
+ drivers/net/ethernet/intel/idpf/xdp.c       |    4 ++-
+ drivers/net/ethernet/intel/idpf/xsk.c       |   29 ++++++++++++++++++++++++++++
+ drivers/net/ethernet/intel/idpf/xsk.h       |    4 +++
+ 7 files changed, 55 insertions(+), 4 deletions(-)
+
+--- a/drivers/net/ethernet/intel/idpf/idpf.h
++++ b/drivers/net/ethernet/intel/idpf/idpf.h
+@@ -995,6 +995,13 @@ static inline void idpf_vport_ctrl_unloc
+ 	mutex_unlock(&np->adapter->vport_ctrl_lock);
+ }
+ 
++static inline bool idpf_vport_ctrl_is_locked(struct net_device *netdev)
++{
++	struct idpf_netdev_priv *np = netdev_priv(netdev);
++
++	return mutex_is_locked(&np->adapter->vport_ctrl_lock);
++}
++
+ void idpf_statistics_task(struct work_struct *work);
+ void idpf_init_task(struct work_struct *work);
+ void idpf_service_task(struct work_struct *work);
+--- a/drivers/net/ethernet/intel/idpf/idpf_lib.c
++++ b/drivers/net/ethernet/intel/idpf/idpf_lib.c
+@@ -5,6 +5,7 @@
+ #include "idpf_virtchnl.h"
+ #include "idpf_ptp.h"
+ #include "xdp.h"
++#include "xsk.h"
+ 
+ static const struct net_device_ops idpf_netdev_ops;
+ 
+@@ -2617,4 +2618,5 @@ static const struct net_device_ops idpf_
+ 	.ndo_hwtstamp_set = idpf_hwtstamp_set,
+ 	.ndo_bpf = idpf_xdp,
+ 	.ndo_xdp_xmit = idpf_xdp_xmit,
++	.ndo_xsk_wakeup = idpf_xsk_wakeup,
+ };
+--- a/drivers/net/ethernet/intel/idpf/idpf_txrx.c
++++ b/drivers/net/ethernet/intel/idpf/idpf_txrx.c
+@@ -1210,6 +1210,8 @@ static int idpf_qp_enable(const struct i
+ 		if (!idpf_queue_has(XSK, q->txq))
+ 			continue;
+ 
++		idpf_xsk_init_wakeup(q_vector);
++
+ 		q->txq->q_vector = q_vector;
+ 		q_vector->xsksq[q_vector->num_xsksq++] = q->txq;
+ 	}
+@@ -4423,6 +4425,7 @@ static void idpf_vport_intr_map_vector_t
+ 			continue;
+ 
+ 		qv = idpf_find_rxq_vec(vport, i);
++		idpf_xsk_init_wakeup(qv);
+ 
+ 		xdpsq->q_vector = qv;
+ 		qv->xsksq[qv->num_xsksq++] = xdpsq;
+--- a/drivers/net/ethernet/intel/idpf/idpf_txrx.h
++++ b/drivers/net/ethernet/intel/idpf/idpf_txrx.h
+@@ -374,9 +374,10 @@ struct idpf_intr_reg {
+  * @complq: array of completion queues
+  * @xsksq: array of XSk send queues
+  * @intr_reg: See struct idpf_intr_reg
+- * @napi: napi handler
++ * @csd: XSk wakeup CSD
+  * @total_events: Number of interrupts processed
+  * @wb_on_itr: whether WB on ITR is enabled
++ * @napi: napi handler
+  * @tx_dim: Data for TX net_dim algorithm
+  * @tx_itr_value: TX interrupt throttling rate
+  * @tx_intr_mode: Dynamic ITR or not
+@@ -407,10 +408,13 @@ struct idpf_q_vector {
+ 	__cacheline_group_end_aligned(read_mostly);
+ 
+ 	__cacheline_group_begin_aligned(read_write);
+-	struct napi_struct napi;
++	call_single_data_t csd;
++
+ 	u16 total_events;
+ 	bool wb_on_itr;
+ 
++	struct napi_struct napi;
++
+ 	struct dim tx_dim;
+ 	u16 tx_itr_value;
+ 	bool tx_intr_mode;
+@@ -429,7 +433,7 @@ struct idpf_q_vector {
+ 	__cacheline_group_end_aligned(cold);
+ };
+ libeth_cacheline_set_assert(struct idpf_q_vector, 136,
+-			    24 + sizeof(struct napi_struct) +
++			    56 + sizeof(struct napi_struct) +
+ 			    2 * sizeof(struct dim),
+ 			    8 + sizeof(cpumask_var_t));
+ 
+--- a/drivers/net/ethernet/intel/idpf/xdp.c
++++ b/drivers/net/ethernet/intel/idpf/xdp.c
+@@ -400,7 +400,9 @@ void idpf_xdp_set_features(const struct
+ 	if (!idpf_is_queue_model_split(vport->rxq_model))
+ 		return;
+ 
+-	libeth_xdp_set_features_noredir(vport->netdev, &idpf_xdpmo);
++	libeth_xdp_set_features_noredir(vport->netdev, &idpf_xdpmo,
++					idpf_get_max_tx_bufs(vport->adapter),
++					libeth_xsktmo);
+ }
+ 
+ static int idpf_xdp_setup_prog(struct idpf_vport *vport,
+--- a/drivers/net/ethernet/intel/idpf/xsk.c
++++ b/drivers/net/ethernet/intel/idpf/xsk.c
+@@ -158,6 +158,11 @@ void idpf_xsk_clear_queue(void *q, enum
+ 	}
+ }
+ 
++void idpf_xsk_init_wakeup(struct idpf_q_vector *qv)
++{
++	libeth_xsk_init_wakeup(&qv->csd, &qv->napi);
++}
++
+ void idpf_xsksq_clean(struct idpf_tx_queue *xdpsq)
+ {
+ 	struct libeth_xdpsq_napi_stats ss = { };
+@@ -602,3 +607,27 @@ err_dis:
+ 
+ 	return ret;
+ }
++
++int idpf_xsk_wakeup(struct net_device *dev, u32 qid, u32 flags)
++{
++	const struct idpf_netdev_priv *np = netdev_priv(dev);
++	const struct idpf_vport *vport = np->vport;
++	struct idpf_q_vector *q_vector;
++
++	if (unlikely(idpf_vport_ctrl_is_locked(dev)))
++		return -EBUSY;
++
++	if (unlikely(!vport->link_up))
++		return -ENETDOWN;
++
++	if (unlikely(!vport->num_xdp_txq))
++		return -ENXIO;
++
++	q_vector = idpf_find_rxq_vec(vport, qid);
++	if (unlikely(!q_vector->xsksq))
++		return -ENXIO;
++
++	libeth_xsk_wakeup(&q_vector->csd, qid);
++
++	return 0;
++}
+--- a/drivers/net/ethernet/intel/idpf/xsk.h
++++ b/drivers/net/ethernet/intel/idpf/xsk.h
+@@ -8,14 +8,17 @@
+ 
+ enum virtchnl2_queue_type;
+ struct idpf_buf_queue;
++struct idpf_q_vector;
+ struct idpf_rx_queue;
+ struct idpf_tx_queue;
+ struct idpf_vport;
++struct net_device;
+ struct netdev_bpf;
+ 
+ void idpf_xsk_setup_queue(const struct idpf_vport *vport, void *q,
+ 			  enum virtchnl2_queue_type type);
+ void idpf_xsk_clear_queue(void *q, enum virtchnl2_queue_type type);
++void idpf_xsk_init_wakeup(struct idpf_q_vector *qv);
+ 
+ int idpf_xskfq_init(struct idpf_buf_queue *bufq);
+ void idpf_xskfq_rel(struct idpf_buf_queue *bufq);
+@@ -25,5 +28,6 @@ int idpf_xskrq_poll(struct idpf_rx_queue
+ bool idpf_xsk_xmit(struct idpf_tx_queue *xsksq);
+ 
+ int idpf_xsk_pool_setup(struct idpf_vport *vport, struct netdev_bpf *xdp);
++int idpf_xsk_wakeup(struct net_device *dev, u32 qid, u32 flags);
+ 
+ #endif /* !_IDPF_XSK_H_ */
