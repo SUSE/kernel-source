@@ -1,0 +1,225 @@
+From: David Howells <dhowells@redhat.com>
+Date: Wed, 28 Jan 2026 19:10:48 -0500
+Subject: [PATCH] rxrpc: Fix data-race warning and potential load/store tearing
+References: bsc#1234429
+Patch-mainline: 6.12.69
+Git-commit: 5d5fe8bcd331f1e34e0943ec7c18432edfcf0e8b
+
+[ Upstream commit 5d5fe8bcd331f1e34e0943ec7c18432edfcf0e8b ]
+
+Fix the following:
+
+        BUG: KCSAN: data-race in rxrpc_peer_keepalive_worker / rxrpc_send_data_packet
+
+which is reporting an issue with the reads and writes to ->last_tx_at in:
+
+        conn->peer->last_tx_at = ktime_get_seconds();
+
+and:
+
+        keepalive_at = peer->last_tx_at + RXRPC_KEEPALIVE_TIME;
+
+The lockless accesses to these to values aren't actually a problem as the
+read only needs an approximate time of last transmission for the purposes
+of deciding whether or not the transmission of a keepalive packet is
+warranted yet.
+
+Also, as ->last_tx_at is a 64-bit value, tearing can occur on a 32-bit
+arch.
+
+Fix both of these by switching to an unsigned int for ->last_tx_at and only
+storing the LSW of the time64_t.  It can then be reconstructed at need
+provided no more than 68 years has elapsed since the last transmission.
+
+Fixes: ace45bec6d77 ("rxrpc: Fix firewall route keepalive")
+Reported-by: syzbot+6182afad5045e6703b3d@syzkaller.appspotmail.com
+Closes: https://lore.kernel.org/r/695e7cfb.050a0220.1c677c.036b.GAE@google.com/
+Signed-off-by: David Howells <dhowells@redhat.com>
+cc: Marc Dionne <marc.dionne@auristor.com>
+cc: Simon Horman <horms@kernel.org>
+cc: linux-afs@lists.infradead.org
+cc: stable@kernel.org
+Link: https://patch.msgid.link/1107124.1768903985@warthog.procyon.org.uk
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+[ different struct fields (peer->mtu, peer->srtt_us, peer->rto_us) and different output.c code structure ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ net/rxrpc/ar-internal.h |  9 ++++++++-
+ net/rxrpc/conn_event.c  |  2 +-
+ net/rxrpc/output.c      | 10 +++++-----
+ net/rxrpc/peer_event.c  | 17 ++++++++++++++++-
+ net/rxrpc/proc.c        |  4 ++--
+ net/rxrpc/rxkad.c       |  4 ++--
+ 6 files changed, 34 insertions(+), 12 deletions(-)
+
+diff --git a/net/rxrpc/ar-internal.h b/net/rxrpc/ar-internal.h
+index 6b036c0564c7..1494d162444d 100644
+--- a/net/rxrpc/ar-internal.h
++++ b/net/rxrpc/ar-internal.h
+@@ -335,7 +335,7 @@ struct rxrpc_peer {
+ 	struct hlist_head	error_targets;	/* targets for net error distribution */
+ 	struct rb_root		service_conns;	/* Service connections */
+ 	struct list_head	keepalive_link;	/* Link in net->peer_keepalive[] */
+-	time64_t		last_tx_at;	/* Last time packet sent here */
++	unsigned int		last_tx_at;	/* Last time packet sent here (time64_t LSW) */
+ 	seqlock_t		service_conn_lock;
+ 	spinlock_t		lock;		/* access lock */
+ 	unsigned int		if_mtu;		/* interface MTU for this peer */
+@@ -1161,6 +1161,13 @@ void rxrpc_transmit_one(struct rxrpc_call *call, struct rxrpc_txbuf *txb);
+ void rxrpc_input_error(struct rxrpc_local *, struct sk_buff *);
+ void rxrpc_peer_keepalive_worker(struct work_struct *);
+ 
++/* Update the last transmission time on a peer for keepalive purposes. */
++static inline void rxrpc_peer_mark_tx(struct rxrpc_peer *peer)
++{
++	/* To avoid tearing on 32-bit systems, we only keep the LSW. */
++	WRITE_ONCE(peer->last_tx_at, ktime_get_seconds());
++}
++
+ /*
+  * peer_object.c
+  */
+diff --git a/net/rxrpc/conn_event.c b/net/rxrpc/conn_event.c
+index c4eb7986efdd..c8df12d80c7c 100644
+--- a/net/rxrpc/conn_event.c
++++ b/net/rxrpc/conn_event.c
+@@ -180,7 +180,7 @@ void rxrpc_conn_retransmit_call(struct rxrpc_connection *conn,
+ 	}
+ 
+ 	ret = kernel_sendmsg(conn->local->socket, &msg, iov, ioc, len);
+-	conn->peer->last_tx_at = ktime_get_seconds();
++	rxrpc_peer_mark_tx(conn->peer);
+ 	if (ret < 0)
+ 		trace_rxrpc_tx_fail(chan->call_debug_id, serial, ret,
+ 				    rxrpc_tx_point_call_final_resend);
+diff --git a/net/rxrpc/output.c b/net/rxrpc/output.c
+index ccfae607c9bb..ad7e61066d2b 100644
+--- a/net/rxrpc/output.c
++++ b/net/rxrpc/output.c
+@@ -209,7 +209,7 @@ static void rxrpc_send_ack_packet(struct rxrpc_call *call, struct rxrpc_txbuf *t
+ 	iov_iter_kvec(&msg.msg_iter, WRITE, txb->kvec, txb->nr_kvec, txb->len);
+ 	rxrpc_local_dont_fragment(conn->local, false);
+ 	ret = do_udp_sendmsg(conn->local->socket, &msg, txb->len);
+-	call->peer->last_tx_at = ktime_get_seconds();
++	rxrpc_peer_mark_tx(call->peer);
+ 	if (ret < 0) {
+ 		trace_rxrpc_tx_fail(call->debug_id, txb->serial, ret,
+ 				    rxrpc_tx_point_call_ack);
+@@ -310,7 +310,7 @@ int rxrpc_send_abort_packet(struct rxrpc_call *call)
+ 
+ 	iov_iter_kvec(&msg.msg_iter, WRITE, iov, 1, sizeof(pkt));
+ 	ret = do_udp_sendmsg(conn->local->socket, &msg, sizeof(pkt));
+-	conn->peer->last_tx_at = ktime_get_seconds();
++	rxrpc_peer_mark_tx(conn->peer);
+ 	if (ret < 0)
+ 		trace_rxrpc_tx_fail(call->debug_id, serial, ret,
+ 				    rxrpc_tx_point_call_abort);
+@@ -486,7 +486,7 @@ static int rxrpc_send_data_packet(struct rxrpc_call *call, struct rxrpc_txbuf *t
+ 	 */
+ 	rxrpc_inc_stat(call->rxnet, stat_tx_data_send);
+ 	ret = do_udp_sendmsg(conn->local->socket, &msg, len);
+-	conn->peer->last_tx_at = ktime_get_seconds();
++	rxrpc_peer_mark_tx(conn->peer);
+ 
+ 	if (ret < 0) {
+ 		rxrpc_inc_stat(call->rxnet, stat_tx_data_send_fail);
+@@ -573,7 +573,7 @@ void rxrpc_send_conn_abort(struct rxrpc_connection *conn)
+ 
+ 	trace_rxrpc_tx_packet(conn->debug_id, &whdr, rxrpc_tx_point_conn_abort);
+ 
+-	conn->peer->last_tx_at = ktime_get_seconds();
++	rxrpc_peer_mark_tx(conn->peer);
+ }
+ 
+ /*
+@@ -692,7 +692,7 @@ void rxrpc_send_keepalive(struct rxrpc_peer *peer)
+ 		trace_rxrpc_tx_packet(peer->debug_id, &whdr,
+ 				      rxrpc_tx_point_version_keepalive);
+ 
+-	peer->last_tx_at = ktime_get_seconds();
++	rxrpc_peer_mark_tx(peer);
+ 	_leave("");
+ }
+ 
+diff --git a/net/rxrpc/peer_event.c b/net/rxrpc/peer_event.c
+index 5d0842efde69..adcfb3eb9f51 100644
+--- a/net/rxrpc/peer_event.c
++++ b/net/rxrpc/peer_event.c
+@@ -224,6 +224,21 @@ static void rxrpc_distribute_error(struct rxrpc_peer *peer, struct sk_buff *skb,
+ 	spin_unlock(&peer->lock);
+ }
+ 
++/*
++ * Reconstruct the last transmission time.  The difference calculated should be
++ * valid provided no more than ~68 years elapsed since the last transmission.
++ */
++static time64_t rxrpc_peer_get_tx_mark(const struct rxrpc_peer *peer, time64_t base)
++{
++	s32 last_tx_at = READ_ONCE(peer->last_tx_at);
++	s32 base_lsw = base;
++	s32 diff = last_tx_at - base_lsw;
++
++	diff = clamp(diff, -RXRPC_KEEPALIVE_TIME, RXRPC_KEEPALIVE_TIME);
++
++	return diff + base;
++}
++
+ /*
+  * Perform keep-alive pings.
+  */
+@@ -252,7 +267,7 @@ static void rxrpc_peer_keepalive_dispatch(struct rxrpc_net *rxnet,
+ 		spin_unlock_bh(&rxnet->peer_hash_lock);
+ 
+ 		if (use) {
+-			keepalive_at = peer->last_tx_at + RXRPC_KEEPALIVE_TIME;
++			keepalive_at = rxrpc_peer_get_tx_mark(peer, base) + RXRPC_KEEPALIVE_TIME;
+ 			slot = keepalive_at - base;
+ 			_debug("%02x peer %u t=%d {%pISp}",
+ 			       cursor, peer->debug_id, slot, &peer->srx.transport);
+diff --git a/net/rxrpc/proc.c b/net/rxrpc/proc.c
+index 263a2251e3d2..ca85ac764f82 100644
+--- a/net/rxrpc/proc.c
++++ b/net/rxrpc/proc.c
+@@ -299,13 +299,13 @@ static int rxrpc_peer_seq_show(struct seq_file *seq, void *v)
+ 	now = ktime_get_seconds();
+ 	seq_printf(seq,
+ 		   "UDP   %-47.47s %-47.47s %3u"
+-		   " %3u %5u %6llus %8u %8u\n",
++		   " %3u %5u %6ds %8u %8u\n",
+ 		   lbuff,
+ 		   rbuff,
+ 		   refcount_read(&peer->ref),
+ 		   peer->cong_ssthresh,
+ 		   peer->mtu,
+-		   now - peer->last_tx_at,
++		   (s32)now - (s32)READ_ONCE(peer->last_tx_at),
+ 		   peer->srtt_us >> 3,
+ 		   peer->rto_us);
+ 
+diff --git a/net/rxrpc/rxkad.c b/net/rxrpc/rxkad.c
+index 48a1475e6b06..a8426335e401 100644
+--- a/net/rxrpc/rxkad.c
++++ b/net/rxrpc/rxkad.c
+@@ -676,7 +676,7 @@ static int rxkad_issue_challenge(struct rxrpc_connection *conn)
+ 		return -EAGAIN;
+ 	}
+ 
+-	conn->peer->last_tx_at = ktime_get_seconds();
++	rxrpc_peer_mark_tx(conn->peer);
+ 	trace_rxrpc_tx_packet(conn->debug_id, &whdr,
+ 			      rxrpc_tx_point_rxkad_challenge);
+ 	_leave(" = 0");
+@@ -734,7 +734,7 @@ static int rxkad_send_response(struct rxrpc_connection *conn,
+ 		return -EAGAIN;
+ 	}
+ 
+-	conn->peer->last_tx_at = ktime_get_seconds();
++	rxrpc_peer_mark_tx(conn->peer);
+ 	_leave(" = 0");
+ 	return 0;
+ }
+-- 
+2.51.0
+

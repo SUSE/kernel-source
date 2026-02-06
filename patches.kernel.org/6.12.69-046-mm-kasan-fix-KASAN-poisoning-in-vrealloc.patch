@@ -1,0 +1,159 @@
+From: Andrey Ryabinin <ryabinin.a.a@gmail.com>
+Date: Tue, 13 Jan 2026 20:15:15 +0100
+Subject: [PATCH] mm/kasan: fix KASAN poisoning in vrealloc()
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+References: bsc#1234429
+Patch-mainline: 6.12.69
+Git-commit: 9b47d4eea3f7c1f620e95bda1d6221660bde7d7b
+
+commit 9b47d4eea3f7c1f620e95bda1d6221660bde7d7b upstream.
+
+A KASAN warning can be triggered when vrealloc() changes the requested
+size to a value that is not aligned to KASAN_GRANULE_SIZE.
+
+    ------------[ cut here ]------------
+    WARNING: CPU: 2 PID: 1 at mm/kasan/shadow.c:174 kasan_unpoison+0x40/0x48
+    ...
+    pc : kasan_unpoison+0x40/0x48
+    lr : __kasan_unpoison_vmalloc+0x40/0x68
+    Call trace:
+     kasan_unpoison+0x40/0x48 (P)
+     vrealloc_node_align_noprof+0x200/0x320
+     bpf_patch_insn_data+0x90/0x2f0
+     convert_ctx_accesses+0x8c0/0x1158
+     bpf_check+0x1488/0x1900
+     bpf_prog_load+0xd20/0x1258
+     __sys_bpf+0x96c/0xdf0
+     __arm64_sys_bpf+0x50/0xa0
+     invoke_syscall+0x90/0x160
+
+Introduce a dedicated kasan_vrealloc() helper that centralizes KASAN
+handling for vmalloc reallocations.  The helper accounts for KASAN granule
+alignment when growing or shrinking an allocation and ensures that partial
+granules are handled correctly.
+
+Use this helper from vrealloc_node_align_noprof() to fix poisoning logic.
+
+[ryabinin.a.a@gmail.com: move kasan_enabled() check, fix build]
+  Link: https://lkml.kernel.org/r/20260119144509.32767-1-ryabinin.a.a@gmail.com
+Link: https://lkml.kernel.org/r/20260113191516.31015-1-ryabinin.a.a@gmail.com
+Fixes: d699440f58ce ("mm: fix vrealloc()'s KASAN poisoning logic")
+Signed-off-by: Andrey Ryabinin <ryabinin.a.a@gmail.com>
+Reported-by: Maciej Żenczykowski <maze@google.com>
+Reported-by: <joonki.min@samsung-slsi.corp-partner.google.com>
+Closes: https://lkml.kernel.org/r/CANP3RGeuRW53vukDy7WDO3FiVgu34-xVJYkfpm08oLO3odYFrA@mail.gmail.com
+Reviewed-by: Andrey Konovalov <andreyknvl@gmail.com>
+Tested-by: Maciej Wieczor-Retman <maciej.wieczor-retman@intel.com>
+Cc: Alexander Potapenko <glider@google.com>
+Cc: Dmitriy Vyukov <dvyukov@google.com>
+Cc: Dmitry Vyukov <dvyukov@google.com>
+Cc: Uladzislau Rezki <urezki@gmail.com>
+Cc: Vincenzo Frascino <vincenzo.frascino@arm.com>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ include/linux/kasan.h | 14 ++++++++++++++
+ mm/kasan/common.c     | 21 +++++++++++++++++++++
+ mm/vmalloc.c          |  7 ++-----
+ 3 files changed, 37 insertions(+), 5 deletions(-)
+
+diff --git a/include/linux/kasan.h b/include/linux/kasan.h
+index 4a54449dbfad..5814bf8298b2 100644
+--- a/include/linux/kasan.h
++++ b/include/linux/kasan.h
+@@ -618,6 +618,17 @@ kasan_unpoison_vmap_areas(struct vm_struct **vms, int nr_vms,
+ 		__kasan_unpoison_vmap_areas(vms, nr_vms, flags);
+ }
+ 
++void __kasan_vrealloc(const void *start, unsigned long old_size,
++		unsigned long new_size);
++
++static __always_inline void kasan_vrealloc(const void *start,
++					unsigned long old_size,
++					unsigned long new_size)
++{
++	if (kasan_enabled())
++		__kasan_vrealloc(start, old_size, new_size);
++}
++
+ #else /* CONFIG_KASAN_VMALLOC */
+ 
+ static inline void kasan_populate_early_vm_area_shadow(void *start,
+@@ -647,6 +658,9 @@ kasan_unpoison_vmap_areas(struct vm_struct **vms, int nr_vms,
+ 			  kasan_vmalloc_flags_t flags)
+ { }
+ 
++static inline void kasan_vrealloc(const void *start, unsigned long old_size,
++				unsigned long new_size) { }
++
+ #endif /* CONFIG_KASAN_VMALLOC */
+ 
+ #if (defined(CONFIG_KASAN_GENERIC) || defined(CONFIG_KASAN_SW_TAGS)) && \
+diff --git a/mm/kasan/common.c b/mm/kasan/common.c
+index c49b8520b364..4d98b6a59c3f 100644
+--- a/mm/kasan/common.c
++++ b/mm/kasan/common.c
+@@ -590,4 +590,25 @@ void __kasan_unpoison_vmap_areas(struct vm_struct **vms, int nr_vms,
+ 			__kasan_unpoison_vmalloc(addr, size, flags | KASAN_VMALLOC_KEEP_TAG);
+ 	}
+ }
++
++void __kasan_vrealloc(const void *addr, unsigned long old_size,
++		unsigned long new_size)
++{
++	if (new_size < old_size) {
++		kasan_poison_last_granule(addr, new_size);
++
++		new_size = round_up(new_size, KASAN_GRANULE_SIZE);
++		old_size = round_up(old_size, KASAN_GRANULE_SIZE);
++		if (new_size < old_size)
++			__kasan_poison_vmalloc(addr + new_size,
++					old_size - new_size);
++	} else if (new_size > old_size) {
++		old_size = round_down(old_size, KASAN_GRANULE_SIZE);
++		__kasan_unpoison_vmalloc(addr + old_size,
++					new_size - old_size,
++					KASAN_VMALLOC_PROT_NORMAL |
++					KASAN_VMALLOC_VM_ALLOC |
++					KASAN_VMALLOC_KEEP_TAG);
++	}
++}
+ #endif
+diff --git a/mm/vmalloc.c b/mm/vmalloc.c
+index 98e3671e9467..26e5ab2edaea 100644
+--- a/mm/vmalloc.c
++++ b/mm/vmalloc.c
+@@ -4109,7 +4109,7 @@ void *vrealloc_noprof(const void *p, size_t size, gfp_t flags)
+ 		if (want_init_on_free() || want_init_on_alloc(flags))
+ 			memset((void *)p + size, 0, old_size - size);
+ 		vm->requested_size = size;
+-		kasan_poison_vmalloc(p + size, old_size - size);
++		kasan_vrealloc(p, old_size, size);
+ 		return (void *)p;
+ 	}
+ 
+@@ -4117,16 +4117,13 @@ void *vrealloc_noprof(const void *p, size_t size, gfp_t flags)
+ 	 * We already have the bytes available in the allocation; use them.
+ 	 */
+ 	if (size <= alloced_size) {
+-		kasan_unpoison_vmalloc(p + old_size, size - old_size,
+-				       KASAN_VMALLOC_PROT_NORMAL |
+-				       KASAN_VMALLOC_VM_ALLOC |
+-				       KASAN_VMALLOC_KEEP_TAG);
+ 		/*
+ 		 * No need to zero memory here, as unused memory will have
+ 		 * already been zeroed at initial allocation time or during
+ 		 * realloc shrink time.
+ 		 */
+ 		vm->requested_size = size;
++		kasan_vrealloc(p, old_size, size);
+ 		return (void *)p;
+ 	}
+ 
+-- 
+2.51.0
+

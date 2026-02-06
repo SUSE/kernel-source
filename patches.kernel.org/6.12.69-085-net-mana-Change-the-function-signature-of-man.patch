@@ -1,0 +1,125 @@
+From: Long Li <longli@microsoft.com>
+Date: Tue, 3 Feb 2026 12:45:23 -0800
+Subject: [PATCH] net: mana: Change the function signature of
+ mana_get_primary_netdev_rcu
+References: bsc#1234429
+Patch-mainline: 6.12.69
+Git-commit: a8445cfec101c42e9d64cdb2dac13973b22c205c
+
+commit a8445cfec101c42e9d64cdb2dac13973b22c205c upstream.
+
+Change mana_get_primary_netdev_rcu() to mana_get_primary_netdev(), and
+return the ndev with refcount held. The caller is responsible for dropping
+the refcount.
+
+Also drop the check for IFF_SLAVE as it is not necessary if the upper
+device is present.
+
+Signed-off-by: Long Li <longli@microsoft.com>
+Link: https://patch.msgid.link/1741821332-9392-1-git-send-email-longli@linuxonhyperv.com
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Fixes: 1df03a4b4414 ("RDMA/mana_ib: Set correct device into ib")
+Cc: stable@kernel.org
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/infiniband/hw/mana/device.c           |  7 +++---
+ drivers/infiniband/hw/mana/mana_ib.h          |  1 +
+ drivers/net/ethernet/microsoft/mana/mana_en.c | 22 ++++++++++++-------
+ include/net/mana/mana.h                       |  4 +++-
+ 4 files changed, 21 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/infiniband/hw/mana/device.c b/drivers/infiniband/hw/mana/device.c
+index 7ac01918ef7c..7a1d5c250965 100644
+--- a/drivers/infiniband/hw/mana/device.c
++++ b/drivers/infiniband/hw/mana/device.c
+@@ -84,10 +84,8 @@ static int mana_ib_probe(struct auxiliary_device *adev,
+ 	dev->ib_dev.num_comp_vectors = mdev->gdma_context->max_num_queues;
+ 	dev->ib_dev.dev.parent = mdev->gdma_context->dev;
+ 
+-	rcu_read_lock(); /* required to get primary netdev */
+-	ndev = mana_get_primary_netdev_rcu(mc, 0);
++	ndev = mana_get_primary_netdev(mc, 0, &dev->dev_tracker);
+ 	if (!ndev) {
+-		rcu_read_unlock();
+ 		ret = -ENODEV;
+ 		ibdev_err(&dev->ib_dev, "Failed to get netdev for IB port 1");
+ 		goto free_ib_device;
+@@ -95,7 +93,8 @@ static int mana_ib_probe(struct auxiliary_device *adev,
+ 	ether_addr_copy(mac_addr, ndev->dev_addr);
+ 	addrconf_addr_eui48((u8 *)&dev->ib_dev.node_guid, ndev->dev_addr);
+ 	ret = ib_device_set_netdev(&dev->ib_dev, ndev, 1);
+-	rcu_read_unlock();
++	/* mana_get_primary_netdev() returns ndev with refcount held */
++	netdev_put(ndev, &dev->dev_tracker);
+ 	if (ret) {
+ 		ibdev_err(&dev->ib_dev, "Failed to set ib netdev, ret %d", ret);
+ 		goto free_ib_device;
+diff --git a/drivers/infiniband/hw/mana/mana_ib.h b/drivers/infiniband/hw/mana/mana_ib.h
+index b53a5b4de908..2638688f2505 100644
+--- a/drivers/infiniband/hw/mana/mana_ib.h
++++ b/drivers/infiniband/hw/mana/mana_ib.h
+@@ -64,6 +64,7 @@ struct mana_ib_dev {
+ 	struct gdma_queue **eqs;
+ 	struct xarray qp_table_wq;
+ 	struct mana_ib_adapter_caps adapter_caps;
++	netdevice_tracker dev_tracker;
+ };
+ 
+ struct mana_ib_wq {
+diff --git a/drivers/net/ethernet/microsoft/mana/mana_en.c b/drivers/net/ethernet/microsoft/mana/mana_en.c
+index 12c22261dd3a..37d4966d16db 100644
+--- a/drivers/net/ethernet/microsoft/mana/mana_en.c
++++ b/drivers/net/ethernet/microsoft/mana/mana_en.c
+@@ -3000,21 +3000,27 @@ void mana_remove(struct gdma_dev *gd, bool suspending)
+ 	kfree(ac);
+ }
+ 
+-struct net_device *mana_get_primary_netdev_rcu(struct mana_context *ac, u32 port_index)
++struct net_device *mana_get_primary_netdev(struct mana_context *ac,
++					   u32 port_index,
++					   netdevice_tracker *tracker)
+ {
+ 	struct net_device *ndev;
+ 
+-	RCU_LOCKDEP_WARN(!rcu_read_lock_held(),
+-			 "Taking primary netdev without holding the RCU read lock");
+ 	if (port_index >= ac->num_ports)
+ 		return NULL;
+ 
+-	/* When mana is used in netvsc, the upper netdevice should be returned. */
+-	if (ac->ports[port_index]->flags & IFF_SLAVE)
+-		ndev = netdev_master_upper_dev_get_rcu(ac->ports[port_index]);
+-	else
++	rcu_read_lock();
++
++	/* If mana is used in netvsc, the upper netdevice should be returned. */
++	ndev = netdev_master_upper_dev_get_rcu(ac->ports[port_index]);
++
++	/* If there is no upper device, use the parent Ethernet device */
++	if (!ndev)
+ 		ndev = ac->ports[port_index];
+ 
++	netdev_hold(ndev, tracker, GFP_ATOMIC);
++	rcu_read_unlock();
++
+ 	return ndev;
+ }
+-EXPORT_SYMBOL_NS(mana_get_primary_netdev_rcu, NET_MANA);
++EXPORT_SYMBOL_NS(mana_get_primary_netdev, NET_MANA);
+diff --git a/include/net/mana/mana.h b/include/net/mana/mana.h
+index f2a5200d8a0f..ac9a4b0bd49b 100644
+--- a/include/net/mana/mana.h
++++ b/include/net/mana/mana.h
+@@ -819,5 +819,7 @@ int mana_cfg_vport(struct mana_port_context *apc, u32 protection_dom_id,
+ 		   u32 doorbell_pg_id);
+ void mana_uncfg_vport(struct mana_port_context *apc);
+ 
+-struct net_device *mana_get_primary_netdev_rcu(struct mana_context *ac, u32 port_index);
++struct net_device *mana_get_primary_netdev(struct mana_context *ac,
++					   u32 port_index,
++					   netdevice_tracker *tracker);
+ #endif /* _MANA_H */
+-- 
+2.51.0
+
