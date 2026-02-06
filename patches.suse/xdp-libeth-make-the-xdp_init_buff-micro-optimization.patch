@@ -1,0 +1,111 @@
+From: Alexander Lobakin <aleksander.lobakin@intel.com>
+Date: Tue, 26 Aug 2025 17:54:55 +0200
+Subject: xdp, libeth: make the xdp_init_buff() micro-optimization generic
+Patch-mainline: v6.18-rc1
+Git-commit: 17d370a70bae277678b6ea82d71ef5892e7aaa97
+References: jsc#PED-14404 jsc#PED-15079
+
+Often times the compilers are not able to expand two consecutive 32-bit
+writes into one 64-bit on the corresponding architectures. This applies
+to xdp_init_buff() called for every received frame (or at least once
+per each 64 frames when the frag size is fixed).
+Move the not-so-pretty hack from libeth_xdp straight to xdp_init_buff(),
+but using a proper union around ::frame_sz and ::flags.
+The optimization is limited to LE architectures due to the structure
+layout.
+
+One simple example from idpf with the XDP series applied (Clang 22-git,
+CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE => -O2):
+
+add/remove: 0/0 grow/shrink: 0/1 up/down: 0/-27 (-27)
+Function                                     old     new   delta
+idpf_vport_splitq_napi_poll                 5076    5049     -27
+
+The perf difference with XDP_DROP is around +0.8-1% which I see as more
+than satisfying.
+
+Suggested-by: Simon Horman <horms@kernel.org>
+Signed-off-by: Alexander Lobakin <aleksander.lobakin@intel.com>
+Tested-by: Ramu R <ramu.r@intel.com>
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/net/libeth/xdp.h |   11 +----------
+ include/net/xdp.h        |   28 +++++++++++++++++++++++++---
+ 2 files changed, 26 insertions(+), 13 deletions(-)
+
+--- a/include/net/libeth/xdp.h
++++ b/include/net/libeth/xdp.h
+@@ -1274,7 +1274,6 @@ bool libeth_xdp_buff_add_frag(struct lib
+  * Internal, use libeth_xdp_process_buff() instead. Initializes XDP buffer
+  * head with the Rx buffer data: data pointer, length, headroom, and
+  * truesize/tailroom. Zeroes the flags.
+- * Uses faster single u64 write instead of per-field access.
+  */
+ static inline void libeth_xdp_prepare_buff(struct libeth_xdp_buff *xdp,
+ 					   const struct libeth_fqe *fqe,
+@@ -1282,17 +1281,9 @@ static inline void libeth_xdp_prepare_bu
+ {
+ 	const struct page *page = __netmem_to_page(fqe->netmem);
+ 
+-#ifdef __LIBETH_WORD_ACCESS
+-	static_assert(offsetofend(typeof(xdp->base), flags) -
+-		      offsetof(typeof(xdp->base), frame_sz) ==
+-		      sizeof(u64));
+-
+-	*(u64 *)&xdp->base.frame_sz = fqe->truesize;
+-#else
+-	xdp_init_buff(&xdp->base, fqe->truesize, xdp->base.rxq);
+-#endif
+ 	xdp_prepare_buff(&xdp->base, page_address(page) + fqe->offset,
+ 			 page->pp->p.offset, len, true);
++	xdp_init_buff(&xdp->base, fqe->truesize, xdp->base.rxq);
+ }
+ 
+ /**
+--- a/include/net/xdp.h
++++ b/include/net/xdp.h
+@@ -85,8 +85,20 @@ struct xdp_buff {
+ 	void *data_hard_start;
+ 	struct xdp_rxq_info *rxq;
+ 	struct xdp_txq_info *txq;
+-	u32 frame_sz; /* frame size to deduce data_hard_end/reserved tailroom*/
+-	u32 flags; /* supported values defined in xdp_buff_flags */
++
++	union {
++		struct {
++			/* frame size to deduce data_hard_end/tailroom */
++			u32 frame_sz;
++			/* supported values defined in xdp_buff_flags */
++			u32 flags;
++		};
++
++#ifdef __LITTLE_ENDIAN
++		/* Used to micro-optimize xdp_init_buff(), don't use directly */
++		u64 frame_sz_flags_init;
++#endif
++	};
+ };
+ 
+ static __always_inline bool xdp_buff_has_frags(const struct xdp_buff *xdp)
+@@ -118,9 +130,19 @@ static __always_inline void xdp_buff_set
+ static __always_inline void
+ xdp_init_buff(struct xdp_buff *xdp, u32 frame_sz, struct xdp_rxq_info *rxq)
+ {
+-	xdp->frame_sz = frame_sz;
+ 	xdp->rxq = rxq;
++
++#ifdef __LITTLE_ENDIAN
++	/*
++	 * Force the compilers to initialize ::flags and assign ::frame_sz with
++	 * one write on 64-bit LE architectures as they're often unable to do
++	 * it themselves.
++	 */
++	xdp->frame_sz_flags_init = frame_sz;
++#else
++	xdp->frame_sz = frame_sz;
+ 	xdp->flags = 0;
++#endif
+ }
+ 
+ static __always_inline void
