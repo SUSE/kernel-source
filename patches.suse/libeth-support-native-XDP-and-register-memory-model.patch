@@ -1,0 +1,114 @@
+From: Alexander Lobakin <aleksander.lobakin@intel.com>
+Date: Thu, 12 Jun 2025 18:02:20 +0200
+Subject: libeth: support native XDP and register memory model
+Patch-mainline: v6.17-rc1
+Git-commit: 35c64b6500ef7308155bf0dc556c646e4d7b0fd3
+References: jsc#PED-14404 jsc#PED-15079
+
+Expand libeth's Page Pool functionality by adding native XDP support.
+This means picking the appropriate headroom and DMA direction.
+Also, register all the created &page_pools as XDP memory models.
+A driver then can call xdp_rxq_info_attach_page_pool() when registering
+its RxQ info.
+
+Signed-off-by: Alexander Lobakin <aleksander.lobakin@intel.com>
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/libeth/rx.c |   20 +++++++++++++++-----
+ include/net/libeth/rx.h                |    6 +++++-
+ 2 files changed, 20 insertions(+), 6 deletions(-)
+
+--- a/drivers/net/ethernet/intel/libeth/rx.c
++++ b/drivers/net/ethernet/intel/libeth/rx.c
+@@ -72,7 +72,7 @@ static u32 libeth_rx_hw_len_truesize(con
+ static bool libeth_rx_page_pool_params(struct libeth_fq *fq,
+ 				       struct page_pool_params *pp)
+ {
+-	pp->offset = LIBETH_SKB_HEADROOM;
++	pp->offset = fq->xdp ? LIBETH_XDP_HEADROOM : LIBETH_SKB_HEADROOM;
+ 	/* HW-writeable / syncable length per one page */
+ 	pp->max_len = LIBETH_RX_PAGE_LEN(pp->offset);
+ 
+@@ -159,11 +159,12 @@ int libeth_rx_fq_create(struct libeth_fq
+ 		.dev		= napi->dev->dev.parent,
+ 		.netdev		= napi->dev,
+ 		.napi		= napi,
+-		.dma_dir	= DMA_FROM_DEVICE,
+ 	};
+ 	struct libeth_fqe *fqes;
+ 	struct page_pool *pool;
+-	bool ret;
++	int ret;
++
++	pp.dma_dir = fq->xdp ? DMA_BIDIRECTIONAL : DMA_FROM_DEVICE;
+ 
+ 	if (!fq->hsplit)
+ 		ret = libeth_rx_page_pool_params(fq, &pp);
+@@ -177,18 +178,26 @@ int libeth_rx_fq_create(struct libeth_fq
+ 		return PTR_ERR(pool);
+ 
+ 	fqes = kvcalloc_node(fq->count, sizeof(*fqes), GFP_KERNEL, fq->nid);
+-	if (!fqes)
++	if (!fqes) {
++		ret = -ENOMEM;
+ 		goto err_buf;
++	}
++
++	ret = xdp_reg_page_pool(pool);
++	if (ret)
++		goto err_mem;
+ 
+ 	fq->fqes = fqes;
+ 	fq->pp = pool;
+ 
+ 	return 0;
+ 
++err_mem:
++	kvfree(fqes);
+ err_buf:
+ 	page_pool_destroy(pool);
+ 
+-	return -ENOMEM;
++	return ret;
+ }
+ EXPORT_SYMBOL_GPL(libeth_rx_fq_create);
+ 
+@@ -198,6 +207,7 @@ EXPORT_SYMBOL_GPL(libeth_rx_fq_create);
+  */
+ void libeth_rx_fq_destroy(struct libeth_fq *fq)
+ {
++	xdp_unreg_page_pool(fq->pp);
+ 	kvfree(fq->fqes);
+ 	page_pool_destroy(fq->pp);
+ }
+--- a/include/net/libeth/rx.h
++++ b/include/net/libeth/rx.h
+@@ -13,8 +13,10 @@
+ 
+ /* Space reserved in front of each frame */
+ #define LIBETH_SKB_HEADROOM	(NET_SKB_PAD + NET_IP_ALIGN)
++#define LIBETH_XDP_HEADROOM	(ALIGN(XDP_PACKET_HEADROOM, NET_SKB_PAD) + \
++				 NET_IP_ALIGN)
+ /* Maximum headroom for worst-case calculations */
+-#define LIBETH_MAX_HEADROOM	LIBETH_SKB_HEADROOM
++#define LIBETH_MAX_HEADROOM	LIBETH_XDP_HEADROOM
+ /* Link layer / L2 overhead: Ethernet, 2 VLAN tags (C + S), FCS */
+ #define LIBETH_RX_LL_LEN	(ETH_HLEN + 2 * VLAN_HLEN + ETH_FCS_LEN)
+ /* Maximum supported L2-L4 header length */
+@@ -66,6 +68,7 @@ enum libeth_fqe_type {
+  * @count: number of descriptors/buffers the queue has
+  * @type: type of the buffers this queue has
+  * @hsplit: flag whether header split is enabled
++ * @xdp: flag indicating whether XDP is enabled
+  * @buf_len: HW-writeable length per each buffer
+  * @nid: ID of the closest NUMA node with memory
+  */
+@@ -81,6 +84,7 @@ struct libeth_fq {
+ 	/* Cold fields */
+ 	enum libeth_fqe_type	type:2;
+ 	bool			hsplit:1;
++	bool			xdp:1;
+ 
+ 	u32			buf_len;
+ 	int			nid;
