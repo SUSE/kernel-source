@@ -1,0 +1,470 @@
+From: Arkadiusz Kubalewski <arkadiusz.kubalewski@intel.com>
+Date: Thu, 12 Jun 2025 17:28:35 +0200
+Subject: ice: add phase offset monitor for all PPS dpll inputs
+Patch-mainline: v6.17-rc1
+Git-commit: 863c7e5059363a37dba19df78a37fb0960b331fa
+References: jsc#PED-14404 jsc#PED-15079
+
+Implement a new admin command and helper function to handle and obtain
+CGU measurements for input pins.
+
+Add new callback operations to control the dpll device-level feature
+"phase offset monitor," allowing it to be enabled or disabled. If the
+feature is enabled, provide users with measured phase offsets and
+notifications.
+
+Initialize PPS DPLL with new callback operations if the feature is
+supported by the firmware.
+
+Reviewed-by: Milena Olech <milena.olech@intel.com>
+Signed-off-by: Arkadiusz Kubalewski <arkadiusz.kubalewski@intel.com>
+Acked-by: Vadim Fedorenko <vadim.fedorenko@linux.dev>
+Link: https://patch.msgid.link/20250612152835.1703397-4-arkadiusz.kubalewski@intel.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/ice/ice_adminq_cmd.h |   20 ++
+ drivers/net/ethernet/intel/ice/ice_common.c     |   26 +++
+ drivers/net/ethernet/intel/ice/ice_common.h     |    3 
+ drivers/net/ethernet/intel/ice/ice_dpll.c       |  193 +++++++++++++++++++++++-
+ drivers/net/ethernet/intel/ice/ice_dpll.h       |    8 
+ drivers/net/ethernet/intel/ice/ice_main.c       |    4 
+ 6 files changed, 252 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/ethernet/intel/ice/ice_adminq_cmd.h
++++ b/drivers/net/ethernet/intel/ice/ice_adminq_cmd.h
+@@ -2272,6 +2272,22 @@ struct ice_aqc_get_pkg_info_resp {
+ 	struct ice_aqc_get_pkg_info pkg_info[];
+ };
+ 
++#define ICE_CGU_INPUT_PHASE_OFFSET_BYTES	6
++
++struct ice_cgu_input_measure {
++	u8 phase_offset[ICE_CGU_INPUT_PHASE_OFFSET_BYTES];
++	__le32 freq;
++} __packed __aligned(sizeof(__le16));
++
++#define ICE_AQC_GET_CGU_IN_MEAS_DPLL_IDX_M	ICE_M(0xf, 0)
++
++/* Get CGU input measure command response data structure (indirect 0x0C59) */
++struct ice_aqc_get_cgu_input_measure {
++	u8 dpll_idx_opt;
++	u8 length;
++	u8 rsvd[6];
++};
++
+ #define ICE_AQC_GET_CGU_MAX_PHASE_ADJ	GENMASK(30, 0)
+ 
+ /* Get CGU abilities command response data structure (indirect 0x0C61) */
+@@ -2721,6 +2737,7 @@ struct ice_aq_desc {
+ 		struct ice_aqc_add_get_update_free_vsi vsi_cmd;
+ 		struct ice_aqc_add_update_free_vsi_resp add_update_free_vsi_res;
+ 		struct ice_aqc_download_pkg download_pkg;
++		struct ice_aqc_get_cgu_input_measure get_cgu_input_measure;
+ 		struct ice_aqc_set_cgu_input_config set_cgu_input_config;
+ 		struct ice_aqc_get_cgu_input_config get_cgu_input_config;
+ 		struct ice_aqc_set_cgu_output_config set_cgu_output_config;
+@@ -2772,6 +2789,8 @@ enum ice_aq_err {
+ 	ICE_AQ_RC_OK		= 0,  /* Success */
+ 	ICE_AQ_RC_EPERM		= 1,  /* Operation not permitted */
+ 	ICE_AQ_RC_ENOENT	= 2,  /* No such element */
++	ICE_AQ_RC_ESRCH		= 3,  /* Bad opcode */
++	ICE_AQ_RC_EAGAIN	= 8,  /* Try again */
+ 	ICE_AQ_RC_ENOMEM	= 9,  /* Out of memory */
+ 	ICE_AQ_RC_EBUSY		= 12, /* Device or resource busy */
+ 	ICE_AQ_RC_EEXIST	= 13, /* Object already exists */
+@@ -2927,6 +2946,7 @@ enum ice_adminq_opc {
+ 	ice_aqc_opc_get_pkg_info_list			= 0x0C43,
+ 
+ 	/* 1588/SyncE commands/events */
++	ice_aqc_opc_get_cgu_input_measure		= 0x0C59,
+ 	ice_aqc_opc_get_cgu_abilities			= 0x0C61,
+ 	ice_aqc_opc_set_cgu_input_config		= 0x0C62,
+ 	ice_aqc_opc_get_cgu_input_config		= 0x0C63,
+--- a/drivers/net/ethernet/intel/ice/ice_common.c
++++ b/drivers/net/ethernet/intel/ice/ice_common.c
+@@ -4971,6 +4971,32 @@ ice_dis_vsi_rdma_qset(struct ice_port_in
+ }
+ 
+ /**
++ * ice_aq_get_cgu_input_pin_measure - get input pin signal measurements
++ * @hw: pointer to the HW struct
++ * @dpll_idx: index of dpll to be measured
++ * @meas: array to be filled with results
++ * @meas_num: max number of results array can hold
++ *
++ * Get CGU measurements (0x0C59) of phase and frequency offsets for input
++ * pins on given dpll.
++ *
++ * Return: 0 on success or negative value on failure.
++ */
++int ice_aq_get_cgu_input_pin_measure(struct ice_hw *hw, u8 dpll_idx,
++				     struct ice_cgu_input_measure *meas,
++				     u16 meas_num)
++{
++	struct ice_aqc_get_cgu_input_measure *cmd;
++	struct ice_aq_desc desc;
++
++	ice_fill_dflt_direct_cmd_desc(&desc, ice_aqc_opc_get_cgu_input_measure);
++	cmd = &desc.params.get_cgu_input_measure;
++	cmd->dpll_idx_opt = dpll_idx & ICE_AQC_GET_CGU_IN_MEAS_DPLL_IDX_M;
++
++	return ice_aq_send_cmd(hw, &desc, meas, meas_num * sizeof(*meas), NULL);
++}
++
++/**
+  * ice_aq_get_cgu_abilities - get cgu abilities
+  * @hw: pointer to the HW struct
+  * @abilities: CGU abilities
+--- a/drivers/net/ethernet/intel/ice/ice_common.h
++++ b/drivers/net/ethernet/intel/ice/ice_common.h
+@@ -229,6 +229,9 @@ void ice_replay_post(struct ice_hw *hw);
+ struct ice_q_ctx *
+ ice_get_lan_q_ctx(struct ice_hw *hw, u16 vsi_handle, u8 tc, u16 q_handle);
+ int ice_sbq_rw_reg(struct ice_hw *hw, struct ice_sbq_msg_input *in, u16 flag);
++int ice_aq_get_cgu_input_pin_measure(struct ice_hw *hw, u8 dpll_idx,
++				     struct ice_cgu_input_measure *meas,
++				     u16 meas_num);
+ int
+ ice_aq_get_cgu_abilities(struct ice_hw *hw,
+ 			 struct ice_aqc_get_cgu_abilities *abilities);
+--- a/drivers/net/ethernet/intel/ice/ice_dpll.c
++++ b/drivers/net/ethernet/intel/ice/ice_dpll.c
+@@ -12,6 +12,8 @@
+ #define ICE_DPLL_PIN_ESYNC_PULSE_HIGH_PERCENT	25
+ #define ICE_DPLL_PIN_GEN_RCLK_FREQ		1953125
+ #define ICE_DPLL_PIN_PRIO_OUTPUT		0xff
++#define ICE_DPLL_INPUT_REF_NUM			10
++#define ICE_DPLL_PHASE_OFFSET_PERIOD		2
+ #define ICE_DPLL_SW_PIN_INPUT_BASE_SFP		4
+ #define ICE_DPLL_SW_PIN_INPUT_BASE_QSFP		6
+ #define ICE_DPLL_SW_PIN_OUTPUT_BASE		0
+@@ -793,6 +795,67 @@ static int ice_dpll_mode_get(const struc
+ }
+ 
+ /**
++ * ice_dpll_phase_offset_monitor_set - set phase offset monitor state
++ * @dpll: registered dpll pointer
++ * @dpll_priv: private data pointer passed on dpll registration
++ * @state: feature state to be set
++ * @extack: error reporting
++ *
++ * Dpll subsystem callback. Enable/disable phase offset monitor feature of dpll.
++ *
++ * Context: Acquires and releases pf->dplls.lock
++ * Return: 0 - success
++ */
++static int ice_dpll_phase_offset_monitor_set(const struct dpll_device *dpll,
++					     void *dpll_priv,
++					     enum dpll_feature_state state,
++					     struct netlink_ext_ack *extack)
++{
++	struct ice_dpll *d = dpll_priv;
++	struct ice_pf *pf = d->pf;
++
++	mutex_lock(&pf->dplls.lock);
++	if (state == DPLL_FEATURE_STATE_ENABLE)
++		d->phase_offset_monitor_period = ICE_DPLL_PHASE_OFFSET_PERIOD;
++	else
++		d->phase_offset_monitor_period = 0;
++	mutex_unlock(&pf->dplls.lock);
++
++	return 0;
++}
++
++/**
++ * ice_dpll_phase_offset_monitor_get - get phase offset monitor state
++ * @dpll: registered dpll pointer
++ * @dpll_priv: private data pointer passed on dpll registration
++ * @state: on success holds current state of phase offset monitor
++ * @extack: error reporting
++ *
++ * Dpll subsystem callback. Provides current state of phase offset monitor
++ * features on dpll device.
++ *
++ * Context: Acquires and releases pf->dplls.lock
++ * Return: 0 - success
++ */
++static int ice_dpll_phase_offset_monitor_get(const struct dpll_device *dpll,
++					     void *dpll_priv,
++					     enum dpll_feature_state *state,
++					     struct netlink_ext_ack *extack)
++{
++	struct ice_dpll *d = dpll_priv;
++	struct ice_pf *pf = d->pf;
++
++	mutex_lock(&pf->dplls.lock);
++	if (d->phase_offset_monitor_period)
++		*state = DPLL_FEATURE_STATE_ENABLE;
++	else
++		*state = DPLL_FEATURE_STATE_DISABLE;
++	mutex_unlock(&pf->dplls.lock);
++
++	return 0;
++}
++
++/**
+  * ice_dpll_pin_state_set - set pin's state on dpll
+  * @pin: pointer to a pin
+  * @pin_priv: private data pointer passed on pin registration
+@@ -1757,6 +1820,8 @@ ice_dpll_phase_offset_get(const struct d
+ 	if (d->active_input == pin || (p->input &&
+ 				       d->active_input == p->input->pin))
+ 		*phase_offset = d->phase_offset * ICE_DPLL_PHASE_OFFSET_FACTOR;
++	else if (d->phase_offset_monitor_period)
++		*phase_offset = p->phase_offset * ICE_DPLL_PHASE_OFFSET_FACTOR;
+ 	else
+ 		*phase_offset = 0;
+ 	mutex_unlock(&pf->dplls.lock);
+@@ -2216,6 +2281,13 @@ static const struct dpll_device_ops ice_
+ 	.mode_get = ice_dpll_mode_get,
+ };
+ 
++static const struct dpll_device_ops ice_dpll_pom_ops = {
++	.lock_status_get = ice_dpll_lock_status_get,
++	.mode_get = ice_dpll_mode_get,
++	.phase_offset_monitor_set = ice_dpll_phase_offset_monitor_set,
++	.phase_offset_monitor_get = ice_dpll_phase_offset_monitor_get,
++};
++
+ /**
+  * ice_generate_clock_id - generates unique clock_id for registering dpll.
+  * @pf: board private structure
+@@ -2261,6 +2333,110 @@ static void ice_dpll_notify_changes(stru
+ }
+ 
+ /**
++ * ice_dpll_is_pps_phase_monitor - check if dpll capable of phase offset monitor
++ * @pf: pf private structure
++ *
++ * Check if firmware is capable of supporting admin command to provide
++ * phase offset monitoring on all the input pins on PPS dpll.
++ *
++ * Returns:
++ * * true - PPS dpll phase offset monitoring is supported
++ * * false - PPS dpll phase offset monitoring is not supported
++ */
++static bool ice_dpll_is_pps_phase_monitor(struct ice_pf *pf)
++{
++	struct ice_cgu_input_measure meas[ICE_DPLL_INPUT_REF_NUM];
++	int ret = ice_aq_get_cgu_input_pin_measure(&pf->hw, DPLL_TYPE_PPS, meas,
++						   ARRAY_SIZE(meas));
++
++	if (ret && pf->hw.adminq.sq_last_status == ICE_AQ_RC_ESRCH)
++		return false;
++
++	return true;
++}
++
++/**
++ * ice_dpll_pins_notify_mask - notify dpll subsystem about bulk pin changes
++ * @pins: array of ice_dpll_pin pointers registered within dpll subsystem
++ * @pin_num: number of pins
++ * @phase_offset_ntf_mask: bitmask of pin indexes to notify
++ *
++ * Iterate over array of pins and call dpll subsystem pin notify if
++ * corresponding pin index within bitmask is set.
++ *
++ * Context: Must be called while pf->dplls.lock is released.
++ */
++static void ice_dpll_pins_notify_mask(struct ice_dpll_pin *pins,
++				      u8 pin_num,
++				      u32 phase_offset_ntf_mask)
++{
++	int i = 0;
++
++	for (i = 0; i < pin_num; i++)
++		if (phase_offset_ntf_mask & (1 << i))
++			dpll_pin_change_ntf(pins[i].pin);
++}
++
++/**
++ * ice_dpll_pps_update_phase_offsets - update phase offset measurements
++ * @pf: pf private structure
++ * @phase_offset_pins_updated: returns mask of updated input pin indexes
++ *
++ * Read phase offset measurements for PPS dpll device and store values in
++ * input pins array. On success phase_offset_pins_updated - fills bitmask of
++ * updated input pin indexes, pins shall be notified.
++ *
++ * Context: Shall be called with pf->dplls.lock being locked.
++ * Returns:
++ * * 0 - success or no data available
++ * * negative - AQ failure
++ */
++static int ice_dpll_pps_update_phase_offsets(struct ice_pf *pf,
++					     u32 *phase_offset_pins_updated)
++{
++	struct ice_cgu_input_measure meas[ICE_DPLL_INPUT_REF_NUM];
++	struct ice_dpll_pin *p;
++	s64 phase_offset, tmp;
++	int i, j, ret;
++
++	*phase_offset_pins_updated = 0;
++	ret = ice_aq_get_cgu_input_pin_measure(&pf->hw, DPLL_TYPE_PPS, meas,
++					       ARRAY_SIZE(meas));
++	if (ret && pf->hw.adminq.sq_last_status == ICE_AQ_RC_EAGAIN) {
++		return 0;
++	} else if (ret) {
++		dev_err(ice_pf_to_dev(pf),
++			"failed to get input pin measurements dpll=%d, ret=%d %s\n",
++			DPLL_TYPE_PPS, ret,
++			ice_aq_str(pf->hw.adminq.sq_last_status));
++		return ret;
++	}
++	for (i = 0; i < pf->dplls.num_inputs; i++) {
++		p = &pf->dplls.inputs[i];
++		phase_offset = 0;
++		for (j = 0; j < ICE_CGU_INPUT_PHASE_OFFSET_BYTES; j++) {
++			tmp = meas[i].phase_offset[j];
++#ifdef __LITTLE_ENDIAN
++			phase_offset += tmp << 8 * j;
++#else
++			phase_offset += tmp << 8 *
++				(ICE_CGU_INPUT_PHASE_OFFSET_BYTES - 1 - j);
++#endif
++		}
++		phase_offset = sign_extend64(phase_offset, 47);
++		if (p->phase_offset != phase_offset) {
++			dev_dbg(ice_pf_to_dev(pf),
++				"phase offset changed for pin:%d old:%llx, new:%llx\n",
++				p->idx, p->phase_offset, phase_offset);
++			p->phase_offset = phase_offset;
++			*phase_offset_pins_updated |= (1 << i);
++		}
++	}
++
++	return 0;
++}
++
++/**
+  * ice_dpll_update_state - update dpll state
+  * @pf: pf private structure
+  * @d: pointer to queried dpll device
+@@ -2346,14 +2522,19 @@ static void ice_dpll_periodic_work(struc
+ 	struct ice_pf *pf = container_of(d, struct ice_pf, dplls);
+ 	struct ice_dpll *de = &pf->dplls.eec;
+ 	struct ice_dpll *dp = &pf->dplls.pps;
++	u32 phase_offset_ntf = 0;
+ 	int ret = 0;
+ 
+ 	if (ice_is_reset_in_progress(pf->state))
+ 		goto resched;
+ 	mutex_lock(&pf->dplls.lock);
++	d->periodic_counter++;
+ 	ret = ice_dpll_update_state(pf, de, false);
+ 	if (!ret)
+ 		ret = ice_dpll_update_state(pf, dp, false);
++	if (!ret && dp->phase_offset_monitor_period &&
++	    d->periodic_counter % dp->phase_offset_monitor_period == 0)
++		ret = ice_dpll_pps_update_phase_offsets(pf, &phase_offset_ntf);
+ 	if (ret) {
+ 		d->cgu_state_acq_err_num++;
+ 		/* stop rescheduling this worker */
+@@ -2368,6 +2549,9 @@ static void ice_dpll_periodic_work(struc
+ 	mutex_unlock(&pf->dplls.lock);
+ 	ice_dpll_notify_changes(de);
+ 	ice_dpll_notify_changes(dp);
++	if (phase_offset_ntf)
++		ice_dpll_pins_notify_mask(d->inputs, d->num_inputs,
++					  phase_offset_ntf);
+ 
+ resched:
+ 	/* Run twice a second or reschedule if update failed */
+@@ -2782,7 +2966,7 @@ static void
+ ice_dpll_deinit_dpll(struct ice_pf *pf, struct ice_dpll *d, bool cgu)
+ {
+ 	if (cgu)
+-		dpll_device_unregister(d->dpll, &ice_dpll_ops, d);
++		dpll_device_unregister(d->dpll, d->ops, d);
+ 	dpll_device_put(d->dpll);
+ }
+ 
+@@ -2816,12 +3000,17 @@ ice_dpll_init_dpll(struct ice_pf *pf, st
+ 	}
+ 	d->pf = pf;
+ 	if (cgu) {
++		const struct dpll_device_ops *ops = &ice_dpll_ops;
++
++		if (type == DPLL_TYPE_PPS && ice_dpll_is_pps_phase_monitor(pf))
++			ops =  &ice_dpll_pom_ops;
+ 		ice_dpll_update_state(pf, d, true);
+-		ret = dpll_device_register(d->dpll, type, &ice_dpll_ops, d);
++		ret = dpll_device_register(d->dpll, type, ops, d);
+ 		if (ret) {
+ 			dpll_device_put(d->dpll);
+ 			return ret;
+ 		}
++		d->ops = ops;
+ 	}
+ 
+ 	return 0;
+--- a/drivers/net/ethernet/intel/ice/ice_dpll.h
++++ b/drivers/net/ethernet/intel/ice/ice_dpll.h
+@@ -31,6 +31,7 @@ enum ice_dpll_pin_sw {
+  * @prop: pin properties
+  * @freq: current frequency of a pin
+  * @phase_adjust: current phase adjust value
++ * @phase_offset: monitored phase offset value
+  */
+ struct ice_dpll_pin {
+ 	struct dpll_pin *pin;
+@@ -46,6 +47,7 @@ struct ice_dpll_pin {
+ 	struct ice_dpll_pin *input;
+ 	struct ice_dpll_pin *output;
+ 	enum dpll_pin_direction direction;
++	s64 phase_offset;
+ 	u8 status;
+ 	bool active;
+ 	bool hidden;
+@@ -64,8 +66,10 @@ struct ice_dpll_pin {
+  * @input_prio: priorities of each input
+  * @dpll_state: current dpll sync state
+  * @prev_dpll_state: last dpll sync state
++ * @phase_offset_monitor_period: period for phase offset monitor read frequency
+  * @active_input: pointer to active input pin
+  * @prev_input: pointer to previous active input pin
++ * @ops: holds the registered ops
+  */
+ struct ice_dpll {
+ 	struct dpll_device *dpll;
+@@ -81,8 +85,10 @@ struct ice_dpll {
+ 	enum dpll_lock_status dpll_state;
+ 	enum dpll_lock_status prev_dpll_state;
+ 	enum dpll_mode mode;
++	u32 phase_offset_monitor_period;
+ 	struct dpll_pin *active_input;
+ 	struct dpll_pin *prev_input;
++	const struct dpll_device_ops *ops;
+ };
+ 
+ /** ice_dplls - store info required for CCU (clock controlling unit)
+@@ -101,6 +107,7 @@ struct ice_dpll {
+  * @clock_id: clock_id of dplls
+  * @input_phase_adj_max: max phase adjust value for an input pins
+  * @output_phase_adj_max: max phase adjust value for an output pins
++ * @periodic_counter: counter of periodic work executions
+  */
+ struct ice_dplls {
+ 	struct kthread_worker *kworker;
+@@ -121,6 +128,7 @@ struct ice_dplls {
+ 	u64 clock_id;
+ 	s32 input_phase_adj_max;
+ 	s32 output_phase_adj_max;
++	u32 periodic_counter;
+ 	bool generic;
+ };
+ 
+--- a/drivers/net/ethernet/intel/ice/ice_main.c
++++ b/drivers/net/ethernet/intel/ice/ice_main.c
+@@ -7977,6 +7977,10 @@ const char *ice_aq_str(enum ice_aq_err a
+ 		return "ICE_AQ_RC_EPERM";
+ 	case ICE_AQ_RC_ENOENT:
+ 		return "ICE_AQ_RC_ENOENT";
++	case ICE_AQ_RC_ESRCH:
++		return "ICE_AQ_RC_ESRCH";
++	case ICE_AQ_RC_EAGAIN:
++		return "ICE_AQ_RC_EAGAIN";
+ 	case ICE_AQ_RC_ENOMEM:
+ 		return "ICE_AQ_RC_ENOMEM";
+ 	case ICE_AQ_RC_EBUSY:
