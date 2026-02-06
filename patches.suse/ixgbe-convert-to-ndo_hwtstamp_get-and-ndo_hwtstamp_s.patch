@@ -1,0 +1,158 @@
+From: Vladimir Oltean <vladimir.oltean@nxp.com>
+Date: Tue, 13 May 2025 13:11:31 +0300
+Subject: ixgbe: convert to ndo_hwtstamp_get() and ndo_hwtstamp_set()
+Patch-mainline: v6.17-rc1
+Git-commit: 8f3f4995e8ca0716b8ff352baa754e0b24ed2810
+References: jsc#PED-14409 jsc#PED-15061 jsc#PED-14407
+
+New timestamping API was introduced in commit 66f7223039c0 ("net: add
+NDOs for configuring hardware timestamping") from kernel v6.6.
+
+It is time to convert the Intel ixgbe driver to the new API, so that
+timestamping configuration can be removed from the ndo_eth_ioctl() path
+completely.
+
+Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Reviewed-by: Vadim Fedorenko <vadim.fedorenko@linux.dev>
+Reviewed-by: Milena Olech <milena.olech@intel.com>
+Tested-by: Rinitha S <sx.rinitha@intel.com> (A Contingent worker at Intel)
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/ixgbe/ixgbe.h      |    9 +++--
+ drivers/net/ethernet/intel/ixgbe/ixgbe_main.c |    6 +--
+ drivers/net/ethernet/intel/ixgbe/ixgbe_ptp.c  |   42 +++++++++++++-------------
+ 3 files changed, 29 insertions(+), 28 deletions(-)
+
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe.h
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe.h
+@@ -786,7 +786,7 @@ struct ixgbe_adapter {
+ 	struct ptp_clock_info ptp_caps;
+ 	struct work_struct ptp_tx_work;
+ 	struct sk_buff *ptp_tx_skb;
+-	struct hwtstamp_config tstamp_config;
++	struct kernel_hwtstamp_config tstamp_config;
+ 	unsigned long ptp_tx_start;
+ 	unsigned long last_overflow_check;
+ 	unsigned long last_rx_ptp_check;
+@@ -1081,8 +1081,11 @@ static inline void ixgbe_ptp_rx_hwtstamp
+ 	rx_ring->last_rx_timestamp = jiffies;
+ }
+ 
+-int ixgbe_ptp_set_ts_config(struct ixgbe_adapter *adapter, struct ifreq *ifr);
+-int ixgbe_ptp_get_ts_config(struct ixgbe_adapter *adapter, struct ifreq *ifr);
++int ixgbe_ptp_hwtstamp_get(struct net_device *netdev,
++			   struct kernel_hwtstamp_config *config);
++int ixgbe_ptp_hwtstamp_set(struct net_device *netdev,
++			   struct kernel_hwtstamp_config *config,
++			   struct netlink_ext_ack *extack);
+ void ixgbe_ptp_start_cyclecounter(struct ixgbe_adapter *adapter);
+ void ixgbe_ptp_reset(struct ixgbe_adapter *adapter);
+ void ixgbe_ptp_check_pps_event(struct ixgbe_adapter *adapter);
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@ -9440,10 +9440,6 @@ static int ixgbe_ioctl(struct net_device
+ 	struct ixgbe_adapter *adapter = ixgbe_from_netdev(netdev);
+ 
+ 	switch (cmd) {
+-	case SIOCSHWTSTAMP:
+-		return ixgbe_ptp_set_ts_config(adapter, req);
+-	case SIOCGHWTSTAMP:
+-		return ixgbe_ptp_get_ts_config(adapter, req);
+ 	case SIOCGMIIPHY:
+ 		if (!adapter->hw.phy.ops.read_reg)
+ 			return -EOPNOTSUPP;
+@@ -10907,6 +10903,8 @@ static const struct net_device_ops ixgbe
+ 	.ndo_bpf		= ixgbe_xdp,
+ 	.ndo_xdp_xmit		= ixgbe_xdp_xmit,
+ 	.ndo_xsk_wakeup         = ixgbe_xsk_wakeup,
++	.ndo_hwtstamp_get	= ixgbe_ptp_hwtstamp_get,
++	.ndo_hwtstamp_set	= ixgbe_ptp_hwtstamp_set,
+ };
+ 
+ static void ixgbe_disable_txr_hw(struct ixgbe_adapter *adapter,
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_ptp.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_ptp.c
+@@ -936,20 +936,22 @@ void ixgbe_ptp_rx_rgtstamp(struct ixgbe_
+ }
+ 
+ /**
+- * ixgbe_ptp_get_ts_config - get current hardware timestamping configuration
+- * @adapter: pointer to adapter structure
+- * @ifr: ioctl data
++ * ixgbe_ptp_hwtstamp_get - get current hardware timestamping configuration
++ * @netdev: pointer to net device structure
++ * @config: timestamping configuration structure
+  *
+  * This function returns the current timestamping settings. Rather than
+  * attempt to deconstruct registers to fill in the values, simply keep a copy
+  * of the old settings around, and return a copy when requested.
+  */
+-int ixgbe_ptp_get_ts_config(struct ixgbe_adapter *adapter, struct ifreq *ifr)
++int ixgbe_ptp_hwtstamp_get(struct net_device *netdev,
++			   struct kernel_hwtstamp_config *config)
+ {
+-	struct hwtstamp_config *config = &adapter->tstamp_config;
++	struct ixgbe_adapter *adapter = ixgbe_from_netdev(netdev);
+ 
+-	return copy_to_user(ifr->ifr_data, config,
+-			    sizeof(*config)) ? -EFAULT : 0;
++	*config = adapter->tstamp_config;
++
++	return 0;
+ }
+ 
+ /**
+@@ -978,7 +980,7 @@ int ixgbe_ptp_get_ts_config(struct ixgbe
+  * mode, if required to support the specifically requested mode.
+  */
+ static int ixgbe_ptp_set_timestamp_mode(struct ixgbe_adapter *adapter,
+-				 struct hwtstamp_config *config)
++					struct kernel_hwtstamp_config *config)
+ {
+ 	struct ixgbe_hw *hw = &adapter->hw;
+ 	u32 tsync_tx_ctl = IXGBE_TSYNCTXCTL_ENABLED;
+@@ -1129,31 +1131,29 @@ static int ixgbe_ptp_set_timestamp_mode(
+ }
+ 
+ /**
+- * ixgbe_ptp_set_ts_config - user entry point for timestamp mode
+- * @adapter: pointer to adapter struct
+- * @ifr: ioctl data
++ * ixgbe_ptp_hwtstamp_set - user entry point for timestamp mode
++ * @netdev: pointer to net device structure
++ * @config: timestamping configuration structure
++ * @extack: netlink extended ack structure for error reporting
+  *
+  * Set hardware to requested mode. If unsupported, return an error with no
+  * changes. Otherwise, store the mode for future reference.
+  */
+-int ixgbe_ptp_set_ts_config(struct ixgbe_adapter *adapter, struct ifreq *ifr)
++int ixgbe_ptp_hwtstamp_set(struct net_device *netdev,
++			   struct kernel_hwtstamp_config *config,
++			   struct netlink_ext_ack *extack)
+ {
+-	struct hwtstamp_config config;
++	struct ixgbe_adapter *adapter = ixgbe_from_netdev(netdev);
+ 	int err;
+ 
+-	if (copy_from_user(&config, ifr->ifr_data, sizeof(config)))
+-		return -EFAULT;
+-
+-	err = ixgbe_ptp_set_timestamp_mode(adapter, &config);
++	err = ixgbe_ptp_set_timestamp_mode(adapter, config);
+ 	if (err)
+ 		return err;
+ 
+ 	/* save these settings for future reference */
+-	memcpy(&adapter->tstamp_config, &config,
+-	       sizeof(adapter->tstamp_config));
++	adapter->tstamp_config = *config;
+ 
+-	return copy_to_user(ifr->ifr_data, &config, sizeof(config)) ?
+-		-EFAULT : 0;
++	return 0;
+ }
+ 
+ static void ixgbe_ptp_link_speed_adjust(struct ixgbe_adapter *adapter,
