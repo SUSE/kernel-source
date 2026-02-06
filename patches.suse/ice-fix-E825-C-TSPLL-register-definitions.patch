@@ -1,0 +1,139 @@
+From: Jacob Keller <jacob.e.keller@intel.com>
+Date: Thu, 1 May 2025 15:54:14 -0700
+Subject: ice: fix E825-C TSPLL register definitions
+Patch-mainline: v6.17-rc1
+Git-commit: bf12bc439407e27f4dcfbbb40edec6278e1ad13a
+References: jsc#PED-14404 jsc#PED-15079
+
+The E825-C hardware has a slightly different register layout for register
+19 of the Clock Generation Unit and TSPLL. The fbdiv_intgr value can be 10
+bits wide.
+
+Additionally, most of the fields that were in register 24 are made
+available in register 23 instead. The programming logic already has a
+corrected definition for register 23, but it incorrectly still used the
+8-bit definition of fbdiv_intgr. This results in truncating some of the
+values of fbdiv_intgr, including the value used for the 156.25MHz signal.
+
+The driver only used register 24 to obtain the enable status, which we
+should read from register 23. This results in an incorrect output for the
+log messages, but does not change any functionality besides
+disabled-by-default dynamic debug messages.
+
+Fix the register definitions, and adjust the code to properly reflect the
+enable/disable status in the log messages.
+
+Co-developed-by: Karol Kolacinski <karol.kolacinski@intel.com>
+Signed-off-by: Karol Kolacinski <karol.kolacinski@intel.com>
+Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+Tested-by: Rinitha S <sx.rinitha@intel.com> (A Contingent worker at Intel)
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/ice/ice_common.h |   17 ++++++++++++++++-
+ drivers/net/ethernet/intel/ice/ice_tspll.c  |   17 +++++++----------
+ 2 files changed, 23 insertions(+), 11 deletions(-)
+
+--- a/drivers/net/ethernet/intel/ice/ice_common.h
++++ b/drivers/net/ethernet/intel/ice/ice_common.h
+@@ -74,7 +74,7 @@ union ice_cgu_r16 {
+ };
+ 
+ #define ICE_CGU_R19 0x4c
+-union ice_cgu_r19 {
++union ice_cgu_r19_e82x {
+ 	struct {
+ 		u32 fbdiv_intgr : 8;
+ 		u32 fdpll_ulck_thr : 5;
+@@ -87,6 +87,21 @@ union ice_cgu_r19 {
+ 		u32 misc27 : 1;
+ 	};
+ 	u32 val;
++};
++
++union ice_cgu_r19_e825 {
++	struct {
++		u32 tspll_fbdiv_intgr : 10;
++		u32 fdpll_ulck_thr : 5;
++		u32 misc15 : 1;
++		u32 tspll_ndivratio : 4;
++		u32 tspll_iref_ndivratio : 3;
++		u32 misc19 : 1;
++		u32 japll_ndivratio : 4;
++		u32 japll_postdiv_pdivratio : 3;
++		u32 misc27 : 1;
++	};
++	u32 val;
+ };
+ 
+ #define ICE_CGU_R22 0x58
+--- a/drivers/net/ethernet/intel/ice/ice_tspll.c
++++ b/drivers/net/ethernet/intel/ice/ice_tspll.c
+@@ -230,7 +230,7 @@ static int ice_tspll_cfg_e82x(struct ice
+ 			      enum ice_clk_src clk_src)
+ {
+ 	union tspll_ro_bwm_lf bwm_lf;
+-	union ice_cgu_r19 dw19;
++	union ice_cgu_r19_e82x dw19;
+ 	union ice_cgu_r22 dw22;
+ 	union ice_cgu_r24 dw24;
+ 	union ice_cgu_r9 dw9;
+@@ -398,9 +398,9 @@ static int ice_tspll_cfg_e825c(struct ic
+ 			       enum ice_clk_src clk_src)
+ {
+ 	union tspll_ro_lock_e825c ro_lock;
++	union ice_cgu_r19_e825 dw19;
+ 	union ice_cgu_r16 dw16;
+ 	union ice_cgu_r23 dw23;
+-	union ice_cgu_r19 dw19;
+ 	union ice_cgu_r22 dw22;
+ 	union ice_cgu_r24 dw24;
+ 	union ice_cgu_r9 dw9;
+@@ -428,10 +428,6 @@ static int ice_tspll_cfg_e825c(struct ic
+ 	if (err)
+ 		return err;
+ 
+-	err = ice_read_cgu_reg(hw, ICE_CGU_R24, &dw24.val);
+-	if (err)
+-		return err;
+-
+ 	err = ice_read_cgu_reg(hw, ICE_CGU_R16, &dw16.val);
+ 	if (err)
+ 		return err;
+@@ -446,7 +442,7 @@ static int ice_tspll_cfg_e825c(struct ic
+ 
+ 	/* Log the current clock configuration */
+ 	ice_debug(hw, ICE_DBG_PTP, "Current TSPLL configuration -- %s, clk_src %s, clk_freq %s, PLL %s\n",
+-		  str_enabled_disabled(dw24.ts_pll_enable),
++		  str_enabled_disabled(dw23.ts_pll_enable),
+ 		  ice_tspll_clk_src_str(dw23.time_ref_sel),
+ 		  ice_tspll_clk_freq_str(dw9.time_ref_freq_sel),
+ 		  ro_lock.plllock_true_lock_cri ? "locked" : "unlocked");
+@@ -486,8 +482,8 @@ static int ice_tspll_cfg_e825c(struct ic
+ 	if (err)
+ 		return err;
+ 
+-	dw19.fbdiv_intgr = e825c_tspll_params[clk_freq].fbdiv_intgr;
+-	dw19.ndivratio = e825c_tspll_params[clk_freq].ndivratio;
++	dw19.tspll_fbdiv_intgr = e825c_tspll_params[clk_freq].fbdiv_intgr;
++	dw19.tspll_ndivratio = e825c_tspll_params[clk_freq].ndivratio;
+ 
+ 	err = ice_write_cgu_reg(hw, ICE_CGU_R19, dw19.val);
+ 	if (err)
+@@ -518,6 +514,7 @@ static int ice_tspll_cfg_e825c(struct ic
+ 	if (err)
+ 		return err;
+ 
++	dw24.val = 0;
+ 	dw24.fbdiv_frac = e825c_tspll_params[clk_freq].fbdiv_frac;
+ 
+ 	err = ice_write_cgu_reg(hw, ICE_CGU_R24, dw24.val);
+@@ -545,7 +542,7 @@ static int ice_tspll_cfg_e825c(struct ic
+ 
+ 	/* Log the current clock configuration */
+ 	ice_debug(hw, ICE_DBG_PTP, "New TSPLL configuration -- %s, clk_src %s, clk_freq %s, PLL %s\n",
+-		  str_enabled_disabled(dw24.ts_pll_enable),
++		  str_enabled_disabled(dw23.ts_pll_enable),
+ 		  ice_tspll_clk_src_str(dw23.time_ref_sel),
+ 		  ice_tspll_clk_freq_str(dw9.time_ref_freq_sel),
+ 		  ro_lock.plllock_true_lock_cri ? "locked" : "unlocked");
