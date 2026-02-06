@@ -1,0 +1,410 @@
+From: Alexander Lobakin <aleksander.lobakin@intel.com>
+Date: Tue, 26 Aug 2025 17:55:05 +0200
+Subject: idpf: add support for XDP on Rx
+Patch-mainline: v6.18-rc1
+Git-commit: cba102cd719029a10bda1d0ca00ed646796f1f21
+References: jsc#PED-14403
+
+Use libeth XDP infra to support running XDP program on Rx polling.
+This includes all of the possible verdicts/actions.
+XDP Tx queues are cleaned only in "lazy" mode when there are less than
+1/4 free descriptors left on the ring. libeth helper macros to define
+driver-specific XDP functions make sure the compiler could uninline
+them when needed.
+
+Use __LIBETH_WORD_ACCESS to parse descriptors more efficiently when
+applicable. It really gives some good boosts and code size reduction
+on x86_64:
+
+XDP only: add/remove: 0/0 grow/shrink: 3/3 up/down: 5/-59 (-54)
+with XSk: add/remove: 0/0 grow/shrink: 5/6 up/down: 23/-124 (-101)
+
+with the most demanding workloads like XSk xmit differing in up to 5-8%.
+
+Co-developed-by: Michal Kubiak <michal.kubiak@intel.com>
+Signed-off-by: Michal Kubiak <michal.kubiak@intel.com>
+Signed-off-by: Alexander Lobakin <aleksander.lobakin@intel.com>
+Tested-by: Ramu R <ramu.r@intel.com>
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/idpf/idpf_lib.c  |    2 
+ drivers/net/ethernet/intel/idpf/idpf_txrx.c |   23 ++--
+ drivers/net/ethernet/intel/idpf/idpf_txrx.h |    4 
+ drivers/net/ethernet/intel/idpf/xdp.c       |  147 +++++++++++++++++++++++++++-
+ drivers/net/ethernet/intel/idpf/xdp.h       |   92 ++++++++++++++++-
+ 5 files changed, 248 insertions(+), 20 deletions(-)
+
+--- a/drivers/net/ethernet/intel/idpf/idpf_lib.c
++++ b/drivers/net/ethernet/intel/idpf/idpf_lib.c
+@@ -836,6 +836,8 @@ static int idpf_cfg_netdev(struct idpf_v
+ 	netdev->hw_features |=  netdev->features | other_offloads;
+ 	netdev->vlan_features |= netdev->features | other_offloads;
+ 	netdev->hw_enc_features |= dflt_features | other_offloads;
++	idpf_xdp_set_features(vport);
++
+ 	idpf_set_ethtool_ops(netdev);
+ 	SET_NETDEV_DEV(netdev, &adapter->pdev->dev);
+ 
+--- a/drivers/net/ethernet/intel/idpf/idpf_txrx.c
++++ b/drivers/net/ethernet/intel/idpf/idpf_txrx.c
+@@ -1,8 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /* Copyright (C) 2023 Intel Corporation */
+ 
+-#include <net/libeth/xdp.h>
+-
+ #include "idpf.h"
+ #include "idpf_ptp.h"
+ #include "idpf_virtchnl.h"
+@@ -3043,14 +3041,12 @@ static bool idpf_rx_process_skb_fields(s
+ 	return !__idpf_rx_process_skb_fields(rxq, skb, xdp->desc);
+ }
+ 
+-static void
+-idpf_xdp_run_pass(struct libeth_xdp_buff *xdp, struct napi_struct *napi,
+-		  struct libeth_rq_napi_stats *ss,
+-		  const struct virtchnl2_rx_flex_desc_adv_nic_3 *desc)
+-{
+-	libeth_xdp_run_pass(xdp, NULL, napi, ss, desc, NULL,
+-			    idpf_rx_process_skb_fields);
+-}
++LIBETH_XDP_DEFINE_START();
++LIBETH_XDP_DEFINE_RUN(static idpf_xdp_run_pass, idpf_xdp_run_prog,
++		      idpf_xdp_tx_flush_bulk, idpf_rx_process_skb_fields);
++LIBETH_XDP_DEFINE_FINALIZE(static idpf_xdp_finalize_rx, idpf_xdp_tx_flush_bulk,
++			   idpf_xdp_tx_finalize);
++LIBETH_XDP_DEFINE_END();
+ 
+ /**
+  * idpf_rx_hsplit_wa - handle header buffer overflows and split errors
+@@ -3136,7 +3132,10 @@ static int idpf_rx_splitq_clean(struct i
+ 	struct libeth_rq_napi_stats rs = { };
+ 	u16 ntc = rxq->next_to_clean;
+ 	LIBETH_XDP_ONSTACK_BUFF(xdp);
++	LIBETH_XDP_ONSTACK_BULK(bq);
+ 
++	libeth_xdp_tx_init_bulk(&bq, rxq->xdp_prog, rxq->xdp_rxq.dev,
++				rxq->xdpsqs, rxq->num_xdp_txq);
+ 	libeth_xdp_init_buff(xdp, &rxq->xdp, &rxq->xdp_rxq);
+ 
+ 	/* Process Rx packets bounded by budget */
+@@ -3232,9 +3231,11 @@ payload:
+ 		if (!idpf_rx_splitq_is_eop(rx_desc) || unlikely(!xdp->data))
+ 			continue;
+ 
+-		idpf_xdp_run_pass(xdp, rxq->napi, &rs, rx_desc);
++		idpf_xdp_run_pass(xdp, &bq, rxq->napi, &rs, rx_desc);
+ 	}
+ 
++	idpf_xdp_finalize_rx(&bq);
++
+ 	rxq->next_to_clean = ntc;
+ 	libeth_xdp_save_buff(&rxq->xdp, xdp);
+ 
+--- a/drivers/net/ethernet/intel/idpf/idpf_txrx.h
++++ b/drivers/net/ethernet/intel/idpf/idpf_txrx.h
+@@ -648,8 +648,8 @@ struct idpf_tx_queue {
+ 	__cacheline_group_end_aligned(read_mostly);
+ 
+ 	__cacheline_group_begin_aligned(read_write);
+-	u16 next_to_use;
+-	u16 next_to_clean;
++	u32 next_to_use;
++	u32 next_to_clean;
+ 
+ 	union {
+ 		struct {
+--- a/drivers/net/ethernet/intel/idpf/xdp.c
++++ b/drivers/net/ethernet/intel/idpf/xdp.c
+@@ -1,8 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /* Copyright (C) 2025 Intel Corporation */
+ 
+-#include <net/libeth/xdp.h>
+-
+ #include "idpf.h"
+ #include "idpf_virtchnl.h"
+ #include "xdp.h"
+@@ -113,6 +111,8 @@ void idpf_xdp_copy_prog_to_rqs(const str
+ 	idpf_rxq_for_each(vport, idpf_xdp_rxq_assign_prog, xdp_prog);
+ }
+ 
++static void idpf_xdp_tx_timer(struct work_struct *work);
++
+ int idpf_xdpsqs_get(const struct idpf_vport *vport)
+ {
+ 	struct libeth_xdpsq_timer **timers __free(kvfree) = NULL;
+@@ -155,6 +155,8 @@ int idpf_xdpsqs_get(const struct idpf_vp
+ 
+ 		xdpsq->timer = timers[i - sqs];
+ 		libeth_xdpsq_get(&xdpsq->xdp_lock, dev, vport->xdpsq_share);
++		libeth_xdpsq_init_timer(xdpsq->timer, xdpsq, &xdpsq->xdp_lock,
++					idpf_xdp_tx_timer);
+ 
+ 		xdpsq->pending = 0;
+ 		xdpsq->xdp_tx = 0;
+@@ -181,6 +183,7 @@ void idpf_xdpsqs_put(const struct idpf_v
+ 		if (!idpf_queue_has_clear(XDP, xdpsq))
+ 			continue;
+ 
++		libeth_xdpsq_deinit_timer(xdpsq->timer);
+ 		libeth_xdpsq_put(&xdpsq->xdp_lock, dev);
+ 
+ 		kfree(xdpsq->timer);
+@@ -189,6 +192,146 @@ void idpf_xdpsqs_put(const struct idpf_v
+ 	}
+ }
+ 
++static int idpf_xdp_parse_cqe(const struct idpf_splitq_4b_tx_compl_desc *desc,
++			      bool gen)
++{
++	u32 val;
++
++#ifdef __LIBETH_WORD_ACCESS
++	val = *(const u32 *)desc;
++#else
++	val = ((u32)le16_to_cpu(desc->q_head_compl_tag.q_head) << 16) |
++	      le16_to_cpu(desc->qid_comptype_gen);
++#endif
++	if (!!(val & IDPF_TXD_COMPLQ_GEN_M) != gen)
++		return -ENODATA;
++
++	if (unlikely((val & GENMASK(IDPF_TXD_COMPLQ_GEN_S - 1, 0)) !=
++		     FIELD_PREP(IDPF_TXD_COMPLQ_COMPL_TYPE_M,
++				IDPF_TXD_COMPLT_RS)))
++		return -EINVAL;
++
++	return upper_16_bits(val);
++}
++
++static u32 idpf_xdpsq_poll(struct idpf_tx_queue *xdpsq, u32 budget)
++{
++	struct idpf_compl_queue *cq = xdpsq->complq;
++	u32 tx_ntc = xdpsq->next_to_clean;
++	u32 tx_cnt = xdpsq->desc_count;
++	u32 ntc = cq->next_to_clean;
++	u32 cnt = cq->desc_count;
++	u32 done_frames;
++	bool gen;
++
++	gen = idpf_queue_has(GEN_CHK, cq);
++
++	for (done_frames = 0; done_frames < budget; ) {
++		int ret;
++
++		ret = idpf_xdp_parse_cqe(&cq->comp_4b[ntc], gen);
++		if (ret >= 0) {
++			done_frames = ret > tx_ntc ? ret - tx_ntc :
++						     ret + tx_cnt - tx_ntc;
++			goto next;
++		}
++
++		switch (ret) {
++		case -ENODATA:
++			goto out;
++		case -EINVAL:
++			break;
++		}
++
++next:
++		if (unlikely(++ntc == cnt)) {
++			ntc = 0;
++			gen = !gen;
++			idpf_queue_change(GEN_CHK, cq);
++		}
++	}
++
++out:
++	cq->next_to_clean = ntc;
++
++	return done_frames;
++}
++
++static u32 idpf_xdpsq_complete(void *_xdpsq, u32 budget)
++{
++	struct libeth_xdpsq_napi_stats ss = { };
++	struct idpf_tx_queue *xdpsq = _xdpsq;
++	u32 tx_ntc = xdpsq->next_to_clean;
++	u32 tx_cnt = xdpsq->desc_count;
++	struct xdp_frame_bulk bq;
++	struct libeth_cq_pp cp = {
++		.dev	= xdpsq->dev,
++		.bq	= &bq,
++		.xss	= &ss,
++		.napi	= true,
++	};
++	u32 done_frames;
++
++	done_frames = idpf_xdpsq_poll(xdpsq, budget);
++	if (unlikely(!done_frames))
++		return 0;
++
++	xdp_frame_bulk_init(&bq);
++
++	for (u32 i = 0; likely(i < done_frames); i++) {
++		libeth_xdp_complete_tx(&xdpsq->tx_buf[tx_ntc], &cp);
++
++		if (unlikely(++tx_ntc == tx_cnt))
++			tx_ntc = 0;
++	}
++
++	xdp_flush_frame_bulk(&bq);
++
++	xdpsq->next_to_clean = tx_ntc;
++	xdpsq->pending -= done_frames;
++	xdpsq->xdp_tx -= cp.xdp_tx;
++
++	return done_frames;
++}
++
++static u32 idpf_xdp_tx_prep(void *_xdpsq, struct libeth_xdpsq *sq)
++{
++	struct idpf_tx_queue *xdpsq = _xdpsq;
++	u32 free;
++
++	libeth_xdpsq_lock(&xdpsq->xdp_lock);
++
++	free = xdpsq->desc_count - xdpsq->pending;
++	if (free < xdpsq->thresh)
++		free += idpf_xdpsq_complete(xdpsq, xdpsq->thresh);
++
++	*sq = (struct libeth_xdpsq){
++		.sqes		= xdpsq->tx_buf,
++		.descs		= xdpsq->desc_ring,
++		.count		= xdpsq->desc_count,
++		.lock		= &xdpsq->xdp_lock,
++		.ntu		= &xdpsq->next_to_use,
++		.pending	= &xdpsq->pending,
++		.xdp_tx		= &xdpsq->xdp_tx,
++	};
++
++	return free;
++}
++
++LIBETH_XDP_DEFINE_START();
++LIBETH_XDP_DEFINE_TIMER(static idpf_xdp_tx_timer, idpf_xdpsq_complete);
++LIBETH_XDP_DEFINE_FLUSH_TX(idpf_xdp_tx_flush_bulk, idpf_xdp_tx_prep,
++			   idpf_xdp_tx_xmit);
++LIBETH_XDP_DEFINE_END();
++
++void idpf_xdp_set_features(const struct idpf_vport *vport)
++{
++	if (!idpf_is_queue_model_split(vport->rxq_model))
++		return;
++
++	libeth_xdp_set_features_noredir(vport->netdev);
++}
++
+ static int idpf_xdp_setup_prog(struct idpf_vport *vport,
+ 			       const struct netdev_bpf *xdp)
+ {
+--- a/drivers/net/ethernet/intel/idpf/xdp.h
++++ b/drivers/net/ethernet/intel/idpf/xdp.h
+@@ -4,12 +4,9 @@
+ #ifndef _IDPF_XDP_H_
+ #define _IDPF_XDP_H_
+ 
+-#include <linux/types.h>
++#include <net/libeth/xdp.h>
+ 
+-struct bpf_prog;
+-struct idpf_vport;
+-struct net_device;
+-struct netdev_bpf;
++#include "idpf_txrx.h"
+ 
+ int idpf_xdp_rxq_info_init_all(const struct idpf_vport *vport);
+ void idpf_xdp_rxq_info_deinit_all(const struct idpf_vport *vport);
+@@ -19,6 +16,91 @@ void idpf_xdp_copy_prog_to_rqs(const str
+ int idpf_xdpsqs_get(const struct idpf_vport *vport);
+ void idpf_xdpsqs_put(const struct idpf_vport *vport);
+ 
++bool idpf_xdp_tx_flush_bulk(struct libeth_xdp_tx_bulk *bq, u32 flags);
++
++/**
++ * idpf_xdp_tx_xmit - produce a single HW Tx descriptor out of XDP desc
++ * @desc: XDP descriptor to pull the DMA address and length from
++ * @i: descriptor index on the queue to fill
++ * @sq: XDP queue to produce the HW Tx descriptor on
++ * @priv: &xsk_tx_metadata_ops on XSk xmit or %NULL
++ */
++static inline void idpf_xdp_tx_xmit(struct libeth_xdp_tx_desc desc, u32 i,
++				    const struct libeth_xdpsq *sq, u64 priv)
++{
++	struct idpf_flex_tx_desc *tx_desc = sq->descs;
++	u32 cmd;
++
++	cmd = FIELD_PREP(IDPF_FLEX_TXD_QW1_DTYPE_M,
++			 IDPF_TX_DESC_DTYPE_FLEX_L2TAG1_L2TAG2);
++	if (desc.flags & LIBETH_XDP_TX_LAST)
++		cmd |= FIELD_PREP(IDPF_FLEX_TXD_QW1_CMD_M,
++				  IDPF_TX_DESC_CMD_EOP);
++	if (priv && (desc.flags & LIBETH_XDP_TX_CSUM))
++		cmd |= FIELD_PREP(IDPF_FLEX_TXD_QW1_CMD_M,
++				  IDPF_TX_FLEX_DESC_CMD_CS_EN);
++
++	tx_desc = &tx_desc[i];
++	tx_desc->buf_addr = cpu_to_le64(desc.addr);
++#ifdef __LIBETH_WORD_ACCESS
++	*(u64 *)&tx_desc->qw1 = ((u64)desc.len << 48) | cmd;
++#else
++	tx_desc->qw1.buf_size = cpu_to_le16(desc.len);
++	tx_desc->qw1.cmd_dtype = cpu_to_le16(cmd);
++#endif
++}
++
++static inline void idpf_xdpsq_set_rs(const struct idpf_tx_queue *xdpsq)
++{
++	u32 ntu, cmd;
++
++	ntu = xdpsq->next_to_use;
++	if (unlikely(!ntu))
++		ntu = xdpsq->desc_count;
++
++	cmd = FIELD_PREP(IDPF_FLEX_TXD_QW1_CMD_M, IDPF_TX_DESC_CMD_RS);
++#ifdef __LIBETH_WORD_ACCESS
++	*(u64 *)&xdpsq->flex_tx[ntu - 1].q.qw1 |= cmd;
++#else
++	xdpsq->flex_tx[ntu - 1].q.qw1.cmd_dtype |= cpu_to_le16(cmd);
++#endif
++}
++
++static inline void idpf_xdpsq_update_tail(const struct idpf_tx_queue *xdpsq)
++{
++	dma_wmb();
++	writel_relaxed(xdpsq->next_to_use, xdpsq->tail);
++}
++
++/**
++ * idpf_xdp_tx_finalize - finalize sending over XDPSQ
++ * @_xdpsq: XDP Tx queue
++ * @sent: whether any frames were sent
++ * @flush: whether to update RS bit and the tail register
++ *
++ * Set the RS bit ("end of batch"), bump the tail, and queue the cleanup timer.
++ * To be called after a NAPI polling loop, at the end of .ndo_xdp_xmit() etc.
++ */
++static inline void idpf_xdp_tx_finalize(void *_xdpsq, bool sent, bool flush)
++{
++	struct idpf_tx_queue *xdpsq = _xdpsq;
++
++	if ((!flush || unlikely(!sent)) &&
++	    likely(xdpsq->desc_count - 1 != xdpsq->pending))
++		return;
++
++	libeth_xdpsq_lock(&xdpsq->xdp_lock);
++
++	idpf_xdpsq_set_rs(xdpsq);
++	idpf_xdpsq_update_tail(xdpsq);
++
++	libeth_xdpsq_queue_timer(xdpsq->timer);
++
++	libeth_xdpsq_unlock(&xdpsq->xdp_lock);
++}
++
++void idpf_xdp_set_features(const struct idpf_vport *vport);
++
+ int idpf_xdp(struct net_device *dev, struct netdev_bpf *xdp);
+ 
+ #endif /* _IDPF_XDP_H_ */
