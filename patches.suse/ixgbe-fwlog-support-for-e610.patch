@@ -1,0 +1,146 @@
+From: Michal Swiatkowski <michal.swiatkowski@linux.intel.com>
+Date: Tue, 12 Aug 2025 06:23:36 +0200
+Subject: ixgbe: fwlog support for e610
+Patch-mainline: v6.18-rc1
+Git-commit: 641585bc978e0a1170ca8f12fbb1468b3874a2db
+References: jsc#PED-14409 jsc#PED-15061 jsc#PED-14407
+
+The device support firmware logging feature. Use libie code to
+initialize it and allow reading the logs using debugfs.
+
+The commands are the same as in ice driver. Look at the description in
+commit 96a9a9341cda ("ice: configure FW logging") for more info.
+
+Reviewed-by: Przemek Kitszel <przemyslaw.kitszel@intel.com>
+Signed-off-by: Michal Swiatkowski <michal.swiatkowski@linux.intel.com>
+Tested-by: Rinitha S <sx.rinitha@intel.com> (A Contingent worker at Intel)
+Reviewed-by: Simon Horman <horms@kernel.org>
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/Kconfig            |    1 
+ drivers/net/ethernet/intel/ixgbe/ixgbe_e610.c |   32 ++++++++++++++++++++++++++
+ drivers/net/ethernet/intel/ixgbe/ixgbe_e610.h |    2 +
+ drivers/net/ethernet/intel/ixgbe/ixgbe_main.c |   10 ++++++++
+ drivers/net/ethernet/intel/ixgbe/ixgbe_type.h |    2 +
+ 5 files changed, 47 insertions(+)
+
+--- a/drivers/net/ethernet/intel/Kconfig
++++ b/drivers/net/ethernet/intel/Kconfig
+@@ -146,6 +146,7 @@ config IXGBE
+ 	tristate "Intel(R) 10GbE PCI Express adapters support"
+ 	depends on PCI
+ 	depends on PTP_1588_CLOCK_OPTIONAL
++	select LIBIE_FWLOG
+ 	select MDIO
+ 	select NET_DEVLINK
+ 	select PLDMFW
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_e610.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_e610.c
+@@ -3921,6 +3921,38 @@ static int ixgbe_read_pba_string_e610(st
+ 	return err;
+ }
+ 
++static int __fwlog_send_cmd(void *priv, struct libie_aq_desc *desc, void *buf,
++			    u16 size)
++{
++	struct ixgbe_hw *hw = priv;
++
++	return ixgbe_aci_send_cmd(hw, desc, buf, size);
++}
++
++int ixgbe_fwlog_init(struct ixgbe_hw *hw)
++{
++	struct ixgbe_adapter *adapter = hw->back;
++	struct libie_fwlog_api api = {
++		.pdev = adapter->pdev,
++		.send_cmd = __fwlog_send_cmd,
++		.debugfs_root = adapter->ixgbe_dbg_adapter,
++		.priv = hw,
++	};
++
++	if (hw->mac.type != ixgbe_mac_e610)
++		return -EOPNOTSUPP;
++
++	return libie_fwlog_init(&hw->fwlog, &api);
++}
++
++void ixgbe_fwlog_deinit(struct ixgbe_hw *hw)
++{
++	if (hw->mac.type != ixgbe_mac_e610)
++		return;
++
++	libie_fwlog_deinit(&hw->fwlog);
++}
++
+ static const struct ixgbe_mac_operations mac_ops_e610 = {
+ 	.init_hw			= ixgbe_init_hw_generic,
+ 	.start_hw			= ixgbe_start_hw_e610,
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_e610.h
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_e610.h
+@@ -96,5 +96,7 @@ int ixgbe_aci_update_nvm(struct ixgbe_hw
+ 			 bool last_command, u8 command_flags);
+ int ixgbe_nvm_write_activate(struct ixgbe_hw *hw, u16 cmd_flags,
+ 			     u8 *response_flags);
++int ixgbe_fwlog_init(struct ixgbe_hw *hw);
++void ixgbe_fwlog_deinit(struct ixgbe_hw *hw);
+ 
+ #endif /* _IXGBE_E610_H_ */
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@ -172,6 +172,7 @@ static int debug = -1;
+ module_param(debug, int, 0);
+ MODULE_PARM_DESC(debug, "Debug level (0=none,...,16=all)");
+ 
++MODULE_IMPORT_NS("LIBIE_FWLOG");
+ MODULE_DESCRIPTION("Intel(R) 10 Gigabit PCI Express Network Driver");
+ MODULE_LICENSE("GPL v2");
+ 
+@@ -3355,6 +3356,10 @@ static void ixgbe_handle_fw_event(struct
+ 			e_crit(drv, "%s\n", ixgbe_overheat_msg);
+ 			ixgbe_down(adapter);
+ 			break;
++		case libie_aqc_opc_fw_logs_event:
++			libie_get_fwlog_data(&hw->fwlog, event.msg_buf,
++					     le16_to_cpu(event.desc.datalen));
++			break;
+ 		default:
+ 			e_warn(hw, "unknown FW async event captured\n");
+ 			break;
+@@ -11998,6 +12003,10 @@ skip_sriov:
+ 	ixgbe_devlink_init_regions(adapter);
+ 	devl_register(adapter->devlink);
+ 	devl_unlock(adapter->devlink);
++
++	if (ixgbe_fwlog_init(hw))
++		e_dev_info("Firmware logging not supported\n");
++
+ 	return 0;
+ 
+ err_netdev:
+@@ -12055,6 +12064,7 @@ static void ixgbe_remove(struct pci_dev
+ 	devl_lock(adapter->devlink);
+ 	devl_unregister(adapter->devlink);
+ 	ixgbe_devlink_destroy_regions(adapter);
++	ixgbe_fwlog_deinit(&adapter->hw);
+ 	ixgbe_dbg_adapter_exit(adapter);
+ 
+ 	set_bit(__IXGBE_REMOVING, &adapter->state);
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_type.h
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_type.h
+@@ -7,6 +7,7 @@
+ #include <linux/types.h>
+ #include <linux/mdio.h>
+ #include <linux/netdevice.h>
++#include <linux/net/intel/libie/fwlog.h>
+ #include "ixgbe_type_e610.h"
+ 
+ /* Device IDs */
+@@ -3752,6 +3753,7 @@ struct ixgbe_hw {
+ 	struct ixgbe_flash_info		flash;
+ 	struct ixgbe_hw_dev_caps	dev_caps;
+ 	struct ixgbe_hw_func_caps	func_caps;
++	struct libie_fwlog		fwlog;
+ };
+ 
+ struct ixgbe_info {
