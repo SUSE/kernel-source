@@ -1,0 +1,113 @@
+From: Yonghong Song <yonghong.song@linux.dev>
+Date: Thu, 14 Nov 2024 22:03:54 -0800
+Subject: bpf: Add necessary migrate_disable to range_tree.
+Patch-mainline: v6.13-rc1
+Git-commit: 4ff04abf9d5bc33d33c7a799887517619188b068
+References: jsc#PED-14653
+
+When running bpf selftest (./test_progs -j), the following warnings
+showed up:
+
+  $ ./test_progs -t arena_atomics
+  ...
+  BUG: using smp_processor_id() in preemptible [00000000] code: kworker/u19:0/12501
+  caller is bpf_mem_free+0x128/0x330
+  ...
+  Call Trace:
+   <TASK>
+   dump_stack_lvl
+   check_preemption_disabled
+   bpf_mem_free
+   range_tree_destroy
+   arena_map_free
+   bpf_map_free_deferred
+   process_scheduled_works
+   ...
+
+For selftests arena_htab and arena_list, similar smp_process_id() BUGs are
+dumped, and the following are two stack trace:
+
+   <TASK>
+   dump_stack_lvl
+   check_preemption_disabled
+   bpf_mem_alloc
+   range_tree_set
+   arena_map_alloc
+   map_create
+   ...
+
+   <TASK>
+   dump_stack_lvl
+   check_preemption_disabled
+   bpf_mem_alloc
+   range_tree_clear
+   arena_vm_fault
+   do_pte_missing
+   handle_mm_fault
+   do_user_addr_fault
+   ...
+
+Add migrate_{disable,enable}() around related bpf_mem_{alloc,free}()
+calls to fix the issue.
+
+Fixes: b795379757eb ("bpf: Introduce range_tree data structure and use it in bpf arena")
+Signed-off-by: Yonghong Song <yonghong.song@linux.dev>
+Link: https://lore.kernel.org/r/20241115060354.2832495-1-yonghong.song@linux.dev
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ kernel/bpf/range_tree.c |   10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+--- a/kernel/bpf/range_tree.c
++++ b/kernel/bpf/range_tree.c
+@@ -150,7 +150,9 @@ int range_tree_clear(struct range_tree *
+ 			range_it_insert(rn, rt);
+ 
+ 			/* Add a range */
++			migrate_disable();
+ 			new_rn = bpf_mem_alloc(&bpf_global_ma, sizeof(struct range_node));
++			migrate_enable();
+ 			if (!new_rn)
+ 				return -ENOMEM;
+ 			new_rn->rn_start = last + 1;
+@@ -170,7 +172,9 @@ int range_tree_clear(struct range_tree *
+ 		} else {
+ 			/* in the middle of the clearing range */
+ 			range_it_remove(rn, rt);
++			migrate_disable();
+ 			bpf_mem_free(&bpf_global_ma, rn);
++			migrate_enable();
+ 		}
+ 	}
+ 	return 0;
+@@ -223,7 +227,9 @@ int range_tree_set(struct range_tree *rt
+ 		range_it_remove(right, rt);
+ 		left->rn_last = right->rn_last;
+ 		range_it_insert(left, rt);
++		migrate_disable();
+ 		bpf_mem_free(&bpf_global_ma, right);
++		migrate_enable();
+ 	} else if (left) {
+ 		/* Combine with the left range */
+ 		range_it_remove(left, rt);
+@@ -235,7 +241,9 @@ int range_tree_set(struct range_tree *rt
+ 		right->rn_start = start;
+ 		range_it_insert(right, rt);
+ 	} else {
++		migrate_disable();
+ 		left = bpf_mem_alloc(&bpf_global_ma, sizeof(struct range_node));
++		migrate_enable();
+ 		if (!left)
+ 			return -ENOMEM;
+ 		left->rn_start = start;
+@@ -251,7 +259,9 @@ void range_tree_destroy(struct range_tre
+ 
+ 	while ((rn = range_it_iter_first(rt, 0, -1U))) {
+ 		range_it_remove(rn, rt);
++		migrate_disable();
+ 		bpf_mem_free(&bpf_global_ma, rn);
++		migrate_enable();
+ 	}
+ }
+ 
