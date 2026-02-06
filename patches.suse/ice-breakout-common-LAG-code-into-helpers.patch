@@ -1,0 +1,182 @@
+From: Dave Ertman <david.m.ertman@intel.com>
+Date: Mon, 16 Jun 2025 13:03:22 +0200
+Subject: ice: breakout common LAG code into helpers
+Patch-mainline: v6.17-rc1
+Git-commit: 351d8d8ab6af71193033a2786a99ea56e1af8526
+References: jsc#PED-14404 jsc#PED-15079
+
+In the VF handling code, parts of the code for lag can be broken out into
+helper functions to reduce code duplication. Break this code out into
+helper functions
+
+Reviewed-by: Marcin Szycik <marcin.szycik@linux.intel.com>
+Signed-off-by: Dave Ertman <david.m.ertman@intel.com>
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/ice/ice_lag.c      |   42 ++++++++++++++++++++++++++
+ drivers/net/ethernet/intel/ice/ice_lag.h      |    2 +
+ drivers/net/ethernet/intel/ice/ice_vf_lib.c   |   19 +----------
+ drivers/net/ethernet/intel/ice/ice_virtchnl.c |   23 ++------------
+ 4 files changed, 51 insertions(+), 35 deletions(-)
+
+--- a/drivers/net/ethernet/intel/ice/ice_lag.c
++++ b/drivers/net/ethernet/intel/ice/ice_lag.c
+@@ -823,6 +823,48 @@ cp_free:
+ }
+ 
+ /**
++ * ice_lag_prepare_vf_reset - helper to adjust vf lag for reset
++ * @lag: lag struct for interface that owns VF
++ *
++ * Context: must be called with the lag_mutex lock held.
++ *
++ * Return: active lport value or ICE_LAG_INVALID_PORT if nothing moved.
++ */
++u8 ice_lag_prepare_vf_reset(struct ice_lag *lag)
++{
++	u8 pri_prt, act_prt;
++
++	if (lag && lag->bonded && lag->primary && lag->upper_netdev) {
++		pri_prt = lag->pf->hw.port_info->lport;
++		act_prt = lag->active_port;
++		if (act_prt != pri_prt && act_prt != ICE_LAG_INVALID_PORT) {
++			ice_lag_move_vf_nodes_cfg(lag, act_prt, pri_prt);
++			return act_prt;
++		}
++	}
++
++	return ICE_LAG_INVALID_PORT;
++}
++
++/**
++ * ice_lag_complete_vf_reset - helper for lag after reset
++ * @lag: lag struct for primary interface
++ * @act_prt: which port should be active for lag
++ *
++ * Context: must be called while holding the lag_mutex.
++ */
++void ice_lag_complete_vf_reset(struct ice_lag *lag, u8 act_prt)
++{
++	u8 pri_prt;
++
++	if (lag && lag->bonded && lag->primary &&
++	    act_prt != ICE_LAG_INVALID_PORT) {
++		pri_prt = lag->pf->hw.port_info->lport;
++		ice_lag_move_vf_nodes_cfg(lag, pri_prt, act_prt);
++	}
++}
++
++/**
+  * ice_lag_info_event - handle NETDEV_BONDING_INFO event
+  * @lag: LAG info struct
+  * @ptr: opaque data pointer
+--- a/drivers/net/ethernet/intel/ice/ice_lag.h
++++ b/drivers/net/ethernet/intel/ice/ice_lag.h
+@@ -70,4 +70,6 @@ void ice_deinit_lag(struct ice_pf *pf);
+ void ice_lag_rebuild(struct ice_pf *pf);
+ bool ice_lag_is_switchdev_running(struct ice_pf *pf);
+ void ice_lag_move_vf_nodes_cfg(struct ice_lag *lag, u8 src_prt, u8 dst_prt);
++u8 ice_lag_prepare_vf_reset(struct ice_lag *lag);
++void ice_lag_complete_vf_reset(struct ice_lag *lag, u8 act_prt);
+ #endif /* _ICE_LAG_H_ */
+--- a/drivers/net/ethernet/intel/ice/ice_vf_lib.c
++++ b/drivers/net/ethernet/intel/ice/ice_vf_lib.c
+@@ -859,16 +859,13 @@ static void ice_notify_vf_reset(struct i
+ int ice_reset_vf(struct ice_vf *vf, u32 flags)
+ {
+ 	struct ice_pf *pf = vf->pf;
+-	struct ice_lag *lag;
+ 	struct ice_vsi *vsi;
+-	u8 act_prt, pri_prt;
+ 	struct device *dev;
+ 	int err = 0;
++	u8 act_prt;
+ 	bool rsd;
+ 
+ 	dev = ice_pf_to_dev(pf);
+-	act_prt = ICE_LAG_INVALID_PORT;
+-	pri_prt = pf->hw.port_info->lport;
+ 
+ 	if (flags & ICE_VF_RESET_NOTIFY)
+ 		ice_notify_vf_reset(vf);
+@@ -884,16 +881,8 @@ int ice_reset_vf(struct ice_vf *vf, u32
+ 	else
+ 		lockdep_assert_held(&vf->cfg_lock);
+ 
+-	lag = pf->lag;
+ 	mutex_lock(&pf->lag_mutex);
+-	if (lag && lag->bonded && lag->primary) {
+-		act_prt = lag->active_port;
+-		if (act_prt != pri_prt && act_prt != ICE_LAG_INVALID_PORT &&
+-		    lag->upper_netdev)
+-			ice_lag_move_vf_nodes_cfg(lag, act_prt, pri_prt);
+-		else
+-			act_prt = ICE_LAG_INVALID_PORT;
+-	}
++	act_prt = ice_lag_prepare_vf_reset(pf->lag);
+ 
+ 	if (ice_is_vf_disabled(vf)) {
+ 		vsi = ice_get_vf_vsi(vf);
+@@ -979,9 +968,7 @@ int ice_reset_vf(struct ice_vf *vf, u32
+ 	ice_reset_vf_mbx_cnt(vf);
+ 
+ out_unlock:
+-	if (lag && lag->bonded && lag->primary &&
+-	    act_prt != ICE_LAG_INVALID_PORT)
+-		ice_lag_move_vf_nodes_cfg(lag, pri_prt, act_prt);
++	ice_lag_complete_vf_reset(pf->lag, act_prt);
+ 	mutex_unlock(&pf->lag_mutex);
+ 
+ 	if (flags & ICE_VF_RESET_LOCK)
+--- a/drivers/net/ethernet/intel/ice/ice_virtchnl.c
++++ b/drivers/net/ethernet/intel/ice/ice_virtchnl.c
+@@ -1996,24 +1996,13 @@ static int ice_vc_cfg_qs_msg(struct ice_
+ 	    (struct virtchnl_vsi_queue_config_info *)msg;
+ 	struct virtchnl_queue_pair_info *qpi;
+ 	struct ice_pf *pf = vf->pf;
+-	struct ice_lag *lag;
+ 	struct ice_vsi *vsi;
+-	u8 act_prt, pri_prt;
+ 	int i = -1, q_idx;
+ 	bool ena_ts;
++	u8 act_prt;
+ 
+-	lag = pf->lag;
+ 	mutex_lock(&pf->lag_mutex);
+-	act_prt = ICE_LAG_INVALID_PORT;
+-	pri_prt = pf->hw.port_info->lport;
+-	if (lag && lag->bonded && lag->primary) {
+-		act_prt = lag->active_port;
+-		if (act_prt != pri_prt && act_prt != ICE_LAG_INVALID_PORT &&
+-		    lag->upper_netdev)
+-			ice_lag_move_vf_nodes_cfg(lag, act_prt, pri_prt);
+-		else
+-			act_prt = ICE_LAG_INVALID_PORT;
+-	}
++	act_prt = ice_lag_prepare_vf_reset(pf->lag);
+ 
+ 	if (!test_bit(ICE_VF_STATE_ACTIVE, vf->vf_states))
+ 		goto error_param;
+@@ -2141,9 +2130,7 @@ static int ice_vc_cfg_qs_msg(struct ice_
+ 		}
+ 	}
+ 
+-	if (lag && lag->bonded && lag->primary &&
+-	    act_prt != ICE_LAG_INVALID_PORT)
+-		ice_lag_move_vf_nodes_cfg(lag, pri_prt, act_prt);
++	ice_lag_complete_vf_reset(pf->lag, act_prt);
+ 	mutex_unlock(&pf->lag_mutex);
+ 
+ 	/* send the response to the VF */
+@@ -2160,9 +2147,7 @@ error_param:
+ 				vf->vf_id, i);
+ 	}
+ 
+-	if (lag && lag->bonded && lag->primary &&
+-	    act_prt != ICE_LAG_INVALID_PORT)
+-		ice_lag_move_vf_nodes_cfg(lag, pri_prt, act_prt);
++	ice_lag_complete_vf_reset(pf->lag, act_prt);
+ 	mutex_unlock(&pf->lag_mutex);
+ 
+ 	ice_lag_move_new_vf_nodes(vf);
