@@ -1,0 +1,163 @@
+From: Benjamin Marzinski <bmarzins@redhat.com>
+Date: Wed, 8 Oct 2025 23:04:31 -0400
+Subject: dm: Fix deadlock when reloading a multipath table
+Patch-mainline: v6.19-rc1
+Git-commit: be4addb1914f00c60599495acacf4e24e9cb8237
+References: bsc#1254928
+
+Request-based devices (dm-multipath) queue I/O in blk-mq on noflush
+suspends. Any queued IO will make it impossible to freeze the queue. If
+a process attempts to update the queue limits while there is queued IO,
+it can be get stuck holding the limits lock, while unable to freeze the
+queue. If device-mapper then attempts to update the limits during a
+table swap, it will deadlock trying to grab the limits lock while making
+it impossible to flush the IO.
+
+Disallow updating the queue limits during a table swap, when updating an
+immutable request-based dm device (dm-multipath) during a noflush
+suspend. It is userspace's responsibility to make sure that the new
+table uses the same limits as the existing table if it asks for a
+noflush suspend.
+
+Signed-off-by: Benjamin Marzinski <bmarzins@redhat.com>
+Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+Acked-by: Martin Wilck <mwilck@suse.com>
+---
+ drivers/md/dm-table.c |    4 ++++
+ drivers/md/dm-thin.c  |    7 ++-----
+ drivers/md/dm.c       |   35 +++++++++++++++++++++++------------
+ 3 files changed, 29 insertions(+), 17 deletions(-)
+
+--- a/drivers/md/dm-table.c
++++ b/drivers/md/dm-table.c
+@@ -1875,6 +1875,10 @@ bool dm_table_supports_size_change(struc
+ 	return true;
+ }
+ 
++/*
++ * This function will be skipped by noflush reloads of immutable request
++ * based devices (dm-mpath).
++ */
+ int dm_table_set_restrictions(struct dm_table *t, struct request_queue *q,
+ 			      struct queue_limits *limits)
+ {
+--- a/drivers/md/dm-thin.c
++++ b/drivers/md/dm-thin.c
+@@ -4383,11 +4383,8 @@ static void thin_postsuspend(struct dm_t
+ {
+ 	struct thin_c *tc = ti->private;
+ 
+-	/*
+-	 * The dm_noflush_suspending flag has been cleared by now, so
+-	 * unfortunately we must always run this.
+-	 */
+-	noflush_work(tc, do_noflush_stop);
++	if (dm_noflush_suspending(ti))
++		noflush_work(tc, do_noflush_stop);
+ }
+ 
+ static int thin_preresume(struct dm_target *ti)
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@ -2444,7 +2444,6 @@ static struct dm_table *__bind(struct ma
+ {
+ 	struct dm_table *old_map;
+ 	sector_t size, old_size;
+-	int ret;
+ 
+ 	lockdep_assert_held(&md->suspend_lock);
+ 
+@@ -2459,11 +2458,13 @@ static struct dm_table *__bind(struct ma
+ 
+ 	set_capacity(md->disk, size);
+ 
+-	ret = dm_table_set_restrictions(t, md->queue, limits);
+-	if (ret) {
+-		set_capacity(md->disk, old_size);
+-		old_map = ERR_PTR(ret);
+-		goto out;
++	if (limits) {
++		int ret = dm_table_set_restrictions(t, md->queue, limits);
++		if (ret) {
++			set_capacity(md->disk, old_size);
++			old_map = ERR_PTR(ret);
++			goto out;
++		}
+ 	}
+ 
+ 	/*
+@@ -2841,6 +2842,7 @@ static void dm_wq_work(struct work_struc
+ 
+ static void dm_queue_flush(struct mapped_device *md)
+ {
++	clear_bit(DMF_NOFLUSH_SUSPENDING, &md->flags);
+ 	clear_bit(DMF_BLOCK_IO_FOR_SUSPEND, &md->flags);
+ 	smp_mb__after_atomic();
+ 	queue_work(md->wq, &md->work);
+@@ -2853,6 +2855,7 @@ struct dm_table *dm_swap_table(struct ma
+ {
+ 	struct dm_table *live_map = NULL, *map = ERR_PTR(-EINVAL);
+ 	struct queue_limits limits;
++	bool update_limits = true;
+ 	int r;
+ 
+ 	mutex_lock(&md->suspend_lock);
+@@ -2862,19 +2865,30 @@ struct dm_table *dm_swap_table(struct ma
+ 		goto out;
+ 
+ 	/*
++	 * To avoid a potential deadlock locking the queue limits, disallow
++	 * updating the queue limits during a table swap, when updating an
++	 * immutable request-based dm device (dm-multipath) during a noflush
++	 * suspend. It is userspace's responsibility to make sure that the new
++	 * table uses the same limits as the existing table, if it asks for a
++	 * noflush suspend.
++	 */
++	if (dm_request_based(md) && md->immutable_target &&
++	    __noflush_suspending(md))
++		update_limits = false;
++	/*
+ 	 * If the new table has no data devices, retain the existing limits.
+ 	 * This helps multipath with queue_if_no_path if all paths disappear,
+ 	 * then new I/O is queued based on these limits, and then some paths
+ 	 * reappear.
+ 	 */
+-	if (dm_table_has_no_data_devices(table)) {
++	else if (dm_table_has_no_data_devices(table)) {
+ 		live_map = dm_get_live_table_fast(md);
+ 		if (live_map)
+ 			limits = md->queue->limits;
+ 		dm_put_live_table_fast(md);
+ 	}
+ 
+-	if (!live_map) {
++	if (update_limits && !live_map) {
+ 		r = dm_calculate_queue_limits(table, &limits);
+ 		if (r) {
+ 			map = ERR_PTR(r);
+@@ -2882,7 +2896,7 @@ struct dm_table *dm_swap_table(struct ma
+ 		}
+ 	}
+ 
+-	map = __bind(md, table, &limits);
++	map = __bind(md, table, update_limits ? &limits : NULL);
+ 	dm_issue_global_event();
+ 
+ out:
+@@ -2935,7 +2949,6 @@ static int __dm_suspend(struct mapped_de
+ 
+ 	/*
+ 	 * DMF_NOFLUSH_SUSPENDING must be set before presuspend.
+-	 * This flag is cleared before dm_suspend returns.
+ 	 */
+ 	if (noflush)
+ 		set_bit(DMF_NOFLUSH_SUSPENDING, &md->flags);
+@@ -2998,8 +3011,6 @@ static int __dm_suspend(struct mapped_de
+ 	if (!r)
+ 		set_bit(dmf_suspended_flag, &md->flags);
+ 
+-	if (noflush)
+-		clear_bit(DMF_NOFLUSH_SUSPENDING, &md->flags);
+ 	if (map)
+ 		synchronize_srcu(&md->io_barrier);
+ 
