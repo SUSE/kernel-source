@@ -1,0 +1,132 @@
+From: Jacob Keller <jacob.e.keller@intel.com>
+Date: Wed, 18 Jun 2025 15:24:36 -0700
+Subject: ice: add support for reading and unpacking Rx queue context
+Patch-mainline: v6.17-rc1
+Git-commit: ef41603d09f124fcebb86bcc4a648ffafbfa120b
+References: jsc#PED-14404 jsc#PED-15079
+
+In order to support live migration, the ice driver will need to read
+certain data from the Rx queue context. This is stored in the hardware in a
+packed format.
+
+Since we use <linux/packing.h> for the mapping between the packed hardware
+format and the unpacked structure, it is trivial to enable unpacking
+support via the unpack_fields() function.
+
+Add the ice_unpack_rxq_ctx() function based on the unpack_fields() API.
+Re-use the same field definitions from the packing implementation.
+
+Add ice_copy_rxq_ctx_from_hw() to copy the Rx queue context data from the
+hardware registers.
+
+Use these to implement ice_read_rxq_ctx() which will return the Rx queue
+context to the caller in its unpacked ice_rlan_ctx struct.
+
+This will enable the migration logic access to the relevant data about the
+Rx device queues. It can easily be copied to the target system as part of
+the migration payload, where it will be used to configure the Rx queues.
+
+Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+Reviewed-by: Madhu Chittim <madhu.chittim@intel.com>
+Reviewed-by: Przemek Kitszel <przemyslaw.kitszel@intel.com>
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/ice/ice_common.c |   60 ++++++++++++++++++++++++++++
+ drivers/net/ethernet/intel/ice/ice_common.h |    2 
+ 2 files changed, 62 insertions(+)
+
+--- a/drivers/net/ethernet/intel/ice/ice_common.c
++++ b/drivers/net/ethernet/intel/ice/ice_common.c
+@@ -1342,6 +1342,26 @@ static void ice_copy_rxq_ctx_to_hw(struc
+ 	}
+ }
+ 
++/**
++ * ice_copy_rxq_ctx_from_hw - Copy packed Rx Queue context from HW registers
++ * @hw: pointer to the hardware structure
++ * @rxq_ctx: pointer to the packed Rx queue context
++ * @rxq_index: the index of the Rx queue
++ */
++static void ice_copy_rxq_ctx_from_hw(struct ice_hw *hw,
++				     ice_rxq_ctx_buf_t *rxq_ctx,
++				     u32 rxq_index)
++{
++	u32 *ctx = (u32 *)rxq_ctx;
++
++	/* Copy each dword separately from HW */
++	for (int i = 0; i < ICE_RXQ_CTX_SIZE_DWORDS; i++, ctx++) {
++		*ctx = rd32(hw, QRX_CONTEXT(i, rxq_index));
++
++		ice_debug(hw, ICE_DBG_QCTX, "qrxdata[%d]: %08X\n", i, *ctx);
++	}
++}
++
+ #define ICE_CTX_STORE(struct_name, struct_field, width, lsb) \
+ 	PACKED_FIELD((lsb) + (width) - 1, (lsb), struct struct_name, struct_field)
+ 
+@@ -1386,6 +1406,21 @@ static void ice_pack_rxq_ctx(const struc
+ }
+ 
+ /**
++ * ice_unpack_rxq_ctx - Unpack Rx queue context from a HW buffer
++ * @buf: the HW buffer to unpack from
++ * @ctx: the Rx queue context to unpack
++ *
++ * Unpack the Rx queue context from the HW buffer into the CPU-friendly
++ * structure.
++ */
++static void ice_unpack_rxq_ctx(const ice_rxq_ctx_buf_t *buf,
++			       struct ice_rlan_ctx *ctx)
++{
++	unpack_fields(buf, sizeof(*buf), ctx, ice_rlan_ctx_fields,
++		      QUIRK_LITTLE_ENDIAN | QUIRK_LSW32_IS_FIRST);
++}
++
++/**
+  * ice_write_rxq_ctx - Write Rx Queue context to hardware
+  * @hw: pointer to the hardware structure
+  * @rlan_ctx: pointer to the unpacked Rx queue context
+@@ -1409,6 +1444,31 @@ int ice_write_rxq_ctx(struct ice_hw *hw,
+ 
+ 	return 0;
+ }
++
++/**
++ * ice_read_rxq_ctx - Read Rx queue context from HW
++ * @hw: pointer to the hardware structure
++ * @rlan_ctx: pointer to the Rx queue context
++ * @rxq_index: the index of the Rx queue
++ *
++ * Read the Rx queue context from the hardware registers, and unpack it into
++ * the sparse Rx queue context structure.
++ *
++ * Returns: 0 on success, or -EINVAL if the Rx queue index is invalid.
++ */
++int ice_read_rxq_ctx(struct ice_hw *hw, struct ice_rlan_ctx *rlan_ctx,
++		     u32 rxq_index)
++{
++	ice_rxq_ctx_buf_t buf = {};
++
++	if (rxq_index > QRX_CTRL_MAX_INDEX)
++		return -EINVAL;
++
++	ice_copy_rxq_ctx_from_hw(hw, &buf, rxq_index);
++	ice_unpack_rxq_ctx(&buf, rlan_ctx);
++
++	return 0;
++}
+ 
+ /* LAN Tx Queue Context */
+ static const struct packed_field_u8 ice_tlan_ctx_fields[] = {
+--- a/drivers/net/ethernet/intel/ice/ice_common.h
++++ b/drivers/net/ethernet/intel/ice/ice_common.h
+@@ -118,6 +118,8 @@ void ice_set_safe_mode_caps(struct ice_h
+ 
+ int ice_write_rxq_ctx(struct ice_hw *hw, struct ice_rlan_ctx *rlan_ctx,
+ 		      u32 rxq_index);
++int ice_read_rxq_ctx(struct ice_hw *hw, struct ice_rlan_ctx *rlan_ctx,
++		     u32 rxq_index);
+ 
+ int
+ ice_aq_get_rss_lut(struct ice_hw *hw, struct ice_aq_get_set_rss_lut_params *get_params);
