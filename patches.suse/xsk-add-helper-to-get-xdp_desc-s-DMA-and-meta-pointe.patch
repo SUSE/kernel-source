@@ -1,0 +1,210 @@
+From: Alexander Lobakin <aleksander.lobakin@intel.com>
+Date: Thu, 6 Feb 2025 19:26:29 +0100
+Subject: xsk: add helper to get &xdp_desc's DMA and meta pointer in one go
+Patch-mainline: v6.15-rc1
+Git-commit: 23d9324a27a48858cfdd7f0342f52328e8595c6d
+References: jsc#PED-14404 jsc#PED-15079
+
+Currently, when your driver supports XSk Tx metadata and you want to
+send an XSk frame, you need to do the following:
+
+* call external xsk_buff_raw_get_dma();
+* call inline xsk_buff_get_metadata(), which calls external
+  xsk_buff_raw_get_data() and then do some inline checks.
+
+This effectively means that the following piece:
+
+addr = pool->unaligned ? xp_unaligned_add_offset_to_addr(addr) : addr;
+
+is done twice per frame, plus you have 2 external calls per frame, plus
+this:
+
+	meta = pool->addrs + addr - pool->tx_metadata_len;
+	if (unlikely(!xsk_buff_valid_tx_metadata(meta)))
+
+is always inlined, even if there's no meta or it's invalid.
+
+Add xsk_buff_raw_get_ctx() (xp_raw_get_ctx() to be precise) to do that
+in one go. It returns a small structure with 2 fields: DMA address,
+filled unconditionally, and metadata pointer, non-NULL only if it's
+present and valid. The address correction is performed only once and
+you also have only 1 external call per XSk frame, which does all the
+calculations and checks outside of your hotpath. You only need to
+check `if (ctx.meta)` for the metadata presence.
+To not copy any existing code, derive address correction and getting
+virtual and DMA address into small helpers. bloat-o-meter reports no
+object code changes for the existing functionality.
+
+Signed-off-by: Alexander Lobakin <aleksander.lobakin@intel.com>
+Link: https://patch.msgid.link/20250206182630.3914318-5-aleksander.lobakin@intel.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/net/xdp_sock_drv.h  |   43 ++++++++++++++++++++++++++++++++++++++---
+ include/net/xsk_buff_pool.h |    8 +++++++
+ net/xdp/xsk_buff_pool.c     |   46 ++++++++++++++++++++++++++++++++++++++++----
+ 3 files changed, 90 insertions(+), 7 deletions(-)
+
+--- a/include/net/xdp_sock_drv.h
++++ b/include/net/xdp_sock_drv.h
+@@ -196,6 +196,23 @@ static inline void *xsk_buff_raw_get_dat
+ 	return xp_raw_get_data(pool, addr);
+ }
+ 
++/**
++ * xsk_buff_raw_get_ctx - get &xdp_desc context
++ * @pool: XSk buff pool desc address belongs to
++ * @addr: desc address (from userspace)
++ *
++ * Wrapper for xp_raw_get_ctx() to be used in drivers, see its kdoc for
++ * details.
++ *
++ * Return: new &xdp_desc_ctx struct containing desc's DMA address and metadata
++ * pointer, if it is present and valid (initialized to %NULL otherwise).
++ */
++static inline struct xdp_desc_ctx
++xsk_buff_raw_get_ctx(const struct xsk_buff_pool *pool, u64 addr)
++{
++	return xp_raw_get_ctx(pool, addr);
++}
++
+ #define XDP_TXMD_FLAGS_VALID ( \
+ 		XDP_TXMD_FLAGS_TIMESTAMP | \
+ 		XDP_TXMD_FLAGS_CHECKSUM | \
+@@ -207,20 +224,27 @@ xsk_buff_valid_tx_metadata(const struct
+ 	return !(meta->flags & ~XDP_TXMD_FLAGS_VALID);
+ }
+ 
+-static inline struct xsk_tx_metadata *xsk_buff_get_metadata(struct xsk_buff_pool *pool, u64 addr)
++static inline struct xsk_tx_metadata *
++__xsk_buff_get_metadata(const struct xsk_buff_pool *pool, void *data)
+ {
+ 	struct xsk_tx_metadata *meta;
+ 
+ 	if (!pool->tx_metadata_len)
+ 		return NULL;
+ 
+-	meta = xp_raw_get_data(pool, addr) - pool->tx_metadata_len;
++	meta = data - pool->tx_metadata_len;
+ 	if (unlikely(!xsk_buff_valid_tx_metadata(meta)))
+ 		return NULL; /* no way to signal the error to the user */
+ 
+ 	return meta;
+ }
+ 
++static inline struct xsk_tx_metadata *
++xsk_buff_get_metadata(struct xsk_buff_pool *pool, u64 addr)
++{
++	return __xsk_buff_get_metadata(pool, xp_raw_get_data(pool, addr));
++}
++
+ static inline void xsk_buff_dma_sync_for_cpu(struct xdp_buff *xdp)
+ {
+ 	struct xdp_buff_xsk *xskb = container_of(xdp, struct xdp_buff_xsk, xdp);
+@@ -388,12 +412,25 @@ static inline void *xsk_buff_raw_get_dat
+ 	return NULL;
+ }
+ 
++static inline struct xdp_desc_ctx
++xsk_buff_raw_get_ctx(const struct xsk_buff_pool *pool, u64 addr)
++{
++	return (struct xdp_desc_ctx){ };
++}
++
+ static inline bool xsk_buff_valid_tx_metadata(struct xsk_tx_metadata *meta)
+ {
+ 	return false;
+ }
+ 
+-static inline struct xsk_tx_metadata *xsk_buff_get_metadata(struct xsk_buff_pool *pool, u64 addr)
++static inline struct xsk_tx_metadata *
++__xsk_buff_get_metadata(const struct xsk_buff_pool *pool, void *data)
++{
++	return NULL;
++}
++
++static inline struct xsk_tx_metadata *
++xsk_buff_get_metadata(struct xsk_buff_pool *pool, u64 addr)
+ {
+ 	return NULL;
+ }
+--- a/include/net/xsk_buff_pool.h
++++ b/include/net/xsk_buff_pool.h
+@@ -142,6 +142,14 @@ u32 xp_alloc_batch(struct xsk_buff_pool
+ bool xp_can_alloc(struct xsk_buff_pool *pool, u32 count);
+ void *xp_raw_get_data(struct xsk_buff_pool *pool, u64 addr);
+ dma_addr_t xp_raw_get_dma(struct xsk_buff_pool *pool, u64 addr);
++
++struct xdp_desc_ctx {
++	dma_addr_t dma;
++	struct xsk_tx_metadata *meta;
++};
++
++struct xdp_desc_ctx xp_raw_get_ctx(const struct xsk_buff_pool *pool, u64 addr);
++
+ static inline dma_addr_t xp_get_dma(struct xdp_buff_xsk *xskb)
+ {
+ 	return xskb->dma;
+--- a/net/xdp/xsk_buff_pool.c
++++ b/net/xdp/xsk_buff_pool.c
+@@ -694,18 +694,56 @@ void xp_free(struct xdp_buff_xsk *xskb)
+ }
+ EXPORT_SYMBOL(xp_free);
+ 
+-void *xp_raw_get_data(struct xsk_buff_pool *pool, u64 addr)
++static u64 __xp_raw_get_addr(const struct xsk_buff_pool *pool, u64 addr)
++{
++	return pool->unaligned ? xp_unaligned_add_offset_to_addr(addr) : addr;
++}
++
++static void *__xp_raw_get_data(const struct xsk_buff_pool *pool, u64 addr)
+ {
+-	addr = pool->unaligned ? xp_unaligned_add_offset_to_addr(addr) : addr;
+ 	return pool->addrs + addr;
+ }
++
++void *xp_raw_get_data(struct xsk_buff_pool *pool, u64 addr)
++{
++	return __xp_raw_get_data(pool, __xp_raw_get_addr(pool, addr));
++}
+ EXPORT_SYMBOL(xp_raw_get_data);
+ 
+-dma_addr_t xp_raw_get_dma(struct xsk_buff_pool *pool, u64 addr)
++static dma_addr_t __xp_raw_get_dma(const struct xsk_buff_pool *pool, u64 addr)
+ {
+-	addr = pool->unaligned ? xp_unaligned_add_offset_to_addr(addr) : addr;
+ 	return (pool->dma_pages[addr >> PAGE_SHIFT] &
+ 		~XSK_NEXT_PG_CONTIG_MASK) +
+ 		(addr & ~PAGE_MASK);
+ }
++
++dma_addr_t xp_raw_get_dma(struct xsk_buff_pool *pool, u64 addr)
++{
++	return __xp_raw_get_dma(pool, __xp_raw_get_addr(pool, addr));
++}
+ EXPORT_SYMBOL(xp_raw_get_dma);
++
++/**
++ * xp_raw_get_ctx - get &xdp_desc context
++ * @pool: XSk buff pool desc address belongs to
++ * @addr: desc address (from userspace)
++ *
++ * Helper for getting desc's DMA address and metadata pointer, if present.
++ * Saves one call on hotpath, double calculation of the actual address,
++ * and inline checks for metadata presence and sanity.
++ *
++ * Return: new &xdp_desc_ctx struct containing desc's DMA address and metadata
++ * pointer, if it is present and valid (initialized to %NULL otherwise).
++ */
++struct xdp_desc_ctx xp_raw_get_ctx(const struct xsk_buff_pool *pool, u64 addr)
++{
++	struct xdp_desc_ctx ret;
++
++	addr = __xp_raw_get_addr(pool, addr);
++
++	ret.dma = __xp_raw_get_dma(pool, addr);
++	ret.meta = __xsk_buff_get_metadata(pool, __xp_raw_get_data(pool, addr));
++
++	return ret;
++}
++EXPORT_SYMBOL(xp_raw_get_ctx);
