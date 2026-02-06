@@ -1,0 +1,135 @@
+From: Alexander Lobakin <aleksander.lobakin@intel.com>
+Date: Tue, 26 Aug 2025 17:55:07 +0200
+Subject: idpf: add XDP RSS hash hint
+Patch-mainline: v6.18-rc1
+Git-commit: 88ca0c738c4159ce87893782b6dd964b5aa01f6e
+References: jsc#PED-14403
+
+Add &xdp_metadata_ops with a callback to get RSS hash hint from the
+descriptor. Declare the splitq 32-byte descriptor as 4 u64s to parse
+them more efficiently when possible.
+
+Signed-off-by: Alexander Lobakin <aleksander.lobakin@intel.com>
+Tested-by: Ramu R <ramu.r@intel.com>
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/idpf/xdp.c |   28 ++++++++++++++
+ drivers/net/ethernet/intel/idpf/xdp.h |   64 ++++++++++++++++++++++++++++++++++
+ 2 files changed, 91 insertions(+), 1 deletion(-)
+
+--- a/drivers/net/ethernet/intel/idpf/xdp.c
++++ b/drivers/net/ethernet/intel/idpf/xdp.c
+@@ -342,12 +342,38 @@ int idpf_xdp_xmit(struct net_device *dev
+ 				       idpf_xdp_tx_finalize);
+ }
+ 
++static int idpf_xdpmo_rx_hash(const struct xdp_md *ctx, u32 *hash,
++			      enum xdp_rss_hash_type *rss_type)
++{
++	const struct libeth_xdp_buff *xdp = (typeof(xdp))ctx;
++	struct idpf_xdp_rx_desc desc __uninitialized;
++	const struct idpf_rx_queue *rxq;
++	struct libeth_rx_pt pt;
++
++	rxq = libeth_xdp_buff_to_rq(xdp, typeof(*rxq), xdp_rxq);
++
++	idpf_xdp_get_qw0(&desc, xdp->desc);
++
++	pt = rxq->rx_ptype_lkup[idpf_xdp_rx_pt(&desc)];
++	if (!libeth_rx_pt_has_hash(rxq->xdp_rxq.dev, pt))
++		return -ENODATA;
++
++	idpf_xdp_get_qw2(&desc, xdp->desc);
++
++	return libeth_xdpmo_rx_hash(hash, rss_type, idpf_xdp_rx_hash(&desc),
++				    pt);
++}
++
++static const struct xdp_metadata_ops idpf_xdpmo = {
++	.xmo_rx_hash		= idpf_xdpmo_rx_hash,
++};
++
+ void idpf_xdp_set_features(const struct idpf_vport *vport)
+ {
+ 	if (!idpf_is_queue_model_split(vport->rxq_model))
+ 		return;
+ 
+-	libeth_xdp_set_features_noredir(vport->netdev);
++	libeth_xdp_set_features_noredir(vport->netdev, &idpf_xdpmo);
+ }
+ 
+ static int idpf_xdp_setup_prog(struct idpf_vport *vport,
+--- a/drivers/net/ethernet/intel/idpf/xdp.h
++++ b/drivers/net/ethernet/intel/idpf/xdp.h
+@@ -99,6 +99,70 @@ static inline void idpf_xdp_tx_finalize(
+ 	libeth_xdpsq_unlock(&xdpsq->xdp_lock);
+ }
+ 
++struct idpf_xdp_rx_desc {
++	aligned_u64		qw0;
++#define IDPF_XDP_RX_BUFQ	BIT_ULL(47)
++#define IDPF_XDP_RX_GEN		BIT_ULL(46)
++#define IDPF_XDP_RX_LEN		GENMASK_ULL(45, 32)
++#define IDPF_XDP_RX_PT		GENMASK_ULL(25, 16)
++
++	aligned_u64		qw1;
++#define IDPF_XDP_RX_BUF		GENMASK_ULL(47, 32)
++#define IDPF_XDP_RX_EOP		BIT_ULL(1)
++
++	aligned_u64		qw2;
++#define IDPF_XDP_RX_HASH	GENMASK_ULL(31, 0)
++
++	aligned_u64		qw3;
++} __aligned(4 * sizeof(u64));
++static_assert(sizeof(struct idpf_xdp_rx_desc) ==
++	      sizeof(struct virtchnl2_rx_flex_desc_adv_nic_3));
++
++#define idpf_xdp_rx_bufq(desc)	!!((desc)->qw0 & IDPF_XDP_RX_BUFQ)
++#define idpf_xdp_rx_gen(desc)	!!((desc)->qw0 & IDPF_XDP_RX_GEN)
++#define idpf_xdp_rx_len(desc)	FIELD_GET(IDPF_XDP_RX_LEN, (desc)->qw0)
++#define idpf_xdp_rx_pt(desc)	FIELD_GET(IDPF_XDP_RX_PT, (desc)->qw0)
++#define idpf_xdp_rx_buf(desc)	FIELD_GET(IDPF_XDP_RX_BUF, (desc)->qw1)
++#define idpf_xdp_rx_eop(desc)	!!((desc)->qw1 & IDPF_XDP_RX_EOP)
++#define idpf_xdp_rx_hash(desc)	FIELD_GET(IDPF_XDP_RX_HASH, (desc)->qw2)
++
++static inline void
++idpf_xdp_get_qw0(struct idpf_xdp_rx_desc *desc,
++		 const struct virtchnl2_rx_flex_desc_adv_nic_3 *rxd)
++{
++#ifdef __LIBETH_WORD_ACCESS
++	desc->qw0 = ((const typeof(desc))rxd)->qw0;
++#else
++	desc->qw0 = ((u64)le16_to_cpu(rxd->pktlen_gen_bufq_id) << 32) |
++		    ((u64)le16_to_cpu(rxd->ptype_err_fflags0) << 16);
++#endif
++}
++
++static inline void
++idpf_xdp_get_qw1(struct idpf_xdp_rx_desc *desc,
++		 const struct virtchnl2_rx_flex_desc_adv_nic_3 *rxd)
++{
++#ifdef __LIBETH_WORD_ACCESS
++	desc->qw1 = ((const typeof(desc))rxd)->qw1;
++#else
++	desc->qw1 = ((u64)le16_to_cpu(rxd->buf_id) << 32) |
++		    rxd->status_err0_qw1;
++#endif
++}
++
++static inline void
++idpf_xdp_get_qw2(struct idpf_xdp_rx_desc *desc,
++		 const struct virtchnl2_rx_flex_desc_adv_nic_3 *rxd)
++{
++#ifdef __LIBETH_WORD_ACCESS
++	desc->qw2 = ((const typeof(desc))rxd)->qw2;
++#else
++	desc->qw2 = ((u64)rxd->hash3 << 24) |
++		    ((u64)rxd->ff2_mirrid_hash2.hash2 << 16) |
++		    le16_to_cpu(rxd->hash1);
++#endif
++}
++
+ void idpf_xdp_set_features(const struct idpf_vport *vport);
+ 
+ int idpf_xdp(struct net_device *dev, struct netdev_bpf *xdp);
