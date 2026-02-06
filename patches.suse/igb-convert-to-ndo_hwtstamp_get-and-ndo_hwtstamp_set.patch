@@ -1,0 +1,154 @@
+From: Vladimir Oltean <vladimir.oltean@nxp.com>
+Date: Tue, 13 May 2025 13:11:30 +0300
+Subject: igb: convert to ndo_hwtstamp_get() and ndo_hwtstamp_set()
+Patch-mainline: v6.17-rc1
+Git-commit: b88428d3fc55a0beb88d4439f5f269b57de3a92f
+References: sc#PED-15065 jsc#PED-14410 jsc#PED-14408
+
+New timestamping API was introduced in commit 66f7223039c0 ("net: add
+NDOs for configuring hardware timestamping") from kernel v6.6.
+
+It is time to convert the Intel igb driver to the new API, so that
+timestamping configuration can be removed from the ndo_eth_ioctl() path
+completely.
+
+Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Reviewed-by: Vadim Fedorenko <vadim.fedorenko@linux.dev>
+Reviewed-by: Milena Olech <milena.olech@intel.com>
+Tested-by: Rinitha S <sx.rinitha@intel.com> (A Contingent worker at Intel)
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/igb/igb.h      |    9 ++++---
+ drivers/net/ethernet/intel/igb/igb_main.c |    6 +---
+ drivers/net/ethernet/intel/igb/igb_ptp.c  |   37 +++++++++++++-----------------
+ 3 files changed, 25 insertions(+), 27 deletions(-)
+
+--- a/drivers/net/ethernet/intel/igb/igb.h
++++ b/drivers/net/ethernet/intel/igb/igb.h
+@@ -626,7 +626,7 @@ struct igb_adapter {
+ 	struct delayed_work ptp_overflow_work;
+ 	struct work_struct ptp_tx_work;
+ 	struct sk_buff *ptp_tx_skb;
+-	struct hwtstamp_config tstamp_config;
++	struct kernel_hwtstamp_config tstamp_config;
+ 	unsigned long ptp_tx_start;
+ 	unsigned long last_rx_ptp_check;
+ 	unsigned long last_rx_timestamp;
+@@ -771,8 +771,11 @@ void igb_ptp_tx_hang(struct igb_adapter
+ void igb_ptp_rx_rgtstamp(struct igb_q_vector *q_vector, struct sk_buff *skb);
+ int igb_ptp_rx_pktstamp(struct igb_q_vector *q_vector, void *va,
+ 			ktime_t *timestamp);
+-int igb_ptp_set_ts_config(struct net_device *netdev, struct ifreq *ifr);
+-int igb_ptp_get_ts_config(struct net_device *netdev, struct ifreq *ifr);
++int igb_ptp_hwtstamp_get(struct net_device *netdev,
++			 struct kernel_hwtstamp_config *config);
++int igb_ptp_hwtstamp_set(struct net_device *netdev,
++			 struct kernel_hwtstamp_config *config,
++			 struct netlink_ext_ack *extack);
+ void igb_set_flag_queue_pairs(struct igb_adapter *, const u32);
+ unsigned int igb_get_max_rss_queues(struct igb_adapter *);
+ #ifdef CONFIG_IGB_HWMON
+--- a/drivers/net/ethernet/intel/igb/igb_main.c
++++ b/drivers/net/ethernet/intel/igb/igb_main.c
+@@ -3062,6 +3062,8 @@ static const struct net_device_ops igb_n
+ 	.ndo_bpf		= igb_xdp,
+ 	.ndo_xdp_xmit		= igb_xdp_xmit,
+ 	.ndo_xsk_wakeup         = igb_xsk_wakeup,
++	.ndo_hwtstamp_get	= igb_ptp_hwtstamp_get,
++	.ndo_hwtstamp_set	= igb_ptp_hwtstamp_set,
+ };
+ 
+ /**
+@@ -9315,10 +9317,6 @@ static int igb_ioctl(struct net_device *
+ 	case SIOCGMIIREG:
+ 	case SIOCSMIIREG:
+ 		return igb_mii_ioctl(netdev, ifr, cmd);
+-	case SIOCGHWTSTAMP:
+-		return igb_ptp_get_ts_config(netdev, ifr);
+-	case SIOCSHWTSTAMP:
+-		return igb_ptp_set_ts_config(netdev, ifr);
+ 	default:
+ 		return -EOPNOTSUPP;
+ 	}
+--- a/drivers/net/ethernet/intel/igb/igb_ptp.c
++++ b/drivers/net/ethernet/intel/igb/igb_ptp.c
+@@ -1108,21 +1108,22 @@ void igb_ptp_rx_rgtstamp(struct igb_q_ve
+ }
+ 
+ /**
+- * igb_ptp_get_ts_config - get hardware time stamping config
++ * igb_ptp_hwtstamp_get - get hardware time stamping config
+  * @netdev: netdev struct
+- * @ifr: interface struct
++ * @config: timestamping configuration structure
+  *
+  * Get the hwtstamp_config settings to return to the user. Rather than attempt
+  * to deconstruct the settings from the registers, just return a shadow copy
+  * of the last known settings.
+  **/
+-int igb_ptp_get_ts_config(struct net_device *netdev, struct ifreq *ifr)
++int igb_ptp_hwtstamp_get(struct net_device *netdev,
++			 struct kernel_hwtstamp_config *config)
+ {
+ 	struct igb_adapter *adapter = netdev_priv(netdev);
+-	struct hwtstamp_config *config = &adapter->tstamp_config;
+ 
+-	return copy_to_user(ifr->ifr_data, config, sizeof(*config)) ?
+-		-EFAULT : 0;
++	*config = adapter->tstamp_config;
++
++	return 0;
+ }
+ 
+ /**
+@@ -1143,7 +1144,7 @@ int igb_ptp_get_ts_config(struct net_dev
+  * level 2 or 4".
+  */
+ static int igb_ptp_set_timestamp_mode(struct igb_adapter *adapter,
+-				      struct hwtstamp_config *config)
++				      struct kernel_hwtstamp_config *config)
+ {
+ 	struct e1000_hw *hw = &adapter->hw;
+ 	u32 tsync_tx_ctl = E1000_TSYNCTXCTL_ENABLED;
+@@ -1289,30 +1290,26 @@ static int igb_ptp_set_timestamp_mode(st
+ }
+ 
+ /**
+- * igb_ptp_set_ts_config - set hardware time stamping config
++ * igb_ptp_hwtstamp_set - set hardware time stamping config
+  * @netdev: netdev struct
+- * @ifr: interface struct
+- *
++ * @config: timestamping configuration structure
++ * @extack: netlink extended ack structure for error reporting
+  **/
+-int igb_ptp_set_ts_config(struct net_device *netdev, struct ifreq *ifr)
++int igb_ptp_hwtstamp_set(struct net_device *netdev,
++			 struct kernel_hwtstamp_config *config,
++			 struct netlink_ext_ack *extack)
+ {
+ 	struct igb_adapter *adapter = netdev_priv(netdev);
+-	struct hwtstamp_config config;
+ 	int err;
+ 
+-	if (copy_from_user(&config, ifr->ifr_data, sizeof(config)))
+-		return -EFAULT;
+-
+-	err = igb_ptp_set_timestamp_mode(adapter, &config);
++	err = igb_ptp_set_timestamp_mode(adapter, config);
+ 	if (err)
+ 		return err;
+ 
+ 	/* save these settings for future reference */
+-	memcpy(&adapter->tstamp_config, &config,
+-	       sizeof(adapter->tstamp_config));
++	adapter->tstamp_config = *config;
+ 
+-	return copy_to_user(ifr->ifr_data, &config, sizeof(config)) ?
+-		-EFAULT : 0;
++	return 0;
+ }
+ 
+ /**
