@@ -1,0 +1,82 @@
+From: Takashi Sakamoto <o-takashi@sakamocchi.jp>
+Date: Wed, 28 Jan 2026 07:34:13 +0900
+Subject: [PATCH] firewire: core: fix race condition against transaction list
+References: bsc#1012628
+Patch-mainline: 6.18.9
+Git-commit: 20e01bba2ae4898ce65cdcacd1bd6bec5111abd9
+
+commit 20e01bba2ae4898ce65cdcacd1bd6bec5111abd9 upstream.
+
+The list of transaction is enumerated without acquiring card lock when
+processing AR response event. This causes a race condition bug when
+processing AT request completion event concurrently.
+
+This commit fixes the bug by put timer start for split transaction
+expiration into the scope of lock. The value of jiffies in card structure
+is referred before acquiring the lock.
+
+Cc: stable@vger.kernel.org # v6.18
+Fixes: b5725cfa4120 ("firewire: core: use spin lock specific to timer for split transaction")
+Reported-by: Andreas Persson <andreasp56@outlook.com>
+Closes: https://github.com/alsa-project/snd-firewire-ctl-services/issues/209
+Tested-by: Andreas Persson <andreasp56@outlook.com>
+Link: https://lore.kernel.org/r/20260127223413.22265-1-o-takashi@sakamocchi.jp
+Signed-off-by: Takashi Sakamoto <o-takashi@sakamocchi.jp>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/firewire/core-transaction.c | 19 ++++++++++---------
+ 1 file changed, 10 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/firewire/core-transaction.c b/drivers/firewire/core-transaction.c
+index c65f491c54d0..2e797430332c 100644
+--- a/drivers/firewire/core-transaction.c
++++ b/drivers/firewire/core-transaction.c
+@@ -134,20 +134,14 @@ static void split_transaction_timeout_callback(struct timer_list *timer)
+ 	}
+ }
+ 
+-static void start_split_transaction_timeout(struct fw_transaction *t,
+-					    struct fw_card *card)
++// card->transactions.lock should be acquired in advance for the linked list.
++static void start_split_transaction_timeout(struct fw_transaction *t, unsigned int delta)
+ {
+-	unsigned long delta;
+-
+ 	if (list_empty(&t->link) || WARN_ON(t->is_split_transaction))
+ 		return;
+ 
+ 	t->is_split_transaction = true;
+ 
+-	// NOTE: This can be without irqsave when we can guarantee that __fw_send_request() for
+-	// local destination never runs in any type of IRQ context.
+-	scoped_guard(spinlock_irqsave, &card->split_timeout.lock)
+-		delta = card->split_timeout.jiffies;
+ 	mod_timer(&t->split_timeout_timer, jiffies + delta);
+ }
+ 
+@@ -168,13 +162,20 @@ static void transmit_complete_callback(struct fw_packet *packet,
+ 		break;
+ 	case ACK_PENDING:
+ 	{
++		unsigned int delta;
++
+ 		// NOTE: This can be without irqsave when we can guarantee that __fw_send_request() for
+ 		// local destination never runs in any type of IRQ context.
+ 		scoped_guard(spinlock_irqsave, &card->split_timeout.lock) {
+ 			t->split_timeout_cycle =
+ 				compute_split_timeout_timestamp(card, packet->timestamp) & 0xffff;
++			delta = card->split_timeout.jiffies;
+ 		}
+-		start_split_transaction_timeout(t, card);
++
++		// NOTE: This can be without irqsave when we can guarantee that __fw_send_request() for
++		// local destination never runs in any type of IRQ context.
++		scoped_guard(spinlock_irqsave, &card->transactions.lock)
++			start_split_transaction_timeout(t, delta);
+ 		break;
+ 	}
+ 	case ACK_BUSY_X:
+-- 
+2.52.0
+

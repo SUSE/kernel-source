@@ -1,0 +1,98 @@
+From: Tvrtko Ursulin <tvrtko.ursulin@igalia.com>
+Date: Fri, 23 Jan 2026 14:15:40 +0000
+Subject: [PATCH] drm: Do not allow userspace to trigger kernel warnings in
+ drm_gem_change_handle_ioctl()
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+References: bsc#1012628
+Patch-mainline: 6.18.9
+Git-commit: 12f15d52d38ac53f7c70ea3d4b3d76afed04e064
+
+commit 12f15d52d38ac53f7c70ea3d4b3d76afed04e064 upstream.
+
+Since GEM bo handles are u32 in the uapi and the internal implementation
+uses idr_alloc() which uses int ranges, passing a new handle larger than
+INT_MAX trivially triggers a kernel warning:
+
+idr_alloc():
+...
+	if (WARN_ON_ONCE(start < 0))
+		return -EINVAL;
+...
+
+Fix it by rejecting new handles above INT_MAX and at the same time make
+the end limit calculation more obvious by moving into int domain.
+
+Signed-off-by: Tvrtko Ursulin <tvrtko.ursulin@igalia.com>
+Reported-by: Zhi Wang <wangzhi@stu.xidian.edu.cn>
+Fixes: 53096728b891 ("drm: Add DRM prime interface to reassign GEM handle")
+Cc: David Francis <David.Francis@amd.com>
+Cc: Felix Kuehling <felix.kuehling@amd.com>
+Cc: Christian König <christian.koenig@amd.com>
+Cc: <stable@vger.kernel.org> # v6.18+
+Tested-by: Harshit Mogalapalli <harshit.m.mogalapalli@oracle.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Tvrtko Ursulin <tursulin@ursulin.net>
+Link: https://lore.kernel.org/r/20260123141540.76540-1-tvrtko.ursulin@igalia.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/gpu/drm/drm_gem.c | 18 ++++++++++++------
+ 1 file changed, 12 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_gem.c b/drivers/gpu/drm/drm_gem.c
+index 3b9df655e837..11e7141c1524 100644
+--- a/drivers/gpu/drm/drm_gem.c
++++ b/drivers/gpu/drm/drm_gem.c
+@@ -970,16 +970,21 @@ int drm_gem_change_handle_ioctl(struct drm_device *dev, void *data,
+ {
+ 	struct drm_gem_change_handle *args = data;
+ 	struct drm_gem_object *obj;
+-	int ret;
++	int handle, ret;
+ 
+ 	if (!drm_core_check_feature(dev, DRIVER_GEM))
+ 		return -EOPNOTSUPP;
+ 
++	/* idr_alloc() limitation. */
++	if (args->new_handle > INT_MAX)
++		return -EINVAL;
++	handle = args->new_handle;
++
+ 	obj = drm_gem_object_lookup(file_priv, args->handle);
+ 	if (!obj)
+ 		return -ENOENT;
+ 
+-	if (args->handle == args->new_handle) {
++	if (args->handle == handle) {
+ 		ret = 0;
+ 		goto out;
+ 	}
+@@ -987,18 +992,19 @@ int drm_gem_change_handle_ioctl(struct drm_device *dev, void *data,
+ 	mutex_lock(&file_priv->prime.lock);
+ 
+ 	spin_lock(&file_priv->table_lock);
+-	ret = idr_alloc(&file_priv->object_idr, obj,
+-		args->new_handle, args->new_handle + 1, GFP_NOWAIT);
++	ret = idr_alloc(&file_priv->object_idr, obj, handle, handle + 1,
++			GFP_NOWAIT);
+ 	spin_unlock(&file_priv->table_lock);
+ 
+ 	if (ret < 0)
+ 		goto out_unlock;
+ 
+ 	if (obj->dma_buf) {
+-		ret = drm_prime_add_buf_handle(&file_priv->prime, obj->dma_buf, args->new_handle);
++		ret = drm_prime_add_buf_handle(&file_priv->prime, obj->dma_buf,
++					       handle);
+ 		if (ret < 0) {
+ 			spin_lock(&file_priv->table_lock);
+-			idr_remove(&file_priv->object_idr, args->new_handle);
++			idr_remove(&file_priv->object_idr, handle);
+ 			spin_unlock(&file_priv->table_lock);
+ 			goto out_unlock;
+ 		}
+-- 
+2.52.0
+
