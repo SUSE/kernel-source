@@ -1,0 +1,145 @@
+From: Puranjay Mohan <puranjay@kernel.org>
+Date: Sat, 26 Oct 2024 12:53:37 +0000
+Subject: bpf: bpf_csum_diff: Optimize and homogenize for all archs
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Patch-mainline: v6.13-rc1
+Git-commit: 6a4794d5a3e2bf10233ce8a5e53f168e23715e8a
+References: jsc#PED-14653
+
+1. Optimization
+   ------------
+
+The current implementation copies the 'from' and 'to' buffers to a
+scratchpad and it takes the bitwise NOT of 'from' buffer while copying.
+In the next step csum_partial() is called with this scratchpad.
+
+so, mathematically, the current implementation is doing:
+
+	result = csum(to - from)
+
+Here, 'to'  and '~ from' are copied in to the scratchpad buffer, we need
+it in the scratchpad buffer because csum_partial() takes a single
+contiguous buffer and not two disjoint buffers like 'to' and 'from'.
+
+We can re write this equation to:
+
+	result = csum(to) - csum(from)
+
+using the distributive property of csum().
+
+this allows 'to' and 'from' to be at different locations and therefore
+this scratchpad and copying is not needed.
+
+This in C code will look like:
+
+result = csum_sub(csum_partial(to, to_size, seed),
+                  csum_partial(from, from_size, 0));
+
+2. Homogenization
+   --------------
+
+The bpf_csum_diff() helper calls csum_partial() which is implemented by
+some architectures like arm and x86 but other architectures rely on the
+generic implementation in lib/checksum.c
+
+The generic implementation in lib/checksum.c returns a 16 bit value but
+the arch specific implementations can return more than 16 bits, this
+works out in most places because before the result is used, it is passed
+through csum_fold() that turns it into a 16-bit value.
+
+bpf_csum_diff() directly returns the value from csum_partial() and
+therefore the returned values could be different on different
+architectures. see discussion in [1]:
+
+for the int value 28 the calculated checksums are:
+
+x86                    :    -29 : 0xffffffe3
+generic (arm64, riscv) :  65507 : 0x0000ffe3
+arm                    : 131042 : 0x0001ffe2
+
+Pass the result of bpf_csum_diff() through from32to16() before returning
+to homogenize this result for all architectures.
+
+NOTE: from32to16() is used instead of csum_fold() because csum_fold()
+does from32to16() + bitwise NOT of the result, which is not what we want
+to do here.
+
+[1] https://lore.kernel.org/bpf/CAJ+HfNiQbOcqCLxFUP2FMm5QrLXUUaj852Fxe3hn_2JNiucn6g@mail.gmail.com/
+
+Signed-off-by: Puranjay Mohan <puranjay@kernel.org>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Reviewed-by: Toke Høiland-Jørgensen <toke@redhat.com>
+Acked-by: Daniel Borkmann <daniel@iogearbox.net>
+Link: https://lore.kernel.org/bpf/20241026125339.26459-3-puranjay@kernel.org
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ net/core/filter.c |   41 ++++++++++++-----------------------------
+ 1 file changed, 12 insertions(+), 29 deletions(-)
+
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -1654,18 +1654,6 @@ void sk_reuseport_prog_free(struct bpf_p
+ 		bpf_prog_destroy(prog);
+ }
+ 
+-struct bpf_scratchpad {
+-	union {
+-		__be32 diff[MAX_BPF_STACK / sizeof(__be32)];
+-		u8     buff[MAX_BPF_STACK];
+-	};
+-	local_lock_t	bh_lock;
+-};
+-
+-static DEFINE_PER_CPU(struct bpf_scratchpad, bpf_sp) = {
+-	.bh_lock	= INIT_LOCAL_LOCK(bh_lock),
+-};
+-
+ static inline int __bpf_try_make_writable(struct sk_buff *skb,
+ 					  unsigned int write_len)
+ {
+@@ -2022,11 +2010,6 @@ static const struct bpf_func_proto bpf_l
+ BPF_CALL_5(bpf_csum_diff, __be32 *, from, u32, from_size,
+ 	   __be32 *, to, u32, to_size, __wsum, seed)
+ {
+-	struct bpf_scratchpad *sp = this_cpu_ptr(&bpf_sp);
+-	u32 diff_size = from_size + to_size;
+-	int i, j = 0;
+-	__wsum ret;
+-
+ 	/* This is quite flexible, some examples:
+ 	 *
+ 	 * from_size == 0, to_size > 0,  seed := csum --> pushing data
+@@ -2035,19 +2018,19 @@ BPF_CALL_5(bpf_csum_diff, __be32 *, from
+ 	 *
+ 	 * Even for diffing, from_size and to_size don't need to be equal.
+ 	 */
+-	if (unlikely(((from_size | to_size) & (sizeof(__be32) - 1)) ||
+-		     diff_size > sizeof(sp->diff)))
+-		return -EINVAL;
+ 
+-	local_lock_nested_bh(&bpf_sp.bh_lock);
+-	for (i = 0; i < from_size / sizeof(__be32); i++, j++)
+-		sp->diff[j] = ~from[i];
+-	for (i = 0; i <   to_size / sizeof(__be32); i++, j++)
+-		sp->diff[j] = to[i];
+-
+-	ret = csum_partial(sp->diff, diff_size, seed);
+-	local_unlock_nested_bh(&bpf_sp.bh_lock);
+-	return ret;
++	__wsum ret = seed;
++
++	if (from_size && to_size)
++		ret = csum_sub(csum_partial(to, to_size, ret),
++			       csum_partial(from, from_size, 0));
++	else if (to_size)
++		ret = csum_partial(to, to_size, ret);
++
++	else if (from_size)
++		ret = ~csum_partial(from, from_size, ~ret);
++
++	return csum_from32to16((__force unsigned int)ret);
+ }
+ 
+ static const struct bpf_func_proto bpf_csum_diff_proto = {
