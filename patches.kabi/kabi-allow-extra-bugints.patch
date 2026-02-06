@@ -30,6 +30,7 @@ defined in the GA version of SLE15-SP5 kernel. Extended flags are not
 preserved.
 
 Signed-off-by: Nikolay Borisov  <nik.borisov@suse.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
 ---
  arch/x86/include/asm/cpufeature.h  |   43 ++++++++++++++++++++++++++-----------
  arch/x86/include/asm/cpufeatures.h |   27 ++++++++++++++---------
@@ -38,8 +39,9 @@ Signed-off-by: Nikolay Borisov  <nik.borisov@suse.com>
  arch/x86/kernel/cpu/common.c       |   18 +++++++++++++--
  arch/x86/kernel/cpu/mkcapflags.sh  |   17 +++++---------
  arch/x86/kernel/cpu/proc.c         |   12 ++++++++++
+ arch/x86/kvm/reverse_cpuid.h       |    4 +--
  arch/x86/net/bpf_jit_comp.c        |    6 ++---
- 8 files changed, 92 insertions(+), 40 deletions(-)
+ 9 files changed, 94 insertions(+), 42 deletions(-)
 
 --- a/arch/x86/include/asm/cpufeature.h
 +++ b/arch/x86/include/asm/cpufeature.h
@@ -54,7 +56,7 @@ Signed-off-by: Nikolay Borisov  <nik.borisov@suse.com>
 +	 */
  	CPUID_LNX_6,
  };
- 
+
 +#define CPUID_IDX(x) ((x) - CPUID_MAX - 1)
 +#define IS_EXT_BIT(bit) ((bit>>5) >= (NCAPINTS + NBUGINTS))
 +
@@ -65,7 +67,7 @@ Signed-off-by: Nikolay Borisov  <nik.borisov@suse.com>
  #define X86_CAP_FMT "%s"
  #define x86_cap_flag(flag) x86_cap_flags[flag]
 @@ -49,12 +57,14 @@ extern const char * const x86_power_flag
- 
+
  /*
   * In order to save room, we index into this array by doing
 - * X86_BUG_<name> - NCAPINTS*32.
@@ -73,17 +75,17 @@ Signed-off-by: Nikolay Borisov  <nik.borisov@suse.com>
   */
 -extern const char * const x86_bug_flags[NBUGINTS*32];
 +extern const char * const x86_bug_flags[(NBUGINTS+NEXTBUGINTS)*32];
- 
+
  #define test_cpu_cap(c, bit)						\
 -	 test_bit(bit, (unsigned long *)((c)->x86_capability))
 + (IS_EXT_BIT(bit) ? test_bit((bit) - (NCAPINTS+NBUGINTS)*32,		\
 +			     (unsigned long *)((c)->x86_ext_capability)) : \
 +		    test_bit(bit, (unsigned long *)((c)->x86_capability)))
- 
+
  /*
   * There are 32 bits/features in each mask word.  The high bits
 @@ -129,8 +139,9 @@ extern const char * const x86_bug_flags[
- 
+
  #define this_cpu_has(bit)						\
  	(__builtin_constant_p(bit) && REQUIRED_MASK_BIT_SET(bit) ? 1 :	\
 -	 x86_this_cpu_test_bit(bit,					\
@@ -91,13 +93,13 @@ Signed-off-by: Nikolay Borisov  <nik.borisov@suse.com>
 +	 (IS_EXT_BIT(bit) ? x86_this_cpu_test_bit((bit) - (NCAPINTS+NBUGINTS)*32, \
 +						  (unsigned long *)&cpu_info.x86_ext_capability) : \
 +	  x86_this_cpu_test_bit(bit, (unsigned long *)&cpu_info.x86_capability)))
- 
+
  /*
   * This macro is for detection of features which need kernel
 @@ -145,7 +156,14 @@ extern const char * const x86_bug_flags[
- 
+
  #define boot_cpu_has(bit)	cpu_has(&boot_cpu_data, bit)
- 
+
 -#define set_cpu_cap(c, bit)	set_bit(bit, (unsigned long *)((c)->x86_capability))
 +#define set_cpu_cap(c, bit) do {					\
 +	if (IS_EXT_BIT(bit)) {						\
@@ -107,12 +109,12 @@ Signed-off-by: Nikolay Borisov  <nik.borisov@suse.com>
 +		set_bit(bit, (unsigned long *)((c)->x86_capability));	\
 +	}								\
 +} while (0)
- 
+
  extern void setup_clear_cpu_cap(unsigned int bit);
  extern void clear_cpu_cap(struct cpuinfo_x86 *c, unsigned int bit);
 @@ -200,11 +218,12 @@ t_no:
  }
- 
+
  #define static_cpu_has(bit)					\
 -(								\
 -	__builtin_constant_p(boot_cpu_has(bit)) ?		\
@@ -125,32 +127,32 @@ Signed-off-by: Nikolay Borisov  <nik.borisov@suse.com>
 +		_static_cpu_has(bit));				\
 +})
  #endif
- 
+
  #define cpu_has_bug(c, bit)		cpu_has(c, (bit))
 @@ -215,7 +234,7 @@ t_no:
  #define boot_cpu_has_bug(bit)		cpu_has_bug(&boot_cpu_data, (bit))
  #define boot_cpu_set_bug(bit)		set_cpu_cap(&boot_cpu_data, (bit))
- 
+
 -#define MAX_CPU_FEATURES		(NCAPINTS * 32)
 +#define MAX_CPU_FEATURES		((NCAPINTS + NEXTCAPINTS)*32)
  #define cpu_have_feature		boot_cpu_has
- 
+
  #define CPU_FEATURE_TYPEFMT		"x86,ven%04Xfam%04Xmod%04X"
 --- a/arch/x86/include/asm/cpufeatures.h
 +++ b/arch/x86/include/asm/cpufeatures.h
 @@ -16,6 +16,8 @@
  #define NCAPINTS			22	   /* N 32-bit words worth of info */
  #define NBUGINTS			1	   /* N 32-bit bug flags */
- 
+
 +#define NEXTCAPINTS			1
 +#define NEXTBUGINTS			1
  /*
   * Note: If the comment begins with a quoted string, that string is used
   * in /proc/cpuinfo instead of the macro name.  If the string is "",
-@@ -441,16 +443,21 @@
- 
+@@ -442,16 +444,21 @@
  #define X86_FEATURE_INDIRECT_THUNK_ITS	(21*32 + 9) /* Use thunk for indirect branches in lower half of cacheline */
- 
+ #define X86_FEATURE_IBPB_EXIT_TO_USER	(21*32+14) /* Use IBPB on exit-to-userspace, see VMSCAPE bug */
+
 +#define X86_EXT_FEATURE(x)		(NBUGINTS*32 + (x))
 +#define X86_FEATUREINDEX(x)		((x) < NCAPINTS*32 ? (x) : (x) - NBUGINTS*32)
 +
@@ -163,21 +165,22 @@ Signed-off-by: Nikolay Borisov  <nik.borisov@suse.com>
 +#define X86_FEATURE_BHI_CTRL		X86_EXT_FEATURE(22*32+ 1) /* "" BHI_DIS_S HW control available */
 +#define X86_FEATURE_CLEAR_BHB_HW	X86_EXT_FEATURE(22*32+ 2) /* "" BHI_DIS_S HW control enabled */
 +#define X86_FEATURE_CLEAR_BHB_LOOP_ON_VMEXIT X86_EXT_FEATURE(22*32+ 3) /* "" Clear branch history at vmexit using SW loop */
- 
+
  /*
   * BUG word(s)
   */
  #define X86_BUG(x)			(NCAPINTS*32 + (x))
 +#define X86_EXT_BUG(x)			((NCAPINTS+NEXTCAPINTS)*32 + (x))
 +#define X86_BUGINDEX(x)			((x) < (NCAPINTS+NBUGINTS)*32 ? (x) - NCAPINTS*32 : (x) - (NCAPINTS+NEXTCAPINTS)*32)
- 
+
  #define X86_BUG_F00F			X86_BUG(0) /* Intel F00F */
  #define X86_BUG_FDIV			X86_BUG(1) /* FPU FDIV */
-@@ -492,10 +499,10 @@
+@@ -493,11 +500,11 @@
  #define X86_BUG_GDS			X86_BUG(31) /* CPU is affected by Gather Data Sampling */
- 
+
  /* BUG word 2 */
 -#define X86_BUG_DIV0			X86_BUG(1*32 + 0) /* AMD DIV0 speculation bug */
+-#define X86_BUG_VMSCAPE		X86_BUG( 1*32+10) /* "vmscape" CPU is affected by VMSCAPE attacks from guests */
 -#define X86_BUG_RFDS			X86_BUG(1*32 + 1) /* CPU is vulnerable to Register File Data Sampling */
 -#define X86_BUG_BHI			X86_BUG(1*32 + 2) /* CPU is affected by Branch History Injection */
 -#define X86_BUG_IBPB_NO_RET		X86_BUG(1*32 + 4) /* "ibpb_no_ret" IBPB omits return target predictions */
@@ -189,6 +192,7 @@ Signed-off-by: Nikolay Borisov  <nik.borisov@suse.com>
 +#define X86_BUG_IBPB_NO_RET		X86_EXT_BUG(1*32 + 4) /* "ibpb_no_ret" IBPB omits return target predictions */
 +#define X86_BUG_ITS			X86_EXT_BUG(1*32 + 6) /* "its" CPU is affected by Indirect Target Selection */
 +#define X86_BUG_ITS_NATIVE_ONLY		X86_EXT_BUG(1*32 + 7) /* "its_native_only" CPU is affected by ITS, VMX is not affected */
++#define X86_BUG_VMSCAPE		X86_EXT_BUG( 1*32+10) /* "vmscape" CPU is affected by VMSCAPE attacks from guests */
  #endif /* _ASM_X86_CPUFEATURES_H */
 --- a/arch/x86/include/asm/processor.h
 +++ b/arch/x86/include/asm/processor.h
@@ -203,14 +207,14 @@ Signed-off-by: Nikolay Borisov  <nik.borisov@suse.com>
 +
  #endif
  } __randomize_layout;
- 
+
 @@ -177,7 +182,7 @@ extern struct cpuinfo_x86	boot_cpu_data;
  extern struct cpuinfo_x86	new_cpu_data;
- 
+
  extern __u32			cpu_caps_cleared[NCAPINTS + NBUGINTS];
 -extern __u32			cpu_caps_set[NCAPINTS + NBUGINTS];
 +extern __u32			cpu_caps_set[NCAPINTS + NBUGINTS + NEXTCAPINTS + NEXTBUGINTS];
- 
+
  #ifdef CONFIG_SMP
  DECLARE_PER_CPU_READ_MOSTLY(struct cpuinfo_x86, cpu_info);
 --- a/arch/x86/kernel/alternative.c
@@ -221,18 +225,18 @@ Signed-off-by: Nikolay Borisov  <nik.borisov@suse.com>
  		BUG_ON(a->instrlen > sizeof(insn_buff));
 -		BUG_ON(feature >= (NCAPINTS + NBUGINTS) * 32);
 +		BUG_ON(feature >= (NCAPINTS + NBUGINTS + NEXTCAPINTS + NEXTBUGINTS) * 32);
- 
+
  		/*
  		 * Patch if either:
 --- a/arch/x86/kernel/cpu/common.c
 +++ b/arch/x86/kernel/cpu/common.c
 @@ -678,7 +678,7 @@ static const char *table_lookup_model(st
- 
+
  /* Aligned to unsigned long to avoid split lock in atomic bitmap ops */
  __u32 cpu_caps_cleared[NCAPINTS + NBUGINTS] __aligned(sizeof(unsigned long));
 -__u32 cpu_caps_set[NCAPINTS + NBUGINTS] __aligned(sizeof(unsigned long));
 +__u32 cpu_caps_set[NCAPINTS + NBUGINTS + NEXTCAPINTS + NEXTBUGINTS] __aligned(sizeof(unsigned long));
- 
+
  void load_percpu_segment(int cpu)
  {
 @@ -940,6 +940,10 @@ static void apply_forced_caps(struct cpu
@@ -244,15 +248,15 @@ Signed-off-by: Nikolay Borisov  <nik.borisov@suse.com>
 +		c->x86_ext_capability[i] |= cpu_caps_set[NCAPINTS+NBUGINTS + i];
 +	}
  }
- 
+
  static void init_speculation_control(struct cpuinfo_x86 *c)
 @@ -1591,6 +1595,7 @@ static void __init early_identify_cpu(st
  	c->x86_cache_alignment = c->x86_clflush_size;
- 
+
  	memset(&c->x86_capability, 0, sizeof(c->x86_capability));
 +	memset(&c->x86_ext_capability, 0, sizeof(c->x86_ext_capability));
  	c->extended_cpuid_level = 0;
- 
+
  	if (!have_cpuid_p())
 @@ -1848,6 +1853,7 @@ static void identify_cpu(struct cpuinfo_
  #endif
@@ -268,14 +272,14 @@ Signed-off-by: Nikolay Borisov  <nik.borisov@suse.com>
  			boot_cpu_data.x86_capability[i] &= c->x86_capability[i];
 +		for (i = 0; i < NEXTCAPINTS; i++)
 +			boot_cpu_data.x86_ext_capability[i] &= c->x86_ext_capability[i];
- 
+
  		/* OR, i.e. replicate the bug flags */
  		for (i = NCAPINTS; i < NCAPINTS + NBUGINTS; i++)
  			c->x86_capability[i] |= boot_cpu_data.x86_capability[i];
 +		for (i = NEXTCAPINTS; i < NEXTCAPINTS + NEXTBUGINTS; i++)
 +			c->x86_ext_capability[i] |= boot_cpu_data.x86_ext_capability[i];
  	}
- 
+
  	ppin_init(c);
 @@ -2383,6 +2393,8 @@ void store_cpu_caps(struct cpuinfo_x86 *
  	/* Copy all capability leafs and pick up the synthetic ones. */
@@ -283,26 +287,26 @@ Signed-off-by: Nikolay Borisov  <nik.borisov@suse.com>
  	       sizeof(curr_info->x86_capability));
 +	memcpy(&curr_info->x86_ext_capability, &boot_cpu_data.x86_ext_capability,
 +	       sizeof(curr_info->x86_ext_capability));
- 
+
  	/* Get the hardware CPUID leafs */
  	get_cpu_cap(curr_info);
 @@ -2409,7 +2421,9 @@ void microcode_check(struct cpuinfo_x86
  	store_cpu_caps(&curr_info);
- 
+
  	if (!memcmp(&prev_info->x86_capability, &curr_info.x86_capability,
 -		    sizeof(prev_info->x86_capability)))
 +		    sizeof(prev_info->x86_capability)) &&
 +	    !memcmp(&prev_info->x86_ext_capability, &curr_info.x86_ext_capability,
 +		    sizeof(prev_info->x86_ext_capability)))
  		return;
- 
+
  	pr_warn("x86/CPU: CPU features have changed after loading microcode, but might not take effect.\n");
 --- a/arch/x86/kernel/cpu/mkcapflags.sh
 +++ b/arch/x86/kernel/cpu/mkcapflags.sh
 @@ -36,15 +36,10 @@ dump_array()
  		# Name is uppercase, VALUE is all lowercase
  		VALUE="$(echo "$VALUE" | tr A-Z a-z)"
- 
+
 -        if [ -n "$POSTFIX" ]; then
 -            T=$(( $PFX_SZ + $(echo $POSTFIX | wc -c) + 2 ))
 -	        TABS="$(printf '\t\t\t\t\t\t')"
@@ -322,15 +326,15 @@ Signed-off-by: Nikolay Borisov  <nik.borisov@suse.com>
 @@ -57,10 +52,10 @@ trap 'rm "$OUT"' EXIT
  	echo "#endif"
  	echo ""
- 
+
 -	dump_array "x86_cap_flags" "NCAPINTS*32" "X86_FEATURE_" "" $2
 +	dump_array "x86_cap_flags" "(NCAPINTS+NEXTCAPINTS)*32" "X86_FEATURE_" "X86_FEATUREINDEX" $2
  	echo ""
- 
+
 -	dump_array "x86_bug_flags" "NBUGINTS*32" "X86_BUG_" "NCAPINTS*32" $2
 +	dump_array "x86_bug_flags" "(NBUGINTS+NEXTBUGINTS)*32" "X86_BUG_" "X86_BUGINDEX" $2
  	echo ""
- 
+
  	echo "#ifdef CONFIG_X86_VMX_FEATURE_NAMES"
 --- a/arch/x86/kernel/cpu/proc.c
 +++ b/arch/x86/kernel/cpu/proc.c
@@ -344,11 +348,11 @@ Signed-off-by: Nikolay Borisov  <nik.borisov@suse.com>
 +		if (cpu_has(c, cap_bit) && x86_cap_flags[i] != NULL)
 +			seq_printf(m, " %s", x86_cap_flags[i]);
 +	}
- 
+
  #ifdef CONFIG_X86_VMX_FEATURE_NAMES
  	if (cpu_has(c, X86_FEATURE_VMX) && c->vmx_capability[0]) {
 @@ -118,6 +124,12 @@ static int show_cpuinfo(struct seq_file
- 
+
  		if (cpu_has_bug(c, bug_bit) && x86_bug_flags[i])
  			seq_printf(m, " %s", x86_bug_flags[i]);
 +	}
@@ -358,14 +362,30 @@ Signed-off-by: Nikolay Borisov  <nik.borisov@suse.com>
 +		if (cpu_has_bug(c, bug_bit) && x86_bug_flags[i])
 +			seq_printf(m, " %s", x86_bug_flags[i]);
  	}
- 
+
  	seq_printf(m, "\nbogomips\t: %lu.%02lu\n",
+--- a/arch/x86/kvm/reverse_cpuid.h
++++ b/arch/x86/kvm/reverse_cpuid.h
+@@ -12,11 +12,11 @@
+  * "bug" caps, but KVM doesn't use those.
+  */
+ enum kvm_only_cpuid_leafs {
+-	CPUID_12_EAX	 = NCAPINTS,
++	CPUID_12_EAX	 = NCAPINTS + NEXTCAPINTS,
+ 	CPUID_7_2_EDX,
+ 	NR_KVM_CPU_CAPS,
+
+-	NKVMCAPINTS = NR_KVM_CPU_CAPS - NCAPINTS,
++	NKVMCAPINTS = NR_KVM_CPU_CAPS - NCAPINTS - NEXTCAPINTS,
+ };
+
+ #define KVM_X86_FEATURE(w, f)		((w)*32 + (f))
 --- a/arch/x86/net/bpf_jit_comp.c
 +++ b/arch/x86/net/bpf_jit_comp.c
 @@ -882,7 +882,7 @@ static int emit_spectre_bhb_barrier(u8 *
  	u8 *prog = *pprog;
  	u8 *func;
- 
+
 -	if (cpu_feature_enabled(X86_FEATURE_CLEAR_BHB_LOOP)) {
 +	if (boot_cpu_has(X86_FEATURE_CLEAR_BHB_LOOP)) {
  		/* The clearing sequence clobbers eax and ecx. */
