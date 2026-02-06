@@ -1,0 +1,290 @@
+From: Michal Kubiak <michal.kubiak@intel.com>
+Date: Tue, 26 Aug 2025 17:55:00 +0200
+Subject: idpf: remove SW marker handling from NAPI
+Patch-mainline: v6.18-rc1
+Git-commit: 9d39447051a0decaf90ba520611ee0e4644a94d5
+References: jsc#PED-14403
+
+SW marker descriptors on completion queues are used only when a queue
+is about to be destroyed. It's far from hotpath and handling it in the
+hotpath NAPI poll makes no sense.
+Instead, run a simple poller after a virtchnl message for destroying
+the queue is sent and wait for the replies. If replies for all of the
+queues are received, this means the synchronization is done correctly
+and we can go forth with stopping the link.
+
+Signed-off-by: Michal Kubiak <michal.kubiak@intel.com>
+Signed-off-by: Alexander Lobakin <aleksander.lobakin@intel.com>
+Tested-by: Ramu R <ramu.r@intel.com>
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/idpf/idpf.h          |    7 -
+ drivers/net/ethernet/intel/idpf/idpf_lib.c      |    2 
+ drivers/net/ethernet/intel/idpf/idpf_txrx.c     |   97 ++++++++++++++----------
+ drivers/net/ethernet/intel/idpf/idpf_txrx.h     |    4 
+ drivers/net/ethernet/intel/idpf/idpf_virtchnl.c |   34 ++------
+ 5 files changed, 72 insertions(+), 72 deletions(-)
+
+--- a/drivers/net/ethernet/intel/idpf/idpf.h
++++ b/drivers/net/ethernet/intel/idpf/idpf.h
+@@ -40,6 +40,7 @@ struct idpf_vport_max_q;
+ #define IDPF_NUM_CHUNKS_PER_MSG(struct_sz, chunk_sz)	\
+ 	((IDPF_CTLQ_MAX_BUF_LEN - (struct_sz)) / (chunk_sz))
+ 
++#define IDPF_WAIT_FOR_MARKER_TIMEO	500
+ #define IDPF_MAX_WAIT			500
+ 
+ /* available message levels */
+@@ -248,13 +249,10 @@ enum idpf_vport_reset_cause {
+ /**
+  * enum idpf_vport_flags - Vport flags
+  * @IDPF_VPORT_DEL_QUEUES: To send delete queues message
+- * @IDPF_VPORT_SW_MARKER: Indicate TX pipe drain software marker packets
+- *			  processing is done
+  * @IDPF_VPORT_FLAGS_NBITS: Must be last
+  */
+ enum idpf_vport_flags {
+ 	IDPF_VPORT_DEL_QUEUES,
+-	IDPF_VPORT_SW_MARKER,
+ 	IDPF_VPORT_FLAGS_NBITS,
+ };
+ 
+@@ -320,7 +318,6 @@ struct idpf_fsteer_fltr {
+  * @tx_itr_profile: TX profiles for Dynamic Interrupt Moderation
+  * @port_stats: per port csum, header split, and other offload stats
+  * @link_up: True if link is up
+- * @sw_marker_wq: workqueue for marker packets
+  * @tx_tstamp_caps: Capabilities negotiated for Tx timestamping
+  * @tstamp_config: The Tx tstamp config
+  * @tstamp_task: Tx timestamping task
+@@ -369,8 +366,6 @@ struct idpf_vport {
+ 
+ 	bool link_up;
+ 
+-	wait_queue_head_t sw_marker_wq;
+-
+ 	struct idpf_ptp_vport_tx_tstamp_caps *tx_tstamp_caps;
+ 	struct kernel_hwtstamp_config tstamp_config;
+ 	struct work_struct tstamp_task;
+--- a/drivers/net/ethernet/intel/idpf/idpf_lib.c
++++ b/drivers/net/ethernet/intel/idpf/idpf_lib.c
+@@ -1565,8 +1565,6 @@ void idpf_init_task(struct work_struct *
+ 	index = vport->idx;
+ 	vport_config = adapter->vport_config[index];
+ 
+-	init_waitqueue_head(&vport->sw_marker_wq);
+-
+ 	spin_lock_init(&vport_config->mac_filter_list_lock);
+ 
+ 	INIT_LIST_HEAD(&vport_config->user_config.mac_filter_list);
+--- a/drivers/net/ethernet/intel/idpf/idpf_txrx.c
++++ b/drivers/net/ethernet/intel/idpf/idpf_txrx.c
+@@ -1561,32 +1561,6 @@ err_out:
+ }
+ 
+ /**
+- * idpf_tx_handle_sw_marker - Handle queue marker packet
+- * @tx_q: tx queue to handle software marker
+- */
+-static void idpf_tx_handle_sw_marker(struct idpf_tx_queue *tx_q)
+-{
+-	struct idpf_netdev_priv *priv = netdev_priv(tx_q->netdev);
+-	struct idpf_vport *vport = priv->vport;
+-	int i;
+-
+-	idpf_queue_clear(SW_MARKER, tx_q);
+-	/* Hardware must write marker packets to all queues associated with
+-	 * completion queues. So check if all queues received marker packets
+-	 */
+-	for (i = 0; i < vport->num_txq; i++)
+-		/* If we're still waiting on any other TXQ marker completions,
+-		 * just return now since we cannot wake up the marker_wq yet.
+-		 */
+-		if (idpf_queue_has(SW_MARKER, vport->txqs[i]))
+-			return;
+-
+-	/* Drain complete */
+-	set_bit(IDPF_VPORT_SW_MARKER, vport->flags);
+-	wake_up(&vport->sw_marker_wq);
+-}
+-
+-/**
+  * idpf_tx_read_tstamp - schedule a work to read Tx timestamp value
+  * @txq: queue to read the timestamp from
+  * @skb: socket buffer to provide Tx timestamp value
+@@ -1833,9 +1807,6 @@ static bool idpf_tx_clean_complq(struct
+ 			idpf_tx_handle_rs_completion(tx_q, tx_desc,
+ 						     &cleaned_stats, budget);
+ 			break;
+-		case IDPF_TXD_COMPLT_SW_MARKER:
+-			idpf_tx_handle_sw_marker(tx_q);
+-			break;
+ 		default:
+ 			netdev_err(tx_q->netdev,
+ 				   "Unknown TX completion type: %d\n", ctype);
+@@ -1908,6 +1879,66 @@ fetch_next_desc:
+ }
+ 
+ /**
++ * idpf_wait_for_sw_marker_completion - wait for SW marker of disabled Tx queue
++ * @txq: disabled Tx queue
++ *
++ * When Tx queue is requested for disabling, the CP sends a special completion
++ * descriptor called "SW marker", meaning the queue is ready to be destroyed.
++ * If, for some reason, the marker is not received within 500 ms, break the
++ * polling to not hang the driver.
++ */
++void idpf_wait_for_sw_marker_completion(const struct idpf_tx_queue *txq)
++{
++	struct idpf_compl_queue *complq = txq->txq_grp->complq;
++	u32 ntc = complq->next_to_clean;
++	unsigned long timeout;
++	bool flow, gen_flag;
++
++	if (!idpf_queue_has(SW_MARKER, txq))
++		return;
++
++	flow = idpf_queue_has(FLOW_SCH_EN, complq);
++	gen_flag = idpf_queue_has(GEN_CHK, complq);
++
++	timeout = jiffies + msecs_to_jiffies(IDPF_WAIT_FOR_MARKER_TIMEO);
++
++	do {
++		struct idpf_splitq_4b_tx_compl_desc *tx_desc;
++		struct idpf_tx_queue *target;
++		u32 ctype_gen, id;
++
++		tx_desc = flow ? &complq->comp[ntc].common :
++			  &complq->comp_4b[ntc];
++		ctype_gen = le16_to_cpu(tx_desc->qid_comptype_gen);
++
++		if (!!(ctype_gen & IDPF_TXD_COMPLQ_GEN_M) != gen_flag) {
++			usleep_range(500, 1000);
++			continue;
++		}
++
++		if (FIELD_GET(IDPF_TXD_COMPLQ_COMPL_TYPE_M, ctype_gen) !=
++		    IDPF_TXD_COMPLT_SW_MARKER)
++			goto next;
++
++		id = FIELD_GET(IDPF_TXD_COMPLQ_QID_M, ctype_gen);
++		target = complq->txq_grp->txqs[id];
++
++		idpf_queue_clear(SW_MARKER, target);
++		if (target == txq)
++			break;
++
++next:
++		if (unlikely(++ntc == complq->desc_count)) {
++			ntc = 0;
++			gen_flag = !gen_flag;
++		}
++	} while (time_before(jiffies, timeout));
++
++	idpf_queue_assign(GEN_CHK, complq, gen_flag);
++	complq->next_to_clean = ntc;
++}
++
++/**
+  * idpf_tx_splitq_build_ctb - populate command tag and size for queue
+  * based scheduling descriptors
+  * @desc: descriptor to populate
+@@ -3917,14 +3948,6 @@ static int idpf_vport_splitq_napi_poll(s
+ 		return budget;
+ 	}
+ 
+-	/* Switch to poll mode in the tear-down path after sending disable
+-	 * queues virtchnl message, as the interrupts will be disabled after
+-	 * that.
+-	 */
+-	if (unlikely(q_vector->num_txq && idpf_queue_has(POLL_MODE,
+-							 q_vector->tx[0])))
+-		return budget;
+-
+ 	work_done = min_t(int, work_done, budget - 1);
+ 
+ 	/* Exit the polling mode, but don't re-enable interrupts if stack might
+--- a/drivers/net/ethernet/intel/idpf/idpf_txrx.h
++++ b/drivers/net/ethernet/intel/idpf/idpf_txrx.h
+@@ -275,7 +275,6 @@ struct idpf_ptype_state {
+  *			  bit and Q_RFL_GEN is the SW bit.
+  * @__IDPF_Q_FLOW_SCH_EN: Enable flow scheduling
+  * @__IDPF_Q_SW_MARKER: Used to indicate TX queue marker completions
+- * @__IDPF_Q_POLL_MODE: Enable poll mode
+  * @__IDPF_Q_CRC_EN: enable CRC offload in singleq mode
+  * @__IDPF_Q_HSPLIT_EN: enable header split on Rx (splitq)
+  * @__IDPF_Q_PTP: indicates whether the Rx timestamping is enabled for the
+@@ -287,7 +286,6 @@ enum idpf_queue_flags_t {
+ 	__IDPF_Q_RFL_GEN_CHK,
+ 	__IDPF_Q_FLOW_SCH_EN,
+ 	__IDPF_Q_SW_MARKER,
+-	__IDPF_Q_POLL_MODE,
+ 	__IDPF_Q_CRC_EN,
+ 	__IDPF_Q_HSPLIT_EN,
+ 	__IDPF_Q_PTP,
+@@ -1038,4 +1036,6 @@ bool idpf_rx_singleq_buf_hw_alloc_all(st
+ 				      u16 cleaned_count);
+ int idpf_tso(struct sk_buff *skb, struct idpf_tx_offload_params *off);
+ 
++void idpf_wait_for_sw_marker_completion(const struct idpf_tx_queue *txq);
++
+ #endif /* !_IDPF_TXRX_H_ */
+--- a/drivers/net/ethernet/intel/idpf/idpf_virtchnl.c
++++ b/drivers/net/ethernet/intel/idpf/idpf_virtchnl.c
+@@ -724,21 +724,17 @@ int idpf_recv_mb_msg(struct idpf_adapter
+  **/
+ static int idpf_wait_for_marker_event(struct idpf_vport *vport)
+ {
+-	int event;
+-	int i;
++	bool markers_rcvd = true;
+ 
+-	for (i = 0; i < vport->num_txq; i++)
+-		idpf_queue_set(SW_MARKER, vport->txqs[i]);
++	for (u32 i = 0; i < vport->num_txq; i++) {
++		struct idpf_tx_queue *txq = vport->txqs[i];
+ 
+-	event = wait_event_timeout(vport->sw_marker_wq,
+-				   test_and_clear_bit(IDPF_VPORT_SW_MARKER,
+-						      vport->flags),
+-				   msecs_to_jiffies(500));
+-
+-	for (i = 0; i < vport->num_txq; i++)
+-		idpf_queue_clear(POLL_MODE, vport->txqs[i]);
++		idpf_queue_set(SW_MARKER, txq);
++		idpf_wait_for_sw_marker_completion(txq);
++		markers_rcvd &= !idpf_queue_has(SW_MARKER, txq);
++	}
+ 
+-	if (event)
++	if (markers_rcvd)
+ 		return 0;
+ 
+ 	dev_warn(&vport->adapter->pdev->dev, "Failed to receive marker packets\n");
+@@ -2137,24 +2133,12 @@ int idpf_send_enable_queues_msg(struct i
+  */
+ int idpf_send_disable_queues_msg(struct idpf_vport *vport)
+ {
+-	int err, i;
++	int err;
+ 
+ 	err = idpf_send_ena_dis_queues_msg(vport, false);
+ 	if (err)
+ 		return err;
+ 
+-	/* switch to poll mode as interrupts will be disabled after disable
+-	 * queues virtchnl message is sent
+-	 */
+-	for (i = 0; i < vport->num_txq; i++)
+-		idpf_queue_set(POLL_MODE, vport->txqs[i]);
+-
+-	/* schedule the napi to receive all the marker packets */
+-	local_bh_disable();
+-	for (i = 0; i < vport->num_q_vectors; i++)
+-		napi_schedule(&vport->q_vectors[i].napi);
+-	local_bh_enable();
+-
+ 	return idpf_wait_for_marker_event(vport);
+ }
+ 
