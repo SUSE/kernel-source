@@ -1,0 +1,166 @@
+From: =?UTF-8?q?Alexis=20Lothor=C3=A9=20=28eBPF=20Foundation=29?=
+Date: Sun, 20 Oct 2024 21:22:53 +0200
+ <alexis.lothore@bootlin.com>
+Subject: selftests/bpf: factorize conn and syncookies tests in a single runner
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Patch-mainline: v6.13-rc1
+Git-commit: 6414b3e5d5d44cd214161abf2ce2221d9e9de7bf
+References: jsc#PED-14653
+
+btf_skc_cls_ingress currently describe two tests, both running a simple
+tcp server and then initializing a connection to it. The sole difference
+between the tests is about the tcp_syncookie configuration, and some
+checks around this feature being enabled/disabled.
+
+Share the common code between those two tests by moving the code into a
+single runner, parameterized by a "gen_cookies" argument. Split the
+performed checks accordingly.
+
+Signed-off-by: Alexis Lothoré (eBPF Foundation) <alexis.lothore@bootlin.com>
+Link: https://lore.kernel.org/r/20241020-syncookie-v2-1-2db240225fed@bootlin.com
+Signed-off-by: Martin KaFai Lau <martin.lau@kernel.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ tools/testing/selftests/bpf/prog_tests/btf_skc_cls_ingress.c |  106 +++--------
+ 1 file changed, 37 insertions(+), 69 deletions(-)
+
+--- a/tools/testing/selftests/bpf/prog_tests/btf_skc_cls_ingress.c
++++ b/tools/testing/selftests/bpf/prog_tests/btf_skc_cls_ingress.c
+@@ -71,13 +71,14 @@ static void print_err_line(void)
+ 		printf("bpf prog error at line %u\n", skel->bss->linum);
+ }
+ 
+-static void test_conn(void)
++static void run_test(bool gen_cookies)
+ {
++	const char *tcp_syncookies = gen_cookies ? "2" : "1";
+ 	int listen_fd = -1, cli_fd = -1, srv_fd = -1, err;
+ 	socklen_t addrlen = sizeof(srv_sa6);
+ 	int srv_port;
+ 
+-	if (write_sysctl("/proc/sys/net/ipv4/tcp_syncookies", "1"))
++	if (write_sysctl("/proc/sys/net/ipv4/tcp_syncookies", tcp_syncookies))
+ 		return;
+ 
+ 	listen_fd = start_server(AF_INET6, SOCK_STREAM, "::1", 0, 0);
+@@ -99,19 +100,36 @@ static void test_conn(void)
+ 	if (CHECK_FAIL(srv_fd == -1))
+ 		goto done;
+ 
+-	if (CHECK(skel->bss->listen_tp_sport != srv_port ||
+-		  skel->bss->req_sk_sport != srv_port,
+-		  "Unexpected sk src port",
+-		  "listen_tp_sport:%u req_sk_sport:%u expected:%u\n",
+-		  skel->bss->listen_tp_sport, skel->bss->req_sk_sport,
+-		  srv_port))
++	if (CHECK(skel->bss->listen_tp_sport != srv_port,
++		  "Unexpected listen tp src port",
++		  "listen_tp_sport:%u expected:%u\n",
++		  skel->bss->listen_tp_sport, srv_port))
+ 		goto done;
+ 
+-	if (CHECK(skel->bss->gen_cookie || skel->bss->recv_cookie,
+-		  "Unexpected syncookie states",
+-		  "gen_cookie:%u recv_cookie:%u\n",
+-		  skel->bss->gen_cookie, skel->bss->recv_cookie))
+-		goto done;
++	if (!gen_cookies) {
++		if (CHECK(skel->bss->req_sk_sport != srv_port,
++			  "Unexpected req_sk src port",
++			  "req_sk_sport:%u expected:%u\n",
++			  skel->bss->req_sk_sport, srv_port))
++			goto done;
++		if (CHECK(skel->bss->gen_cookie || skel->bss->recv_cookie,
++			  "Unexpected syncookie states",
++			  "gen_cookie:%u recv_cookie:%u\n",
++			  skel->bss->gen_cookie, skel->bss->recv_cookie))
++			goto done;
++	} else {
++		if (CHECK(skel->bss->req_sk_sport,
++			  "Unexpected req_sk src port",
++			  "req_sk_sport:%u expected:0\n",
++			  skel->bss->req_sk_sport))
++			goto done;
++		if (CHECK(!skel->bss->gen_cookie ||
++			  skel->bss->gen_cookie != skel->bss->recv_cookie,
++			  "Unexpected syncookie states",
++			  "gen_cookie:%u recv_cookie:%u\n",
++			  skel->bss->gen_cookie, skel->bss->recv_cookie))
++			goto done;
++	}
+ 
+ 	CHECK(skel->bss->linum, "bpf prog detected error", "at line %u\n",
+ 	      skel->bss->linum);
+@@ -125,64 +143,14 @@ done:
+ 		close(srv_fd);
+ }
+ 
+-static void test_syncookie(void)
++static void test_conn(void)
+ {
+-	int listen_fd = -1, cli_fd = -1, srv_fd = -1, err;
+-	socklen_t addrlen = sizeof(srv_sa6);
+-	int srv_port;
+-
+-	/* Enforce syncookie mode */
+-	if (write_sysctl("/proc/sys/net/ipv4/tcp_syncookies", "2"))
+-		return;
+-
+-	listen_fd = start_server(AF_INET6, SOCK_STREAM, "::1", 0, 0);
+-	if (CHECK_FAIL(listen_fd == -1))
+-		return;
+-
+-	err = getsockname(listen_fd, (struct sockaddr *)&srv_sa6, &addrlen);
+-	if (CHECK(err, "getsockname(listen_fd)", "err:%d errno:%d\n", err,
+-		  errno))
+-		goto done;
+-	memcpy(&skel->bss->srv_sa6, &srv_sa6, sizeof(srv_sa6));
+-	srv_port = ntohs(srv_sa6.sin6_port);
+-
+-	cli_fd = connect_to_fd(listen_fd, 0);
+-	if (CHECK_FAIL(cli_fd == -1))
+-		goto done;
+-
+-	srv_fd = accept(listen_fd, NULL, NULL);
+-	if (CHECK_FAIL(srv_fd == -1))
+-		goto done;
+-
+-	if (CHECK(skel->bss->listen_tp_sport != srv_port,
+-		  "Unexpected tp src port",
+-		  "listen_tp_sport:%u expected:%u\n",
+-		  skel->bss->listen_tp_sport, srv_port))
+-		goto done;
+-
+-	if (CHECK(skel->bss->req_sk_sport,
+-		  "Unexpected req_sk src port",
+-		  "req_sk_sport:%u expected:0\n",
+-		   skel->bss->req_sk_sport))
+-		goto done;
+-
+-	if (CHECK(!skel->bss->gen_cookie ||
+-		  skel->bss->gen_cookie != skel->bss->recv_cookie,
+-		  "Unexpected syncookie states",
+-		  "gen_cookie:%u recv_cookie:%u\n",
+-		  skel->bss->gen_cookie, skel->bss->recv_cookie))
+-		goto done;
+-
+-	CHECK(skel->bss->linum, "bpf prog detected error", "at line %u\n",
+-	      skel->bss->linum);
++	run_test(false);
++}
+ 
+-done:
+-	if (listen_fd != -1)
+-		close(listen_fd);
+-	if (cli_fd != -1)
+-		close(cli_fd);
+-	if (srv_fd != -1)
+-		close(srv_fd);
++static void test_syncookie(void)
++{
++	run_test(true);
+ }
+ 
+ struct test {
