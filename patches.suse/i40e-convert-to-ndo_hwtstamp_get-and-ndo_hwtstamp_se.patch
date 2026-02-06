@@ -1,0 +1,193 @@
+From: Vladimir Oltean <vladimir.oltean@nxp.com>
+Date: Tue, 13 May 2025 13:11:32 +0300
+Subject: i40e: convert to ndo_hwtstamp_get() and ndo_hwtstamp_set()
+Patch-mainline: v6.17-rc1
+Git-commit: 8cc249787783feb4ad02e6a9138e058b5f23f8eb
+References: jsc#PED-14193 jsc#PED-14411 jsc#PED-15069
+
+New timestamping API was introduced in commit 66f7223039c0 ("net: add
+NDOs for configuring hardware timestamping") from kernel v6.6.
+
+It is time to convert the Intel i40e driver to the new API, so that
+timestamping configuration can be removed from the ndo_eth_ioctl() path
+completely.
+
+Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Reviewed-by: Vadim Fedorenko <vadim.fedorenko@linux.dev>
+Reviewed-by: Milena Olech <milena.olech@intel.com>
+Tested-by: Rinitha S <sx.rinitha@intel.com> (A Contingent worker at Intel)
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/i40e/i40e.h      |    9 +++--
+ drivers/net/ethernet/intel/i40e/i40e_main.c |   24 +--------------
+ drivers/net/ethernet/intel/i40e/i40e_ptp.c  |   43 ++++++++++++++--------------
+ 3 files changed, 31 insertions(+), 45 deletions(-)
+
+--- a/drivers/net/ethernet/intel/i40e/i40e.h
++++ b/drivers/net/ethernet/intel/i40e/i40e.h
+@@ -661,7 +661,7 @@ struct i40e_pf {
+ 	struct ptp_clock_info ptp_caps;
+ 	struct sk_buff *ptp_tx_skb;
+ 	unsigned long ptp_tx_start;
+-	struct hwtstamp_config tstamp_config;
++	struct kernel_hwtstamp_config tstamp_config;
+ 	struct timespec64 ptp_prev_hw_time;
+ 	struct work_struct ptp_extts0_work;
+ 	ktime_t ptp_reset_start;
+@@ -1303,8 +1303,11 @@ void i40e_ptp_tx_hang(struct i40e_pf *pf
+ void i40e_ptp_tx_hwtstamp(struct i40e_pf *pf);
+ void i40e_ptp_rx_hwtstamp(struct i40e_pf *pf, struct sk_buff *skb, u8 index);
+ void i40e_ptp_set_increment(struct i40e_pf *pf);
+-int i40e_ptp_set_ts_config(struct i40e_pf *pf, struct ifreq *ifr);
+-int i40e_ptp_get_ts_config(struct i40e_pf *pf, struct ifreq *ifr);
++int i40e_ptp_hwtstamp_get(struct net_device *netdev,
++			  struct kernel_hwtstamp_config *config);
++int i40e_ptp_hwtstamp_set(struct net_device *netdev,
++			  struct kernel_hwtstamp_config *config,
++			  struct netlink_ext_ack *extack);
+ void i40e_ptp_save_hw_time(struct i40e_pf *pf);
+ void i40e_ptp_restore_hw_time(struct i40e_pf *pf);
+ void i40e_ptp_init(struct i40e_pf *pf);
+--- a/drivers/net/ethernet/intel/i40e/i40e_main.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_main.c
+@@ -2955,27 +2955,6 @@ static int i40e_change_mtu(struct net_de
+ }
+ 
+ /**
+- * i40e_ioctl - Access the hwtstamp interface
+- * @netdev: network interface device structure
+- * @ifr: interface request data
+- * @cmd: ioctl command
+- **/
+-int i40e_ioctl(struct net_device *netdev, struct ifreq *ifr, int cmd)
+-{
+-	struct i40e_netdev_priv *np = netdev_priv(netdev);
+-	struct i40e_pf *pf = np->vsi->back;
+-
+-	switch (cmd) {
+-	case SIOCGHWTSTAMP:
+-		return i40e_ptp_get_ts_config(pf, ifr);
+-	case SIOCSHWTSTAMP:
+-		return i40e_ptp_set_ts_config(pf, ifr);
+-	default:
+-		return -EOPNOTSUPP;
+-	}
+-}
+-
+-/**
+  * i40e_vlan_stripping_enable - Turn on vlan stripping for the VSI
+  * @vsi: the vsi being adjusted
+  **/
+@@ -13626,7 +13605,6 @@ static const struct net_device_ops i40e_
+ 	.ndo_validate_addr	= eth_validate_addr,
+ 	.ndo_set_mac_address	= i40e_set_mac,
+ 	.ndo_change_mtu		= i40e_change_mtu,
+-	.ndo_eth_ioctl		= i40e_ioctl,
+ 	.ndo_tx_timeout		= i40e_tx_timeout,
+ 	.ndo_vlan_rx_add_vid	= i40e_vlan_rx_add_vid,
+ 	.ndo_vlan_rx_kill_vid	= i40e_vlan_rx_kill_vid,
+@@ -13654,6 +13632,8 @@ static const struct net_device_ops i40e_
+ 	.ndo_xsk_wakeup	        = i40e_xsk_wakeup,
+ 	.ndo_dfwd_add_station	= i40e_fwd_add,
+ 	.ndo_dfwd_del_station	= i40e_fwd_del,
++	.ndo_hwtstamp_get	= i40e_ptp_hwtstamp_get,
++	.ndo_hwtstamp_set	= i40e_ptp_hwtstamp_set,
+ };
+ 
+ /**
+--- a/drivers/net/ethernet/intel/i40e/i40e_ptp.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_ptp.c
+@@ -912,23 +912,26 @@ void i40e_ptp_set_increment(struct i40e_
+ }
+ 
+ /**
+- * i40e_ptp_get_ts_config - ioctl interface to read the HW timestamping
+- * @pf: Board private structure
+- * @ifr: ioctl data
++ * i40e_ptp_hwtstamp_get - interface to read the HW timestamping
++ * @netdev: Network device structure
++ * @config: Timestamping configuration structure
+  *
+  * Obtain the current hardware timestamping settigs as requested. To do this,
+  * keep a shadow copy of the timestamp settings rather than attempting to
+  * deconstruct it from the registers.
+  **/
+-int i40e_ptp_get_ts_config(struct i40e_pf *pf, struct ifreq *ifr)
++int i40e_ptp_hwtstamp_get(struct net_device *netdev,
++			  struct kernel_hwtstamp_config *config)
+ {
+-	struct hwtstamp_config *config = &pf->tstamp_config;
++	struct i40e_netdev_priv *np = netdev_priv(netdev);
++	struct i40e_pf *pf = np->vsi->back;
+ 
+ 	if (!test_bit(I40E_FLAG_PTP_ENA, pf->flags))
+ 		return -EOPNOTSUPP;
+ 
+-	return copy_to_user(ifr->ifr_data, config, sizeof(*config)) ?
+-		-EFAULT : 0;
++	*config = pf->tstamp_config;
++
++	return 0;
+ }
+ 
+ /**
+@@ -1167,7 +1170,7 @@ int i40e_ptp_alloc_pins(struct i40e_pf *
+  * more broad if the specific filter is not directly supported.
+  **/
+ static int i40e_ptp_set_timestamp_mode(struct i40e_pf *pf,
+-				       struct hwtstamp_config *config)
++				       struct kernel_hwtstamp_config *config)
+ {
+ 	struct i40e_hw *hw = &pf->hw;
+ 	u32 tsyntype, regval;
+@@ -1290,9 +1293,10 @@ static int i40e_ptp_set_timestamp_mode(s
+ }
+ 
+ /**
+- * i40e_ptp_set_ts_config - ioctl interface to control the HW timestamping
+- * @pf: Board private structure
+- * @ifr: ioctl data
++ * i40e_ptp_hwtstamp_set - interface to control the HW timestamping
++ * @netdev: Network device structure
++ * @config: Timestamping configuration structure
++ * @extack: Netlink extended ack structure for error reporting
+  *
+  * Respond to the user filter requests and make the appropriate hardware
+  * changes here. The XL710 cannot support splitting of the Tx/Rx timestamping
+@@ -1303,26 +1307,25 @@ static int i40e_ptp_set_timestamp_mode(s
+  * as the user receives the timestamps they care about and the user is notified
+  * the filter has been broadened.
+  **/
+-int i40e_ptp_set_ts_config(struct i40e_pf *pf, struct ifreq *ifr)
++int i40e_ptp_hwtstamp_set(struct net_device *netdev,
++			  struct kernel_hwtstamp_config *config,
++			  struct netlink_ext_ack *extack)
+ {
+-	struct hwtstamp_config config;
++	struct i40e_netdev_priv *np = netdev_priv(netdev);
++	struct i40e_pf *pf = np->vsi->back;
+ 	int err;
+ 
+ 	if (!test_bit(I40E_FLAG_PTP_ENA, pf->flags))
+ 		return -EOPNOTSUPP;
+ 
+-	if (copy_from_user(&config, ifr->ifr_data, sizeof(config)))
+-		return -EFAULT;
+-
+-	err = i40e_ptp_set_timestamp_mode(pf, &config);
++	err = i40e_ptp_set_timestamp_mode(pf, config);
+ 	if (err)
+ 		return err;
+ 
+ 	/* save these settings for future reference */
+-	pf->tstamp_config = config;
++	pf->tstamp_config = *config;
+ 
+-	return copy_to_user(ifr->ifr_data, &config, sizeof(config)) ?
+-		-EFAULT : 0;
++	return 0;
+ }
+ 
+ /**
