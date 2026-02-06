@@ -1,0 +1,145 @@
+From: Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+Date: Tue, 19 Aug 2025 15:19:58 -0700
+Subject: ixgbe: fix ndo_xdp_xmit() workloads
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Patch-mainline: v6.17-rc3
+Git-commit: f3d9f7fa7f5dbfd4fdb1e69c25fc5627700d19dd
+References: jsc#PED-14409 jsc#PED-15061 jsc#PED-14407
+
+Currently ixgbe driver checks periodically in its watchdog subtask if
+there is anything to be transmitted (considering both Tx and XDP rings)
+under state of carrier not being 'ok'. Such event is interpreted as Tx
+hang and therefore results in interface reset.
+
+This is currently problematic for ndo_xdp_xmit() as it is allowed to
+produce descriptors when interface is going through reset or its carrier
+is turned off.
+
+Furthermore, XDP rings should not really be objects of Tx hang
+detection. This mechanism is rather a matter of ndo_tx_timeout() being
+called from dev_watchdog against Tx rings exposed to networking stack.
+
+Taking into account issues described above, let us have a two fold fix -
+do not respect XDP rings in local ixgbe watchdog and do not produce Tx
+descriptors in ndo_xdp_xmit callback when there is some problem with
+carrier currently. For now, keep the Tx hang checks in clean Tx irq
+routine, but adjust it to not execute for XDP rings.
+
+Cc: Tobias Böhm <tobias.boehm@hetzner-cloud.de>
+Reported-by: Marcus Wichelmann <marcus.wichelmann@hetzner-cloud.de>
+Closes: https://lore.kernel.org/netdev/eca1880f-253a-4955-afe6-732d7c6926ee@hetzner-cloud.de/
+Fixes: 6453073987ba ("ixgbe: add initial support for xdp redirect")
+Fixes: 33fdc82f0883 ("ixgbe: add support for XDP_TX action")
+Reviewed-by: Aleksandr Loktionov <aleksandr.loktionov@intel.com>
+Tested-by: Marcus Wichelmann <marcus.wichelmann@hetzner-cloud.de>
+Signed-off-by: Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Link: https://patch.msgid.link/20250819222000.3504873-5-anthony.l.nguyen@intel.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/ixgbe/ixgbe_main.c |   34 ++++++++------------------
+ 1 file changed, 11 insertions(+), 23 deletions(-)
+
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@ -968,10 +968,6 @@ static void ixgbe_update_xoff_rx_lfc(str
+ 	for (i = 0; i < adapter->num_tx_queues; i++)
+ 		clear_bit(__IXGBE_HANG_CHECK_ARMED,
+ 			  &adapter->tx_ring[i]->state);
+-
+-	for (i = 0; i < adapter->num_xdp_queues; i++)
+-		clear_bit(__IXGBE_HANG_CHECK_ARMED,
+-			  &adapter->xdp_ring[i]->state);
+ }
+ 
+ static void ixgbe_update_xoff_received(struct ixgbe_adapter *adapter)
+@@ -1214,7 +1210,7 @@ static void ixgbe_pf_handle_tx_hang(stru
+ 	struct ixgbe_adapter *adapter = netdev_priv(tx_ring->netdev);
+ 	struct ixgbe_hw *hw = &adapter->hw;
+ 
+-	e_err(drv, "Detected Tx Unit Hang%s\n"
++	e_err(drv, "Detected Tx Unit Hang\n"
+ 		   "  Tx Queue             <%d>\n"
+ 		   "  TDH, TDT             <%x>, <%x>\n"
+ 		   "  next_to_use          <%x>\n"
+@@ -1222,16 +1218,14 @@ static void ixgbe_pf_handle_tx_hang(stru
+ 		   "tx_buffer_info[next_to_clean]\n"
+ 		   "  time_stamp           <%lx>\n"
+ 		   "  jiffies              <%lx>\n",
+-	      ring_is_xdp(tx_ring) ? " (XDP)" : "",
+ 	      tx_ring->queue_index,
+ 	      IXGBE_READ_REG(hw, IXGBE_TDH(tx_ring->reg_idx)),
+ 	      IXGBE_READ_REG(hw, IXGBE_TDT(tx_ring->reg_idx)),
+ 	      tx_ring->next_to_use, next,
+ 	      tx_ring->tx_buffer_info[next].time_stamp, jiffies);
+ 
+-	if (!ring_is_xdp(tx_ring))
+-		netif_stop_subqueue(tx_ring->netdev,
+-				    tx_ring->queue_index);
++	netif_stop_subqueue(tx_ring->netdev,
++			    tx_ring->queue_index);
+ }
+ 
+ /**
+@@ -1451,6 +1445,9 @@ static bool ixgbe_clean_tx_irq(struct ix
+ 				   total_bytes);
+ 	adapter->tx_ipsec += total_ipsec;
+ 
++	if (ring_is_xdp(tx_ring))
++		return !!budget;
++
+ 	if (check_for_tx_hang(tx_ring) && ixgbe_check_tx_hang(tx_ring)) {
+ 		if (adapter->hw.mac.type == ixgbe_mac_e610)
+ 			ixgbe_handle_mdd_event(adapter, tx_ring);
+@@ -1468,9 +1465,6 @@ static bool ixgbe_clean_tx_irq(struct ix
+ 		return true;
+ 	}
+ 
+-	if (ring_is_xdp(tx_ring))
+-		return !!budget;
+-
+ #define TX_WAKE_THRESHOLD (DESC_NEEDED * 2)
+ 	txq = netdev_get_tx_queue(tx_ring->netdev, tx_ring->queue_index);
+ 	if (!__netif_txq_completed_wake(txq, total_packets, total_bytes,
+@@ -7974,12 +7968,9 @@ static void ixgbe_check_hang_subtask(str
+ 		return;
+ 
+ 	/* Force detection of hung controller */
+-	if (netif_carrier_ok(adapter->netdev)) {
++	if (netif_carrier_ok(adapter->netdev))
+ 		for (i = 0; i < adapter->num_tx_queues; i++)
+ 			set_check_for_tx_hang(adapter->tx_ring[i]);
+-		for (i = 0; i < adapter->num_xdp_queues; i++)
+-			set_check_for_tx_hang(adapter->xdp_ring[i]);
+-	}
+ 
+ 	if (!(adapter->flags & IXGBE_FLAG_MSIX_ENABLED)) {
+ 		/*
+@@ -8199,13 +8190,6 @@ static bool ixgbe_ring_tx_pending(struct
+ 			return true;
+ 	}
+ 
+-	for (i = 0; i < adapter->num_xdp_queues; i++) {
+-		struct ixgbe_ring *ring = adapter->xdp_ring[i];
+-
+-		if (ring->next_to_use != ring->next_to_clean)
+-			return true;
+-	}
+-
+ 	return false;
+ }
+ 
+@@ -11004,6 +10988,10 @@ static int ixgbe_xdp_xmit(struct net_dev
+ 	if (unlikely(test_bit(__IXGBE_DOWN, &adapter->state)))
+ 		return -ENETDOWN;
+ 
++	if (!netif_carrier_ok(adapter->netdev) ||
++	    !netif_running(adapter->netdev))
++		return -ENETDOWN;
++
+ 	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK))
+ 		return -EINVAL;
+ 
