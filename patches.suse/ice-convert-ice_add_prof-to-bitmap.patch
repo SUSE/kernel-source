@@ -1,0 +1,172 @@
+From: Jesse Brandeburg <jesse.brandeburg@intel.com>
+Date: Wed, 18 Jun 2025 13:28:53 +0200
+Subject: ice: convert ice_add_prof() to bitmap
+Patch-mainline: v6.17-rc1
+Git-commit: 850a9a32ab6d8bdd2caf667e184e802aaa2b022d
+References: jsc#PED-14404 jsc#PED-15079
+
+Previously the ice_add_prof() took an array of u8 and looped over it with
+for_each_set_bit(), examining each 8 bit value as a bitmap.
+This was just hard to understand and unnecessary, and was triggering
+undefined behavior sanitizers with unaligned accesses within bitmap
+fields (on our internal tools/builds). Since the @ptype being passed in
+was already declared as a bitmap, refactor this to use native types with
+the advantage of simplifying the code to use a single loop.
+
+Co-developed-by: Jacob Keller <jacob.e.keller@intel.com>
+Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+Signed-off-by: Jesse Brandeburg <jesse.brandeburg@intel.com>
+Signed-off-by: Aleksandr Loktionov <aleksandr.loktionov@intel.com>
+CC: Jesse Brandeburg <jbrandeburg@cloudflare.com>
+Signed-off-by: Przemek Kitszel <przemyslaw.kitszel@intel.com>
+Reviewed-by: Paul Menzel <pmenzel@molgen.mpg.de>
+Tested-by: Rinitha S <sx.rinitha@intel.com> (A Contingent worker at Intel)
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/ice/ice_flex_pipe.c |   78 ++++++++-----------------
+ drivers/net/ethernet/intel/ice/ice_flex_pipe.h |    7 +-
+ drivers/net/ethernet/intel/ice/ice_flow.c      |    4 -
+ 3 files changed, 34 insertions(+), 55 deletions(-)
+
+--- a/drivers/net/ethernet/intel/ice/ice_flex_pipe.c
++++ b/drivers/net/ethernet/intel/ice/ice_flex_pipe.c
+@@ -3043,16 +3043,16 @@ ice_disable_fd_swap(struct ice_hw *hw, u
+  * the ID value used here.
+  */
+ int
+-ice_add_prof(struct ice_hw *hw, enum ice_block blk, u64 id, u8 ptypes[],
+-	     const struct ice_ptype_attributes *attr, u16 attr_cnt,
+-	     struct ice_fv_word *es, u16 *masks, bool symm, bool fd_swap)
++ice_add_prof(struct ice_hw *hw, enum ice_block blk, u64 id,
++	     unsigned long *ptypes, const struct ice_ptype_attributes *attr,
++	     u16 attr_cnt, struct ice_fv_word *es, u16 *masks, bool symm,
++	     bool fd_swap)
+ {
+-	u32 bytes = DIV_ROUND_UP(ICE_FLOW_PTYPE_MAX, BITS_PER_BYTE);
+ 	DECLARE_BITMAP(ptgs_used, ICE_XLT1_CNT);
+ 	struct ice_prof_map *prof;
+-	u8 byte = 0;
+-	u8 prof_id;
+ 	int status;
++	u8 prof_id;
++	u16 ptype;
+ 
+ 	bitmap_zero(ptgs_used, ICE_XLT1_CNT);
+ 
+@@ -3102,57 +3102,35 @@ ice_add_prof(struct ice_hw *hw, enum ice
+ 	prof->context = 0;
+ 
+ 	/* build list of ptgs */
+-	while (bytes && prof->ptg_cnt < ICE_MAX_PTG_PER_PROFILE) {
+-		u8 bit;
++	for_each_set_bit(ptype, ptypes, ICE_FLOW_PTYPE_MAX) {
++		u8 ptg;
+ 
+-		if (!ptypes[byte]) {
+-			bytes--;
+-			byte++;
++		/* The package should place all ptypes in a non-zero
++		 * PTG, so the following call should never fail.
++		 */
++		if (ice_ptg_find_ptype(hw, blk, ptype, &ptg))
+ 			continue;
+-		}
+-
+-		/* Examine 8 bits per byte */
+-		for_each_set_bit(bit, (unsigned long *)&ptypes[byte],
+-				 BITS_PER_BYTE) {
+-			u16 ptype;
+-			u8 ptg;
+ 
+-			ptype = byte * BITS_PER_BYTE + bit;
++		/* If PTG is already added, skip and continue */
++		if (test_bit(ptg, ptgs_used))
++			continue;
+ 
+-			/* The package should place all ptypes in a non-zero
+-			 * PTG, so the following call should never fail.
+-			 */
+-			if (ice_ptg_find_ptype(hw, blk, ptype, &ptg))
+-				continue;
++		set_bit(ptg, ptgs_used);
++		/* Check to see there are any attributes for this ptype, and
++		 * add them if found.
++		 */
++		status = ice_add_prof_attrib(prof, ptg, ptype, attr, attr_cnt);
++		if (status == -ENOSPC)
++			break;
++		if (status) {
++			/* This is simple a ptype/PTG with no attribute */
++			prof->ptg[prof->ptg_cnt] = ptg;
++			prof->attr[prof->ptg_cnt].flags = 0;
++			prof->attr[prof->ptg_cnt].mask = 0;
+ 
+-			/* If PTG is already added, skip and continue */
+-			if (test_bit(ptg, ptgs_used))
+-				continue;
+-
+-			__set_bit(ptg, ptgs_used);
+-			/* Check to see there are any attributes for
+-			 * this PTYPE, and add them if found.
+-			 */
+-			status = ice_add_prof_attrib(prof, ptg, ptype,
+-						     attr, attr_cnt);
+-			if (status == -ENOSPC)
++			if (++prof->ptg_cnt >= ICE_MAX_PTG_PER_PROFILE)
+ 				break;
+-			if (status) {
+-				/* This is simple a PTYPE/PTG with no
+-				 * attribute
+-				 */
+-				prof->ptg[prof->ptg_cnt] = ptg;
+-				prof->attr[prof->ptg_cnt].flags = 0;
+-				prof->attr[prof->ptg_cnt].mask = 0;
+-
+-				if (++prof->ptg_cnt >=
+-				    ICE_MAX_PTG_PER_PROFILE)
+-					break;
+-			}
+ 		}
+-
+-		bytes--;
+-		byte++;
+ 	}
+ 
+ 	list_add(&prof->list, &hw->blk[blk].es.prof_map);
+--- a/drivers/net/ethernet/intel/ice/ice_flex_pipe.h
++++ b/drivers/net/ethernet/intel/ice/ice_flex_pipe.h
+@@ -39,9 +39,10 @@ bool ice_hw_ptype_ena(struct ice_hw *hw,
+ 
+ /* XLT2/VSI group functions */
+ int
+-ice_add_prof(struct ice_hw *hw, enum ice_block blk, u64 id, u8 ptypes[],
+-	     const struct ice_ptype_attributes *attr, u16 attr_cnt,
+-	     struct ice_fv_word *es, u16 *masks, bool symm, bool fd_swap);
++ice_add_prof(struct ice_hw *hw, enum ice_block blk, u64 id,
++	     unsigned long *ptypes, const struct ice_ptype_attributes *attr,
++	     u16 attr_cnt, struct ice_fv_word *es, u16 *masks, bool symm,
++	     bool fd_swap);
+ struct ice_prof_map *
+ ice_search_prof_id(struct ice_hw *hw, enum ice_block blk, u64 id);
+ int
+--- a/drivers/net/ethernet/intel/ice/ice_flow.c
++++ b/drivers/net/ethernet/intel/ice/ice_flow.c
+@@ -1421,7 +1421,7 @@ ice_flow_add_prof_sync(struct ice_hw *hw
+ 	}
+ 
+ 	/* Add a HW profile for this flow profile */
+-	status = ice_add_prof(hw, blk, prof_id, (u8 *)params->ptypes,
++	status = ice_add_prof(hw, blk, prof_id, params->ptypes,
+ 			      params->attr, params->attr_cnt, params->es,
+ 			      params->mask, symm, true);
+ 	if (status) {
+@@ -1617,7 +1617,7 @@ ice_flow_set_parser_prof(struct ice_hw *
+ 		break;
+ 	}
+ 
+-	status = ice_add_prof(hw, blk, id, (u8 *)prof->ptypes,
++	status = ice_add_prof(hw, blk, id, prof->ptypes,
+ 			      params->attr, params->attr_cnt,
+ 			      params->es, params->mask, false, false);
+ 	if (status)
