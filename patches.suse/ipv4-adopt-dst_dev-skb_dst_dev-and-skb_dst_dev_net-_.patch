@@ -1,0 +1,358 @@
+From: Eric Dumazet <edumazet@google.com>
+Date: Mon, 30 Jun 2025 12:19:31 +0000
+Subject: ipv4: adopt dst_dev, skb_dst_dev and skb_dst_dev_net[_rcu]
+Patch-mainline: v6.17-rc1
+Git-commit: a74fc62eec155ca5a6da8ff3856f3dc87fe24558
+References: CVE-2025-40139 bsc#1253409
+
+Use the new helpers as a first step to deal with
+potential dst->dev races.
+
+SLE15-SP5-LTSS: omit ipv4_default_advmss() change as ip_rt_min_advmss is not
+per-net yet.
+
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Reviewed-by: Kuniyuki Iwashima <kuniyu@google.com>
+Link: https://patch.msgid.link/20250630121934.3399505-8-edumazet@google.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Michal Kubecek <mkubecek@suse.cz>
+
+---
+ include/net/inet_hashtables.h |  2 +-
+ include/net/ip.h              | 10 ++++++----
+ include/net/route.h           |  2 +-
+ net/ipv4/icmp.c               | 14 ++++++++------
+ net/ipv4/igmp.c               |  2 +-
+ net/ipv4/ip_fragment.c        |  2 +-
+ net/ipv4/ip_output.c          |  6 +++---
+ net/ipv4/ip_vti.c             |  4 ++--
+ net/ipv4/netfilter.c          |  4 ++--
+ net/ipv4/route.c              |  6 +++---
+ net/ipv4/tcp_fastopen.c       |  4 +++-
+ net/ipv4/tcp_ipv4.c           |  2 +-
+ net/ipv4/tcp_metrics.c        |  8 ++++----
+ net/ipv4/xfrm4_output.c       |  2 +-
+ 14 files changed, 37 insertions(+), 31 deletions(-)
+
+--- a/include/net/inet_hashtables.h
++++ b/include/net/inet_hashtables.h
+@@ -386,7 +386,7 @@ static inline struct sock *__inet_lookup_skb(struct inet_hashinfo *hashinfo,
+ 					     bool *refcounted)
+ {
+ 	struct sock *sk = skb_steal_sock(skb, refcounted);
+-	struct net *net = dev_net_rcu(skb_dst(skb)->dev);
++	struct net *net = skb_dst_dev_net_rcu(skb);
+ 	const struct iphdr *iph = ip_hdr(skb);
+ 
+ 	if (sk)
+--- a/include/net/ip.h
++++ b/include/net/ip.h
+@@ -446,7 +446,7 @@ static inline unsigned int ip_dst_mtu_maybe_forward(const struct dst_entry *dst,
+ 
+ 	rcu_read_lock();
+ 
+-	net = dev_net_rcu(dst->dev);
++	net = dev_net_rcu(dst_dev(dst));
+ 	if (READ_ONCE(net->ipv4.sysctl_ip_fwd_use_pmtu) ||
+ 	    ip_mtu_locked(dst) ||
+ 	    !forwarding) {
+@@ -460,7 +460,7 @@ static inline unsigned int ip_dst_mtu_maybe_forward(const struct dst_entry *dst,
+ 	if (mtu)
+ 		goto out;
+ 
+-	mtu = READ_ONCE(dst->dev->mtu);
++	mtu = READ_ONCE(dst_dev(dst)->mtu);
+ 
+ 	if (unlikely(ip_mtu_locked(dst))) {
+ 		if (rt->rt_uses_gateway && mtu > 576)
+@@ -480,13 +480,15 @@ static inline unsigned int ip_dst_mtu_maybe_forward(const struct dst_entry *dst,
+ static inline unsigned int ip_skb_dst_mtu(struct sock *sk,
+ 					  const struct sk_buff *skb)
+ {
++	const struct dst_entry *dst = skb_dst(skb);
++
+ 	if (!sk || !sk_fullsock(sk) || ip_sk_use_pmtu(sk)) {
+ 		bool forwarding = IPCB(skb)->flags & IPSKB_FORWARDED;
+ 
+-		return ip_dst_mtu_maybe_forward(skb_dst(skb), forwarding);
++		return ip_dst_mtu_maybe_forward(dst, forwarding);
+ 	}
+ 
+-	return min(READ_ONCE(skb_dst(skb)->dev->mtu), IP_MAX_MTU);
++	return min(READ_ONCE(dst_dev(dst)->mtu), IP_MAX_MTU);
+ }
+ 
+ struct dst_metrics *ip_fib_metrics_init(struct net *net, struct nlattr *fc_mx,
+--- a/include/net/route.h
++++ b/include/net/route.h
+@@ -362,7 +362,7 @@ static inline int ip4_dst_hoplimit(const struct dst_entry *dst)
+ 		const struct net *net;
+ 
+ 		rcu_read_lock();
+-		net = dev_net_rcu(dst->dev);
++		net = dev_net_rcu(dst_dev(dst));
+ 		hoplimit = READ_ONCE(net->ipv4.sysctl_ip_default_ttl);
+ 		rcu_read_unlock();
+ 	}
+--- a/net/ipv4/icmp.c
++++ b/net/ipv4/icmp.c
+@@ -315,6 +315,7 @@ static bool icmpv4_xrlim_allow(struct net *net, struct rtable *rt,
+ {
+ 	struct dst_entry *dst = &rt->dst;
+ 	struct inet_peer *peer;
++	struct net_device *dev;
+ 	bool rc = true;
+ 	int vif;
+ 
+@@ -322,10 +323,11 @@ static bool icmpv4_xrlim_allow(struct net *net, struct rtable *rt,
+ 		goto out;
+ 
+ 	/* No rate limit on loopback */
+-	if (dst->dev && (dst->dev->flags&IFF_LOOPBACK))
++	dev = dst_dev(dst);
++	if (dev && (dev->flags & IFF_LOOPBACK))
+ 		goto out;
+ 
+-	vif = l3mdev_master_ifindex(dst->dev);
++	vif = l3mdev_master_ifindex(dev);
+ 	peer = inet_getpeer_v4(net->ipv4.peers, fl4->daddr, vif, 1);
+ 	rc = inet_peer_xrlim_allow(peer, net->ipv4.sysctl_icmp_ratelimit);
+ 	if (peer)
+@@ -506,7 +508,7 @@ static struct rtable *icmp_route_lookup(struct net *net,
+ 	if (err)
+ 		goto relookup_failed;
+ 
+-	if (inet_addr_type_dev_table(net, skb_dst(skb_in)->dev,
++	if (inet_addr_type_dev_table(net, dst_dev(skb_dst(skb_in)),
+ 				     fl4_dec.saddr) == RTN_LOCAL) {
+ 		rt2 = __ip_route_output_key(net, &fl4_dec);
+ 		if (IS_ERR(rt2))
+@@ -831,7 +833,7 @@ static bool icmp_unreach(struct sk_buff *skb)
+ 	struct net *net;
+ 	u32 info = 0;
+ 
+-	net = dev_net_rcu(skb_dst(skb)->dev);
++	net = skb_dst_dev_net_rcu(skb);
+ 
+ 	/*
+ 	 *	Incomplete header ?
+@@ -969,7 +971,7 @@ static bool icmp_echo(struct sk_buff *skb)
+ {
+ 	struct net *net;
+ 
+-	net = dev_net_rcu(skb_dst(skb)->dev);
++	net = skb_dst_dev_net_rcu(skb);
+ 	if (!net->ipv4.sysctl_icmp_echo_ignore_all) {
+ 		struct icmp_bxm icmp_param;
+ 
+@@ -1020,7 +1022,7 @@ static bool icmp_timestamp(struct sk_buff *skb)
+ 	return true;
+ 
+ out_err:
+-	__ICMP_INC_STATS(dev_net_rcu(skb_dst(skb)->dev), ICMP_MIB_INERRORS);
++	__ICMP_INC_STATS(skb_dst_dev_net_rcu(skb), ICMP_MIB_INERRORS);
+ 	return false;
+ }
+ 
+--- a/net/ipv4/igmp.c
++++ b/net/ipv4/igmp.c
+@@ -425,7 +425,7 @@ static int igmpv3_sendpack(struct sk_buff *skb)
+ 
+ 	pig->csum = ip_compute_csum(igmp_hdr(skb), igmplen);
+ 
+-	return ip_local_out(dev_net(skb_dst(skb)->dev), skb->sk, skb);
++	return ip_local_out(skb_dst_dev_net(skb), skb->sk, skb);
+ }
+ 
+ static int grec_size(struct ip_mc_list *pmc, int type, int gdel, int sdel)
+--- a/net/ipv4/ip_fragment.c
++++ b/net/ipv4/ip_fragment.c
+@@ -474,7 +474,7 @@ static int ip_frag_reasm(struct ipq *qp, struct sk_buff *skb,
+ /* Process an incoming IP datagram fragment. */
+ int ip_defrag(struct net *net, struct sk_buff *skb, u32 user)
+ {
+-	struct net_device *dev = skb->dev ? : skb_dst(skb)->dev;
++	struct net_device *dev = skb->dev ? : skb_dst_dev(skb);
+ 	int vif = l3mdev_master_ifindex_rcu(dev);
+ 	struct ipq *qp;
+ 
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@ -113,7 +113,7 @@ int __ip_local_out(struct net *net, struct sock *sk, struct sk_buff *skb)
+ 	skb->protocol = htons(ETH_P_IP);
+ 
+ 	return nf_hook(NFPROTO_IPV4, NF_INET_LOCAL_OUT,
+-		       net, sk, skb, NULL, skb_dst(skb)->dev,
++		       net, sk, skb, NULL, skb_dst_dev(skb),
+ 		       dst_output);
+ }
+ 
+@@ -194,7 +194,7 @@ static int ip_finish_output2(struct net *net, struct sock *sk, struct sk_buff *s
+ {
+ 	struct dst_entry *dst = skb_dst(skb);
+ 	struct rtable *rt = (struct rtable *)dst;
+-	struct net_device *dev = dst->dev;
++	struct net_device *dev = dst_dev(dst);
+ 	unsigned int hh_len = LL_RESERVED_SPACE(dev);
+ 	struct neighbour *neigh;
+ 	bool is_v6gw = false;
+@@ -430,7 +430,7 @@ int ip_mc_output(struct net *net, struct sock *sk, struct sk_buff *skb)
+ 
+ int ip_output(struct net *net, struct sock *sk, struct sk_buff *skb)
+ {
+-	struct net_device *dev = skb_dst(skb)->dev, *indev = skb->dev;
++	struct net_device *dev = skb_dst_dev(skb), *indev = skb->dev;
+ 
+ 	IP_UPD_PO_STATS(net, IPSTATS_MIB_OUT, skb->len);
+ 
+--- a/net/ipv4/ip_vti.c
++++ b/net/ipv4/ip_vti.c
+@@ -238,7 +238,7 @@ static netdev_tx_t vti_xmit(struct sk_buff *skb, struct net_device *dev,
+ 		goto tx_error_icmp;
+ 	}
+ 
+-	tdev = dst->dev;
++	tdev = dst_dev(dst);
+ 
+ 	if (tdev == dev) {
+ 		dst_release(dst);
+@@ -266,7 +266,7 @@ static netdev_tx_t vti_xmit(struct sk_buff *skb, struct net_device *dev,
+ queued:
+ 	skb_scrub_packet(skb, !net_eq(tunnel->net, dev_net(dev)));
+ 	skb_dst_set(skb, dst);
+-	skb->dev = skb_dst(skb)->dev;
++	skb->dev = skb_dst_dev(skb);
+ 
+ 	err = dst_output(tunnel->net, skb->sk, skb);
+ 	if (net_xmit_eval(err) == 0)
+--- a/net/ipv4/netfilter.c
++++ b/net/ipv4/netfilter.c
+@@ -19,13 +19,13 @@
+ /* route_me_harder function, used by iptable_nat, iptable_mangle + ip_queue */
+ int ip_route_me_harder(struct net *net, struct sk_buff *skb, unsigned int addr_type)
+ {
++	struct net_device *dev = skb_dst_dev(skb);
+ 	const struct iphdr *iph = ip_hdr(skb);
+ 	struct rtable *rt;
+ 	struct flowi4 fl4 = {};
+ 	__be32 saddr = iph->saddr;
+ 	const struct sock *sk = skb_to_full_sk(skb);
+ 	__u8 flags = sk ? inet_sk_flowi_flags(sk) : 0;
+-	struct net_device *dev = skb_dst(skb)->dev;
+ 	unsigned int hh_len;
+ 
+ 	if (addr_type == RTN_UNSPEC)
+@@ -70,7 +70,7 @@ int ip_route_me_harder(struct net *net, struct sk_buff *skb, unsigned int addr_t
+ #endif
+ 
+ 	/* Change in oif may mean change in hh_len. */
+-	hh_len = skb_dst(skb)->dev->hard_header_len;
++	hh_len = skb_dst_dev(skb)->hard_header_len;
+ 	if (skb_headroom(skb) < hh_len &&
+ 	    pskb_expand_head(skb, HH_DATA_ALIGN(hh_len - skb_headroom(skb)),
+ 				0, GFP_ATOMIC))
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@ -442,7 +442,7 @@ static struct neighbour *ipv4_neigh_lookup(const struct dst_entry *dst,
+ 					   const void *daddr)
+ {
+ 	const struct rtable *rt = container_of(dst, struct rtable, dst);
+-	struct net_device *dev = dst->dev;
++	struct net_device *dev = dst_dev(dst);
+ 	struct neighbour *n;
+ 
+ 	rcu_read_lock_bh();
+@@ -469,7 +469,7 @@ static struct neighbour *ipv4_neigh_lookup(const struct dst_entry *dst,
+ static void ipv4_confirm_neigh(const struct dst_entry *dst, const void *daddr)
+ {
+ 	const struct rtable *rt = container_of(dst, struct rtable, dst);
+-	struct net_device *dev = dst->dev;
++	struct net_device *dev = dst_dev(dst);
+ 	const __be32 *pkey = daddr;
+ 
+ 	if (rt->rt_gw_family == AF_INET) {
+@@ -1048,7 +1048,7 @@ static void __ip_rt_update_pmtu(struct rtable *rt, struct flowi4 *fl4, u32 mtu)
+ 		return;
+ 
+ 	rcu_read_lock();
+-	net = dev_net_rcu(dst->dev);
++	net = dev_net_rcu(dst_dev(dst));
+ 	if (mtu < ip_rt_min_pmtu) {
+ 		lock = true;
+ 		mtu = min(old_mtu, ip_rt_min_pmtu);
+--- a/net/ipv4/tcp_fastopen.c
++++ b/net/ipv4/tcp_fastopen.c
+@@ -548,6 +548,7 @@ bool tcp_fastopen_active_should_disable(struct sock *sk)
+ void tcp_fastopen_active_disable_ofo_check(struct sock *sk)
+ {
+ 	struct tcp_sock *tp = tcp_sk(sk);
++	struct net_device *dev;
+ 	struct dst_entry *dst;
+ 	struct sk_buff *skb;
+ 
+@@ -565,7 +566,8 @@ void tcp_fastopen_active_disable_ofo_check(struct sock *sk)
+ 	} else if (tp->syn_fastopen_ch &&
+ 		   atomic_read(&sock_net(sk)->ipv4.tfo_active_disable_times)) {
+ 		dst = sk_dst_get(sk);
+-		if (!(dst && dst->dev && (dst->dev->flags & IFF_LOOPBACK)))
++		dev = dst ? dst_dev(dst) : NULL;
++		if (!(dev && (dev->flags & IFF_LOOPBACK)))
+ 			atomic_set(&sock_net(sk)->ipv4.tfo_active_disable_times, 0);
+ 		dst_release(dst);
+ 	}
+--- a/net/ipv4/tcp_ipv4.c
++++ b/net/ipv4/tcp_ipv4.c
+@@ -703,7 +703,7 @@ static void tcp_v4_send_reset(const struct sock *sk, struct sk_buff *skb)
+ 	arg.iov[0].iov_base = (unsigned char *)&rep;
+ 	arg.iov[0].iov_len  = sizeof(rep.th);
+ 
+-	net = sk ? sock_net(sk) : dev_net_rcu(skb_dst(skb)->dev);
++	net = sk ? sock_net(sk) : skb_dst_dev_net_rcu(skb);
+ #ifdef CONFIG_TCP_MD5SIG
+ 	rcu_read_lock();
+ 	hash_location = tcp_parse_md5sig_option(th);
+--- a/net/ipv4/tcp_metrics.c
++++ b/net/ipv4/tcp_metrics.c
+@@ -149,11 +149,11 @@ static struct tcp_metrics_block *tcpm_new(struct dst_entry *dst,
+ 					  unsigned int hash)
+ {
+ 	struct tcp_metrics_block *tm;
+-	struct net *net;
+ 	bool reclaim = false;
++	struct net *net;
+ 
+ 	spin_lock_bh(&tcp_metrics_lock);
+-	net = dev_net_rcu(dst->dev);
++	net = dev_net_rcu(dst_dev(dst));
+ 
+ 	/* While waiting for the spin-lock the cache might have been populated
+ 	 * with this entry and so we have to check again.
+@@ -253,7 +253,7 @@ static struct tcp_metrics_block *__tcp_get_metrics_req(struct request_sock *req,
+ 		return NULL;
+ 	}
+ 
+-	net = dev_net_rcu(dst->dev);
++	net = dev_net_rcu(dst_dev(dst));
+ 	hash ^= net_hash_mix(net);
+ 	hash = hash_32(hash, tcp_metrics_hash_log);
+ 
+@@ -298,7 +298,7 @@ static struct tcp_metrics_block *tcp_get_metrics(struct sock *sk,
+ 	else
+ 		return NULL;
+ 
+-	net = dev_net_rcu(dst->dev);
++	net = dev_net_rcu(dst_dev(dst));
+ 	hash ^= net_hash_mix(net);
+ 	hash = hash_32(hash, tcp_metrics_hash_log);
+ 
+--- a/net/ipv4/xfrm4_output.c
++++ b/net/ipv4/xfrm4_output.c
+@@ -31,7 +31,7 @@ static int __xfrm4_output(struct net *net, struct sock *sk, struct sk_buff *skb)
+ int xfrm4_output(struct net *net, struct sock *sk, struct sk_buff *skb)
+ {
+ 	return NF_HOOK_COND(NFPROTO_IPV4, NF_INET_POST_ROUTING,
+-			    net, sk, skb, skb->dev, skb_dst(skb)->dev,
++			    net, sk, skb, skb->dev, skb_dst_dev(skb),
+ 			    __xfrm4_output,
+ 			    !(IPCB(skb)->flags & IPSKB_REROUTED));
+ }
