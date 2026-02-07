@@ -1,0 +1,159 @@
+From: Ard Biesheuvel <ardb@kernel.org>
+Date: Fri, 20 Dec 2024 12:04:57 +0100
+Subject: efi/libstub: Use __free() helper for pool deallocations
+Patch-mainline: v6.14-rc1
+Git-commit: 4e23c96b1fe1a13078209394a292efe06767f3a4
+References: jsc#PED-14259
+
+Annotate some local buffer allocations as __free(efi_pool) and simplify
+the associated error handling accordingly. This removes a couple of
+gotos and simplifies the code.
+
+Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+Acked-by: Chun-Yi Lee <jlee@suse.com>
+---
+ drivers/firmware/efi/libstub/efi-stub-helper.c |    9 ++++-----
+ drivers/firmware/efi/libstub/efi-stub.c        |   21 ++++++++++-----------
+ drivers/firmware/efi/libstub/x86-stub.c        |   16 ++++++----------
+ 3 files changed, 20 insertions(+), 26 deletions(-)
+
+--- a/drivers/firmware/efi/libstub/efi-stub-helper.c
++++ b/drivers/firmware/efi/libstub/efi-stub-helper.c
+@@ -47,9 +47,10 @@ bool __pure __efi_soft_reserve_enabled(v
+  */
+ efi_status_t efi_parse_options(char const *cmdline)
+ {
+-	size_t len;
++	char *buf __free(efi_pool) = NULL;
+ 	efi_status_t status;
+-	char *str, *buf;
++	size_t len;
++	char *str;
+ 
+ 	if (!cmdline)
+ 		return EFI_SUCCESS;
+@@ -102,7 +103,6 @@ efi_status_t efi_parse_options(char cons
+ 			efi_parse_option_graphics(val + strlen("efifb:"));
+ 		}
+ 	}
+-	efi_bs_call(free_pool, buf);
+ 	return EFI_SUCCESS;
+ }
+ 
+@@ -250,7 +250,7 @@ static efi_status_t efi_measure_tagged_e
+ 						  u64, const union efistub_event *);
+ 		struct { u32 hash_log_extend_event; } mixed_mode;
+ 	} method;
+-	struct efistub_measured_event *evt;
++	struct efistub_measured_event *evt __free(efi_pool) = NULL;
+ 	int size = struct_size(evt, tagged_event.tagged_event_data,
+ 			       events[event].event_data_len);
+ 	efi_guid_t tcg2_guid = EFI_TCG2_PROTOCOL_GUID;
+@@ -312,7 +312,6 @@ static efi_status_t efi_measure_tagged_e
+ 
+ 	status = efi_fn_call(&method, hash_log_extend_event, protocol, 0,
+ 			     load_addr, load_size, &evt->event_data);
+-	efi_bs_call(free_pool, evt);
+ 
+ 	if (status == EFI_SUCCESS)
+ 		return EFI_SUCCESS;
+--- a/drivers/firmware/efi/libstub/efi-stub.c
++++ b/drivers/firmware/efi/libstub/efi-stub.c
+@@ -104,8 +104,8 @@ static u32 get_supported_rt_services(voi
+ 
+ efi_status_t efi_handle_cmdline(efi_loaded_image_t *image, char **cmdline_ptr)
+ {
++	char *cmdline __free(efi_pool) = NULL;
+ 	efi_status_t status;
+-	char *cmdline;
+ 
+ 	/*
+ 	 * Get the command line from EFI, using the LOADED_IMAGE
+@@ -120,25 +120,24 @@ efi_status_t efi_handle_cmdline(efi_load
+ 
+ 	if (!IS_ENABLED(CONFIG_CMDLINE_FORCE)) {
+ 		status = efi_parse_options(cmdline);
+-		if (status != EFI_SUCCESS)
+-			goto fail_free_cmdline;
++		if (status != EFI_SUCCESS) {
++			efi_err("Failed to parse EFI load options\n");
++			return status;
++		}
+ 	}
+ 
+ 	if (IS_ENABLED(CONFIG_CMDLINE_EXTEND) ||
+ 	    IS_ENABLED(CONFIG_CMDLINE_FORCE) ||
+ 	    cmdline[0] == 0) {
+ 		status = efi_parse_options(CONFIG_CMDLINE);
+-		if (status != EFI_SUCCESS)
+-			goto fail_free_cmdline;
++		if (status != EFI_SUCCESS) {
++			efi_err("Failed to parse built-in command line\n");
++			return status;
++		}
+ 	}
+ 
+-	*cmdline_ptr = cmdline;
++	*cmdline_ptr = no_free_ptr(cmdline);
+ 	return EFI_SUCCESS;
+-
+-fail_free_cmdline:
+-	efi_err("Failed to parse options\n");
+-	efi_bs_call(free_pool, cmdline);
+-	return status;
+ }
+ 
+ efi_status_t efi_stub_common(efi_handle_t handle,
+--- a/drivers/firmware/efi/libstub/x86-stub.c
++++ b/drivers/firmware/efi/libstub/x86-stub.c
+@@ -42,7 +42,7 @@ union sev_memory_acceptance_protocol {
+ static efi_status_t
+ preserve_pci_rom_image(efi_pci_io_protocol_t *pci, struct pci_setup_rom **__rom)
+ {
+-	struct pci_setup_rom *rom = NULL;
++	struct pci_setup_rom *rom __free(efi_pool) = NULL;
+ 	efi_status_t status;
+ 	unsigned long size;
+ 	uint64_t romsize;
+@@ -75,14 +75,13 @@ preserve_pci_rom_image(efi_pci_io_protoc
+ 	rom->data.len	= size - sizeof(struct setup_data);
+ 	rom->data.next	= 0;
+ 	rom->pcilen	= romsize;
+-	*__rom = rom;
+ 
+ 	status = efi_call_proto(pci, pci.read, EfiPciIoWidthUint16,
+ 				PCI_VENDOR_ID, 1, &rom->vendor);
+ 
+ 	if (status != EFI_SUCCESS) {
+ 		efi_err("Failed to read rom->vendor\n");
+-		goto free_struct;
++		return status;
+ 	}
+ 
+ 	status = efi_call_proto(pci, pci.read, EfiPciIoWidthUint16,
+@@ -90,21 +89,18 @@ preserve_pci_rom_image(efi_pci_io_protoc
+ 
+ 	if (status != EFI_SUCCESS) {
+ 		efi_err("Failed to read rom->devid\n");
+-		goto free_struct;
++		return status;
+ 	}
+ 
+ 	status = efi_call_proto(pci, get_location, &rom->segment, &rom->bus,
+ 				&rom->device, &rom->function);
+ 
+ 	if (status != EFI_SUCCESS)
+-		goto free_struct;
++		return status;
+ 
+ 	memcpy(rom->romdata, romimage, romsize);
+-	return status;
+-
+-free_struct:
+-	efi_bs_call(free_pool, rom);
+-	return status;
++	*__rom = no_free_ptr(rom);
++	return EFI_SUCCESS;
+ }
+ 
+ /*
