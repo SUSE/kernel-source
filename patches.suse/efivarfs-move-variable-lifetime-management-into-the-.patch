@@ -1,0 +1,282 @@
+From: James Bottomley <James.Bottomley@HansenPartnership.com>
+Date: Sun, 19 Jan 2025 10:12:10 -0500
+Subject: efivarfs: move variable lifetime management into the inodes
+Patch-mainline: v6.14-rc1
+Git-commit: fddca52766e276cb2fdc0be940ad75e0f01e214e
+References: jsc#PED-14259
+
+Make the inodes the default management vehicle for struct
+efivar_entry, so they are now all freed automatically if the file is
+removed and on unmount in kill_litter_super().  Remove the now
+superfluous iterator to free the entries after kill_litter_super().
+
+Also fixes a bug where some entry freeing was missing causing efivarfs
+to leak memory.
+
+Signed-off-by: James Bottomley <James.Bottomley@HansenPartnership.com>
+Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+Acked-by: Chun-Yi Lee <jlee@suse.com>
+---
+ fs/efivarfs/inode.c    |   23 +++++++++-------------
+ fs/efivarfs/internal.h |    7 +++++-
+ fs/efivarfs/super.c    |   51 +++++++++++++++++++++++++++----------------------
+ fs/efivarfs/vars.c     |   39 ++-----------------------------------
+ 4 files changed, 48 insertions(+), 72 deletions(-)
+
+--- a/fs/efivarfs/inode.c
++++ b/fs/efivarfs/inode.c
+@@ -82,26 +82,23 @@ static int efivarfs_create(struct mnt_id
+ 	struct efivar_entry *var;
+ 	int namelen, i = 0, err = 0;
+ 	bool is_removable = false;
++	efi_guid_t vendor;
+ 
+ 	if (!efivarfs_valid_name(dentry->d_name.name, dentry->d_name.len))
+ 		return -EINVAL;
+ 
+-	var = kzalloc(sizeof(struct efivar_entry), GFP_KERNEL);
+-	if (!var)
+-		return -ENOMEM;
+-
+ 	/* length of the variable name itself: remove GUID and separator */
+ 	namelen = dentry->d_name.len - EFI_VARIABLE_GUID_LEN - 1;
+ 
+-	err = guid_parse(dentry->d_name.name + namelen + 1, &var->var.VendorGuid);
++	err = guid_parse(dentry->d_name.name + namelen + 1, &vendor);
+ 	if (err)
+ 		goto out;
+-	if (guid_equal(&var->var.VendorGuid, &LINUX_EFI_RANDOM_SEED_TABLE_GUID)) {
++	if (guid_equal(&vendor, &LINUX_EFI_RANDOM_SEED_TABLE_GUID)) {
+ 		err = -EPERM;
+ 		goto out;
+ 	}
+ 
+-	if (efivar_variable_is_removable(var->var.VendorGuid,
++	if (efivar_variable_is_removable(vendor,
+ 					 dentry->d_name.name, namelen))
+ 		is_removable = true;
+ 
+@@ -110,6 +107,9 @@ static int efivarfs_create(struct mnt_id
+ 		err = -ENOMEM;
+ 		goto out;
+ 	}
++	var = efivar_entry(inode);
++
++	var->var.VendorGuid = vendor;
+ 
+ 	for (i = 0; i < namelen; i++)
+ 		var->var.VariableName[i] = dentry->d_name.name[i];
+@@ -117,7 +117,6 @@ static int efivarfs_create(struct mnt_id
+ 	var->var.VariableName[i] = '\0';
+ 
+ 	inode->i_private = var;
+-	kmemleak_ignore(var);
+ 
+ 	err = efivar_entry_add(var, &info->efivarfs_list);
+ 	if (err)
+@@ -126,11 +125,9 @@ static int efivarfs_create(struct mnt_id
+ 	d_instantiate(dentry, inode);
+ 	dget(dentry);
+ out:
+-	if (err) {
+-		kfree(var);
+-		if (inode)
+-			iput(inode);
+-	}
++	if (err && inode)
++		iput(inode);
++
+ 	return err;
+ }
+ 
+--- a/fs/efivarfs/internal.h
++++ b/fs/efivarfs/internal.h
+@@ -29,15 +29,20 @@ struct efi_variable {
+ struct efivar_entry {
+ 	struct efi_variable var;
+ 	struct list_head list;
++	struct inode vfs_inode;
+ };
+ 
++static inline struct efivar_entry *efivar_entry(struct inode *inode)
++{
++	return container_of(inode, struct efivar_entry, vfs_inode);
++}
++
+ int efivar_init(int (*func)(efi_char16_t *, efi_guid_t, unsigned long, void *,
+ 			    struct list_head *),
+ 		void *data, struct list_head *head);
+ 
+ int efivar_entry_add(struct efivar_entry *entry, struct list_head *head);
+ void __efivar_entry_add(struct efivar_entry *entry, struct list_head *head);
+-void efivar_entry_remove(struct efivar_entry *entry);
+ int efivar_entry_delete(struct efivar_entry *entry);
+ 
+ int efivar_entry_size(struct efivar_entry *entry, unsigned long *size);
+--- a/fs/efivarfs/super.c
++++ b/fs/efivarfs/super.c
+@@ -39,9 +39,25 @@ static int efivarfs_ops_notifier(struct
+ 	return NOTIFY_OK;
+ }
+ 
+-static void efivarfs_evict_inode(struct inode *inode)
++static struct inode *efivarfs_alloc_inode(struct super_block *sb)
+ {
+-	clear_inode(inode);
++	struct efivar_entry *entry = kzalloc(sizeof(*entry), GFP_KERNEL);
++
++	if (!entry)
++		return NULL;
++
++	inode_init_once(&entry->vfs_inode);
++
++	return &entry->vfs_inode;
++}
++
++static void efivarfs_free_inode(struct inode *inode)
++{
++	struct efivar_entry *entry = efivar_entry(inode);
++
++	if (inode->i_private)
++		list_del(&entry->list);
++	kfree(entry);
+ }
+ 
+ static int efivarfs_show_options(struct seq_file *m, struct dentry *root)
+@@ -106,7 +122,8 @@ static int efivarfs_statfs(struct dentry
+ static const struct super_operations efivarfs_ops = {
+ 	.statfs = efivarfs_statfs,
+ 	.drop_inode = generic_delete_inode,
+-	.evict_inode = efivarfs_evict_inode,
++	.alloc_inode = efivarfs_alloc_inode,
++	.free_inode = efivarfs_free_inode,
+ 	.show_options = efivarfs_show_options,
+ };
+ 
+@@ -227,21 +244,14 @@ static int efivarfs_callback(efi_char16_
+ 	if (guid_equal(&vendor, &LINUX_EFI_RANDOM_SEED_TABLE_GUID))
+ 		return 0;
+ 
+-	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+-	if (!entry)
+-		return err;
+-
+-	memcpy(entry->var.VariableName, name16, name_size);
+-	memcpy(&(entry->var.VendorGuid), &vendor, sizeof(efi_guid_t));
+-
+ 	name = efivar_get_utf8name(name16, &vendor);
+ 	if (!name)
+-		goto fail;
++		return err;
+ 
+ 	/* length of the variable name itself: remove GUID and separator */
+ 	len = strlen(name) - EFI_VARIABLE_GUID_LEN - 1;
+ 
+-	if (efivar_variable_is_removable(entry->var.VendorGuid, name, len))
++	if (efivar_variable_is_removable(vendor, name, len))
+ 		is_removable = true;
+ 
+ 	inode = efivarfs_get_inode(sb, d_inode(root), S_IFREG | 0644, 0,
+@@ -249,6 +259,11 @@ static int efivarfs_callback(efi_char16_
+ 	if (!inode)
+ 		goto fail_name;
+ 
++	entry = efivar_entry(inode);
++
++	memcpy(entry->var.VariableName, name16, name_size);
++	memcpy(&(entry->var.VendorGuid), &vendor, sizeof(efi_guid_t));
++
+ 	dentry = efivarfs_alloc_dentry(root, name);
+ 	if (IS_ERR(dentry)) {
+ 		err = PTR_ERR(dentry);
+@@ -273,16 +288,8 @@ fail_inode:
+ 	iput(inode);
+ fail_name:
+ 	kfree(name);
+-fail:
+-	kfree(entry);
+-	return err;
+-}
+ 
+-static int efivarfs_destroy(struct efivar_entry *entry, void *data)
+-{
+-	efivar_entry_remove(entry);
+-	kfree(entry);
+-	return 0;
++	return err;
+ }
+ 
+ enum {
+@@ -407,7 +414,7 @@ static void efivarfs_kill_sb(struct supe
+ 	kill_litter_super(sb);
+ 
+ 	/* Remove all entries and destroy */
+-	efivar_entry_iter(efivarfs_destroy, &sfi->efivarfs_list, NULL);
++	WARN_ON(!list_empty(&sfi->efivarfs_list));
+ 	kfree(sfi);
+ }
+ 
+--- a/fs/efivarfs/vars.c
++++ b/fs/efivarfs/vars.c
+@@ -486,34 +486,6 @@ void __efivar_entry_add(struct efivar_en
+ }
+ 
+ /**
+- * efivar_entry_remove - remove entry from variable list
+- * @entry: entry to remove from list
+- *
+- * Returns 0 on success, or a kernel error code on failure.
+- */
+-void efivar_entry_remove(struct efivar_entry *entry)
+-{
+-	list_del(&entry->list);
+-}
+-
+-/*
+- * efivar_entry_list_del_unlock - remove entry from variable list
+- * @entry: entry to remove
+- *
+- * Remove @entry from the variable list and release the list lock.
+- *
+- * NOTE: slightly weird locking semantics here - we expect to be
+- * called with the efivars lock already held, and we release it before
+- * returning. This is because this function is usually called after
+- * set_variable() while the lock is still held.
+- */
+-static void efivar_entry_list_del_unlock(struct efivar_entry *entry)
+-{
+-	list_del(&entry->list);
+-	efivar_unlock();
+-}
+-
+-/**
+  * efivar_entry_delete - delete variable and remove entry from list
+  * @entry: entry containing variable to delete
+  *
+@@ -536,12 +508,10 @@ int efivar_entry_delete(struct efivar_en
+ 	status = efivar_set_variable_locked(entry->var.VariableName,
+ 					    &entry->var.VendorGuid,
+ 					    0, 0, NULL, false);
+-	if (!(status == EFI_SUCCESS || status == EFI_NOT_FOUND)) {
+-		efivar_unlock();
++	efivar_unlock();
++	if (!(status == EFI_SUCCESS || status == EFI_NOT_FOUND))
+ 		return efi_status_to_err(status);
+-	}
+ 
+-	efivar_entry_list_del_unlock(entry);
+ 	return 0;
+ }
+ 
+@@ -679,10 +649,7 @@ int efivar_entry_set_get_size(struct efi
+ 				    &entry->var.VendorGuid,
+ 				    NULL, size, NULL);
+ 
+-	if (status == EFI_NOT_FOUND)
+-		efivar_entry_list_del_unlock(entry);
+-	else
+-		efivar_unlock();
++	efivar_unlock();
+ 
+ 	if (status && status != EFI_BUFFER_TOO_SMALL)
+ 		return efi_status_to_err(status);
