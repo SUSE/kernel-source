@@ -1,0 +1,65 @@
+From: Ard Biesheuvel <ardb@kernel.org>
+Date: Thu, 27 Feb 2025 18:35:11 +0100
+Subject: efi/libstub: Avoid CopyMem/SetMem EFI services after ExitBootServices
+Patch-mainline: v6.15-rc1
+Git-commit: 74d613e046e418ed512b265aa2ef8a27a761fb4d
+References: jsc#PED-14259
+
+Given that memset/memcpy are intrinsics, the compiler might insert calls
+to these routines unexpectedly, including in code that executes after
+ExitBootServices(). In this case, the respective boot services are no
+longer accessible, and calling them will cause a crash.
+
+So fall back to a bytewise copy/store if this happens to occur, even
+though no such occurrences are known to exist in the kernel currently.
+
+Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+Acked-by: Chun-Yi Lee <jlee@suse.com>
+---
+ drivers/firmware/efi/libstub/intrinsics.c |   26 ++++++++++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+
+--- a/drivers/firmware/efi/libstub/intrinsics.c
++++ b/drivers/firmware/efi/libstub/intrinsics.c
+@@ -15,8 +15,31 @@ void *__memmove(void *__dest, const void
+ void *__memset(void *s, int c, size_t count) __alias(memset);
+ #endif
+ 
++static void *efistub_memmove(u8 *dst, const u8 *src, size_t len)
++{
++	if (src > dst || dst >= (src + len))
++		for (size_t i = 0; i < len; i++)
++			dst[i] = src[i];
++	else
++		for (ssize_t i = len - 1; i >= 0; i--)
++			dst[i] = src[i];
++
++	return dst;
++}
++
++static void *efistub_memset(void *dst, int c, size_t len)
++{
++	for (u8 *d = dst; len--; d++)
++		*d = c;
++
++	return dst;
++}
++
+ void *memcpy(void *dst, const void *src, size_t len)
+ {
++	if (efi_table_attr(efi_system_table, boottime) == NULL)
++		return efistub_memmove(dst, src, len);
++
+ 	efi_bs_call(copy_mem, dst, src, len);
+ 	return dst;
+ }
+@@ -25,6 +48,9 @@ extern void *memmove(void *dst, const vo
+ 
+ void *memset(void *dst, int c, size_t len)
+ {
++	if (efi_table_attr(efi_system_table, boottime) == NULL)
++		return efistub_memset(dst, c, len);
++
+ 	efi_bs_call(set_mem, dst, len, c & U8_MAX);
+ 	return dst;
+ }
