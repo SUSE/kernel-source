@@ -1,0 +1,163 @@
+From: Besar Wicaksono <bwicaksono@nvidia.com>
+Date: Tue, 30 Sep 2025 00:26:02 +0000
+Subject: perf/arm_cspmu: Add pmpidr support
+Git-commit: 04330be8dc7fddf36f4adb1271932788ad47e7ad
+Patch-mainline: v6.19-rc1
+References: jsc#PED-15498
+
+The PMIIDR value is composed by the values in PMPIDR registers.
+We can use PMPIDR registers as alternative for device
+identification for systems that do not implement PMIIDR.
+
+Reviewed-by: Ilkka Koskinen <ilkka@os.amperecomputing.com>
+Signed-off-by: Besar Wicaksono <bwicaksono@nvidia.com>
+Signed-off-by: Will Deacon <will@kernel.org>
+Signed-off-by: Tony Jones <tonyj@suse.de>
+---
+ drivers/perf/arm_cspmu/arm_cspmu.c    | 44 ++++++++++++++++++++++++++++++++---
+ drivers/perf/arm_cspmu/arm_cspmu.h    | 35 ++++++++++++++++++++++++++--
+ drivers/perf/arm_cspmu/nvidia_cspmu.c |  2 +-
+ 3 files changed, 75 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/perf/arm_cspmu/arm_cspmu.c b/drivers/perf/arm_cspmu/arm_cspmu.c
+index 82d7ed6202f1..33ad2cab5c16 100644
+--- a/drivers/perf/arm_cspmu/arm_cspmu.c
++++ b/drivers/perf/arm_cspmu/arm_cspmu.c
+@@ -322,14 +322,14 @@ static struct arm_cspmu_impl_match impl_match[] = {
+ 	{
+ 		.module_name	= "nvidia_cspmu",
+ 		.pmiidr_val	= ARM_CSPMU_IMPL_ID_NVIDIA,
+-		.pmiidr_mask	= ARM_CSPMU_PMIIDR_IMPLEMENTER,
++		.pmiidr_mask	= PMIIDR_IMPLEMENTER,
+ 		.module		= NULL,
+ 		.impl_init_ops	= NULL,
+ 	},
+ 	{
+ 		.module_name	= "ampere_cspmu",
+ 		.pmiidr_val	= ARM_CSPMU_IMPL_ID_AMPERE,
+-		.pmiidr_mask	= ARM_CSPMU_PMIIDR_IMPLEMENTER,
++		.pmiidr_mask	= PMIIDR_IMPLEMENTER,
+ 		.module		= NULL,
+ 		.impl_init_ops	= NULL,
+ 	},
+@@ -351,6 +351,44 @@ static struct arm_cspmu_impl_match *arm_cspmu_impl_match_get(u32 pmiidr)
+ 	return NULL;
+ }
+ 
++static u32 arm_cspmu_get_pmiidr(struct arm_cspmu *cspmu)
++{
++	u32 pmiidr, pmpidr;
++
++	pmiidr = readl(cspmu->base0 + PMIIDR);
++
++	if (pmiidr != 0)
++		return pmiidr;
++
++	/* Construct PMIIDR value from PMPIDRs. */
++
++	pmpidr = readl(cspmu->base0 + PMPIDR0);
++	pmiidr |= FIELD_PREP(PMIIDR_PRODUCTID_PART_0,
++				FIELD_GET(PMPIDR0_PART_0, pmpidr));
++
++	pmpidr = readl(cspmu->base0 + PMPIDR1);
++	pmiidr |= FIELD_PREP(PMIIDR_PRODUCTID_PART_1,
++				FIELD_GET(PMPIDR1_PART_1, pmpidr));
++	pmiidr |= FIELD_PREP(PMIIDR_IMPLEMENTER_DES_0,
++				FIELD_GET(PMPIDR1_DES_0, pmpidr));
++
++	pmpidr = readl(cspmu->base0 + PMPIDR2);
++	pmiidr |= FIELD_PREP(PMIIDR_VARIANT,
++				FIELD_GET(PMPIDR2_REVISION, pmpidr));
++	pmiidr |= FIELD_PREP(PMIIDR_IMPLEMENTER_DES_1,
++				FIELD_GET(PMPIDR2_DES_1, pmpidr));
++
++	pmpidr = readl(cspmu->base0 + PMPIDR3);
++	pmiidr |= FIELD_PREP(PMIIDR_REVISION,
++				FIELD_GET(PMPIDR3_REVAND, pmpidr));
++
++	pmpidr = readl(cspmu->base0 + PMPIDR4);
++	pmiidr |= FIELD_PREP(PMIIDR_IMPLEMENTER_DES_2,
++				FIELD_GET(PMPIDR4_DES_2, pmpidr));
++
++	return pmiidr;
++}
++
+ #define DEFAULT_IMPL_OP(name)	.name = arm_cspmu_##name
+ 
+ static int arm_cspmu_init_impl_ops(struct arm_cspmu *cspmu)
+@@ -361,7 +399,7 @@ static int arm_cspmu_init_impl_ops(struct arm_cspmu *cspmu)
+ 
+ 	/* Start with a default PMU implementation */
+ 	cspmu->impl.module = THIS_MODULE;
+-	cspmu->impl.pmiidr = readl(cspmu->base0 + PMIIDR);
++	cspmu->impl.pmiidr = arm_cspmu_get_pmiidr(cspmu);
+ 	cspmu->impl.ops = (struct arm_cspmu_impl_ops) {
+ 		DEFAULT_IMPL_OP(get_event_attrs),
+ 		DEFAULT_IMPL_OP(get_format_attrs),
+diff --git a/drivers/perf/arm_cspmu/arm_cspmu.h b/drivers/perf/arm_cspmu/arm_cspmu.h
+index 23bfc4a58064..cd65a58dbd88 100644
+--- a/drivers/perf/arm_cspmu/arm_cspmu.h
++++ b/drivers/perf/arm_cspmu/arm_cspmu.h
+@@ -86,6 +86,11 @@
+ #define PMCFGR				0xE00
+ #define PMCR				0xE04
+ #define PMIIDR				0xE08
++#define PMPIDR0				0xFE0
++#define PMPIDR1				0xFE4
++#define PMPIDR2				0xFE8
++#define PMPIDR3				0xFEC
++#define PMPIDR4				0xFD0
+ 
+ /* PMCFGR register field */
+ #define PMCFGR_NCG			GENMASK(31, 28)
+@@ -115,8 +120,34 @@
+ #define PMCR_E				BIT(0)
+ 
+ /* PMIIDR register field */
+-#define ARM_CSPMU_PMIIDR_IMPLEMENTER	GENMASK(11, 0)
+-#define ARM_CSPMU_PMIIDR_PRODUCTID	GENMASK(31, 20)
++#define PMIIDR_IMPLEMENTER		GENMASK(11, 0)
++#define PMIIDR_IMPLEMENTER_DES_0	GENMASK(3, 0)
++#define PMIIDR_IMPLEMENTER_DES_1	GENMASK(6, 4)
++#define PMIIDR_IMPLEMENTER_DES_2	GENMASK(11, 8)
++#define PMIIDR_REVISION			GENMASK(15, 12)
++#define PMIIDR_VARIANT			GENMASK(19, 16)
++#define PMIIDR_PRODUCTID		GENMASK(31, 20)
++#define PMIIDR_PRODUCTID_PART_0		GENMASK(27, 20)
++#define PMIIDR_PRODUCTID_PART_1		GENMASK(31, 28)
++
++/* PMPIDR0 register field */
++#define PMPIDR0_PART_0			GENMASK(7, 0)
++
++/* PMPIDR1 register field */
++#define PMPIDR1_DES_0			GENMASK(7, 4)
++#define PMPIDR1_PART_1			GENMASK(3, 0)
++
++/* PMPIDR2 register field */
++#define PMPIDR2_REVISION		GENMASK(7, 4)
++#define PMPIDR2_DES_1			GENMASK(2, 0)
++
++/* PMPIDR3 register field */
++#define PMPIDR3_REVAND			GENMASK(7, 4)
++#define PMPIDR3_CMOD			GENMASK(3, 0)
++
++/* PMPIDR4 register field */
++#define PMPIDR4_SIZE			GENMASK(7, 4)
++#define PMPIDR4_DES_2			GENMASK(3, 0)
+ 
+ /* JEDEC-assigned JEP106 identification code */
+ #define ARM_CSPMU_IMPL_ID_NVIDIA	0x36B
+diff --git a/drivers/perf/arm_cspmu/nvidia_cspmu.c b/drivers/perf/arm_cspmu/nvidia_cspmu.c
+index dc6d4e3e2a1b..b6cec351a142 100644
+--- a/drivers/perf/arm_cspmu/nvidia_cspmu.c
++++ b/drivers/perf/arm_cspmu/nvidia_cspmu.c
+@@ -322,7 +322,7 @@ static int nv_cspmu_init_ops(struct arm_cspmu *cspmu)
+ 	if (!ctx)
+ 		return -ENOMEM;
+ 
+-	prodid = FIELD_GET(ARM_CSPMU_PMIIDR_PRODUCTID, cspmu->impl.pmiidr);
++	prodid = FIELD_GET(PMIIDR_PRODUCTID, cspmu->impl.pmiidr);
+ 
+ 	/* Find matching PMU. */
+ 	for (; match->prodid; match++) {
+
