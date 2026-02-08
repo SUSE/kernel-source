@@ -1,0 +1,115 @@
+From: James Bottomley <James.Bottomley@HansenPartnership.com>
+Date: Mon, 17 Mar 2025 23:06:01 -0400
+Subject: efivarfs: fix NULL dereference on resume
+Patch-mainline: v6.14
+Git-commit: 11092db5b57377ac99e6339cfd16ca35ef011f3c
+References: jsc#PED-14259
+
+LSMs often inspect the path.mnt of files in the security hooks, and this
+causes a NULL deref in efivarfs_pm_notify() because the path is
+constructed with a NULL path.mnt.
+
+Fix by obtaining from vfs_kern_mount() instead, and being very careful
+to ensure that deactivate_super() (potentially triggered by a racing
+userspace umount) is not called directly from the notifier, because it
+would deadlock when efivarfs_kill_sb() tried to unregister the notifier
+chain.
+
+[ Al notes:
+	Umm...  That's probably safe, but not as a long-term solution -
+	it's too intimately dependent upon fs/super.c internals. The
+	reasons why you can't run into ->s_umount deadlock here are
+	non-trivial... ]
+
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Signed-off-by: James Bottomley <James.Bottomley@HansenPartnership.com>
+Link: https://lore.kernel.org/r/e54e6a2f-1178-4980-b771-4d9bafc2aa47@tnxip.de
+Link: https://lore.kernel.org/r/3e998bf87638a442cbc6864cdcd3d8d9e08ce3e3.camel@HansenPartnership.com
+Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+Acked-by: Chun-Yi Lee <jlee@suse.com>
+---
+ fs/efivarfs/super.c |   50 ++++++++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 48 insertions(+), 2 deletions(-)
+
+--- a/fs/efivarfs/super.c
++++ b/fs/efivarfs/super.c
+@@ -474,12 +474,25 @@ static int efivarfs_check_missing(efi_ch
+ 	return err;
+ }
+ 
++static void efivarfs_deactivate_super_work(struct work_struct *work)
++{
++	struct super_block *s = container_of(work, struct super_block,
++					     destroy_work);
++	/*
++	 * note: here s->destroy_work is free for reuse (which
++	 * will happen in deactivate_super)
++	 */
++	deactivate_super(s);
++}
++
++static struct file_system_type efivarfs_type;
++
+ static int efivarfs_pm_notify(struct notifier_block *nb, unsigned long action,
+ 			      void *ptr)
+ {
+ 	struct efivarfs_fs_info *sfi = container_of(nb, struct efivarfs_fs_info,
+ 						    pm_nb);
+-	struct path path = { .mnt = NULL, .dentry = sfi->sb->s_root, };
++	struct path path;
+ 	struct efivarfs_ctx ectx = {
+ 		.ctx = {
+ 			.actor	= efivarfs_actor,
+@@ -487,6 +500,7 @@ static int efivarfs_pm_notify(struct not
+ 		.sb = sfi->sb,
+ 	};
+ 	struct file *file;
++	struct super_block *s = sfi->sb;
+ 	static bool rescan_done = true;
+ 
+ 	if (action == PM_HIBERNATION_PREPARE) {
+@@ -499,11 +513,43 @@ static int efivarfs_pm_notify(struct not
+ 	if (rescan_done)
+ 		return NOTIFY_DONE;
+ 
++	/* ensure single superblock is alive and pin it */
++	if (!atomic_inc_not_zero(&s->s_active))
++		return NOTIFY_DONE;
++
+ 	pr_info("efivarfs: resyncing variable state\n");
+ 
+-	/* O_NOATIME is required to prevent oops on NULL mnt */
++	path.dentry = sfi->sb->s_root;
++
++	/*
++	 * do not add SB_KERNMOUNT which a single superblock could
++	 * expose to userspace and which also causes MNT_INTERNAL, see
++	 * below
++	 */
++	path.mnt = vfs_kern_mount(&efivarfs_type, 0,
++				  efivarfs_type.name, NULL);
++	if (IS_ERR(path.mnt)) {
++		pr_err("efivarfs: internal mount failed\n");
++		/*
++		 * We may be the last pinner of the superblock but
++		 * calling efivarfs_kill_sb from within the notifier
++		 * here would deadlock trying to unregister it
++		 */
++		INIT_WORK(&s->destroy_work, efivarfs_deactivate_super_work);
++		schedule_work(&s->destroy_work);
++		return PTR_ERR(path.mnt);
++	}
++
++	/* path.mnt now has pin on superblock, so this must be above one */
++	atomic_dec(&s->s_active);
++
+ 	file = kernel_file_open(&path, O_RDONLY | O_DIRECTORY | O_NOATIME,
+ 				current_cred());
++	/*
++	 * safe even if last put because no MNT_INTERNAL means this
++	 * will do delayed deactivate_super and not deadlock
++	 */
++	mntput(path.mnt);
+ 	if (IS_ERR(file))
+ 		return NOTIFY_DONE;
+ 
