@@ -1,0 +1,261 @@
+From: James Bottomley <James.Bottomley@HansenPartnership.com>
+Date: Tue, 7 Jan 2025 13:31:29 -0800
+Subject: efivarfs: add variable resync after hibernation
+Patch-mainline: v6.14-rc1
+Git-commit: b5d1e6ee761a109400e97ac6a1b91c57d0f6a43a
+References: jsc#PED-14259
+
+Hibernation allows other OSs to boot and thus the variable state might
+be altered by the time the hibernation image is resumed.  Resync the
+variable state by looping over all the dentries and update the size
+(in case of alteration) delete any which no-longer exist.  Finally,
+loop over all efi variables creating any which don't have
+corresponding dentries.
+
+Signed-off-by: James Bottomley <James.Bottomley@HansenPartnership.com>
+[ardb: - apply error pointer fixup from Dan Carpenter
+       - rebase onto latest version of James's efivarfs rework]
+Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+Acked-by: Chun-Yi Lee <jlee@suse.com>
+---
+ fs/efivarfs/internal.h |    3 
+ fs/efivarfs/super.c    |  151 ++++++++++++++++++++++++++++++++++++++++++++++++-
+ fs/efivarfs/vars.c     |    6 +
+ 3 files changed, 156 insertions(+), 4 deletions(-)
+
+--- a/fs/efivarfs/internal.h
++++ b/fs/efivarfs/internal.h
+@@ -17,6 +17,7 @@ struct efivarfs_fs_info {
+ 	struct efivarfs_mount_opts mount_opts;
+ 	struct super_block *sb;
+ 	struct notifier_block nb;
++	struct notifier_block pm_nb;
+ };
+ 
+ struct efi_variable {
+@@ -37,7 +38,7 @@ static inline struct efivar_entry *efiva
+ }
+ 
+ int efivar_init(int (*func)(efi_char16_t *, efi_guid_t, unsigned long, void *),
+-		void *data);
++		void *data, bool duplicate_check);
+ 
+ int efivar_entry_delete(struct efivar_entry *entry);
+ 
+--- a/fs/efivarfs/super.c
++++ b/fs/efivarfs/super.c
+@@ -13,6 +13,7 @@
+ #include <linux/pagemap.h>
+ #include <linux/ucs2_string.h>
+ #include <linux/slab.h>
++#include <linux/suspend.h>
+ #include <linux/magic.h>
+ #include <linux/statfs.h>
+ #include <linux/notifier.h>
+@@ -366,7 +367,7 @@ static int efivarfs_fill_super(struct su
+ 	if (err)
+ 		return err;
+ 
+-	return efivar_init(efivarfs_callback, sb);
++	return efivar_init(efivarfs_callback, sb, true);
+ }
+ 
+ static int efivarfs_get_tree(struct fs_context *fc)
+@@ -390,6 +391,148 @@ static const struct fs_context_operation
+ 	.reconfigure	= efivarfs_reconfigure,
+ };
+ 
++struct efivarfs_ctx {
++	struct dir_context ctx;
++	struct super_block *sb;
++	struct dentry *dentry;
++};
++
++static bool efivarfs_actor(struct dir_context *ctx, const char *name, int len,
++			   loff_t offset, u64 ino, unsigned mode)
++{
++	unsigned long size;
++	struct efivarfs_ctx *ectx = container_of(ctx, struct efivarfs_ctx, ctx);
++	struct qstr qstr = { .name = name, .len = len };
++	struct dentry *dentry = d_hash_and_lookup(ectx->sb->s_root, &qstr);
++	struct inode *inode;
++	struct efivar_entry *entry;
++	int err;
++
++	if (IS_ERR_OR_NULL(dentry))
++		return true;
++
++	inode = d_inode(dentry);
++	entry = efivar_entry(inode);
++
++	err = efivar_entry_size(entry, &size);
++	size += sizeof(__u32);	/* attributes */
++	if (err)
++		size = 0;
++
++	inode_lock(inode);
++	i_size_write(inode, size);
++	inode_unlock(inode);
++
++	if (!size) {
++		ectx->dentry = dentry;
++		return false;
++	}
++
++	dput(dentry);
++
++	return true;
++}
++
++static int efivarfs_check_missing(efi_char16_t *name16, efi_guid_t vendor,
++				  unsigned long name_size, void *data)
++{
++	char *name;
++	struct super_block *sb = data;
++	struct dentry *dentry;
++	struct qstr qstr;
++	int err;
++
++	if (guid_equal(&vendor, &LINUX_EFI_RANDOM_SEED_TABLE_GUID))
++		return 0;
++
++	name = efivar_get_utf8name(name16, &vendor);
++	if (!name)
++		return -ENOMEM;
++
++	qstr.name = name;
++	qstr.len = strlen(name);
++	dentry = d_hash_and_lookup(sb->s_root, &qstr);
++	if (IS_ERR(dentry)) {
++		err = PTR_ERR(dentry);
++		goto out;
++	}
++
++	if (!dentry) {
++		/* found missing entry */
++		pr_info("efivarfs: creating variable %s\n", name);
++		return efivarfs_create_dentry(sb, name16, name_size, vendor, name);
++	}
++
++	dput(dentry);
++	err = 0;
++
++ out:
++	kfree(name);
++
++	return err;
++}
++
++static int efivarfs_pm_notify(struct notifier_block *nb, unsigned long action,
++			      void *ptr)
++{
++	struct efivarfs_fs_info *sfi = container_of(nb, struct efivarfs_fs_info,
++						    pm_nb);
++	struct path path = { .mnt = NULL, .dentry = sfi->sb->s_root, };
++	struct efivarfs_ctx ectx = {
++		.ctx = {
++			.actor	= efivarfs_actor,
++		},
++		.sb = sfi->sb,
++	};
++	struct file *file;
++	static bool rescan_done = true;
++
++	if (action == PM_HIBERNATION_PREPARE) {
++		rescan_done = false;
++		return NOTIFY_OK;
++	} else if (action != PM_POST_HIBERNATION) {
++		return NOTIFY_DONE;
++	}
++
++	if (rescan_done)
++		return NOTIFY_DONE;
++
++	pr_info("efivarfs: resyncing variable state\n");
++
++	/* O_NOATIME is required to prevent oops on NULL mnt */
++	file = kernel_file_open(&path, O_RDONLY | O_DIRECTORY | O_NOATIME,
++				current_cred());
++	if (IS_ERR(file))
++		return NOTIFY_DONE;
++
++	rescan_done = true;
++
++	/*
++	 * First loop over the directory and verify each entry exists,
++	 * removing it if it doesn't
++	 */
++	file->f_pos = 2;	/* skip . and .. */
++	do {
++		ectx.dentry = NULL;
++		iterate_dir(file, &ectx.ctx);
++		if (ectx.dentry) {
++			pr_info("efivarfs: removing variable %pd\n",
++				ectx.dentry);
++			simple_recursive_removal(ectx.dentry, NULL);
++			dput(ectx.dentry);
++		}
++	} while (ectx.dentry);
++	fput(file);
++
++	/*
++	 * then loop over variables, creating them if there's no matching
++	 * dentry
++	 */
++	efivar_init(efivarfs_check_missing, sfi->sb, false);
++
++	return NOTIFY_OK;
++}
++
+ static int efivarfs_init_fs_context(struct fs_context *fc)
+ {
+ 	struct efivarfs_fs_info *sfi;
+@@ -406,6 +549,11 @@ static int efivarfs_init_fs_context(stru
+ 
+ 	fc->s_fs_info = sfi;
+ 	fc->ops = &efivarfs_context_ops;
++
++	sfi->pm_nb.notifier_call = efivarfs_pm_notify;
++	sfi->pm_nb.priority = 0;
++	register_pm_notifier(&sfi->pm_nb);
++
+ 	return 0;
+ }
+ 
+@@ -415,6 +563,7 @@ static void efivarfs_kill_sb(struct supe
+ 
+ 	blocking_notifier_chain_unregister(&efivar_ops_nh, &sfi->nb);
+ 	kill_litter_super(sb);
++	unregister_pm_notifier(&sfi->pm_nb);
+ 
+ 	kfree(sfi);
+ }
+--- a/fs/efivarfs/vars.c
++++ b/fs/efivarfs/vars.c
+@@ -364,6 +364,7 @@ static void dup_variable_bug(efi_char16_
+  * efivar_init - build the initial list of EFI variables
+  * @func: callback function to invoke for every variable
+  * @data: function-specific data to pass to @func
++ * @duplicate_check: fail if a duplicate variable is found
+  *
+  * Get every EFI variable from the firmware and invoke @func. @func
+  * should populate the initial dentry and inode tree.
+@@ -371,7 +372,7 @@ static void dup_variable_bug(efi_char16_
+  * Returns 0 on success, or a kernel error code on failure.
+  */
+ int efivar_init(int (*func)(efi_char16_t *, efi_guid_t, unsigned long, void *),
+-		void *data)
++		void *data, bool duplicate_check)
+ {
+ 	unsigned long variable_name_size = 512;
+ 	efi_char16_t *variable_name;
+@@ -415,7 +416,8 @@ int efivar_init(int (*func)(efi_char16_t
+ 			 * we'll ever see a different variable name,
+ 			 * and may end up looping here forever.
+ 			 */
+-			if (efivarfs_variable_is_present(variable_name,
++			if (duplicate_check &&
++			    efivarfs_variable_is_present(variable_name,
+ 							 &vendor_guid, data)) {
+ 				dup_variable_bug(variable_name, &vendor_guid,
+ 						 variable_name_size);

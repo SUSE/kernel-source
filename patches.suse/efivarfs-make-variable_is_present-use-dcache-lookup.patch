@@ -1,0 +1,111 @@
+From: James Bottomley <James.Bottomley@HansenPartnership.com>
+Date: Mon, 6 Jan 2025 18:35:22 -0800
+Subject: efivarfs: make variable_is_present use dcache lookup
+Patch-mainline: v6.14-rc1
+Git-commit: 7e365c7e2cc587ac90c346a52156a6b08845d909
+References: jsc#PED-14259
+
+Instead of searching the variable entry list for a variable, use the
+dcache lookup functions to find it instead.  Also add an efivarfs_
+prefix to the function now it is no longer static.
+
+Signed-off-by: James Bottomley <James.Bottomley@HansenPartnership.com>
+Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+Acked-by: Chun-Yi Lee <jlee@suse.com>
+---
+ fs/efivarfs/internal.h |    2 ++
+ fs/efivarfs/super.c    |   29 +++++++++++++++++++++++++++++
+ fs/efivarfs/vars.c     |   26 ++------------------------
+ 3 files changed, 33 insertions(+), 24 deletions(-)
+
+--- a/fs/efivarfs/internal.h
++++ b/fs/efivarfs/internal.h
+@@ -56,6 +56,8 @@ bool efivar_validate(efi_guid_t vendor,
+ bool efivar_variable_is_removable(efi_guid_t vendor, const char *name,
+ 				  size_t len);
+ char *efivar_get_utf8name(const efi_char16_t *name16, efi_guid_t *vendor);
++bool efivarfs_variable_is_present(efi_char16_t *variable_name,
++				  efi_guid_t *vendor, void *data);
+ 
+ extern const struct file_operations efivarfs_file_operations;
+ extern const struct inode_operations efivarfs_dir_inode_operations;
+--- a/fs/efivarfs/super.c
++++ b/fs/efivarfs/super.c
+@@ -181,6 +181,35 @@ static struct dentry *efivarfs_alloc_den
+ 	return ERR_PTR(-ENOMEM);
+ }
+ 
++bool efivarfs_variable_is_present(efi_char16_t *variable_name,
++				  efi_guid_t *vendor, void *data)
++{
++	char *name = efivar_get_utf8name(variable_name, vendor);
++	struct super_block *sb = data;
++	struct dentry *dentry;
++	struct qstr qstr;
++
++	if (!name)
++		/*
++		 * If the allocation failed there'll already be an
++		 * error in the log (and likely a huge and growing
++		 * number of them since they system will be under
++		 * extreme memory pressure), so simply assume
++		 * collision for safety but don't add to the log
++		 * flood.
++		 */
++		return true;
++
++	qstr.name = name;
++	qstr.len = strlen(name);
++	dentry = d_hash_and_lookup(sb->s_root, &qstr);
++	kfree(name);
++	if (!IS_ERR_OR_NULL(dentry))
++		dput(dentry);
++
++	return dentry != NULL;
++}
++
+ static int efivarfs_callback(efi_char16_t *name16, efi_guid_t vendor,
+ 			     unsigned long name_size, void *data,
+ 			     struct list_head *list)
+--- a/fs/efivarfs/vars.c
++++ b/fs/efivarfs/vars.c
+@@ -313,28 +313,6 @@ efivar_variable_is_removable(efi_guid_t
+ 	return found;
+ }
+ 
+-static bool variable_is_present(efi_char16_t *variable_name, efi_guid_t *vendor,
+-				struct list_head *head)
+-{
+-	struct efivar_entry *entry, *n;
+-	unsigned long strsize1, strsize2;
+-	bool found = false;
+-
+-	strsize1 = ucs2_strsize(variable_name, EFI_VAR_NAME_LEN);
+-	list_for_each_entry_safe(entry, n, head, list) {
+-		strsize2 = ucs2_strsize(entry->var.VariableName, EFI_VAR_NAME_LEN);
+-		if (strsize1 == strsize2 &&
+-			!memcmp(variable_name, &(entry->var.VariableName),
+-				strsize2) &&
+-			!efi_guidcmp(entry->var.VendorGuid,
+-				*vendor)) {
+-			found = true;
+-			break;
+-		}
+-	}
+-	return found;
+-}
+-
+ /*
+  * Returns the size of variable_name, in bytes, including the
+  * terminating NULL character, or variable_name_size if no NULL
+@@ -439,8 +417,8 @@ int efivar_init(int (*func)(efi_char16_t
+ 			 * we'll ever see a different variable name,
+ 			 * and may end up looping here forever.
+ 			 */
+-			if (variable_is_present(variable_name, &vendor_guid,
+-						head)) {
++			if (efivarfs_variable_is_present(variable_name,
++							 &vendor_guid, data)) {
+ 				dup_variable_bug(variable_name, &vendor_guid,
+ 						 variable_name_size);
+ 				status = EFI_NOT_FOUND;

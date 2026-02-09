@@ -1,0 +1,174 @@
+From: Ard Biesheuvel <ardb@kernel.org>
+Date: Thu, 19 Dec 2024 15:30:39 +0100
+Subject: efi/libstub: Use cleanup helpers for freeing copies of the memory map
+Patch-mainline: v6.14-rc1
+Git-commit: ad69b0b6f9954796875ee4faf6c16c9caca21999
+References: jsc#PED-14259
+
+The EFI stub may obtain the memory map from the firmware numerous times,
+and this involves doing a EFI pool allocation first, which needs to be
+freed after use.
+
+Streamline this using a cleanup helper, which makes the code easier to
+follow.
+
+Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+Acked-by: Chun-Yi Lee <jlee@suse.com>
+---
+ drivers/firmware/efi/libstub/kaslr.c       |    4 +---
+ drivers/firmware/efi/libstub/mem.c         |   20 ++++++++------------
+ drivers/firmware/efi/libstub/randomalloc.c |    4 +---
+ drivers/firmware/efi/libstub/relocate.c    |   10 ++++------
+ drivers/firmware/efi/libstub/x86-stub.c    |   11 ++++++-----
+ 5 files changed, 20 insertions(+), 29 deletions(-)
+
+--- a/drivers/firmware/efi/libstub/kaslr.c
++++ b/drivers/firmware/efi/libstub/kaslr.c
+@@ -57,7 +57,7 @@ u32 efi_kaslr_get_phys_seed(efi_handle_t
+  */
+ static bool check_image_region(u64 base, u64 size)
+ {
+-	struct efi_boot_memmap *map;
++	struct efi_boot_memmap *map __free(efi_pool) = NULL;
+ 	efi_status_t status;
+ 	bool ret = false;
+ 	int map_offset;
+@@ -80,8 +80,6 @@ static bool check_image_region(u64 base,
+ 		}
+ 	}
+ 
+-	efi_bs_call(free_pool, map);
+-
+ 	return ret;
+ }
+ 
+--- a/drivers/firmware/efi/libstub/mem.c
++++ b/drivers/firmware/efi/libstub/mem.c
+@@ -20,10 +20,10 @@
+ efi_status_t efi_get_memory_map(struct efi_boot_memmap **map,
+ 				bool install_cfg_tbl)
+ {
++	struct efi_boot_memmap tmp, *m __free(efi_pool) = NULL;
+ 	int memtype = install_cfg_tbl ? EFI_ACPI_RECLAIM_MEMORY
+ 				      : EFI_LOADER_DATA;
+ 	efi_guid_t tbl_guid = LINUX_EFI_BOOT_MEMMAP_GUID;
+-	struct efi_boot_memmap *m, tmp;
+ 	efi_status_t status;
+ 	unsigned long size;
+ 
+@@ -48,24 +48,20 @@ efi_status_t efi_get_memory_map(struct e
+ 		 */
+ 		status = efi_bs_call(install_configuration_table, &tbl_guid, m);
+ 		if (status != EFI_SUCCESS)
+-			goto free_map;
++			return status;
+ 	}
+ 
+ 	m->buff_size = m->map_size = size;
+ 	status = efi_bs_call(get_memory_map, &m->map_size, m->map, &m->map_key,
+ 			     &m->desc_size, &m->desc_ver);
+-	if (status != EFI_SUCCESS)
+-		goto uninstall_table;
++	if (status != EFI_SUCCESS) {
++		if (install_cfg_tbl)
++			efi_bs_call(install_configuration_table, &tbl_guid, NULL);
++		return status;
++	}
+ 
+-	*map = m;
++	*map = no_free_ptr(m);
+ 	return EFI_SUCCESS;
+-
+-uninstall_table:
+-	if (install_cfg_tbl)
+-		efi_bs_call(install_configuration_table, &tbl_guid, NULL);
+-free_map:
+-	efi_bs_call(free_pool, m);
+-	return status;
+ }
+ 
+ /**
+--- a/drivers/firmware/efi/libstub/randomalloc.c
++++ b/drivers/firmware/efi/libstub/randomalloc.c
+@@ -59,9 +59,9 @@ efi_status_t efi_random_alloc(unsigned l
+ 			      unsigned long alloc_min,
+ 			      unsigned long alloc_max)
+ {
++	struct efi_boot_memmap *map __free(efi_pool) = NULL;
+ 	unsigned long total_slots = 0, target_slot;
+ 	unsigned long total_mirrored_slots = 0;
+-	struct efi_boot_memmap *map;
+ 	efi_status_t status;
+ 	int map_offset;
+ 
+@@ -130,7 +130,5 @@ efi_status_t efi_random_alloc(unsigned l
+ 		break;
+ 	}
+ 
+-	efi_bs_call(free_pool, map);
+-
+ 	return status;
+ }
+--- a/drivers/firmware/efi/libstub/relocate.c
++++ b/drivers/firmware/efi/libstub/relocate.c
+@@ -23,14 +23,14 @@
+ efi_status_t efi_low_alloc_above(unsigned long size, unsigned long align,
+ 				 unsigned long *addr, unsigned long min)
+ {
+-	struct efi_boot_memmap *map;
++	struct efi_boot_memmap *map __free(efi_pool) = NULL;
+ 	efi_status_t status;
+ 	unsigned long nr_pages;
+ 	int i;
+ 
+ 	status = efi_get_memory_map(&map, false);
+ 	if (status != EFI_SUCCESS)
+-		goto fail;
++		return status;
+ 
+ 	/*
+ 	 * Enforce minimum alignment that EFI or Linux requires when
+@@ -79,11 +79,9 @@ efi_status_t efi_low_alloc_above(unsigne
+ 	}
+ 
+ 	if (i == map->map_size / map->desc_size)
+-		status = EFI_NOT_FOUND;
++		return EFI_NOT_FOUND;
+ 
+-	efi_bs_call(free_pool, map);
+-fail:
+-	return status;
++	return EFI_SUCCESS;
+ }
+ 
+ /**
+--- a/drivers/firmware/efi/libstub/x86-stub.c
++++ b/drivers/firmware/efi/libstub/x86-stub.c
+@@ -616,7 +616,7 @@ static efi_status_t allocate_e820(struct
+ 				  struct setup_data **e820ext,
+ 				  u32 *e820ext_size)
+ {
+-	struct efi_boot_memmap *map;
++	struct efi_boot_memmap *map __free(efi_pool) = NULL;
+ 	efi_status_t status;
+ 	__u32 nr_desc;
+ 
+@@ -630,13 +630,14 @@ static efi_status_t allocate_e820(struct
+ 				 EFI_MMAP_NR_SLACK_SLOTS;
+ 
+ 		status = alloc_e820ext(nr_e820ext, e820ext, e820ext_size);
++		if (status != EFI_SUCCESS)
++			return status;
+ 	}
+ 
+-	if (IS_ENABLED(CONFIG_UNACCEPTED_MEMORY) && status == EFI_SUCCESS)
+-		status = allocate_unaccepted_bitmap(nr_desc, map);
++	if (IS_ENABLED(CONFIG_UNACCEPTED_MEMORY))
++		return allocate_unaccepted_bitmap(nr_desc, map);
+ 
+-	efi_bs_call(free_pool, map);
+-	return status;
++	return EFI_SUCCESS;
+ }
+ 
+ struct exit_boot_struct {

@@ -1,0 +1,249 @@
+From: Ard Biesheuvel <ardb@kernel.org>
+Date: Thu, 19 Dec 2024 10:37:40 +0100
+Subject: efi/libstub: Simplify GOP handling code
+Patch-mainline: v6.14-rc1
+Git-commit: 60a34085c36d6eb292c1e03bc355b1aa3a74a689
+References: jsc#PED-14259
+
+Use the LocateHandleBuffer() API and a __free() function to simplify the
+logic that allocates a handle buffer to iterate over all GOP protocols
+in the EFI database.
+
+Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+Acked-by: Chun-Yi Lee <jlee@suse.com>
+---
+ arch/x86/include/asm/efi.h              |    3 +
+ drivers/firmware/efi/libstub/efi-stub.c |   30 ++++++----------
+ drivers/firmware/efi/libstub/efistub.h  |    9 +++--
+ drivers/firmware/efi/libstub/gop.c      |   57 ++++++++++----------------------
+ drivers/firmware/efi/libstub/x86-stub.c |   17 +--------
+ 5 files changed, 41 insertions(+), 75 deletions(-)
+
+--- a/arch/x86/include/asm/efi.h
++++ b/arch/x86/include/asm/efi.h
+@@ -250,6 +250,9 @@ static inline u32 efi64_convert_status(e
+ #define __efi64_argmap_allocate_pool(type, size, buffer)		\
+ 	((type), (size), efi64_zero_upper(buffer))
+ 
++#define __efi64_argmap_locate_handle_buffer(type, proto, key, num, buf)	\
++	((type), (proto), (key), efi64_zero_upper(num), efi64_zero_upper(buf))
++
+ #define __efi64_argmap_create_event(type, tpl, f, c, event)		\
+ 	((type), (tpl), (f), (c), efi64_zero_upper(event))
+ 
+--- a/drivers/firmware/efi/libstub/efi-stub.c
++++ b/drivers/firmware/efi/libstub/efi-stub.c
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <linux/efi.h>
++#include <linux/screen_info.h>
+ #include <asm/efi.h>
+ 
+ #include "efistub.h"
+@@ -53,25 +54,16 @@ void __weak free_screen_info(struct scre
+ 
+ static struct screen_info *setup_graphics(void)
+ {
+-	efi_guid_t gop_proto = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;
+-	efi_status_t status;
+-	unsigned long size;
+-	void **gop_handle = NULL;
+-	struct screen_info *si = NULL;
+-
+-	size = 0;
+-	status = efi_bs_call(locate_handle, EFI_LOCATE_BY_PROTOCOL,
+-			     &gop_proto, NULL, &size, gop_handle);
+-	if (status == EFI_BUFFER_TOO_SMALL) {
+-		si = alloc_screen_info();
+-		if (!si)
+-			return NULL;
+-		status = efi_setup_gop(si, &gop_proto, size);
+-		if (status != EFI_SUCCESS) {
+-			free_screen_info(si);
+-			return NULL;
+-		}
+-	}
++	struct screen_info *si, tmp = {};
++
++	if (efi_setup_gop(&tmp) != EFI_SUCCESS)
++		return NULL;
++
++	si = alloc_screen_info();
++	if (!si)
++		return NULL;
++
++	*si = tmp;
+ 	return si;
+ }
+ 
+--- a/drivers/firmware/efi/libstub/efistub.h
++++ b/drivers/firmware/efi/libstub/efistub.h
+@@ -4,6 +4,7 @@
+ #define _DRIVERS_FIRMWARE_EFI_EFISTUB_H
+ 
+ #include <linux/compiler.h>
++#include <linux/cleanup.h>
+ #include <linux/efi.h>
+ #include <linux/kernel.h>
+ #include <linux/kern_levels.h>
+@@ -313,7 +314,9 @@ union efi_boot_services {
+ 		void *close_protocol;
+ 		void *open_protocol_information;
+ 		void *protocols_per_handle;
+-		void *locate_handle_buffer;
++		efi_status_t (__efiapi *locate_handle_buffer)(int, efi_guid_t *,
++							      void *, unsigned long *,
++							      efi_handle_t **);
+ 		efi_status_t (__efiapi *locate_protocol)(efi_guid_t *, void *,
+ 							 void **);
+ 		efi_status_t (__efiapi *install_multiple_protocol_interfaces)(efi_handle_t *, ...);
+@@ -1052,6 +1055,7 @@ void efi_puts(const char *str);
+ __printf(1, 2) int efi_printk(char const *fmt, ...);
+ 
+ void efi_free(unsigned long size, unsigned long addr);
++DEFINE_FREE(efi_pool, void *, if (_T) efi_bs_call(free_pool, _T));
+ 
+ void efi_apply_loadoptions_quirk(const void **load_options, u32 *load_options_size);
+ 
+@@ -1081,8 +1085,7 @@ efi_status_t efi_parse_options(char cons
+ 
+ void efi_parse_option_graphics(char *option);
+ 
+-efi_status_t efi_setup_gop(struct screen_info *si, efi_guid_t *proto,
+-			   unsigned long size);
++efi_status_t efi_setup_gop(struct screen_info *si);
+ 
+ efi_status_t handle_cmdline_files(efi_loaded_image_t *image,
+ 				  const efi_char16_t *optstr,
+--- a/drivers/firmware/efi/libstub/gop.c
++++ b/drivers/firmware/efi/libstub/gop.c
+@@ -461,25 +461,25 @@ setup_pixel_info(struct screen_info *si,
+ 	}
+ }
+ 
+-static efi_graphics_output_protocol_t *
+-find_gop(efi_guid_t *proto, unsigned long size, void **handles)
++static efi_graphics_output_protocol_t *find_gop(unsigned long num,
++						const efi_handle_t handles[])
+ {
+ 	efi_graphics_output_protocol_t *first_gop;
+ 	efi_handle_t h;
+ 
+ 	first_gop = NULL;
+ 
+-	for_each_efi_handle(h, handles, efi_get_handle_num(size)) {
++	for_each_efi_handle(h, handles, num) {
+ 		efi_status_t status;
+ 
+ 		efi_graphics_output_protocol_t *gop;
+ 		efi_graphics_output_protocol_mode_t *mode;
+ 		efi_graphics_output_mode_info_t *info;
+-
+-		efi_guid_t conout_proto = EFI_CONSOLE_OUT_DEVICE_GUID;
+ 		void *dummy = NULL;
+ 
+-		status = efi_bs_call(handle_protocol, h, proto, (void **)&gop);
++		status = efi_bs_call(handle_protocol, h,
++				     &EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID,
++				     (void **)&gop);
+ 		if (status != EFI_SUCCESS)
+ 			continue;
+ 
+@@ -499,7 +499,8 @@ find_gop(efi_guid_t *proto, unsigned lon
+ 		 * Once we've found a GOP supporting ConOut,
+ 		 * don't bother looking any further.
+ 		 */
+-		status = efi_bs_call(handle_protocol, h, &conout_proto, &dummy);
++		status = efi_bs_call(handle_protocol, h,
++				     &EFI_CONSOLE_OUT_DEVICE_GUID, &dummy);
+ 		if (status == EFI_SUCCESS)
+ 			return gop;
+ 
+@@ -510,16 +511,22 @@ find_gop(efi_guid_t *proto, unsigned lon
+ 	return first_gop;
+ }
+ 
+-static efi_status_t setup_gop(struct screen_info *si, efi_guid_t *proto,
+-			      unsigned long size, void **handles)
++efi_status_t efi_setup_gop(struct screen_info *si)
+ {
+-	efi_graphics_output_protocol_t *gop;
++	efi_handle_t *handles __free(efi_pool) = NULL;
+ 	efi_graphics_output_protocol_mode_t *mode;
+ 	efi_graphics_output_mode_info_t *info;
++	efi_graphics_output_protocol_t *gop;
++	efi_status_t status;
++	unsigned long num;
+ 
+-	gop = find_gop(proto, size, handles);
++	status = efi_bs_call(locate_handle_buffer, EFI_LOCATE_BY_PROTOCOL,
++			      &EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID, NULL, &num,
++			      &handles);
++	if (status != EFI_SUCCESS)
++		return status;
+ 
+-	/* Did we find any GOPs? */
++	gop = find_gop(num, handles);
+ 	if (!gop)
+ 		return EFI_NOT_FOUND;
+ 
+@@ -551,29 +558,3 @@ static efi_status_t setup_gop(struct scr
+ 
+ 	return EFI_SUCCESS;
+ }
+-
+-/*
+- * See if we have Graphics Output Protocol
+- */
+-efi_status_t efi_setup_gop(struct screen_info *si, efi_guid_t *proto,
+-			   unsigned long size)
+-{
+-	efi_status_t status;
+-	void **gop_handle = NULL;
+-
+-	status = efi_bs_call(allocate_pool, EFI_LOADER_DATA, size,
+-			     (void **)&gop_handle);
+-	if (status != EFI_SUCCESS)
+-		return status;
+-
+-	status = efi_bs_call(locate_handle, EFI_LOCATE_BY_PROTOCOL, proto, NULL,
+-			     &size, gop_handle);
+-	if (status != EFI_SUCCESS)
+-		goto free_handle;
+-
+-	status = setup_gop(si, proto, size, gop_handle);
+-
+-free_handle:
+-	efi_bs_call(free_pool, gop_handle);
+-	return status;
+-}
+--- a/drivers/firmware/efi/libstub/x86-stub.c
++++ b/drivers/firmware/efi/libstub/x86-stub.c
+@@ -406,24 +406,11 @@ static void setup_quirks(struct boot_par
+ 
+ static void setup_graphics(struct boot_params *boot_params)
+ {
+-	efi_guid_t graphics_proto = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;
+-	struct screen_info *si;
+-	efi_status_t status;
+-	unsigned long size;
+-	void **gop_handle = NULL;
+-
+-	si = &boot_params->screen_info;
+-	memset(si, 0, sizeof(*si));
+-
+-	size = 0;
+-	status = efi_bs_call(locate_handle, EFI_LOCATE_BY_PROTOCOL,
+-			     &graphics_proto, NULL, &size, gop_handle);
+-	if (status == EFI_BUFFER_TOO_SMALL)
+-		status = efi_setup_gop(si, &graphics_proto, size);
++	struct screen_info *si = memset(&boot_params->screen_info, 0, sizeof(*si));
+ 
++	efi_setup_gop(si);
+ }
+ 
+-
+ static void __noreturn efi_exit(efi_handle_t handle, efi_status_t status)
+ {
+ 	efi_bs_call(exit, handle, status, 0, NULL);
