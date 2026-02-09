@@ -1,0 +1,167 @@
+From: Catalin Marinas <catalin.marinas@arm.com>
+Date: Wed, 25 Jun 2025 11:34:32 +0000
+Subject: arm64: cpufeature: Introduce MATCH_ALL_EARLY_CPUS capability type
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: 3eb06f6ce3af65df4e9b3d8fc1d711fbfe7673b3
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13757
+
+For system-wide capabilities, the kernel has the SCOPE_SYSTEM type. Such
+capabilities are checked once the SMP boot has completed using the
+sanitised ID registers. However, there is a need for a new capability
+type similar in scope to the system one but with checking performed
+locally on each CPU during boot (e.g. based on MIDR_EL1 which is not a
+sanitised register).
+
+Introduce ARM64_CPUCAP_MATCH_ALL_EARLY_CPUS which, together with
+ARM64_CPUCAP_SCOPE_LOCAL_CPU, ensures that such capability is enabled
+only if all early CPUs have it. For ease of use, define
+ARM64_CPUCAP_EARLY_LOCAL_CPU_FEATURE which combines SCOPE_LOCAL_CPU,
+PERMITTED_FOR_LATE_CPUS and MATCH_ALL_EARLY_CPUS.
+
+Signed-off-by: Mikołaj Lenczewski <miko.lenczewski@arm.com>
+Reviewed-by: Suzuki K Poulose <Suzuki.Poulose@arm.com>
+Link: https://lore.kernel.org/r/20250625113435.26849-2-miko.lenczewski@arm.com
+Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+Acked-by: Ivan T. Ivanov <iivanov@suse.de>
+---
+ arch/arm64/include/asm/cpufeature.h |   23 +++++++++++++
+ arch/arm64/kernel/cpufeature.c      |   60 +++++++++++++++++++++++++++++-------
+ 2 files changed, 72 insertions(+), 11 deletions(-)
+
+--- a/arch/arm64/include/asm/cpufeature.h
++++ b/arch/arm64/include/asm/cpufeature.h
+@@ -275,6 +275,14 @@ extern struct arm64_ftr_reg arm64_ftr_re
+ #define ARM64_CPUCAP_OPTIONAL_FOR_LATE_CPU	((u16)BIT(5))
+ /* Panic when a conflict is detected */
+ #define ARM64_CPUCAP_PANIC_ON_CONFLICT		((u16)BIT(6))
++/*
++ * When paired with SCOPE_LOCAL_CPU, all early CPUs must satisfy the
++ * condition. This is different from SCOPE_SYSTEM where the check is performed
++ * only once at the end of the SMP boot on the sanitised ID registers.
++ * SCOPE_SYSTEM is not suitable for cases where the capability depends on
++ * properties local to a CPU like MIDR_EL1.
++ */
++#define ARM64_CPUCAP_MATCH_ALL_EARLY_CPUS	((u16)BIT(7))
+ 
+ /*
+  * CPU errata workarounds that need to be enabled at boot time if one or
+@@ -304,6 +312,16 @@ extern struct arm64_ftr_reg arm64_ftr_re
+ 	(ARM64_CPUCAP_SCOPE_LOCAL_CPU		|	\
+ 	 ARM64_CPUCAP_OPTIONAL_FOR_LATE_CPU	|	\
+ 	 ARM64_CPUCAP_PERMITTED_FOR_LATE_CPU)
++/*
++ * CPU feature detected at boot time and present on all early CPUs. Late CPUs
++ * are permitted to have the feature even if it hasn't been enabled, although
++ * the feature will not be used by Linux in this case. If all early CPUs have
++ * the feature, then every late CPU must have it.
++ */
++#define ARM64_CPUCAP_EARLY_LOCAL_CPU_FEATURE		\
++	 (ARM64_CPUCAP_SCOPE_LOCAL_CPU		|	\
++	  ARM64_CPUCAP_PERMITTED_FOR_LATE_CPU	|	\
++	  ARM64_CPUCAP_MATCH_ALL_EARLY_CPUS)
+ 
+ /*
+  * CPU feature detected at boot time, on one or more CPUs. A late CPU
+@@ -391,6 +409,11 @@ static inline int cpucap_default_scope(c
+ 	return cap->type & ARM64_CPUCAP_SCOPE_MASK;
+ }
+ 
++static inline bool cpucap_match_all_early_cpus(const struct arm64_cpu_capabilities *cap)
++{
++	return cap->type & ARM64_CPUCAP_MATCH_ALL_EARLY_CPUS;
++}
++
+ /*
+  * Generic helper for handling capabilities with multiple (match,enable) pairs
+  * of call backs, sharing the same capability bit.
+--- a/arch/arm64/kernel/cpufeature.c
++++ b/arch/arm64/kernel/cpufeature.c
+@@ -3264,18 +3264,49 @@ static void update_cpu_capabilities(u16
+ 
+ 	scope_mask &= ARM64_CPUCAP_SCOPE_MASK;
+ 	for (i = 0; i < ARM64_NCAPS; i++) {
++		bool match_all = false;
++		bool caps_set = false;
++		bool boot_cpu = false;
++
+ 		caps = cpucap_ptrs[i];
+-		if (!caps || !(caps->type & scope_mask) ||
+-		    cpus_have_cap(caps->capability) ||
+-		    !caps->matches(caps, cpucap_default_scope(caps)))
++		if (!caps || !(caps->type & scope_mask))
++			continue;
++
++		match_all = cpucap_match_all_early_cpus(caps);
++		caps_set = cpus_have_cap(caps->capability);
++		boot_cpu = scope_mask & SCOPE_BOOT_CPU;
++
++		/*
++		 * Unless it's a match-all CPUs feature, avoid probing if
++		 * already detected.
++		 */
++		if (!match_all && caps_set)
++			continue;
++
++		/*
++		 * A match-all CPUs capability is only set when probing the
++		 * boot CPU. It may be cleared subsequently if not detected on
++		 * secondary ones.
++		 */
++		if (match_all && !caps_set && !boot_cpu)
++			continue;
++
++		if (!caps->matches(caps, cpucap_default_scope(caps))) {
++			if (match_all)
++				__clear_bit(caps->capability, system_cpucaps);
+ 			continue;
++		}
+ 
+-		if (caps->desc && !caps->cpus)
++		/*
++		 * Match-all CPUs capabilities are logged later when the
++		 * system capabilities are finalised.
++		 */
++		if (!match_all && caps->desc && !caps->cpus)
+ 			pr_info("detected: %s\n", caps->desc);
+ 
+ 		__set_bit(caps->capability, system_cpucaps);
+ 
+-		if ((scope_mask & SCOPE_BOOT_CPU) && (caps->type & SCOPE_BOOT_CPU))
++		if (boot_cpu && (caps->type & SCOPE_BOOT_CPU))
+ 			set_bit(caps->capability, boot_cpucaps);
+ 	}
+ }
+@@ -3671,17 +3702,24 @@ static void __init setup_system_capabili
+ 	enable_cpu_capabilities(SCOPE_ALL & ~SCOPE_BOOT_CPU);
+ 	apply_alternatives_all();
+ 
+-	/*
+-	 * Log any cpucaps with a cpumask as these aren't logged by
+-	 * update_cpu_capabilities().
+-	 */
+ 	for (int i = 0; i < ARM64_NCAPS; i++) {
+ 		const struct arm64_cpu_capabilities *caps = cpucap_ptrs[i];
+ 
+-		if (caps && caps->cpus && caps->desc &&
+-			cpumask_any(caps->cpus) < nr_cpu_ids)
++		if (!caps || !caps->desc)
++			continue;
++
++		/*
++		 * Log any cpucaps with a cpumask as these aren't logged by
++		 * update_cpu_capabilities().
++		 */
++		if (caps->cpus && cpumask_any(caps->cpus) < nr_cpu_ids)
+ 			pr_info("detected: %s on CPU%*pbl\n",
+ 				caps->desc, cpumask_pr_args(caps->cpus));
++
++		/* Log match-all CPUs capabilities */
++		if (cpucap_match_all_early_cpus(caps) &&
++		    cpus_have_cap(caps->capability))
++			pr_info("detected: %s\n", caps->desc);
+ 	}
+ 
+ 	/*

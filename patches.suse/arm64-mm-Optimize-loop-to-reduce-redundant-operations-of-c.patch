@@ -1,0 +1,267 @@
+From: Xavier Xia <xavier.qyxia@gmail.com>
+Date: Tue, 24 Jun 2025 23:25:49 +0800
+Subject: arm64/mm: Optimize loop to reduce redundant operations of
+ contpte_ptep_get
+Git-commit: 093ae7a033cfde536db997e7dc4e829ce65fb38a
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13757
+
+This commit optimizes the contpte_ptep_get and contpte_ptep_get_lockless
+function by adding early termination logic. It checks if the dirty and
+young bits of orig_pte are already set and skips redundant bit-setting
+operations during the loop. This reduces unnecessary iterations and
+improves performance.
+
+In order to verify the optimization performance, a test function has been
+designed. The function's execution time and instruction statistics have
+been traced using perf, and the following are the operation results on a
+certain Qualcomm mobile phone chip:
+
+Test Code:
+	#include <stdlib.h>
+	#include <sys/mman.h>
+	#include <stdio.h>
+
+	#define PAGE_SIZE 4096
+	#define CONT_PTES 16
+	#define TEST_SIZE (4096* CONT_PTES * PAGE_SIZE)
+	#define YOUNG_BIT 8
+	void rwdata(char *buf)
+	{
+		for (size_t i = 0; i < TEST_SIZE; i += PAGE_SIZE) {
+			buf[i] = 'a';
+			volatile char c = buf[i];
+		}
+	}
+	void clear_young_dirty(char *buf)
+	{
+		if (madvise(buf, TEST_SIZE, MADV_FREE) == -1) {
+			perror("madvise free failed");
+			free(buf);
+			exit(EXIT_FAILURE);
+		}
+		if (madvise(buf, TEST_SIZE, MADV_COLD) == -1) {
+			perror("madvise free failed");
+			free(buf);
+			exit(EXIT_FAILURE);
+		}
+	}
+	void set_one_young(char *buf)
+	{
+		for (size_t i = 0; i < TEST_SIZE; i += CONT_PTES * PAGE_SIZE) {
+			volatile char c = buf[i + YOUNG_BIT * PAGE_SIZE];
+		}
+	}
+
+	void test_contpte_perf() {
+		char *buf;
+		int ret = posix_memalign((void **)&buf, CONT_PTES * PAGE_SIZE,
+				TEST_SIZE);
+		if ((ret != 0) || ((unsigned long)buf % CONT_PTES * PAGE_SIZE)) {
+			perror("posix_memalign failed");
+			exit(EXIT_FAILURE);
+		}
+
+		rwdata(buf);
+	#if TEST_CASE2 || TEST_CASE3
+		clear_young_dirty(buf);
+	#endif
+	#if TEST_CASE2
+		set_one_young(buf);
+	#endif
+
+		for (int j = 0; j < 500; j++) {
+			mlock(buf, TEST_SIZE);
+
+			munlock(buf, TEST_SIZE);
+		}
+		free(buf);
+	}
+
+	int main(void)
+	{
+		test_contpte_perf();
+		return 0;
+	}
+
+	Descriptions of three test scenarios
+
+Scenario 1
+	The data of all 16 PTEs are both dirty and young.
+	#define TEST_CASE2 0
+	#define TEST_CASE3 0
+
+Scenario 2
+	Among the 16 PTEs, only the 8th one is young, and there are no dirty ones.
+	#define TEST_CASE2 1
+	#define TEST_CASE3 0
+
+Scenario 3
+	Among the 16 PTEs, there are neither young nor dirty ones.
+	#define TEST_CASE2 0
+	#define TEST_CASE3 1
+
+Test results
+
+|Scenario 1         |       Original|       Optimized|
+|-------------------|---------------|----------------|
+|instructions       |    37912436160|     18731580031|
+|test time          |         4.2797|          2.2949|
+|overhead of        |               |                |
+|contpte_ptep_get() |         21.31%|           4.80%|
+
+|Scenario 2         |       Original|       Optimized|
+|-------------------|---------------|----------------|
+|instructions       |    36701270862|     36115790086|
+|test time          |         3.2335|          3.0874|
+|Overhead of        |               |                |
+|contpte_ptep_get() |         32.26%|          33.57%|
+
+|Scenario 3         |       Original|       Optimized|
+|-------------------|---------------|----------------|
+|instructions       |    36706279735|     36750881878|
+|test time          |         3.2008|          3.1249|
+|Overhead of        |               |                |
+|contpte_ptep_get() |         31.94%|          34.59%|
+
+For Scenario 1, optimized code can achieve an instruction benefit of 50.59%
+and a time benefit of 46.38%.
+For Scenario 2, optimized code can achieve an instruction count benefit of
+1.6% and a time benefit of 4.5%.
+For Scenario 3, since all the PTEs have neither the young nor the dirty
+flag, the branches taken by optimized code should be the same as those of
+the original code. In fact, the test results of optimized code seem to be
+closer to those of the original code.
+
+Ryan re-ran these tests on Apple M2 with 4K base pages + 64K mTHP.
+
+Scenario 1: reduced to 56% of baseline execution time
+Scenario 2: reduced to 89% of baseline execution time
+Scenario 3: reduced to 91% of baseline execution time
+
+It can be proven through test function that the optimization for
+contpte_ptep_get is effective. Since the logic of contpte_ptep_get_lockless
+is similar to that of contpte_ptep_get, the same optimization scheme is
+also adopted for it.
+
+Reviewed-by: Ryan Roberts <ryan.roberts@arm.com>
+Tested-by: Ryan Roberts <ryan.roberts@arm.com>
+Reviewed-by: Barry Song <baohua@kernel.org>
+Signed-off-by: Xavier Xia <xavier.qyxia@gmail.com>
+Link: https://lore.kernel.org/r/20250624152549.2647828-1-xavier.qyxia@gmail.com
+Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+Acked-by: Ivan T. Ivanov <iivanov@suse.de>
+---
+ arch/arm64/mm/contpte.c |   72 ++++++++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 63 insertions(+), 9 deletions(-)
+
+--- a/arch/arm64/mm/contpte.c
++++ b/arch/arm64/mm/contpte.c
+@@ -306,17 +306,46 @@ pte_t contpte_ptep_get(pte_t *ptep, pte_
+ 	for (i = 0; i < CONT_PTES; i++, ptep++) {
+ 		pte = __ptep_get(ptep);
+ 
+-		if (pte_dirty(pte))
++		if (pte_dirty(pte)) {
+ 			orig_pte = pte_mkdirty(orig_pte);
++			for (; i < CONT_PTES; i++, ptep++) {
++				pte = __ptep_get(ptep);
++				if (pte_young(pte)) {
++					orig_pte = pte_mkyoung(orig_pte);
++					break;
++				}
++			}
++			break;
++		}
+ 
+-		if (pte_young(pte))
++		if (pte_young(pte)) {
+ 			orig_pte = pte_mkyoung(orig_pte);
++			i++;
++			ptep++;
++			for (; i < CONT_PTES; i++, ptep++) {
++				pte = __ptep_get(ptep);
++				if (pte_dirty(pte)) {
++					orig_pte = pte_mkdirty(orig_pte);
++					break;
++				}
++			}
++			break;
++		}
+ 	}
+ 
+ 	return orig_pte;
+ }
+ EXPORT_SYMBOL_GPL(contpte_ptep_get);
+ 
++static inline bool contpte_is_consistent(pte_t pte, unsigned long pfn,
++					pgprot_t orig_prot)
++{
++	pgprot_t prot = pte_pgprot(pte_mkold(pte_mkclean(pte)));
++
++	return pte_valid_cont(pte) && pte_pfn(pte) == pfn &&
++			pgprot_val(prot) == pgprot_val(orig_prot);
++}
++
+ pte_t contpte_ptep_get_lockless(pte_t *orig_ptep)
+ {
+ 	/*
+@@ -339,7 +368,6 @@ pte_t contpte_ptep_get_lockless(pte_t *o
+ 	pgprot_t orig_prot;
+ 	unsigned long pfn;
+ 	pte_t orig_pte;
+-	pgprot_t prot;
+ 	pte_t *ptep;
+ 	pte_t pte;
+ 	int i;
+@@ -356,18 +384,44 @@ retry:
+ 
+ 	for (i = 0; i < CONT_PTES; i++, ptep++, pfn++) {
+ 		pte = __ptep_get(ptep);
+-		prot = pte_pgprot(pte_mkold(pte_mkclean(pte)));
+ 
+-		if (!pte_valid_cont(pte) ||
+-		   pte_pfn(pte) != pfn ||
+-		   pgprot_val(prot) != pgprot_val(orig_prot))
++		if (!contpte_is_consistent(pte, pfn, orig_prot))
+ 			goto retry;
+ 
+-		if (pte_dirty(pte))
++		if (pte_dirty(pte)) {
+ 			orig_pte = pte_mkdirty(orig_pte);
++			for (; i < CONT_PTES; i++, ptep++, pfn++) {
++				pte = __ptep_get(ptep);
++
++				if (!contpte_is_consistent(pte, pfn, orig_prot))
++					goto retry;
++
++				if (pte_young(pte)) {
++					orig_pte = pte_mkyoung(orig_pte);
++					break;
++				}
++			}
++			break;
++		}
+ 
+-		if (pte_young(pte))
++		if (pte_young(pte)) {
+ 			orig_pte = pte_mkyoung(orig_pte);
++			i++;
++			ptep++;
++			pfn++;
++			for (; i < CONT_PTES; i++, ptep++, pfn++) {
++				pte = __ptep_get(ptep);
++
++				if (!contpte_is_consistent(pte, pfn, orig_prot))
++					goto retry;
++
++				if (pte_dirty(pte)) {
++					orig_pte = pte_mkdirty(orig_pte);
++					break;
++				}
++			}
++			break;
++		}
+ 	}
+ 
+ 	return orig_pte;

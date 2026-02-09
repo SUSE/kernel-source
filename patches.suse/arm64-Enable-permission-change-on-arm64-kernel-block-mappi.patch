@@ -1,0 +1,301 @@
+From: Dev Jain <dev.jain@arm.com>
+Date: Wed, 17 Sep 2025 12:02:07 -0700
+Subject: arm64: Enable permission change on arm64 kernel block mappings
+Git-commit: a660194dd101e937c319171ad99c3fbe466fd825
+Patch-mainline: v6.18-rc1
+References: jsc#PED-13757
+
+This patch paves the path to enable huge mappings in vmalloc space and
+linear map space by default on arm64. For this we must ensure that we
+can handle any permission games on the kernel (init_mm) pagetable.
+Previously, __change_memory_common() used apply_to_page_range() which
+does not support changing permissions for block mappings. We move away
+from this by using the pagewalk API, similar to what riscv does right
+now. It is the responsibility of the caller to ensure that the range
+over which permissions are being changed falls on leaf mapping
+boundaries. For systems with BBML2, this will be handled in future
+patches by dyanmically splitting the mappings when required.
+
+Unlike apply_to_page_range(), the pagewalk API currently enforces the
+init_mm.mmap_lock to be held. To avoid the unnecessary bottleneck of the
+mmap_lock for our usecase, this patch extends this generic API to be
+used locklessly, so as to retain the existing behaviour for changing
+permissions. Apart from this reason, it is noted at [1] that KFENCE can
+manipulate kernel pgtable entries during softirqs. It does this by
+calling set_memory_valid() -> __change_memory_common(). This being a
+non-sleepable context, we cannot take the init_mm mmap lock.
+
+Add comments to highlight the conditions under which we can use the
+lockless variant - no underlying VMA, and the user having exclusive
+control over the range, thus guaranteeing no concurrent access.
+
+We require that the start and end of a given range do not partially
+overlap block mappings, or cont mappings. Return -EINVAL in case a
+partial block mapping is detected in any of the PGD/P4D/PUD/PMD levels;
+add a corresponding comment in update_range_prot() to warn that
+eliminating such a condition is the responsibility of the caller.
+
+Note that, the pte level callback may change permissions for a whole
+contpte block, and that will be done one pte at a time, as opposed to an
+atomic operation for the block mappings. This is fine as any access will
+decode either the old or the new permission until the TLBI.
+
+apply_to_page_range() currently performs all pte level callbacks while
+in lazy mmu mode. Since arm64 can optimize performance by batching
+barriers when modifying kernel pgtables in lazy mmu mode, we would like
+to continue to benefit from this optimisation. Unfortunately
+walk_kernel_page_table_range() does not use lazy mmu mode. However,
+since the pagewalk framework is not allocating any memory, we can safely
+bracket the whole operation inside lazy mmu mode ourselves. Therefore,
+wrap the call to walk_kernel_page_table_range() with the lazy MMU
+helpers.
+
+Link: https://lore.kernel.org/linux-arm-kernel/89d0ad18-4772-4d8f-ae8a-7c48d26a927e@arm.com/ [1]
+Signed-off-by: Dev Jain <dev.jain@arm.com>
+Signed-off-by: Yang Shi <yshi@os.amperecomputing.com>
+Reviewed-by: Ryan Roberts <ryan.roberts@arm.com>
+Reviewed-by: Catalin Marinas <catalin.marinas@arm.com>
+Signed-off-by: Will Deacon <will@kernel.org>
+Acked-by: Ivan T. Ivanov <iivanov@suse.de>
+---
+ arch/arm64/mm/pageattr.c |  119 ++++++++++++++++++++++++++++++++++-------------
+ include/linux/pagewalk.h |    3 +
+ mm/pagewalk.c            |   36 +++++++++-----
+ 3 files changed, 115 insertions(+), 43 deletions(-)
+
+--- a/arch/arm64/mm/pageattr.c
++++ b/arch/arm64/mm/pageattr.c
+@@ -8,6 +8,7 @@
+ #include <linux/mem_encrypt.h>
+ #include <linux/sched.h>
+ #include <linux/vmalloc.h>
++#include <linux/pagewalk.h>
+ 
+ #include <asm/cacheflush.h>
+ #include <asm/pgtable-prot.h>
+@@ -20,6 +21,65 @@ struct page_change_data {
+ 	pgprot_t clear_mask;
+ };
+ 
++static ptdesc_t set_pageattr_masks(ptdesc_t val, struct mm_walk *walk)
++{
++	struct page_change_data *masks = walk->private;
++
++	val &= ~(pgprot_val(masks->clear_mask));
++	val |= (pgprot_val(masks->set_mask));
++
++	return val;
++}
++
++static int pageattr_pud_entry(pud_t *pud, unsigned long addr,
++			      unsigned long next, struct mm_walk *walk)
++{
++	pud_t val = pudp_get(pud);
++
++	if (pud_sect(val)) {
++		if (WARN_ON_ONCE((next - addr) != PUD_SIZE))
++			return -EINVAL;
++		val = __pud(set_pageattr_masks(pud_val(val), walk));
++		set_pud(pud, val);
++		walk->action = ACTION_CONTINUE;
++	}
++
++	return 0;
++}
++
++static int pageattr_pmd_entry(pmd_t *pmd, unsigned long addr,
++			      unsigned long next, struct mm_walk *walk)
++{
++	pmd_t val = pmdp_get(pmd);
++
++	if (pmd_sect(val)) {
++		if (WARN_ON_ONCE((next - addr) != PMD_SIZE))
++			return -EINVAL;
++		val = __pmd(set_pageattr_masks(pmd_val(val), walk));
++		set_pmd(pmd, val);
++		walk->action = ACTION_CONTINUE;
++	}
++
++	return 0;
++}
++
++static int pageattr_pte_entry(pte_t *pte, unsigned long addr,
++			      unsigned long next, struct mm_walk *walk)
++{
++	pte_t val = __ptep_get(pte);
++
++	val = __pte(set_pageattr_masks(pte_val(val), walk));
++	__set_pte(pte, val);
++
++	return 0;
++}
++
++static const struct mm_walk_ops pageattr_ops = {
++	.pud_entry	= pageattr_pud_entry,
++	.pmd_entry	= pageattr_pmd_entry,
++	.pte_entry	= pageattr_pte_entry,
++};
++
+ bool rodata_full __ro_after_init = IS_ENABLED(CONFIG_RODATA_FULL_DEFAULT_ENABLED);
+ 
+ bool can_set_direct_map(void)
+@@ -37,32 +97,35 @@ bool can_set_direct_map(void)
+ 		arm64_kfence_can_set_direct_map() || is_realm_world();
+ }
+ 
+-static int change_page_range(pte_t *ptep, unsigned long addr, void *data)
++static int update_range_prot(unsigned long start, unsigned long size,
++			     pgprot_t set_mask, pgprot_t clear_mask)
+ {
+-	struct page_change_data *cdata = data;
+-	pte_t pte = __ptep_get(ptep);
++	struct page_change_data data;
++	int ret;
+ 
+-	pte = clear_pte_bit(pte, cdata->clear_mask);
+-	pte = set_pte_bit(pte, cdata->set_mask);
++	data.set_mask = set_mask;
++	data.clear_mask = clear_mask;
+ 
+-	__set_pte(ptep, pte);
+-	return 0;
++	arch_enter_lazy_mmu_mode();
++
++	/*
++	 * The caller must ensure that the range we are operating on does not
++	 * partially overlap a block mapping, or a cont mapping. Any such case
++	 * must be eliminated by splitting the mapping.
++	 */
++	ret = walk_kernel_page_table_range_lockless(start, start + size,
++						    &pageattr_ops, NULL, &data);
++	arch_leave_lazy_mmu_mode();
++
++	return ret;
+ }
+ 
+-/*
+- * This function assumes that the range is mapped with PAGE_SIZE pages.
+- */
+ static int __change_memory_common(unsigned long start, unsigned long size,
+-				pgprot_t set_mask, pgprot_t clear_mask)
++				  pgprot_t set_mask, pgprot_t clear_mask)
+ {
+-	struct page_change_data data;
+ 	int ret;
+ 
+-	data.set_mask = set_mask;
+-	data.clear_mask = clear_mask;
+-
+-	ret = apply_to_page_range(&init_mm, start, size, change_page_range,
+-					&data);
++	ret = update_range_prot(start, size, set_mask, clear_mask);
+ 
+ 	/*
+ 	 * If the memory is being made valid without changing any other bits
+@@ -174,32 +237,26 @@ int set_memory_valid(unsigned long addr,
+ 
+ int set_direct_map_invalid_noflush(struct page *page)
+ {
+-	struct page_change_data data = {
+-		.set_mask = __pgprot(0),
+-		.clear_mask = __pgprot(PTE_VALID),
+-	};
++	pgprot_t clear_mask = __pgprot(PTE_VALID);
++	pgprot_t set_mask = __pgprot(0);
+ 
+ 	if (!can_set_direct_map())
+ 		return 0;
+ 
+-	return apply_to_page_range(&init_mm,
+-				   (unsigned long)page_address(page),
+-				   PAGE_SIZE, change_page_range, &data);
++	return update_range_prot((unsigned long)page_address(page),
++				 PAGE_SIZE, set_mask, clear_mask);
+ }
+ 
+ int set_direct_map_default_noflush(struct page *page)
+ {
+-	struct page_change_data data = {
+-		.set_mask = __pgprot(PTE_VALID | PTE_WRITE),
+-		.clear_mask = __pgprot(PTE_RDONLY),
+-	};
++	pgprot_t set_mask = __pgprot(PTE_VALID | PTE_WRITE);
++	pgprot_t clear_mask = __pgprot(PTE_RDONLY);
+ 
+ 	if (!can_set_direct_map())
+ 		return 0;
+ 
+-	return apply_to_page_range(&init_mm,
+-				   (unsigned long)page_address(page),
+-				   PAGE_SIZE, change_page_range, &data);
++	return update_range_prot((unsigned long)page_address(page),
++				 PAGE_SIZE, set_mask, clear_mask);
+ }
+ 
+ static int __set_memory_enc_dec(unsigned long addr,
+--- a/include/linux/pagewalk.h
++++ b/include/linux/pagewalk.h
+@@ -132,6 +132,9 @@ int walk_page_range(struct mm_struct *mm
+ int walk_kernel_page_table_range(unsigned long start,
+ 		unsigned long end, const struct mm_walk_ops *ops,
+ 		pgd_t *pgd, void *private);
++int walk_kernel_page_table_range_lockless(unsigned long start,
++		unsigned long end, const struct mm_walk_ops *ops,
++		pgd_t *pgd, void *private);
+ int walk_page_range_vma(struct vm_area_struct *vma, unsigned long start,
+ 			unsigned long end, const struct mm_walk_ops *ops,
+ 			void *private);
+--- a/mm/pagewalk.c
++++ b/mm/pagewalk.c
+@@ -605,10 +605,32 @@ int walk_page_range(struct mm_struct *mm
+ int walk_kernel_page_table_range(unsigned long start, unsigned long end,
+ 		const struct mm_walk_ops *ops, pgd_t *pgd, void *private)
+ {
+-	struct mm_struct *mm = &init_mm;
++	/*
++	 * Kernel intermediate page tables are usually not freed, so the mmap
++	 * read lock is sufficient. But there are some exceptions.
++	 * E.g. memory hot-remove. In which case, the mmap lock is insufficient
++	 * to prevent the intermediate kernel pages tables belonging to the
++	 * specified address range from being freed. The caller should take
++	 * other actions to prevent this race.
++	 */
++	mmap_assert_locked(&init_mm);
++
++	return walk_kernel_page_table_range_lockless(start, end, ops, pgd,
++						     private);
++}
++
++/*
++ * Use this function to walk the kernel page tables locklessly. It should be
++ * guaranteed that the caller has exclusive access over the range they are
++ * operating on - that there should be no concurrent access, for example,
++ * changing permissions for vmalloc objects.
++ */
++int walk_kernel_page_table_range_lockless(unsigned long start, unsigned long end,
++		const struct mm_walk_ops *ops, pgd_t *pgd, void *private)
++{
+ 	struct mm_walk walk = {
+ 		.ops		= ops,
+-		.mm		= mm,
++		.mm		= &init_mm,
+ 		.pgd		= pgd,
+ 		.private	= private,
+ 		.no_vma		= true
+@@ -619,16 +641,6 @@ int walk_kernel_page_table_range(unsigne
+ 	if (!check_ops_valid(ops))
+ 		return -EINVAL;
+ 
+-	/*
+-	 * Kernel intermediate page tables are usually not freed, so the mmap
+-	 * read lock is sufficient. But there are some exceptions.
+-	 * E.g. memory hot-remove. In which case, the mmap lock is insufficient
+-	 * to prevent the intermediate kernel pages tables belonging to the
+-	 * specified address range from being freed. The caller should take
+-	 * other actions to prevent this race.
+-	 */
+-	mmap_assert_locked(mm);
+-
+ 	return walk_pgd_range(start, end, &walk);
+ }
+ 

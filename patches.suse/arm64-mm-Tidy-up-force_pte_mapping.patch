@@ -1,0 +1,91 @@
+From: Ryan Roberts <ryan.roberts@arm.com>
+Date: Thu, 6 Nov 2025 16:09:43 +0000
+Subject: arm64: mm: Tidy up force_pte_mapping()
+Git-commit: 53357f14f924a06cced46069755bb10c2a6891c1
+Patch-mainline: v6.18-rc6
+References: jsc#PED-13757
+
+Tidy up the implementation of force_pte_mapping() to make it easier to
+read and introduce the split_leaf_mapping_possible() helper to reduce
+code duplication in split_kernel_leaf_mapping() and
+arch_kfence_init_pool().
+
+Suggested-by: David Hildenbrand (Red Hat) <david@kernel.org>
+Signed-off-by: Ryan Roberts <ryan.roberts@arm.com>
+Reviewed-by: David Hildenbrand (Red Hat) <david@kernel.org>
+Reviewed-by: Yang Shi <yang@os.amperecomputing.com>
+Signed-off-by: Will Deacon <will@kernel.org>
+Acked-by: Ivan T. Ivanov <iivanov@suse.de>
+---
+ arch/arm64/mm/mmu.c |   43 +++++++++++++++++++++++--------------------
+ 1 file changed, 23 insertions(+), 20 deletions(-)
+
+--- a/arch/arm64/mm/mmu.c
++++ b/arch/arm64/mm/mmu.c
+@@ -710,12 +710,26 @@ out:
+ 
+ static inline bool force_pte_mapping(void)
+ {
+-	bool bbml2 = system_capabilities_finalized() ?
++	const bool bbml2 = system_capabilities_finalized() ?
+ 		system_supports_bbml2_noabort() : cpu_supports_bbml2_noabort();
+ 
+-	return (!bbml2 && (rodata_full || arm64_kfence_can_set_direct_map() ||
+-			   is_realm_world())) ||
+-		debug_pagealloc_enabled();
++	if (debug_pagealloc_enabled())
++		return true;
++	if (bbml2)
++		return false;
++	return rodata_full || arm64_kfence_can_set_direct_map() || is_realm_world();
++}
++
++static inline bool split_leaf_mapping_possible(void)
++{
++	/*
++	 * !BBML2_NOABORT systems should never run into scenarios where we would
++	 * have to split. So exit early and let calling code detect it and raise
++	 * a warning.
++	 */
++	if (!system_supports_bbml2_noabort())
++		return false;
++	return !force_pte_mapping();
+ }
+ 
+ static DEFINE_MUTEX(pgtable_split_lock);
+@@ -725,22 +739,11 @@ int split_kernel_leaf_mapping(unsigned l
+ 	int ret;
+ 
+ 	/*
+-	 * !BBML2_NOABORT systems should not be trying to change permissions on
+-	 * anything that is not pte-mapped in the first place. Just return early
+-	 * and let the permission change code raise a warning if not already
+-	 * pte-mapped.
+-	 */
+-	if (!system_supports_bbml2_noabort())
+-		return 0;
+-
+-	/*
+-	 * If the region is within a pte-mapped area, there is no need to try to
+-	 * split. Additionally, CONFIG_DEBUG_PAGEALLOC and CONFIG_KFENCE may
+-	 * change permissions from atomic context so for those cases (which are
+-	 * always pte-mapped), we must not go any further because taking the
+-	 * mutex below may sleep.
++	 * Exit early if the region is within a pte-mapped area or if we can't
++	 * split. For the latter case, the permission change code will raise a
++	 * warning if not already pte-mapped.
+ 	 */
+-	if (force_pte_mapping() || is_kfence_address((void *)start))
++	if (!split_leaf_mapping_possible() || is_kfence_address((void *)start))
+ 		return 0;
+ 
+ 	/*
+@@ -1039,7 +1042,7 @@ bool arch_kfence_init_pool(void)
+ 	int ret;
+ 
+ 	/* Exit early if we know the linear map is already pte-mapped. */
+-	if (!system_supports_bbml2_noabort() || force_pte_mapping())
++	if (!split_leaf_mapping_possible())
+ 		return true;
+ 
+ 	/* Kfence pool is already pte-mapped for the early init case. */
