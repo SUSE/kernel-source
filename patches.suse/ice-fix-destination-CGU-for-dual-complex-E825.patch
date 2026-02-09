@@ -1,0 +1,99 @@
+From: Grzegorz Nitka <grzegorz.nitka@intel.com>
+Date: Mon, 29 Sep 2025 17:29:05 +0200
+Subject: ice: fix destination CGU for dual complex E825
+Patch-mainline: v6.18-rc4
+Git-commit: 45076413063cf5e0e25fd3f7f89fc90338b161c8
+References: jsc#PED-14404 jsc#PED-15079
+
+On dual complex E825, only complex 0 has functional CGU (Clock
+Generation Unit), powering all the PHYs.
+SBQ (Side Band Queue) destination device 'cgu' in current implementation
+points to CGU on current complex and, in order to access primary CGU
+from the secondary complex, the driver should use 'cgu_peer' as
+a destination device in read/write CGU registers operations.
+
+Define new 'cgu_peer' (15) as RDA (Remote Device Access) client over
+SB-IOSF interface and use it as device target when accessing CGU from
+secondary complex.
+
+This problem has been identified when working on recovery clock
+enablement [1]. In existing implementation for E825 devices, only PF0,
+which is clock owner, is involved in CGU configuration, thus the
+problem was not exposed to the user.
+
+[1] https://lore.kernel.org/intel-wired-lan/20250905150947.871566-1-grzegorz.nitka@intel.com/
+
+Fixes: e2193f9f9ec9 ("ice: enable timesync operation on 2xNAC E825 devices")
+Signed-off-by: Grzegorz Nitka <grzegorz.nitka@intel.com>
+Reviewed-by: Arkadiusz Kubalewski <Arkadiusz.kubalewski@intel.com>
+Reviewed-by: Aleksandr Loktionov <aleksandr.loktionov@intel.com>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Tested-by: Rinitha S <sx.rinitha@intel.com> (A Contingent worker at Intel)
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/ice/ice_common.c  |   26 ++++++++++++++++++++++++--
+ drivers/net/ethernet/intel/ice/ice_sbq_cmd.h |    1 +
+ 2 files changed, 25 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/ethernet/intel/ice/ice_common.c
++++ b/drivers/net/ethernet/intel/ice/ice_common.c
+@@ -6506,6 +6506,28 @@ u32 ice_get_link_speed(u16 index)
+ }
+ 
+ /**
++ * ice_get_dest_cgu - get destination CGU dev for given HW
++ * @hw: pointer to the HW struct
++ *
++ * Get CGU client id for CGU register read/write operations.
++ *
++ * Return: CGU device id to use in SBQ transactions.
++ */
++static enum ice_sbq_dev_id ice_get_dest_cgu(struct ice_hw *hw)
++{
++	/* On dual complex E825 only complex 0 has functional CGU powering all
++	 * the PHYs.
++	 * SBQ destination device cgu points to CGU on a current complex and to
++	 * access primary CGU from the secondary complex, the driver should use
++	 * cgu_peer as a destination device.
++	 */
++	if (hw->mac_type == ICE_MAC_GENERIC_3K_E825 && ice_is_dual(hw) &&
++	    !ice_is_primary(hw))
++		return ice_sbq_dev_cgu_peer;
++	return ice_sbq_dev_cgu;
++}
++
++/**
+  * ice_read_cgu_reg - Read a CGU register
+  * @hw: Pointer to the HW struct
+  * @addr: Register address to read
+@@ -6519,8 +6541,8 @@ u32 ice_get_link_speed(u16 index)
+ int ice_read_cgu_reg(struct ice_hw *hw, u32 addr, u32 *val)
+ {
+ 	struct ice_sbq_msg_input cgu_msg = {
++		.dest_dev = ice_get_dest_cgu(hw),
+ 		.opcode = ice_sbq_msg_rd,
+-		.dest_dev = ice_sbq_dev_cgu,
+ 		.msg_addr_low = addr
+ 	};
+ 	int err;
+@@ -6551,8 +6573,8 @@ int ice_read_cgu_reg(struct ice_hw *hw,
+ int ice_write_cgu_reg(struct ice_hw *hw, u32 addr, u32 val)
+ {
+ 	struct ice_sbq_msg_input cgu_msg = {
++		.dest_dev = ice_get_dest_cgu(hw),
+ 		.opcode = ice_sbq_msg_wr,
+-		.dest_dev = ice_sbq_dev_cgu,
+ 		.msg_addr_low = addr,
+ 		.data = val
+ 	};
+--- a/drivers/net/ethernet/intel/ice/ice_sbq_cmd.h
++++ b/drivers/net/ethernet/intel/ice/ice_sbq_cmd.h
+@@ -50,6 +50,7 @@ enum ice_sbq_dev_id {
+ 	ice_sbq_dev_phy_0	= 0x02,
+ 	ice_sbq_dev_cgu		= 0x06,
+ 	ice_sbq_dev_phy_0_peer	= 0x0D,
++	ice_sbq_dev_cgu_peer	= 0x0F,
+ };
+ 
+ enum ice_sbq_msg_opcode {

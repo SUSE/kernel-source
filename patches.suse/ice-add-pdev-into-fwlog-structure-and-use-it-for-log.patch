@@ -1,0 +1,224 @@
+From: Michal Swiatkowski <michal.swiatkowski@linux.intel.com>
+Date: Tue, 12 Aug 2025 06:23:26 +0200
+Subject: ice: add pdev into fwlog structure and use it for logging
+Patch-mainline: v6.18-rc1
+Git-commit: 4773761949dec7d47633b624e3c9e4cf0a1af9e8
+References: jsc#PED-14404 jsc#PED-15079
+
+Prepare the code to be moved to the library. ice_debug() won't be there
+so switch to dev_dbg().
+
+Add struct pdev pointer in fwlog to track on which pdev the fwlog was
+created.
+
+Switch the dev passed in dev_warn() to the one stored in fwlog.
+
+Reviewed-by: Przemek Kitszel <przemyslaw.kitszel@intel.com>
+Signed-off-by: Michal Swiatkowski <michal.swiatkowski@linux.intel.com>
+Reviewed-by: Aleksandr Loktionov <aleksandr.loktionov@intel.com>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/ice/ice_common.c  |    3 +-
+ drivers/net/ethernet/intel/ice/ice_debugfs.c |    2 -
+ drivers/net/ethernet/intel/ice/ice_fwlog.c   |   37 +++++++++++++--------------
+ drivers/net/ethernet/intel/ice/ice_fwlog.h   |    7 ++---
+ 4 files changed, 26 insertions(+), 23 deletions(-)
+
+--- a/drivers/net/ethernet/intel/ice/ice_common.c
++++ b/drivers/net/ethernet/intel/ice/ice_common.c
+@@ -992,6 +992,7 @@ int ice_init_hw(struct ice_hw *hw)
+ {
+ 	struct ice_aqc_get_phy_caps_data *pcaps __free(kfree) = NULL;
+ 	void *mac_buf __free(kfree) = NULL;
++	struct ice_pf *pf = hw->back;
+ 	u16 mac_buf_len;
+ 	int status;
+ 
+@@ -1012,7 +1013,7 @@ int ice_init_hw(struct ice_hw *hw)
+ 	if (status)
+ 		goto err_unroll_cqinit;
+ 
+-	status = ice_fwlog_init(hw, &hw->fwlog);
++	status = ice_fwlog_init(hw, &hw->fwlog, pf->pdev);
+ 	if (status)
+ 		ice_debug(hw, ICE_DBG_FW_LOG, "Error initializing FW logging: %d\n",
+ 			  status);
+--- a/drivers/net/ethernet/intel/ice/ice_debugfs.c
++++ b/drivers/net/ethernet/intel/ice/ice_debugfs.c
+@@ -450,7 +450,7 @@ ice_debugfs_log_size_write(struct file *
+ 	}
+ 
+ 	/* free all the buffers and the tracking info and resize */
+-	ice_fwlog_realloc_rings(hw, &hw->fwlog, index);
++	ice_fwlog_realloc_rings(&hw->fwlog, index);
+ 
+ 	/* if we get here, nothing went wrong; return count since we didn't
+ 	 * really write anything
+--- a/drivers/net/ethernet/intel/ice/ice_fwlog.c
++++ b/drivers/net/ethernet/intel/ice/ice_fwlog.c
+@@ -73,13 +73,11 @@ static void ice_fwlog_free_ring_buffs(st
+ #define ICE_FWLOG_INDEX_TO_BYTES(n) ((128 * 1024) << (n))
+ /**
+  * ice_fwlog_realloc_rings - reallocate the FW log rings
+- * @hw: pointer to the HW structure
+  * @fwlog: pointer to the fwlog structure
+  * @index: the new index to use to allocate memory for the log data
+  *
+  */
+-void ice_fwlog_realloc_rings(struct ice_hw *hw, struct ice_fwlog *fwlog,
+-			     int index)
++void ice_fwlog_realloc_rings(struct ice_fwlog *fwlog, int index)
+ {
+ 	struct ice_fwlog_ring ring;
+ 	int status, ring_size;
+@@ -109,7 +107,7 @@ void ice_fwlog_realloc_rings(struct ice_
+ 
+ 	status = ice_fwlog_alloc_ring_buffs(&ring);
+ 	if (status) {
+-		dev_warn(ice_hw_to_dev(hw), "Unable to allocate memory for FW log ring data buffers\n");
++		dev_warn(&fwlog->pdev->dev, "Unable to allocate memory for FW log ring data buffers\n");
+ 		ice_fwlog_free_ring_buffs(&ring);
+ 		kfree(ring.rings);
+ 		return;
+@@ -165,16 +163,16 @@ static int ice_aq_fwlog_get(struct ice_h
+ 
+ 	status = ice_aq_send_cmd(hw, &desc, buf, ICE_AQ_MAX_BUF_LEN, NULL);
+ 	if (status) {
+-		ice_debug(hw, ICE_DBG_FW_LOG, "Failed to get FW log configuration\n");
++		dev_dbg(&hw->fwlog.pdev->dev, "Failed to get FW log configuration\n");
+ 		goto status_out;
+ 	}
+ 
+ 	module_id_cnt = le16_to_cpu(cmd->ops.cfg.mdl_cnt);
+ 	if (module_id_cnt < ICE_AQC_FW_LOG_ID_MAX) {
+-		ice_debug(hw, ICE_DBG_FW_LOG, "FW returned less than the expected number of FW log module IDs\n");
++		dev_dbg(&hw->fwlog.pdev->dev, "FW returned less than the expected number of FW log module IDs\n");
+ 	} else if (module_id_cnt > ICE_AQC_FW_LOG_ID_MAX) {
+-		ice_debug(hw, ICE_DBG_FW_LOG, "FW returned more than expected number of FW log module IDs, setting module_id_cnt to software expected max %u\n",
+-			  ICE_AQC_FW_LOG_ID_MAX);
++		dev_dbg(&hw->fwlog.pdev->dev, "FW returned more than expected number of FW log module IDs, setting module_id_cnt to software expected max %u\n",
++			ICE_AQC_FW_LOG_ID_MAX);
+ 		module_id_cnt = ICE_AQC_FW_LOG_ID_MAX;
+ 	}
+ 
+@@ -225,8 +223,8 @@ static void ice_fwlog_set_supported(stru
+ 
+ 	status = ice_aq_fwlog_get(hw, cfg);
+ 	if (status)
+-		ice_debug(hw, ICE_DBG_FW_LOG, "ice_aq_fwlog_get failed, FW logging is not supported on this version of FW, status %d\n",
+-			  status);
++		dev_dbg(&fwlog->pdev->dev, "ice_aq_fwlog_get failed, FW logging is not supported on this version of FW, status %d\n",
++			status);
+ 	else
+ 		fwlog->supported = true;
+ 
+@@ -237,17 +235,20 @@ static void ice_fwlog_set_supported(stru
+  * ice_fwlog_init - Initialize FW logging configuration
+  * @hw: pointer to the HW structure
+  * @fwlog: pointer to the fwlog structure
++ * @pdev: pointer to the pci dev used in dev_warn()
+  *
+  * This function should be called on driver initialization during
+  * ice_init_hw().
+  */
+-int ice_fwlog_init(struct ice_hw *hw, struct ice_fwlog *fwlog)
++int ice_fwlog_init(struct ice_hw *hw, struct ice_fwlog *fwlog,
++		   struct pci_dev *pdev)
+ {
+ 	/* only support fw log commands on PF 0 */
+ 	if (hw->bus.func)
+ 		return -EINVAL;
+ 
+ 	ice_fwlog_set_supported(hw, fwlog);
++	fwlog->pdev = pdev;
+ 
+ 	if (ice_fwlog_supported(fwlog)) {
+ 		int status;
+@@ -261,7 +262,7 @@ int ice_fwlog_init(struct ice_hw *hw, st
+ 					    sizeof(*fwlog->ring.rings),
+ 					    GFP_KERNEL);
+ 		if (!fwlog->ring.rings) {
+-			dev_warn(ice_hw_to_dev(hw), "Unable to allocate memory for FW log rings\n");
++			dev_warn(&fwlog->pdev->dev, "Unable to allocate memory for FW log rings\n");
+ 			return -ENOMEM;
+ 		}
+ 
+@@ -270,7 +271,7 @@ int ice_fwlog_init(struct ice_hw *hw, st
+ 
+ 		status = ice_fwlog_alloc_ring_buffs(&fwlog->ring);
+ 		if (status) {
+-			dev_warn(ice_hw_to_dev(hw), "Unable to allocate memory for FW log ring data buffers\n");
++			dev_warn(&fwlog->pdev->dev, "Unable to allocate memory for FW log ring data buffers\n");
+ 			ice_fwlog_free_ring_buffs(&fwlog->ring);
+ 			kfree(fwlog->ring.rings);
+ 			return status;
+@@ -278,7 +279,7 @@ int ice_fwlog_init(struct ice_hw *hw, st
+ 
+ 		ice_debugfs_fwlog_init(hw->back);
+ 	} else {
+-		dev_warn(ice_hw_to_dev(hw), "FW logging is not supported in this NVM image. Please update the NVM to get FW log support\n");
++		dev_warn(&fwlog->pdev->dev, "FW logging is not supported in this NVM image. Please update the NVM to get FW log support\n");
+ 	}
+ 
+ 	return 0;
+@@ -308,7 +309,7 @@ void ice_fwlog_deinit(struct ice_hw *hw,
+ 	fwlog->cfg.options &= ~ICE_FWLOG_OPTION_ARQ_ENA;
+ 	status = ice_fwlog_set(hw, &fwlog->cfg);
+ 	if (status)
+-		dev_warn(ice_hw_to_dev(hw), "Unable to turn off FW logging, status: %d\n",
++		dev_warn(&fwlog->pdev->dev, "Unable to turn off FW logging, status: %d\n",
+ 			 status);
+ 
+ 	kfree(pf->ice_debugfs_pf_fwlog_modules);
+@@ -317,7 +318,7 @@ void ice_fwlog_deinit(struct ice_hw *hw,
+ 
+ 	status = ice_fwlog_unregister(hw, fwlog);
+ 	if (status)
+-		dev_warn(ice_hw_to_dev(hw), "Unable to unregister FW logging, status: %d\n",
++		dev_warn(&fwlog->pdev->dev, "Unable to unregister FW logging, status: %d\n",
+ 			 status);
+ 
+ 	if (fwlog->ring.rings) {
+@@ -436,7 +437,7 @@ int ice_fwlog_register(struct ice_hw *hw
+ 
+ 	status = ice_aq_fwlog_register(hw, true);
+ 	if (status)
+-		ice_debug(hw, ICE_DBG_FW_LOG, "Failed to register for firmware logging events over ARQ\n");
++		dev_dbg(&fwlog->pdev->dev, "Failed to register for firmware logging events over ARQ\n");
+ 	else
+ 		fwlog->cfg.options |= ICE_FWLOG_OPTION_IS_REGISTERED;
+ 
+@@ -457,7 +458,7 @@ int ice_fwlog_unregister(struct ice_hw *
+ 
+ 	status = ice_aq_fwlog_register(hw, false);
+ 	if (status)
+-		ice_debug(hw, ICE_DBG_FW_LOG, "Failed to unregister from firmware logging events over ARQ\n");
++		dev_dbg(&fwlog->pdev->dev, "Failed to unregister from firmware logging events over ARQ\n");
+ 	else
+ 		fwlog->cfg.options &= ~ICE_FWLOG_OPTION_IS_REGISTERED;
+ 
+--- a/drivers/net/ethernet/intel/ice/ice_fwlog.h
++++ b/drivers/net/ethernet/intel/ice/ice_fwlog.h
+@@ -68,16 +68,17 @@ struct ice_fwlog {
+ 	struct ice_fwlog_cfg cfg;
+ 	bool supported; /* does hardware support FW logging? */
+ 	struct ice_fwlog_ring ring;
++	struct pci_dev *pdev;
+ };
+ 
+ bool ice_fwlog_ring_empty(struct ice_fwlog_ring *rings);
+ void ice_fwlog_ring_increment(u16 *item, u16 size);
+-int ice_fwlog_init(struct ice_hw *hw, struct ice_fwlog *fwlog);
++int ice_fwlog_init(struct ice_hw *hw, struct ice_fwlog *fwlog,
++		   struct pci_dev *pdev);
+ void ice_fwlog_deinit(struct ice_hw *hw, struct ice_fwlog *fwlog);
+ int ice_fwlog_set(struct ice_hw *hw, struct ice_fwlog_cfg *cfg);
+ int ice_fwlog_register(struct ice_hw *hw, struct ice_fwlog *fwlog);
+ int ice_fwlog_unregister(struct ice_hw *hw, struct ice_fwlog *fwlog);
+-void ice_fwlog_realloc_rings(struct ice_hw *hw, struct ice_fwlog *fwlog,
+-			     int index);
++void ice_fwlog_realloc_rings(struct ice_fwlog *fwlog, int index);
+ void ice_get_fwlog_data(struct ice_fwlog *fwlog, u8 *buf, u16 len);
+ #endif /* _ICE_FWLOG_H_ */

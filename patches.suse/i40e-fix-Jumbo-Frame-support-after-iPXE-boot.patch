@@ -1,0 +1,164 @@
+From: Jacob Keller <jacob.e.keller@intel.com>
+Date: Wed, 27 Aug 2025 14:17:36 -0700
+Subject: i40e: fix Jumbo Frame support after iPXE boot
+Patch-mainline: v6.17-rc6
+Git-commit: 503f1c72c31bbee21e669a08cf65c49e96d42755
+References: jsc#PED-14193 jsc#PED-14411 jsc#PED-15069
+
+The i40e hardware has multiple hardware settings which define the Maximum
+Frame Size (MFS) of the physical port. The firmware has an AdminQ command
+(0x0603) to configure the MFS, but the i40e Linux driver never issues this
+command.
+
+In most cases this is no problem, as the NVM default value has the device
+configured for its maximum value of 9728. Unfortunately, recent versions of
+the iPXE intelxl driver now issue the 0x0603 Set Mac Config command,
+modifying the MFS and reducing it from its default value of 9728.
+
+This occurred as part of iPXE commit 6871a7de705b ("[intelxl] Use admin
+queue to set port MAC address and maximum frame size"), a prerequisite
+change for supporting the E800 series hardware in iPXE. Both the E700 and
+E800 firmware support the AdminQ command, and the iPXE code shares much of
+the logic between the two device drivers.
+
+The ice E800 Linux driver already issues the 0x0603 Set Mac Config command
+early during probe, and is thus unaffected by the iPXE change.
+
+Since commit 3a2c6ced90e1 ("i40e: Add a check to see if MFS is set"), the
+i40e driver does check the I40E_PRTGL_SAH register, but it only logs a
+warning message if its value is below the 9728 default. This register also
+only covers received packets and not transmitted packets. A warning can
+inform system administrators, but does not correct the issue. No
+interactions from userspace cause the driver to write to PRTGL_SAH or issue
+the 0x0603 AdminQ command. Only a GLOBR reset will restore the value to its
+default value. There is no obvious method to trigger a GLOBR reset from
+user space.
+
+To fix this, introduce the i40e_aq_set_mac_config() function, similar to
+the one from the ice driver. Call this during early probe to ensure that
+the device configuration matches driver expectation. Unlike E800, the E700
+firmware also has a bit to control whether the MAC should append CRC data.
+It is on by default, but setting a 0 to this bit would disable CRC. The
+i40e implementation must set this bit to ensure CRC will be appended by the
+MAC.
+
+In addition to the AQ command, instead of just checking the I40E_PRTGL_SAH
+register, update its value to the 9728 default and write it back. This
+ensures that the hardware is in the expected state, regardless of whether
+the iPXE (or any other early boot driver) has modified this state.
+
+This is a better user experience, as we now fix the issues with larger MTU
+instead of merely warning. It also aligns with the way the ice E800 series
+driver works.
+
+A final note: The Fixes tag provided here is not strictly accurate. The
+issue occurs as a result of an external entity (the iPXE intelxl driver),
+and this is not a regression specifically caused by the mentioned change.
+However, I believe the original change to just warn about PRTGL_SAH being
+too low was an insufficient fix.
+
+Fixes: 3a2c6ced90e1 ("i40e: Add a check to see if MFS is set")
+Link: https://github.com/ipxe/ipxe/commit/6871a7de705b6f6a4046f0d19da9bcd689c3bc8e
+Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+Signed-off-by: Aleksandr Loktionov <aleksandr.loktionov@intel.com>
+Reviewed-by: Michal Schmidt <mschmidt@redhat.com>
+Tested-by: Rinitha S <sx.rinitha@intel.com> (A Contingent worker at Intel)
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/i40e/i40e_adminq_cmd.h |    1 
+ drivers/net/ethernet/intel/i40e/i40e_common.c     |   34 ++++++++++++++++++++++
+ drivers/net/ethernet/intel/i40e/i40e_main.c       |   16 ++++++----
+ drivers/net/ethernet/intel/i40e/i40e_prototype.h  |    2 +
+ 4 files changed, 47 insertions(+), 6 deletions(-)
+
+--- a/drivers/net/ethernet/intel/i40e/i40e_adminq_cmd.h
++++ b/drivers/net/ethernet/intel/i40e/i40e_adminq_cmd.h
+@@ -1561,6 +1561,7 @@ I40E_CHECK_CMD_LENGTH(i40e_aq_set_phy_co
+ struct i40e_aq_set_mac_config {
+ 	__le16	max_frame_size;
+ 	u8	params;
++#define I40E_AQ_SET_MAC_CONFIG_CRC_EN	BIT(2)
+ 	u8	tx_timer_priority; /* bitmap */
+ 	__le16	tx_timer_value;
+ 	__le16	fc_refresh_threshold;
+--- a/drivers/net/ethernet/intel/i40e/i40e_common.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_common.c
+@@ -1190,6 +1190,40 @@ int i40e_set_fc(struct i40e_hw *hw, u8 *
+ }
+ 
+ /**
++ * i40e_aq_set_mac_config - Configure MAC settings
++ * @hw: pointer to the hw struct
++ * @max_frame_size: Maximum Frame Size to be supported by the port
++ * @cmd_details: pointer to command details structure or NULL
++ *
++ * Set MAC configuration (0x0603). Note that max_frame_size must be greater
++ * than zero.
++ *
++ * Return: 0 on success, or a negative error code on failure.
++ */
++int i40e_aq_set_mac_config(struct i40e_hw *hw, u16 max_frame_size,
++			   struct i40e_asq_cmd_details *cmd_details)
++{
++	struct i40e_aq_set_mac_config *cmd;
++	struct libie_aq_desc desc;
++
++	cmd = libie_aq_raw(&desc);
++
++	if (max_frame_size == 0)
++		return -EINVAL;
++
++	i40e_fill_default_direct_cmd_desc(&desc, i40e_aqc_opc_set_mac_config);
++
++	cmd->max_frame_size = cpu_to_le16(max_frame_size);
++	cmd->params = I40E_AQ_SET_MAC_CONFIG_CRC_EN;
++
++#define I40E_AQ_SET_MAC_CONFIG_FC_DEFAULT_THRESHOLD	0x7FFF
++	cmd->fc_refresh_threshold =
++		cpu_to_le16(I40E_AQ_SET_MAC_CONFIG_FC_DEFAULT_THRESHOLD);
++
++	return i40e_asq_send_command(hw, &desc, NULL, 0, cmd_details);
++}
++
++/**
+  * i40e_aq_clear_pxe_mode
+  * @hw: pointer to the hw struct
+  * @cmd_details: pointer to command details structure or NULL
+--- a/drivers/net/ethernet/intel/i40e/i40e_main.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_main.c
+@@ -16046,13 +16046,17 @@ static int i40e_probe(struct pci_dev *pd
+ 		dev_dbg(&pf->pdev->dev, "get supported phy types ret =  %pe last_status =  %s\n",
+ 			ERR_PTR(err), libie_aq_str(pf->hw.aq.asq_last_status));
+ 
+-	/* make sure the MFS hasn't been set lower than the default */
+ #define MAX_FRAME_SIZE_DEFAULT 0x2600
+-	val = FIELD_GET(I40E_PRTGL_SAH_MFS_MASK,
+-			rd32(&pf->hw, I40E_PRTGL_SAH));
+-	if (val < MAX_FRAME_SIZE_DEFAULT)
+-		dev_warn(&pdev->dev, "MFS for port %x (%d) has been set below the default (%d)\n",
+-			 pf->hw.port, val, MAX_FRAME_SIZE_DEFAULT);
++
++	err = i40e_aq_set_mac_config(hw, MAX_FRAME_SIZE_DEFAULT, NULL);
++	if (err)
++		dev_warn(&pdev->dev, "set mac config ret = %pe last_status = %s\n",
++			 ERR_PTR(err), libie_aq_str(pf->hw.aq.asq_last_status));
++
++	/* Make sure the MFS is set to the expected value */
++	val = rd32(hw, I40E_PRTGL_SAH);
++	FIELD_MODIFY(I40E_PRTGL_SAH_MFS_MASK, &val, MAX_FRAME_SIZE_DEFAULT);
++	wr32(hw, I40E_PRTGL_SAH, val);
+ 
+ 	/* Add a filter to drop all Flow control frames from any VSI from being
+ 	 * transmitted. By doing so we stop a malicious VF from sending out
+--- a/drivers/net/ethernet/intel/i40e/i40e_prototype.h
++++ b/drivers/net/ethernet/intel/i40e/i40e_prototype.h
+@@ -98,6 +98,8 @@ int i40e_aq_set_mac_loopback(struct i40e
+ 			     struct i40e_asq_cmd_details *cmd_details);
+ int i40e_aq_set_phy_int_mask(struct i40e_hw *hw, u16 mask,
+ 			     struct i40e_asq_cmd_details *cmd_details);
++int i40e_aq_set_mac_config(struct i40e_hw *hw, u16 max_frame_size,
++			   struct i40e_asq_cmd_details *cmd_details);
+ int i40e_aq_clear_pxe_mode(struct i40e_hw *hw,
+ 			   struct i40e_asq_cmd_details *cmd_details);
+ int i40e_aq_set_link_restart_an(struct i40e_hw *hw,

@@ -1,0 +1,221 @@
+From: Alexander Lobakin <aleksander.lobakin@intel.com>
+Date: Tue, 26 Aug 2025 17:54:58 +0200
+Subject: idpf: link NAPIs to queues
+Patch-mainline: v6.18-rc1
+Git-commit: bd74a86bc75d35adefbebcec7c3a743d02c06230
+References: jsc#PED-14403
+
+Add the missing linking of NAPIs to netdev queues when enabling
+interrupt vectors in order to support NAPI configuration and
+interfaces requiring get_rx_queue()->napi to be set (like XSk
+busy polling).
+
+As currently, idpf_vport_{start,stop}() is called from several flows
+with inconsistent RTNL locking, we need to synchronize them to avoid
+runtime assertions. Notably:
+
+* idpf_{open,stop}() -- regular NDOs, RTNL is always taken;
+* idpf_initiate_soft_reset() -- usually called under RTNL;
+* idpf_init_task -- called from the init work, needs RTNL;
+* idpf_vport_dealloc -- called without RTNL taken, needs it.
+
+Expand common idpf_vport_{start,stop}() to take an additional bool
+telling whether we need to manually take the RTNL lock.
+
+Suggested-by: Maciej Fijalkowski <maciej.fijalkowski@intel.com> # helper
+Signed-off-by: Alexander Lobakin <aleksander.lobakin@intel.com>
+Tested-by: Ramu R <ramu.r@intel.com>
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/idpf/idpf_lib.c  |   38 ++++++++++++++++++++--------
+ drivers/net/ethernet/intel/idpf/idpf_txrx.c |   18 +++++++++++++
+ 2 files changed, 46 insertions(+), 10 deletions(-)
+
+--- a/drivers/net/ethernet/intel/idpf/idpf_lib.c
++++ b/drivers/net/ethernet/intel/idpf/idpf_lib.c
+@@ -883,14 +883,18 @@ static void idpf_remove_features(struct
+ /**
+  * idpf_vport_stop - Disable a vport
+  * @vport: vport to disable
++ * @rtnl: whether to take RTNL lock
+  */
+-static void idpf_vport_stop(struct idpf_vport *vport)
++static void idpf_vport_stop(struct idpf_vport *vport, bool rtnl)
+ {
+ 	struct idpf_netdev_priv *np = netdev_priv(vport->netdev);
+ 
+ 	if (np->state <= __IDPF_VPORT_DOWN)
+ 		return;
+ 
++	if (rtnl)
++		rtnl_lock();
++
+ 	netif_carrier_off(vport->netdev);
+ 	netif_tx_disable(vport->netdev);
+ 
+@@ -912,6 +916,9 @@ static void idpf_vport_stop(struct idpf_
+ 	idpf_vport_queues_rel(vport);
+ 	idpf_vport_intr_rel(vport);
+ 	np->state = __IDPF_VPORT_DOWN;
++
++	if (rtnl)
++		rtnl_unlock();
+ }
+ 
+ /**
+@@ -935,7 +942,7 @@ static int idpf_stop(struct net_device *
+ 	idpf_vport_ctrl_lock(netdev);
+ 	vport = idpf_netdev_to_vport(netdev);
+ 
+-	idpf_vport_stop(vport);
++	idpf_vport_stop(vport, false);
+ 
+ 	idpf_vport_ctrl_unlock(netdev);
+ 
+@@ -1028,7 +1035,7 @@ static void idpf_vport_dealloc(struct id
+ 	idpf_idc_deinit_vport_aux_device(vport->vdev_info);
+ 
+ 	idpf_deinit_mac_addr(vport);
+-	idpf_vport_stop(vport);
++	idpf_vport_stop(vport, true);
+ 
+ 	if (!test_bit(IDPF_HR_RESET_IN_PROG, adapter->flags))
+ 		idpf_decfg_netdev(vport);
+@@ -1369,8 +1376,9 @@ static void idpf_rx_init_buf_tail(struct
+ /**
+  * idpf_vport_open - Bring up a vport
+  * @vport: vport to bring up
++ * @rtnl: whether to take RTNL lock
+  */
+-static int idpf_vport_open(struct idpf_vport *vport)
++static int idpf_vport_open(struct idpf_vport *vport, bool rtnl)
+ {
+ 	struct idpf_netdev_priv *np = netdev_priv(vport->netdev);
+ 	struct idpf_adapter *adapter = vport->adapter;
+@@ -1380,6 +1388,9 @@ static int idpf_vport_open(struct idpf_v
+ 	if (np->state != __IDPF_VPORT_DOWN)
+ 		return -EBUSY;
+ 
++	if (rtnl)
++		rtnl_lock();
++
+ 	/* we do not allow interface up just yet */
+ 	netif_carrier_off(vport->netdev);
+ 
+@@ -1387,7 +1398,7 @@ static int idpf_vport_open(struct idpf_v
+ 	if (err) {
+ 		dev_err(&adapter->pdev->dev, "Failed to allocate interrupts for vport %u: %d\n",
+ 			vport->vport_id, err);
+-		return err;
++		goto err_rtnl_unlock;
+ 	}
+ 
+ 	err = idpf_vport_queues_alloc(vport);
+@@ -1474,6 +1485,9 @@ static int idpf_vport_open(struct idpf_v
+ 		goto deinit_rss;
+ 	}
+ 
++	if (rtnl)
++		rtnl_unlock();
++
+ 	return 0;
+ 
+ deinit_rss:
+@@ -1491,6 +1505,10 @@ queues_rel:
+ intr_rel:
+ 	idpf_vport_intr_rel(vport);
+ 
++err_rtnl_unlock:
++	if (rtnl)
++		rtnl_unlock();
++
+ 	return err;
+ }
+ 
+@@ -1571,7 +1589,7 @@ void idpf_init_task(struct work_struct *
+ 	np = netdev_priv(vport->netdev);
+ 	np->state = __IDPF_VPORT_DOWN;
+ 	if (test_and_clear_bit(IDPF_VPORT_UP_REQUESTED, vport_config->flags))
+-		idpf_vport_open(vport);
++		idpf_vport_open(vport, true);
+ 
+ 	/* Spawn and return 'idpf_init_task' work queue until all the
+ 	 * default vports are created
+@@ -1961,7 +1979,7 @@ int idpf_initiate_soft_reset(struct idpf
+ 		idpf_send_delete_queues_msg(vport);
+ 	} else {
+ 		set_bit(IDPF_VPORT_DEL_QUEUES, vport->flags);
+-		idpf_vport_stop(vport);
++		idpf_vport_stop(vport, false);
+ 	}
+ 
+ 	idpf_deinit_rss(vport);
+@@ -1991,7 +2009,7 @@ int idpf_initiate_soft_reset(struct idpf
+ 		goto err_open;
+ 
+ 	if (current_state == __IDPF_VPORT_UP)
+-		err = idpf_vport_open(vport);
++		err = idpf_vport_open(vport, false);
+ 
+ 	goto free_vport;
+ 
+@@ -2001,7 +2019,7 @@ err_reset:
+ 
+ err_open:
+ 	if (current_state == __IDPF_VPORT_UP)
+-		idpf_vport_open(vport);
++		idpf_vport_open(vport, false);
+ 
+ free_vport:
+ 	kfree(new_vport);
+@@ -2239,7 +2257,7 @@ static int idpf_open(struct net_device *
+ 	if (err)
+ 		goto unlock;
+ 
+-	err = idpf_vport_open(vport);
++	err = idpf_vport_open(vport, false);
+ 
+ unlock:
+ 	idpf_vport_ctrl_unlock(netdev);
+--- a/drivers/net/ethernet/intel/idpf/idpf_txrx.c
++++ b/drivers/net/ethernet/intel/idpf/idpf_txrx.c
+@@ -3424,6 +3424,20 @@ void idpf_vport_intr_rel(struct idpf_vpo
+ 	vport->q_vectors = NULL;
+ }
+ 
++static void idpf_q_vector_set_napi(struct idpf_q_vector *q_vector, bool link)
++{
++	struct napi_struct *napi = link ? &q_vector->napi : NULL;
++	struct net_device *dev = q_vector->vport->netdev;
++
++	for (u32 i = 0; i < q_vector->num_rxq; i++)
++		netif_queue_set_napi(dev, q_vector->rx[i]->idx,
++				     NETDEV_QUEUE_TYPE_RX, napi);
++
++	for (u32 i = 0; i < q_vector->num_txq; i++)
++		netif_queue_set_napi(dev, q_vector->tx[i]->idx,
++				     NETDEV_QUEUE_TYPE_TX, napi);
++}
++
+ /**
+  * idpf_vport_intr_rel_irq - Free the IRQ association with the OS
+  * @vport: main vport structure
+@@ -3446,6 +3460,8 @@ static void idpf_vport_intr_rel_irq(stru
+ 
+ 		/* clear the affinity_mask in the IRQ descriptor */
+ 		irq_set_affinity_hint(irq_num, NULL);
++
++		idpf_q_vector_set_napi(q_vector, false);
+ 		kfree(free_irq(irq_num, q_vector));
+ 	}
+ }
+@@ -3635,6 +3651,8 @@ static int idpf_vport_intr_req_irq(struc
+ 		}
+ 		/* assign the mask for this irq */
+ 		irq_set_affinity_hint(irq_num, q_vector->affinity_mask);
++
++		idpf_q_vector_set_napi(q_vector, true);
+ 	}
+ 
+ 	return 0;

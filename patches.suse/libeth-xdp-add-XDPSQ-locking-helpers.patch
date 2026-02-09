@@ -1,0 +1,290 @@
+From: Alexander Lobakin <aleksander.lobakin@intel.com>
+Date: Thu, 12 Jun 2025 18:02:24 +0200
+Subject: libeth: xdp: add XDPSQ locking helpers
+Patch-mainline: v6.17-rc1
+Git-commit: c4ba6a9b9d460c6fd742e118022f2808ec3c4223
+References: jsc#PED-14404 jsc#PED-15079
+
+Unfortunately, it's not always possible to allocate
+max(num_rxqs, nr_cpu_ids) even on hi-end NICs.
+To mitigate this, add simple locking helpers to libeth_xdp.
+As long as XDPSQs are not shared, the whole functionality is gated
+behind a static lock. Otherwise, each bulk flush locks the queue for
+the time of cleaning and filling the descriptors.
+As long as this particular queue is not used by more than 1 CPU,
+the impact is minimal (runtime check for boolean twice per 16+
+descriptors).
+
+Suggested-by: Maciej Fijalkowski <maciej.fijalkowski@intel.com> # static key
+Signed-off-by: Alexander Lobakin <aleksander.lobakin@intel.com>
+Reviewed-by: Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/libeth/xdp.c |   47 +++++++++++
+ include/net/libeth/types.h              |   21 +++++
+ include/net/libeth/xdp.h                |  127 +++++++++++++++++++++++++++++++-
+ 3 files changed, 192 insertions(+), 3 deletions(-)
+
+--- a/drivers/net/ethernet/intel/libeth/xdp.c
++++ b/drivers/net/ethernet/intel/libeth/xdp.c
+@@ -9,6 +9,53 @@
+ 
+ #include "priv.h"
+ 
++/* XDPSQ sharing */
++
++DEFINE_STATIC_KEY_FALSE(libeth_xdpsq_share);
++EXPORT_SYMBOL_GPL(libeth_xdpsq_share);
++
++void __libeth_xdpsq_get(struct libeth_xdpsq_lock *lock,
++			const struct net_device *dev)
++{
++	bool warn;
++
++	spin_lock_init(&lock->lock);
++	lock->share = true;
++
++	warn = !static_key_enabled(&libeth_xdpsq_share);
++	static_branch_inc(&libeth_xdpsq_share);
++
++	if (warn && net_ratelimit())
++		netdev_warn(dev, "XDPSQ sharing enabled, possible XDP Tx slowdown\n");
++}
++EXPORT_SYMBOL_GPL(__libeth_xdpsq_get);
++
++void __libeth_xdpsq_put(struct libeth_xdpsq_lock *lock,
++			const struct net_device *dev)
++{
++	static_branch_dec(&libeth_xdpsq_share);
++
++	if (!static_key_enabled(&libeth_xdpsq_share) && net_ratelimit())
++		netdev_notice(dev, "XDPSQ sharing disabled\n");
++
++	lock->share = false;
++}
++EXPORT_SYMBOL_GPL(__libeth_xdpsq_put);
++
++void __acquires(&lock->lock)
++__libeth_xdpsq_lock(struct libeth_xdpsq_lock *lock)
++{
++	spin_lock(&lock->lock);
++}
++EXPORT_SYMBOL_GPL(__libeth_xdpsq_lock);
++
++void __releases(&lock->lock)
++__libeth_xdpsq_unlock(struct libeth_xdpsq_lock *lock)
++{
++	spin_unlock(&lock->lock);
++}
++EXPORT_SYMBOL_GPL(__libeth_xdpsq_unlock);
++
+ /* ``XDP_TX`` bulking */
+ 
+ static void __cold
+--- a/include/net/libeth/types.h
++++ b/include/net/libeth/types.h
+@@ -4,7 +4,7 @@
+ #ifndef __LIBETH_TYPES_H
+ #define __LIBETH_TYPES_H
+ 
+-#include <linux/types.h>
++#include <linux/spinlock.h>
+ 
+ /**
+  * struct libeth_sq_napi_stats - "hot" counters to update in Tx completion loop
+@@ -41,4 +41,23 @@ struct libeth_xdpsq_napi_stats {
+ 	};
+ };
+ 
++/* XDP */
++
++/*
++ * The following structures should be embedded into driver's queue structure
++ * and passed to the libeth_xdp helpers, never used directly.
++ */
++
++/* XDPSQ sharing */
++
++/**
++ * struct libeth_xdpsq_lock - locking primitive for sharing XDPSQs
++ * @lock: spinlock for locking the queue
++ * @share: whether this particular queue is shared
++ */
++struct libeth_xdpsq_lock {
++	spinlock_t			lock;
++	bool				share;
++};
++
+ #endif /* __LIBETH_TYPES_H */
+--- a/include/net/libeth/xdp.h
++++ b/include/net/libeth/xdp.h
+@@ -60,6 +60,123 @@ static_assert(offsetof(struct libeth_xdp
+ static_assert(IS_ALIGNED(sizeof(struct xdp_buff_xsk),
+ 			 __alignof(struct libeth_xdp_buff)));
+ 
++/* XDPSQ sharing */
++
++DECLARE_STATIC_KEY_FALSE(libeth_xdpsq_share);
++
++/**
++ * libeth_xdpsq_num - calculate optimal number of XDPSQs for this device + sys
++ * @rxq: current number of active Rx queues
++ * @txq: current number of active Tx queues
++ * @max: maximum number of Tx queues
++ *
++ * Each RQ must have its own XDPSQ for XSk pairs, each CPU must have own XDPSQ
++ * for lockless sending (``XDP_TX``, .ndo_xdp_xmit()). Cap the maximum of these
++ * two with the number of SQs the device can have (minus used ones).
++ *
++ * Return: number of XDP Tx queues the device needs to use.
++ */
++static inline u32 libeth_xdpsq_num(u32 rxq, u32 txq, u32 max)
++{
++	return min(max(nr_cpu_ids, rxq), max - txq);
++}
++
++/**
++ * libeth_xdpsq_shared - whether XDPSQs can be shared between several CPUs
++ * @num: number of active XDPSQs
++ *
++ * Return: true if there's no 1:1 XDPSQ/CPU association, false otherwise.
++ */
++static inline bool libeth_xdpsq_shared(u32 num)
++{
++	return num < nr_cpu_ids;
++}
++
++/**
++ * libeth_xdpsq_id - get XDPSQ index corresponding to this CPU
++ * @num: number of active XDPSQs
++ *
++ * Helper for libeth_xdp routines, do not use in drivers directly.
++ *
++ * Return: XDPSQ index needs to be used on this CPU.
++ */
++static inline u32 libeth_xdpsq_id(u32 num)
++{
++	u32 ret = raw_smp_processor_id();
++
++	if (static_branch_unlikely(&libeth_xdpsq_share) &&
++	    libeth_xdpsq_shared(num))
++		ret %= num;
++
++	return ret;
++}
++
++void __libeth_xdpsq_get(struct libeth_xdpsq_lock *lock,
++			const struct net_device *dev);
++void __libeth_xdpsq_put(struct libeth_xdpsq_lock *lock,
++			const struct net_device *dev);
++
++/**
++ * libeth_xdpsq_get - initialize &libeth_xdpsq_lock
++ * @lock: lock to initialize
++ * @dev: netdev which this lock belongs to
++ * @share: whether XDPSQs can be shared
++ *
++ * Tracks the current XDPSQ association and enables the static lock
++ * if needed.
++ */
++static inline void libeth_xdpsq_get(struct libeth_xdpsq_lock *lock,
++				    const struct net_device *dev,
++				    bool share)
++{
++	if (unlikely(share))
++		__libeth_xdpsq_get(lock, dev);
++}
++
++/**
++ * libeth_xdpsq_put - deinitialize &libeth_xdpsq_lock
++ * @lock: lock to deinitialize
++ * @dev: netdev which this lock belongs to
++ *
++ * Tracks the current XDPSQ association and disables the static lock
++ * if needed.
++ */
++static inline void libeth_xdpsq_put(struct libeth_xdpsq_lock *lock,
++				    const struct net_device *dev)
++{
++	if (static_branch_unlikely(&libeth_xdpsq_share) && lock->share)
++		__libeth_xdpsq_put(lock, dev);
++}
++
++void __libeth_xdpsq_lock(struct libeth_xdpsq_lock *lock);
++void __libeth_xdpsq_unlock(struct libeth_xdpsq_lock *lock);
++
++/**
++ * libeth_xdpsq_lock - grab &libeth_xdpsq_lock if needed
++ * @lock: lock to take
++ *
++ * Touches the underlying spinlock only if the static key is enabled
++ * and the queue itself is marked as shareable.
++ */
++static inline void libeth_xdpsq_lock(struct libeth_xdpsq_lock *lock)
++{
++	if (static_branch_unlikely(&libeth_xdpsq_share) && lock->share)
++		__libeth_xdpsq_lock(lock);
++}
++
++/**
++ * libeth_xdpsq_unlock - free &libeth_xdpsq_lock if needed
++ * @lock: lock to free
++ *
++ * Touches the underlying spinlock only if the static key is enabled
++ * and the queue itself is marked as shareable.
++ */
++static inline void libeth_xdpsq_unlock(struct libeth_xdpsq_lock *lock)
++{
++	if (static_branch_unlikely(&libeth_xdpsq_share) && lock->share)
++		__libeth_xdpsq_unlock(lock);
++}
++
+ /* Common Tx bits */
+ 
+ /**
+@@ -179,6 +296,7 @@ struct libeth_xdp_tx_bulk {
+  * @count: number of descriptors on that queue
+  * @pending: pointer to the number of sent-not-completed descs on that queue
+  * @xdp_tx: pointer to the above
++ * @lock: corresponding XDPSQ lock
+  *
+  * Abstraction for driver-independent implementation of Tx. Placed on the stack
+  * and filled by the driver before the transmission, so that the generic
+@@ -193,6 +311,7 @@ struct libeth_xdpsq {
+ 
+ 	u32				*pending;
+ 	u32				*xdp_tx;
++	struct libeth_xdpsq_lock	*lock;
+ };
+ 
+ /**
+@@ -229,7 +348,8 @@ struct libeth_xdp_tx_desc {
+  *
+  * Internal abstraction for placing @n XDP Tx frames on the HW XDPSQ. Used for
+  * all types of frames.
+- * @unroll greatly increases the object code size, but also greatly increases
++ * @prep must lock the queue as this function releases it at the end. @unroll
++ * greatly increases the object code size, but also greatly increases
+  * performance.
+  * The compilers inline all those onstack abstractions to direct data accesses.
+  *
+@@ -253,7 +373,7 @@ libeth_xdp_tx_xmit_bulk(const struct lib
+ 
+ 	n = min(n, prep(xdpsq, &sq));
+ 	if (unlikely(!n))
+-		return 0;
++		goto unlock;
+ 
+ 	ntu = *sq.ntu;
+ 
+@@ -302,6 +422,9 @@ out:
+ 	if (sq.xdp_tx)
+ 		*sq.xdp_tx += n;
+ 
++unlock:
++	libeth_xdpsq_unlock(sq.lock);
++
+ 	return n;
+ }
+ 

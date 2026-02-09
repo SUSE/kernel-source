@@ -1,0 +1,63 @@
+From: Nathan Chancellor <nathan@kernel.org>
+Date: Sat, 25 Oct 2025 21:53:20 +0100
+Subject: libeth: xdp: Disable generic kCFI pass for libeth_xdp_tx_xmit_bulk()
+Patch-mainline: v6.18-rc5
+Git-commit: c57f5fee54dfc83ee1d7f70f7beb9410b8466e9e
+References: jsc#PED-14404 jsc#PED-15079
+
+When building drivers/net/ethernet/intel/idpf/xsk.c for ARCH=arm with
+CONFIG_CFI=y using a version of LLVM prior to 22.0.0, there is a
+BUILD_BUG_ON failure:
+
+  $ cat arch/arm/configs/repro.config
+  CONFIG_BPF_SYSCALL=y
+  CONFIG_CFI=y
+  CONFIG_IDPF=y
+  CONFIG_XDP_SOCKETS=y
+
+  $ make -skj"$(nproc)" ARCH=arm LLVM=1 clean defconfig repro.config drivers/net/ethernet/intel/idpf/xsk.o
+  In file included from drivers/net/ethernet/intel/idpf/xsk.c:4:
+  include/net/libeth/xsk.h:205:2: error: call to '__compiletime_assert_728' declared with 'error' attribute: BUILD_BUG_ON failed: !__builtin_constant_p(tmo == libeth_xsktmo)
+    205 |         BUILD_BUG_ON(!__builtin_constant_p(tmo == libeth_xsktmo));
+        |         ^
+  ...
+
+libeth_xdp_tx_xmit_bulk() indirectly calls libeth_xsk_xmit_fill_buf()
+but these functions are marked as __always_inline so that the compiler
+can turn these indirect calls into direct ones and see that the tmo
+parameter to __libeth_xsk_xmit_fill_buf_md() is ultimately libeth_xsktmo
+from idpf_xsk_xmit().
+
+Unfortunately, the generic kCFI pass in LLVM expands the kCFI bundles
+from the indirect calls in libeth_xdp_tx_xmit_bulk() in such a way that
+later optimizations cannot turn these calls into direct ones, making the
+BUILD_BUG_ON fail because it cannot be proved at compile time that tmo
+is libeth_xsktmo.
+
+Disable the generic kCFI pass for libeth_xdp_tx_xmit_bulk() to ensure
+these indirect calls can always be turned into direct calls to avoid
+this error.
+
+Closes: https://github.com/ClangBuiltLinux/linux/issues/2124
+Fixes: 9705d6552f58 ("idpf: implement Rx path for AF_XDP")
+Signed-off-by: Nathan Chancellor <nathan@kernel.org>
+Reviewed-by: Aleksandr Loktionov <aleksandr.loktionov@intel.com>
+Acked-by: Alexander Lobakin <aleksander.lobakin@intel.com>
+Link: https://patch.msgid.link/20251025-idpf-fix-arm-kcfi-build-error-v1-3-ec57221153ae@kernel.org
+Signed-off-by: Kees Cook <kees@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/net/libeth/xdp.h |    2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+--- a/include/net/libeth/xdp.h
++++ b/include/net/libeth/xdp.h
+@@ -513,7 +513,7 @@ struct libeth_xdp_tx_desc {
+  * can't fail, but can send less frames if there's no enough free descriptors
+  * available. The actual free space is returned by @prep from the driver.
+  */
+-static __always_inline u32
++static __always_inline __nocfi_generic u32
+ libeth_xdp_tx_xmit_bulk(const struct libeth_xdp_tx_frame *bulk, void *xdpsq,
+ 			u32 n, bool unroll, u64 priv,
+ 			u32 (*prep)(void *xdpsq, struct libeth_xdpsq *sq),

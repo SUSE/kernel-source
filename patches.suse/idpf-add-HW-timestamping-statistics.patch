@@ -1,0 +1,197 @@
+From: Milena Olech <milena.olech@intel.com>
+Date: Fri, 29 Aug 2025 13:57:33 -0400
+Subject: idpf: add HW timestamping statistics
+Patch-mainline: v6.18-rc1
+Git-commit: 7a5a03869801e2f1cabdc55b2e697fea20da5c68
+References: jsc#PED-14403
+
+Add HW timestamping statistics support - through implementing get_ts_stats.
+Timestamp statistics include correctly timestamped packets, discarded,
+skipped and flushed during PTP release.
+
+Most of the stats are collected per vport, only requests skipped due to
+lack of free latch index are collected per Tx queue.
+
+Statistics can be obtained using kernel ethtool since version 6.10
+with:
+ethtool -I -T <interface>
+
+The output will include:
+Statistics:
+  tx_pkts: 15
+  tx_lost: 0
+  tx_err: 0
+
+Signed-off-by: Milena Olech <milena.olech@intel.com>
+Co-developed-by: Anton Nadezhdin <anton.nadezhdin@intel.com>
+Signed-off-by: Anton Nadezhdin <anton.nadezhdin@intel.com>
+Reviewed-by: Aleksandr Loktionov <aleksandr.loktionov@intel.com>
+Reviewed-by: Jacob Keller <jacob.e.keller@intel.com>
+Tested-by: Samuel Salin <Samuel.salin@intel.com>
+Reviewed-by: Paul Menzel <pmenzel@molgen.mpg.de>
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/idpf/idpf.h              |   17 ++++++
+ drivers/net/ethernet/intel/idpf/idpf_ethtool.c      |   56 ++++++++++++++++++++
+ drivers/net/ethernet/intel/idpf/idpf_ptp.c          |   11 +++
+ drivers/net/ethernet/intel/idpf/idpf_virtchnl_ptp.c |    4 +
+ 4 files changed, 87 insertions(+), 1 deletion(-)
+
+--- a/drivers/net/ethernet/intel/idpf/idpf.h
++++ b/drivers/net/ethernet/intel/idpf/idpf.h
+@@ -256,6 +256,21 @@ enum idpf_vport_flags {
+ 	IDPF_VPORT_FLAGS_NBITS,
+ };
+ 
++/**
++ * struct idpf_tstamp_stats - Tx timestamp statistics
++ * @stats_sync: See struct u64_stats_sync
++ * @packets: Number of packets successfully timestamped by the hardware
++ * @discarded: Number of Tx skbs discarded due to cached PHC
++ *	       being too old to correctly extend timestamp
++ * @flushed: Number of Tx skbs flushed due to interface closed
++ */
++struct idpf_tstamp_stats {
++	struct u64_stats_sync stats_sync;
++	u64_stats_t packets;
++	u64_stats_t discarded;
++	u64_stats_t flushed;
++};
++
+ struct idpf_port_stats {
+ 	struct u64_stats_sync stats_sync;
+ 	u64_stats_t rx_hw_csum_err;
+@@ -328,6 +343,7 @@ struct idpf_fsteer_fltr {
+  * @tx_tstamp_caps: Capabilities negotiated for Tx timestamping
+  * @tstamp_config: The Tx tstamp config
+  * @tstamp_task: Tx timestamping task
++ * @tstamp_stats: Tx timestamping statistics
+  */
+ struct idpf_vport {
+ 	u16 num_txq;
+@@ -386,6 +402,7 @@ struct idpf_vport {
+ 	struct idpf_ptp_vport_tx_tstamp_caps *tx_tstamp_caps;
+ 	struct kernel_hwtstamp_config tstamp_config;
+ 	struct work_struct tstamp_task;
++	struct idpf_tstamp_stats tstamp_stats;
+ };
+ 
+ /**
+--- a/drivers/net/ethernet/intel/idpf/idpf_ethtool.c
++++ b/drivers/net/ethernet/intel/idpf/idpf_ethtool.c
+@@ -1685,6 +1685,61 @@ unlock:
+ 	return err;
+ }
+ 
++/**
++ * idpf_get_ts_stats - Collect HW tstamping statistics
++ * @netdev: network interface device structure
++ * @ts_stats: HW timestamping stats structure
++ *
++ * Collect HW timestamping statistics including successfully timestamped
++ * packets, discarded due to illegal values, flushed during releasing PTP and
++ * skipped due to lack of the free index.
++ */
++static void idpf_get_ts_stats(struct net_device *netdev,
++			      struct ethtool_ts_stats *ts_stats)
++{
++	struct idpf_netdev_priv *np = netdev_priv(netdev);
++	struct idpf_vport *vport;
++	unsigned int start;
++
++	idpf_vport_ctrl_lock(netdev);
++	vport = idpf_netdev_to_vport(netdev);
++	do {
++		start = u64_stats_fetch_begin(&vport->tstamp_stats.stats_sync);
++		ts_stats->pkts = u64_stats_read(&vport->tstamp_stats.packets);
++		ts_stats->lost = u64_stats_read(&vport->tstamp_stats.flushed);
++		ts_stats->err = u64_stats_read(&vport->tstamp_stats.discarded);
++	} while (u64_stats_fetch_retry(&vport->tstamp_stats.stats_sync, start));
++
++	if (np->state != __IDPF_VPORT_UP)
++		goto exit;
++
++	for (u16 i = 0; i < vport->num_txq_grp; i++) {
++		struct idpf_txq_group *txq_grp = &vport->txq_grps[i];
++
++		for (u16 j = 0; j < txq_grp->num_txq; j++) {
++			struct idpf_tx_queue *txq = txq_grp->txqs[j];
++			struct idpf_tx_queue_stats *stats;
++			u64 ts;
++
++			if (!txq)
++				continue;
++
++			stats = &txq->q_stats;
++			do {
++				start = u64_stats_fetch_begin(&txq->stats_sync);
++
++				ts = u64_stats_read(&stats->tstamp_skipped);
++			} while (u64_stats_fetch_retry(&txq->stats_sync,
++						       start));
++
++			ts_stats->lost += ts;
++		}
++	}
++
++exit:
++	idpf_vport_ctrl_unlock(netdev);
++}
++
+ static const struct ethtool_ops idpf_ethtool_ops = {
+ 	.supported_coalesce_params = ETHTOOL_COALESCE_USECS |
+ 				     ETHTOOL_COALESCE_USE_ADAPTIVE,
+@@ -1711,6 +1766,7 @@ static const struct ethtool_ops idpf_eth
+ 	.set_ringparam		= idpf_set_ringparam,
+ 	.get_link_ksettings	= idpf_get_link_ksettings,
+ 	.get_ts_info		= idpf_get_ts_info,
++	.get_ts_stats		= idpf_get_ts_stats,
+ };
+ 
+ /**
+--- a/drivers/net/ethernet/intel/idpf/idpf_ptp.c
++++ b/drivers/net/ethernet/intel/idpf/idpf_ptp.c
+@@ -618,8 +618,13 @@ u64 idpf_ptp_extend_ts(struct idpf_vport
+ 
+ 	discard_time = ptp->cached_phc_jiffies + 2 * HZ;
+ 
+-	if (time_is_before_jiffies(discard_time))
++	if (time_is_before_jiffies(discard_time)) {
++		u64_stats_update_begin(&vport->tstamp_stats.stats_sync);
++		u64_stats_inc(&vport->tstamp_stats.discarded);
++		u64_stats_update_end(&vport->tstamp_stats.stats_sync);
++
+ 		return 0;
++	}
+ 
+ 	return idpf_ptp_tstamp_extend_32b_to_64b(ptp->cached_phc_time,
+ 						 lower_32_bits(in_tstamp));
+@@ -853,10 +858,14 @@ static void idpf_ptp_release_vport_tstam
+ 
+ 	/* Remove list with latches in use */
+ 	head = &vport->tx_tstamp_caps->latches_in_use;
++	u64_stats_update_begin(&vport->tstamp_stats.stats_sync);
+ 	list_for_each_entry_safe(ptp_tx_tstamp, tmp, head, list_member) {
++		u64_stats_inc(&vport->tstamp_stats.flushed);
++
+ 		list_del(&ptp_tx_tstamp->list_member);
+ 		kfree(ptp_tx_tstamp);
+ 	}
++	u64_stats_update_end(&vport->tstamp_stats.stats_sync);
+ 
+ 	spin_unlock_bh(&vport->tx_tstamp_caps->latches_lock);
+ 
+--- a/drivers/net/ethernet/intel/idpf/idpf_virtchnl_ptp.c
++++ b/drivers/net/ethernet/intel/idpf/idpf_virtchnl_ptp.c
+@@ -521,6 +521,10 @@ idpf_ptp_get_tstamp_value(struct idpf_vp
+ 	list_add(&ptp_tx_tstamp->list_member,
+ 		 &tx_tstamp_caps->latches_free);
+ 
++	u64_stats_update_begin(&vport->tstamp_stats.stats_sync);
++	u64_stats_inc(&vport->tstamp_stats.packets);
++	u64_stats_update_end(&vport->tstamp_stats.stats_sync);
++
+ 	return 0;
+ }
+ 

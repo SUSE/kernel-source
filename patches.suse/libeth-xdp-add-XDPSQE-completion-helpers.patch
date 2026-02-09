@@ -1,0 +1,327 @@
+From: Alexander Lobakin <aleksander.lobakin@intel.com>
+Date: Thu, 12 Jun 2025 18:02:23 +0200
+Subject: libeth: xdp: add XDPSQE completion helpers
+Patch-mainline: v6.17-rc1
+Git-commit: 26ce8eb0bb7d47c5fb36f7c12f34e4a320f14cac
+References: jsc#PED-14404 jsc#PED-15079
+
+Similarly to libeth_tx_complete(), add libeth_xdp_complete_tx() to
+handle XDP_TX and xmit buffers. Both use bulk return under the hood.
+
+Also add out of line libeth_tx_complete_any() which handles both
+regular and XDP frames (if libeth_xdp is loaded), for example,
+to call on queue destroy, where we don't need inlining but
+convenience.
+
+Signed-off-by: Alexander Lobakin <aleksander.lobakin@intel.com>
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/libeth/Makefile |    1 
+ drivers/net/ethernet/intel/libeth/priv.h   |   26 +++++++++++
+ drivers/net/ethernet/intel/libeth/tx.c     |   38 ++++++++++++++++
+ drivers/net/ethernet/intel/libeth/xdp.c    |   58 +++++++++++++++++++++++++
+ include/net/libeth/tx.h                    |   13 +++++
+ include/net/libeth/types.h                 |   21 ++++++++-
+ include/net/libeth/xdp.h                   |   66 +++++++++++++++++++++++++++++
+ 7 files changed, 221 insertions(+), 2 deletions(-)
+ create mode 100644 drivers/net/ethernet/intel/libeth/priv.h
+ create mode 100644 drivers/net/ethernet/intel/libeth/tx.c
+
+--- a/drivers/net/ethernet/intel/libeth/Makefile
++++ b/drivers/net/ethernet/intel/libeth/Makefile
+@@ -4,6 +4,7 @@
+ obj-$(CONFIG_LIBETH)		+= libeth.o
+ 
+ libeth-y			:= rx.o
++libeth-y			+= tx.o
+ 
+ obj-$(CONFIG_LIBETH_XDP)	+= libeth_xdp.o
+ 
+--- /dev/null
++++ b/drivers/net/ethernet/intel/libeth/priv.h
+@@ -0,0 +1,26 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Copyright (C) 2025 Intel Corporation */
++
++#ifndef __LIBETH_PRIV_H
++#define __LIBETH_PRIV_H
++
++#include <linux/types.h>
++
++/* XDP */
++
++struct skb_shared_info;
++struct xdp_frame_bulk;
++
++struct libeth_xdp_ops {
++	void	(*bulk)(const struct skb_shared_info *sinfo,
++			struct xdp_frame_bulk *bq, bool frags);
++};
++
++void libeth_attach_xdp(const struct libeth_xdp_ops *ops);
++
++static inline void libeth_detach_xdp(void)
++{
++	libeth_attach_xdp(NULL);
++}
++
++#endif /* __LIBETH_PRIV_H */
+--- /dev/null
++++ b/drivers/net/ethernet/intel/libeth/tx.c
+@@ -0,0 +1,38 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Copyright (C) 2025 Intel Corporation */
++
++#define DEFAULT_SYMBOL_NAMESPACE	"LIBETH"
++
++#include <net/libeth/xdp.h>
++
++#include "priv.h"
++
++/* Tx buffer completion */
++
++DEFINE_STATIC_CALL_NULL(bulk, libeth_xdp_return_buff_bulk);
++
++/**
++ * libeth_tx_complete_any - perform Tx completion for one SQE of any type
++ * @sqe: Tx buffer to complete
++ * @cp: polling params
++ *
++ * Can be used to complete both regular and XDP SQEs, for example when
++ * destroying queues.
++ * When libeth_xdp is not loaded, XDPSQEs won't be handled.
++ */
++void libeth_tx_complete_any(struct libeth_sqe *sqe, struct libeth_cq_pp *cp)
++{
++	if (sqe->type >= __LIBETH_SQE_XDP_START)
++		__libeth_xdp_complete_tx(sqe, cp, static_call(bulk));
++	else
++		libeth_tx_complete(sqe, cp);
++}
++EXPORT_SYMBOL_GPL(libeth_tx_complete_any);
++
++/* Module */
++
++void libeth_attach_xdp(const struct libeth_xdp_ops *ops)
++{
++	static_call_update(bulk, ops ? ops->bulk : NULL);
++}
++EXPORT_SYMBOL_GPL(libeth_attach_xdp);
+--- a/drivers/net/ethernet/intel/libeth/xdp.c
++++ b/drivers/net/ethernet/intel/libeth/xdp.c
+@@ -7,6 +7,8 @@
+ 
+ #include <net/libeth/xdp.h>
+ 
++#include "priv.h"
++
+ /* ``XDP_TX`` bulking */
+ 
+ static void __cold
+@@ -115,6 +117,62 @@ void __cold libeth_xdp_return_buff_slow(
+ }
+ EXPORT_SYMBOL_GPL(libeth_xdp_return_buff_slow);
+ 
++/* Tx buffer completion */
++
++static void libeth_xdp_put_netmem_bulk(netmem_ref netmem,
++				       struct xdp_frame_bulk *bq)
++{
++	if (unlikely(bq->count == XDP_BULK_QUEUE_SIZE))
++		xdp_flush_frame_bulk(bq);
++
++	bq->q[bq->count++] = netmem;
++}
++
++/**
++ * libeth_xdp_return_buff_bulk - free &xdp_buff as part of a bulk
++ * @sinfo: shared info corresponding to the buffer
++ * @bq: XDP frame bulk to store the buffer
++ * @frags: whether the buffer has frags
++ *
++ * Same as xdp_return_frame_bulk(), but for &libeth_xdp_buff, speeds up Tx
++ * completion of ``XDP_TX`` buffers and allows to free them in same bulks
++ * with &xdp_frame buffers.
++ */
++void libeth_xdp_return_buff_bulk(const struct skb_shared_info *sinfo,
++				 struct xdp_frame_bulk *bq, bool frags)
++{
++	if (!frags)
++		goto head;
++
++	for (u32 i = 0; i < sinfo->nr_frags; i++)
++		libeth_xdp_put_netmem_bulk(skb_frag_netmem(&sinfo->frags[i]),
++					   bq);
++
++head:
++	libeth_xdp_put_netmem_bulk(virt_to_netmem(sinfo), bq);
++}
++EXPORT_SYMBOL_GPL(libeth_xdp_return_buff_bulk);
++
++/* Module */
++
++static const struct libeth_xdp_ops xdp_ops __initconst = {
++	.bulk	= libeth_xdp_return_buff_bulk,
++};
++
++static int __init libeth_xdp_module_init(void)
++{
++	libeth_attach_xdp(&xdp_ops);
++
++	return 0;
++}
++module_init(libeth_xdp_module_init);
++
++static void __exit libeth_xdp_module_exit(void)
++{
++	libeth_detach_xdp();
++}
++module_exit(libeth_xdp_module_exit);
++
+ MODULE_DESCRIPTION("Common Ethernet library - XDP infra");
+ MODULE_IMPORT_NS(LIBETH);
+ MODULE_LICENSE("GPL");
+--- a/include/net/libeth/tx.h
++++ b/include/net/libeth/tx.h
+@@ -84,7 +84,10 @@ struct libeth_sqe {
+ /**
+  * struct libeth_cq_pp - completion queue poll params
+  * @dev: &device to perform DMA unmapping
++ * @bq: XDP frame bulk to combine return operations
+  * @ss: onstack NAPI stats to fill
++ * @xss: onstack XDPSQ NAPI stats to fill
++ * @xdp_tx: number of XDP frames processed
+  * @napi: whether it's called from the NAPI context
+  *
+  * libeth uses this structure to access objects needed for performing full
+@@ -93,7 +96,13 @@ struct libeth_sqe {
+  */
+ struct libeth_cq_pp {
+ 	struct device			*dev;
+-	struct libeth_sq_napi_stats	*ss;
++	struct xdp_frame_bulk		*bq;
++
++	union {
++		struct libeth_sq_napi_stats	*ss;
++		struct libeth_xdpsq_napi_stats	*xss;
++	};
++	u32				xdp_tx;
+ 
+ 	bool				napi;
+ };
+@@ -139,4 +148,6 @@ static inline void libeth_tx_complete(st
+ 	sqe->type = LIBETH_SQE_EMPTY;
+ }
+ 
++void libeth_tx_complete_any(struct libeth_sqe *sqe, struct libeth_cq_pp *cp);
++
+ #endif /* __LIBETH_TX_H */
+--- a/include/net/libeth/types.h
++++ b/include/net/libeth/types.h
+@@ -1,5 +1,5 @@
+ /* SPDX-License-Identifier: GPL-2.0-only */
+-/* Copyright (C) 2024 Intel Corporation */
++/* Copyright (C) 2024-2025 Intel Corporation */
+ 
+ #ifndef __LIBETH_TYPES_H
+ #define __LIBETH_TYPES_H
+@@ -20,6 +20,25 @@ struct libeth_sq_napi_stats {
+ 		};
+ 		DECLARE_FLEX_ARRAY(u32, raw);
+ 	};
++};
++
++/**
++ * struct libeth_xdpsq_napi_stats - "hot" counters to update in XDP Tx
++ *				    completion loop
++ * @packets: completed frames counter
++ * @bytes: sum of bytes of completed frames above
++ * @fragments: sum of fragments of completed S/G frames
++ * @raw: alias to access all the fields as an array
++ */
++struct libeth_xdpsq_napi_stats {
++	union {
++		struct {
++							u32 packets;
++							u32 bytes;
++							u32 fragments;
++		};
++		DECLARE_FLEX_ARRAY(u32, raw);
++	};
+ };
+ 
+ #endif /* __LIBETH_TYPES_H */
+--- a/include/net/libeth/xdp.h
++++ b/include/net/libeth/xdp.h
+@@ -824,4 +824,70 @@ out:
+ 	xdp->data = NULL;
+ }
+ 
++/* Tx buffer completion */
++
++void libeth_xdp_return_buff_bulk(const struct skb_shared_info *sinfo,
++				 struct xdp_frame_bulk *bq, bool frags);
++
++/**
++ * __libeth_xdp_complete_tx - complete sent XDPSQE
++ * @sqe: SQ element / Tx buffer to complete
++ * @cp: Tx polling/completion params
++ * @bulk: internal callback to bulk-free ``XDP_TX`` buffers
++ *
++ * Use the non-underscored version in drivers instead. This one is shared
++ * internally with libeth_tx_complete_any().
++ * Complete an XDPSQE of any type of XDP frame. This includes DMA unmapping
++ * when needed, buffer freeing, stats update, and SQE invalidation.
++ */
++static __always_inline void
++__libeth_xdp_complete_tx(struct libeth_sqe *sqe, struct libeth_cq_pp *cp,
++			 typeof(libeth_xdp_return_buff_bulk) bulk)
++{
++	enum libeth_sqe_type type = sqe->type;
++
++	switch (type) {
++	case LIBETH_SQE_EMPTY:
++		return;
++	case LIBETH_SQE_XDP_XMIT:
++	case LIBETH_SQE_XDP_XMIT_FRAG:
++		dma_unmap_page(cp->dev, dma_unmap_addr(sqe, dma),
++			       dma_unmap_len(sqe, len), DMA_TO_DEVICE);
++		break;
++	default:
++		break;
++	}
++
++	switch (type) {
++	case LIBETH_SQE_XDP_TX:
++		bulk(sqe->sinfo, cp->bq, sqe->nr_frags != 1);
++		break;
++	case LIBETH_SQE_XDP_XMIT:
++		xdp_return_frame_bulk(sqe->xdpf, cp->bq);
++		break;
++	default:
++		break;
++	}
++
++	switch (type) {
++	case LIBETH_SQE_XDP_TX:
++	case LIBETH_SQE_XDP_XMIT:
++		cp->xdp_tx -= sqe->nr_frags;
++
++		cp->xss->packets++;
++		cp->xss->bytes += sqe->bytes;
++		break;
++	default:
++		break;
++	}
++
++	sqe->type = LIBETH_SQE_EMPTY;
++}
++
++static inline void libeth_xdp_complete_tx(struct libeth_sqe *sqe,
++					  struct libeth_cq_pp *cp)
++{
++	__libeth_xdp_complete_tx(sqe, cp, libeth_xdp_return_buff_bulk);
++}
++
+ #endif /* __LIBETH_XDP_H */

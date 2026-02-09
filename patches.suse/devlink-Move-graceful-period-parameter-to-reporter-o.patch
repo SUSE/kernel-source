@@ -1,0 +1,572 @@
+From: Shahar Shitrit <shshitrit@nvidia.com>
+Date: Sun, 24 Aug 2025 11:43:50 +0300
+Subject: devlink: Move graceful period parameter to reporter ops
+Patch-mainline: v6.18-rc1
+Git-commit: d2b007374551ac09db16badde575cdd698f6fc92
+References: jsc#PED-14404 jsc#PED-15079
+
+Move the default graceful period from a parameter to
+devlink_health_reporter_create() to a field in the
+devlink_health_reporter_ops structure.
+
+This change improves consistency, as the graceful period is inherently
+tied to the reporter's behavior and recovery policy. It simplifies the
+signature of devlink_health_reporter_create() and its internal helper
+functions. It also centralizes the reporter configuration at the ops
+structure, preparing the groundwork for a downstream patch that will
+introduce a devlink health reporter burst period attribute whose
+default value will similarly be provided by the driver via the ops
+structure.
+
+Signed-off-by: Shahar Shitrit <shshitrit@nvidia.com>
+Reviewed-by: Jiri Pirko <jiri@nvidia.com>
+Signed-off-by: Mark Bloch <mbloch@nvidia.com>
+Link: https://patch.msgid.link/20250824084354.533182-2-mbloch@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/amd/pds_core/main.c                     |    2 
+ drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c            |    2 
+ drivers/net/ethernet/huawei/hinic/hinic_devlink.c            |   10 +-
+ drivers/net/ethernet/intel/ice/devlink/health.c              |    3 
+ drivers/net/ethernet/marvell/octeontx2/af/rvu_devlink.c      |   32 ++++++--
+ drivers/net/ethernet/mellanox/mlx5/core/diag/reporter_vnic.c |    2 
+ drivers/net/ethernet/mellanox/mlx5/core/en/reporter_rx.c     |   10 +-
+ drivers/net/ethernet/mellanox/mlx5/core/en/reporter_tx.c     |   10 +-
+ drivers/net/ethernet/mellanox/mlx5/core/en_rep.c             |    2 
+ drivers/net/ethernet/mellanox/mlx5/core/health.c             |   41 ++++++-----
+ drivers/net/ethernet/mellanox/mlxsw/core.c                   |    2 
+ drivers/net/ethernet/qlogic/qed/qed_devlink.c                |    9 +-
+ drivers/net/netdevsim/health.c                               |    4 -
+ include/net/devlink.h                                        |   11 +-
+ net/devlink/health.c                                         |   28 ++-----
+ 15 files changed, 97 insertions(+), 71 deletions(-)
+
+--- a/drivers/net/ethernet/amd/pds_core/main.c
++++ b/drivers/net/ethernet/amd/pds_core/main.c
+@@ -275,7 +275,7 @@ static int pdsc_init_pf(struct pdsc *pds
+ 		goto err_out_stop;
+ 	}
+ 
+-	hr = devl_health_reporter_create(dl, &pdsc_fw_reporter_ops, 0, pdsc);
++	hr = devl_health_reporter_create(dl, &pdsc_fw_reporter_ops, pdsc);
+ 	if (IS_ERR(hr)) {
+ 		devl_unlock(dl);
+ 		dev_warn(pdsc->dev, "Failed to create fw reporter: %pe\n", hr);
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+@@ -219,7 +219,7 @@ __bnxt_dl_reporter_create(struct bnxt *b
+ {
+ 	struct devlink_health_reporter *reporter;
+ 
+-	reporter = devlink_health_reporter_create(bp->dl, ops, 0, bp);
++	reporter = devlink_health_reporter_create(bp->dl, ops, bp);
+ 	if (IS_ERR(reporter)) {
+ 		netdev_warn(bp->dev, "Failed to create %s health reporter, rc = %ld\n",
+ 			    ops->name, PTR_ERR(reporter));
+--- a/drivers/net/ethernet/huawei/hinic/hinic_devlink.c
++++ b/drivers/net/ethernet/huawei/hinic/hinic_devlink.c
+@@ -443,8 +443,9 @@ int hinic_health_reporters_create(struct
+ 	struct devlink *devlink = priv_to_devlink(priv);
+ 
+ 	priv->hw_fault_reporter =
+-		devlink_health_reporter_create(devlink, &hinic_hw_fault_reporter_ops,
+-					       0, priv);
++		devlink_health_reporter_create(devlink,
++					       &hinic_hw_fault_reporter_ops,
++					       priv);
+ 	if (IS_ERR(priv->hw_fault_reporter)) {
+ 		dev_warn(&priv->hwdev->hwif->pdev->dev, "Failed to create hw fault reporter, err: %ld\n",
+ 			 PTR_ERR(priv->hw_fault_reporter));
+@@ -452,8 +453,9 @@ int hinic_health_reporters_create(struct
+ 	}
+ 
+ 	priv->fw_fault_reporter =
+-		devlink_health_reporter_create(devlink, &hinic_fw_fault_reporter_ops,
+-					       0, priv);
++		devlink_health_reporter_create(devlink,
++					       &hinic_fw_fault_reporter_ops,
++					       priv);
+ 	if (IS_ERR(priv->fw_fault_reporter)) {
+ 		dev_warn(&priv->hwdev->hwif->pdev->dev, "Failed to create fw fault reporter, err: %ld\n",
+ 			 PTR_ERR(priv->fw_fault_reporter));
+--- a/drivers/net/ethernet/intel/ice/devlink/health.c
++++ b/drivers/net/ethernet/intel/ice/devlink/health.c
+@@ -450,9 +450,8 @@ ice_init_devlink_rep(struct ice_pf *pf,
+ {
+ 	struct devlink *devlink = priv_to_devlink(pf);
+ 	struct devlink_health_reporter *rep;
+-	const u64 graceful_period = 0;
+ 
+-	rep = devl_health_reporter_create(devlink, ops, graceful_period, pf);
++	rep = devl_health_reporter_create(devlink, ops, pf);
+ 	if (IS_ERR(rep)) {
+ 		struct device *dev = ice_pf_to_dev(pf);
+ 
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_devlink.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_devlink.c
+@@ -505,7 +505,9 @@ static int rvu_nix_register_reporters(st
+ 
+ 	rvu_reporters->nix_event_ctx = nix_event_context;
+ 	rvu_reporters->rvu_hw_nix_intr_reporter =
+-		devlink_health_reporter_create(rvu_dl->dl, &rvu_hw_nix_intr_reporter_ops, 0, rvu);
++		devlink_health_reporter_create(rvu_dl->dl,
++					       &rvu_hw_nix_intr_reporter_ops,
++					       rvu);
+ 	if (IS_ERR(rvu_reporters->rvu_hw_nix_intr_reporter)) {
+ 		dev_warn(rvu->dev, "Failed to create hw_nix_intr reporter, err=%ld\n",
+ 			 PTR_ERR(rvu_reporters->rvu_hw_nix_intr_reporter));
+@@ -513,7 +515,9 @@ static int rvu_nix_register_reporters(st
+ 	}
+ 
+ 	rvu_reporters->rvu_hw_nix_gen_reporter =
+-		devlink_health_reporter_create(rvu_dl->dl, &rvu_hw_nix_gen_reporter_ops, 0, rvu);
++		devlink_health_reporter_create(rvu_dl->dl,
++					       &rvu_hw_nix_gen_reporter_ops,
++					       rvu);
+ 	if (IS_ERR(rvu_reporters->rvu_hw_nix_gen_reporter)) {
+ 		dev_warn(rvu->dev, "Failed to create hw_nix_gen reporter, err=%ld\n",
+ 			 PTR_ERR(rvu_reporters->rvu_hw_nix_gen_reporter));
+@@ -521,7 +525,9 @@ static int rvu_nix_register_reporters(st
+ 	}
+ 
+ 	rvu_reporters->rvu_hw_nix_err_reporter =
+-		devlink_health_reporter_create(rvu_dl->dl, &rvu_hw_nix_err_reporter_ops, 0, rvu);
++		devlink_health_reporter_create(rvu_dl->dl,
++					       &rvu_hw_nix_err_reporter_ops,
++					       rvu);
+ 	if (IS_ERR(rvu_reporters->rvu_hw_nix_err_reporter)) {
+ 		dev_warn(rvu->dev, "Failed to create hw_nix_err reporter, err=%ld\n",
+ 			 PTR_ERR(rvu_reporters->rvu_hw_nix_err_reporter));
+@@ -529,7 +535,9 @@ static int rvu_nix_register_reporters(st
+ 	}
+ 
+ 	rvu_reporters->rvu_hw_nix_ras_reporter =
+-		devlink_health_reporter_create(rvu_dl->dl, &rvu_hw_nix_ras_reporter_ops, 0, rvu);
++		devlink_health_reporter_create(rvu_dl->dl,
++					       &rvu_hw_nix_ras_reporter_ops,
++					       rvu);
+ 	if (IS_ERR(rvu_reporters->rvu_hw_nix_ras_reporter)) {
+ 		dev_warn(rvu->dev, "Failed to create hw_nix_ras reporter, err=%ld\n",
+ 			 PTR_ERR(rvu_reporters->rvu_hw_nix_ras_reporter));
+@@ -1051,7 +1059,9 @@ static int rvu_npa_register_reporters(st
+ 
+ 	rvu_reporters->npa_event_ctx = npa_event_context;
+ 	rvu_reporters->rvu_hw_npa_intr_reporter =
+-		devlink_health_reporter_create(rvu_dl->dl, &rvu_hw_npa_intr_reporter_ops, 0, rvu);
++		devlink_health_reporter_create(rvu_dl->dl,
++					       &rvu_hw_npa_intr_reporter_ops,
++					       rvu);
+ 	if (IS_ERR(rvu_reporters->rvu_hw_npa_intr_reporter)) {
+ 		dev_warn(rvu->dev, "Failed to create hw_npa_intr reporter, err=%ld\n",
+ 			 PTR_ERR(rvu_reporters->rvu_hw_npa_intr_reporter));
+@@ -1059,7 +1069,9 @@ static int rvu_npa_register_reporters(st
+ 	}
+ 
+ 	rvu_reporters->rvu_hw_npa_gen_reporter =
+-		devlink_health_reporter_create(rvu_dl->dl, &rvu_hw_npa_gen_reporter_ops, 0, rvu);
++		devlink_health_reporter_create(rvu_dl->dl,
++					       &rvu_hw_npa_gen_reporter_ops,
++					       rvu);
+ 	if (IS_ERR(rvu_reporters->rvu_hw_npa_gen_reporter)) {
+ 		dev_warn(rvu->dev, "Failed to create hw_npa_gen reporter, err=%ld\n",
+ 			 PTR_ERR(rvu_reporters->rvu_hw_npa_gen_reporter));
+@@ -1067,7 +1079,9 @@ static int rvu_npa_register_reporters(st
+ 	}
+ 
+ 	rvu_reporters->rvu_hw_npa_err_reporter =
+-		devlink_health_reporter_create(rvu_dl->dl, &rvu_hw_npa_err_reporter_ops, 0, rvu);
++		devlink_health_reporter_create(rvu_dl->dl,
++					       &rvu_hw_npa_err_reporter_ops,
++					       rvu);
+ 	if (IS_ERR(rvu_reporters->rvu_hw_npa_err_reporter)) {
+ 		dev_warn(rvu->dev, "Failed to create hw_npa_err reporter, err=%ld\n",
+ 			 PTR_ERR(rvu_reporters->rvu_hw_npa_err_reporter));
+@@ -1075,7 +1089,9 @@ static int rvu_npa_register_reporters(st
+ 	}
+ 
+ 	rvu_reporters->rvu_hw_npa_ras_reporter =
+-		devlink_health_reporter_create(rvu_dl->dl, &rvu_hw_npa_ras_reporter_ops, 0, rvu);
++		devlink_health_reporter_create(rvu_dl->dl,
++					       &rvu_hw_npa_ras_reporter_ops,
++					       rvu);
+ 	if (IS_ERR(rvu_reporters->rvu_hw_npa_ras_reporter)) {
+ 		dev_warn(rvu->dev, "Failed to create hw_npa_ras reporter, err=%ld\n",
+ 			 PTR_ERR(rvu_reporters->rvu_hw_npa_ras_reporter));
+--- a/drivers/net/ethernet/mellanox/mlx5/core/diag/reporter_vnic.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/diag/reporter_vnic.c
+@@ -133,7 +133,7 @@ void mlx5_reporter_vnic_create(struct ml
+ 	health->vnic_reporter =
+ 		devlink_health_reporter_create(devlink,
+ 					       &mlx5_reporter_vnic_ops,
+-					       0, dev);
++					       dev);
+ 	if (IS_ERR(health->vnic_reporter))
+ 		mlx5_core_warn(dev,
+ 			       "Failed to create vnic reporter, err = %ld\n",
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/reporter_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/reporter_rx.c
+@@ -644,22 +644,24 @@ void mlx5e_reporter_icosq_resume_recover
+ 	mutex_unlock(&c->icosq_recovery_lock);
+ }
+ 
++#define MLX5E_REPORTER_RX_GRACEFUL_PERIOD 500
++
+ static const struct devlink_health_reporter_ops mlx5_rx_reporter_ops = {
+ 	.name = "rx",
+ 	.recover = mlx5e_rx_reporter_recover,
+ 	.diagnose = mlx5e_rx_reporter_diagnose,
+ 	.dump = mlx5e_rx_reporter_dump,
++	.default_graceful_period = MLX5E_REPORTER_RX_GRACEFUL_PERIOD,
+ };
+ 
+-#define MLX5E_REPORTER_RX_GRACEFUL_PERIOD 500
+-
+ void mlx5e_reporter_rx_create(struct mlx5e_priv *priv)
+ {
++	struct devlink_port *port = priv->netdev->devlink_port;
+ 	struct devlink_health_reporter *reporter;
+ 
+-	reporter = devlink_port_health_reporter_create(priv->netdev->devlink_port,
++	reporter = devlink_port_health_reporter_create(port,
+ 						       &mlx5_rx_reporter_ops,
+-						       MLX5E_REPORTER_RX_GRACEFUL_PERIOD, priv);
++						       priv);
+ 	if (IS_ERR(reporter)) {
+ 		netdev_warn(priv->netdev, "Failed to create rx reporter, err = %ld\n",
+ 			    PTR_ERR(reporter));
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/reporter_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/reporter_tx.c
+@@ -519,22 +519,24 @@ void mlx5e_reporter_tx_ptpsq_unhealthy(s
+ 	mlx5e_health_report(priv, priv->tx_reporter, err_str, &err_ctx);
+ }
+ 
++#define MLX5_REPORTER_TX_GRACEFUL_PERIOD 500
++
+ static const struct devlink_health_reporter_ops mlx5_tx_reporter_ops = {
+ 		.name = "tx",
+ 		.recover = mlx5e_tx_reporter_recover,
+ 		.diagnose = mlx5e_tx_reporter_diagnose,
+ 		.dump = mlx5e_tx_reporter_dump,
++		.default_graceful_period = MLX5_REPORTER_TX_GRACEFUL_PERIOD,
+ };
+ 
+-#define MLX5_REPORTER_TX_GRACEFUL_PERIOD 500
+-
+ void mlx5e_reporter_tx_create(struct mlx5e_priv *priv)
+ {
++	struct devlink_port *port = priv->netdev->devlink_port;
+ 	struct devlink_health_reporter *reporter;
+ 
+-	reporter = devlink_port_health_reporter_create(priv->netdev->devlink_port,
++	reporter = devlink_port_health_reporter_create(port,
+ 						       &mlx5_tx_reporter_ops,
+-						       MLX5_REPORTER_TX_GRACEFUL_PERIOD, priv);
++						       priv);
+ 	if (IS_ERR(reporter)) {
+ 		netdev_warn(priv->netdev,
+ 			    "Failed to create tx reporter, err = %ld\n",
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+@@ -1440,7 +1440,7 @@ static void mlx5e_rep_vnic_reporter_crea
+ 
+ 	reporter = devl_port_health_reporter_create(dl_port,
+ 						    &mlx5_rep_vnic_reporter_ops,
+-						    0, rpriv);
++						    rpriv);
+ 	if (IS_ERR(reporter)) {
+ 		mlx5_core_err(priv->mdev,
+ 			      "Failed to create representor vnic reporter, err = %ld\n",
+--- a/drivers/net/ethernet/mellanox/mlx5/core/health.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/health.c
+@@ -669,54 +669,61 @@ static void mlx5_fw_fatal_reporter_err_w
+ 	}
+ }
+ 
++#define MLX5_FW_REPORTER_ECPF_GRACEFUL_PERIOD 180000
++#define MLX5_FW_REPORTER_PF_GRACEFUL_PERIOD 60000
++#define MLX5_FW_REPORTER_VF_GRACEFUL_PERIOD 30000
++#define MLX5_FW_REPORTER_DEFAULT_GRACEFUL_PERIOD \
++	MLX5_FW_REPORTER_VF_GRACEFUL_PERIOD
++
++static
++const struct devlink_health_reporter_ops mlx5_fw_fatal_reporter_ecpf_ops = {
++		.name = "fw_fatal",
++		.recover = mlx5_fw_fatal_reporter_recover,
++		.dump = mlx5_fw_fatal_reporter_dump,
++		.default_graceful_period =
++			MLX5_FW_REPORTER_ECPF_GRACEFUL_PERIOD,
++};
++
+ static const struct devlink_health_reporter_ops mlx5_fw_fatal_reporter_pf_ops = {
+ 		.name = "fw_fatal",
+ 		.recover = mlx5_fw_fatal_reporter_recover,
+ 		.dump = mlx5_fw_fatal_reporter_dump,
++		.default_graceful_period = MLX5_FW_REPORTER_PF_GRACEFUL_PERIOD,
+ };
+ 
+ static const struct devlink_health_reporter_ops mlx5_fw_fatal_reporter_ops = {
+ 		.name = "fw_fatal",
+ 		.recover = mlx5_fw_fatal_reporter_recover,
++		.default_graceful_period =
++			MLX5_FW_REPORTER_DEFAULT_GRACEFUL_PERIOD,
+ };
+ 
+-#define MLX5_FW_REPORTER_ECPF_GRACEFUL_PERIOD 180000
+-#define MLX5_FW_REPORTER_PF_GRACEFUL_PERIOD 60000
+-#define MLX5_FW_REPORTER_VF_GRACEFUL_PERIOD 30000
+-#define MLX5_FW_REPORTER_DEFAULT_GRACEFUL_PERIOD MLX5_FW_REPORTER_VF_GRACEFUL_PERIOD
+-
+ void mlx5_fw_reporters_create(struct mlx5_core_dev *dev)
+ {
+ 	const struct devlink_health_reporter_ops *fw_fatal_ops;
+ 	struct mlx5_core_health *health = &dev->priv.health;
+ 	const struct devlink_health_reporter_ops *fw_ops;
+ 	struct devlink *devlink = priv_to_devlink(dev);
+-	u64 grace_period;
+ 
+-	fw_fatal_ops = &mlx5_fw_fatal_reporter_pf_ops;
+ 	fw_ops = &mlx5_fw_reporter_pf_ops;
+ 	if (mlx5_core_is_ecpf(dev)) {
+-		grace_period = MLX5_FW_REPORTER_ECPF_GRACEFUL_PERIOD;
++		fw_fatal_ops = &mlx5_fw_fatal_reporter_ecpf_ops;
+ 	} else if (mlx5_core_is_pf(dev)) {
+-		grace_period = MLX5_FW_REPORTER_PF_GRACEFUL_PERIOD;
++		fw_fatal_ops = &mlx5_fw_fatal_reporter_pf_ops;
+ 	} else {
+ 		/* VF or SF */
+-		grace_period = MLX5_FW_REPORTER_DEFAULT_GRACEFUL_PERIOD;
+ 		fw_fatal_ops = &mlx5_fw_fatal_reporter_ops;
+ 		fw_ops = &mlx5_fw_reporter_ops;
+ 	}
+ 
+-	health->fw_reporter =
+-		devl_health_reporter_create(devlink, fw_ops, 0, dev);
++	health->fw_reporter = devl_health_reporter_create(devlink, fw_ops, dev);
+ 	if (IS_ERR(health->fw_reporter))
+ 		mlx5_core_warn(dev, "Failed to create fw reporter, err = %ld\n",
+ 			       PTR_ERR(health->fw_reporter));
+ 
+-	health->fw_fatal_reporter =
+-		devl_health_reporter_create(devlink,
+-					    fw_fatal_ops,
+-					    grace_period,
+-					    dev);
++	health->fw_fatal_reporter = devl_health_reporter_create(devlink,
++								fw_fatal_ops,
++								dev);
+ 	if (IS_ERR(health->fw_fatal_reporter))
+ 		mlx5_core_warn(dev, "Failed to create fw fatal reporter, err = %ld\n",
+ 			       PTR_ERR(health->fw_fatal_reporter));
+--- a/drivers/net/ethernet/mellanox/mlxsw/core.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/core.c
+@@ -2044,7 +2044,7 @@ static int mlxsw_core_health_init(struct
+ 		return 0;
+ 
+ 	fw_fatal = devl_health_reporter_create(devlink, &mlxsw_core_health_fw_fatal_ops,
+-					       0, mlxsw_core);
++					       mlxsw_core);
+ 	if (IS_ERR(fw_fatal)) {
+ 		dev_err(mlxsw_core->bus_info->dev, "Failed to create fw fatal reporter");
+ 		return PTR_ERR(fw_fatal);
+--- a/drivers/net/ethernet/qlogic/qed/qed_devlink.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_devlink.c
+@@ -87,20 +87,21 @@ qed_fw_fatal_reporter_recover(struct dev
+ 	return 0;
+ }
+ 
++#define QED_REPORTER_FW_GRACEFUL_PERIOD 0
++
+ static const struct devlink_health_reporter_ops qed_fw_fatal_reporter_ops = {
+ 		.name = "fw_fatal",
+ 		.recover = qed_fw_fatal_reporter_recover,
+ 		.dump = qed_fw_fatal_reporter_dump,
++		.default_graceful_period = QED_REPORTER_FW_GRACEFUL_PERIOD,
+ };
+ 
+-#define QED_REPORTER_FW_GRACEFUL_PERIOD 0
+-
+ void qed_fw_reporters_create(struct devlink *devlink)
+ {
+ 	struct qed_devlink *dl = devlink_priv(devlink);
+ 
+-	dl->fw_reporter = devlink_health_reporter_create(devlink, &qed_fw_fatal_reporter_ops,
+-							 QED_REPORTER_FW_GRACEFUL_PERIOD, dl);
++	dl->fw_reporter = devlink_health_reporter_create(devlink,
++		&qed_fw_fatal_reporter_ops, dl);
+ 	if (IS_ERR(dl->fw_reporter)) {
+ 		DP_NOTICE(dl->cdev, "Failed to create fw reporter, err = %ld\n",
+ 			  PTR_ERR(dl->fw_reporter));
+--- a/drivers/net/netdevsim/health.c
++++ b/drivers/net/netdevsim/health.c
+@@ -183,14 +183,14 @@ int nsim_dev_health_init(struct nsim_dev
+ 	health->empty_reporter =
+ 		devl_health_reporter_create(devlink,
+ 					    &nsim_dev_empty_reporter_ops,
+-					    0, health);
++					    health);
+ 	if (IS_ERR(health->empty_reporter))
+ 		return PTR_ERR(health->empty_reporter);
+ 
+ 	health->dummy_reporter =
+ 		devl_health_reporter_create(devlink,
+ 					    &nsim_dev_dummy_reporter_ops,
+-					    0, health);
++					    health);
+ 	if (IS_ERR(health->dummy_reporter)) {
+ 		err = PTR_ERR(health->dummy_reporter);
+ 		goto err_empty_reporter_destroy;
+--- a/include/net/devlink.h
++++ b/include/net/devlink.h
+@@ -744,6 +744,8 @@ enum devlink_health_reporter_state {
+  *        if priv_ctx is NULL, run a full dump
+  * @diagnose: callback to diagnose the current status
+  * @test: callback to trigger a test event
++ * @default_graceful_period: default min time (in msec)
++ *	between recovery attempts
+  */
+ 
+ struct devlink_health_reporter_ops {
+@@ -758,6 +760,7 @@ struct devlink_health_reporter_ops {
+ 			struct netlink_ext_ack *extack);
+ 	int (*test)(struct devlink_health_reporter *reporter,
+ 		    struct netlink_ext_ack *extack);
++	u64 default_graceful_period;
+ };
+ 
+ /**
+@@ -1933,22 +1936,22 @@ void devlink_fmsg_binary_pair_put(struct
+ struct devlink_health_reporter *
+ devl_port_health_reporter_create(struct devlink_port *port,
+ 				 const struct devlink_health_reporter_ops *ops,
+-				 u64 graceful_period, void *priv);
++				 void *priv);
+ 
+ struct devlink_health_reporter *
+ devlink_port_health_reporter_create(struct devlink_port *port,
+ 				    const struct devlink_health_reporter_ops *ops,
+-				    u64 graceful_period, void *priv);
++				    void *priv);
+ 
+ struct devlink_health_reporter *
+ devl_health_reporter_create(struct devlink *devlink,
+ 			    const struct devlink_health_reporter_ops *ops,
+-			    u64 graceful_period, void *priv);
++			    void *priv);
+ 
+ struct devlink_health_reporter *
+ devlink_health_reporter_create(struct devlink *devlink,
+ 			       const struct devlink_health_reporter_ops *ops,
+-			       u64 graceful_period, void *priv);
++			       void *priv);
+ 
+ void
+ devl_health_reporter_destroy(struct devlink_health_reporter *reporter);
+--- a/net/devlink/health.c
++++ b/net/devlink/health.c
+@@ -108,11 +108,11 @@ devlink_port_health_reporter_find_by_nam
+ static struct devlink_health_reporter *
+ __devlink_health_reporter_create(struct devlink *devlink,
+ 				 const struct devlink_health_reporter_ops *ops,
+-				 u64 graceful_period, void *priv)
++				 void *priv)
+ {
+ 	struct devlink_health_reporter *reporter;
+ 
+-	if (WARN_ON(graceful_period && !ops->recover))
++	if (WARN_ON(ops->default_graceful_period && !ops->recover))
+ 		return ERR_PTR(-EINVAL);
+ 
+ 	reporter = kzalloc(sizeof(*reporter), GFP_KERNEL);
+@@ -122,7 +122,7 @@ __devlink_health_reporter_create(struct
+ 	reporter->priv = priv;
+ 	reporter->ops = ops;
+ 	reporter->devlink = devlink;
+-	reporter->graceful_period = graceful_period;
++	reporter->graceful_period = ops->default_graceful_period;
+ 	reporter->auto_recover = !!ops->recover;
+ 	reporter->auto_dump = !!ops->dump;
+ 	return reporter;
+@@ -134,13 +134,12 @@ __devlink_health_reporter_create(struct
+  *
+  * @port: devlink_port to which health reports will relate
+  * @ops: devlink health reporter ops
+- * @graceful_period: min time (in msec) between recovery attempts
+  * @priv: driver priv pointer
+  */
+ struct devlink_health_reporter *
+ devl_port_health_reporter_create(struct devlink_port *port,
+ 				 const struct devlink_health_reporter_ops *ops,
+-				 u64 graceful_period, void *priv)
++				 void *priv)
+ {
+ 	struct devlink_health_reporter *reporter;
+ 
+@@ -150,8 +149,7 @@ devl_port_health_reporter_create(struct
+ 						   ops->name))
+ 		return ERR_PTR(-EEXIST);
+ 
+-	reporter = __devlink_health_reporter_create(port->devlink, ops,
+-						    graceful_period, priv);
++	reporter = __devlink_health_reporter_create(port->devlink, ops, priv);
+ 	if (IS_ERR(reporter))
+ 		return reporter;
+ 
+@@ -164,14 +162,13 @@ EXPORT_SYMBOL_GPL(devl_port_health_repor
+ struct devlink_health_reporter *
+ devlink_port_health_reporter_create(struct devlink_port *port,
+ 				    const struct devlink_health_reporter_ops *ops,
+-				    u64 graceful_period, void *priv)
++				    void *priv)
+ {
+ 	struct devlink_health_reporter *reporter;
+ 	struct devlink *devlink = port->devlink;
+ 
+ 	devl_lock(devlink);
+-	reporter = devl_port_health_reporter_create(port, ops,
+-						    graceful_period, priv);
++	reporter = devl_port_health_reporter_create(port, ops, priv);
+ 	devl_unlock(devlink);
+ 	return reporter;
+ }
+@@ -182,13 +179,12 @@ EXPORT_SYMBOL_GPL(devlink_port_health_re
+  *
+  * @devlink: devlink instance which the health reports will relate
+  * @ops: devlink health reporter ops
+- * @graceful_period: min time (in msec) between recovery attempts
+  * @priv: driver priv pointer
+  */
+ struct devlink_health_reporter *
+ devl_health_reporter_create(struct devlink *devlink,
+ 			    const struct devlink_health_reporter_ops *ops,
+-			    u64 graceful_period, void *priv)
++			    void *priv)
+ {
+ 	struct devlink_health_reporter *reporter;
+ 
+@@ -197,8 +193,7 @@ devl_health_reporter_create(struct devli
+ 	if (devlink_health_reporter_find_by_name(devlink, ops->name))
+ 		return ERR_PTR(-EEXIST);
+ 
+-	reporter = __devlink_health_reporter_create(devlink, ops,
+-						    graceful_period, priv);
++	reporter = __devlink_health_reporter_create(devlink, ops, priv);
+ 	if (IS_ERR(reporter))
+ 		return reporter;
+ 
+@@ -210,13 +205,12 @@ EXPORT_SYMBOL_GPL(devl_health_reporter_c
+ struct devlink_health_reporter *
+ devlink_health_reporter_create(struct devlink *devlink,
+ 			       const struct devlink_health_reporter_ops *ops,
+-			       u64 graceful_period, void *priv)
++			       void *priv)
+ {
+ 	struct devlink_health_reporter *reporter;
+ 
+ 	devl_lock(devlink);
+-	reporter = devl_health_reporter_create(devlink, ops,
+-					       graceful_period, priv);
++	reporter = devl_health_reporter_create(devlink, ops, priv);
+ 	devl_unlock(devlink);
+ 	return reporter;
+ }
