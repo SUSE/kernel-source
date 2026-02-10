@@ -1,0 +1,144 @@
+From: Nilay Shroff <nilay@linux.ibm.com>
+Date: Tue, 4 Mar 2025 15:52:35 +0530
+Subject: [PATCH] block: protect wbt_lat_usec using q->elevator_lock
+Git-commit: 245618f8e45ff4f79327627b474b563da71c2c75
+Patch-mainline: v6.15
+References: jsc#PED-14161
+
+The wbt latency and state could be updated while initializing the
+elevator or exiting the elevator. It could be also updated while
+configuring IO latency QoS parameters using cgroup. The elevator
+code path is now protected with q->elevator_lock. So we should
+protect the access to sysfs attribute wbt_lat_usec using q->elevator
+_lock instead of q->sysfs_lock. White we're at it, also protect
+ioc_qos_write(), which configures wbt parameters via cgroup, using
+q->elevator_lock.
+
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Hannes Reinecke <hare@suse.de>
+Reviewed-by: Ming Lei <ming.lei@redhat.com>
+Signed-off-by: Nilay Shroff <nilay@linux.ibm.com>
+Link: https://lore.kernel.org/r/20250304102551.2533767-7-nilay@linux.ibm.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/blk-iocost.c     |  2 ++
+ block/blk-sysfs.c      | 20 ++++++++------------
+ include/linux/blkdev.h |  4 ++--
+ 3 files changed, 12 insertions(+), 14 deletions(-)
+
+diff --git a/block/blk-iocost.c b/block/blk-iocost.c
+index 6be46e28459b..38e7bf3c3b4f 100644
+--- a/block/blk-iocost.c
++++ b/block/blk-iocost.c
+@@ -3248,6 +3248,7 @@ static ssize_t ioc_qos_write(struct kernfs_open_file *of, char *input,
+ 	}
+ 
+ 	memflags = blk_mq_freeze_queue(disk->queue);
++	mutex_lock(&disk->queue->elevator_lock);
+ 	blk_mq_quiesce_queue(disk->queue);
+ 
+ 	spin_lock_irq(&ioc->lock);
+@@ -3355,6 +3356,7 @@ static ssize_t ioc_qos_write(struct kernfs_open_file *of, char *input,
+ 	spin_unlock_irq(&ioc->lock);
+ 
+ 	blk_mq_unquiesce_queue(disk->queue);
++	mutex_unlock(&disk->queue->elevator_lock);
+ 	blk_mq_unfreeze_queue(disk->queue, memflags);
+ 
+ 	ret = -EINVAL;
+diff --git a/block/blk-sysfs.c b/block/blk-sysfs.c
+index f1fa57de29ed..223da196a548 100644
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@ -557,7 +557,7 @@ static ssize_t queue_wb_lat_show(struct gendisk *disk, char *page)
+ 	ssize_t ret;
+ 	struct request_queue *q = disk->queue;
+ 
+-	mutex_lock(&q->sysfs_lock);
++	mutex_lock(&q->elevator_lock);
+ 	if (!wbt_rq_qos(q)) {
+ 		ret = -EINVAL;
+ 		goto out;
+@@ -570,7 +570,7 @@ static ssize_t queue_wb_lat_show(struct gendisk *disk, char *page)
+ 
+ 	ret = sysfs_emit(page, "%llu\n", div_u64(wbt_get_min_lat(q), 1000));
+ out:
+-	mutex_unlock(&q->sysfs_lock);
++	mutex_unlock(&q->elevator_lock);
+ 	return ret;
+ }
+ 
+@@ -589,8 +589,8 @@ static ssize_t queue_wb_lat_store(struct gendisk *disk, const char *page,
+ 	if (val < -1)
+ 		return -EINVAL;
+ 
+-	mutex_lock(&q->sysfs_lock);
+ 	memflags = blk_mq_freeze_queue(q);
++	mutex_lock(&q->elevator_lock);
+ 
+ 	rqos = wbt_rq_qos(q);
+ 	if (!rqos) {
+@@ -619,8 +619,8 @@ static ssize_t queue_wb_lat_store(struct gendisk *disk, const char *page,
+ 
+ 	blk_mq_unquiesce_queue(q);
+ out:
++	mutex_unlock(&q->elevator_lock);
+ 	blk_mq_unfreeze_queue(q, memflags);
+-	mutex_unlock(&q->sysfs_lock);
+ 
+ 	return ret;
+ }
+@@ -689,19 +689,15 @@ static struct attribute *queue_attrs[] = {
+ 
+ /* Request-based queue attributes that are not relevant for bio-based queues. */
+ static struct attribute *blk_mq_queue_attrs[] = {
+-	/*
+-	 * Attributes which are protected with q->sysfs_lock.
+-	 */
+-#ifdef CONFIG_BLK_WBT
+-	&queue_wb_lat_entry.attr,
+-#endif
+ 	/*
+ 	 * Attributes which require some form of locking other than
+ 	 * q->sysfs_lock.
+ 	 */
+ 	&elv_iosched_entry.attr,
+ 	&queue_requests_entry.attr,
+-
++#ifdef CONFIG_BLK_WBT
++	&queue_wb_lat_entry.attr,
++#endif
+ 	/*
+ 	 * Attributes which don't require locking.
+ 	 */
+@@ -882,10 +878,10 @@ int blk_register_queue(struct gendisk *disk)
+ 			goto out_crypto_sysfs_unregister;
+ 		}
+ 	}
++	wbt_enable_default(disk);
+ 	mutex_unlock(&q->elevator_lock);
+ 
+ 	blk_queue_flag_set(QUEUE_FLAG_REGISTERED, q);
+-	wbt_enable_default(disk);
+ 
+ 	/* Now everything is ready and send out KOBJ_ADD uevent */
+ 	kobject_uevent(&disk->queue_kobj, KOBJ_ADD);
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 3e66ad016a23..0ee3b5c9388e 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -563,8 +563,8 @@ struct request_queue {
+ 	/*
+ 	 * Protects against I/O scheduler switching, particularly when
+ 	 * updating q->elevator. Since the elevator update code path may
+-	 * also modify q->nr_requests, this lock also protects the sysfs
+-	 * attribute nr_requests.
++	 * also modify q->nr_requests and wbt latency, this lock also
++	 * protects the sysfs attributes nr_requests and wbt_lat_usec.
+ 	 * To ensure proper locking order during an elevator update, first
+ 	 * freeze the queue, then acquire ->elevator_lock.
+ 	 */
+-- 
+2.43.0
+
