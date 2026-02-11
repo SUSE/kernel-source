@@ -1,0 +1,157 @@
+From: Patrisious Haddad <phaddad@nvidia.com>
+Date: Wed, 29 Oct 2025 17:42:55 +0200
+Subject: net/mlx5: fs, set non default device per namespace
+Patch-mainline: v6.19-rc1
+Git-commit: 583b4fe1c19d978bb787e0adf9ce469cb7f68455
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+Add mlx5_fs_set_root_dev() function which swaps the root namespace
+core device with another one for a given table_type.
+
+It is intended for usage only by RDMA_TRANSPORT tables in case of LAG
+configuration, to allow the creation of tables during LAG always
+through the LAG master device, which is valid since during LAG the
+master is allowed to manage the RDMA_TRANSPORT tables of its slaves.
+
+In addition move the table_type enum to global include to allow its use
+in a downstream patch in the RDMA driver.
+
+Signed-off-by: Patrisious Haddad <phaddad@nvidia.com>
+Signed-off-by: Edward Srouji <edwards@nvidia.com>
+Link: https://patch.msgid.link/20251029-support-other-eswitch-v1-3-98bb707b5d57@nvidia.com
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/fs_core.c |   56 ++++++++++++++++++++++
+ drivers/net/ethernet/mellanox/mlx5/core/fs_core.h |   18 -------
+ include/linux/mlx5/fs.h                           |   22 ++++++++
+ 3 files changed, 78 insertions(+), 18 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
+@@ -3308,6 +3308,62 @@ err:
+ 	return ret;
+ }
+ 
++static bool mlx5_fs_ns_is_empty(struct mlx5_flow_namespace *ns)
++{
++	struct fs_prio *iter_prio;
++
++	fs_for_each_prio(iter_prio, ns) {
++		if (iter_prio->num_ft)
++			return false;
++	}
++
++	return true;
++}
++
++int mlx5_fs_set_root_dev(struct mlx5_core_dev *dev,
++			 struct mlx5_core_dev *new_dev,
++			 enum fs_flow_table_type table_type)
++{
++	struct mlx5_flow_root_namespace	**root;
++	int total_vports;
++	int i;
++
++	switch (table_type) {
++	case FS_FT_RDMA_TRANSPORT_TX:
++		root = dev->priv.steering->rdma_transport_tx_root_ns;
++		total_vports = dev->priv.steering->rdma_transport_tx_vports;
++		break;
++	case FS_FT_RDMA_TRANSPORT_RX:
++		root = dev->priv.steering->rdma_transport_rx_root_ns;
++		total_vports = dev->priv.steering->rdma_transport_rx_vports;
++		break;
++	default:
++		WARN_ON_ONCE(true);
++		return -EINVAL;
++	}
++
++	for (i = 0; i < total_vports; i++) {
++		mutex_lock(&root[i]->chain_lock);
++		if (!mlx5_fs_ns_is_empty(&root[i]->ns)) {
++			mutex_unlock(&root[i]->chain_lock);
++			goto err;
++		}
++		root[i]->dev = new_dev;
++		mutex_unlock(&root[i]->chain_lock);
++	}
++	return 0;
++err:
++	while (i--) {
++		mutex_lock(&root[i]->chain_lock);
++		root[i]->dev = dev;
++		mutex_unlock(&root[i]->chain_lock);
++	}
++	/* If you hit this error try destroying all flow tables and try again */
++	mlx5_core_err(dev, "Failed to set root device for RDMA TRANSPORT\n");
++	return -EINVAL;
++}
++EXPORT_SYMBOL(mlx5_fs_set_root_dev);
++
+ static int init_rdma_transport_rx_root_ns(struct mlx5_flow_steering *steering)
+ {
+ 	struct mlx5_core_dev *dev = steering->dev;
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_core.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_core.h
+@@ -103,24 +103,6 @@ enum fs_node_type {
+ 	FS_TYPE_FLOW_DEST
+ };
+ 
+-enum fs_flow_table_type {
+-	FS_FT_NIC_RX          = 0x0,
+-	FS_FT_NIC_TX          = 0x1,
+-	FS_FT_ESW_EGRESS_ACL  = 0x2,
+-	FS_FT_ESW_INGRESS_ACL = 0x3,
+-	FS_FT_FDB             = 0X4,
+-	FS_FT_SNIFFER_RX	= 0X5,
+-	FS_FT_SNIFFER_TX	= 0X6,
+-	FS_FT_RDMA_RX		= 0X7,
+-	FS_FT_RDMA_TX		= 0X8,
+-	FS_FT_PORT_SEL		= 0X9,
+-	FS_FT_FDB_RX		= 0xa,
+-	FS_FT_FDB_TX		= 0xb,
+-	FS_FT_RDMA_TRANSPORT_RX	= 0xd,
+-	FS_FT_RDMA_TRANSPORT_TX	= 0xe,
+-	FS_FT_MAX_TYPE = FS_FT_RDMA_TRANSPORT_TX,
+-};
+-
+ enum fs_flow_table_op_mod {
+ 	FS_FT_OP_MOD_NORMAL,
+ 	FS_FT_OP_MOD_LAG_DEMUX,
+--- a/include/linux/mlx5/fs.h
++++ b/include/linux/mlx5/fs.h
+@@ -129,6 +129,24 @@ enum {
+ 	FDB_PER_VPORT,
+ };
+ 
++enum fs_flow_table_type {
++	FS_FT_NIC_RX          = 0x0,
++	FS_FT_NIC_TX          = 0x1,
++	FS_FT_ESW_EGRESS_ACL  = 0x2,
++	FS_FT_ESW_INGRESS_ACL = 0x3,
++	FS_FT_FDB             = 0X4,
++	FS_FT_SNIFFER_RX	= 0X5,
++	FS_FT_SNIFFER_TX	= 0X6,
++	FS_FT_RDMA_RX		= 0X7,
++	FS_FT_RDMA_TX		= 0X8,
++	FS_FT_PORT_SEL		= 0X9,
++	FS_FT_FDB_RX		= 0xa,
++	FS_FT_FDB_TX		= 0xb,
++	FS_FT_RDMA_TRANSPORT_RX	= 0xd,
++	FS_FT_RDMA_TRANSPORT_TX	= 0xe,
++	FS_FT_MAX_TYPE = FS_FT_RDMA_TRANSPORT_TX,
++};
++
+ struct mlx5_pkt_reformat;
+ struct mlx5_modify_hdr;
+ struct mlx5_flow_definer;
+@@ -356,4 +374,8 @@ u32 mlx5_flow_table_id(struct mlx5_flow_
+ 
+ struct mlx5_flow_root_namespace *
+ mlx5_get_root_namespace(struct mlx5_core_dev *dev, enum mlx5_flow_namespace_type ns_type);
++
++int mlx5_fs_set_root_dev(struct mlx5_core_dev *dev,
++			 struct mlx5_core_dev *new_dev,
++			 enum fs_flow_table_type table_type);
+ #endif
