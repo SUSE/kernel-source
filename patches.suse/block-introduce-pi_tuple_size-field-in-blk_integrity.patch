@@ -1,0 +1,124 @@
+From: Anuj Gupta <anuj20.g@samsung.com>
+Date: Mon, 30 Jun 2025 14:35:46 +0530
+Subject: [PATCH] block: introduce pi_tuple_size field in blk_integrity
+Git-commit: 76e45252a4cefa205439eb6610a244771e7d88da
+Patch-mainline: v6.17
+References: jsc#PED-14161
+
+Introduce a new pi_tuple_size field in struct blk_integrity to
+explicitly represent the size (in bytes) of the protection information
+(PI) tuple. This is a prep patch.
+Add validation in blk_validate_integrity_limits() to ensure that
+pi size matches the expected size for known checksum types and never
+exceeds the pi_tuple_size.
+
+Suggested-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
+Link: https://lore.kernel.org/20250630090548.3317-3-anuj20.g@samsung.com
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Christian Brauner <brauner@kernel.org>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/blk-settings.c     | 38 ++++++++++++++++++++++++++++++++++++++
+ drivers/nvme/host/core.c |  2 ++
+ drivers/scsi/sd_dif.c    |  1 +
+ include/linux/blkdev.h   |  1 +
+ 4 files changed, 42 insertions(+)
+
+diff --git a/block/blk-settings.c b/block/blk-settings.c
+index 787500ff00c3..32f3cdc9835a 100644
+--- a/block/blk-settings.c
++++ b/block/blk-settings.c
+@@ -14,6 +14,8 @@
+ #include <linux/jiffies.h>
+ #include <linux/gfp.h>
+ #include <linux/dma-mapping.h>
++#include <linux/t10-pi.h>
++#include <linux/crc64.h>
+ 
+ #include "blk.h"
+ #include "blk-rq-qos.h"
+@@ -135,6 +137,42 @@ static int blk_validate_integrity_limits(struct queue_limits *lim)
+ 		return -EINVAL;
+ 	}
+ 
++	if (bi->pi_tuple_size > bi->metadata_size) {
++		pr_warn("pi_tuple_size (%u) exceeds metadata_size (%u)\n",
++			 bi->pi_tuple_size,
++			 bi->metadata_size);
++		return -EINVAL;
++	}
++
++	switch (bi->csum_type) {
++	case BLK_INTEGRITY_CSUM_NONE:
++		if (bi->pi_tuple_size) {
++			pr_warn("pi_tuple_size must be 0 when checksum type \
++				 is none\n");
++			return -EINVAL;
++		}
++		break;
++	case BLK_INTEGRITY_CSUM_CRC:
++	case BLK_INTEGRITY_CSUM_IP:
++		if (bi->pi_tuple_size != sizeof(struct t10_pi_tuple)) {
++			pr_warn("pi_tuple_size mismatch for T10 PI: expected \
++				 %zu, got %u\n",
++				 sizeof(struct t10_pi_tuple),
++				 bi->pi_tuple_size);
++			return -EINVAL;
++		}
++		break;
++	case BLK_INTEGRITY_CSUM_CRC64:
++		if (bi->pi_tuple_size != sizeof(struct crc64_pi_tuple)) {
++			pr_warn("pi_tuple_size mismatch for CRC64 PI: \
++				 expected %zu, got %u\n",
++				 sizeof(struct crc64_pi_tuple),
++				 bi->pi_tuple_size);
++			return -EINVAL;
++		}
++		break;
++	}
++
+ 	if (!bi->interval_exp)
+ 		bi->interval_exp = ilog2(lim->logical_block_size);
+ 
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index b027dda38e69..fe72accab516 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -1867,6 +1867,8 @@ static bool nvme_init_integrity(struct nvme_ns_head *head,
+ 	}
+ 
+ 	bi->metadata_size = head->ms;
++	if (bi->csum_type)
++		bi->pi_tuple_size = head->pi_size;
+ 	bi->pi_offset = info->pi_offset;
+ 	return true;
+ }
+diff --git a/drivers/scsi/sd_dif.c b/drivers/scsi/sd_dif.c
+index 18bfca1f1c78..ff4217fef93b 100644
+--- a/drivers/scsi/sd_dif.c
++++ b/drivers/scsi/sd_dif.c
+@@ -53,6 +53,7 @@ void sd_dif_config_host(struct scsi_disk *sdkp, struct queue_limits *lim)
+ 		bi->flags |= BLK_INTEGRITY_REF_TAG;
+ 
+ 	bi->metadata_size = sizeof(struct t10_pi_tuple);
++	bi->pi_tuple_size = bi->metadata_size;
+ 
+ 	if (dif && type) {
+ 		bi->flags |= BLK_INTEGRITY_DEVICE_CAPABLE;
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index ccda87d06a38..0d4011dcfed3 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -120,6 +120,7 @@ struct blk_integrity {
+ 	unsigned char				pi_offset;
+ 	unsigned char				interval_exp;
+ 	unsigned char				tag_size;
++	unsigned char				pi_tuple_size;
+ };
+ 
+ typedef unsigned int __bitwise blk_mode_t;
+-- 
+2.43.0
+
