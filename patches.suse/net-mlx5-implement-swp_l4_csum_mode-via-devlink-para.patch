@@ -1,0 +1,345 @@
+From: Daniel Zahka <daniel.zahka@gmail.com>
+Date: Tue, 18 Nov 2025 18:50:34 -0800
+Subject: net/mlx5: implement swp_l4_csum_mode via devlink params
+Patch-mainline: v6.19-rc1
+Git-commit: b11d358bf8c306b18a86322d0d8d2549e971be97
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+swp_l4_csum_mode controls how L4 transmit checksums are computed when
+using Software Parser (SWP) hints for header locations.
+
+Supported values:
+  1. default: device will choose between full_csum or l4_only. Driver
+     will discover the device's choice during initialization.
+  2. full_csum: calculate L4 checksum with the pseudo-header.
+  3. l4_only: calculate L4 checksum without the pseudo-header. Only
+     available when swp_l4_csum_mode_l4_only is set in
+     mlx5_ifc_nv_sw_offload_cap_bits.
+
+Note that 'default' might be returned from the device and passed to
+userspace, and it might also be set during a
+devlink_param::reset_default() call, but attempts to set a value of
+default directly with param-set will be rejected.
+
+The l4_only setting is a dependency for PSP initialization in
+mlx5e_psp_init().
+
+Reviewed-by: Aleksandr Loktionov <aleksandr.loktionov@intel.com>
+Signed-off-by: Daniel Zahka <daniel.zahka@gmail.com>
+Link: https://patch.msgid.link/20251119025038.651131-5-daniel.zahka@gmail.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ Documentation/networking/devlink/mlx5.rst              |   14 +
+ drivers/net/ethernet/mellanox/mlx5/core/devlink.h      |    3 
+ drivers/net/ethernet/mellanox/mlx5/core/lib/nv_param.c |  229 +++++++++++++++++
+ 3 files changed, 245 insertions(+), 1 deletion(-)
+
+--- a/Documentation/networking/devlink/mlx5.rst
++++ b/Documentation/networking/devlink/mlx5.rst
+@@ -218,6 +218,20 @@ parameters.
+        * ``balanced`` : Merges fewer CQEs, resulting in a moderate compression ratio but maintaining a balance between bandwidth savings and performance
+        * ``aggressive`` : Merges more CQEs into a single entry, achieving a higher compression rate and maximizing performance, particularly under high traffic loads
+ 
++   * - ``swp_l4_csum_mode``
++     - string
++     - permanent
++     - Configure how the L4 checksum is calculated by the device when using
++       Software Parser (SWP) hints for header locations.
++
++       * ``default`` : Use the device's default checksum calculation
++         mode. The driver will discover during init whether or
++         full_csum or l4_only is in use. Setting this value explicitly
++         from userspace is not allowed, but some firmware versions may
++         return this value on param read.
++       * ``full_csum`` : Calculate full checksum including the pseudo-header
++       * ``l4_only`` : Calculate L4-only checksum, excluding the pseudo-header
++
+ The ``mlx5`` driver supports reloading via ``DEVLINK_CMD_RELOAD``
+ 
+ Info versions
+--- a/drivers/net/ethernet/mellanox/mlx5/core/devlink.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/devlink.h
+@@ -26,7 +26,8 @@ enum mlx5_devlink_param_id {
+ 	MLX5_DEVLINK_PARAM_ID_PCIE_CONG_IN_HIGH,
+ 	MLX5_DEVLINK_PARAM_ID_PCIE_CONG_OUT_LOW,
+ 	MLX5_DEVLINK_PARAM_ID_PCIE_CONG_OUT_HIGH,
+-	MLX5_DEVLINK_PARAM_ID_CQE_COMPRESSION_TYPE
++	MLX5_DEVLINK_PARAM_ID_CQE_COMPRESSION_TYPE,
++	MLX5_DEVLINK_PARAM_ID_SWP_L4_CSUM_MODE,
+ };
+ 
+ struct mlx5_trap_ctx {
+--- a/drivers/net/ethernet/mellanox/mlx5/core/lib/nv_param.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/lib/nv_param.c
+@@ -8,6 +8,8 @@ enum {
+ 	MLX5_CLASS_0_CTRL_ID_NV_GLOBAL_PCI_CONF               = 0x80,
+ 	MLX5_CLASS_0_CTRL_ID_NV_GLOBAL_PCI_CAP                = 0x81,
+ 	MLX5_CLASS_0_CTRL_ID_NV_SW_OFFLOAD_CONFIG             = 0x10a,
++	MLX5_CLASS_0_CTRL_ID_NV_SW_OFFLOAD_CAP                = 0x10b,
++	MLX5_CLASS_0_CTRL_ID_NV_SW_ACCELERATE_CONF            = 0x11d,
+ 
+ 	MLX5_CLASS_3_CTRL_ID_NV_PF_PCI_CONF                   = 0x80,
+ };
+@@ -32,6 +34,12 @@ union mlx5_ifc_config_item_type_auto_bit
+ 	u8 reserved_at_0[0x20];
+ };
+ 
++enum {
++	MLX5_ACCESS_MODE_NEXT = 0,
++	MLX5_ACCESS_MODE_CURRENT,
++	MLX5_ACCESS_MODE_DEFAULT,
++};
++
+ struct mlx5_ifc_config_item_bits {
+ 	u8         valid[0x2];
+ 	u8         priority[0x2];
+@@ -123,6 +131,17 @@ struct mlx5_ifc_nv_sw_offload_conf_bits
+ 	u8         lro_log_timeout0[0x4];
+ };
+ 
++struct mlx5_ifc_nv_sw_offload_cap_bits {
++	u8         reserved_at_0[0x19];
++	u8         swp_l4_csum_mode_l4_only[0x1];
++	u8         reserved_at_1a[0x6];
++};
++
++struct mlx5_ifc_nv_sw_accelerate_conf_bits {
++	u8         swp_l4_csum_mode[0x2];
++	u8         reserved_at_2[0x3e];
++};
++
+ #define MNVDA_HDR_SZ \
+ 	(MLX5_ST_SZ_BYTES(mnvda_reg) - \
+ 	 MLX5_BYTE_OFF(mnvda_reg, configuration_item_data))
+@@ -195,6 +214,32 @@ mlx5_nv_param_read_sw_offload_conf(struc
+ 	return mlx5_nv_param_read(dev, mnvda, len);
+ }
+ 
++static int
++mlx5_nv_param_read_sw_offload_cap(struct mlx5_core_dev *dev, void *mnvda,
++				  size_t len)
++{
++	MLX5_SET_CFG_ITEM_TYPE(global, mnvda, type_class, 0);
++	MLX5_SET_CFG_ITEM_TYPE(global, mnvda, parameter_index,
++			       MLX5_CLASS_0_CTRL_ID_NV_SW_OFFLOAD_CAP);
++	MLX5_SET_CFG_HDR_LEN(mnvda, nv_sw_offload_cap);
++
++	return mlx5_nv_param_read(dev, mnvda, len);
++}
++
++static int
++mlx5_nv_param_read_sw_accelerate_conf(struct mlx5_core_dev *dev, void *mnvda,
++				      size_t len, int access_mode)
++{
++	MLX5_SET_CFG_ITEM_TYPE(global, mnvda, type_class, 0);
++	MLX5_SET_CFG_ITEM_TYPE(global, mnvda, parameter_index,
++			       MLX5_CLASS_0_CTRL_ID_NV_SW_ACCELERATE_CONF);
++	MLX5_SET_CFG_HDR_LEN(mnvda, nv_sw_accelerate_conf);
++	MLX5_SET(mnvda_reg, mnvda, configuration_item_header.access_mode,
++		 access_mode);
++
++	return mlx5_nv_param_read(dev, mnvda, len);
++}
++
+ static const char *const
+ 	cqe_compress_str[] = { "balanced", "aggressive" };
+ 
+@@ -269,6 +314,182 @@ mlx5_nv_param_devlink_cqe_compress_set(s
+ 	return mlx5_nv_param_write(dev, mnvda, sizeof(mnvda));
+ }
+ 
++enum swp_l4_csum_mode {
++	SWP_L4_CSUM_MODE_DEFAULT = 0,
++	SWP_L4_CSUM_MODE_FULL_CSUM = 1,
++	SWP_L4_CSUM_MODE_L4_ONLY = 2,
++};
++
++static const char *const
++	swp_l4_csum_mode_str[] = { "default", "full_csum", "l4_only" };
++
++static int
++mlx5_swp_l4_csum_mode_get(struct devlink *devlink, u32 id,
++			  int access_mode, u8 *value,
++			  struct netlink_ext_ack *extack)
++{
++	struct mlx5_core_dev *dev = devlink_priv(devlink);
++	u32 mnvda[MLX5_ST_SZ_DW(mnvda_reg)] = {};
++	void *data;
++	int err;
++
++	err = mlx5_nv_param_read_sw_accelerate_conf(dev, mnvda, sizeof(mnvda),
++						    access_mode);
++	if (err) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "Failed to read sw_accelerate_conf mnvda reg");
++		return err;
++	}
++
++	data = MLX5_ADDR_OF(mnvda_reg, mnvda, configuration_item_data);
++	*value = MLX5_GET(nv_sw_accelerate_conf, data, swp_l4_csum_mode);
++
++	if (*value >= ARRAY_SIZE(swp_l4_csum_mode_str)) {
++		NL_SET_ERR_MSG_FMT_MOD(extack,
++				       "Invalid swp_l4_csum_mode value %u read from device",
++				       *value);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int
++mlx5_devlink_swp_l4_csum_mode_get(struct devlink *devlink, u32 id,
++				  struct devlink_param_gset_ctx *ctx,
++				  struct netlink_ext_ack *extack)
++{
++	u8 value;
++	int err;
++
++	err = mlx5_swp_l4_csum_mode_get(devlink, id, MLX5_ACCESS_MODE_NEXT,
++					&value, extack);
++	if (err)
++		return err;
++
++	strscpy(ctx->val.vstr, swp_l4_csum_mode_str[value],
++		sizeof(ctx->val.vstr));
++	return 0;
++}
++
++static int
++mlx5_devlink_swp_l4_csum_mode_validate(struct devlink *devlink, u32 id,
++				       union devlink_param_value val,
++				       struct netlink_ext_ack *extack)
++{
++	struct mlx5_core_dev *dev = devlink_priv(devlink);
++	u32 cap[MLX5_ST_SZ_DW(mnvda_reg)] = {};
++	void *data;
++	int err, i;
++
++	for (i = 0; i < ARRAY_SIZE(swp_l4_csum_mode_str); i++) {
++		if (!strcmp(val.vstr, swp_l4_csum_mode_str[i]))
++			break;
++	}
++
++	if (i >= ARRAY_SIZE(swp_l4_csum_mode_str) ||
++	    i == SWP_L4_CSUM_MODE_DEFAULT) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "Invalid value, supported values are full_csum/l4_only");
++		return -EINVAL;
++	}
++
++	if (i == SWP_L4_CSUM_MODE_L4_ONLY) {
++		err = mlx5_nv_param_read_sw_offload_cap(dev, cap, sizeof(cap));
++		if (err) {
++			NL_SET_ERR_MSG_MOD(extack,
++					   "Failed to read sw_offload_cap");
++			return err;
++		}
++
++		data = MLX5_ADDR_OF(mnvda_reg, cap, configuration_item_data);
++		if (!MLX5_GET(nv_sw_offload_cap, data, swp_l4_csum_mode_l4_only)) {
++			NL_SET_ERR_MSG_MOD(extack,
++					   "l4_only mode is not supported on this device");
++			return -EOPNOTSUPP;
++		}
++	}
++
++	return 0;
++}
++
++static int
++mlx5_swp_l4_csum_mode_set(struct devlink *devlink, u32 id, u8 value,
++			  struct netlink_ext_ack *extack)
++{
++	struct mlx5_core_dev *dev = devlink_priv(devlink);
++	u32 mnvda[MLX5_ST_SZ_DW(mnvda_reg)] = {};
++	void *data;
++	int err;
++
++	err = mlx5_nv_param_read_sw_accelerate_conf(dev, mnvda, sizeof(mnvda),
++						    MLX5_ACCESS_MODE_NEXT);
++	if (err) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "Failed to read sw_accelerate_conf mnvda reg");
++		return err;
++	}
++
++	data = MLX5_ADDR_OF(mnvda_reg, mnvda, configuration_item_data);
++	MLX5_SET(nv_sw_accelerate_conf, data, swp_l4_csum_mode, value);
++
++	err = mlx5_nv_param_write(dev, mnvda, sizeof(mnvda));
++	if (err)
++		NL_SET_ERR_MSG_MOD(extack,
++				   "Failed to write sw_accelerate_conf mnvda reg");
++
++	return err;
++}
++
++static int
++mlx5_devlink_swp_l4_csum_mode_set(struct devlink *devlink, u32 id,
++				  struct devlink_param_gset_ctx *ctx,
++				  struct netlink_ext_ack *extack)
++{
++	u8 value;
++
++	if (!strcmp(ctx->val.vstr, "full_csum"))
++		value = SWP_L4_CSUM_MODE_FULL_CSUM;
++	else
++		value = SWP_L4_CSUM_MODE_L4_ONLY;
++
++	return mlx5_swp_l4_csum_mode_set(devlink, id, value, extack);
++}
++
++static int
++mlx5_devlink_swp_l4_csum_mode_get_default(struct devlink *devlink, u32 id,
++					  struct devlink_param_gset_ctx *ctx,
++					  struct netlink_ext_ack *extack)
++{
++	u8 value;
++	int err;
++
++	err = mlx5_swp_l4_csum_mode_get(devlink, id, MLX5_ACCESS_MODE_DEFAULT,
++					&value, extack);
++	if (err)
++		return err;
++
++	strscpy(ctx->val.vstr, swp_l4_csum_mode_str[value],
++		sizeof(ctx->val.vstr));
++	return 0;
++}
++
++static int
++mlx5_devlink_swp_l4_csum_mode_set_default(struct devlink *devlink, u32 id,
++					  enum devlink_param_cmode cmode,
++					  struct netlink_ext_ack *extack)
++{
++	u8 value;
++	int err;
++
++	err = mlx5_swp_l4_csum_mode_get(devlink, id, MLX5_ACCESS_MODE_DEFAULT,
++					&value, extack);
++	if (err)
++		return err;
++
++	return mlx5_swp_l4_csum_mode_set(devlink, id, value, extack);
++}
++
+ static int mlx5_nv_param_read_global_pci_conf(struct mlx5_core_dev *dev,
+ 					      void *mnvda, size_t len)
+ {
+@@ -548,6 +769,14 @@ static const struct devlink_param mlx5_n
+ 			     mlx5_nv_param_devlink_cqe_compress_get,
+ 			     mlx5_nv_param_devlink_cqe_compress_set,
+ 			     mlx5_nv_param_devlink_cqe_compress_validate),
++	DEVLINK_PARAM_DRIVER_WITH_DEFAULTS(MLX5_DEVLINK_PARAM_ID_SWP_L4_CSUM_MODE,
++					   "swp_l4_csum_mode", DEVLINK_PARAM_TYPE_STRING,
++					   BIT(DEVLINK_PARAM_CMODE_PERMANENT),
++					   mlx5_devlink_swp_l4_csum_mode_get,
++					   mlx5_devlink_swp_l4_csum_mode_set,
++					   mlx5_devlink_swp_l4_csum_mode_validate,
++					   mlx5_devlink_swp_l4_csum_mode_get_default,
++					   mlx5_devlink_swp_l4_csum_mode_set_default),
+ };
+ 
+ int mlx5_nv_param_register_dl_params(struct devlink *devlink)
