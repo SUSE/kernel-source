@@ -1,0 +1,124 @@
+From: Saeed Mahameed <saeedm@nvidia.com>
+Date: Mon, 17 Nov 2025 23:42:08 +0200
+Subject: net/mlx5: Abort new commands if all command slots are stalled
+Patch-mainline: v6.19-rc1
+Git-commit: fbb9933666e31f84c62e9620e9ec4d220ee31ab4
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+In case of a FW issue, FW might be not responding to FW commands,
+causing kernel lockout for a long period of time, e.g. rtnl_lock held
+while ethtool is trying to collect stats waiting for FW to respond to
+multiple commands, when all of them will timeout.
+
+While there's no immediate indication of the FW lockout, we can safely
+assume that something is wrong when all command slots are busy and in
+a timeout state and no FW completion was received on any of them.
+
+In such case, start immediately failing new commands.
+
+Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+Reviewed-by: Moshe Shemesh <moshe@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://patch.msgid.link/1763415729-1238421-5-git-send-email-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/cmd.c |   55 ++++++++++++++++++++++++++
+ include/linux/mlx5/driver.h                   |    1 
+ 2 files changed, 56 insertions(+)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/cmd.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/cmd.c
+@@ -181,6 +181,7 @@ static int cmd_alloc_index(struct mlx5_c
+ static void cmd_free_index(struct mlx5_cmd *cmd, int idx)
+ {
+ 	lockdep_assert_held(&cmd->alloc_lock);
++	cmd->ent_arr[idx] = NULL;
+ 	set_bit(idx, &cmd->vars.bitmask);
+ }
+ 
+@@ -1200,6 +1201,44 @@ out_err:
+ 	return err;
+ }
+ 
++/* Check if all command slots are stalled (timed out and not recovered).
++ * returns true if all slots timed out on a recent command and have not been
++ * completed by FW yet. (stalled state)
++ * false otherwise (at least one slot is not stalled).
++ *
++ * In such odd situation "all_stalled", this serves as a protection mechanism
++ * to avoid blocking the kernel for long periods of time in case FW is not
++ * responding to commands.
++ */
++static bool mlx5_cmd_all_stalled(struct mlx5_core_dev *dev)
++{
++	struct mlx5_cmd *cmd = &dev->cmd;
++	bool all_stalled = true;
++	unsigned long flags;
++	int i;
++
++	spin_lock_irqsave(&cmd->alloc_lock, flags);
++
++	/* at least one command slot is free */
++	if (bitmap_weight(&cmd->vars.bitmask, cmd->vars.max_reg_cmds) > 0) {
++		all_stalled = false;
++		goto out;
++	}
++
++	for_each_clear_bit(i, &cmd->vars.bitmask, cmd->vars.max_reg_cmds) {
++		struct mlx5_cmd_work_ent *ent = dev->cmd.ent_arr[i];
++
++		if (!test_bit(MLX5_CMD_ENT_STATE_TIMEDOUT, &ent->state)) {
++			all_stalled = false;
++			break;
++		}
++	}
++out:
++	spin_unlock_irqrestore(&cmd->alloc_lock, flags);
++
++	return all_stalled;
++}
++
+ /*  Notes:
+  *    1. Callback functions may not sleep
+  *    2. page queue commands do not support asynchrous completion
+@@ -1230,6 +1269,15 @@ static int mlx5_cmd_invoke(struct mlx5_c
+ 	if (callback && page_queue)
+ 		return -EINVAL;
+ 
++	if (!page_queue && mlx5_cmd_all_stalled(dev)) {
++		mlx5_core_err_rl(dev,
++				 "All CMD slots are stalled, aborting command\n");
++		/* there's no reason to wait and block the whole kernel if FW
++		 * isn't currently responding to all slots, fail immediately
++		 */
++		return -EAGAIN;
++	}
++
+ 	ent = cmd_alloc_ent(cmd, in, out, uout, uout_size,
+ 			    callback, context, page_queue);
+ 	if (IS_ERR(ent))
+@@ -1700,6 +1748,13 @@ static void mlx5_cmd_comp_handler(struct
+ 		if (test_bit(i, &vector)) {
+ 			ent = cmd->ent_arr[i];
+ 
++			if (forced && ent->ret == -ETIMEDOUT)
++				set_bit(MLX5_CMD_ENT_STATE_TIMEDOUT,
++					&ent->state);
++			else if (!forced) /* real FW completion */
++				clear_bit(MLX5_CMD_ENT_STATE_TIMEDOUT,
++					  &ent->state);
++
+ 			/* if we already completed the command, ignore it */
+ 			if (!test_and_clear_bit(MLX5_CMD_ENT_STATE_PENDING_COMP,
+ 						&ent->state)) {
+--- a/include/linux/mlx5/driver.h
++++ b/include/linux/mlx5/driver.h
+@@ -819,6 +819,7 @@ typedef void (*mlx5_cmd_cbk_t)(int statu
+ 
+ enum {
+ 	MLX5_CMD_ENT_STATE_PENDING_COMP,
++	MLX5_CMD_ENT_STATE_TIMEDOUT,
+ };
+ 
+ struct mlx5_cmd_work_ent {
