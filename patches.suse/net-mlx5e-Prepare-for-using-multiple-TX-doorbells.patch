@@ -1,0 +1,178 @@
+From: Cosmin Ratiu <cratiu@nvidia.com>
+Date: Tue, 16 Sep 2025 17:11:39 +0300
+Subject: net/mlx5e: Prepare for using multiple TX doorbells
+Patch-mainline: v6.18-rc1
+Git-commit: 673d7ab7563e1268ac4ca62914b2b99d16219500
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+The driver allocates a single doorbell per device and uses
+it for all Send Queues (SQs). This can become a bottleneck due to the
+high number of concurrent MMIO accesses when ringing the same doorbell
+from many channels.
+
+This patch makes the doorbells used by channel queues configurable.
+
+mlx5e_channel_pick_doorbell() is added to select the doorbell to be used
+for a given channel, picking the default for now.
+
+When opening a channel, the selected doorbell is saved to the channel
+struct and used whenever channel-related queues are created.
+
+Finally, 'uar_page' is added to 'struct mlx5e_create_sq_param' to
+control which doorbell to use when allocating an SQ, since that can
+happen outside channel context (e.g. for PTP).
+
+Signed-off-by: Cosmin Ratiu <cratiu@nvidia.com>
+Reviewed-by: Dragos Tatulea <dtatulea@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en.h        |    1 +
+ drivers/net/ethernet/mellanox/mlx5/core/en/params.h |    1 +
+ drivers/net/ethernet/mellanox/mlx5/core/en/ptp.c    |    4 +++-
+ drivers/net/ethernet/mellanox/mlx5/core/en/ptp.h    |    1 +
+ drivers/net/ethernet/mellanox/mlx5/core/en_main.c   |   18 ++++++++++++++----
+ 5 files changed, 20 insertions(+), 5 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -787,6 +787,7 @@ struct mlx5e_channel {
+ 	int                        vec_ix;
+ 	int                        sd_ix;
+ 	int                        cpu;
++	struct mlx5_sq_bfreg      *bfreg;
+ 	/* Sync between icosq recovery and XSK enable/disable. */
+ 	struct mutex               icosq_recovery_lock;
+ 
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/params.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/params.h
+@@ -51,6 +51,7 @@ struct mlx5e_create_sq_param {
+ 	u32                         tisn;
+ 	u8                          tis_lst_sz;
+ 	u8                          min_inline_mode;
++	u32                         uar_page;
+ };
+ 
+ /* Striding RQ dynamic parameters */
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/ptp.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/ptp.c
+@@ -333,7 +333,7 @@ static int mlx5e_ptp_alloc_txqsq(struct
+ 	sq->mdev      = mdev;
+ 	sq->ch_ix     = MLX5E_PTP_CHANNEL_IX;
+ 	sq->txq_ix    = txq_ix;
+-	sq->uar_map   = mdev->priv.bfreg.map;
++	sq->uar_map   = c->bfreg->map;
+ 	sq->min_inline_mode = params->tx_min_inline_mode;
+ 	sq->hw_mtu    = MLX5E_SW2HW_MTU(params, params->sw_mtu);
+ 	sq->stats     = &c->priv->ptp_stats.sq[tc];
+@@ -471,6 +471,7 @@ static int mlx5e_ptp_open_txqsq(struct m
+ 	csp.wq_ctrl         = &txqsq->wq_ctrl;
+ 	csp.min_inline_mode = txqsq->min_inline_mode;
+ 	csp.ts_cqe_to_dest_cqn = ptpsq->ts_cq.mcq.cqn;
++	csp.uar_page = c->bfreg->index;
+ 
+ 	err = mlx5e_create_sq_rdy(c->mdev, sqp, &csp, 0, &txqsq->sqn);
+ 	if (err)
+@@ -885,6 +886,7 @@ int mlx5e_ptp_open(struct mlx5e_priv *pr
+ 	c->num_tc   = mlx5e_get_dcb_num_tc(params);
+ 	c->stats    = &priv->ptp_stats.ch;
+ 	c->lag_port = lag_port;
++	c->bfreg    = &mdev->priv.bfreg;
+ 
+ 	err = mlx5e_ptp_set_state(c, params);
+ 	if (err)
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/ptp.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/ptp.h
+@@ -66,6 +66,7 @@ struct mlx5e_ptp {
+ 	struct mlx5_core_dev      *mdev;
+ 	struct hwtstamp_config    *tstamp;
+ 	DECLARE_BITMAP(state, MLX5E_PTP_STATE_NUM_STATES);
++	struct mlx5_sq_bfreg      *bfreg;
+ };
+ 
+ static inline bool mlx5e_use_ptpsq(struct sk_buff *skb)
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -1509,7 +1509,7 @@ static int mlx5e_alloc_xdpsq(struct mlx5
+ 	sq->pdev      = c->pdev;
+ 	sq->mkey_be   = c->mkey_be;
+ 	sq->channel   = c;
+-	sq->uar_map   = mdev->priv.bfreg.map;
++	sq->uar_map   = c->bfreg->map;
+ 	sq->min_inline_mode = params->tx_min_inline_mode;
+ 	sq->hw_mtu    = MLX5E_SW2HW_MTU(params, params->sw_mtu) - ETH_FCS_LEN;
+ 	sq->xsk_pool  = xsk_pool;
+@@ -1594,7 +1594,7 @@ static int mlx5e_alloc_icosq(struct mlx5
+ 	int err;
+ 
+ 	sq->channel   = c;
+-	sq->uar_map   = mdev->priv.bfreg.map;
++	sq->uar_map   = c->bfreg->map;
+ 	sq->reserved_room = param->stop_room;
+ 
+ 	param->wq.db_numa_node = cpu_to_node(c->cpu);
+@@ -1679,7 +1679,7 @@ static int mlx5e_alloc_txqsq(struct mlx5
+ 	sq->priv      = c->priv;
+ 	sq->ch_ix     = c->ix;
+ 	sq->txq_ix    = txq_ix;
+-	sq->uar_map   = mdev->priv.bfreg.map;
++	sq->uar_map   = c->bfreg->map;
+ 	sq->min_inline_mode = params->tx_min_inline_mode;
+ 	sq->hw_mtu    = MLX5E_SW2HW_MTU(params, params->sw_mtu);
+ 	sq->max_sq_mpw_wqebbs = mlx5e_get_max_sq_aligned_wqebbs(mdev);
+@@ -1755,7 +1755,7 @@ static int mlx5e_create_sq(struct mlx5_c
+ 	MLX5_SET(sqc,  sqc, flush_in_error_en, 1);
+ 
+ 	MLX5_SET(wq,   wq, wq_type,       MLX5_WQ_TYPE_CYCLIC);
+-	MLX5_SET(wq,   wq, uar_page,      mdev->priv.bfreg.index);
++	MLX5_SET(wq,   wq, uar_page,      csp->uar_page);
+ 	MLX5_SET(wq,   wq, log_wq_pg_sz,  csp->wq_ctrl->buf.page_shift -
+ 					  MLX5_ADAPTER_PAGE_SHIFT);
+ 	MLX5_SET64(wq, wq, dbr_addr,      csp->wq_ctrl->db.dma);
+@@ -1859,6 +1859,7 @@ int mlx5e_open_txqsq(struct mlx5e_channe
+ 	csp.cqn             = sq->cq.mcq.cqn;
+ 	csp.wq_ctrl         = &sq->wq_ctrl;
+ 	csp.min_inline_mode = sq->min_inline_mode;
++	csp.uar_page        = c->bfreg->index;
+ 	err = mlx5e_create_sq_rdy(c->mdev, param, &csp, qos_queue_group_id, &sq->sqn);
+ 	if (err)
+ 		goto err_free_txqsq;
+@@ -2016,6 +2017,7 @@ static int mlx5e_open_icosq(struct mlx5e
+ 	csp.cqn             = sq->cq.mcq.cqn;
+ 	csp.wq_ctrl         = &sq->wq_ctrl;
+ 	csp.min_inline_mode = params->tx_min_inline_mode;
++	csp.uar_page        = c->bfreg->index;
+ 	err = mlx5e_create_sq_rdy(c->mdev, param, &csp, 0, &sq->sqn);
+ 	if (err)
+ 		goto err_free_icosq;
+@@ -2076,6 +2078,7 @@ int mlx5e_open_xdpsq(struct mlx5e_channe
+ 	csp.cqn             = sq->cq.mcq.cqn;
+ 	csp.wq_ctrl         = &sq->wq_ctrl;
+ 	csp.min_inline_mode = sq->min_inline_mode;
++	csp.uar_page        = c->bfreg->index;
+ 	set_bit(MLX5E_SQ_STATE_ENABLED, &sq->state);
+ 
+ 	err = mlx5e_create_sq_rdy(c->mdev, param, &csp, 0, &sq->sqn);
+@@ -2704,6 +2707,11 @@ void mlx5e_trigger_napi_sched(struct nap
+ 	local_bh_enable();
+ }
+ 
++static void mlx5e_channel_pick_doorbell(struct mlx5e_channel *c)
++{
++	c->bfreg = &c->mdev->priv.bfreg;
++}
++
+ static int mlx5e_open_channel(struct mlx5e_priv *priv, int ix,
+ 			      struct mlx5e_params *params,
+ 			      struct xsk_buff_pool *xsk_pool,
+@@ -2758,6 +2766,8 @@ static int mlx5e_open_channel(struct mlx
+ 	c->aff_mask = irq_get_effective_affinity_mask(irq);
+ 	c->lag_port = mlx5e_enumerate_lag_port(mdev, ix);
+ 
++	mlx5e_channel_pick_doorbell(c);
++
+ 	netif_napi_add_config(netdev, &c->napi, mlx5e_napi_poll, ix);
+ 	netif_napi_set_irq(&c->napi, irq);
+ 
