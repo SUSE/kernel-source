@@ -1,0 +1,155 @@
+From: Jesse Brandeburg <jesse.brandeburg@intel.com>
+Date: Thu, 16 Oct 2025 23:08:38 -0700
+Subject: ice: implement ethtool standard stats
+Patch-mainline: v6.19-rc1
+Git-commit: 20ae87514ad5159f821951761fc7362bceeca265
+References: jsc#PED-14404 jsc#PED-15079
+
+Add support for MAC/pause/RMON stats. This enables reporting hardware
+statistics in a common way via:
+
+ethtool -S eth0 --all-groups
+and
+ethtool --include-statistics --show-pause eth0
+
+While doing so, add support for one new stat, receive length error
+(RLEC), which is extremely unlikely to happen since most L2 frames have
+a type/length field specifying a "type", and raw ethernet frames aren't
+used much any longer.
+
+NOTE: I didn't implement Ctrl aka control frame stats because the
+hardware doesn't seem to implement support.
+
+Reviewed-by: Marcin Szycik <marcin.szycik@linux.intel.com>
+Reviewed-by: Jacob Keller <jacob.e.keller@intel.com>
+Reviewed-by: Jakub Kicinski <kuba@kernel.org>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Signed-off-by: Jesse Brandeburg <jesse.brandeburg@intel.com>
+Tested-by: Rinitha S <sx.rinitha@intel.com>
+Reviewed-by: Aleksandr Loktionov <aleksandr.loktionov@intel.com>
+Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+Link: https://patch.msgid.link/20251016-jk-iwl-next-2025-10-15-v2-9-ff3a390d9fc6@intel.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/ice/ice_ethtool.c |   78 +++++++++++++++++++++++++++
+ drivers/net/ethernet/intel/ice/ice_main.c    |    3 +
+ drivers/net/ethernet/intel/ice/ice_type.h    |    1 
+ 3 files changed, 82 insertions(+)
+
+--- a/drivers/net/ethernet/intel/ice/ice_ethtool.c
++++ b/drivers/net/ethernet/intel/ice/ice_ethtool.c
+@@ -4684,6 +4684,81 @@ static void ice_get_fec_stats(struct net
+ 			    pi->lport, err);
+ }
+ 
++static void ice_get_eth_mac_stats(struct net_device *netdev,
++				  struct ethtool_eth_mac_stats *mac_stats)
++{
++	struct ice_pf *pf = ice_netdev_to_pf(netdev);
++	struct ice_hw_port_stats *ps = &pf->stats;
++
++	mac_stats->FramesTransmittedOK = ps->eth.tx_unicast +
++					 ps->eth.tx_multicast +
++					 ps->eth.tx_broadcast;
++	mac_stats->FramesReceivedOK = ps->eth.rx_unicast +
++				      ps->eth.rx_multicast +
++				      ps->eth.rx_broadcast;
++	mac_stats->FrameCheckSequenceErrors = ps->crc_errors;
++	mac_stats->OctetsTransmittedOK = ps->eth.tx_bytes;
++	mac_stats->OctetsReceivedOK = ps->eth.rx_bytes;
++	mac_stats->MulticastFramesXmittedOK = ps->eth.tx_multicast;
++	mac_stats->BroadcastFramesXmittedOK = ps->eth.tx_broadcast;
++	mac_stats->MulticastFramesReceivedOK = ps->eth.rx_multicast;
++	mac_stats->BroadcastFramesReceivedOK = ps->eth.rx_broadcast;
++	mac_stats->InRangeLengthErrors = ps->rx_len_errors;
++	mac_stats->FrameTooLongErrors = ps->rx_oversize;
++}
++
++static void ice_get_pause_stats(struct net_device *netdev,
++				struct ethtool_pause_stats *pause_stats)
++{
++	struct ice_pf *pf = ice_netdev_to_pf(netdev);
++	struct ice_hw_port_stats *ps = &pf->stats;
++
++	pause_stats->tx_pause_frames = ps->link_xon_tx + ps->link_xoff_tx;
++	pause_stats->rx_pause_frames = ps->link_xon_rx + ps->link_xoff_rx;
++}
++
++static const struct ethtool_rmon_hist_range ice_rmon_ranges[] = {
++	{    0,    64 },
++	{   65,   127 },
++	{  128,   255 },
++	{  256,   511 },
++	{  512,  1023 },
++	{ 1024,  1522 },
++	{ 1523,  9522 },
++	{}
++};
++
++static void ice_get_rmon_stats(struct net_device *netdev,
++			       struct ethtool_rmon_stats *rmon,
++			       const struct ethtool_rmon_hist_range **ranges)
++{
++	struct ice_pf *pf = ice_netdev_to_pf(netdev);
++	struct ice_hw_port_stats *ps = &pf->stats;
++
++	rmon->undersize_pkts	= ps->rx_undersize;
++	rmon->oversize_pkts	= ps->rx_oversize;
++	rmon->fragments		= ps->rx_fragments;
++	rmon->jabbers		= ps->rx_jabber;
++
++	rmon->hist[0]		= ps->rx_size_64;
++	rmon->hist[1]		= ps->rx_size_127;
++	rmon->hist[2]		= ps->rx_size_255;
++	rmon->hist[3]		= ps->rx_size_511;
++	rmon->hist[4]		= ps->rx_size_1023;
++	rmon->hist[5]		= ps->rx_size_1522;
++	rmon->hist[6]		= ps->rx_size_big;
++
++	rmon->hist_tx[0]	= ps->tx_size_64;
++	rmon->hist_tx[1]	= ps->tx_size_127;
++	rmon->hist_tx[2]	= ps->tx_size_255;
++	rmon->hist_tx[3]	= ps->tx_size_511;
++	rmon->hist_tx[4]	= ps->tx_size_1023;
++	rmon->hist_tx[5]	= ps->tx_size_1522;
++	rmon->hist_tx[6]	= ps->tx_size_big;
++
++	*ranges = ice_rmon_ranges;
++}
++
+ #define ICE_ETHTOOL_PFR (ETH_RESET_IRQ | ETH_RESET_DMA | \
+ 	ETH_RESET_FILTER | ETH_RESET_OFFLOAD)
+ 
+@@ -4767,6 +4842,9 @@ static const struct ethtool_ops ice_etht
+ 	.get_link_ksettings	= ice_get_link_ksettings,
+ 	.set_link_ksettings	= ice_set_link_ksettings,
+ 	.get_fec_stats		= ice_get_fec_stats,
++	.get_eth_mac_stats	= ice_get_eth_mac_stats,
++	.get_pause_stats	= ice_get_pause_stats,
++	.get_rmon_stats		= ice_get_rmon_stats,
+ 	.get_drvinfo		= ice_get_drvinfo,
+ 	.get_regs_len		= ice_get_regs_len,
+ 	.get_regs		= ice_get_regs,
+--- a/drivers/net/ethernet/intel/ice/ice_main.c
++++ b/drivers/net/ethernet/intel/ice/ice_main.c
+@@ -7180,6 +7180,9 @@ void ice_update_pf_stats(struct ice_pf *
+ 			  &prev_ps->mac_remote_faults,
+ 			  &cur_ps->mac_remote_faults);
+ 
++	ice_stat_update32(hw, GLPRT_RLEC(port), pf->stat_prev_loaded,
++			  &prev_ps->rx_len_errors, &cur_ps->rx_len_errors);
++
+ 	ice_stat_update32(hw, GLPRT_RUC(port), pf->stat_prev_loaded,
+ 			  &prev_ps->rx_undersize, &cur_ps->rx_undersize);
+ 
+--- a/drivers/net/ethernet/intel/ice/ice_type.h
++++ b/drivers/net/ethernet/intel/ice/ice_type.h
+@@ -1063,6 +1063,7 @@ struct ice_hw_port_stats {
+ 	u64 error_bytes;		/* errbc */
+ 	u64 mac_local_faults;		/* mlfc */
+ 	u64 mac_remote_faults;		/* mrfc */
++	u64 rx_len_errors;		/* rlec */
+ 	u64 link_xon_rx;		/* lxonrxc */
+ 	u64 link_xoff_rx;		/* lxoffrxc */
+ 	u64 link_xon_tx;		/* lxontxc */
