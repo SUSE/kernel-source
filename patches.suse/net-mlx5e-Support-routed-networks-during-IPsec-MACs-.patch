@@ -1,0 +1,148 @@
+From: Alexandre Cassen <acassen@corp.free.fr>
+Date: Tue, 22 Jul 2025 17:23:47 +0300
+Subject: net/mlx5e: Support routed networks during IPsec MACs initialization
+Patch-mainline: v6.17-rc1
+Git-commit: 71670f766b8f4c1490e07ad4394e8e27c03b2e91
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+Remote IPsec tunnel endpoint may refer to a network segment that is
+not directly connected to the host. In such a case, IPsec tunnel
+endpoints are connected to a router and reachable via a routing path.
+In IPsec packet offload mode, HW is initialized with the MAC address
+of both IPsec tunnel endpoints.
+
+Extend the current IPsec init MACs procedure to resolve nexthop for
+routed networks. Direct neighbour lookup and probe is still used
+for directly connected networks and as a fallback mechanism if fib
+lookup fails.
+
+Signed-off-by: Alexandre Cassen <acassen@corp.free.fr>
+Signed-off-by: Leon Romanovsky <leonro@nvidia.com>
+Reviewed-by: Cosmin Ratiu <cratiu@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Reviewed-by: Michal Swiatkowski <michal.swiatkowski@linux.intel.com>
+Link: https://patch.msgid.link/1753194228-333722-2-git-send-email-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.c |   82 ++++++++++++++-
+ 1 file changed, 80 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.c
+@@ -36,6 +36,7 @@
+ #include <linux/inetdevice.h>
+ #include <linux/netdevice.h>
+ #include <net/netevent.h>
++#include <net/ipv6_stubs.h>
+ 
+ #include "en.h"
+ #include "eswitch.h"
+@@ -259,9 +260,15 @@ static void mlx5e_ipsec_init_macs(struct
+ 				  struct mlx5_accel_esp_xfrm_attrs *attrs)
+ {
+ 	struct mlx5_core_dev *mdev = mlx5e_ipsec_sa2dev(sa_entry);
++	struct mlx5e_ipsec_addr *addrs = &attrs->addrs;
+ 	struct net_device *netdev = sa_entry->dev;
++	struct xfrm_state *x = sa_entry->x;
++	struct dst_entry *rt_dst_entry;
++	struct flowi4 fl4 = {};
++	struct flowi6 fl6 = {};
+ 	struct neighbour *n;
+ 	u8 addr[ETH_ALEN];
++	struct rtable *rt;
+ 	const void *pkey;
+ 	u8 *dst, *src;
+ 
+@@ -274,18 +281,89 @@ static void mlx5e_ipsec_init_macs(struct
+ 	case XFRM_DEV_OFFLOAD_IN:
+ 		src = attrs->dmac;
+ 		dst = attrs->smac;
+-		pkey = &attrs->addrs.saddr.a4;
++
++		switch (addrs->family) {
++		case AF_INET:
++			fl4.flowi4_proto = x->sel.proto;
++			fl4.daddr = addrs->saddr.a4;
++			fl4.saddr = addrs->daddr.a4;
++			pkey = &addrs->saddr.a4;
++			break;
++		case AF_INET6:
++			fl6.flowi6_proto = x->sel.proto;
++			memcpy(fl6.daddr.s6_addr32, addrs->saddr.a6, 16);
++			memcpy(fl6.saddr.s6_addr32, addrs->daddr.a6, 16);
++			pkey = &addrs->saddr.a6;
++			break;
++		default:
++			return;
++		}
+ 		break;
+ 	case XFRM_DEV_OFFLOAD_OUT:
+ 		src = attrs->smac;
+ 		dst = attrs->dmac;
+-		pkey = &attrs->addrs.daddr.a4;
++		switch (addrs->family) {
++		case AF_INET:
++			fl4.flowi4_proto = x->sel.proto;
++			fl4.daddr = addrs->daddr.a4;
++			fl4.saddr = addrs->saddr.a4;
++			pkey = &addrs->daddr.a4;
++			break;
++		case AF_INET6:
++			fl6.flowi6_proto = x->sel.proto;
++			memcpy(fl6.daddr.s6_addr32, addrs->daddr.a6, 16);
++			memcpy(fl6.saddr.s6_addr32, addrs->saddr.a6, 16);
++			pkey = &addrs->daddr.a6;
++			break;
++		default:
++			return;
++		}
+ 		break;
+ 	default:
+ 		return;
+ 	}
+ 
+ 	ether_addr_copy(src, addr);
++
++	/* Destination can refer to a routed network, so perform FIB lookup
++	 * to resolve nexthop and get its MAC. Neighbour resolution is used as
++	 * fallback.
++	 */
++	switch (addrs->family) {
++	case AF_INET:
++		rt = ip_route_output_key(dev_net(netdev), &fl4);
++		if (IS_ERR(rt))
++			goto neigh;
++
++		if (rt->rt_type != RTN_UNICAST) {
++			ip_rt_put(rt);
++			goto neigh;
++		}
++		rt_dst_entry = &rt->dst;
++		break;
++	case AF_INET6:
++		rt_dst_entry = ipv6_stub->ipv6_dst_lookup_flow(
++			dev_net(netdev), NULL, &fl6, NULL);
++		if (IS_ERR(rt_dst_entry))
++			goto neigh;
++		break;
++	default:
++		return;
++	}
++
++	n = dst_neigh_lookup(rt_dst_entry, pkey);
++	if (!n) {
++		dst_release(rt_dst_entry);
++		goto neigh;
++	}
++
++	neigh_ha_snapshot(addr, n, netdev);
++	ether_addr_copy(dst, addr);
++	dst_release(rt_dst_entry);
++	neigh_release(n);
++	return;
++
++neigh:
+ 	n = neigh_lookup(&arp_tbl, pkey, netdev);
+ 	if (!n) {
+ 		n = neigh_create(&arp_tbl, pkey, netdev);
