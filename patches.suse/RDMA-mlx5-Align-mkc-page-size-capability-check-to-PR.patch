@@ -1,0 +1,132 @@
+From: Michael Guralnik <michaelgur@nvidia.com>
+Date: Wed, 9 Jul 2025 09:42:10 +0300
+Subject: RDMA/mlx5: Align mkc page size capability check to PRM
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Patch-mainline: v6.17-rc1
+Git-commit: fcfb03597b7d7737aac6bdfda1f7b5d152cfed73
+References: jsc#PED-15334
+
+Align the capabilities checked when using the log_page_size 6th bit in the
+mkey context to the PRM definition. The upper and lower bounds are set by
+max/min caps, and modification of the 6th bit by UMR is allowed only when
+a specific UMR cap is set.
+Current implementation falsely assumes all page sizes up-to 2^63 are
+supported when the UMR cap is set. In case the upper bound cap is lower
+than 63, this might result a FW syndrome on mkey creation, e.g:
+mlx5_core 0000:c1:00.0: mlx5_cmd_out_err:832:(pid 0): CREATE_MKEY(0×200) op_mod(0×0) failed, status bad parameter(0×3), syndrome (0×38a711), err(-22)
+
+Previous cap enforcement is still correct for all current HW, FW and
+driver combinations. However, this patch aligns the code to be PRM
+compliant in the general case.
+
+Signed-off-by: Michael Guralnik <michaelgur@nvidia.com>
+Link: https://patch.msgid.link/eab4eeb4785105a4bb5eb362dc0b3662cd840412.1751979184.git.leon@kernel.org
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/hw/mlx5/mlx5_ib.h |   51 +++++++++++++++++++++++++++++++----
+ drivers/infiniband/hw/mlx5/mr.c      |   10 ++++--
+ 2 files changed, 52 insertions(+), 9 deletions(-)
+
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@ -1750,18 +1750,59 @@ static inline u32 smi_to_native_portnum(
+ 	return (port - 1) / dev->num_ports + 1;
+ }
+ 
++static inline unsigned int get_max_log_entity_size_cap(struct mlx5_ib_dev *dev,
++						       int access_mode)
++{
++	int max_log_size = 0;
++
++	if (access_mode == MLX5_MKC_ACCESS_MODE_MTT)
++		max_log_size =
++			MLX5_CAP_GEN_2(dev->mdev, max_mkey_log_entity_size_mtt);
++	else if (access_mode == MLX5_MKC_ACCESS_MODE_KSM)
++		max_log_size = MLX5_CAP_GEN_2(
++			dev->mdev, max_mkey_log_entity_size_fixed_buffer);
++
++	if (!max_log_size ||
++	    (max_log_size > 31 &&
++	     !MLX5_CAP_GEN_2(dev->mdev, umr_log_entity_size_5)))
++		max_log_size = 31;
++
++	return max_log_size;
++}
++
++static inline unsigned int get_min_log_entity_size_cap(struct mlx5_ib_dev *dev,
++						       int access_mode)
++{
++	int min_log_size = 0;
++
++	if (access_mode == MLX5_MKC_ACCESS_MODE_KSM &&
++	    MLX5_CAP_GEN_2(dev->mdev,
++			   min_mkey_log_entity_size_fixed_buffer_valid))
++		min_log_size = MLX5_CAP_GEN_2(
++			dev->mdev, min_mkey_log_entity_size_fixed_buffer);
++	else
++		min_log_size =
++			MLX5_CAP_GEN_2(dev->mdev, log_min_mkey_entity_size);
++
++	min_log_size = max(min_log_size, MLX5_ADAPTER_PAGE_SHIFT);
++	return min_log_size;
++}
++
+ /*
+  * For mkc users, instead of a page_offset the command has a start_iova which
+  * specifies both the page_offset and the on-the-wire IOVA
+  */
+ static __always_inline unsigned long
+ mlx5_umem_mkc_find_best_pgsz(struct mlx5_ib_dev *dev, struct ib_umem *umem,
+-			     u64 iova)
++			     u64 iova, int access_mode)
+ {
+-	int page_size_bits =
+-		MLX5_CAP_GEN_2(dev->mdev, umr_log_entity_size_5) ? 6 : 5;
+-	unsigned long bitmap =
+-		__mlx5_log_page_size_to_bitmap(page_size_bits, 0);
++	unsigned int max_log_entity_size_cap, min_log_entity_size_cap;
++	unsigned long bitmap;
++
++	max_log_entity_size_cap = get_max_log_entity_size_cap(dev, access_mode);
++	min_log_entity_size_cap = get_min_log_entity_size_cap(dev, access_mode);
++
++	bitmap = GENMASK_ULL(max_log_entity_size_cap, min_log_entity_size_cap);
+ 
+ 	return ib_umem_find_best_pgsz(umem, bitmap, iova);
+ }
+--- a/drivers/infiniband/hw/mlx5/mr.c
++++ b/drivers/infiniband/hw/mlx5/mr.c
+@@ -1130,7 +1130,8 @@ static struct mlx5_ib_mr *alloc_cacheabl
+ 	if (umem->is_dmabuf)
+ 		page_size = mlx5_umem_dmabuf_default_pgsz(umem, iova);
+ 	else
+-		page_size = mlx5_umem_mkc_find_best_pgsz(dev, umem, iova);
++		page_size = mlx5_umem_mkc_find_best_pgsz(dev, umem, iova,
++							 access_mode);
+ 	if (WARN_ON(!page_size))
+ 		return ERR_PTR(-EINVAL);
+ 
+@@ -1435,8 +1436,8 @@ static struct ib_mr *create_real_mr(stru
+ 		mr = alloc_cacheable_mr(pd, umem, iova, access_flags,
+ 					MLX5_MKC_ACCESS_MODE_MTT);
+ 	} else {
+-		unsigned long page_size =
+-			mlx5_umem_mkc_find_best_pgsz(dev, umem, iova);
++		unsigned long page_size = mlx5_umem_mkc_find_best_pgsz(
++				dev, umem, iova, MLX5_MKC_ACCESS_MODE_MTT);
+ 
+ 		mutex_lock(&dev->slow_path_mutex);
+ 		mr = reg_create(pd, umem, iova, access_flags, page_size,
+@@ -1754,7 +1755,8 @@ static bool can_use_umr_rereg_pas(struct
+ 	if (!mlx5r_umr_can_load_pas(dev, new_umem->length))
+ 		return false;
+ 
+-	*page_size = mlx5_umem_mkc_find_best_pgsz(dev, new_umem, iova);
++	*page_size = mlx5_umem_mkc_find_best_pgsz(
++		dev, new_umem, iova, mr->mmkey.cache_ent->rb_key.access_mode);
+ 	if (WARN_ON(!*page_size))
+ 		return false;
+ 	return (mr->mmkey.cache_ent->rb_key.ndescs) >=
