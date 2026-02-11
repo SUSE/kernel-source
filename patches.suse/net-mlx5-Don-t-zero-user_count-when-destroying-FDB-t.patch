@@ -1,0 +1,72 @@
+From: Cosmin Ratiu <cratiu@nvidia.com>
+Date: Sun, 26 Oct 2025 22:20:19 +0200
+Subject: net/mlx5: Don't zero user_count when destroying FDB tables
+Patch-mainline: v6.18-rc4
+Git-commit: 53110232c95ff56067fd96c75a1a1c53d10dcd98
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+esw->user_count tracks how many TC rules are added on an esw via
+mlx5e_configure_flower -> mlx5_esw_get -> atomic64_inc(&esw->user_count)
+
+esw.user_count was unconditionally set to 0 in
+esw_destroy_legacy_fdb_table and esw_destroy_offloads_fdb_tables.
+
+These two together can lead to the following sequence of events:
+1. echo 1 > /sys/class/net/eth2/device/sriov_numvfs
+  - mlx5_core_sriov_configure -...-> esw_create_legacy_table ->
+    atomic64_set(&esw->user_count, 0)
+2. tc qdisc add dev eth2 ingress && \
+   tc filter replace dev eth2 pref 1 protocol ip chain 0 ingress \
+       handle 1 flower action ct nat zone 64000 pipe
+  - mlx5e_configure_flower -> mlx5_esw_get ->
+    atomic64_inc(&esw->user_count)
+3. echo 0 > /sys/class/net/eth2/device/sriov_numvfs
+  - mlx5_core_sriov_configure -..-> esw_destroy_legacy_fdb_table
+    -> atomic64_set(&esw->user_count, 0)
+4. devlink dev eswitch set pci/0000:08:00.0 mode switchdev
+  - mlx5_devlink_eswitch_mode_set -> mlx5_esw_try_lock ->
+    atomic64_read(&esw->user_count) == 0
+  - then proceed to a WARN_ON in:
+  esw_offloads_start -> mlx5_eswitch_enable_locke -> esw_offloads_enable
+  -> mlx5_esw_offloads_rep_load -> mlx5e_vport_rep_load ->
+  mlx5e_netdev_change_profile -> mlx5e_detach_netdev ->
+  mlx5e_cleanup_nic_rx -> mlx5e_tc_nic_cleanup ->
+  mlx5e_mod_hdr_tbl_destroy
+
+Fix this by not clearing out the user_count when destroying FDB tables,
+so that the check in mlx5_esw_try_lock can prevent the mode change when
+there are TC rules configured, as originally intended.
+
+Fixes: 2318b8bb94a3 ("net/mlx5: E-switch, Destroy legacy fdb table when needed")
+Signed-off-by: Cosmin Ratiu <cratiu@nvidia.com>
+Reviewed-by: Dragos Tatulea <dtatulea@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Link: https://patch.msgid.link/1761510019-938772-1-git-send-email-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/esw/legacy.c       |    1 -
+ drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c |    1 -
+ 2 files changed, 2 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/esw/legacy.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/esw/legacy.c
+@@ -66,7 +66,6 @@ static void esw_destroy_legacy_fdb_table
+ 	esw->fdb_table.legacy.addr_grp = NULL;
+ 	esw->fdb_table.legacy.allmulti_grp = NULL;
+ 	esw->fdb_table.legacy.promisc_grp = NULL;
+-	atomic64_set(&esw->user_count, 0);
+ }
+ 
+ static int esw_create_legacy_fdb_table(struct mlx5_eswitch *esw)
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@ -1978,7 +1978,6 @@ static void esw_destroy_offloads_fdb_tab
+ 	/* Holds true only as long as DMFS is the default */
+ 	mlx5_flow_namespace_set_mode(esw->fdb_table.offloads.ns,
+ 				     MLX5_FLOW_STEERING_MODE_DMFS);
+-	atomic64_set(&esw->user_count, 0);
+ }
+ 
+ static int esw_get_nr_ft_offloads_steering_src_ports(struct mlx5_eswitch *esw)
