@@ -1,0 +1,141 @@
+From: Tariq Toukan <tariqt@nvidia.com>
+Date: Thu, 30 Oct 2025 15:32:34 +0200
+Subject: net/mlx5e: Use TIR API in mlx5e_modify_tirs_lb()
+Patch-mainline: v6.19-rc1
+Git-commit: 5c51a86122b20326229c6c9dff4a92c186cbb6bf
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+Extend the TIR API and use it in mlx5e_modify_tirs_lb() instead of the
+explicit modify_tir code.
+
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Reviewed-by: Carolina Jubran <cjubran@nvidia.com>
+Reviewed-by: Dragos Tatulea <dtatulea@nvidia.com>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Link: https://patch.msgid.link/1761831159-1013140-3-git-send-email-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en/tir.c    |   29 ++++++++++++--
+ drivers/net/ethernet/mellanox/mlx5/core/en/tir.h    |    3 +
+ drivers/net/ethernet/mellanox/mlx5/core/en_common.c |   41 ++++++--------------
+ 3 files changed, 43 insertions(+), 30 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/tir.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/tir.c
+@@ -146,6 +146,31 @@ void mlx5e_tir_builder_build_direct(stru
+ 	MLX5_SET(tirc, tirc, rx_hash_fn, MLX5_RX_HASH_FN_INVERTED_XOR8);
+ }
+ 
++static void mlx5e_tir_context_self_lb_block(void *tirc, bool enable_uc_lb,
++					    bool enable_mc_lb)
++{
++	u8 lb_flags = 0;
++
++	if (enable_uc_lb)
++		lb_flags = MLX5_TIRC_SELF_LB_BLOCK_BLOCK_UNICAST;
++	if (enable_mc_lb)
++		lb_flags |= MLX5_TIRC_SELF_LB_BLOCK_BLOCK_MULTICAST;
++
++	MLX5_SET(tirc, tirc, self_lb_block, lb_flags);
++}
++
++void mlx5e_tir_builder_build_self_lb_block(struct mlx5e_tir_builder *builder,
++					   bool enable_uc_lb,
++					   bool enable_mc_lb)
++{
++	void *tirc = mlx5e_tir_builder_get_tirc(builder);
++
++	if (builder->modify)
++		MLX5_SET(modify_tir_in, builder->in, bitmask.self_lb_en, 1);
++
++	mlx5e_tir_context_self_lb_block(tirc, enable_uc_lb, enable_mc_lb);
++}
++
+ void mlx5e_tir_builder_build_tls(struct mlx5e_tir_builder *builder)
+ {
+ 	void *tirc = mlx5e_tir_builder_get_tirc(builder);
+@@ -153,9 +178,7 @@ void mlx5e_tir_builder_build_tls(struct
+ 	WARN_ON(builder->modify);
+ 
+ 	MLX5_SET(tirc, tirc, tls_en, 1);
+-	MLX5_SET(tirc, tirc, self_lb_block,
+-		 MLX5_TIRC_SELF_LB_BLOCK_BLOCK_UNICAST |
+-		 MLX5_TIRC_SELF_LB_BLOCK_BLOCK_MULTICAST);
++	mlx5e_tir_context_self_lb_block(tirc, true, true);
+ }
+ 
+ int mlx5e_tir_init(struct mlx5e_tir *tir, struct mlx5e_tir_builder *builder,
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/tir.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/tir.h
+@@ -35,6 +35,9 @@ void mlx5e_tir_builder_build_rss(struct
+ 				 const struct mlx5e_rss_params_traffic_type *rss_tt,
+ 				 bool inner);
+ void mlx5e_tir_builder_build_direct(struct mlx5e_tir_builder *builder);
++void mlx5e_tir_builder_build_self_lb_block(struct mlx5e_tir_builder *builder,
++					   bool enable_uc_lb,
++					   bool enable_mc_lb);
+ void mlx5e_tir_builder_build_tls(struct mlx5e_tir_builder *builder);
+ 
+ struct mlx5_core_dev;
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_common.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_common.c
+@@ -250,44 +250,31 @@ void mlx5e_destroy_mdev_resources(struct
+ int mlx5e_modify_tirs_lb(struct mlx5_core_dev *mdev, bool enable_uc_lb,
+ 			 bool enable_mc_lb)
+ {
++	struct mlx5e_tir_builder *builder;
+ 	struct mlx5e_tir *tir;
+-	u8 lb_flags = 0;
+-	int err  = 0;
+-	u32 tirn = 0;
+-	int inlen;
+-	void *in;
++	int err = 0;
+ 
+-	inlen = MLX5_ST_SZ_BYTES(modify_tir_in);
+-	in = kvzalloc(inlen, GFP_KERNEL);
+-	if (!in)
++	builder = mlx5e_tir_builder_alloc(true);
++	if (!builder)
+ 		return -ENOMEM;
+ 
+-	if (enable_uc_lb)
+-		lb_flags = MLX5_TIRC_SELF_LB_BLOCK_BLOCK_UNICAST;
+-
+-	if (enable_mc_lb)
+-		lb_flags |= MLX5_TIRC_SELF_LB_BLOCK_BLOCK_MULTICAST;
+-
+-	if (lb_flags)
+-		MLX5_SET(modify_tir_in, in, ctx.self_lb_block, lb_flags);
+-
+-	MLX5_SET(modify_tir_in, in, bitmask.self_lb_en, 1);
++	mlx5e_tir_builder_build_self_lb_block(builder, enable_uc_lb,
++					      enable_mc_lb);
+ 
+ 	mutex_lock(&mdev->mlx5e_res.hw_objs.td.list_lock);
+ 	list_for_each_entry(tir, &mdev->mlx5e_res.hw_objs.td.tirs_list, list) {
+-		tirn = tir->tirn;
+-		err = mlx5_core_modify_tir(mdev, tirn, in);
+-		if (err)
++		err = mlx5e_tir_modify(tir, builder);
++		if (err) {
++			mlx5_core_err(mdev,
++				      "modify tir(0x%x) enable_lb uc(%d) mc(%d) failed, %d\n",
++				      mlx5e_tir_get_tirn(tir),
++				      enable_uc_lb, enable_mc_lb, err);
+ 			break;
++		}
+ 	}
+ 	mutex_unlock(&mdev->mlx5e_res.hw_objs.td.list_lock);
+ 
+-	kvfree(in);
+-	if (err)
+-		mlx5_core_err(mdev,
+-			      "modify tir(0x%x) enable_lb uc(%d) mc(%d) failed, %d\n",
+-			      tirn,
+-			      enable_uc_lb, enable_mc_lb, err);
++	mlx5e_tir_builder_free(builder);
+ 
+ 	return err;
+ }
