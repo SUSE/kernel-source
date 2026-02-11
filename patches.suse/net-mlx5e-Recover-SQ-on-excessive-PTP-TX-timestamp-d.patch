@@ -1,0 +1,115 @@
+From: Carolina Jubran <cjubran@nvidia.com>
+Date: Mon, 17 Nov 2025 23:42:06 +0200
+Subject: net/mlx5e: Recover SQ on excessive PTP TX timestamp delta
+Patch-mainline: v6.19-rc1
+Git-commit: 391dad2e686f214932f769847cc8603a7df389eb
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+Extend the TX timestamp handler to recover the SQ when the difference
+between the port and CQE TX timestamps is abnormally large.
+
+The current logic aborts timestamp delivery if the delta exceeds
+1/128 seconds, which matches the maximum expected packet interval in
+ptp4l. A larger delta makes the timestamps unreliable.
+
+This change adds recovery if the delta exceeds 0.5 seconds. Such a
+large gap should not occur in normal operation and indicates that
+firmware is stuck or metadata tracking is out of sync, leading to stale
+or mismatched timestamps. Recovering the SQ ensures forward progress
+and avoids silently dropping invalid timestamps.
+
+The timestamp handler now takes mlx5e_ptpsq directly to access both CQ
+stats and the recovery state.
+
+Signed-off-by: Carolina Jubran <cjubran@nvidia.com>
+Reviewed-by: Shahar Shitrit <shshitrit@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://patch.msgid.link/1763415729-1238421-3-git-send-email-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en/ptp.c |   21 +++++++++++++++------
+ drivers/net/ethernet/mellanox/mlx5/core/en/ptp.h |    2 +-
+ drivers/net/ethernet/mellanox/mlx5/core/en_tx.c  |    2 +-
+ 3 files changed, 17 insertions(+), 8 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/ptp.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/ptp.c
+@@ -81,7 +81,7 @@ static struct mlx5e_skb_cb_hwtstamp *mlx
+ }
+ 
+ static void mlx5e_skb_cb_hwtstamp_tx(struct sk_buff *skb,
+-				     struct mlx5e_ptp_cq_stats *cq_stats)
++				     struct mlx5e_ptpsq *ptpsq)
+ {
+ 	struct skb_shared_hwtstamps hwts = {};
+ 	ktime_t diff;
+@@ -91,8 +91,17 @@ static void mlx5e_skb_cb_hwtstamp_tx(str
+ 
+ 	/* Maximal allowed diff is 1 / 128 second */
+ 	if (diff > (NSEC_PER_SEC >> 7)) {
+-		cq_stats->abort++;
+-		cq_stats->abort_abs_diff_ns += diff;
++		struct mlx5e_txqsq *sq = &ptpsq->txqsq;
++
++		ptpsq->cq_stats->abort++;
++		ptpsq->cq_stats->abort_abs_diff_ns += diff;
++		if (diff > (NSEC_PER_SEC >> 1) &&
++		    !test_and_set_bit(MLX5E_SQ_STATE_RECOVERING, &sq->state)) {
++			netdev_warn(sq->channel->netdev,
++				    "PTP TX timestamp difference between CQE and port exceeds threshold: %lld ns, recovering SQ %u\n",
++				    (s64)diff, sq->sqn);
++			queue_work(sq->priv->wq, &ptpsq->report_unhealthy_work);
++		}
+ 		return;
+ 	}
+ 
+@@ -102,7 +111,7 @@ static void mlx5e_skb_cb_hwtstamp_tx(str
+ 
+ void mlx5e_skb_cb_hwtstamp_handler(struct sk_buff *skb, int hwtstamp_type,
+ 				   ktime_t hwtstamp,
+-				   struct mlx5e_ptp_cq_stats *cq_stats)
++				   struct mlx5e_ptpsq *ptpsq)
+ {
+ 	switch (hwtstamp_type) {
+ 	case (MLX5E_SKB_CB_CQE_HWTSTAMP):
+@@ -120,7 +129,7 @@ void mlx5e_skb_cb_hwtstamp_handler(struc
+ 	    !mlx5e_skb_cb_get_hwts(skb)->port_hwtstamp)
+ 		return;
+ 
+-	mlx5e_skb_cb_hwtstamp_tx(skb, cq_stats);
++	mlx5e_skb_cb_hwtstamp_tx(skb, ptpsq);
+ 	memset(skb->cb, 0, sizeof(struct mlx5e_skb_cb_hwtstamp));
+ }
+ 
+@@ -208,7 +217,7 @@ static void mlx5e_ptp_handle_ts_cqe(stru
+ 
+ 	hwtstamp = mlx5e_cqe_ts_to_ns(sq->ptp_cyc2time, sq->clock, get_cqe_ts(cqe));
+ 	mlx5e_skb_cb_hwtstamp_handler(skb, MLX5E_SKB_CB_PORT_HWTSTAMP,
+-				      hwtstamp, ptpsq->cq_stats);
++				      hwtstamp, ptpsq);
+ 	ptpsq->cq_stats->cqe++;
+ 
+ 	mlx5e_ptpsq_mark_ts_cqes_undelivered(ptpsq, hwtstamp);
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/ptp.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/ptp.h
+@@ -147,7 +147,7 @@ enum {
+ 
+ void mlx5e_skb_cb_hwtstamp_handler(struct sk_buff *skb, int hwtstamp_type,
+ 				   ktime_t hwtstamp,
+-				   struct mlx5e_ptp_cq_stats *cq_stats);
++				   struct mlx5e_ptpsq *ptpsq);
+ 
+ void mlx5e_skb_cb_hwtstamp_init(struct sk_buff *skb);
+ #endif /* __MLX5_EN_PTP_H__ */
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+@@ -749,7 +749,7 @@ static void mlx5e_consume_skb(struct mlx
+ 		hwts.hwtstamp = mlx5e_cqe_ts_to_ns(sq->ptp_cyc2time, sq->clock, ts);
+ 		if (sq->ptpsq) {
+ 			mlx5e_skb_cb_hwtstamp_handler(skb, MLX5E_SKB_CB_CQE_HWTSTAMP,
+-						      hwts.hwtstamp, sq->ptpsq->cq_stats);
++						      hwts.hwtstamp, sq->ptpsq);
+ 		} else {
+ 			skb_tstamp_tx(skb, &hwts);
+ 			sq->stats->timestamps++;
