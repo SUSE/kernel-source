@@ -1,0 +1,402 @@
+From: Mark Bloch <mbloch@nvidia.com>
+Date: Thu, 23 Oct 2025 12:16:57 +0300
+Subject: net/mlx5: Add software system image GUID infrastructure
+Patch-mainline: v6.19-rc1
+Git-commit: 7718f2a8b87af7363d60819ac0ac0da8b2f8ff00
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+Replace direct hardware system image GUID usage with a new software
+system image GUID function that supports variable-length identifiers.
+
+Key changes:
+- Add mlx5_query_nic_sw_system_image_guid() function with length parameter.
+- Update all callsites to use the new function and buffer/length approach.
+- Modify mapping contexts to use byte arrays instead of u64 keys.
+- Update devcom matching to support variable-length keys.
+- Change mlx5_same_hw_devs() to use buffer comparison instead of u64.
+
+This refactoring prepares the infrastructure for balance ID support,
+which requires extending the system image GUID with additional data.
+The change maintains backward compatibility while enabling future
+enhancements.
+
+Signed-off-by: Mark Bloch <mbloch@nvidia.com>
+Reviewed-by: Shay Drori <shayd@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://patch.msgid.link/1761211020-925651-3-git-send-email-tariqt@nvidia.com
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/dev.c              |   12 ++++--
+ drivers/net/ethernet/mellanox/mlx5/core/en/devlink.c       |    7 +--
+ drivers/net/ethernet/mellanox/mlx5/core/en/mapping.c       |   13 ++++--
+ drivers/net/ethernet/mellanox/mlx5/core/en/mapping.h       |    3 +
+ drivers/net/ethernet/mellanox/mlx5/core/en/tc/int_port.c   |    8 ++--
+ drivers/net/ethernet/mellanox/mlx5/core/en/tc_ct.c         |   11 +++--
+ drivers/net/ethernet/mellanox/mlx5/core/en_tc.c            |   26 ++++++++-----
+ drivers/net/ethernet/mellanox/mlx5/core/esw/devlink_port.c |    6 ---
+ drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c |    8 ++--
+ drivers/net/ethernet/mellanox/mlx5/core/lag/lag.c          |    4 +-
+ drivers/net/ethernet/mellanox/mlx5/core/lib/devcom.h       |    2 +
+ drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h        |    2 +
+ drivers/net/ethernet/mellanox/mlx5/core/vport.c            |   15 +++++++
+ include/linux/mlx5/driver.h                                |    3 +
+ 14 files changed, 80 insertions(+), 40 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/dev.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/dev.c
+@@ -564,10 +564,14 @@ int mlx5_rescan_drivers_locked(struct ml
+ 
+ bool mlx5_same_hw_devs(struct mlx5_core_dev *dev, struct mlx5_core_dev *peer_dev)
+ {
+-	u64 fsystem_guid, psystem_guid;
++	u8 fsystem_guid[MLX5_SW_IMAGE_GUID_MAX_BYTES];
++	u8 psystem_guid[MLX5_SW_IMAGE_GUID_MAX_BYTES];
++	u8 flen;
++	u8 plen;
+ 
+-	fsystem_guid = mlx5_query_nic_system_image_guid(dev);
+-	psystem_guid = mlx5_query_nic_system_image_guid(peer_dev);
++	mlx5_query_nic_sw_system_image_guid(dev, fsystem_guid, &flen);
++	mlx5_query_nic_sw_system_image_guid(peer_dev, psystem_guid, &plen);
+ 
+-	return (fsystem_guid && psystem_guid && fsystem_guid == psystem_guid);
++	return plen && flen && flen == plen &&
++		!memcmp(fsystem_guid, psystem_guid, flen);
+ }
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/devlink.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/devlink.c
+@@ -40,11 +40,8 @@ void mlx5e_destroy_devlink(struct mlx5e_
+ static void
+ mlx5e_devlink_get_port_parent_id(struct mlx5_core_dev *dev, struct netdev_phys_item_id *ppid)
+ {
+-	u64 parent_id;
+-
+-	parent_id = mlx5_query_nic_system_image_guid(dev);
+-	ppid->id_len = sizeof(parent_id);
+-	memcpy(ppid->id, &parent_id, sizeof(parent_id));
++	BUILD_BUG_ON(MLX5_SW_IMAGE_GUID_MAX_BYTES > MAX_PHYS_ITEM_ID_LEN);
++	mlx5_query_nic_sw_system_image_guid(dev, ppid->id, &ppid->id_len);
+ }
+ 
+ int mlx5e_devlink_port_register(struct mlx5e_dev *mlx5e_dev,
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/mapping.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/mapping.c
+@@ -6,6 +6,7 @@
+ #include <linux/xarray.h>
+ #include <linux/hashtable.h>
+ #include <linux/refcount.h>
++#include <linux/mlx5/driver.h>
+ 
+ #include "mapping.h"
+ 
+@@ -24,7 +25,8 @@ struct mapping_ctx {
+ 	struct delayed_work dwork;
+ 	struct list_head pending_list;
+ 	spinlock_t pending_list_lock; /* Guards pending list */
+-	u64 id;
++	u8 id[MLX5_SW_IMAGE_GUID_MAX_BYTES];
++	u8 id_len;
+ 	u8 type;
+ 	struct list_head list;
+ 	refcount_t refcount;
+@@ -220,13 +222,15 @@ mapping_create(size_t data_size, u32 max
+ }
+ 
+ struct mapping_ctx *
+-mapping_create_for_id(u64 id, u8 type, size_t data_size, u32 max_id, bool delayed_removal)
++mapping_create_for_id(u8 *id, u8 id_len, u8 type, size_t data_size, u32 max_id,
++		      bool delayed_removal)
+ {
+ 	struct mapping_ctx *ctx;
+ 
+ 	mutex_lock(&shared_ctx_lock);
+ 	list_for_each_entry(ctx, &shared_ctx_list, list) {
+-		if (ctx->id == id && ctx->type == type) {
++		if (ctx->type == type && ctx->id_len == id_len &&
++		    !memcmp(id, ctx->id, id_len)) {
+ 			if (refcount_inc_not_zero(&ctx->refcount))
+ 				goto unlock;
+ 			break;
+@@ -237,7 +241,8 @@ mapping_create_for_id(u64 id, u8 type, s
+ 	if (IS_ERR(ctx))
+ 		goto unlock;
+ 
+-	ctx->id = id;
++	memcpy(ctx->id, id, id_len);
++	ctx->id_len = id_len;
+ 	ctx->type = type;
+ 	list_add(&ctx->list, &shared_ctx_list);
+ 
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/mapping.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/mapping.h
+@@ -27,6 +27,7 @@ void mapping_destroy(struct mapping_ctx
+ /* adds mapping with an id or get an existing mapping with the same id
+  */
+ struct mapping_ctx *
+-mapping_create_for_id(u64 id, u8 type, size_t data_size, u32 max_id, bool delayed_removal);
++mapping_create_for_id(u8 *id, u8 id_len, u8 type, size_t data_size, u32 max_id,
++		      bool delayed_removal);
+ 
+ #endif /* __MLX5_MAPPING_H__ */
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/tc/int_port.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/tc/int_port.c
+@@ -307,7 +307,8 @@ mlx5e_tc_int_port_init(struct mlx5e_priv
+ {
+ 	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
+ 	struct mlx5e_tc_int_port_priv *int_port_priv;
+-	u64 mapping_id;
++	u8 mapping_id[MLX5_SW_IMAGE_GUID_MAX_BYTES];
++	u8 id_len;
+ 
+ 	if (!mlx5e_tc_int_port_supported(esw))
+ 		return NULL;
+@@ -316,9 +317,10 @@ mlx5e_tc_int_port_init(struct mlx5e_priv
+ 	if (!int_port_priv)
+ 		return NULL;
+ 
+-	mapping_id = mlx5_query_nic_system_image_guid(priv->mdev);
++	mlx5_query_nic_sw_system_image_guid(priv->mdev, mapping_id, &id_len);
+ 
+-	int_port_priv->metadata_mapping = mapping_create_for_id(mapping_id, MAPPING_TYPE_INT_PORT,
++	int_port_priv->metadata_mapping = mapping_create_for_id(mapping_id, id_len,
++								MAPPING_TYPE_INT_PORT,
+ 								sizeof(u32) * 2,
+ 								(1 << ESW_VPORT_BITS) - 1, true);
+ 	if (IS_ERR(int_port_priv->metadata_mapping)) {
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/tc_ct.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/tc_ct.c
+@@ -2287,9 +2287,10 @@ mlx5_tc_ct_init(struct mlx5e_priv *priv,
+ 		enum mlx5_flow_namespace_type ns_type,
+ 		struct mlx5e_post_act *post_act)
+ {
++	u8 mapping_id[MLX5_SW_IMAGE_GUID_MAX_BYTES];
+ 	struct mlx5_tc_ct_priv *ct_priv;
+ 	struct mlx5_core_dev *dev;
+-	u64 mapping_id;
++	u8 id_len;
+ 	int err;
+ 
+ 	dev = priv->mdev;
+@@ -2301,16 +2302,18 @@ mlx5_tc_ct_init(struct mlx5e_priv *priv,
+ 	if (!ct_priv)
+ 		goto err_alloc;
+ 
+-	mapping_id = mlx5_query_nic_system_image_guid(dev);
++	mlx5_query_nic_sw_system_image_guid(dev, mapping_id, &id_len);
+ 
+-	ct_priv->zone_mapping = mapping_create_for_id(mapping_id, MAPPING_TYPE_ZONE,
++	ct_priv->zone_mapping = mapping_create_for_id(mapping_id, id_len,
++						      MAPPING_TYPE_ZONE,
+ 						      sizeof(u16), 0, true);
+ 	if (IS_ERR(ct_priv->zone_mapping)) {
+ 		err = PTR_ERR(ct_priv->zone_mapping);
+ 		goto err_mapping_zone;
+ 	}
+ 
+-	ct_priv->labels_mapping = mapping_create_for_id(mapping_id, MAPPING_TYPE_LABELS,
++	ct_priv->labels_mapping = mapping_create_for_id(mapping_id, id_len,
++							MAPPING_TYPE_LABELS,
+ 							sizeof(u32) * 4, 0, true);
+ 	if (IS_ERR(ct_priv->labels_mapping)) {
+ 		err = PTR_ERR(ct_priv->labels_mapping);
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@ -5233,10 +5233,11 @@ static void mlx5e_tc_nic_destroy_miss_ta
+ int mlx5e_tc_nic_init(struct mlx5e_priv *priv)
+ {
+ 	struct mlx5e_tc_table *tc = mlx5e_fs_get_tc(priv->fs);
++	u8 mapping_id[MLX5_SW_IMAGE_GUID_MAX_BYTES];
+ 	struct mlx5_core_dev *dev = priv->mdev;
+ 	struct mapping_ctx *chains_mapping;
+ 	struct mlx5_chains_attr attr = {};
+-	u64 mapping_id;
++	u8 id_len;
+ 	int err;
+ 
+ 	mlx5e_mod_hdr_tbl_init(&tc->mod_hdr);
+@@ -5252,11 +5253,13 @@ int mlx5e_tc_nic_init(struct mlx5e_priv
+ 	lockdep_set_class(&tc->ht.mutex, &tc_ht_lock_key);
+ 	lockdep_init_map(&tc->ht.run_work.lockdep_map, "tc_ht_wq_key", &tc_ht_wq_key, 0);
+ 
+-	mapping_id = mlx5_query_nic_system_image_guid(dev);
++	mlx5_query_nic_sw_system_image_guid(dev, mapping_id, &id_len);
+ 
+-	chains_mapping = mapping_create_for_id(mapping_id, MAPPING_TYPE_CHAIN,
++	chains_mapping = mapping_create_for_id(mapping_id, id_len,
++					       MAPPING_TYPE_CHAIN,
+ 					       sizeof(struct mlx5_mapped_obj),
+-					       MLX5E_TC_TABLE_CHAIN_TAG_MASK, true);
++					       MLX5E_TC_TABLE_CHAIN_TAG_MASK,
++					       true);
+ 
+ 	if (IS_ERR(chains_mapping)) {
+ 		err = PTR_ERR(chains_mapping);
+@@ -5387,14 +5390,15 @@ void mlx5e_tc_ht_cleanup(struct rhashtab
+ int mlx5e_tc_esw_init(struct mlx5_rep_uplink_priv *uplink_priv)
+ {
+ 	const size_t sz_enc_opts = sizeof(struct tunnel_match_enc_opts);
++	u8 mapping_id[MLX5_SW_IMAGE_GUID_MAX_BYTES];
+ 	struct mlx5_devcom_match_attr attr = {};
+ 	struct netdev_phys_item_id ppid;
+ 	struct mlx5e_rep_priv *rpriv;
+ 	struct mapping_ctx *mapping;
+ 	struct mlx5_eswitch *esw;
+ 	struct mlx5e_priv *priv;
+-	u64 mapping_id;
+ 	int err = 0;
++	u8 id_len;
+ 
+ 	rpriv = container_of(uplink_priv, struct mlx5e_rep_priv, uplink_priv);
+ 	priv = netdev_priv(rpriv->netdev);
+@@ -5412,9 +5416,9 @@ int mlx5e_tc_esw_init(struct mlx5_rep_up
+ 
+ 	uplink_priv->tc_psample = mlx5e_tc_sample_init(esw, uplink_priv->post_act);
+ 
+-	mapping_id = mlx5_query_nic_system_image_guid(esw->dev);
++	mlx5_query_nic_sw_system_image_guid(esw->dev, mapping_id, &id_len);
+ 
+-	mapping = mapping_create_for_id(mapping_id, MAPPING_TYPE_TUNNEL,
++	mapping = mapping_create_for_id(mapping_id, id_len, MAPPING_TYPE_TUNNEL,
+ 					sizeof(struct tunnel_match_key),
+ 					TUNNEL_INFO_BITS_MASK, true);
+ 
+@@ -5427,8 +5431,10 @@ int mlx5e_tc_esw_init(struct mlx5_rep_up
+ 	/* Two last values are reserved for stack devices slow path table mark
+ 	 * and bridge ingress push mark.
+ 	 */
+-	mapping = mapping_create_for_id(mapping_id, MAPPING_TYPE_TUNNEL_ENC_OPTS,
+-					sz_enc_opts, ENC_OPTS_BITS_MASK - 2, true);
++	mapping = mapping_create_for_id(mapping_id, id_len,
++					MAPPING_TYPE_TUNNEL_ENC_OPTS,
++					sz_enc_opts, ENC_OPTS_BITS_MASK - 2,
++					true);
+ 	if (IS_ERR(mapping)) {
+ 		err = PTR_ERR(mapping);
+ 		goto err_enc_opts_mapping;
+@@ -5449,7 +5455,7 @@ int mlx5e_tc_esw_init(struct mlx5_rep_up
+ 
+ 	err = dev_get_port_parent_id(priv->netdev, &ppid, false);
+ 	if (!err) {
+-		memcpy(&attr.key.val, &ppid.id, sizeof(attr.key.val));
++		memcpy(&attr.key.buf, &ppid.id, ppid.id_len);
+ 		attr.flags = MLX5_DEVCOM_MATCH_FLAGS_NS;
+ 		attr.net = mlx5_core_net(esw->dev);
+ 		mlx5_esw_offloads_devcom_init(esw, &attr);
+--- a/drivers/net/ethernet/mellanox/mlx5/core/esw/devlink_port.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/esw/devlink_port.c
+@@ -7,11 +7,7 @@
+ static void
+ mlx5_esw_get_port_parent_id(struct mlx5_core_dev *dev, struct netdev_phys_item_id *ppid)
+ {
+-	u64 parent_id;
+-
+-	parent_id = mlx5_query_nic_system_image_guid(dev);
+-	ppid->id_len = sizeof(parent_id);
+-	memcpy(ppid->id, &parent_id, sizeof(parent_id));
++	mlx5_query_nic_sw_system_image_guid(dev, ppid->id, &ppid->id_len);
+ }
+ 
+ static bool mlx5_esw_devlink_port_supported(struct mlx5_eswitch *esw, u16 vport_num)
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@ -3556,10 +3556,11 @@ bool mlx5_esw_offloads_controller_valid(
+ 
+ int esw_offloads_enable(struct mlx5_eswitch *esw)
+ {
++	u8 mapping_id[MLX5_SW_IMAGE_GUID_MAX_BYTES];
+ 	struct mapping_ctx *reg_c0_obj_pool;
+ 	struct mlx5_vport *vport;
+ 	unsigned long i;
+-	u64 mapping_id;
++	u8 id_len;
+ 	int err;
+ 
+ 	mutex_init(&esw->offloads.termtbl_mutex);
+@@ -3581,9 +3582,10 @@ int esw_offloads_enable(struct mlx5_eswi
+ 	if (err)
+ 		goto err_vport_metadata;
+ 
+-	mapping_id = mlx5_query_nic_system_image_guid(esw->dev);
++	mlx5_query_nic_sw_system_image_guid(esw->dev, mapping_id, &id_len);
+ 
+-	reg_c0_obj_pool = mapping_create_for_id(mapping_id, MAPPING_TYPE_CHAIN,
++	reg_c0_obj_pool = mapping_create_for_id(mapping_id, id_len,
++						MAPPING_TYPE_CHAIN,
+ 						sizeof(struct mlx5_mapped_obj),
+ 						ESW_REG_C0_USER_DATA_METADATA_MASK,
+ 						true);
+--- a/drivers/net/ethernet/mellanox/mlx5/core/lag/lag.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/lag/lag.c
+@@ -1418,10 +1418,12 @@ static void mlx5_lag_unregister_hca_devc
+ static int mlx5_lag_register_hca_devcom_comp(struct mlx5_core_dev *dev)
+ {
+ 	struct mlx5_devcom_match_attr attr = {
+-		.key.val = mlx5_query_nic_system_image_guid(dev),
+ 		.flags = MLX5_DEVCOM_MATCH_FLAGS_NS,
+ 		.net = mlx5_core_net(dev),
+ 	};
++	u8 len __always_unused;
++
++	mlx5_query_nic_sw_system_image_guid(dev, attr.key.buf, &len);
+ 
+ 	/* This component is use to sync adding core_dev to lag_dev and to sync
+ 	 * changes of mlx5_adev_devices between LAG layer and other layers.
+--- a/drivers/net/ethernet/mellanox/mlx5/core/lib/devcom.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/lib/devcom.h
+@@ -10,8 +10,10 @@ enum mlx5_devom_match_flags {
+ 	MLX5_DEVCOM_MATCH_FLAGS_NS = BIT(0),
+ };
+ 
++#define MLX5_DEVCOM_MATCH_KEY_MAX 32
+ union mlx5_devcom_match_key {
+ 	u64 val;
++	u8 buf[MLX5_DEVCOM_MATCH_KEY_MAX];
+ };
+ 
+ struct mlx5_devcom_match_attr {
+--- a/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
+@@ -444,6 +444,8 @@ int mlx5_init_one_light(struct mlx5_core
+ void mlx5_uninit_one_light(struct mlx5_core_dev *dev);
+ void mlx5_unload_one_light(struct mlx5_core_dev *dev);
+ 
++void mlx5_query_nic_sw_system_image_guid(struct mlx5_core_dev *mdev, u8 *buf,
++					 u8 *len);
+ int mlx5_vport_set_other_func_cap(struct mlx5_core_dev *dev, const void *hca_cap, u16 vport,
+ 				  u16 opmod);
+ #define mlx5_vport_get_other_func_general_cap(dev, vport, out)		\
+--- a/drivers/net/ethernet/mellanox/mlx5/core/vport.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/vport.c
+@@ -1190,6 +1190,21 @@ u64 mlx5_query_nic_system_image_guid(str
+ }
+ EXPORT_SYMBOL_GPL(mlx5_query_nic_system_image_guid);
+ 
++void mlx5_query_nic_sw_system_image_guid(struct mlx5_core_dev *mdev, u8 *buf,
++					 u8 *len)
++{
++	u64 fw_system_image_guid;
++
++	*len = 0;
++
++	fw_system_image_guid = mlx5_query_nic_system_image_guid(mdev);
++	if (!fw_system_image_guid)
++		return;
++
++	memcpy(buf, &fw_system_image_guid, sizeof(fw_system_image_guid));
++	*len += sizeof(fw_system_image_guid);
++}
++
+ static bool mlx5_vport_use_vhca_id_as_func_id(struct mlx5_core_dev *dev,
+ 					      u16 vport_num, u16 *vhca_id)
+ {
+--- a/include/linux/mlx5/driver.h
++++ b/include/linux/mlx5/driver.h
+@@ -1379,4 +1379,7 @@ static inline struct net *mlx5_core_net(
+ {
+ 	return devlink_net(priv_to_devlink(dev));
+ }
++
++#define MLX5_SW_IMAGE_GUID_MAX_BYTES 8
++
+ #endif /* MLX5_DRIVER_H */
