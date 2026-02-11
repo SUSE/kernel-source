@@ -1,0 +1,308 @@
+From: Carolina Jubran <cjubran@nvidia.com>
+Date: Thu, 30 Oct 2025 12:25:10 +0200
+Subject: net/mlx5e: Convert to new hwtstamp_get/set interface
+Patch-mainline: v6.19-rc1
+Git-commit: 1c7fe48a90158486a66665f1401d0b90bd390ef0
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+Migrate from the legacy ioctl hardware timestamping interface to the
+ndo_hwtstamp_get/set operations.
+
+Signed-off-by: Carolina Jubran <cjubran@nvidia.com>
+Reviewed-by: Cosmin Ratiu <cratiu@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://patch.msgid.link/1761819910-1011051-7-git-send-email-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en.h               |   11 +-
+ drivers/net/ethernet/mellanox/mlx5/core/en/txrx.h          |    2 
+ drivers/net/ethernet/mellanox/mlx5/core/en_main.c          |   57 +++++++------
+ drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c      |   34 ++++---
+ drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.h      |    6 +
+ drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib_vlan.c |    9 --
+ 6 files changed, 65 insertions(+), 54 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -698,7 +698,7 @@ struct mlx5e_rq {
+ 	struct mlx5e_rq_stats *stats;
+ 	struct mlx5e_cq        cq;
+ 	struct mlx5e_cq_decomp cqd;
+-	struct hwtstamp_config *hwtstamp_config;
++	struct kernel_hwtstamp_config *hwtstamp_config;
+ 	struct mlx5_clock      *clock;
+ 	struct mlx5e_icosq    *icosq;
+ 	struct mlx5e_priv     *priv;
+@@ -918,7 +918,7 @@ struct mlx5e_priv {
+ 	u8                         max_opened_tc;
+ 	bool                       tx_ptp_opened;
+ 	bool                       rx_ptp_opened;
+-	struct hwtstamp_config     hwtstamp_config;
++	struct kernel_hwtstamp_config hwtstamp_config;
+ 	u16                        q_counter[MLX5_SD_MAX_GROUP_SZ];
+ 	u16                        drop_rq_q_counter;
+ 	struct notifier_block      events_nb;
+@@ -1023,8 +1023,11 @@ void mlx5e_self_test(struct net_device *
+ 		     u64 *buf);
+ void mlx5e_set_rx_mode_work(struct work_struct *work);
+ 
+-int mlx5e_hwtstamp_set(struct mlx5e_priv *priv, struct ifreq *ifr);
+-int mlx5e_hwtstamp_get(struct mlx5e_priv *priv, struct ifreq *ifr);
++int mlx5e_hwtstamp_set(struct mlx5e_priv *priv,
++		       struct kernel_hwtstamp_config *config,
++		       struct netlink_ext_ack *extack);
++int mlx5e_hwtstamp_get(struct mlx5e_priv *priv,
++		       struct kernel_hwtstamp_config *config);
+ int mlx5e_modify_rx_cqe_compression_locked(struct mlx5e_priv *priv, bool val, bool rx_filter);
+ 
+ int mlx5e_vlan_rx_add_vid(struct net_device *dev, __always_unused __be16 proto,
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/txrx.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/txrx.h
+@@ -92,7 +92,7 @@ int mlx5e_poll_rx_cq(struct mlx5e_cq *cq
+ void mlx5e_free_rx_descs(struct mlx5e_rq *rq);
+ void mlx5e_free_rx_missing_descs(struct mlx5e_rq *rq);
+ 
+-static inline bool mlx5e_rx_hw_stamp(struct hwtstamp_config *config)
++static inline bool mlx5e_rx_hw_stamp(struct kernel_hwtstamp_config *config)
+ {
+ 	return config->rx_filter == HWTSTAMP_FILTER_ALL;
+ }
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -4706,22 +4706,23 @@ static int mlx5e_hwstamp_config_ptp_rx(s
+ 					&new_params.ptp_rx, true);
+ }
+ 
+-int mlx5e_hwtstamp_set(struct mlx5e_priv *priv, struct ifreq *ifr)
++int mlx5e_hwtstamp_set(struct mlx5e_priv *priv,
++		       struct kernel_hwtstamp_config *config,
++		       struct netlink_ext_ack *extack)
+ {
+-	struct hwtstamp_config config;
+ 	bool rx_cqe_compress_def;
+ 	bool ptp_rx;
+ 	int err;
+ 
+ 	if (!MLX5_CAP_GEN(priv->mdev, device_frequency_khz) ||
+-	    (mlx5_clock_get_ptp_index(priv->mdev) == -1))
++	    (mlx5_clock_get_ptp_index(priv->mdev) == -1)) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "Timestamps are not supported on this device");
+ 		return -EOPNOTSUPP;
+-
+-	if (copy_from_user(&config, ifr->ifr_data, sizeof(config)))
+-		return -EFAULT;
++	}
+ 
+ 	/* TX HW timestamp */
+-	switch (config.tx_type) {
++	switch (config->tx_type) {
+ 	case HWTSTAMP_TX_OFF:
+ 	case HWTSTAMP_TX_ON:
+ 		break;
+@@ -4733,7 +4734,7 @@ int mlx5e_hwtstamp_set(struct mlx5e_priv
+ 	rx_cqe_compress_def = priv->channels.params.rx_cqe_compress_def;
+ 
+ 	/* RX HW timestamp */
+-	switch (config.rx_filter) {
++	switch (config->rx_filter) {
+ 	case HWTSTAMP_FILTER_NONE:
+ 		ptp_rx = false;
+ 		break;
+@@ -4752,7 +4753,7 @@ int mlx5e_hwtstamp_set(struct mlx5e_priv
+ 	case HWTSTAMP_FILTER_PTP_V2_SYNC:
+ 	case HWTSTAMP_FILTER_PTP_V2_DELAY_REQ:
+ 	case HWTSTAMP_FILTER_NTP_ALL:
+-		config.rx_filter = HWTSTAMP_FILTER_ALL;
++		config->rx_filter = HWTSTAMP_FILTER_ALL;
+ 		/* ptp_rx is set if both HW TS is set and CQE
+ 		 * compression is set
+ 		 */
+@@ -4765,47 +4766,50 @@ int mlx5e_hwtstamp_set(struct mlx5e_priv
+ 
+ 	if (!mlx5e_profile_feature_cap(priv->profile, PTP_RX))
+ 		err = mlx5e_hwstamp_config_no_ptp_rx(priv,
+-						     config.rx_filter != HWTSTAMP_FILTER_NONE);
++						     config->rx_filter != HWTSTAMP_FILTER_NONE);
+ 	else
+ 		err = mlx5e_hwstamp_config_ptp_rx(priv, ptp_rx);
+ 	if (err)
+ 		goto err_unlock;
+ 
+-	memcpy(&priv->hwtstamp_config, &config, sizeof(config));
++	priv->hwtstamp_config = *config;
+ 	mutex_unlock(&priv->state_lock);
+ 
+ 	/* might need to fix some features */
+ 	netdev_update_features(priv->netdev);
+ 
+-	return copy_to_user(ifr->ifr_data, &config,
+-			    sizeof(config)) ? -EFAULT : 0;
++	return 0;
+ err_unlock:
+ 	mutex_unlock(&priv->state_lock);
+ 	return err;
+ }
+ 
+-int mlx5e_hwtstamp_get(struct mlx5e_priv *priv, struct ifreq *ifr)
++static int mlx5e_hwtstamp_set_ndo(struct net_device *netdev,
++				  struct kernel_hwtstamp_config *config,
++				  struct netlink_ext_ack *extack)
+ {
+-	struct hwtstamp_config *cfg = &priv->hwtstamp_config;
++	struct mlx5e_priv *priv = netdev_priv(netdev);
++
++	return mlx5e_hwtstamp_set(priv, config, extack);
++}
+ 
++int mlx5e_hwtstamp_get(struct mlx5e_priv *priv,
++		       struct kernel_hwtstamp_config *config)
++{
+ 	if (!MLX5_CAP_GEN(priv->mdev, device_frequency_khz))
+ 		return -EOPNOTSUPP;
+ 
+-	return copy_to_user(ifr->ifr_data, cfg, sizeof(*cfg)) ? -EFAULT : 0;
++	*config = priv->hwtstamp_config;
++
++	return 0;
+ }
+ 
+-static int mlx5e_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
++static int mlx5e_hwtstamp_get_ndo(struct net_device *dev,
++				  struct kernel_hwtstamp_config *config)
+ {
+ 	struct mlx5e_priv *priv = netdev_priv(dev);
+ 
+-	switch (cmd) {
+-	case SIOCSHWTSTAMP:
+-		return mlx5e_hwtstamp_set(priv, ifr);
+-	case SIOCGHWTSTAMP:
+-		return mlx5e_hwtstamp_get(priv, ifr);
+-	default:
+-		return -EOPNOTSUPP;
+-	}
++	return mlx5e_hwtstamp_get(priv, config);
+ }
+ 
+ #ifdef CONFIG_MLX5_ESWITCH
+@@ -5249,13 +5253,14 @@ const struct net_device_ops mlx5e_netdev
+ 	.ndo_set_features        = mlx5e_set_features,
+ 	.ndo_fix_features        = mlx5e_fix_features,
+ 	.ndo_change_mtu          = mlx5e_change_nic_mtu,
+-	.ndo_eth_ioctl            = mlx5e_ioctl,
+ 	.ndo_set_tx_maxrate      = mlx5e_set_tx_maxrate,
+ 	.ndo_features_check      = mlx5e_features_check,
+ 	.ndo_tx_timeout          = mlx5e_tx_timeout,
+ 	.ndo_bpf		 = mlx5e_xdp,
+ 	.ndo_xdp_xmit            = mlx5e_xdp_xmit,
+ 	.ndo_xsk_wakeup          = mlx5e_xsk_wakeup,
++	.ndo_hwtstamp_get        = mlx5e_hwtstamp_get_ndo,
++	.ndo_hwtstamp_set        = mlx5e_hwtstamp_set_ndo,
+ #ifdef CONFIG_MLX5_EN_ARFS
+ 	.ndo_rx_flow_steer	 = mlx5e_rx_flow_steer,
+ #endif
+--- a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+@@ -44,6 +44,23 @@ static int mlx5i_open(struct net_device
+ static int mlx5i_close(struct net_device *netdev);
+ static int mlx5i_change_mtu(struct net_device *netdev, int new_mtu);
+ 
++int mlx5i_hwtstamp_set(struct net_device *dev,
++		       struct kernel_hwtstamp_config *config,
++		       struct netlink_ext_ack *extack)
++{
++	struct mlx5e_priv *epriv = mlx5i_epriv(dev);
++
++	return mlx5e_hwtstamp_set(epriv, config, extack);
++}
++
++int mlx5i_hwtstamp_get(struct net_device *dev,
++		       struct kernel_hwtstamp_config *config)
++{
++	struct mlx5e_priv *epriv = mlx5i_epriv(dev);
++
++	return mlx5e_hwtstamp_get(epriv, config);
++}
++
+ static const struct net_device_ops mlx5i_netdev_ops = {
+ 	.ndo_open                = mlx5i_open,
+ 	.ndo_stop                = mlx5i_close,
+@@ -51,7 +68,8 @@ static const struct net_device_ops mlx5i
+ 	.ndo_init                = mlx5i_dev_init,
+ 	.ndo_uninit              = mlx5i_dev_cleanup,
+ 	.ndo_change_mtu          = mlx5i_change_mtu,
+-	.ndo_eth_ioctl            = mlx5i_ioctl,
++	.ndo_hwtstamp_get        = mlx5i_hwtstamp_get,
++	.ndo_hwtstamp_set        = mlx5i_hwtstamp_set,
+ };
+ 
+ /* IPoIB mlx5 netdev profile */
+@@ -554,20 +572,6 @@ int mlx5i_dev_init(struct net_device *de
+ 	return 0;
+ }
+ 
+-int mlx5i_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
+-{
+-	struct mlx5e_priv *priv = mlx5i_epriv(dev);
+-
+-	switch (cmd) {
+-	case SIOCSHWTSTAMP:
+-		return mlx5e_hwtstamp_set(priv, ifr);
+-	case SIOCGHWTSTAMP:
+-		return mlx5e_hwtstamp_get(priv, ifr);
+-	default:
+-		return -EOPNOTSUPP;
+-	}
+-}
+-
+ void mlx5i_dev_cleanup(struct net_device *dev)
+ {
+ 	struct mlx5e_priv    *priv   = mlx5i_epriv(dev);
+--- a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.h
+@@ -88,7 +88,11 @@ struct net_device *mlx5i_pkey_get_netdev
+ /* Shared ndo functions */
+ int mlx5i_dev_init(struct net_device *dev);
+ void mlx5i_dev_cleanup(struct net_device *dev);
+-int mlx5i_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd);
++int mlx5i_hwtstamp_set(struct net_device *dev,
++		       struct kernel_hwtstamp_config *config,
++		       struct netlink_ext_ack *extack);
++int mlx5i_hwtstamp_get(struct net_device *dev,
++		       struct kernel_hwtstamp_config *config);
+ 
+ /* Parent profile functions */
+ int mlx5i_init(struct mlx5_core_dev *mdev, struct net_device *netdev);
+--- a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib_vlan.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib_vlan.c
+@@ -140,7 +140,6 @@ static int mlx5i_pkey_close(struct net_d
+ static int mlx5i_pkey_dev_init(struct net_device *dev);
+ static void mlx5i_pkey_dev_cleanup(struct net_device *netdev);
+ static int mlx5i_pkey_change_mtu(struct net_device *netdev, int new_mtu);
+-static int mlx5i_pkey_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd);
+ 
+ static const struct net_device_ops mlx5i_pkey_netdev_ops = {
+ 	.ndo_open                = mlx5i_pkey_open,
+@@ -149,7 +148,8 @@ static const struct net_device_ops mlx5i
+ 	.ndo_get_stats64         = mlx5i_get_stats,
+ 	.ndo_uninit              = mlx5i_pkey_dev_cleanup,
+ 	.ndo_change_mtu          = mlx5i_pkey_change_mtu,
+-	.ndo_eth_ioctl            = mlx5i_pkey_ioctl,
++	.ndo_hwtstamp_get        = mlx5i_hwtstamp_get,
++	.ndo_hwtstamp_set        = mlx5i_hwtstamp_set,
+ };
+ 
+ /* Child NDOs */
+@@ -184,11 +184,6 @@ static int mlx5i_pkey_dev_init(struct ne
+ 	return mlx5i_dev_init(dev);
+ }
+ 
+-static int mlx5i_pkey_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
+-{
+-	return mlx5i_ioctl(dev, ifr, cmd);
+-}
+-
+ static void mlx5i_pkey_dev_cleanup(struct net_device *netdev)
+ {
+ 	mlx5i_parent_put(netdev);
