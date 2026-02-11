@@ -1,0 +1,141 @@
+From: "Russell King (Oracle)" <rmk+kernel@armlinux.org.uk>
+Date: Wed, 8 Jan 2025 16:47:38 +0000
+Subject: net: stmmac: move tx_lpi_timer tracking to phylib
+Patch-mainline: v6.14-rc1
+Git-commit: 1991819debaa22ee75f4163f3b17f9e545f3ae98
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+When stmmac_ethtool_op_get_eee() is called, stmmac sets the tx_lpi_timer
+and tx_lpi_enabled members, and then calls into phylink and thus phylib.
+phylib overwrites these members.
+
+phylib will also cause a link down/link up transition when settings
+that impact the MAC have been changed.
+
+Convert stmmac to use the tx_lpi_timer setting in struct phy_device,
+updating priv->tx_lpi_timer each time when the link comes up, rather
+than trying to maintain this user setting itself. We initialise the
+phylib tx_lpi_timer setting by doing a get_ee-modify-set_eee sequence
+with the last known priv->tx_lpi_timer value. In order for this to work
+correctly, we also need this member to be initialised earlier.
+
+As stmmac_eee_init() is no longer called outside of stmmac_main.c, make
+it static.
+
+Reviewed-by: Andrew Lunn <andrew@lunn.ch>
+Tested-by: Choong Yong Liang <yong.liang.choong@linux.intel.com>
+Signed-off-by: Russell King (Oracle) <rmk+kernel@armlinux.org.uk>
+Link: https://patch.msgid.link/E1tVZDW-0002Jr-W3@rmk-PC.armlinux.org.uk
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/stmicro/stmmac/stmmac.h         |    1 
+ drivers/net/ethernet/stmicro/stmmac/stmmac_ethtool.c |   14 ------------
+ drivers/net/ethernet/stmicro/stmmac/stmmac_main.c    |   21 ++++++++++++++-----
+ 3 files changed, 17 insertions(+), 19 deletions(-)
+
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac.h
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac.h
+@@ -408,7 +408,6 @@ int stmmac_dvr_probe(struct device *devi
+ 		     struct plat_stmmacenet_data *plat_dat,
+ 		     struct stmmac_resources *res);
+ void stmmac_disable_eee_mode(struct stmmac_priv *priv);
+-bool stmmac_eee_init(struct stmmac_priv *priv);
+ int stmmac_reinit_queues(struct net_device *dev, u32 rx_cnt, u32 tx_cnt);
+ int stmmac_reinit_ringparam(struct net_device *dev, u32 rx_size, u32 tx_size);
+ int stmmac_bus_clks_config(struct stmmac_priv *priv, bool enabled);
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_ethtool.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_ethtool.c
+@@ -898,7 +898,6 @@ static int stmmac_ethtool_op_get_eee(str
+ 	if (!priv->dma_cap.eee)
+ 		return -EOPNOTSUPP;
+ 
+-	edata->tx_lpi_timer = priv->tx_lpi_timer;
+ 	edata->tx_lpi_enabled = priv->tx_lpi_enabled;
+ 
+ 	return phylink_ethtool_get_eee(priv->phylink, edata);
+@@ -908,7 +907,6 @@ static int stmmac_ethtool_op_set_eee(str
+ 				     struct ethtool_keee *edata)
+ {
+ 	struct stmmac_priv *priv = netdev_priv(dev);
+-	int ret;
+ 
+ 	if (!priv->dma_cap.eee)
+ 		return -EOPNOTSUPP;
+@@ -920,17 +918,7 @@ static int stmmac_ethtool_op_set_eee(str
+ 	if (!edata->eee_enabled)
+ 		stmmac_disable_eee_mode(priv);
+ 
+-	ret = phylink_ethtool_set_eee(priv->phylink, edata);
+-	if (ret)
+-		return ret;
+-
+-	if (edata->eee_enabled &&
+-	    priv->tx_lpi_timer != edata->tx_lpi_timer) {
+-		priv->tx_lpi_timer = edata->tx_lpi_timer;
+-		stmmac_eee_init(priv);
+-	}
+-
+-	return 0;
++	return phylink_ethtool_set_eee(priv->phylink, edata);
+ }
+ 
+ static u32 stmmac_usec2riwt(u32 usec, struct stmmac_priv *priv)
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -468,7 +468,7 @@ static void stmmac_eee_ctrl_timer(struct
+  *  can also manage EEE, this function enable the LPI state and start related
+  *  timer.
+  */
+-bool stmmac_eee_init(struct stmmac_priv *priv)
++static bool stmmac_eee_init(struct stmmac_priv *priv)
+ {
+ 	int eee_tw_timer = priv->eee_tw_timer;
+ 
+@@ -1087,6 +1087,7 @@ static void stmmac_mac_link_up(struct ph
+ 		priv->eee_active =
+ 			phy_init_eee(phy, !(priv->plat->flags &
+ 				STMMAC_FLAG_RX_CLK_RUNS_IN_LPI)) >= 0;
++		priv->tx_lpi_timer = phy->eee_cfg.tx_lpi_timer;
+ 		priv->eee_enabled = stmmac_eee_init(priv);
+ 		priv->tx_lpi_enabled = priv->eee_enabled;
+ 		stmmac_set_eee_pls(priv, priv->hw, true);
+@@ -1183,6 +1184,16 @@ static int stmmac_init_phy(struct net_de
+ 		ret = phylink_fwnode_phy_connect(priv->phylink, fwnode, 0);
+ 	}
+ 
++	if (ret == 0) {
++		struct ethtool_keee eee;
++
++		/* Configure phylib's copy of the LPI timer */
++		if (!phylink_ethtool_get_eee(priv->phylink, &eee)) {
++			eee.tx_lpi_timer = priv->tx_lpi_timer;
++			phylink_ethtool_set_eee(priv->phylink, &eee);
++		}
++	}
++
+ 	if (!priv->plat->pmt) {
+ 		struct ethtool_wolinfo wol = { .cmd = ETHTOOL_GWOL };
+ 
+@@ -3435,10 +3446,6 @@ static int stmmac_hw_setup(struct net_de
+ 
+ 	priv->eee_tw_timer = STMMAC_DEFAULT_TWT_LS;
+ 
+-	/* Convert the timer from msec to usec */
+-	if (!priv->tx_lpi_timer)
+-		priv->tx_lpi_timer = eee_timer * 1000;
+-
+ 	if (priv->use_riwt) {
+ 		u32 queue;
+ 
+@@ -3905,6 +3912,10 @@ static int __stmmac_open(struct net_devi
+ 	u32 chan;
+ 	int ret;
+ 
++	/* Initialise the tx lpi timer, converting from msec to usec */
++	if (!priv->tx_lpi_timer)
++		priv->tx_lpi_timer = eee_timer * 1000;
++
+ 	ret = pm_runtime_resume_and_get(priv->device);
+ 	if (ret < 0)
+ 		return ret;
