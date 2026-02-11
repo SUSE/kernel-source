@@ -1,0 +1,121 @@
+From: Caleb Sander Mateos <csander@purestorage.com>
+Date: Fri, 25 Apr 2025 19:17:28 -0600
+Subject: [PATCH] block: avoid hctx spinlock for plug with multiple queues
+Git-commit: 9712c57ec1117d6b5fe1cc8ad420049171140b26
+Patch-mainline: v6.16
+References: jsc#PED-14161
+
+blk_mq_flush_plug_list() has a fast path if all requests in the plug
+are destined for the same request_queue. It calls ->queue_rqs() with the
+whole batch of requests, falling back on ->queue_rq() for any requests
+not handled by ->queue_rqs(). However, if the requests are destined for
+multiple queues, blk_mq_flush_plug_list() has a slow path that calls
+blk_mq_dispatch_list() repeatedly to filter the requests by ctx/hctx.
+Each queue's requests are inserted into the hctx's dispatch list under a
+spinlock, then __blk_mq_sched_dispatch_requests() takes them out of the
+dispatch list (taking the spinlock again), and finally
+blk_mq_dispatch_rq_list() calls ->queue_rq() on each request.
+
+Acquiring the hctx spinlock twice and calling ->queue_rq() instead of
+->queue_rqs() makes the slow path significantly more expensive. Thus,
+batching more requests into a single plug (e.g. io_uring_enter syscall)
+can counterintuitively hurt performance by causing the plug to span
+multiple queues. We have observed 2-3% of CPU time spent acquiring the
+hctx spinlock alone on workloads issuing requests to multiple NVMe
+devices in the same io_uring SQE batches.
+
+Add a medium path in blk_mq_flush_plug_list() for plugs that don't have
+elevators or come from a schedule, but do span multiple queues. Filter
+the requests by queue and call ->queue_rqs()/->queue_rq() on the list of
+requests destined to each request_queue.
+
+With this change, we no longer see any CPU time spent in _raw_spin_lock
+from blk_mq_flush_plug_list and throughput increases accordingly.
+
+Signed-off-by: Caleb Sander Mateos <csander@purestorage.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Link: https://lore.kernel.org/r/20250426011728.4189119-4-csander@purestorage.com
+[axboe: fix whitespace damage]
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/blk-mq.c | 49 ++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 48 insertions(+), 1 deletion(-)
+
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index a777cb361ee3..796baeccd37b 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -2836,6 +2836,35 @@ static void __blk_mq_flush_list(struct request_queue *q, struct rq_list *rqs)
+ 	q->mq_ops->queue_rqs(rqs);
+ }
+ 
++static unsigned blk_mq_extract_queue_requests(struct rq_list *rqs,
++					      struct rq_list *queue_rqs)
++{
++	struct request *rq = rq_list_pop(rqs);
++	struct request_queue *this_q = rq->q;
++	struct request **prev = &rqs->head;
++	struct rq_list matched_rqs = {};
++	struct request *last = NULL;
++	unsigned depth = 1;
++
++	rq_list_add_tail(&matched_rqs, rq);
++	while ((rq = *prev)) {
++		if (rq->q == this_q) {
++			/* move rq from rqs to matched_rqs */
++			*prev = rq->rq_next;
++			rq_list_add_tail(&matched_rqs, rq);
++			depth++;
++		} else {
++			/* leave rq in rqs */
++			prev = &rq->rq_next;
++			last = rq;
++		}
++	}
++
++	rqs->tail = last;
++	*queue_rqs = matched_rqs;
++	return depth;
++}
++
+ static void blk_mq_dispatch_queue_requests(struct rq_list *rqs, unsigned depth)
+ {
+ 	struct request_queue *q = rq_list_peek(rqs)->q;
+@@ -2902,6 +2931,19 @@ static void blk_mq_dispatch_list(struct rq_list *rqs, bool from_sched)
+ 	percpu_ref_put(&this_hctx->queue->q_usage_counter);
+ }
+ 
++static void blk_mq_dispatch_multiple_queue_requests(struct rq_list *rqs)
++{
++	do {
++		struct rq_list queue_rqs;
++		unsigned depth;
++
++		depth = blk_mq_extract_queue_requests(rqs, &queue_rqs);
++		blk_mq_dispatch_queue_requests(&queue_rqs, depth);
++		while (!rq_list_empty(&queue_rqs))
++			blk_mq_dispatch_list(&queue_rqs, false);
++	} while (!rq_list_empty(rqs));
++}
++
+ void blk_mq_flush_plug_list(struct blk_plug *plug, bool from_schedule)
+ {
+ 	unsigned int depth;
+@@ -2918,7 +2960,12 @@ void blk_mq_flush_plug_list(struct blk_plug *plug, bool from_schedule)
+ 	depth = plug->rq_count;
+ 	plug->rq_count = 0;
+ 
+-	if (!plug->multiple_queues && !plug->has_elevator && !from_schedule) {
++	if (!plug->has_elevator && !from_schedule) {
++		if (plug->multiple_queues) {
++			blk_mq_dispatch_multiple_queue_requests(&plug->mq_list);
++			return;
++		}
++
+ 		blk_mq_dispatch_queue_requests(&plug->mq_list, depth);
+ 		if (rq_list_empty(&plug->mq_list))
+ 			return;
+-- 
+2.43.0
+
