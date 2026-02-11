@@ -1,0 +1,257 @@
+From: Dragos Tatulea <dtatulea@nvidia.com>
+Date: Tue, 15 Jul 2025 17:30:20 +0300
+Subject: net/mlx5e: Create/destroy PCIe Congestion Event object
+Patch-mainline: v6.17-rc1
+Git-commit: ab2b0d4d639435f382583b107997a4ce805a665b
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+Add initial infrastructure to create and destroy the PCIe Congestion
+Event object if the object is supported.
+
+The verb for the object creation function is "set" instead of
+"create" because the function will accommodate the modify operation
+as well in a subsequent patch.
+
+The next patches will hook it up to the event handler and will add
+actual functionality.
+
+Signed-off-by: Dragos Tatulea <dtatulea@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://patch.msgid.link/1752589821-145787-2-git-send-email-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/Makefile             |    2 
+ drivers/net/ethernet/mellanox/mlx5/core/en.h                 |    2 
+ drivers/net/ethernet/mellanox/mlx5/core/en/pcie_cong_event.c |  140 +++++++++++
+ drivers/net/ethernet/mellanox/mlx5/core/en/pcie_cong_event.h |   10 
+ drivers/net/ethernet/mellanox/mlx5/core/en_main.c            |    3 
+ drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h          |   13 +
+ 6 files changed, 169 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/net/ethernet/mellanox/mlx5/core/en/pcie_cong_event.c
+ create mode 100644 drivers/net/ethernet/mellanox/mlx5/core/en/pcie_cong_event.h
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/Makefile
++++ b/drivers/net/ethernet/mellanox/mlx5/core/Makefile
+@@ -29,7 +29,7 @@ mlx5_core-$(CONFIG_MLX5_CORE_EN) += en/r
+ 		en/reporter_tx.o en/reporter_rx.o en/params.o en/xsk/pool.o \
+ 		en/xsk/setup.o en/xsk/rx.o en/xsk/tx.o en/devlink.o en/ptp.o \
+ 		en/qos.o en/htb.o en/trap.o en/fs_tt_redirect.o en/selq.o \
+-		lib/crypto.o lib/sd.o
++		lib/crypto.o lib/sd.o en/pcie_cong_event.o
+ 
+ #
+ # Netdev extra
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -920,6 +920,8 @@ struct mlx5e_priv {
+ 	struct notifier_block      events_nb;
+ 	struct notifier_block      blocking_events_nb;
+ 
++	struct mlx5e_pcie_cong_event *cong_event;
++
+ 	struct udp_tunnel_nic_info nic_info;
+ #ifdef CONFIG_MLX5_CORE_EN_DCB
+ 	struct mlx5e_dcbx          dcbx;
+--- /dev/null
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/pcie_cong_event.c
+@@ -0,0 +1,140 @@
++// SPDX-License-Identifier: GPL-2.0 OR Linux-OpenIB
++// Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES.
++
++#include "en.h"
++#include "pcie_cong_event.h"
++
++struct mlx5e_pcie_cong_thresh {
++	u16 inbound_high;
++	u16 inbound_low;
++	u16 outbound_high;
++	u16 outbound_low;
++};
++
++struct mlx5e_pcie_cong_event {
++	u64 obj_id;
++
++	struct mlx5e_priv *priv;
++};
++
++/* In units of 0.01 % */
++static const struct mlx5e_pcie_cong_thresh default_thresh_config = {
++	.inbound_high = 9000,
++	.inbound_low = 7500,
++	.outbound_high = 9000,
++	.outbound_low = 7500,
++};
++
++static int
++mlx5_cmd_pcie_cong_event_set(struct mlx5_core_dev *dev,
++			     const struct mlx5e_pcie_cong_thresh *config,
++			     u64 *obj_id)
++{
++	u32 in[MLX5_ST_SZ_DW(pcie_cong_event_cmd_in)] = {};
++	u32 out[MLX5_ST_SZ_DW(general_obj_out_cmd_hdr)];
++	void *cong_obj;
++	void *hdr;
++	int err;
++
++	hdr = MLX5_ADDR_OF(pcie_cong_event_cmd_in, in, hdr);
++	cong_obj = MLX5_ADDR_OF(pcie_cong_event_cmd_in, in, cong_obj);
++
++	MLX5_SET(general_obj_in_cmd_hdr, hdr, opcode,
++		 MLX5_CMD_OP_CREATE_GENERAL_OBJECT);
++
++	MLX5_SET(general_obj_in_cmd_hdr, hdr, obj_type,
++		 MLX5_GENERAL_OBJECT_TYPES_PCIE_CONG_EVENT);
++
++	MLX5_SET(pcie_cong_event_obj, cong_obj, inbound_event_en, 1);
++	MLX5_SET(pcie_cong_event_obj, cong_obj, outbound_event_en, 1);
++
++	MLX5_SET(pcie_cong_event_obj, cong_obj,
++		 inbound_cong_high_threshold, config->inbound_high);
++	MLX5_SET(pcie_cong_event_obj, cong_obj,
++		 inbound_cong_low_threshold, config->inbound_low);
++
++	MLX5_SET(pcie_cong_event_obj, cong_obj,
++		 outbound_cong_high_threshold, config->outbound_high);
++	MLX5_SET(pcie_cong_event_obj, cong_obj,
++		 outbound_cong_low_threshold, config->outbound_low);
++
++	err = mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out));
++	if (err)
++		return err;
++
++	*obj_id = MLX5_GET(general_obj_out_cmd_hdr, out, obj_id);
++
++	mlx5_core_dbg(dev, "PCIe congestion event (obj_id=%llu) created. Config: in: [%u, %u], out: [%u, %u]\n",
++		      *obj_id,
++		      config->inbound_high, config->inbound_low,
++		      config->outbound_high, config->outbound_low);
++
++	return 0;
++}
++
++static int mlx5_cmd_pcie_cong_event_destroy(struct mlx5_core_dev *dev,
++					    u64 obj_id)
++{
++	u32 in[MLX5_ST_SZ_DW(pcie_cong_event_cmd_in)] = {};
++	u32 out[MLX5_ST_SZ_DW(general_obj_out_cmd_hdr)];
++	void *hdr;
++
++	hdr = MLX5_ADDR_OF(pcie_cong_event_cmd_in, in, hdr);
++	MLX5_SET(general_obj_in_cmd_hdr, hdr, opcode,
++		 MLX5_CMD_OP_DESTROY_GENERAL_OBJECT);
++	MLX5_SET(general_obj_in_cmd_hdr, hdr, obj_type,
++		 MLX5_GENERAL_OBJECT_TYPES_PCIE_CONG_EVENT);
++	MLX5_SET(general_obj_in_cmd_hdr, hdr, obj_id, obj_id);
++
++	return mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out));
++}
++
++int mlx5e_pcie_cong_event_init(struct mlx5e_priv *priv)
++{
++	struct mlx5e_pcie_cong_event *cong_event;
++	struct mlx5_core_dev *mdev = priv->mdev;
++	int err;
++
++	if (!mlx5_pcie_cong_event_supported(mdev))
++		return 0;
++
++	cong_event = kvzalloc_node(sizeof(*cong_event), GFP_KERNEL,
++				   mdev->priv.numa_node);
++	if (!cong_event)
++		return -ENOMEM;
++
++	cong_event->priv = priv;
++
++	err = mlx5_cmd_pcie_cong_event_set(mdev, &default_thresh_config,
++					   &cong_event->obj_id);
++	if (err) {
++		mlx5_core_warn(mdev, "Error creating a PCIe congestion event object\n");
++		goto err_free;
++	}
++
++	priv->cong_event = cong_event;
++
++	return 0;
++
++err_free:
++	kvfree(cong_event);
++
++	return err;
++}
++
++void mlx5e_pcie_cong_event_cleanup(struct mlx5e_priv *priv)
++{
++	struct mlx5e_pcie_cong_event *cong_event = priv->cong_event;
++	struct mlx5_core_dev *mdev = priv->mdev;
++
++	if (!cong_event)
++		return;
++
++	priv->cong_event = NULL;
++
++	if (mlx5_cmd_pcie_cong_event_destroy(mdev, cong_event->obj_id))
++		mlx5_core_warn(mdev, "Error destroying PCIe congestion event (obj_id=%llu)\n",
++			       cong_event->obj_id);
++
++	kvfree(cong_event);
++}
+--- /dev/null
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/pcie_cong_event.h
+@@ -0,0 +1,10 @@
++/* SPDX-License-Identifier: GPL-2.0 OR Linux-OpenIB */
++/* Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES. */
++
++#ifndef __MLX5_PCIE_CONG_EVENT_H__
++#define __MLX5_PCIE_CONG_EVENT_H__
++
++int mlx5e_pcie_cong_event_init(struct mlx5e_priv *priv);
++void mlx5e_pcie_cong_event_cleanup(struct mlx5e_priv *priv);
++
++#endif /* __MLX5_PCIE_CONG_EVENT_H__ */
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -75,6 +75,7 @@
+ #include "en/trap.h"
+ #include "lib/devcom.h"
+ #include "lib/sd.h"
++#include "en/pcie_cong_event.h"
+ 
+ static bool mlx5e_hw_gro_supported(struct mlx5_core_dev *mdev)
+ {
+@@ -5963,6 +5964,7 @@ static void mlx5e_nic_enable(struct mlx5
+ 	if (mlx5e_monitor_counter_supported(priv))
+ 		mlx5e_monitor_counter_init(priv);
+ 
++	mlx5e_pcie_cong_event_init(priv);
+ 	mlx5e_hv_vhca_stats_create(priv);
+ 	if (netdev->reg_state != NETREG_REGISTERED)
+ 		return;
+@@ -5993,6 +5995,7 @@ static void mlx5e_nic_disable(struct mlx
+ 
+ 	mlx5e_nic_set_rx_mode(priv);
+ 
++	mlx5e_pcie_cong_event_cleanup(priv);
+ 	mlx5e_hv_vhca_stats_destroy(priv);
+ 	if (mlx5e_monitor_counter_supported(priv))
+ 		mlx5e_monitor_counter_cleanup(priv);
+--- a/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
+@@ -495,4 +495,17 @@ static inline int mlx5_max_eq_cap_get(co
+ 
+ 	return 1 << MLX5_CAP_GEN(dev, log_max_eq);
+ }
++
++static inline bool mlx5_pcie_cong_event_supported(struct mlx5_core_dev *dev)
++{
++	u64 features = MLX5_CAP_GEN_2_64(dev, general_obj_types_127_64);
++
++	if (!(features & MLX5_HCA_CAP_2_GENERAL_OBJECT_TYPES_PCIE_CONG_EVENT))
++		return false;
++
++	if (dev->sd)
++		return false;
++
++	return true;
++}
+ #endif /* __MLX5_CORE_H__ */
