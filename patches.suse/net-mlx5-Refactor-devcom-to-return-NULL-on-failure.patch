@@ -1,0 +1,287 @@
+From: Patrisious Haddad <phaddad@nvidia.com>
+Date: Wed, 22 Oct 2025 15:29:41 +0300
+Subject: net/mlx5: Refactor devcom to return NULL on failure
+Patch-mainline: v6.18-rc3
+Git-commit: 8f82f89550daafc8ca3ba74c389ae1b4afdd75c8
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+Devcom device and component registration isn't always critical to the
+functionality of the caller, hence the registration can fail and we can
+continue working with an ERR_PTR value saved inside a variable.
+
+In order to avoid that make sure all devcom failures return NULL.
+
+Signed-off-by: Patrisious Haddad <phaddad@nvidia.com>
+Reviewed-by: Leon Romanovsky <leonro@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://patch.msgid.link/1761136182-918470-4-git-send-email-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en_main.c          |    6 -
+ drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c |    4 
+ drivers/net/ethernet/mellanox/mlx5/core/lag/lag.c          |    7 -
+ drivers/net/ethernet/mellanox/mlx5/core/lib/clock.c        |    2 
+ drivers/net/ethernet/mellanox/mlx5/core/lib/devcom.c       |   53 ++++++-------
+ drivers/net/ethernet/mellanox/mlx5/core/lib/sd.c           |    4 
+ drivers/net/ethernet/mellanox/mlx5/core/main.c             |    5 -
+ 7 files changed, 39 insertions(+), 42 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -240,8 +240,8 @@ static int mlx5e_devcom_init_mpv(struct
+ 						      &attr,
+ 						      mlx5e_devcom_event_mpv,
+ 						      priv);
+-	if (IS_ERR(priv->devcom))
+-		return PTR_ERR(priv->devcom);
++	if (!priv->devcom)
++		return -EINVAL;
+ 
+ 	if (mlx5_core_is_mp_master(priv->mdev)) {
+ 		mlx5_devcom_send_event(priv->devcom, MPV_DEVCOM_MASTER_UP,
+@@ -254,7 +254,7 @@ static int mlx5e_devcom_init_mpv(struct
+ 
+ static void mlx5e_devcom_cleanup_mpv(struct mlx5e_priv *priv)
+ {
+-	if (IS_ERR_OR_NULL(priv->devcom))
++	if (!priv->devcom)
+ 		return;
+ 
+ 	if (mlx5_core_is_mp_master(priv->mdev)) {
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@ -3129,7 +3129,7 @@ void mlx5_esw_offloads_devcom_init(struc
+ 						     attr,
+ 						     mlx5_esw_offloads_devcom_event,
+ 						     esw);
+-	if (IS_ERR(esw->devcom))
++	if (!esw->devcom)
+ 		return;
+ 
+ 	mlx5_devcom_send_event(esw->devcom,
+@@ -3140,7 +3140,7 @@ void mlx5_esw_offloads_devcom_init(struc
+ 
+ void mlx5_esw_offloads_devcom_cleanup(struct mlx5_eswitch *esw)
+ {
+-	if (IS_ERR_OR_NULL(esw->devcom))
++	if (!esw->devcom)
+ 		return;
+ 
+ 	mlx5_devcom_send_event(esw->devcom,
+--- a/drivers/net/ethernet/mellanox/mlx5/core/lag/lag.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/lag/lag.c
+@@ -1430,11 +1430,10 @@ static int mlx5_lag_register_hca_devcom_
+ 		mlx5_devcom_register_component(dev->priv.devc,
+ 					       MLX5_DEVCOM_HCA_PORTS,
+ 					       &attr, NULL, dev);
+-	if (IS_ERR(dev->priv.hca_devcom_comp)) {
++	if (!dev->priv.hca_devcom_comp) {
+ 		mlx5_core_err(dev,
+-			      "Failed to register devcom HCA component, err: %ld\n",
+-			      PTR_ERR(dev->priv.hca_devcom_comp));
+-		return PTR_ERR(dev->priv.hca_devcom_comp);
++			      "Failed to register devcom HCA component.");
++		return -EINVAL;
+ 	}
+ 
+ 	return 0;
+--- a/drivers/net/ethernet/mellanox/mlx5/core/lib/clock.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/lib/clock.c
+@@ -1456,7 +1456,7 @@ static void mlx5_shared_clock_register(s
+ 	compd = mlx5_devcom_register_component(mdev->priv.devc,
+ 					       MLX5_DEVCOM_SHARED_CLOCK,
+ 					       &attr, NULL, mdev);
+-	if (IS_ERR(compd))
++	if (!compd)
+ 		return;
+ 
+ 	mdev->clock_state->compdev = compd;
+--- a/drivers/net/ethernet/mellanox/mlx5/core/lib/devcom.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/lib/devcom.c
+@@ -76,20 +76,18 @@ mlx5_devcom_dev_alloc(struct mlx5_core_d
+ struct mlx5_devcom_dev *
+ mlx5_devcom_register_device(struct mlx5_core_dev *dev)
+ {
+-	struct mlx5_devcom_dev *devc;
++	struct mlx5_devcom_dev *devc = NULL;
+ 
+ 	mutex_lock(&dev_list_lock);
+ 
+ 	if (devcom_dev_exists(dev)) {
+-		devc = ERR_PTR(-EEXIST);
++		mlx5_core_err(dev, "devcom device already exists");
+ 		goto out;
+ 	}
+ 
+ 	devc = mlx5_devcom_dev_alloc(dev);
+-	if (!devc) {
+-		devc = ERR_PTR(-ENOMEM);
++	if (!devc)
+ 		goto out;
+-	}
+ 
+ 	list_add_tail(&devc->list, &devcom_dev_list);
+ out:
+@@ -110,8 +108,10 @@ mlx5_devcom_dev_release(struct kref *ref
+ 
+ void mlx5_devcom_unregister_device(struct mlx5_devcom_dev *devc)
+ {
+-	if (!IS_ERR_OR_NULL(devc))
+-		kref_put(&devc->ref, mlx5_devcom_dev_release);
++	if (!devc)
++		return;
++
++	kref_put(&devc->ref, mlx5_devcom_dev_release);
+ }
+ 
+ static struct mlx5_devcom_comp *
+@@ -122,7 +122,7 @@ mlx5_devcom_comp_alloc(u64 id, const str
+ 
+ 	comp = kzalloc(sizeof(*comp), GFP_KERNEL);
+ 	if (!comp)
+-		return ERR_PTR(-ENOMEM);
++		return NULL;
+ 
+ 	comp->id = id;
+ 	comp->key.key = attr->key;
+@@ -160,7 +160,7 @@ devcom_alloc_comp_dev(struct mlx5_devcom
+ 
+ 	devcom = kzalloc(sizeof(*devcom), GFP_KERNEL);
+ 	if (!devcom)
+-		return ERR_PTR(-ENOMEM);
++		return NULL;
+ 
+ 	kref_get(&devc->ref);
+ 	devcom->devc = devc;
+@@ -240,31 +240,28 @@ mlx5_devcom_register_component(struct ml
+ 			       mlx5_devcom_event_handler_t handler,
+ 			       void *data)
+ {
+-	struct mlx5_devcom_comp_dev *devcom;
++	struct mlx5_devcom_comp_dev *devcom = NULL;
+ 	struct mlx5_devcom_comp *comp;
+ 
+-	if (IS_ERR_OR_NULL(devc))
+-		return ERR_PTR(-EINVAL);
++	if (!devc)
++		return NULL;
+ 
+ 	mutex_lock(&comp_list_lock);
+ 	comp = devcom_component_get(devc, id, attr, handler);
+-	if (IS_ERR(comp)) {
+-		devcom = ERR_PTR(-EINVAL);
++	if (IS_ERR(comp))
+ 		goto out_unlock;
+-	}
+ 
+ 	if (!comp) {
+ 		comp = mlx5_devcom_comp_alloc(id, attr, handler);
+-		if (IS_ERR(comp)) {
+-			devcom = ERR_CAST(comp);
++		if (!comp)
+ 			goto out_unlock;
+-		}
++
+ 		list_add_tail(&comp->comp_list, &devcom_comp_list);
+ 	}
+ 	mutex_unlock(&comp_list_lock);
+ 
+ 	devcom = devcom_alloc_comp_dev(devc, comp, data);
+-	if (IS_ERR(devcom))
++	if (!devcom)
+ 		kref_put(&comp->ref, mlx5_devcom_comp_release);
+ 
+ 	return devcom;
+@@ -276,8 +273,10 @@ out_unlock:
+ 
+ void mlx5_devcom_unregister_component(struct mlx5_devcom_comp_dev *devcom)
+ {
+-	if (!IS_ERR_OR_NULL(devcom))
+-		devcom_free_comp_dev(devcom);
++	if (!devcom)
++		return;
++
++	devcom_free_comp_dev(devcom);
+ }
+ 
+ int mlx5_devcom_comp_get_size(struct mlx5_devcom_comp_dev *devcom)
+@@ -296,7 +295,7 @@ int mlx5_devcom_send_event(struct mlx5_d
+ 	int err = 0;
+ 	void *data;
+ 
+-	if (IS_ERR_OR_NULL(devcom))
++	if (!devcom)
+ 		return -ENODEV;
+ 
+ 	comp = devcom->comp;
+@@ -338,7 +337,7 @@ void mlx5_devcom_comp_set_ready(struct m
+ 
+ bool mlx5_devcom_comp_is_ready(struct mlx5_devcom_comp_dev *devcom)
+ {
+-	if (IS_ERR_OR_NULL(devcom))
++	if (!devcom)
+ 		return false;
+ 
+ 	return READ_ONCE(devcom->comp->ready);
+@@ -348,7 +347,7 @@ bool mlx5_devcom_for_each_peer_begin(str
+ {
+ 	struct mlx5_devcom_comp *comp;
+ 
+-	if (IS_ERR_OR_NULL(devcom))
++	if (!devcom)
+ 		return false;
+ 
+ 	comp = devcom->comp;
+@@ -421,21 +420,21 @@ void *mlx5_devcom_get_next_peer_data_rcu
+ 
+ void mlx5_devcom_comp_lock(struct mlx5_devcom_comp_dev *devcom)
+ {
+-	if (IS_ERR_OR_NULL(devcom))
++	if (!devcom)
+ 		return;
+ 	down_write(&devcom->comp->sem);
+ }
+ 
+ void mlx5_devcom_comp_unlock(struct mlx5_devcom_comp_dev *devcom)
+ {
+-	if (IS_ERR_OR_NULL(devcom))
++	if (!devcom)
+ 		return;
+ 	up_write(&devcom->comp->sem);
+ }
+ 
+ int mlx5_devcom_comp_trylock(struct mlx5_devcom_comp_dev *devcom)
+ {
+-	if (IS_ERR_OR_NULL(devcom))
++	if (!devcom)
+ 		return 0;
+ 	return down_write_trylock(&devcom->comp->sem);
+ }
+--- a/drivers/net/ethernet/mellanox/mlx5/core/lib/sd.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/lib/sd.c
+@@ -221,8 +221,8 @@ static int sd_register(struct mlx5_core_
+ 	attr.net = mlx5_core_net(dev);
+ 	devcom = mlx5_devcom_register_component(dev->priv.devc, MLX5_DEVCOM_SD_GROUP,
+ 						&attr, NULL, dev);
+-	if (IS_ERR(devcom))
+-		return PTR_ERR(devcom);
++	if (!devcom)
++		return -EINVAL;
+ 
+ 	sd->devcom = devcom;
+ 
+--- a/drivers/net/ethernet/mellanox/mlx5/core/main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/main.c
+@@ -978,9 +978,8 @@ static int mlx5_init_once(struct mlx5_co
+ 	int err;
+ 
+ 	dev->priv.devc = mlx5_devcom_register_device(dev);
+-	if (IS_ERR(dev->priv.devc))
+-		mlx5_core_warn(dev, "failed to register devcom device %pe\n",
+-			       dev->priv.devc);
++	if (!dev->priv.devc)
++		mlx5_core_warn(dev, "failed to register devcom device\n");
+ 
+ 	err = mlx5_query_board_id(dev);
+ 	if (err) {
