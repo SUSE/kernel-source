@@ -1,0 +1,82 @@
+From: Christoph Hellwig <hch@lst.de>
+Date: Tue, 6 May 2025 17:47:26 +0530
+Subject: [PATCH] block: expose write streams for block device nodes
+Git-commit: c27683da6406031d47a65b344d04a40736490d95
+Patch-mainline: v6.16
+References: jsc#PED-14161
+
+Use the per-kiocb write stream if provided, or map temperature hints to
+write streams (which is a bit questionable, but this shows how it is
+done).
+
+Reviewed-by: Hannes Reinecke <hare@suse.de>
+Reviewed-by: Nitesh Shetty <nj.shetty@samsung.com>
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+[kbusch: removed statx reporting]
+Signed-off-by: Keith Busch <kbusch@kernel.org>
+Signed-off-by: Kanchan Joshi <joshi.k@samsung.com>
+Link: https://lore.kernel.org/r/20250506121732.8211-6-joshi.k@samsung.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/fops.c | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/block/fops.c b/block/fops.c
+index b6d7cdd96b54..1309861d4c2c 100644
+--- a/block/fops.c
++++ b/block/fops.c
+@@ -73,6 +73,7 @@ static ssize_t __blkdev_direct_IO_simple(struct kiocb *iocb,
+ 	}
+ 	bio.bi_iter.bi_sector = pos >> SECTOR_SHIFT;
+ 	bio.bi_write_hint = file_inode(iocb->ki_filp)->i_write_hint;
++	bio.bi_write_stream = iocb->ki_write_stream;
+ 	bio.bi_ioprio = iocb->ki_ioprio;
+ 	if (iocb->ki_flags & IOCB_ATOMIC)
+ 		bio.bi_opf |= REQ_ATOMIC;
+@@ -206,6 +207,7 @@ static ssize_t __blkdev_direct_IO(struct kiocb *iocb, struct iov_iter *iter,
+ 	for (;;) {
+ 		bio->bi_iter.bi_sector = pos >> SECTOR_SHIFT;
+ 		bio->bi_write_hint = file_inode(iocb->ki_filp)->i_write_hint;
++		bio->bi_write_stream = iocb->ki_write_stream;
+ 		bio->bi_private = dio;
+ 		bio->bi_end_io = blkdev_bio_end_io;
+ 		bio->bi_ioprio = iocb->ki_ioprio;
+@@ -333,6 +335,7 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
+ 	dio->iocb = iocb;
+ 	bio->bi_iter.bi_sector = pos >> SECTOR_SHIFT;
+ 	bio->bi_write_hint = file_inode(iocb->ki_filp)->i_write_hint;
++	bio->bi_write_stream = iocb->ki_write_stream;
+ 	bio->bi_end_io = blkdev_bio_end_io_async;
+ 	bio->bi_ioprio = iocb->ki_ioprio;
+ 
+@@ -398,6 +401,26 @@ static ssize_t blkdev_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
+ 	if (blkdev_dio_invalid(bdev, iocb, iter))
+ 		return -EINVAL;
+ 
++	if (iov_iter_rw(iter) == WRITE) {
++		u16 max_write_streams = bdev_max_write_streams(bdev);
++
++		if (iocb->ki_write_stream) {
++			if (iocb->ki_write_stream > max_write_streams)
++				return -EINVAL;
++		} else if (max_write_streams) {
++			enum rw_hint write_hint =
++				file_inode(iocb->ki_filp)->i_write_hint;
++
++			/*
++			 * Just use the write hint as write stream for block
++			 * device writes.  This assumes no file system is
++			 * mounted that would use the streams differently.
++			 */
++			if (write_hint <= max_write_streams)
++				iocb->ki_write_stream = write_hint;
++		}
++	}
++
+ 	nr_pages = bio_iov_vecs_to_alloc(iter, BIO_MAX_VECS + 1);
+ 	if (likely(nr_pages <= BIO_MAX_VECS)) {
+ 		if (is_sync_kiocb(iocb))
+-- 
+2.43.0
+
