@@ -1,0 +1,260 @@
+From: Saeed Mahameed <saeedm@nvidia.com>
+Date: Fri, 29 Aug 2025 15:37:17 -0700
+Subject: net/mlx5: E-Switch, Move vport acls root namespaces creation to
+ eswitch
+Patch-mainline: v6.18-rc1
+Git-commit: faa6ac53cdaa26f80e4b44e6255a52bd67b83acb
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+Move the loop that creates the vports ACLs root name spaces to eswitch,
+since it is the eswitch responsibility to decide when and how many
+vports ACLs root namespaces to create, in the next patches we will use
+the fs_core vport ACL root namespace APIs to create/remove root ns
+ACLs dynamically for dynamically created vports.
+
+Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Link: https://patch.msgid.link/20250829223722.900629-3-saeed@kernel.org
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/eswitch.c |   73 ++++++++++++++++++---
+ drivers/net/ethernet/mellanox/mlx5/core/fs_core.c |   76 ++--------------------
+ drivers/net/ethernet/mellanox/mlx5/core/fs_core.h |    7 --
+ 3 files changed, 72 insertions(+), 84 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+@@ -1439,19 +1439,76 @@ static void mlx5_esw_mode_change_notify(
+ 	blocking_notifier_call_chain(&esw->n_head, 0, &info);
+ }
+ 
++static int mlx5_esw_egress_acls_init(struct mlx5_core_dev *dev)
++{
++	struct mlx5_flow_steering *steering = dev->priv.steering;
++	int total_vports = mlx5_eswitch_get_total_vports(dev);
++	int err;
++	int i;
++
++	for (i = 0; i < total_vports; i++) {
++		err = mlx5_fs_vport_egress_acl_ns_add(steering, i);
++		if (err)
++			goto acl_ns_remove;
++	}
++	return 0;
++
++acl_ns_remove:
++	while (i--)
++		mlx5_fs_vport_egress_acl_ns_remove(steering, i);
++	return err;
++}
++
++static void mlx5_esw_egress_acls_cleanup(struct mlx5_core_dev *dev)
++{
++	struct mlx5_flow_steering *steering = dev->priv.steering;
++	int total_vports = mlx5_eswitch_get_total_vports(dev);
++	int i;
++
++	for (i = total_vports - 1; i >= 0; i--)
++		mlx5_fs_vport_egress_acl_ns_remove(steering, i);
++}
++
++static int mlx5_esw_ingress_acls_init(struct mlx5_core_dev *dev)
++{
++	struct mlx5_flow_steering *steering = dev->priv.steering;
++	int total_vports = mlx5_eswitch_get_total_vports(dev);
++	int err;
++	int i;
++
++	for (i = 0; i < total_vports; i++) {
++		err = mlx5_fs_vport_ingress_acl_ns_add(steering, i);
++		if (err)
++			goto acl_ns_remove;
++	}
++	return 0;
++
++acl_ns_remove:
++	while (i--)
++		mlx5_fs_vport_ingress_acl_ns_remove(steering, i);
++	return err;
++}
++
++static void mlx5_esw_ingress_acls_cleanup(struct mlx5_core_dev *dev)
++{
++	struct mlx5_flow_steering *steering = dev->priv.steering;
++	int total_vports = mlx5_eswitch_get_total_vports(dev);
++	int i;
++
++	for (i = total_vports - 1; i >= 0; i--)
++		mlx5_fs_vport_ingress_acl_ns_remove(steering, i);
++}
++
+ static int mlx5_esw_acls_ns_init(struct mlx5_eswitch *esw)
+ {
+ 	struct mlx5_core_dev *dev = esw->dev;
+-	int total_vports;
+ 	int err;
+ 
+ 	if (esw->flags & MLX5_ESWITCH_VPORT_ACL_NS_CREATED)
+ 		return 0;
+ 
+-	total_vports = mlx5_eswitch_get_total_vports(dev);
+-
+ 	if (MLX5_CAP_ESW_EGRESS_ACL(dev, ft_support)) {
+-		err = mlx5_fs_egress_acls_init(dev, total_vports);
++		err = mlx5_esw_egress_acls_init(dev);
+ 		if (err)
+ 			return err;
+ 	} else {
+@@ -1459,7 +1516,7 @@ static int mlx5_esw_acls_ns_init(struct
+ 	}
+ 
+ 	if (MLX5_CAP_ESW_INGRESS_ACL(dev, ft_support)) {
+-		err = mlx5_fs_ingress_acls_init(dev, total_vports);
++		err = mlx5_esw_ingress_acls_init(dev);
+ 		if (err)
+ 			goto err;
+ 	} else {
+@@ -1470,7 +1527,7 @@ static int mlx5_esw_acls_ns_init(struct
+ 
+ err:
+ 	if (MLX5_CAP_ESW_EGRESS_ACL(dev, ft_support))
+-		mlx5_fs_egress_acls_cleanup(dev);
++		mlx5_esw_egress_acls_cleanup(dev);
+ 	return err;
+ }
+ 
+@@ -1480,9 +1537,9 @@ static void mlx5_esw_acls_ns_cleanup(str
+ 
+ 	esw->flags &= ~MLX5_ESWITCH_VPORT_ACL_NS_CREATED;
+ 	if (MLX5_CAP_ESW_INGRESS_ACL(dev, ft_support))
+-		mlx5_fs_ingress_acls_cleanup(dev);
++		mlx5_esw_ingress_acls_cleanup(dev);
+ 	if (MLX5_CAP_ESW_EGRESS_ACL(dev, ft_support))
+-		mlx5_fs_egress_acls_cleanup(dev);
++		mlx5_esw_egress_acls_cleanup(dev);
+ }
+ 
+ /**
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
+@@ -3675,75 +3675,6 @@ void mlx5_fs_vport_ingress_acl_ns_remove
+ 					 vport_idx);
+ }
+ 
+-int mlx5_fs_egress_acls_init(struct mlx5_core_dev *dev, int total_vports)
+-{
+-	struct mlx5_flow_steering *steering = dev->priv.steering;
+-	int err;
+-	int i;
+-
+-	xa_init(&steering->esw_egress_root_ns);
+-
+-	for (i = 0; i < total_vports; i++) {
+-		err = mlx5_fs_vport_egress_acl_ns_add(steering, i);
+-		if (err)
+-			goto cleanup_root_ns;
+-	}
+-	steering->esw_egress_acl_vports = total_vports;
+-	return 0;
+-
+-cleanup_root_ns:
+-	while (i--)
+-		mlx5_fs_vport_egress_acl_ns_remove(steering, i);
+-	xa_destroy(&steering->esw_egress_root_ns);
+-	return err;
+-}
+-
+-void mlx5_fs_egress_acls_cleanup(struct mlx5_core_dev *dev)
+-{
+-	struct mlx5_flow_steering *steering = dev->priv.steering;
+-	int i;
+-
+-	for (i = 0; i < steering->esw_egress_acl_vports; i++)
+-		mlx5_fs_vport_egress_acl_ns_remove(steering, i);
+-
+-	xa_destroy(&steering->esw_egress_root_ns);
+-}
+-
+-int mlx5_fs_ingress_acls_init(struct mlx5_core_dev *dev, int total_vports)
+-{
+-	struct mlx5_flow_steering *steering = dev->priv.steering;
+-	int err;
+-	int i;
+-
+-	xa_init(&steering->esw_ingress_root_ns);
+-
+-	for (i = 0; i < total_vports; i++) {
+-		err = mlx5_fs_vport_ingress_acl_ns_add(steering, i);
+-		if (err)
+-			goto cleanup_root_ns;
+-	}
+-	steering->esw_ingress_acl_vports = total_vports;
+-	return 0;
+-
+-cleanup_root_ns:
+-	while (i--)
+-		mlx5_fs_vport_ingress_acl_ns_remove(steering, i);
+-
+-	xa_destroy(&steering->esw_ingress_root_ns);
+-	return err;
+-}
+-
+-void mlx5_fs_ingress_acls_cleanup(struct mlx5_core_dev *dev)
+-{
+-	struct mlx5_flow_steering *steering = dev->priv.steering;
+-	int i;
+-
+-	for (i = 0; i < steering->esw_ingress_acl_vports; i++)
+-		mlx5_fs_vport_ingress_acl_ns_remove(steering, i);
+-
+-	xa_destroy(&steering->esw_ingress_root_ns);
+-}
+-
+ u32 mlx5_fs_get_capabilities(struct mlx5_core_dev *dev, enum mlx5_flow_namespace_type type)
+ {
+ 	struct mlx5_flow_root_namespace *root;
+@@ -3873,6 +3804,11 @@ void mlx5_fs_core_cleanup(struct mlx5_co
+ {
+ 	struct mlx5_flow_steering *steering = dev->priv.steering;
+ 
++	WARN_ON(!xa_empty(&steering->esw_egress_root_ns));
++	WARN_ON(!xa_empty(&steering->esw_ingress_root_ns));
++	xa_destroy(&steering->esw_egress_root_ns);
++	xa_destroy(&steering->esw_ingress_root_ns);
++
+ 	cleanup_root_ns(steering->root_ns);
+ 	cleanup_fdb_root_ns(steering);
+ 	cleanup_root_ns(steering->port_sel_root_ns);
+@@ -3963,6 +3899,8 @@ int mlx5_fs_core_init(struct mlx5_core_d
+ 			goto err;
+ 	}
+ 
++	xa_init(&steering->esw_egress_root_ns);
++	xa_init(&steering->esw_ingress_root_ns);
+ 	return 0;
+ 
+ err:
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_core.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_core.h
+@@ -159,8 +159,6 @@ struct mlx5_flow_steering {
+ 	struct mlx5_flow_root_namespace	*rdma_tx_root_ns;
+ 	struct mlx5_flow_root_namespace	*egress_root_ns;
+ 	struct mlx5_flow_root_namespace	*port_sel_root_ns;
+-	int esw_egress_acl_vports;
+-	int esw_ingress_acl_vports;
+ 	struct mlx5_flow_root_namespace **rdma_transport_rx_root_ns;
+ 	struct mlx5_flow_root_namespace **rdma_transport_tx_root_ns;
+ 	int rdma_transport_rx_vports;
+@@ -379,11 +377,6 @@ void mlx5_fs_core_free(struct mlx5_core_
+ int mlx5_fs_core_init(struct mlx5_core_dev *dev);
+ void mlx5_fs_core_cleanup(struct mlx5_core_dev *dev);
+ 
+-int mlx5_fs_egress_acls_init(struct mlx5_core_dev *dev, int total_vports);
+-void mlx5_fs_egress_acls_cleanup(struct mlx5_core_dev *dev);
+-int mlx5_fs_ingress_acls_init(struct mlx5_core_dev *dev, int total_vports);
+-void mlx5_fs_ingress_acls_cleanup(struct mlx5_core_dev *dev);
+-
+ int mlx5_fs_vport_egress_acl_ns_add(struct mlx5_flow_steering *steering,
+ 				    u16 vport_idx);
+ int mlx5_fs_vport_ingress_acl_ns_add(struct mlx5_flow_steering *steering,
