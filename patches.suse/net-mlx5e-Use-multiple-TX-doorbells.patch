@@ -1,0 +1,131 @@
+From: Cosmin Ratiu <cratiu@nvidia.com>
+Date: Tue, 16 Sep 2025 17:11:41 +0300
+Subject: net/mlx5e: Use multiple TX doorbells
+Patch-mainline: v6.18-rc1
+Git-commit: 71fb4832d50b01f0af2d257360c239879ce93a8e
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+First, allocate more doorbells in mlx5e_create_mdev_resources:
+- one doorbell remains 'global' and will be used by all non-channel
+  associated SQs (e.g. ASO, HWS, PTP, ...).
+- allocate additional 'num_doorbells' doorbells. This defaults to
+  minimum between 8 and max number of channels.
+
+mlx5e_channel_pick_doorbell() now spreads out channel SQs across
+available doorbells.
+
+Signed-off-by: Cosmin Ratiu <cratiu@nvidia.com>
+Reviewed-by: Dragos Tatulea <dtatulea@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en_common.c |   29 +++++++++++++++++++-
+ drivers/net/ethernet/mellanox/mlx5/core/en_main.c   |   11 ++++++-
+ include/linux/mlx5/driver.h                         |    4 ++
+ 3 files changed, 42 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_common.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_common.c
+@@ -143,6 +143,7 @@ err_close_tises:
+ int mlx5e_create_mdev_resources(struct mlx5_core_dev *mdev, bool create_tises)
+ {
+ 	struct mlx5e_hw_objs *res = &mdev->mlx5e_res.hw_objs;
++	unsigned int num_doorbells, i;
+ 	int err;
+ 
+ 	err = mlx5_core_alloc_pd(mdev, &res->pdn);
+@@ -163,11 +164,30 @@ int mlx5e_create_mdev_resources(struct m
+ 		goto err_dealloc_transport_domain;
+ 	}
+ 
++	num_doorbells = min(MLX5_DEFAULT_NUM_DOORBELLS,
++			    mlx5e_get_max_num_channels(mdev));
++	res->bfregs = kcalloc(num_doorbells, sizeof(*res->bfregs), GFP_KERNEL);
++	if (!res->bfregs) {
++		err = -ENOMEM;
++		goto err_destroy_mkey;
++	}
++
++	for (i = 0; i < num_doorbells; i++) {
++		err = mlx5_alloc_bfreg(mdev, res->bfregs + i, false, false);
++		if (err) {
++			mlx5_core_warn(mdev,
++				       "could only allocate %d/%d doorbells, err %d.\n",
++				       i, num_doorbells, err);
++			break;
++		}
++	}
++	res->num_bfregs = i;
++
+ 	if (create_tises) {
+ 		err = mlx5e_create_tises(mdev, res->tisn);
+ 		if (err) {
+ 			mlx5_core_err(mdev, "alloc tises failed, %d\n", err);
+-			goto err_destroy_mkey;
++			goto err_destroy_bfregs;
+ 		}
+ 		res->tisn_valid = true;
+ 	}
+@@ -184,6 +204,10 @@ int mlx5e_create_mdev_resources(struct m
+ 
+ 	return 0;
+ 
++err_destroy_bfregs:
++	for (i = 0; i < res->num_bfregs; i++)
++		mlx5_free_bfreg(mdev, res->bfregs + i);
++	kfree(res->bfregs);
+ err_destroy_mkey:
+ 	mlx5_core_destroy_mkey(mdev, res->mkey);
+ err_dealloc_transport_domain:
+@@ -201,6 +225,9 @@ void mlx5e_destroy_mdev_resources(struct
+ 	mdev->mlx5e_res.dek_priv = NULL;
+ 	if (res->tisn_valid)
+ 		mlx5e_destroy_tises(mdev, res->tisn);
++	for (unsigned int i = 0; i < res->num_bfregs; i++)
++		mlx5_free_bfreg(mdev, res->bfregs + i);
++	kfree(res->bfregs);
+ 	mlx5_core_destroy_mkey(mdev, res->mkey);
+ 	mlx5_core_dealloc_transport_domain(mdev, res->td.tdn);
+ 	mlx5_core_dealloc_pd(mdev, res->pdn);
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -2712,7 +2712,16 @@ void mlx5e_trigger_napi_sched(struct nap
+ 
+ static void mlx5e_channel_pick_doorbell(struct mlx5e_channel *c)
+ {
+-	c->bfreg = &c->mdev->priv.bfreg;
++	struct mlx5e_hw_objs *hw_objs = &c->mdev->mlx5e_res.hw_objs;
++
++	/* No dedicated Ethernet doorbells, use the global one. */
++	if (hw_objs->num_bfregs == 0) {
++		c->bfreg = &c->mdev->priv.bfreg;
++		return;
++	}
++
++	/* Round-robin between doorbells. */
++	c->bfreg = hw_objs->bfregs + c->vec_ix % hw_objs->num_bfregs;
+ }
+ 
+ static int mlx5e_open_channel(struct mlx5e_priv *priv, int ix,
+--- a/include/linux/mlx5/driver.h
++++ b/include/linux/mlx5/driver.h
+@@ -658,6 +658,8 @@ struct mlx5e_resources {
+ 		u32                        pdn;
+ 		struct mlx5_td             td;
+ 		u32			   mkey;
++		struct mlx5_sq_bfreg      *bfregs;
++		unsigned int               num_bfregs;
+ #define MLX5_MAX_NUM_TC 8
+ 		u32                        tisn[MLX5_MAX_PORTS][MLX5_MAX_NUM_TC];
+ 		bool			   tisn_valid;
+@@ -802,6 +804,8 @@ struct mlx5_db {
+ 	int			index;
+ };
+ 
++#define MLX5_DEFAULT_NUM_DOORBELLS 8
++
+ enum {
+ 	MLX5_COMP_EQ_SIZE = 1024,
+ };
