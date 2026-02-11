@@ -1,0 +1,118 @@
+From: Yevgeny Kliteynik <kliteyn@nvidia.com>
+Date: Thu, 3 Jul 2025 21:54:30 +0300
+Subject: net/mlx5: HWS, Shrink empty matchers
+Patch-mainline: v6.17-rc1
+Git-commit: 96e4c4a1a5bc6b6bc1ba48c6dfd2246df24f2f63
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+Matcher size is dynamic: it starts at initial size, and then it grows
+through rehash as more and more rules are added to this matcher.
+When rules are deleted, matcher's size is not decreased. Rehash
+approach is greedy. The idea is: if the matcher got to a certain size
+at some point, chances are - it will get to this size again, so it is
+better to avoid costly rehash operations whenever possible.
+
+However, when all the rules of the matcher are deleted, this should
+be viewed as special case. If the matcher actually got to the point
+where it has zero rules, it might be an indication that some usecase
+from the past is no longer happening. This is where some ICM can be
+freed.
+
+This patch handles this case: when a number of rules in a matcher
+goes down to zero, the matcher's tables are shrunk to the initial
+size.
+
+Signed-off-by: Yevgeny Kliteynik <kliteyn@nvidia.com>
+Reviewed-by: Vlad Dogaru <vdogaru@nvidia.com>
+Signed-off-by: Mark Bloch <mbloch@nvidia.com>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Link: https://patch.msgid.link/20250703185431.445571-10-mbloch@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/steering/hws/bwc.c |   66 ++++++++++++-
+ 1 file changed, 65 insertions(+), 1 deletion(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/bwc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/bwc.c
+@@ -533,6 +533,70 @@ static void hws_bwc_rule_cnt_dec(struct
+ 		atomic_dec(&bwc_matcher->tx_size.num_of_rules);
+ }
+ 
++static int
++hws_bwc_matcher_rehash_shrink(struct mlx5hws_bwc_matcher *bwc_matcher)
++{
++	struct mlx5hws_bwc_matcher_size *rx_size = &bwc_matcher->rx_size;
++	struct mlx5hws_bwc_matcher_size *tx_size = &bwc_matcher->tx_size;
++
++	/* It is possible that another thread has added a rule.
++	 * Need to check again if we really need rehash/shrink.
++	 */
++	if (atomic_read(&rx_size->num_of_rules) ||
++	    atomic_read(&tx_size->num_of_rules))
++		return 0;
++
++	/* If the current matcher RX/TX size is already at its initial size. */
++	if (rx_size->size_log == MLX5HWS_BWC_MATCHER_INIT_SIZE_LOG &&
++	    tx_size->size_log == MLX5HWS_BWC_MATCHER_INIT_SIZE_LOG)
++		return 0;
++
++	/* Now we've done all the checking - do the shrinking:
++	 *  - reset match RTC size to the initial size
++	 *  - create new matcher
++	 *  - move the rules, which will not do anything as the matcher is empty
++	 *  - destroy the old matcher
++	 */
++
++	rx_size->size_log = MLX5HWS_BWC_MATCHER_INIT_SIZE_LOG;
++	tx_size->size_log = MLX5HWS_BWC_MATCHER_INIT_SIZE_LOG;
++
++	return hws_bwc_matcher_move(bwc_matcher);
++}
++
++static int hws_bwc_rule_cnt_dec_with_shrink(struct mlx5hws_bwc_rule *bwc_rule,
++					    u16 bwc_queue_idx)
++{
++	struct mlx5hws_bwc_matcher *bwc_matcher = bwc_rule->bwc_matcher;
++	struct mlx5hws_context *ctx = bwc_matcher->matcher->tbl->ctx;
++	struct mutex *queue_lock; /* Protect the queue */
++	int ret;
++
++	hws_bwc_rule_cnt_dec(bwc_rule);
++
++	if (atomic_read(&bwc_matcher->rx_size.num_of_rules) ||
++	    atomic_read(&bwc_matcher->tx_size.num_of_rules))
++		return 0;
++
++	/* Matcher has no more rules - shrink it to save ICM. */
++
++	queue_lock = hws_bwc_get_queue_lock(ctx, bwc_queue_idx);
++	mutex_unlock(queue_lock);
++
++	hws_bwc_lock_all_queues(ctx);
++	ret = hws_bwc_matcher_rehash_shrink(bwc_matcher);
++	hws_bwc_unlock_all_queues(ctx);
++
++	mutex_lock(queue_lock);
++
++	if (unlikely(ret))
++		mlx5hws_err(ctx,
++			    "BWC rule deletion: shrinking empty matcher failed (%d)\n",
++			    ret);
++
++	return ret;
++}
++
+ int mlx5hws_bwc_rule_destroy_simple(struct mlx5hws_bwc_rule *bwc_rule)
+ {
+ 	struct mlx5hws_bwc_matcher *bwc_matcher = bwc_rule->bwc_matcher;
+@@ -549,8 +613,8 @@ int mlx5hws_bwc_rule_destroy_simple(stru
+ 	mutex_lock(queue_lock);
+ 
+ 	ret = hws_bwc_rule_destroy_hws_sync(bwc_rule, &attr);
+-	hws_bwc_rule_cnt_dec(bwc_rule);
+ 	hws_bwc_rule_list_remove(bwc_rule);
++	hws_bwc_rule_cnt_dec_with_shrink(bwc_rule, idx);
+ 
+ 	mutex_unlock(queue_lock);
+ 
