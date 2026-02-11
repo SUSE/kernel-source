@@ -1,0 +1,164 @@
+From: Alex Vesker <valex@nvidia.com>
+Date: Sun, 17 Aug 2025 23:23:22 +0300
+Subject: net/mlx5: HWS, Fix table creation UID
+Patch-mainline: v6.17-rc3
+Git-commit: 8a51507320ebddaab32610199774f69cd7d53e78
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+During table creation, caller passes a UID using ft_attr. The UID
+value was ignored, which leads to problems when the caller sets the
+UID to a non-zero value, such as SHARED_RESOURCE_UID (0xffff) - the
+internal FT objects will be created with UID=0.
+
+Fixes: 0869701cba3d ("net/mlx5: HWS, added FW commands handling")
+Signed-off-by: Alex Vesker <valex@nvidia.com>
+Reviewed-by: Yevgeny Kliteynik <kliteyn@nvidia.com>
+Signed-off-by: Mark Bloch <mbloch@nvidia.com>
+Link: https://patch.msgid.link/20250817202323.308604-7-mbloch@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/steering/hws/cmd.c     |    1 
+ drivers/net/ethernet/mellanox/mlx5/core/steering/hws/cmd.h     |    1 
+ drivers/net/ethernet/mellanox/mlx5/core/steering/hws/fs_hws.c  |    1 
+ drivers/net/ethernet/mellanox/mlx5/core/steering/hws/matcher.c |    5 +++
+ drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws.h |    1 
+ drivers/net/ethernet/mellanox/mlx5/core/steering/hws/table.c   |   13 +++++++---
+ drivers/net/ethernet/mellanox/mlx5/core/steering/hws/table.h   |    3 +-
+ 7 files changed, 20 insertions(+), 5 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/cmd.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/cmd.c
+@@ -55,6 +55,7 @@ int mlx5hws_cmd_flow_table_create(struct
+ 
+ 	MLX5_SET(create_flow_table_in, in, opcode, MLX5_CMD_OP_CREATE_FLOW_TABLE);
+ 	MLX5_SET(create_flow_table_in, in, table_type, ft_attr->type);
++	MLX5_SET(create_flow_table_in, in, uid, ft_attr->uid);
+ 
+ 	ft_ctx = MLX5_ADDR_OF(create_flow_table_in, in, flow_table_context);
+ 	MLX5_SET(flow_table_context, ft_ctx, level, ft_attr->level);
+--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/cmd.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/cmd.h
+@@ -36,6 +36,7 @@ struct mlx5hws_cmd_set_fte_attr {
+ struct mlx5hws_cmd_ft_create_attr {
+ 	u8 type;
+ 	u8 level;
++	u16 uid;
+ 	bool rtc_valid;
+ 	bool decap_en;
+ 	bool reformat_en;
+--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/fs_hws.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/fs_hws.c
+@@ -267,6 +267,7 @@ static int mlx5_cmd_hws_create_flow_tabl
+ 
+ 	tbl_attr.type = MLX5HWS_TABLE_TYPE_FDB;
+ 	tbl_attr.level = ft_attr->level;
++	tbl_attr.uid = ft_attr->uid;
+ 	tbl = mlx5hws_table_create(ctx, &tbl_attr);
+ 	if (!tbl) {
+ 		mlx5_core_err(ns->dev, "Failed creating hws flow_table\n");
+--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/matcher.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/matcher.c
+@@ -85,6 +85,7 @@ static int hws_matcher_create_end_ft_iso
+ 
+ 	ret = mlx5hws_table_create_default_ft(tbl->ctx->mdev,
+ 					      tbl,
++					      0,
+ 					      &matcher->end_ft_id);
+ 	if (ret) {
+ 		mlx5hws_err(tbl->ctx, "Isolated matcher: failed to create end flow table\n");
+@@ -112,7 +113,9 @@ static int hws_matcher_create_end_ft(str
+ 	if (mlx5hws_matcher_is_isolated(matcher))
+ 		ret = hws_matcher_create_end_ft_isolated(matcher);
+ 	else
+-		ret = mlx5hws_table_create_default_ft(tbl->ctx->mdev, tbl,
++		ret = mlx5hws_table_create_default_ft(tbl->ctx->mdev,
++						      tbl,
++						      0,
+ 						      &matcher->end_ft_id);
+ 
+ 	if (ret) {
+--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws.h
+@@ -75,6 +75,7 @@ struct mlx5hws_context_attr {
+ struct mlx5hws_table_attr {
+ 	enum mlx5hws_table_type type;
+ 	u32 level;
++	u16 uid;
+ };
+ 
+ enum mlx5hws_matcher_flow_src {
+--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/table.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/table.c
+@@ -9,6 +9,7 @@ u32 mlx5hws_table_get_id(struct mlx5hws_
+ }
+ 
+ static void hws_table_init_next_ft_attr(struct mlx5hws_table *tbl,
++					u16 uid,
+ 					struct mlx5hws_cmd_ft_create_attr *ft_attr)
+ {
+ 	ft_attr->type = tbl->fw_ft_type;
+@@ -16,7 +17,9 @@ static void hws_table_init_next_ft_attr(
+ 		ft_attr->level = tbl->ctx->caps->fdb_ft.max_level - 1;
+ 	else
+ 		ft_attr->level = tbl->ctx->caps->nic_ft.max_level - 1;
++
+ 	ft_attr->rtc_valid = true;
++	ft_attr->uid = uid;
+ }
+ 
+ static void hws_table_set_cap_attr(struct mlx5hws_table *tbl,
+@@ -119,12 +122,12 @@ static int hws_table_connect_to_default_
+ 
+ int mlx5hws_table_create_default_ft(struct mlx5_core_dev *mdev,
+ 				    struct mlx5hws_table *tbl,
+-				    u32 *ft_id)
++				    u16 uid, u32 *ft_id)
+ {
+ 	struct mlx5hws_cmd_ft_create_attr ft_attr = {0};
+ 	int ret;
+ 
+-	hws_table_init_next_ft_attr(tbl, &ft_attr);
++	hws_table_init_next_ft_attr(tbl, uid, &ft_attr);
+ 	hws_table_set_cap_attr(tbl, &ft_attr);
+ 
+ 	ret = mlx5hws_cmd_flow_table_create(mdev, &ft_attr, ft_id);
+@@ -189,7 +192,10 @@ static int hws_table_init(struct mlx5hws
+ 	}
+ 
+ 	mutex_lock(&ctx->ctrl_lock);
+-	ret = mlx5hws_table_create_default_ft(tbl->ctx->mdev, tbl, &tbl->ft_id);
++	ret = mlx5hws_table_create_default_ft(tbl->ctx->mdev,
++					      tbl,
++					      tbl->uid,
++					      &tbl->ft_id);
+ 	if (ret) {
+ 		mlx5hws_err(tbl->ctx, "Failed to create flow table object\n");
+ 		mutex_unlock(&ctx->ctrl_lock);
+@@ -239,6 +245,7 @@ struct mlx5hws_table *mlx5hws_table_crea
+ 	tbl->ctx = ctx;
+ 	tbl->type = attr->type;
+ 	tbl->level = attr->level;
++	tbl->uid = attr->uid;
+ 
+ 	ret = hws_table_init(tbl);
+ 	if (ret) {
+--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/table.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/table.h
+@@ -18,6 +18,7 @@ struct mlx5hws_table {
+ 	enum mlx5hws_table_type type;
+ 	u32 fw_ft_type;
+ 	u32 level;
++	u16 uid;
+ 	struct list_head matchers_list;
+ 	struct list_head tbl_list_node;
+ 	struct mlx5hws_default_miss default_miss;
+@@ -47,7 +48,7 @@ u32 mlx5hws_table_get_res_fw_ft_type(enu
+ 
+ int mlx5hws_table_create_default_ft(struct mlx5_core_dev *mdev,
+ 				    struct mlx5hws_table *tbl,
+-				    u32 *ft_id);
++				    u16 uid, u32 *ft_id);
+ 
+ void mlx5hws_table_destroy_default_ft(struct mlx5hws_table *tbl,
+ 				      u32 ft_id);
