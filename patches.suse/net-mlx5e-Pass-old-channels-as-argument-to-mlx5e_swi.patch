@@ -1,0 +1,113 @@
+From: Tariq Toukan <tariqt@nvidia.com>
+Date: Thu, 30 Oct 2025 15:32:38 +0200
+Subject: net/mlx5e: Pass old channels as argument to
+ mlx5e_switch_priv_channels
+Patch-mainline: v6.19-rc1
+Git-commit: 911e3a37b024163d8329e3560d6fd5f0f0da2558
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+Let the caller function mlx5e_safe_switch_params() maintain a copy
+of the old channels, and pass it to mlx5e_switch_priv_channels().
+
+This is in preparation for the next patch.
+
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Reviewed-by: Carolina Jubran <cjubran@nvidia.com>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Link: https://patch.msgid.link/1761831159-1013140-7-git-send-email-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en_main.c |   25 ++++++++++++++--------
+ 1 file changed, 17 insertions(+), 8 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -3330,12 +3330,12 @@ static int mlx5e_switch_priv_params(stru
+ }
+ 
+ static int mlx5e_switch_priv_channels(struct mlx5e_priv *priv,
++				      struct mlx5e_channels *old_chs,
+ 				      struct mlx5e_channels *new_chs,
+ 				      mlx5e_fp_preactivate preactivate,
+ 				      void *context)
+ {
+ 	struct net_device *netdev = priv->netdev;
+-	struct mlx5e_channels old_chs;
+ 	int carrier_ok;
+ 	int err = 0;
+ 
+@@ -3344,7 +3344,6 @@ static int mlx5e_switch_priv_channels(st
+ 
+ 	mlx5e_deactivate_priv_channels(priv);
+ 
+-	old_chs = priv->channels;
+ 	priv->channels = *new_chs;
+ 
+ 	/* New channels are ready to roll, call the preactivate hook if needed
+@@ -3353,12 +3352,12 @@ static int mlx5e_switch_priv_channels(st
+ 	if (preactivate) {
+ 		err = preactivate(priv, context);
+ 		if (err) {
+-			priv->channels = old_chs;
++			priv->channels = *old_chs;
+ 			goto out;
+ 		}
+ 	}
+ 
+-	mlx5e_close_channels(&old_chs);
++	mlx5e_close_channels(old_chs);
+ 	priv->profile->update_rx(priv);
+ 
+ 	mlx5e_selq_apply(&priv->selq);
+@@ -3377,16 +3376,20 @@ int mlx5e_safe_switch_params(struct mlx5
+ 			     mlx5e_fp_preactivate preactivate,
+ 			     void *context, bool reset)
+ {
+-	struct mlx5e_channels *new_chs;
++	struct mlx5e_channels *old_chs, *new_chs;
+ 	int err;
+ 
+ 	reset &= test_bit(MLX5E_STATE_OPENED, &priv->state);
+ 	if (!reset)
+ 		return mlx5e_switch_priv_params(priv, params, preactivate, context);
+ 
++	old_chs = kzalloc(sizeof(*old_chs), GFP_KERNEL);
+ 	new_chs = kzalloc(sizeof(*new_chs), GFP_KERNEL);
+-	if (!new_chs)
+-		return -ENOMEM;
++	if (!old_chs || !new_chs) {
++		err = -ENOMEM;
++		goto err_free_chs;
++	}
++
+ 	new_chs->params = *params;
+ 
+ 	mlx5e_selq_prepare_params(&priv->selq, &new_chs->params);
+@@ -3395,11 +3398,15 @@ int mlx5e_safe_switch_params(struct mlx5
+ 	if (err)
+ 		goto err_cancel_selq;
+ 
+-	err = mlx5e_switch_priv_channels(priv, new_chs, preactivate, context);
++	*old_chs = priv->channels;
++
++	err = mlx5e_switch_priv_channels(priv, old_chs, new_chs,
++					 preactivate, context);
+ 	if (err)
+ 		goto err_close;
+ 
+ 	kfree(new_chs);
++	kfree(old_chs);
+ 	return 0;
+ 
+ err_close:
+@@ -3407,7 +3414,9 @@ err_close:
+ 
+ err_cancel_selq:
+ 	mlx5e_selq_cancel(&priv->selq);
++err_free_chs:
+ 	kfree(new_chs);
++	kfree(old_chs);
+ 	return err;
+ }
+ 
