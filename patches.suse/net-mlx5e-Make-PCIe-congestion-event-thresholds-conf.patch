@@ -1,0 +1,347 @@
+From: Dragos Tatulea <dtatulea@nvidia.com>
+Date: Sun, 7 Sep 2025 12:39:35 +0300
+Subject: net/mlx5e: Make PCIe congestion event thresholds configurable
+Patch-mainline: v6.18-rc1
+Git-commit: f4053490a6f651476124903dbe0777e3c24ac8cb
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+Add devlink driverinit parameters for configuring the thresholds for
+PCIe congestion events. These parameters are registered only when the
+firmware supports this feature.
+
+Update the mlx5 devlink docs as well on these new params.
+
+Signed-off-by: Dragos Tatulea <dtatulea@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Link: https://patch.msgid.link/1757237976-531416-2-git-send-email-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ Documentation/networking/devlink/mlx5.rst                    |   52 +++++
+ drivers/net/ethernet/mellanox/mlx5/core/devlink.c            |  106 +++++++++++
+ drivers/net/ethernet/mellanox/mlx5/core/devlink.h            |    4 
+ drivers/net/ethernet/mellanox/mlx5/core/en/pcie_cong_event.c |   72 ++++++-
+ 4 files changed, 226 insertions(+), 8 deletions(-)
+
+--- a/Documentation/networking/devlink/mlx5.rst
++++ b/Documentation/networking/devlink/mlx5.rst
+@@ -146,6 +146,58 @@ parameters.
+      - u32
+      - driverinit
+      - Control the size (in packets) of the hairpin queues.
++   * - ``pcie_cong_inbound_high``
++     - u16
++     - driverinit
++     - High threshold configuration for PCIe congestion events. The firmware
++       will send an event once device side inbound PCIe traffic went
++       above the configured high threshold for a long enough period (at least
++       200ms).
++
++       See pci_bw_inbound_high ethtool stat.
++
++       Units are 0.01 %. Accepted values are in range [0, 10000].
++       pcie_cong_inbound_low < pcie_cong_inbound_high.
++       Default value: 9000 (Corresponds to 90%).
++   * - ``pcie_cong_inbound_low``
++     - u16
++     - driverinit
++     - Low threshold configuration for PCIe congestion events. The firmware
++       will send an event once device side inbound PCIe traffic went
++       below the configured low threshold, only after having been previously in
++       a congested state.
++
++       See pci_bw_inbound_low ethtool stat.
++
++       Units are 0.01 %. Accepted values are in range [0, 10000].
++       pcie_cong_inbound_low < pcie_cong_inbound_high.
++       Default value: 7500.
++   * - ``pcie_cong_outbound_high``
++     - u16
++     - driverinit
++     - High threshold configuration for PCIe congestion events. The firmware
++       will send an event once device side outbound PCIe traffic went
++       above the configured high threshold for a long enough period (at least
++       200ms).
++
++       See pci_bw_outbound_high ethtool stat.
++
++       Units are 0.01 %. Accepted values are in range [0, 10000].
++       pcie_cong_outbound_low < pcie_cong_outbound_high.
++       Default value: 9000 (Corresponds to 90%).
++   * - ``pcie_cong_outbound_low``
++     - u16
++     - driverinit
++     - Low threshold configuration for PCIe congestion events. The firmware
++       will send an event once device side outbound PCIe traffic went
++       below the configured low threshold, only after having been previously in
++       a congested state.
++
++       See pci_bw_outbound_low ethtool stat.
++
++       Units are 0.01 %. Accepted values are in range [0, 10000].
++       pcie_cong_outbound_low < pcie_cong_outbound_high.
++       Default value: 7500.
+ 
+    * - ``cqe_compress_type``
+      - string
+--- a/drivers/net/ethernet/mellanox/mlx5/core/devlink.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/devlink.c
+@@ -651,6 +651,105 @@ static void mlx5_devlink_eth_params_unre
+ 			       ARRAY_SIZE(mlx5_devlink_eth_params));
+ }
+ 
++#define MLX5_PCIE_CONG_THRESH_MAX	10000
++#define MLX5_PCIE_CONG_THRESH_DEF_LOW	7500
++#define MLX5_PCIE_CONG_THRESH_DEF_HIGH	9000
++
++static int
++mlx5_devlink_pcie_cong_thresh_validate(struct devlink *devl, u32 id,
++				       union devlink_param_value val,
++				       struct netlink_ext_ack *extack)
++{
++	if (val.vu16 > MLX5_PCIE_CONG_THRESH_MAX) {
++		NL_SET_ERR_MSG_FMT_MOD(extack, "Value %u > max supported (%u)",
++				       val.vu16, MLX5_PCIE_CONG_THRESH_MAX);
++
++		return -EINVAL;
++	}
++
++	switch (id) {
++	case MLX5_DEVLINK_PARAM_ID_PCIE_CONG_IN_LOW:
++	case MLX5_DEVLINK_PARAM_ID_PCIE_CONG_IN_HIGH:
++	case MLX5_DEVLINK_PARAM_ID_PCIE_CONG_OUT_LOW:
++	case MLX5_DEVLINK_PARAM_ID_PCIE_CONG_OUT_HIGH:
++		break;
++	default:
++		return -EOPNOTSUPP;
++	}
++
++	return 0;
++}
++
++static void mlx5_devlink_pcie_cong_init_values(struct devlink *devlink)
++{
++	union devlink_param_value value;
++	u32 id;
++
++	value.vu16 = MLX5_PCIE_CONG_THRESH_DEF_LOW;
++	id = MLX5_DEVLINK_PARAM_ID_PCIE_CONG_IN_LOW;
++	devl_param_driverinit_value_set(devlink, id, value);
++
++	value.vu16 = MLX5_PCIE_CONG_THRESH_DEF_HIGH;
++	id = MLX5_DEVLINK_PARAM_ID_PCIE_CONG_IN_HIGH;
++	devl_param_driverinit_value_set(devlink, id, value);
++
++	value.vu16 = MLX5_PCIE_CONG_THRESH_DEF_LOW;
++	id = MLX5_DEVLINK_PARAM_ID_PCIE_CONG_OUT_LOW;
++	devl_param_driverinit_value_set(devlink, id, value);
++
++	value.vu16 = MLX5_PCIE_CONG_THRESH_DEF_HIGH;
++	id = MLX5_DEVLINK_PARAM_ID_PCIE_CONG_OUT_HIGH;
++	devl_param_driverinit_value_set(devlink, id, value);
++}
++
++static const struct devlink_param mlx5_devlink_pcie_cong_params[] = {
++	DEVLINK_PARAM_DRIVER(MLX5_DEVLINK_PARAM_ID_PCIE_CONG_IN_LOW,
++			     "pcie_cong_inbound_low", DEVLINK_PARAM_TYPE_U16,
++			     BIT(DEVLINK_PARAM_CMODE_DRIVERINIT), NULL, NULL,
++			     mlx5_devlink_pcie_cong_thresh_validate),
++	DEVLINK_PARAM_DRIVER(MLX5_DEVLINK_PARAM_ID_PCIE_CONG_IN_HIGH,
++			     "pcie_cong_inbound_high", DEVLINK_PARAM_TYPE_U16,
++			     BIT(DEVLINK_PARAM_CMODE_DRIVERINIT), NULL, NULL,
++			     mlx5_devlink_pcie_cong_thresh_validate),
++	DEVLINK_PARAM_DRIVER(MLX5_DEVLINK_PARAM_ID_PCIE_CONG_OUT_LOW,
++			     "pcie_cong_outbound_low", DEVLINK_PARAM_TYPE_U16,
++			     BIT(DEVLINK_PARAM_CMODE_DRIVERINIT), NULL, NULL,
++			     mlx5_devlink_pcie_cong_thresh_validate),
++	DEVLINK_PARAM_DRIVER(MLX5_DEVLINK_PARAM_ID_PCIE_CONG_OUT_HIGH,
++			     "pcie_cong_outbound_high", DEVLINK_PARAM_TYPE_U16,
++			     BIT(DEVLINK_PARAM_CMODE_DRIVERINIT), NULL, NULL,
++			     mlx5_devlink_pcie_cong_thresh_validate),
++};
++
++static int mlx5_devlink_pcie_cong_params_register(struct devlink *devlink)
++{
++	struct mlx5_core_dev *dev = devlink_priv(devlink);
++	int err;
++
++	if (!mlx5_pcie_cong_event_supported(dev))
++		return 0;
++
++	err = devl_params_register(devlink, mlx5_devlink_pcie_cong_params,
++				   ARRAY_SIZE(mlx5_devlink_pcie_cong_params));
++	if (err)
++		return err;
++
++	mlx5_devlink_pcie_cong_init_values(devlink);
++
++	return 0;
++}
++
++static void mlx5_devlink_pcie_cong_params_unregister(struct devlink *devlink)
++{
++	struct mlx5_core_dev *dev = devlink_priv(devlink);
++
++	if (!mlx5_pcie_cong_event_supported(dev))
++		return;
++
++	devl_params_unregister(devlink, mlx5_devlink_pcie_cong_params,
++			       ARRAY_SIZE(mlx5_devlink_pcie_cong_params));
++}
++
+ static int mlx5_devlink_enable_rdma_validate(struct devlink *devlink, u32 id,
+ 					     union devlink_param_value val,
+ 					     struct netlink_ext_ack *extack)
+@@ -896,6 +995,10 @@ int mlx5_devlink_params_register(struct
+ 	if (err)
+ 		goto max_uc_list_err;
+ 
++	err = mlx5_devlink_pcie_cong_params_register(devlink);
++	if (err)
++		goto pcie_cong_err;
++
+ 	err = mlx5_nv_param_register_dl_params(devlink);
+ 	if (err)
+ 		goto nv_param_err;
+@@ -903,6 +1006,8 @@ int mlx5_devlink_params_register(struct
+ 	return 0;
+ 
+ nv_param_err:
++	mlx5_devlink_pcie_cong_params_unregister(devlink);
++pcie_cong_err:
+ 	mlx5_devlink_max_uc_list_params_unregister(devlink);
+ max_uc_list_err:
+ 	mlx5_devlink_auxdev_params_unregister(devlink);
+@@ -915,6 +1020,7 @@ auxdev_reg_err:
+ void mlx5_devlink_params_unregister(struct devlink *devlink)
+ {
+ 	mlx5_nv_param_unregister_dl_params(devlink);
++	mlx5_devlink_pcie_cong_params_unregister(devlink);
+ 	mlx5_devlink_max_uc_list_params_unregister(devlink);
+ 	mlx5_devlink_auxdev_params_unregister(devlink);
+ 	devl_params_unregister(devlink, mlx5_devlink_params,
+--- a/drivers/net/ethernet/mellanox/mlx5/core/devlink.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/devlink.h
+@@ -22,6 +22,10 @@ enum mlx5_devlink_param_id {
+ 	MLX5_DEVLINK_PARAM_ID_ESW_MULTIPORT,
+ 	MLX5_DEVLINK_PARAM_ID_HAIRPIN_NUM_QUEUES,
+ 	MLX5_DEVLINK_PARAM_ID_HAIRPIN_QUEUE_SIZE,
++	MLX5_DEVLINK_PARAM_ID_PCIE_CONG_IN_LOW,
++	MLX5_DEVLINK_PARAM_ID_PCIE_CONG_IN_HIGH,
++	MLX5_DEVLINK_PARAM_ID_PCIE_CONG_OUT_LOW,
++	MLX5_DEVLINK_PARAM_ID_PCIE_CONG_OUT_HIGH,
+ 	MLX5_DEVLINK_PARAM_ID_CQE_COMPRESSION_TYPE
+ };
+ 
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/pcie_cong_event.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/pcie_cong_event.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0 OR Linux-OpenIB
+ // Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES.
+ 
++#include "../devlink.h"
+ #include "en.h"
+ #include "pcie_cong_event.h"
+ 
+@@ -41,13 +42,6 @@ struct mlx5e_pcie_cong_event {
+ 	struct mlx5e_pcie_cong_stats stats;
+ };
+ 
+-/* In units of 0.01 % */
+-static const struct mlx5e_pcie_cong_thresh default_thresh_config = {
+-	.inbound_high = 9000,
+-	.inbound_low = 7500,
+-	.outbound_high = 9000,
+-	.outbound_low = 7500,
+-};
+ 
+ static const struct counter_desc mlx5e_pcie_cong_stats_desc[] = {
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_pcie_cong_stats,
+@@ -249,8 +243,60 @@ static int mlx5e_pcie_cong_event_handler
+ 	return NOTIFY_OK;
+ }
+ 
++static int
++mlx5e_pcie_cong_get_thresh_config(struct mlx5_core_dev *dev,
++				  struct mlx5e_pcie_cong_thresh *config)
++{
++	u32 ids[4] = {
++		MLX5_DEVLINK_PARAM_ID_PCIE_CONG_IN_LOW,
++		MLX5_DEVLINK_PARAM_ID_PCIE_CONG_IN_HIGH,
++		MLX5_DEVLINK_PARAM_ID_PCIE_CONG_OUT_LOW,
++		MLX5_DEVLINK_PARAM_ID_PCIE_CONG_OUT_HIGH,
++	};
++	struct devlink *devlink = priv_to_devlink(dev);
++	union devlink_param_value val[4];
++
++	for (int i = 0; i < 4; i++) {
++		u32 id = ids[i];
++		int err;
++
++		err = devl_param_driverinit_value_get(devlink, id, &val[i]);
++		if (err)
++			return err;
++	}
++
++	config->inbound_low = val[0].vu16;
++	config->inbound_high = val[1].vu16;
++	config->outbound_low = val[2].vu16;
++	config->outbound_high = val[3].vu16;
++
++	return 0;
++}
++
++static int
++mlx5e_thresh_config_validate(struct mlx5_core_dev *mdev,
++			     const struct mlx5e_pcie_cong_thresh *config)
++{
++	int err = 0;
++
++	if (config->inbound_low >= config->inbound_high) {
++		err = -EINVAL;
++		mlx5_core_err(mdev, "PCIe inbound congestion threshold configuration invalid: low (%u) >= high (%u).\n",
++			      config->inbound_low, config->inbound_high);
++	}
++
++	if (config->outbound_low >= config->outbound_high) {
++		err = -EINVAL;
++		mlx5_core_err(mdev, "PCIe outbound congestion threshold configuration invalid: low (%u) >= high (%u).\n",
++			      config->outbound_low, config->outbound_high);
++	}
++
++	return err;
++}
++
+ int mlx5e_pcie_cong_event_init(struct mlx5e_priv *priv)
+ {
++	struct mlx5e_pcie_cong_thresh thresh_config = {};
+ 	struct mlx5e_pcie_cong_event *cong_event;
+ 	struct mlx5_core_dev *mdev = priv->mdev;
+ 	int err;
+@@ -258,6 +304,16 @@ int mlx5e_pcie_cong_event_init(struct ml
+ 	if (!mlx5_pcie_cong_event_supported(mdev))
+ 		return 0;
+ 
++	err = mlx5e_pcie_cong_get_thresh_config(mdev, &thresh_config);
++	if (WARN_ON(err))
++		return err;
++
++	err = mlx5e_thresh_config_validate(mdev, &thresh_config);
++	if (err) {
++		mlx5_core_err(mdev, "PCIe congestion event feature disabled\n");
++		return err;
++	}
++
+ 	cong_event = kvzalloc_node(sizeof(*cong_event), GFP_KERNEL,
+ 				   mdev->priv.numa_node);
+ 	if (!cong_event)
+@@ -269,7 +325,7 @@ int mlx5e_pcie_cong_event_init(struct ml
+ 
+ 	cong_event->priv = priv;
+ 
+-	err = mlx5_cmd_pcie_cong_event_set(mdev, &default_thresh_config,
++	err = mlx5_cmd_pcie_cong_event_set(mdev, &thresh_config,
+ 					   &cong_event->obj_id);
+ 	if (err) {
+ 		mlx5_core_warn(mdev, "Error creating a PCIe congestion event object\n");
