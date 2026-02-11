@@ -1,0 +1,99 @@
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Thu, 26 Jun 2025 19:57:43 +0800
+Subject: [PATCH] block: fix false warning in bdev_count_inflight_rw()
+Git-commit: c007062188d8e402c294117db53a24b2bed2b83f
+Patch-mainline: v6.16
+References: jsc#PED-14161
+
+While bdev_count_inflight is interating all cpus, if some IOs are issued
+from traversed cpu and then completed from the cpu that is not traversed
+yet:
+
+cpu0
+		cpu1
+		bdev_count_inflight
+		 //for_each_possible_cpu
+		 // cpu0 is 0
+		 infliht += 0
+// issue a io
+blk_account_io_start
+// cpu0 inflight ++
+
+				cpu2
+				// the io is done
+				blk_account_io_done
+				// cpu2 inflight --
+		 // cpu 1 is 0
+		 inflight += 0
+		 // cpu2 is -1
+		 inflight += -1
+		 ...
+
+In this case, the total inflight will be -1, causing lots of false
+warning. Fix the problem by removing the warning.
+
+Noted there is still a valid warning for nvme-mpath(From Yi) that is not
+fixed yet.
+
+Fixes: f5482ee5edb9 ("block: WARN if bdev inflight counter is negative")
+Reported-by: Yi Zhang <yi.zhang@redhat.com>
+Closes: https://lore.kernel.org/linux-block/aFtUXy-lct0WxY2w@mozart.vkv.me/T/#mae89155a5006463d0a21a4a2c35ae0034b26a339
+Reported-and-tested-by: Calvin Owens <calvin@wbinvd.org>
+Closes: https://lore.kernel.org/linux-block/aFtUXy-lct0WxY2w@mozart.vkv.me/T/#m1d935a00070bf95055d0ac84e6075158b08acaef
+Reported-by: Dave Chinner <david@fromorbit.com>
+Closes: https://lore.kernel.org/linux-block/aFuypjqCXo9-5_En@dread.disaster.area/
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Link: https://lore.kernel.org/r/20250626115743.1641443-1-yukuai3@huawei.com
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/genhd.c | 26 +++++++++++++++-----------
+ 1 file changed, 15 insertions(+), 11 deletions(-)
+
+diff --git a/block/genhd.c b/block/genhd.c
+index 8171a6bc3210..c26733f6324b 100644
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@ -128,23 +128,27 @@ static void part_stat_read_all(struct block_device *part,
+ static void bdev_count_inflight_rw(struct block_device *part,
+ 		unsigned int inflight[2], bool mq_driver)
+ {
++	int write = 0;
++	int read = 0;
+ 	int cpu;
+ 
+ 	if (mq_driver) {
+ 		blk_mq_in_driver_rw(part, inflight);
+-	} else {
+-		for_each_possible_cpu(cpu) {
+-			inflight[READ] += part_stat_local_read_cpu(
+-						part, in_flight[READ], cpu);
+-			inflight[WRITE] += part_stat_local_read_cpu(
+-						part, in_flight[WRITE], cpu);
+-		}
++		return;
++	}
++
++	for_each_possible_cpu(cpu) {
++		read += part_stat_local_read_cpu(part, in_flight[READ], cpu);
++		write += part_stat_local_read_cpu(part, in_flight[WRITE], cpu);
+ 	}
+ 
+-	if (WARN_ON_ONCE((int)inflight[READ] < 0))
+-		inflight[READ] = 0;
+-	if (WARN_ON_ONCE((int)inflight[WRITE] < 0))
+-		inflight[WRITE] = 0;
++	/*
++	 * While iterating all CPUs, some IOs may be issued from a CPU already
++	 * traversed and complete on a CPU that has not yet been traversed,
++	 * causing the inflight number to be negative.
++	 */
++	inflight[READ] = read > 0 ? read : 0;
++	inflight[WRITE] = write > 0 ? write : 0;
+ }
+ 
+ /**
+-- 
+2.43.0
+
