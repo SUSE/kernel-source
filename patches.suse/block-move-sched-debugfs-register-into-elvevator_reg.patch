@@ -1,0 +1,139 @@
+From: Ming Lei <ming.lei@redhat.com>
+Date: Mon, 5 May 2025 22:17:44 +0800
+Subject: [PATCH] block: move sched debugfs register into
+ elevator_register_queue
+Git-commit: 92c22d7efcdf92412ff70eb175d424d9c24ac07f
+Patch-mainline: v6.16
+References: jsc#PED-14161
+
+sched debugfs shares same lifetime with scheduler's kobject, and same
+lock(elevator lock), so move sched debugfs register/unregister into
+elevator_register_queue() and elevator_unregister_queue().
+
+Then we needn't blk_mq_debugfs_register() for us to register sched
+debugfs any more.
+
+Reviewed-by: Yu Kuai <yukuai3@huawei.com>
+Reviewed-by: Nilay Shroff <nilay@linux.ibm.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Hannes Reinecke <hare@suse.de>
+Signed-off-by: Ming Lei <ming.lei@redhat.com>
+Link: https://lore.kernel.org/r/20250505141805.2751237-7-ming.lei@redhat.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/blk-mq-debugfs.c | 11 -----------
+ block/blk-mq-sched.c   | 11 ++---------
+ block/elevator.c       |  8 ++++++++
+ block/elevator.h       |  3 +++
+ 4 files changed, 13 insertions(+), 20 deletions(-)
+
+diff --git a/block/blk-mq-debugfs.c b/block/blk-mq-debugfs.c
+index 7710c409e432..2837a8ce8054 100644
+--- a/block/blk-mq-debugfs.c
++++ b/block/blk-mq-debugfs.c
+@@ -625,20 +625,9 @@ void blk_mq_debugfs_register(struct request_queue *q)
+ 
+ 	debugfs_create_files(q->debugfs_dir, q, blk_mq_debugfs_queue_attrs);
+ 
+-	/*
+-	 * blk_mq_init_sched() attempted to do this already, but q->debugfs_dir
+-	 * didn't exist yet (because we don't know what to name the directory
+-	 * until the queue is registered to a gendisk).
+-	 */
+-	if (q->elevator && !q->sched_debugfs_dir)
+-		blk_mq_debugfs_register_sched(q);
+-
+-	/* Similarly, blk_mq_init_hctx() couldn't do this previously. */
+ 	queue_for_each_hw_ctx(q, hctx, i) {
+ 		if (!hctx->debugfs_dir)
+ 			blk_mq_debugfs_register_hctx(q, hctx);
+-		if (q->elevator && !hctx->sched_debugfs_dir)
+-			blk_mq_debugfs_register_sched_hctx(q, hctx);
+ 	}
+ 
+ 	if (q->rq_qos) {
+diff --git a/block/blk-mq-sched.c b/block/blk-mq-sched.c
+index 2abc5e0704e8..336a15ffecfa 100644
+--- a/block/blk-mq-sched.c
++++ b/block/blk-mq-sched.c
+@@ -434,7 +434,7 @@ static int blk_mq_init_sched_shared_tags(struct request_queue *queue)
+ 	return 0;
+ }
+ 
+-static void blk_mq_sched_reg_debugfs(struct request_queue *q)
++void blk_mq_sched_reg_debugfs(struct request_queue *q)
+ {
+ 	struct blk_mq_hw_ctx *hctx;
+ 	unsigned long i;
+@@ -446,7 +446,7 @@ static void blk_mq_sched_reg_debugfs(struct request_queue *q)
+ 	mutex_unlock(&q->debugfs_mutex);
+ }
+ 
+-static void blk_mq_sched_unreg_debugfs(struct request_queue *q)
++void blk_mq_sched_unreg_debugfs(struct request_queue *q)
+ {
+ 	struct blk_mq_hw_ctx *hctx;
+ 	unsigned long i;
+@@ -503,10 +503,6 @@ int blk_mq_init_sched(struct request_queue *q, struct elevator_type *e)
+ 			}
+ 		}
+ 	}
+-
+-	/* sched is initialized, it is ready to export it via debugfs */
+-	blk_mq_sched_reg_debugfs(q);
+-
+ 	return 0;
+ 
+ err_free_map_and_rqs:
+@@ -544,9 +540,6 @@ void blk_mq_exit_sched(struct request_queue *q, struct elevator_queue *e)
+ 	unsigned long i;
+ 	unsigned int flags = 0;
+ 
+-	/* unexport via debugfs before exiting sched */
+-	blk_mq_sched_unreg_debugfs(q);
+-
+ 	queue_for_each_hw_ctx(q, hctx, i) {
+ 		if (e->type->ops.exit_hctx && hctx->sched_data) {
+ 			e->type->ops.exit_hctx(hctx, i);
+diff --git a/block/elevator.c b/block/elevator.c
+index b32815594892..4400eb8fe54f 100644
+--- a/block/elevator.c
++++ b/block/elevator.c
+@@ -472,6 +472,11 @@ int elv_register_queue(struct request_queue *q, bool uevent)
+ 		if (uevent)
+ 			kobject_uevent(&e->kobj, KOBJ_ADD);
+ 
++		/*
++		 * Sched is initialized, it is ready to export it via
++		 * debugfs
++		 */
++		blk_mq_sched_reg_debugfs(q);
+ 		set_bit(ELEVATOR_FLAG_REGISTERED, &e->flags);
+ 	}
+ 	return error;
+@@ -486,6 +491,9 @@ void elv_unregister_queue(struct request_queue *q)
+ 	if (e && test_and_clear_bit(ELEVATOR_FLAG_REGISTERED, &e->flags)) {
+ 		kobject_uevent(&e->kobj, KOBJ_REMOVE);
+ 		kobject_del(&e->kobj);
++
++		/* unexport via debugfs before exiting sched */
++		blk_mq_sched_unreg_debugfs(q);
+ 	}
+ }
+ 
+diff --git a/block/elevator.h b/block/elevator.h
+index e27af5492cdb..9198676644a9 100644
+--- a/block/elevator.h
++++ b/block/elevator.h
+@@ -181,4 +181,7 @@ extern struct request *elv_rb_find(struct rb_root *, sector_t);
+ #define rq_entry_fifo(ptr)	list_entry((ptr), struct request, queuelist)
+ #define rq_fifo_clear(rq)	list_del_init(&(rq)->queuelist)
+ 
++void blk_mq_sched_reg_debugfs(struct request_queue *q);
++void blk_mq_sched_unreg_debugfs(struct request_queue *q);
++
+ #endif /* _ELEVATOR_H */
+-- 
+2.43.0
+
