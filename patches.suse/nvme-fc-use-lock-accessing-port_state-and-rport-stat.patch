@@ -1,0 +1,52 @@
+From: Daniel Wagner <wagi@kernel.org>
+Date: Tue, 2 Sep 2025 12:22:03 +0200
+Subject: nvme-fc: use lock accessing port_state and rport state
+Patch-mainline: v6.18-rc1
+Git-commit: 891cdbb162ccdb079cd5228ae43bdeebce8597ad
+References: CVE-2025-40342 bsc#1255274
+
+nvme_fc_unregister_remote removes the remote port on a lport object at
+any point in time when there is no active association. This races with
+with the reconnect logic, because nvme_fc_create_association is not
+taking a lock to check the port_state and atomically increase the
+active count on the rport.
+
+Reported-by: Shinichiro Kawasaki <shinichiro.kawasaki@wdc.com>
+Closes: https://lore.kernel.org/all/u4ttvhnn7lark5w3sgrbuy2rxupcvosp4qmvj46nwzgeo5ausc@uyrkdls2muwx
+Signed-off-by: Daniel Wagner <wagi@kernel.org>
+Reviewed-by: Hannes Reinecke <hare@suse.de>
+Signed-off-by: Keith Busch <kbusch@kernel.org>
+Acked-by: Daniel Wagner <dwagner@suse.de>
+---
+ drivers/nvme/host/fc.c |   13 ++++++++++---
+ 1 file changed, 10 insertions(+), 3 deletions(-)
+
+--- a/drivers/nvme/host/fc.c
++++ b/drivers/nvme/host/fc.c
+@@ -2714,16 +2714,23 @@ static int
+ nvme_fc_create_association(struct nvme_fc_ctrl *ctrl)
+ {
+ 	struct nvmf_ctrl_options *opts = ctrl->ctrl.opts;
++	unsigned long flags;
+ 	int ret;
+ 	bool changed;
+ 
+ 	++ctrl->ctrl.nr_reconnects;
+ 
+-	if (ctrl->rport->remoteport.port_state != FC_OBJSTATE_ONLINE)
++	spin_lock_irqsave(&ctrl->rport->lock, flags);
++	if (ctrl->rport->remoteport.port_state != FC_OBJSTATE_ONLINE) {
++		spin_unlock_irqrestore(&ctrl->rport->lock, flags);
+ 		return -ENODEV;
+-
+-	if (nvme_fc_ctlr_active_on_rport(ctrl))
++	}
++	
++	if (nvme_fc_ctlr_active_on_rport(ctrl)) {
++		spin_unlock_irqrestore(&ctrl->rport->lock, flags);
+ 		return -ENOTUNIQ;
++	}
++	spin_unlock_irqrestore(&ctrl->rport->lock, flags);
+ 
+ 	clear_bit(ASSOC_FAILED, &ctrl->flags);
+ 
