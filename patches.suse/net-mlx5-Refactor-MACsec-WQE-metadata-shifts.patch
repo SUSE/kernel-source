@@ -1,0 +1,140 @@
+From: Carolina Jubran <cjubran@nvidia.com>
+Date: Thu, 11 Sep 2025 10:10:18 +0300
+Subject: net/mlx5: Refactor MACsec WQE metadata shifts
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Patch-mainline: v6.18-rc1
+Git-commit: cce65f32443b61db2370a67d2e92d16b773fe8a4
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+Introduce MLX5_ETH_WQE_FT_META_SHIFT as a shared base offset for
+features that use the lower 8 bits of the WQE flow_table_metadata
+field, currently used for timestamping, IPsec, and MACsec.
+
+Define MLX5_ETH_WQE_FT_META_MACSEC_FS_ID_MASK so that fs_id occupies
+bits 2–5, making it clear that fs_id occupies bits in the metadata.
+
+Set MLX5_ETH_WQE_FT_META_MACSEC_MASK as the OR of the MACsec flag and
+MLX5_ETH_WQE_FT_META_MACSEC_FS_ID_MASK, corresponding to the original
+0x3E mask.
+
+Update the fs_id macro to right-shift the MACsec flag by
+MLX5_ETH_WQE_FT_META_SHIFT and update the RoCE modify-header action to
+use it.
+
+Introduce the helper macro MLX5_MACSEC_TX_METADATA(fs_id) to compose
+the full shifted MACsec metadata value.
+
+These changes make it explicit exactly which metadata bits carry MACsec
+information, simplifying future feature exclusions when multiple
+features share the WQE flowtable metadata.
+
+In addition, drop the incorrect “RX flow steering” comment, since this
+applies to TX flow steering.
+
+Signed-off-by: Carolina Jubran <cjubran@nvidia.com>
+Reviewed-by: Jianbo Liu <jianbol@nvidia.com>
+Reviewed-by: Dragos Tatulea <dtatulea@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://patch.msgid.link/1757574619-604874-3-git-send-email-tariqt@nvidia.com
+Reviewed-by: Simon Horman <horms@kernel.org>
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en_accel/macsec.c |    2 -
+ drivers/net/ethernet/mellanox/mlx5/core/lib/macsec_fs.c   |   12 ++++-------
+ drivers/net/ethernet/mellanox/mlx5/core/lib/macsec_fs.h   |   15 ++++++++++++++
+ include/linux/mlx5/qp.h                                   |    9 ++++++--
+ 4 files changed, 28 insertions(+), 10 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/macsec.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/macsec.c
+@@ -1676,7 +1676,7 @@ void mlx5e_macsec_tx_build_eseg(struct m
+ 	if (!fs_id)
+ 		return;
+ 
+-	eseg->flow_table_metadata = cpu_to_be32(MLX5_ETH_WQE_FT_META_MACSEC | fs_id << 2);
++	eseg->flow_table_metadata = cpu_to_be32(MLX5_MACSEC_TX_METADATA(fs_id));
+ }
+ 
+ void mlx5e_macsec_offload_handle_rx_skb(struct net_device *netdev,
+--- a/drivers/net/ethernet/mellanox/mlx5/core/lib/macsec_fs.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/lib/macsec_fs.c
+@@ -45,11 +45,7 @@
+ #define MLX5_SECTAG_HEADER_SIZE_WITHOUT_SCI 0x8
+ #define MLX5_SECTAG_HEADER_SIZE_WITH_SCI (MLX5_SECTAG_HEADER_SIZE_WITHOUT_SCI + MACSEC_SCI_LEN)
+ 
+-/* MACsec RX flow steering */
+-#define MLX5_ETH_WQE_FT_META_MACSEC_MASK 0x3E
+-
+ /* MACsec fs_id handling for steering */
+-#define macsec_fs_set_tx_fs_id(fs_id) (MLX5_ETH_WQE_FT_META_MACSEC | (fs_id) << 2)
+ #define macsec_fs_set_rx_fs_id(fs_id) ((fs_id) | BIT(30))
+ 
+ struct mlx5_sectag_header {
+@@ -597,7 +593,7 @@ static int macsec_fs_tx_setup_fte(struct
+ 	MLX5_SET(fte_match_param, spec->match_criteria, misc_parameters_2.metadata_reg_a,
+ 		 MLX5_ETH_WQE_FT_META_MACSEC_MASK);
+ 	MLX5_SET(fte_match_param, spec->match_value, misc_parameters_2.metadata_reg_a,
+-		 macsec_fs_set_tx_fs_id(id));
++		 MLX5_MACSEC_TX_METADATA(id));
+ 
+ 	*fs_id = id;
+ 	flow_act->crypto.type = MLX5_FLOW_CONTEXT_ENCRYPT_DECRYPT_TYPE_MACSEC;
+@@ -2219,8 +2215,10 @@ static int mlx5_macsec_fs_add_roce_rule_
+ 
+ 	MLX5_SET(set_action_in, action, action_type, MLX5_ACTION_TYPE_SET);
+ 	MLX5_SET(set_action_in, action, field, MLX5_ACTION_IN_FIELD_METADATA_REG_A);
+-	MLX5_SET(set_action_in, action, data, macsec_fs_set_tx_fs_id(fs_id));
+-	MLX5_SET(set_action_in, action, offset, 0);
++	MLX5_SET(set_action_in, action, data,
++		 mlx5_macsec_fs_set_tx_fs_id(fs_id));
++	MLX5_SET(set_action_in, action, offset,
++		 MLX5_ETH_WQE_FT_META_MACSEC_SHIFT);
+ 	MLX5_SET(set_action_in, action, length, 32);
+ 
+ 	modify_hdr = mlx5_modify_header_alloc(mdev, MLX5_FLOW_NAMESPACE_RDMA_TX_MACSEC,
+--- a/drivers/net/ethernet/mellanox/mlx5/core/lib/macsec_fs.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/lib/macsec_fs.h
+@@ -12,6 +12,21 @@
+ #define MLX5_MACSEC_METADATA_MARKER(metadata)  ((((metadata) >> 30) & 0x3)  == 0x1)
+ #define MLX5_MACSEC_RX_METADAT_HANDLE(metadata)  ((metadata) & MLX5_MACSEC_RX_FS_ID_MASK)
+ 
++/* MACsec TX flow steering */
++#define MLX5_ETH_WQE_FT_META_MACSEC_MASK \
++	(MLX5_ETH_WQE_FT_META_MACSEC | MLX5_ETH_WQE_FT_META_MACSEC_FS_ID_MASK)
++#define MLX5_ETH_WQE_FT_META_MACSEC_SHIFT MLX5_ETH_WQE_FT_META_SHIFT
++
++/* MACsec fs_id handling for steering */
++#define mlx5_macsec_fs_set_tx_fs_id(fs_id) \
++	(((MLX5_ETH_WQE_FT_META_MACSEC) >> MLX5_ETH_WQE_FT_META_MACSEC_SHIFT) \
++	 | ((fs_id) << 2))
++
++#define MLX5_MACSEC_TX_METADATA(fs_id) \
++	(mlx5_macsec_fs_set_tx_fs_id(fs_id) << \
++	 MLX5_ETH_WQE_FT_META_MACSEC_SHIFT)
++
++/* MACsec fs_id uses 4 bits, supports up to 16 interfaces */
+ #define MLX5_MACSEC_NUM_OF_SUPPORTED_INTERFACES 16
+ 
+ struct mlx5_macsec_fs;
+--- a/include/linux/mlx5/qp.h
++++ b/include/linux/mlx5/qp.h
+@@ -251,9 +251,14 @@ enum {
+ 	MLX5_ETH_WQE_SWP_OUTER_L4_UDP   = 1 << 5,
+ };
+ 
++/* Base shift for metadata bits used by timestamping, IPsec, and MACsec */
++#define MLX5_ETH_WQE_FT_META_SHIFT 0
++
+ enum {
+-	MLX5_ETH_WQE_FT_META_IPSEC = BIT(0),
+-	MLX5_ETH_WQE_FT_META_MACSEC = BIT(1),
++	MLX5_ETH_WQE_FT_META_IPSEC = BIT(0) << MLX5_ETH_WQE_FT_META_SHIFT,
++	MLX5_ETH_WQE_FT_META_MACSEC = BIT(1) << MLX5_ETH_WQE_FT_META_SHIFT,
++	MLX5_ETH_WQE_FT_META_MACSEC_FS_ID_MASK =
++		GENMASK(5, 2) << MLX5_ETH_WQE_FT_META_SHIFT,
+ };
+ 
+ struct mlx5_wqe_eth_seg {
