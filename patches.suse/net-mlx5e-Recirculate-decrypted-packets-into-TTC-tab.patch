@@ -1,0 +1,111 @@
+From: Jianbo Liu <jianbol@nvidia.com>
+Date: Thu, 18 Sep 2025 10:19:21 +0300
+Subject: net/mlx5e: Recirculate decrypted packets into TTC table
+Patch-mainline: v6.18-rc1
+Git-commit: c69ac57199eac5259a715314a5edeb4c30925934
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+In the commit 5e466345291a ("net/mlx5e: IPsec: Add IPsec steering in
+local NIC RX"), the decrypted packets are handled in RX error flow
+table. There is only one rule in the table, which forwards packets to
+the default ESP TIR.
+
+This patch updates the design to allow RSS after decryption. For ESP
+traffic, SPI and IP addresses are the fields selected for RSS hash,
+and it's common that only one SPI is configured in RX direction, so
+RSS can't work properly as all the packets are hashed to one key in
+this case. To take advantage of RSS and improve performance, the
+decrypted packets need to be forwarded back to TTC table, where RSS
+can work based on the decrypted packet types.
+
+Signed-off-by: Jianbo Liu <jianbol@nvidia.com>
+Reviewed-by: Dragos Tatulea <dtatulea@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://patch.msgid.link/1758179963-649455-3-git-send-email-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec_fs.c |   24 +++++++++---
+ drivers/net/ethernet/mellanox/mlx5/core/lib/ipsec_fs_roce.c |    4 ++
+ 2 files changed, 23 insertions(+), 5 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec_fs.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec_fs.c
+@@ -585,6 +585,20 @@ out:
+ 	return err;
+ }
+ 
++static struct mlx5_flow_destination
++ipsec_rx_decrypted_pkt_def_dest(struct mlx5_ttc_table *ttc, u32 family)
++{
++	struct mlx5_flow_destination dest;
++
++	if (!mlx5_ttc_has_esp_flow_group(ttc))
++		return mlx5_ttc_get_default_dest(ttc, family2tt(family));
++
++	dest.ft = mlx5_get_ttc_flow_table(ttc);
++	dest.type = MLX5_FLOW_DESTINATION_TYPE_FLOW_TABLE;
++
++	return dest;
++}
++
+ static void ipsec_rx_update_default_dest(struct mlx5e_ipsec_rx *rx,
+ 					 struct mlx5_flow_destination *old_dest,
+ 					 struct mlx5_flow_destination *new_dest)
+@@ -598,10 +612,10 @@ static void handle_ipsec_rx_bringup(stru
+ {
+ 	struct mlx5e_ipsec_rx *rx = ipsec_rx(ipsec, family, XFRM_DEV_OFFLOAD_PACKET);
+ 	struct mlx5_flow_namespace *ns = mlx5e_fs_get_ns(ipsec->fs, false);
++	struct mlx5_ttc_table *ttc = mlx5e_fs_get_ttc(ipsec->fs, false);
+ 	struct mlx5_flow_destination old_dest, new_dest;
+ 
+-	old_dest = mlx5_ttc_get_default_dest(mlx5e_fs_get_ttc(ipsec->fs, false),
+-					     family2tt(family));
++	old_dest = ipsec_rx_decrypted_pkt_def_dest(ttc, family);
+ 
+ 	mlx5_ipsec_fs_roce_rx_create(ipsec->mdev, ipsec->roce, ns, &old_dest, family,
+ 				     MLX5E_ACCEL_FS_ESP_FT_ROCE_LEVEL, MLX5E_NIC_PRIO);
+@@ -614,12 +628,12 @@ static void handle_ipsec_rx_bringup(stru
+ static void handle_ipsec_rx_cleanup(struct mlx5e_ipsec *ipsec, u32 family)
+ {
+ 	struct mlx5e_ipsec_rx *rx = ipsec_rx(ipsec, family, XFRM_DEV_OFFLOAD_PACKET);
++	struct mlx5_ttc_table *ttc = mlx5e_fs_get_ttc(ipsec->fs, false);
+ 	struct mlx5_flow_destination old_dest, new_dest;
+ 
+ 	old_dest.ft = mlx5_ipsec_fs_roce_ft_get(ipsec->roce, family);
+ 	old_dest.type = MLX5_FLOW_DESTINATION_TYPE_FLOW_TABLE;
+-	new_dest = mlx5_ttc_get_default_dest(mlx5e_fs_get_ttc(ipsec->fs, false),
+-					     family2tt(family));
++	new_dest = ipsec_rx_decrypted_pkt_def_dest(ttc, family);
+ 	ipsec_rx_update_default_dest(rx, &old_dest, &new_dest);
+ 
+ 	mlx5_ipsec_fs_roce_rx_destroy(ipsec->roce, family, ipsec->mdev);
+@@ -764,7 +778,7 @@ static int ipsec_rx_status_pass_dest_get
+ 	if (rx == ipsec->rx_esw)
+ 		return mlx5_esw_ipsec_rx_status_pass_dest_get(ipsec, dest);
+ 
+-	*dest = mlx5_ttc_get_default_dest(attr->ttc, family2tt(attr->family));
++	*dest = ipsec_rx_decrypted_pkt_def_dest(attr->ttc, attr->family);
+ 	err = mlx5_ipsec_fs_roce_rx_create(ipsec->mdev, ipsec->roce, attr->ns, dest,
+ 					   attr->family, MLX5E_ACCEL_FS_ESP_FT_ROCE_LEVEL,
+ 					   attr->prio);
+--- a/drivers/net/ethernet/mellanox/mlx5/core/lib/ipsec_fs_roce.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/lib/ipsec_fs_roce.c
+@@ -164,6 +164,8 @@ ipsec_fs_roce_rx_rule_setup(struct mlx5_
+ 	roce->rule = rule;
+ 
+ 	memset(spec, 0, sizeof(*spec));
++	if (default_dst->type == MLX5_FLOW_DESTINATION_TYPE_FLOW_TABLE)
++		flow_act.flags |= FLOW_ACT_IGNORE_FLOW_LEVEL;
+ 	rule = mlx5_add_flow_rules(roce->ft, spec, &flow_act, default_dst, 1);
+ 	if (IS_ERR(rule)) {
+ 		err = PTR_ERR(rule);
+@@ -178,6 +180,8 @@ ipsec_fs_roce_rx_rule_setup(struct mlx5_
+ 		goto out;
+ 
+ 	flow_act.action = MLX5_FLOW_CONTEXT_ACTION_FWD_DEST;
++	if (default_dst->type == MLX5_FLOW_DESTINATION_TYPE_FLOW_TABLE)
++		flow_act.flags &= ~FLOW_ACT_IGNORE_FLOW_LEVEL;
+ 	dst.type = MLX5_FLOW_DESTINATION_TYPE_TABLE_TYPE;
+ 	dst.ft = roce->ft_rdma;
+ 	rule = mlx5_add_flow_rules(roce->nic_master_ft, NULL, &flow_act, &dst,
