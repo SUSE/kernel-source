@@ -1,0 +1,69 @@
+From: Nilay Shroff <nilay@linux.ibm.com>
+Date: Sat, 19 Jul 2025 18:56:47 +0530
+Subject: [PATCH] block: fix module reference leak in mq-deadline I/O scheduler
+Git-commit: 1966554b2e82b89d4f6490f430ce76a379e23f1f
+Patch-mainline: v6.16
+References: jsc#PED-14161
+
+During probe, when the block layer registers a request queue, it
+defaults to the mq-deadline I/O scheduler if the device is single-queue
+and the mq-deadline module is available. To determine availability, the
+elevator_set_default() invokes elevator_find_get(), which increments the
+module's reference count. However, this reference is never released,
+resulting in a module reference leak that prevents the mq-deadline module
+from being unloaded.
+
+This patch fixes the issue by ensuring the acquired module reference is
+properly released.
+
+Fixes: 1e44bedbc921 ("block: unifying elevator change")
+Signed-off-by: Nilay Shroff <nilay@linux.ibm.com>
+Reviewed-by: Ming Lei <ming.lei@redhat.com>
+Link: https://lore.kernel.org/r/20250719132722.769536-1-nilay@linux.ibm.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/elevator.c | 19 +++++++++++++------
+ 1 file changed, 13 insertions(+), 6 deletions(-)
+
+diff --git a/block/elevator.c b/block/elevator.c
+index ab22542e6cf0..a960bdc869bc 100644
+--- a/block/elevator.c
++++ b/block/elevator.c
+@@ -719,7 +719,8 @@ void elevator_set_default(struct request_queue *q)
+ 		.name = "mq-deadline",
+ 		.no_uevent = true,
+ 	};
+-	int err = 0;
++	int err;
++	struct elevator_type *e;
+ 
+ 	/* now we allow to switch elevator */
+ 	blk_queue_flag_clear(QUEUE_FLAG_NO_ELV_SWITCH, q);
+@@ -732,12 +733,18 @@ void elevator_set_default(struct request_queue *q)
+ 	 * have multiple queues or mq-deadline is not available, default
+ 	 * to "none".
+ 	 */
+-	if (elevator_find_get(ctx.name) && (q->nr_hw_queues == 1 ||
+-			 blk_mq_is_shared_tags(q->tag_set->flags)))
++	e = elevator_find_get(ctx.name);
++	if (!e)
++		return;
++
++	if ((q->nr_hw_queues == 1 ||
++			blk_mq_is_shared_tags(q->tag_set->flags))) {
+ 		err = elevator_change(q, &ctx);
+-	if (err < 0)
+-		pr_warn("\"%s\" elevator initialization, failed %d, "
+-			"falling back to \"none\"\n", ctx.name, err);
++		if (err < 0)
++			pr_warn("\"%s\" elevator initialization, failed %d, falling back to \"none\"\n",
++					ctx.name, err);
++	}
++	elevator_put(e);
+ }
+ 
+ void elevator_set_none(struct request_queue *q)
+-- 
+2.43.0
+
