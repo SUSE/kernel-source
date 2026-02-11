@@ -1,0 +1,138 @@
+From: Jens Axboe <axboe@kernel.dk>
+Date: Tue, 15 Apr 2025 08:49:35 -0600
+Subject: [PATCH] block: blk-rq-qos: guard rq-qos helpers by static key
+Git-commit: 033b667a823ee403509e7156bc7fa335bd566bff
+Patch-mainline: v6.16
+References: jsc#PED-14161
+
+Even if blk-rq-qos isn't used or configured, dipping into the queue to
+fetch ->rq_qos is a noticeable slowdown and visible in profiles. Add an
+unlikely static key around blk-rq-qos, to avoid fetching this cacheline
+if blk-iolatency or blk-wbt isn't configured or used.
+
+Reviewed-by: Chaitanya Kulkarni <kch@nvidia.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/blk-rq-qos.c |  4 ++++
+ block/blk-rq-qos.h | 21 ++++++++++++---------
+ 2 files changed, 16 insertions(+), 9 deletions(-)
+
+diff --git a/block/blk-rq-qos.c b/block/blk-rq-qos.c
+index 95982bc46ba1..848591fb3c57 100644
+--- a/block/blk-rq-qos.c
++++ b/block/blk-rq-qos.c
+@@ -2,6 +2,8 @@
+ 
+ #include "blk-rq-qos.h"
+ 
++__read_mostly DEFINE_STATIC_KEY_FALSE(block_rq_qos);
++
+ /*
+  * Increment 'v', if 'v' is below 'below'. Returns true if we succeeded,
+  * false if 'v' + 1 would be bigger than 'below'.
+@@ -317,6 +319,7 @@ void rq_qos_exit(struct request_queue *q)
+ 		struct rq_qos *rqos = q->rq_qos;
+ 		q->rq_qos = rqos->next;
+ 		rqos->ops->exit(rqos);
++		static_branch_dec(&block_rq_qos);
+ 	}
+ 	mutex_unlock(&q->rq_qos_mutex);
+ }
+@@ -343,6 +346,7 @@ int rq_qos_add(struct rq_qos *rqos, struct gendisk *disk, enum rq_qos_id id,
+ 		goto ebusy;
+ 	rqos->next = q->rq_qos;
+ 	q->rq_qos = rqos;
++	static_branch_inc(&block_rq_qos);
+ 
+ 	blk_mq_unfreeze_queue(q, memflags);
+ 
+diff --git a/block/blk-rq-qos.h b/block/blk-rq-qos.h
+index 37245c97ee61..39749f4066fb 100644
+--- a/block/blk-rq-qos.h
++++ b/block/blk-rq-qos.h
+@@ -12,6 +12,7 @@
+ #include "blk-mq-debugfs.h"
+ 
+ struct blk_mq_debugfs_attr;
++extern struct static_key_false block_rq_qos;
+ 
+ enum rq_qos_id {
+ 	RQ_QOS_WBT,
+@@ -112,31 +113,33 @@ void __rq_qos_queue_depth_changed(struct rq_qos *rqos);
+ 
+ static inline void rq_qos_cleanup(struct request_queue *q, struct bio *bio)
+ {
+-	if (q->rq_qos)
++	if (static_branch_unlikely(&block_rq_qos) && q->rq_qos)
+ 		__rq_qos_cleanup(q->rq_qos, bio);
+ }
+ 
+ static inline void rq_qos_done(struct request_queue *q, struct request *rq)
+ {
+-	if (q->rq_qos && !blk_rq_is_passthrough(rq))
++	if (static_branch_unlikely(&block_rq_qos) && q->rq_qos &&
++	    !blk_rq_is_passthrough(rq))
+ 		__rq_qos_done(q->rq_qos, rq);
+ }
+ 
+ static inline void rq_qos_issue(struct request_queue *q, struct request *rq)
+ {
+-	if (q->rq_qos)
++	if (static_branch_unlikely(&block_rq_qos) && q->rq_qos)
+ 		__rq_qos_issue(q->rq_qos, rq);
+ }
+ 
+ static inline void rq_qos_requeue(struct request_queue *q, struct request *rq)
+ {
+-	if (q->rq_qos)
++	if (static_branch_unlikely(&block_rq_qos) && q->rq_qos)
+ 		__rq_qos_requeue(q->rq_qos, rq);
+ }
+ 
+ static inline void rq_qos_done_bio(struct bio *bio)
+ {
+-	if (bio->bi_bdev && (bio_flagged(bio, BIO_QOS_THROTTLED) ||
++	if (static_branch_unlikely(&block_rq_qos) &&
++	    bio->bi_bdev && (bio_flagged(bio, BIO_QOS_THROTTLED) ||
+ 			     bio_flagged(bio, BIO_QOS_MERGED))) {
+ 		struct request_queue *q = bdev_get_queue(bio->bi_bdev);
+ 		if (q->rq_qos)
+@@ -146,7 +149,7 @@ static inline void rq_qos_done_bio(struct bio *bio)
+ 
+ static inline void rq_qos_throttle(struct request_queue *q, struct bio *bio)
+ {
+-	if (q->rq_qos) {
++	if (static_branch_unlikely(&block_rq_qos) && q->rq_qos) {
+ 		bio_set_flag(bio, BIO_QOS_THROTTLED);
+ 		__rq_qos_throttle(q->rq_qos, bio);
+ 	}
+@@ -155,14 +158,14 @@ static inline void rq_qos_throttle(struct request_queue *q, struct bio *bio)
+ static inline void rq_qos_track(struct request_queue *q, struct request *rq,
+ 				struct bio *bio)
+ {
+-	if (q->rq_qos)
++	if (static_branch_unlikely(&block_rq_qos) && q->rq_qos)
+ 		__rq_qos_track(q->rq_qos, rq, bio);
+ }
+ 
+ static inline void rq_qos_merge(struct request_queue *q, struct request *rq,
+ 				struct bio *bio)
+ {
+-	if (q->rq_qos) {
++	if (static_branch_unlikely(&block_rq_qos) && q->rq_qos) {
+ 		bio_set_flag(bio, BIO_QOS_MERGED);
+ 		__rq_qos_merge(q->rq_qos, rq, bio);
+ 	}
+@@ -170,7 +173,7 @@ static inline void rq_qos_merge(struct request_queue *q, struct request *rq,
+ 
+ static inline void rq_qos_queue_depth_changed(struct request_queue *q)
+ {
+-	if (q->rq_qos)
++	if (static_branch_unlikely(&block_rq_qos) && q->rq_qos)
+ 		__rq_qos_queue_depth_changed(q->rq_qos);
+ }
+ 
+-- 
+2.43.0
+
