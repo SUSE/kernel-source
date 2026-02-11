@@ -1,0 +1,101 @@
+From: Furong Xu <0x1207@gmail.com>
+Date: Fri, 1 Nov 2024 21:31:34 +0800
+Subject: net: stmmac: xgmac: Complete FPE support
+Patch-mainline: v6.13-rc1
+Git-commit: b440d677e15ff30009ac4964a0f987db4416918b
+References: jsc#PED-14402
+
+Implement the necessary fpe_map_preemption_class callback for xgmac.
+
+Signed-off-by: Furong Xu <0x1207@gmail.com>
+Reviewed-by: Vladimir Oltean <olteanv@gmail.com>
+Link: https://patch.msgid.link/d0347f2b8a71fee372e53293fe26a6538775ec5d.1730449003.git.0x1207@gmail.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/stmicro/stmmac/dwxgmac2_core.c |    2 
+ drivers/net/ethernet/stmicro/stmmac/stmmac_fpe.c    |   43 ++++++++++++++++++++
+ drivers/net/ethernet/stmicro/stmmac/stmmac_fpe.h    |    2 
+ 3 files changed, 47 insertions(+)
+
+--- a/drivers/net/ethernet/stmicro/stmmac/dwxgmac2_core.c
++++ b/drivers/net/ethernet/stmicro/stmmac/dwxgmac2_core.c
+@@ -1545,6 +1545,7 @@ const struct stmmac_ops dwxgmac210_ops =
+ 	.config_l3_filter = dwxgmac2_config_l3_filter,
+ 	.config_l4_filter = dwxgmac2_config_l4_filter,
+ 	.set_arp_offload = dwxgmac2_set_arp_offload,
++	.fpe_map_preemption_class = dwxgmac3_fpe_map_preemption_class,
+ };
+ 
+ static void dwxlgmac2_rx_queue_enable(struct mac_device_info *hw, u8 mode,
+@@ -1601,6 +1602,7 @@ const struct stmmac_ops dwxlgmac2_ops =
+ 	.config_l3_filter = dwxgmac2_config_l3_filter,
+ 	.config_l4_filter = dwxgmac2_config_l4_filter,
+ 	.set_arp_offload = dwxgmac2_set_arp_offload,
++	.fpe_map_preemption_class = dwxgmac3_fpe_map_preemption_class,
+ };
+ 
+ int dwxgmac2_setup(struct stmmac_priv *priv)
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_fpe.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_fpe.c
+@@ -351,6 +351,49 @@ update_mapping:
+ 	return 0;
+ }
+ 
++int dwxgmac3_fpe_map_preemption_class(struct net_device *ndev,
++				      struct netlink_ext_ack *extack, u32 pclass)
++{
++	u32 val, offset, count, preemptible_txqs = 0;
++	struct stmmac_priv *priv = netdev_priv(ndev);
++	int num_tc = netdev_get_num_tc(ndev);
++
++	if (!num_tc) {
++		/* Restore default TC:Queue mapping */
++		for (u32 i = 0; i < priv->plat->tx_queues_to_use; i++) {
++			val = readl(priv->ioaddr + XGMAC_MTL_TXQ_OPMODE(i));
++			writel(u32_replace_bits(val, i, XGMAC_Q2TCMAP),
++			       priv->ioaddr + XGMAC_MTL_TXQ_OPMODE(i));
++		}
++	}
++
++	/* Synopsys Databook:
++	 * "All Queues within a traffic class are selected in a round robin
++	 * fashion (when packets are available) when the traffic class is
++	 * selected by the scheduler for packet transmission. This is true for
++	 * any of the scheduling algorithms."
++	 */
++	for (u32 tc = 0; tc < num_tc; tc++) {
++		count = ndev->tc_to_txq[tc].count;
++		offset = ndev->tc_to_txq[tc].offset;
++
++		if (pclass & BIT(tc))
++			preemptible_txqs |= GENMASK(offset + count - 1, offset);
++
++		for (u32 i = 0; i < count; i++) {
++			val = readl(priv->ioaddr + XGMAC_MTL_TXQ_OPMODE(offset + i));
++			writel(u32_replace_bits(val, tc, XGMAC_Q2TCMAP),
++			       priv->ioaddr + XGMAC_MTL_TXQ_OPMODE(offset + i));
++		}
++	}
++
++	val = readl(priv->ioaddr + XGMAC_MTL_FPE_CTRL_STS);
++	writel(u32_replace_bits(val, preemptible_txqs, FPE_MTL_PREEMPTION_CLASS),
++	       priv->ioaddr + XGMAC_MTL_FPE_CTRL_STS);
++
++	return 0;
++}
++
+ const struct stmmac_fpe_reg dwmac5_fpe_reg = {
+ 	.mac_fpe_reg = GMAC5_MAC_FPE_CTRL_STS,
+ 	.mtl_fpe_reg = GMAC5_MTL_FPE_CTRL_STS,
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_fpe.h
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_fpe.h
+@@ -24,6 +24,8 @@ void stmmac_fpe_set_add_frag_size(struct
+ 
+ int dwmac5_fpe_map_preemption_class(struct net_device *ndev,
+ 				    struct netlink_ext_ack *extack, u32 pclass);
++int dwxgmac3_fpe_map_preemption_class(struct net_device *ndev,
++				      struct netlink_ext_ack *extack, u32 pclass);
+ 
+ extern const struct stmmac_fpe_reg dwmac5_fpe_reg;
+ extern const struct stmmac_fpe_reg dwxgmac3_fpe_reg;
