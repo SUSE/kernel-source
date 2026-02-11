@@ -1,0 +1,105 @@
+From: Christoph Hellwig <hch@lst.de>
+Date: Wed, 7 May 2025 14:04:28 +0200
+Subject: [PATCH] block: add a bio_add_vmalloc helpers
+Git-commit: 8dd16f5e34693aa0aa6a4ed48427045008097e64
+Patch-mainline: v6.16
+References: jsc#PED-14161
+
+Add a helper to add a vmalloc region to a bio, abstracting away the
+vmalloc addresses from the underlying pages and another one wrapping
+it for the simple case where all data fits into a single bio.
+
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Damien Le Moal <dlemoal@kernel.org>
+Reviewed-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+Link: https://lore.kernel.org/r/20250507120451.4000627-5-hch@lst.de
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/bio.c         | 55 +++++++++++++++++++++++++++++++++++++++++++++
+ include/linux/bio.h |  3 +++
+ 2 files changed, 58 insertions(+)
+
+diff --git a/block/bio.c b/block/bio.c
+index 26782ff85dbf..988f5de3c02c 100644
+--- a/block/bio.c
++++ b/block/bio.c
+@@ -1076,6 +1076,61 @@ bool bio_add_folio(struct bio *bio, struct folio *folio, size_t len,
+ }
+ EXPORT_SYMBOL(bio_add_folio);
+ 
++/**
++ * bio_add_vmalloc_chunk - add a vmalloc chunk to a bio
++ * @bio: destination bio
++ * @vaddr: vmalloc address to add
++ * @len: total length in bytes of the data to add
++ *
++ * Add data starting at @vaddr to @bio and return how many bytes were added.
++ * This may be less than the amount originally asked.  Returns 0 if no data
++ * could be added to @bio.
++ *
++ * This helper calls flush_kernel_vmap_range() for the range added.  For reads
++ * the caller still needs to manually call invalidate_kernel_vmap_range() in
++ * the completion handler.
++ */
++unsigned int bio_add_vmalloc_chunk(struct bio *bio, void *vaddr, unsigned len)
++{
++	unsigned int offset = offset_in_page(vaddr);
++
++	len = min(len, PAGE_SIZE - offset);
++	if (bio_add_page(bio, vmalloc_to_page(vaddr), len, offset) < len)
++		return 0;
++	if (op_is_write(bio_op(bio)))
++		flush_kernel_vmap_range(vaddr, len);
++	return len;
++}
++EXPORT_SYMBOL_GPL(bio_add_vmalloc_chunk);
++
++/**
++ * bio_add_vmalloc - add a vmalloc region to a bio
++ * @bio: destination bio
++ * @vaddr: vmalloc address to add
++ * @len: total length in bytes of the data to add
++ *
++ * Add data starting at @vaddr to @bio.  Return %true on success or %false if
++ * @bio does not have enough space for the payload.
++ *
++ * This helper calls flush_kernel_vmap_range() for the range added.  For reads
++ * the caller still needs to manually call invalidate_kernel_vmap_range() in
++ * the completion handler.
++ */
++bool bio_add_vmalloc(struct bio *bio, void *vaddr, unsigned int len)
++{
++	do {
++		unsigned int added = bio_add_vmalloc_chunk(bio, vaddr, len);
++
++		if (!added)
++			return false;
++		vaddr += added;
++		len -= added;
++	} while (len);
++
++	return true;
++}
++EXPORT_SYMBOL_GPL(bio_add_vmalloc);
++
+ void __bio_release_pages(struct bio *bio, bool mark_dirty)
+ {
+ 	struct folio_iter fi;
+diff --git a/include/linux/bio.h b/include/linux/bio.h
+index 128b1c6ca648..5d880903bcc5 100644
+--- a/include/linux/bio.h
++++ b/include/linux/bio.h
+@@ -433,6 +433,9 @@ static inline unsigned int bio_add_max_vecs(void *kaddr, unsigned int len)
+ 	return 1;
+ }
+ 
++unsigned int bio_add_vmalloc_chunk(struct bio *bio, void *vaddr, unsigned len);
++bool bio_add_vmalloc(struct bio *bio, void *vaddr, unsigned int len);
++
+ int submit_bio_wait(struct bio *bio);
+ int bdev_rw_virt(struct block_device *bdev, sector_t sector, void *data,
+ 		size_t len, enum req_op op);
+-- 
+2.43.0
+
