@@ -1,0 +1,229 @@
+From: Cosmin Ratiu <cratiu@nvidia.com>
+Date: Sun, 16 Nov 2025 22:45:40 +0200
+Subject: net/mlx5: Move SF dev table notifier registration outside the PF
+ devlink lock
+Patch-mainline: v6.19-rc1
+Git-commit: 64ad6470c882fcaecfa4a1da96ea94de7ca0dc80
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+This completes the previous patches by moving notifier registration for
+SF dev tables outside the devlink locked critical section in
+mlx5_init_one() / mlx5_uninit_one() and into the mlx5_mdev_init() /
+mlx5_mdev_uninit() functions.
+
+This is only done for non-SFs, since SFs do not have a SF HW table
+themselves.
+
+After this patch, notifiers can grab the PF devlink lock (soon to be
+necessary) without creating a locking cycle.
+
+Signed-off-by: Cosmin Ratiu <cratiu@nvidia.com>
+Reviewed-by: Carolina Jubran <cjubran@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://patch.msgid.link/1763325940-1231508-7-git-send-email-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/main.c       |    7 ++
+ drivers/net/ethernet/mellanox/mlx5/core/sf/dev/dev.c |   47 ++++++++++++-------
+ drivers/net/ethernet/mellanox/mlx5/core/sf/dev/dev.h |   11 ++++
+ include/linux/mlx5/driver.h                          |    1 
+ 4 files changed, 49 insertions(+), 17 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/main.c
+@@ -1837,8 +1837,14 @@ static int mlx5_notifiers_init(struct ml
+ 	if (err)
+ 		goto err_sf_notifiers;
+ 
++	err = mlx5_sf_dev_notifier_init(dev);
++	if (err)
++		goto err_sf_dev_notifier;
++
+ 	return 0;
+ 
++err_sf_dev_notifier:
++	mlx5_sf_notifiers_cleanup(dev);
+ err_sf_notifiers:
+ 	mlx5_sf_hw_notifier_cleanup(dev);
+ err_sf_hw_notifier:
+@@ -1848,6 +1854,7 @@ err_sf_hw_notifier:
+ 
+ static void mlx5_notifiers_cleanup(struct mlx5_core_dev *dev)
+ {
++	mlx5_sf_dev_notifier_cleanup(dev);
+ 	mlx5_sf_notifiers_cleanup(dev);
+ 	mlx5_sf_hw_notifier_cleanup(dev);
+ 	mlx5_events_cleanup(dev);
+--- a/drivers/net/ethernet/mellanox/mlx5/core/sf/dev/dev.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/sf/dev/dev.c
+@@ -16,7 +16,6 @@ struct mlx5_sf_dev_table {
+ 	struct xarray devices;
+ 	phys_addr_t base_address;
+ 	u64 sf_bar_length;
+-	struct notifier_block nb;
+ 	struct workqueue_struct *active_wq;
+ 	struct work_struct work;
+ 	u8 stop_active_wq:1;
+@@ -156,18 +155,23 @@ static void mlx5_sf_dev_del(struct mlx5_
+ static int
+ mlx5_sf_dev_state_change_handler(struct notifier_block *nb, unsigned long event_code, void *data)
+ {
+-	struct mlx5_sf_dev_table *table = container_of(nb, struct mlx5_sf_dev_table, nb);
++	struct mlx5_core_dev *dev = container_of(nb, struct mlx5_core_dev,
++						 priv.sf_dev_nb);
++	struct mlx5_sf_dev_table *table = dev->priv.sf_dev_table;
+ 	const struct mlx5_vhca_state_event *event = data;
+ 	struct mlx5_sf_dev *sf_dev;
+ 	u16 max_functions;
+ 	u16 sf_index;
+ 	u16 base_id;
+ 
+-	max_functions = mlx5_sf_max_functions(table->dev);
++	if (!table)
++		return 0;
++
++	max_functions = mlx5_sf_max_functions(dev);
+ 	if (!max_functions)
+ 		return 0;
+ 
+-	base_id = mlx5_sf_start_function_id(table->dev);
++	base_id = mlx5_sf_start_function_id(dev);
+ 	if (event->function_id < base_id || event->function_id >= (base_id + max_functions))
+ 		return 0;
+ 
+@@ -177,19 +181,19 @@ mlx5_sf_dev_state_change_handler(struct
+ 	case MLX5_VHCA_STATE_INVALID:
+ 	case MLX5_VHCA_STATE_ALLOCATED:
+ 		if (sf_dev)
+-			mlx5_sf_dev_del(table->dev, sf_dev, sf_index);
++			mlx5_sf_dev_del(dev, sf_dev, sf_index);
+ 		break;
+ 	case MLX5_VHCA_STATE_TEARDOWN_REQUEST:
+ 		if (sf_dev)
+-			mlx5_sf_dev_del(table->dev, sf_dev, sf_index);
++			mlx5_sf_dev_del(dev, sf_dev, sf_index);
+ 		else
+-			mlx5_core_err(table->dev,
++			mlx5_core_err(dev,
+ 				      "SF DEV: teardown state for invalid dev index=%d sfnum=0x%x\n",
+ 				      sf_index, event->sw_function_id);
+ 		break;
+ 	case MLX5_VHCA_STATE_ACTIVE:
+ 		if (!sf_dev)
+-			mlx5_sf_dev_add(table->dev, sf_index, event->function_id,
++			mlx5_sf_dev_add(dev, sf_index, event->function_id,
+ 					event->sw_function_id);
+ 		break;
+ 	default:
+@@ -315,6 +319,15 @@ static void mlx5_sf_dev_destroy_active_w
+ 	}
+ }
+ 
++int mlx5_sf_dev_notifier_init(struct mlx5_core_dev *dev)
++{
++	if (mlx5_core_is_sf(dev))
++		return 0;
++
++	dev->priv.sf_dev_nb.notifier_call = mlx5_sf_dev_state_change_handler;
++	return mlx5_vhca_event_notifier_register(dev, &dev->priv.sf_dev_nb);
++}
++
+ void mlx5_sf_dev_table_create(struct mlx5_core_dev *dev)
+ {
+ 	struct mlx5_sf_dev_table *table;
+@@ -329,17 +342,12 @@ void mlx5_sf_dev_table_create(struct mlx
+ 		goto table_err;
+ 	}
+ 
+-	table->nb.notifier_call = mlx5_sf_dev_state_change_handler;
+ 	table->dev = dev;
+ 	table->sf_bar_length = 1 << (MLX5_CAP_GEN(dev, log_min_sf_size) + 12);
+ 	table->base_address = pci_resource_start(dev->pdev, 2);
+ 	xa_init(&table->devices);
+ 	dev->priv.sf_dev_table = table;
+ 
+-	err = mlx5_vhca_event_notifier_register(dev, &table->nb);
+-	if (err)
+-		goto vhca_err;
+-
+ 	err = mlx5_sf_dev_create_active_works(table);
+ 	if (err)
+ 		goto add_active_err;
+@@ -351,10 +359,8 @@ void mlx5_sf_dev_table_create(struct mlx
+ 
+ arm_err:
+ 	mlx5_sf_dev_destroy_active_works(table);
+-add_active_err:
+-	mlx5_vhca_event_notifier_unregister(dev, &table->nb);
+ 	mlx5_vhca_event_work_queues_flush(dev);
+-vhca_err:
++add_active_err:
+ 	kfree(table);
+ 	dev->priv.sf_dev_table = NULL;
+ table_err:
+@@ -372,6 +378,14 @@ static void mlx5_sf_dev_destroy_all(stru
+ 	}
+ }
+ 
++void mlx5_sf_dev_notifier_cleanup(struct mlx5_core_dev *dev)
++{
++	if (mlx5_core_is_sf(dev))
++		return;
++
++	mlx5_vhca_event_notifier_unregister(dev, &dev->priv.sf_dev_nb);
++}
++
+ void mlx5_sf_dev_table_destroy(struct mlx5_core_dev *dev)
+ {
+ 	struct mlx5_sf_dev_table *table = dev->priv.sf_dev_table;
+@@ -380,7 +394,6 @@ void mlx5_sf_dev_table_destroy(struct ml
+ 		return;
+ 
+ 	mlx5_sf_dev_destroy_active_works(table);
+-	mlx5_vhca_event_notifier_unregister(dev, &table->nb);
+ 
+ 	/* Now that event handler is not running, it is safe to destroy
+ 	 * the sf device without race.
+--- a/drivers/net/ethernet/mellanox/mlx5/core/sf/dev/dev.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/sf/dev/dev.h
+@@ -25,7 +25,9 @@ struct mlx5_sf_peer_devlink_event_ctx {
+ 	int err;
+ };
+ 
++int mlx5_sf_dev_notifier_init(struct mlx5_core_dev *dev);
+ void mlx5_sf_dev_table_create(struct mlx5_core_dev *dev);
++void mlx5_sf_dev_notifier_cleanup(struct mlx5_core_dev *dev);
+ void mlx5_sf_dev_table_destroy(struct mlx5_core_dev *dev);
+ 
+ int mlx5_sf_driver_register(void);
+@@ -35,10 +37,19 @@ bool mlx5_sf_dev_allocated(const struct
+ 
+ #else
+ 
++static inline int mlx5_sf_dev_notifier_init(struct mlx5_core_dev *dev)
++{
++	return 0;
++}
++
+ static inline void mlx5_sf_dev_table_create(struct mlx5_core_dev *dev)
+ {
+ }
+ 
++static inline void mlx5_sf_dev_notifier_cleanup(struct mlx5_core_dev *dev)
++{
++}
++
+ static inline void mlx5_sf_dev_table_destroy(struct mlx5_core_dev *dev)
+ {
+ }
+--- a/include/linux/mlx5/driver.h
++++ b/include/linux/mlx5/driver.h
+@@ -616,6 +616,7 @@ struct mlx5_priv {
+ #ifdef CONFIG_MLX5_SF
+ 	struct mlx5_nb vhca_state_nb;
+ 	struct blocking_notifier_head vhca_state_n_head;
++	struct notifier_block sf_dev_nb;
+ 	struct mlx5_sf_dev_table *sf_dev_table;
+ 	struct mlx5_core_dev *parent_mdev;
+ #endif
