@@ -1,0 +1,210 @@
+From: Adithya Jayachandran <ajayachandra@nvidia.com>
+Date: Wed, 15 Oct 2025 18:40:55 -0700
+Subject: {rdma,net}/mlx5: Query vports mac address from device
+Patch-mainline: v6.19-rc1
+Git-commit: eea31f21dce10814e34dc7ef7ed5136269c7bb59
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+Before this patch during either switchdev or legacy mode enablement we
+cleared the mac address of vports between changes. This change allows us
+to preserve the vports mac address between eswitch mode changes.
+
+Vports hold information for VFs/SFs such as the permanent mac address.
+VF/SF mac can be set either by iproute vf interface or devlink function
+interface. For no obvious reason we reset it to 0 on switchdev/legacy
+mode changes, this patch is fixing that, to align with other vport
+information that are never reset, e.g GUID,mtu,promisc mode, etc ..
+
+Signed-off-by: Adithya Jayachandran <ajayachandra@nvidia.com>
+Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+Reviewed-by: Mark Bloch <mbloch@nvidia.com>
+Acked-by: Leon Romanovsky <leon@kernel.org> # RDMA
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/hw/mlx5/main.c                          |    2 -
+ drivers/net/ethernet/mellanox/mlx5/core/eswitch.c          |   20 +++-------
+ drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c |    3 +
+ drivers/net/ethernet/mellanox/mlx5/core/vport.c            |   24 ++++++-------
+ include/linux/mlx5/vport.h                                 |    3 +
+ 5 files changed, 25 insertions(+), 27 deletions(-)
+
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@ -841,7 +841,7 @@ static int mlx5_query_node_guid(struct m
+ 		break;
+ 
+ 	case MLX5_VPORT_ACCESS_METHOD_NIC:
+-		err = mlx5_query_nic_vport_node_guid(dev->mdev, &tmp);
++		err = mlx5_query_nic_vport_node_guid(dev->mdev, 0, false, &tmp);
+ 		break;
+ 
+ 	default:
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+@@ -875,13 +875,10 @@ static int esw_vport_setup(struct mlx5_e
+ 				      vport_num, 1,
+ 				      vport->info.link_state);
+ 
+-	/* Host PF has its own mac/guid. */
+-	if (vport_num) {
+-		mlx5_modify_nic_vport_mac_address(esw->dev, vport_num,
+-						  vport->info.mac);
+-		mlx5_modify_nic_vport_node_guid(esw->dev, vport_num,
+-						vport->info.node_guid);
+-	}
++	mlx5_query_nic_vport_mac_address(esw->dev, vport_num, true,
++					 vport->info.mac);
++	mlx5_query_nic_vport_node_guid(esw->dev, vport_num, true,
++				       &vport->info.node_guid);
+ 
+ 	flags = (vport->info.vlan || vport->info.qos) ?
+ 		SET_VLAN_STRIP | SET_VLAN_INSERT : 0;
+@@ -947,12 +944,6 @@ int mlx5_esw_vport_enable(struct mlx5_es
+ 			goto err_vhca_mapping;
+ 	}
+ 
+-	/* External controller host PF has factory programmed MAC.
+-	 * Read it from the device.
+-	 */
+-	if (mlx5_core_is_ecpf(esw->dev) && vport_num == MLX5_VPORT_PF)
+-		mlx5_query_nic_vport_mac_address(esw->dev, vport_num, true, vport->info.mac);
+-
+ 	esw_vport_change_handle_locked(vport);
+ 
+ 	esw->enabled_vports++;
+@@ -2235,6 +2226,9 @@ int mlx5_eswitch_get_vport_config(struct
+ 	ivi->vf = vport - 1;
+ 
+ 	mutex_lock(&esw->state_lock);
++
++	mlx5_query_nic_vport_mac_address(esw->dev, vport, true,
++					 evport->info.mac);
+ 	ether_addr_copy(ivi->mac, evport->info.mac);
+ 	ivi->linkstate = evport->info.link_state;
+ 	ivi->vlan = evport->info.vlan;
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@ -4491,6 +4491,9 @@ int mlx5_devlink_port_fn_hw_addr_get(str
+ 	struct mlx5_vport *vport = mlx5_devlink_port_vport_get(port);
+ 
+ 	mutex_lock(&esw->state_lock);
++
++	mlx5_query_nic_vport_mac_address(esw->dev, vport->vport, true,
++					 vport->info.mac);
+ 	ether_addr_copy(hw_addr, vport->info.mac);
+ 	*hw_addr_len = ETH_ALEN;
+ 	mutex_unlock(&esw->state_lock);
+--- a/drivers/net/ethernet/mellanox/mlx5/core/vport.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/vport.c
+@@ -78,15 +78,14 @@ int mlx5_modify_vport_admin_state(struct
+ }
+ 
+ static int mlx5_query_nic_vport_context(struct mlx5_core_dev *mdev, u16 vport,
+-					u32 *out)
++					bool other_vport, u32 *out)
+ {
+ 	u32 in[MLX5_ST_SZ_DW(query_nic_vport_context_in)] = {};
+ 
+ 	MLX5_SET(query_nic_vport_context_in, in, opcode,
+ 		 MLX5_CMD_OP_QUERY_NIC_VPORT_CONTEXT);
+ 	MLX5_SET(query_nic_vport_context_in, in, vport_number, vport);
+-	if (vport)
+-		MLX5_SET(query_nic_vport_context_in, in, other_vport, 1);
++	MLX5_SET(query_nic_vport_context_in, in, other_vport, other_vport);
+ 
+ 	return mlx5_cmd_exec_inout(mdev, query_nic_vport_context, in, out);
+ }
+@@ -97,7 +96,7 @@ int mlx5_query_nic_vport_min_inline(stru
+ 	u32 out[MLX5_ST_SZ_DW(query_nic_vport_context_out)] = {};
+ 	int err;
+ 
+-	err = mlx5_query_nic_vport_context(mdev, vport, out);
++	err = mlx5_query_nic_vport_context(mdev, vport, vport > 0, out);
+ 	if (!err)
+ 		*min_inline = MLX5_GET(query_nic_vport_context_out, out,
+ 				       nic_vport_context.min_wqe_inline_mode);
+@@ -219,7 +218,7 @@ int mlx5_query_nic_vport_mtu(struct mlx5
+ 	if (!out)
+ 		return -ENOMEM;
+ 
+-	err = mlx5_query_nic_vport_context(mdev, 0, out);
++	err = mlx5_query_nic_vport_context(mdev, 0, false, out);
+ 	if (!err)
+ 		*mtu = MLX5_GET(query_nic_vport_context_out, out,
+ 				nic_vport_context.mtu);
+@@ -429,7 +428,7 @@ int mlx5_query_nic_vport_system_image_gu
+ 	if (!out)
+ 		return -ENOMEM;
+ 
+-	err = mlx5_query_nic_vport_context(mdev, 0, out);
++	err = mlx5_query_nic_vport_context(mdev, 0, false, out);
+ 	if (err)
+ 		goto out;
+ 
+@@ -451,7 +450,7 @@ int mlx5_query_nic_vport_sd_group(struct
+ 	if (!out)
+ 		return -ENOMEM;
+ 
+-	err = mlx5_query_nic_vport_context(mdev, 0, out);
++	err = mlx5_query_nic_vport_context(mdev, 0, false, out);
+ 	if (err)
+ 		goto out;
+ 
+@@ -462,7 +461,8 @@ out:
+ 	return err;
+ }
+ 
+-int mlx5_query_nic_vport_node_guid(struct mlx5_core_dev *mdev, u64 *node_guid)
++int mlx5_query_nic_vport_node_guid(struct mlx5_core_dev *mdev,
++				   u16 vport, bool other_vport, u64 *node_guid)
+ {
+ 	u32 *out;
+ 	int outlen = MLX5_ST_SZ_BYTES(query_nic_vport_context_out);
+@@ -472,7 +472,7 @@ int mlx5_query_nic_vport_node_guid(struc
+ 	if (!out)
+ 		return -ENOMEM;
+ 
+-	err = mlx5_query_nic_vport_context(mdev, 0, out);
++	err = mlx5_query_nic_vport_context(mdev, vport, other_vport, out);
+ 	if (err)
+ 		goto out;
+ 
+@@ -529,7 +529,7 @@ int mlx5_query_nic_vport_qkey_viol_cntr(
+ 	if (!out)
+ 		return -ENOMEM;
+ 
+-	err = mlx5_query_nic_vport_context(mdev, 0, out);
++	err = mlx5_query_nic_vport_context(mdev, 0, false, out);
+ 	if (err)
+ 		goto out;
+ 
+@@ -804,7 +804,7 @@ int mlx5_query_nic_vport_promisc(struct
+ 	if (!out)
+ 		return -ENOMEM;
+ 
+-	err = mlx5_query_nic_vport_context(mdev, vport, out);
++	err = mlx5_query_nic_vport_context(mdev, vport, vport > 0, out);
+ 	if (err)
+ 		goto out;
+ 
+@@ -908,7 +908,7 @@ int mlx5_nic_vport_query_local_lb(struct
+ 	if (!out)
+ 		return -ENOMEM;
+ 
+-	err = mlx5_query_nic_vport_context(mdev, 0, out);
++	err = mlx5_query_nic_vport_context(mdev, 0, false, out);
+ 	if (err)
+ 		goto out;
+ 
+--- a/include/linux/mlx5/vport.h
++++ b/include/linux/mlx5/vport.h
+@@ -73,7 +73,8 @@ int mlx5_modify_nic_vport_mtu(struct mlx
+ int mlx5_query_nic_vport_system_image_guid(struct mlx5_core_dev *mdev,
+ 					   u64 *system_image_guid);
+ int mlx5_query_nic_vport_sd_group(struct mlx5_core_dev *mdev, u8 *sd_group);
+-int mlx5_query_nic_vport_node_guid(struct mlx5_core_dev *mdev, u64 *node_guid);
++int mlx5_query_nic_vport_node_guid(struct mlx5_core_dev *mdev,
++				   u16 vport, bool other_vport, u64 *node_guid);
+ int mlx5_modify_nic_vport_node_guid(struct mlx5_core_dev *mdev,
+ 				    u16 vport, u64 node_guid);
+ int mlx5_query_nic_vport_qkey_viol_cntr(struct mlx5_core_dev *mdev,
