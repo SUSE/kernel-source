@@ -1,0 +1,208 @@
+From: Vlad Dumitrescu <vdumitrescu@nvidia.com>
+Date: Sat, 6 Sep 2025 18:29:46 -0700
+Subject: net/mlx5: Implement devlink total_vfs parameter
+Patch-mainline: v6.18-rc1
+Git-commit: a4c49611cf4f7018ee80f02bded12fd4002ef95c
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+Some devices support both symmetric (same value for all PFs) and
+asymmetric, while others only support symmetric configuration. This
+implementation prefers asymmetric, since it is closer to the devlink
+model (per function settings), but falls back to symmetric when needed.
+
+Example usage:
+  devlink dev param set pci/0000:01:00.0 name total_vfs value <u16> cmode permanent
+  devlink dev reload pci/0000:01:00.0 action fw_activate
+  echo 1 >/sys/bus/pci/devices/0000:01:00.0/remove
+  echo 1 >/sys/bus/pci/rescan
+  cat /sys/bus/pci/devices/0000:01:00.0/sriov_totalvfs
+
+Signed-off-by: Vlad Dumitrescu <vdumitrescu@nvidia.com>
+Reviewed-by: Jiri Pirko <jiri@nvidia.com>
+Tested-by: Kamal Heib <kheib@redhat.com>
+Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Link: https://patch.msgid.link/20250907012953.301746-5-saeed@kernel.org
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ Documentation/networking/devlink/mlx5.rst              |   22 ++
+ drivers/net/ethernet/mellanox/mlx5/core/lib/nv_param.c |  132 +++++++++++++++++
+ 2 files changed, 154 insertions(+)
+
+--- a/Documentation/networking/devlink/mlx5.rst
++++ b/Documentation/networking/devlink/mlx5.rst
+@@ -40,6 +40,28 @@ Parameters
+      - Boolean
+      - Applies to each physical function (PF) independently, if the device
+        supports it. Otherwise, it applies symmetrically to all PFs.
++   * - ``total_vfs``
++     - permanent
++     - The range is between 1 and a device-specific max.
++     - Applies to each physical function (PF) independently, if the device
++       supports it. Otherwise, it applies symmetrically to all PFs.
++
++Note: permanent parameters such as ``enable_sriov`` and ``total_vfs`` require FW reset to take effect
++
++.. code-block:: bash
++
++   # setup parameters
++   devlink dev param set pci/0000:01:00.0 name enable_sriov value true cmode permanent
++   devlink dev param set pci/0000:01:00.0 name total_vfs value 8 cmode permanent
++
++   # Fw reset
++   devlink dev reload pci/0000:01:00.0 action fw_activate
++
++   # for PCI related config such as sriov PCI reset/rescan is required:
++   echo 1 >/sys/bus/pci/devices/0000:01:00.0/remove
++   echo 1 >/sys/bus/pci/rescan
++   grep ^ /sys/bus/pci/devices/0000:01:00.0/sriov_*
++
+ 
+ The ``mlx5`` driver also implements the following driver-specific
+ parameters.
+--- a/drivers/net/ethernet/mellanox/mlx5/core/lib/nv_param.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/lib/nv_param.c
+@@ -412,10 +412,142 @@ static int mlx5_devlink_enable_sriov_set
+ 	return mlx5_nv_param_write(dev, mnvda, sizeof(mnvda));
+ }
+ 
++static int mlx5_devlink_total_vfs_get(struct devlink *devlink, u32 id,
++				      struct devlink_param_gset_ctx *ctx)
++{
++	struct mlx5_core_dev *dev = devlink_priv(devlink);
++	u32 mnvda[MLX5_ST_SZ_DW(mnvda_reg)] = {};
++	void *data;
++	int err;
++
++	data = MLX5_ADDR_OF(mnvda_reg, mnvda, configuration_item_data);
++
++	err = mlx5_nv_param_read_global_pci_cap(dev, mnvda, sizeof(mnvda));
++	if (err)
++		return err;
++
++	if (!MLX5_GET(nv_global_pci_cap, data, sriov_support)) {
++		ctx->val.vu32 = 0;
++		return 0;
++	}
++
++	memset(mnvda, 0, sizeof(mnvda));
++	err = mlx5_nv_param_read_global_pci_conf(dev, mnvda, sizeof(mnvda));
++	if (err)
++		return err;
++
++	if (!MLX5_GET(nv_global_pci_conf, data, per_pf_total_vf)) {
++		ctx->val.vu32 = MLX5_GET(nv_global_pci_conf, data, total_vfs);
++		return 0;
++	}
++
++	/* SRIOV is per PF */
++	memset(mnvda, 0, sizeof(mnvda));
++	err = mlx5_nv_param_read_per_host_pf_conf(dev, mnvda, sizeof(mnvda));
++	if (err)
++		return err;
++
++	ctx->val.vu32 = MLX5_GET(nv_pf_pci_conf, data, total_vf);
++
++	return 0;
++}
++
++static int mlx5_devlink_total_vfs_set(struct devlink *devlink, u32 id,
++				      struct devlink_param_gset_ctx *ctx,
++				      struct netlink_ext_ack *extack)
++{
++	struct mlx5_core_dev *dev = devlink_priv(devlink);
++	u32 mnvda[MLX5_ST_SZ_DW(mnvda_reg)];
++	bool per_pf_support;
++	void *data;
++	int err;
++
++	err = mlx5_nv_param_read_global_pci_cap(dev, mnvda, sizeof(mnvda));
++	if (err) {
++		NL_SET_ERR_MSG_MOD(extack, "Failed to read global pci cap");
++		return err;
++	}
++
++	data = MLX5_ADDR_OF(mnvda_reg, mnvda, configuration_item_data);
++	if (!MLX5_GET(nv_global_pci_cap, data, sriov_support)) {
++		NL_SET_ERR_MSG_MOD(extack, "Not configurable on this device");
++		return -EOPNOTSUPP;
++	}
++
++	per_pf_support = MLX5_GET(nv_global_pci_cap, data,
++				  per_pf_total_vf_supported);
++	if (!per_pf_support) {
++		/* We don't allow global SRIOV setting on per PF devlink */
++		NL_SET_ERR_MSG_MOD(extack,
++				   "SRIOV is not per PF on this device");
++		return -EOPNOTSUPP;
++	}
++
++	memset(mnvda, 0, sizeof(mnvda));
++	err = mlx5_nv_param_read_global_pci_conf(dev, mnvda, sizeof(mnvda));
++	if (err)
++		return err;
++
++	MLX5_SET(nv_global_pci_conf, data, sriov_valid, 1);
++	MLX5_SET(nv_global_pci_conf, data, per_pf_total_vf, per_pf_support);
++
++	if (!per_pf_support) {
++		MLX5_SET(nv_global_pci_conf, data, total_vfs, ctx->val.vu32);
++		return mlx5_nv_param_write(dev, mnvda, sizeof(mnvda));
++	}
++
++	/* SRIOV is per PF */
++	err = mlx5_nv_param_write(dev, mnvda, sizeof(mnvda));
++	if (err)
++		return err;
++
++	memset(mnvda, 0, sizeof(mnvda));
++	err = mlx5_nv_param_read_per_host_pf_conf(dev, mnvda, sizeof(mnvda));
++	if (err)
++		return err;
++
++	data = MLX5_ADDR_OF(mnvda_reg, mnvda, configuration_item_data);
++	MLX5_SET(nv_pf_pci_conf, data, total_vf, ctx->val.vu32);
++	return mlx5_nv_param_write(dev, mnvda, sizeof(mnvda));
++}
++
++static int mlx5_devlink_total_vfs_validate(struct devlink *devlink, u32 id,
++					   union devlink_param_value val,
++					   struct netlink_ext_ack *extack)
++{
++	struct mlx5_core_dev *dev = devlink_priv(devlink);
++	u32 cap[MLX5_ST_SZ_DW(mnvda_reg)];
++	void *data;
++	u16 max;
++	int err;
++
++	data = MLX5_ADDR_OF(mnvda_reg, cap, configuration_item_data);
++
++	err = mlx5_nv_param_read_global_pci_cap(dev, cap, sizeof(cap));
++	if (err)
++		return err;
++
++	if (!MLX5_GET(nv_global_pci_cap, data, max_vfs_per_pf_valid))
++		return 0; /* optimistic, but set might fail later */
++
++	max = MLX5_GET(nv_global_pci_cap, data, max_vfs_per_pf);
++	if (val.vu16 > max) {
++		NL_SET_ERR_MSG_FMT_MOD(extack,
++				       "Max allowed by device is %u", max);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
+ static const struct devlink_param mlx5_nv_param_devlink_params[] = {
+ 	DEVLINK_PARAM_GENERIC(ENABLE_SRIOV, BIT(DEVLINK_PARAM_CMODE_PERMANENT),
+ 			      mlx5_devlink_enable_sriov_get,
+ 			      mlx5_devlink_enable_sriov_set, NULL),
++	DEVLINK_PARAM_GENERIC(TOTAL_VFS, BIT(DEVLINK_PARAM_CMODE_PERMANENT),
++			      mlx5_devlink_total_vfs_get,
++			      mlx5_devlink_total_vfs_set,
++			      mlx5_devlink_total_vfs_validate),
+ 	DEVLINK_PARAM_DRIVER(MLX5_DEVLINK_PARAM_ID_CQE_COMPRESSION_TYPE,
+ 			     "cqe_compress_type", DEVLINK_PARAM_TYPE_STRING,
+ 			     BIT(DEVLINK_PARAM_CMODE_PERMANENT),
