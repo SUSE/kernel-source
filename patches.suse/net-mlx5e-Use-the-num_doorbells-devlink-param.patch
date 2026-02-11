@@ -1,0 +1,129 @@
+From: Cosmin Ratiu <cratiu@nvidia.com>
+Date: Tue, 16 Sep 2025 17:11:44 +0300
+Subject: net/mlx5e: Use the 'num_doorbells' devlink param
+Patch-mainline: v6.18-rc1
+Git-commit: 11bbcfb7668c6f4d97260f7caaefea22678bc31e
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+Use the new devlink param to control how many doorbells mlx5e devices
+allocate and use. The maximum number of doorbells configurable is capped
+to the maximum number of channels. This only applies to the Ethernet
+part, the RDMA devices using mlx5 manage their own doorbells.
+
+Signed-off-by: Cosmin Ratiu <cratiu@nvidia.com>
+Reviewed-by: Dragos Tatulea <dtatulea@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ Documentation/networking/devlink/mlx5.rst           |    9 ++++++
+ drivers/net/ethernet/mellanox/mlx5/core/devlink.c   |   26 ++++++++++++++++++++
+ drivers/net/ethernet/mellanox/mlx5/core/en_common.c |   15 ++++++++++-
+ 3 files changed, 49 insertions(+), 1 deletion(-)
+
+--- a/Documentation/networking/devlink/mlx5.rst
++++ b/Documentation/networking/devlink/mlx5.rst
+@@ -62,6 +62,15 @@ Note: permanent parameters such as ``ena
+    echo 1 >/sys/bus/pci/rescan
+    grep ^ /sys/bus/pci/devices/0000:01:00.0/sriov_*
+ 
++   * - ``num_doorbells``
++     - driverinit
++     - This controls the number of channel doorbells used by the netdev. In all
++       cases, an additional doorbell is allocated and used for non-channel
++       communication (e.g. for PTP, HWS, etc.). Supported values are:
++
++       - 0: No channel-specific doorbells, use the global one for everything.
++       - [1, max_num_channels]: Spread netdev channels equally across these
++         doorbells.
+ 
+ The ``mlx5`` driver also implements the following driver-specific
+ parameters.
+--- a/drivers/net/ethernet/mellanox/mlx5/core/devlink.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/devlink.c
+@@ -530,6 +530,25 @@ mlx5_devlink_hairpin_queue_size_validate
+ 	return 0;
+ }
+ 
++static int mlx5_devlink_num_doorbells_validate(struct devlink *devlink, u32 id,
++					       union devlink_param_value val,
++					       struct netlink_ext_ack *extack)
++{
++	struct mlx5_core_dev *mdev = devlink_priv(devlink);
++	u32 val32 = val.vu32;
++	u32 max_num_channels;
++
++	max_num_channels = mlx5e_get_max_num_channels(mdev);
++	if (val32 > max_num_channels) {
++		NL_SET_ERR_MSG_FMT_MOD(extack,
++				       "Requested num_doorbells (%u) exceeds maximum number of channels (%u)",
++				       val32, max_num_channels);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
+ static void mlx5_devlink_hairpin_params_init_values(struct devlink *devlink)
+ {
+ 	struct mlx5_core_dev *dev = devlink_priv(devlink);
+@@ -609,6 +628,9 @@ static const struct devlink_param mlx5_d
+ 			     "hairpin_queue_size", DEVLINK_PARAM_TYPE_U32,
+ 			     BIT(DEVLINK_PARAM_CMODE_DRIVERINIT), NULL, NULL,
+ 			     mlx5_devlink_hairpin_queue_size_validate),
++	DEVLINK_PARAM_GENERIC(NUM_DOORBELLS,
++			      BIT(DEVLINK_PARAM_CMODE_DRIVERINIT), NULL, NULL,
++			      mlx5_devlink_num_doorbells_validate),
+ };
+ 
+ static int mlx5_devlink_eth_params_register(struct devlink *devlink)
+@@ -632,6 +654,10 @@ static int mlx5_devlink_eth_params_regis
+ 
+ 	mlx5_devlink_hairpin_params_init_values(devlink);
+ 
++	value.vu32 = MLX5_DEFAULT_NUM_DOORBELLS;
++	devl_param_driverinit_value_set(devlink,
++					DEVLINK_PARAM_GENERIC_ID_NUM_DOORBELLS,
++					value);
+ 	return 0;
+ }
+ 
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_common.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_common.c
+@@ -30,6 +30,7 @@
+  * SOFTWARE.
+  */
+ 
++#include "devlink.h"
+ #include "en.h"
+ #include "lib/crypto.h"
+ 
+@@ -140,6 +141,18 @@ err_close_tises:
+ 	return err;
+ }
+ 
++static unsigned int
++mlx5e_get_devlink_param_num_doorbells(struct mlx5_core_dev *dev)
++{
++	const u32 param_id = DEVLINK_PARAM_GENERIC_ID_NUM_DOORBELLS;
++	struct devlink *devlink = priv_to_devlink(dev);
++	union devlink_param_value val;
++	int err;
++
++	err = devl_param_driverinit_value_get(devlink, param_id, &val);
++	return err ? MLX5_DEFAULT_NUM_DOORBELLS : val.vu32;
++}
++
+ int mlx5e_create_mdev_resources(struct mlx5_core_dev *mdev, bool create_tises)
+ {
+ 	struct mlx5e_hw_objs *res = &mdev->mlx5e_res.hw_objs;
+@@ -164,7 +177,7 @@ int mlx5e_create_mdev_resources(struct m
+ 		goto err_dealloc_transport_domain;
+ 	}
+ 
+-	num_doorbells = min(MLX5_DEFAULT_NUM_DOORBELLS,
++	num_doorbells = min(mlx5e_get_devlink_param_num_doorbells(mdev),
+ 			    mlx5e_get_max_num_channels(mdev));
+ 	res->bfregs = kcalloc(num_doorbells, sizeof(*res->bfregs), GFP_KERNEL);
+ 	if (!res->bfregs) {
