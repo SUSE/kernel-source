@@ -1,0 +1,120 @@
+From: Shay Drory <shayd@nvidia.com>
+Date: Mon, 15 Sep 2025 15:41:10 +0300
+Subject: net/mlx5: Lag, add net namespace support
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Patch-mainline: v6.18-rc1
+Git-commit: d654d3fc2066c40586fa3b0538c0bf093e20b817
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+Update the LAG implementation to support net namespace isolation.
+Recent devcom changes added namespace-aware client matching. Align LAG
+with this model so that hardware LAG forms only between mlx5 interfaces
+that share the same network namespace. This avoids cross-namespace
+interference and matches user expectations when devices are placed in
+different netns.
+
+Make LAG netns-aware by storing the device’s namespace in mlx5_lag and
+registering the devcom client with that namespace. As a result, only
+peers in the same netns are eligible to form a LAG.
+Adjust reload handling so LAG teardown/re-evaluation happens in the
+correct namespace context. Remove the blanket restriction that prevented
+devlink reload when LAG was active. Remove the reload restriction here
+allowing devlink reload in LAG mode is part of delivering complete netns
+aware LAG support:
+
+With per-netns devcom registration, reload no longer risks
+cross-namespace coupling. The devcom client is torn down and
+re-registered in the device’s current netns, and LAG is re-evaluated
+within that scope. The change is trivial and self-contained, and keeping
+it in this patch avoids splitting a feature that is functionally one
+unit.
+
+Only devices in same netns can form hardware LAG.
+devlink reload no longer fails just because LAG is active.
+LAG is torn down/re-created as needed within the correct namespace.
+No change for setups that don’t use namespaces.
+
+Signed-off-by: Shay Drory <shayd@nvidia.com>
+Reviewed-by: Mark Bloch <mbloch@nvidia.com>
+Reviewed-by: Parav Pandit <parav@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://patch.msgid.link/1757940070-618661-5-git-send-email-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/devlink.c |    5 -----
+ drivers/net/ethernet/mellanox/mlx5/core/lag/lag.c |   14 +++++++++++---
+ drivers/net/ethernet/mellanox/mlx5/core/lag/lag.h |    1 +
+ 3 files changed, 12 insertions(+), 8 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/devlink.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/devlink.c
+@@ -204,11 +204,6 @@ static int mlx5_devlink_reload_down(stru
+ 		return 0;
+ 	}
+ 
+-	if (mlx5_lag_is_active(dev)) {
+-		NL_SET_ERR_MSG_MOD(extack, "reload is unsupported in Lag mode");
+-		return -EOPNOTSUPP;
+-	}
+-
+ 	if (mlx5_core_is_mp_slave(dev)) {
+ 		NL_SET_ERR_MSG_MOD(extack, "reload is unsupported for multi port slave");
+ 		return -EOPNOTSUPP;
+--- a/drivers/net/ethernet/mellanox/mlx5/core/lag/lag.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/lag/lag.c
+@@ -35,6 +35,7 @@
+ #include <linux/mlx5/driver.h>
+ #include <linux/mlx5/eswitch.h>
+ #include <linux/mlx5/vport.h>
++#include "lib/mlx5.h"
+ #include "lib/devcom.h"
+ #include "mlx5_core.h"
+ #include "eswitch.h"
+@@ -231,9 +232,13 @@ static void mlx5_do_bond_work(struct wor
+ static void mlx5_ldev_free(struct kref *ref)
+ {
+ 	struct mlx5_lag *ldev = container_of(ref, struct mlx5_lag, ref);
++	struct net *net;
++
++	if (ldev->nb.notifier_call) {
++		net = read_pnet(&ldev->net);
++		unregister_netdevice_notifier_net(net, &ldev->nb);
++	}
+ 
+-	if (ldev->nb.notifier_call)
+-		unregister_netdevice_notifier_net(&init_net, &ldev->nb);
+ 	mlx5_lag_mp_cleanup(ldev);
+ 	cancel_delayed_work_sync(&ldev->bond_work);
+ 	destroy_workqueue(ldev->wq);
+@@ -271,7 +276,8 @@ static struct mlx5_lag *mlx5_lag_dev_all
+ 	INIT_DELAYED_WORK(&ldev->bond_work, mlx5_do_bond_work);
+ 
+ 	ldev->nb.notifier_call = mlx5_lag_netdev_event;
+-	if (register_netdevice_notifier_net(&init_net, &ldev->nb)) {
++	write_pnet(&ldev->net, mlx5_core_net(dev));
++	if (register_netdevice_notifier_net(read_pnet(&ldev->net), &ldev->nb)) {
+ 		ldev->nb.notifier_call = NULL;
+ 		mlx5_core_err(dev, "Failed to register LAG netdev notifier\n");
+ 	}
+@@ -1413,6 +1419,8 @@ static int mlx5_lag_register_hca_devcom_
+ {
+ 	struct mlx5_devcom_match_attr attr = {
+ 		.key.val = mlx5_query_nic_system_image_guid(dev),
++		.flags = MLX5_DEVCOM_MATCH_FLAGS_NS,
++		.net = mlx5_core_net(dev),
+ 	};
+ 
+ 	/* This component is use to sync adding core_dev to lag_dev and to sync
+--- a/drivers/net/ethernet/mellanox/mlx5/core/lag/lag.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/lag/lag.h
+@@ -67,6 +67,7 @@ struct mlx5_lag {
+ 	struct workqueue_struct   *wq;
+ 	struct delayed_work       bond_work;
+ 	struct notifier_block     nb;
++	possible_net_t net;
+ 	struct lag_mp             lag_mp;
+ 	struct mlx5_lag_port_sel  port_sel;
+ 	/* Protect lag fields/state changes */
