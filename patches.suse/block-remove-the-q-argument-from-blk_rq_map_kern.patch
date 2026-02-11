@@ -1,0 +1,214 @@
+From: Christoph Hellwig <hch@lst.de>
+Date: Wed, 7 May 2025 14:04:29 +0200
+Subject: [PATCH] block: remove the q argument from blk_rq_map_kern
+Git-commit: af78428ed3f3eebad7be9d0463251046e9582cf6
+Patch-mainline: v6.16
+References: jsc#PED-14161
+
+Remove the q argument from blk_rq_map_kern and the internal helpers
+called by it as the queue can trivially be derived from the request.
+
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Damien Le Moal <dlemoal@kernel.org>
+Reviewed-by: Hannes Reinecke <hare@suse.de>
+Reviewed-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+Link: https://lore.kernel.org/r/20250507120451.4000627-6-hch@lst.de
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/blk-map.c            | 22 +++++++++-------------
+ drivers/block/pktcdvd.c    |  2 +-
+ drivers/block/ublk_drv.c   |  3 +--
+ drivers/block/virtio_blk.c |  4 ++--
+ drivers/nvme/host/core.c   |  2 +-
+ drivers/scsi/scsi_ioctl.c  |  2 +-
+ drivers/scsi/scsi_lib.c    |  3 +--
+ include/linux/blk-mq.h     |  4 ++--
+ 8 files changed, 18 insertions(+), 24 deletions(-)
+
+diff --git a/block/blk-map.c b/block/blk-map.c
+index cadbf11b50a3..9002cfe855b9 100644
+--- a/block/blk-map.c
++++ b/block/blk-map.c
+@@ -319,7 +319,6 @@ static void bio_map_kern_endio(struct bio *bio)
+ 
+ /**
+  *	bio_map_kern	-	map kernel address into bio
+- *	@q: the struct request_queue for the bio
+  *	@data: pointer to buffer to map
+  *	@len: length in bytes
+  *	@gfp_mask: allocation flags for bio allocation
+@@ -327,8 +326,7 @@ static void bio_map_kern_endio(struct bio *bio)
+  *	Map the kernel address into a bio suitable for io to a block
+  *	device. Returns an error pointer in case of error.
+  */
+-static struct bio *bio_map_kern(struct request_queue *q, void *data,
+-		unsigned int len, gfp_t gfp_mask)
++static struct bio *bio_map_kern(void *data, unsigned int len, gfp_t gfp_mask)
+ {
+ 	unsigned long kaddr = (unsigned long)data;
+ 	unsigned long end = (kaddr + len + PAGE_SIZE - 1) >> PAGE_SHIFT;
+@@ -402,7 +400,6 @@ static void bio_copy_kern_endio_read(struct bio *bio)
+ 
+ /**
+  *	bio_copy_kern	-	copy kernel address into bio
+- *	@q: the struct request_queue for the bio
+  *	@data: pointer to buffer to copy
+  *	@len: length in bytes
+  *	@gfp_mask: allocation flags for bio and page allocation
+@@ -411,8 +408,8 @@ static void bio_copy_kern_endio_read(struct bio *bio)
+  *	copy the kernel address into a bio suitable for io to a block
+  *	device. Returns an error pointer in case of error.
+  */
+-static struct bio *bio_copy_kern(struct request_queue *q, void *data,
+-		unsigned int len, gfp_t gfp_mask, int reading)
++static struct bio *bio_copy_kern(void *data, unsigned int len, gfp_t gfp_mask,
++		int reading)
+ {
+ 	unsigned long kaddr = (unsigned long)data;
+ 	unsigned long end = (kaddr + len + PAGE_SIZE - 1) >> PAGE_SHIFT;
+@@ -687,7 +684,6 @@ EXPORT_SYMBOL(blk_rq_unmap_user);
+ 
+ /**
+  * blk_rq_map_kern - map kernel data to a request, for passthrough requests
+- * @q:		request queue where request should be inserted
+  * @rq:		request to fill
+  * @kbuf:	the kernel buffer
+  * @len:	length of user data
+@@ -698,23 +694,23 @@ EXPORT_SYMBOL(blk_rq_unmap_user);
+  *    buffer is used. Can be called multiple times to append multiple
+  *    buffers.
+  */
+-int blk_rq_map_kern(struct request_queue *q, struct request *rq, void *kbuf,
+-		    unsigned int len, gfp_t gfp_mask)
++int blk_rq_map_kern(struct request *rq, void *kbuf, unsigned int len,
++		gfp_t gfp_mask)
+ {
+ 	int reading = rq_data_dir(rq) == READ;
+ 	unsigned long addr = (unsigned long) kbuf;
+ 	struct bio *bio;
+ 	int ret;
+ 
+-	if (len > (queue_max_hw_sectors(q) << 9))
++	if (len > (queue_max_hw_sectors(rq->q) << SECTOR_SHIFT))
+ 		return -EINVAL;
+ 	if (!len || !kbuf)
+ 		return -EINVAL;
+ 
+-	if (!blk_rq_aligned(q, addr, len) || object_is_on_stack(kbuf))
+-		bio = bio_copy_kern(q, kbuf, len, gfp_mask, reading);
++	if (!blk_rq_aligned(rq->q, addr, len) || object_is_on_stack(kbuf))
++		bio = bio_copy_kern(kbuf, len, gfp_mask, reading);
+ 	else
+-		bio = bio_map_kern(q, kbuf, len, gfp_mask);
++		bio = bio_map_kern(kbuf, len, gfp_mask);
+ 
+ 	if (IS_ERR(bio))
+ 		return PTR_ERR(bio);
+diff --git a/drivers/block/pktcdvd.c b/drivers/block/pktcdvd.c
+index 65b96c083b3c..d5cc7bd2875c 100644
+--- a/drivers/block/pktcdvd.c
++++ b/drivers/block/pktcdvd.c
+@@ -725,7 +725,7 @@ static int pkt_generic_packet(struct pktcdvd_device *pd, struct packet_command *
+ 	scmd = blk_mq_rq_to_pdu(rq);
+ 
+ 	if (cgc->buflen) {
+-		ret = blk_rq_map_kern(q, rq, cgc->buffer, cgc->buflen,
++		ret = blk_rq_map_kern(rq, cgc->buffer, cgc->buflen,
+ 				      GFP_NOIO);
+ 		if (ret)
+ 			goto out;
+diff --git a/drivers/block/ublk_drv.c b/drivers/block/ublk_drv.c
+index 3650bab40dd0..cb612151e9a1 100644
+--- a/drivers/block/ublk_drv.c
++++ b/drivers/block/ublk_drv.c
+@@ -368,8 +368,7 @@ static int ublk_report_zones(struct gendisk *disk, sector_t sector,
+ 		if (ret)
+ 			goto free_req;
+ 
+-		ret = blk_rq_map_kern(disk->queue, req, buffer, buffer_length,
+-					GFP_KERNEL);
++		ret = blk_rq_map_kern(req, buffer, buffer_length, GFP_KERNEL);
+ 		if (ret)
+ 			goto erase_desc;
+ 
+diff --git a/drivers/block/virtio_blk.c b/drivers/block/virtio_blk.c
+index 7cffea01d868..30bca8cb7106 100644
+--- a/drivers/block/virtio_blk.c
++++ b/drivers/block/virtio_blk.c
+@@ -571,7 +571,7 @@ static int virtblk_submit_zone_report(struct virtio_blk *vblk,
+ 	vbr->out_hdr.type = cpu_to_virtio32(vblk->vdev, VIRTIO_BLK_T_ZONE_REPORT);
+ 	vbr->out_hdr.sector = cpu_to_virtio64(vblk->vdev, sector);
+ 
+-	err = blk_rq_map_kern(q, req, report_buf, report_len, GFP_KERNEL);
++	err = blk_rq_map_kern(req, report_buf, report_len, GFP_KERNEL);
+ 	if (err)
+ 		goto out;
+ 
+@@ -817,7 +817,7 @@ static int virtblk_get_id(struct gendisk *disk, char *id_str)
+ 	vbr->out_hdr.type = cpu_to_virtio32(vblk->vdev, VIRTIO_BLK_T_GET_ID);
+ 	vbr->out_hdr.sector = 0;
+ 
+-	err = blk_rq_map_kern(q, req, id_str, VIRTIO_BLK_ID_BYTES, GFP_KERNEL);
++	err = blk_rq_map_kern(req, id_str, VIRTIO_BLK_ID_BYTES, GFP_KERNEL);
+ 	if (err)
+ 		goto out;
+ 
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index a8444d1e8398..af871d268fcb 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -1174,7 +1174,7 @@ int __nvme_submit_sync_cmd(struct request_queue *q, struct nvme_command *cmd,
+ 		req->cmd_flags &= ~REQ_FAILFAST_DRIVER;
+ 
+ 	if (buffer && bufflen) {
+-		ret = blk_rq_map_kern(q, req, buffer, bufflen, GFP_KERNEL);
++		ret = blk_rq_map_kern(req, buffer, bufflen, GFP_KERNEL);
+ 		if (ret)
+ 			goto out;
+ 	}
+diff --git a/drivers/scsi/scsi_ioctl.c b/drivers/scsi/scsi_ioctl.c
+index 2fa45556e1ea..0ddc95bafc71 100644
+--- a/drivers/scsi/scsi_ioctl.c
++++ b/drivers/scsi/scsi_ioctl.c
+@@ -601,7 +601,7 @@ static int sg_scsi_ioctl(struct request_queue *q, bool open_for_write,
+ 	}
+ 
+ 	if (bytes) {
+-		err = blk_rq_map_kern(q, rq, buffer, bytes, GFP_NOIO);
++		err = blk_rq_map_kern(rq, buffer, bytes, GFP_NOIO);
+ 		if (err)
+ 			goto error;
+ 	}
+diff --git a/drivers/scsi/scsi_lib.c b/drivers/scsi/scsi_lib.c
+index 39320dccbdd5..6f006cca0b5e 100644
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@ -313,8 +313,7 @@ int scsi_execute_cmd(struct scsi_device *sdev, const unsigned char *cmd,
+ 		return PTR_ERR(req);
+ 
+ 	if (bufflen) {
+-		ret = blk_rq_map_kern(sdev->request_queue, req,
+-				      buffer, bufflen, GFP_NOIO);
++		ret = blk_rq_map_kern(req, buffer, bufflen, GFP_NOIO);
+ 		if (ret)
+ 			goto out;
+ 	}
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index 906bf330ffb5..de8c85a03bb7 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -1037,8 +1037,8 @@ int blk_rq_map_user_io(struct request *, struct rq_map_data *,
+ int blk_rq_map_user_iov(struct request_queue *, struct request *,
+ 		struct rq_map_data *, const struct iov_iter *, gfp_t);
+ int blk_rq_unmap_user(struct bio *);
+-int blk_rq_map_kern(struct request_queue *, struct request *, void *,
+-		unsigned int, gfp_t);
++int blk_rq_map_kern(struct request *rq, void *kbuf, unsigned int len,
++		gfp_t gfp);
+ int blk_rq_append_bio(struct request *rq, struct bio *bio);
+ void blk_execute_rq_nowait(struct request *rq, bool at_head);
+ blk_status_t blk_execute_rq(struct request *rq, bool at_head);
+-- 
+2.43.0
+
