@@ -1,0 +1,243 @@
+From: Daniel Jurgens <danielj@nvidia.com>
+Date: Wed, 13 Aug 2025 22:19:56 +0300
+Subject: net/mlx5: Support disabling host PFs
+Patch-mainline: v6.18-rc1
+Git-commit: 520369ef43a8504f9d54ee219bb6c692d2e40028
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+Some devices support disabling the physical function on the host. When
+this is configured the vports for the host functions do not exist.
+
+This patch checks if host functions are enabled before trying to access
+their vports.
+
+Signed-off-by: Daniel Jurgens <danielj@nvidia.com>
+Reviewed-by: William Tu <witu@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://patch.msgid.link/1755112796-467444-3-git-send-email-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/eswitch.c          |   62 ++++++++-----
+ drivers/net/ethernet/mellanox/mlx5/core/eswitch.h          |    7 +
+ drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c |   34 ++++---
+ 3 files changed, 66 insertions(+), 37 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+@@ -1297,17 +1297,19 @@ mlx5_eswitch_enable_pf_vf_vports(struct
+ 		    esw->mode == MLX5_ESWITCH_LEGACY;
+ 
+ 	/* Enable PF vport */
+-	if (pf_needed) {
++	if (pf_needed && mlx5_esw_host_functions_enabled(esw->dev)) {
+ 		ret = mlx5_eswitch_load_pf_vf_vport(esw, MLX5_VPORT_PF,
+ 						    enabled_events);
+ 		if (ret)
+ 			return ret;
+ 	}
+ 
+-	/* Enable external host PF HCA */
+-	ret = host_pf_enable_hca(esw->dev);
+-	if (ret)
+-		goto pf_hca_err;
++	if (mlx5_esw_host_functions_enabled(esw->dev)) {
++		/* Enable external host PF HCA */
++		ret = host_pf_enable_hca(esw->dev);
++		if (ret)
++			goto pf_hca_err;
++	}
+ 
+ 	/* Enable ECPF vport */
+ 	if (mlx5_ecpf_vport_exists(esw->dev)) {
+@@ -1339,9 +1341,10 @@ ec_vf_err:
+ 	if (mlx5_ecpf_vport_exists(esw->dev))
+ 		mlx5_eswitch_unload_pf_vf_vport(esw, MLX5_VPORT_ECPF);
+ ecpf_err:
+-	host_pf_disable_hca(esw->dev);
++	if (mlx5_esw_host_functions_enabled(esw->dev))
++		host_pf_disable_hca(esw->dev);
+ pf_hca_err:
+-	if (pf_needed)
++	if (pf_needed && mlx5_esw_host_functions_enabled(esw->dev))
+ 		mlx5_eswitch_unload_pf_vf_vport(esw, MLX5_VPORT_PF);
+ 	return ret;
+ }
+@@ -1361,10 +1364,12 @@ void mlx5_eswitch_disable_pf_vf_vports(s
+ 		mlx5_eswitch_unload_pf_vf_vport(esw, MLX5_VPORT_ECPF);
+ 	}
+ 
+-	host_pf_disable_hca(esw->dev);
++	if (mlx5_esw_host_functions_enabled(esw->dev))
++		host_pf_disable_hca(esw->dev);
+ 
+-	if (mlx5_core_is_ecpf_esw_manager(esw->dev) ||
+-	    esw->mode == MLX5_ESWITCH_LEGACY)
++	if ((mlx5_core_is_ecpf_esw_manager(esw->dev) ||
++	     esw->mode == MLX5_ESWITCH_LEGACY) &&
++	    mlx5_esw_host_functions_enabled(esw->dev))
+ 		mlx5_eswitch_unload_pf_vf_vport(esw, MLX5_VPORT_PF);
+ }
+ 
+@@ -1693,7 +1698,8 @@ int mlx5_esw_sf_max_hpf_functions(struct
+ 	void *hca_caps;
+ 	int err;
+ 
+-	if (!mlx5_core_is_ecpf(dev)) {
++	if (!mlx5_core_is_ecpf(dev) ||
++	    !mlx5_esw_host_functions_enabled(dev)) {
+ 		*max_sfs = 0;
+ 		return 0;
+ 	}
+@@ -1769,21 +1775,23 @@ static int mlx5_esw_vports_init(struct m
+ 
+ 	xa_init(&esw->vports);
+ 
+-	err = mlx5_esw_vport_alloc(esw, idx, MLX5_VPORT_PF);
+-	if (err)
+-		goto err;
+-	if (esw->first_host_vport == MLX5_VPORT_PF)
+-		xa_set_mark(&esw->vports, idx, MLX5_ESW_VPT_HOST_FN);
+-	idx++;
+-
+-	for (i = 0; i < mlx5_core_max_vfs(dev); i++) {
+-		err = mlx5_esw_vport_alloc(esw, idx, idx);
++	if (mlx5_esw_host_functions_enabled(dev)) {
++		err = mlx5_esw_vport_alloc(esw, idx, MLX5_VPORT_PF);
+ 		if (err)
+ 			goto err;
+-		xa_set_mark(&esw->vports, idx, MLX5_ESW_VPT_VF);
+-		xa_set_mark(&esw->vports, idx, MLX5_ESW_VPT_HOST_FN);
++		if (esw->first_host_vport == MLX5_VPORT_PF)
++			xa_set_mark(&esw->vports, idx, MLX5_ESW_VPT_HOST_FN);
+ 		idx++;
++		for (i = 0; i < mlx5_core_max_vfs(dev); i++) {
++			err = mlx5_esw_vport_alloc(esw, idx, idx);
++			if (err)
++				goto err;
++			xa_set_mark(&esw->vports, idx, MLX5_ESW_VPT_VF);
++			xa_set_mark(&esw->vports, idx, MLX5_ESW_VPT_HOST_FN);
++			idx++;
++		}
+ 	}
++
+ 	base_sf_num = mlx5_sf_start_function_id(dev);
+ 	for (i = 0; i < mlx5_sf_max_functions(dev); i++) {
+ 		err = mlx5_esw_vport_alloc(esw, idx, base_sf_num + i);
+@@ -1883,6 +1891,7 @@ int mlx5_eswitch_init(struct mlx5_core_d
+ 		goto free_esw;
+ 
+ 	esw->dev = dev;
++	dev->priv.eswitch = esw;
+ 	esw->manager_vport = mlx5_eswitch_manager_vport(dev);
+ 	esw->first_host_vport = mlx5_eswitch_first_host_vport_num(dev);
+ 
+@@ -1901,7 +1910,6 @@ int mlx5_eswitch_init(struct mlx5_core_d
+ 	if (err)
+ 		goto abort;
+ 
+-	dev->priv.eswitch = esw;
+ 	err = esw_offloads_init(esw);
+ 	if (err)
+ 		goto reps_err;
+@@ -2433,3 +2441,11 @@ void mlx5_eswitch_unblock_ipsec(struct m
+ 	dev->num_ipsec_offloads--;
+ 	mutex_unlock(&esw->state_lock);
+ }
++
++bool mlx5_esw_host_functions_enabled(const struct mlx5_core_dev *dev)
++{
++	if (!dev->priv.eswitch)
++		return true;
++
++	return !dev->priv.eswitch->esw_funcs.host_funcs_disabled;
++}
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@ -894,6 +894,7 @@ int mlx5_esw_ipsec_vf_packet_offload_set
+ 					 bool enable);
+ int mlx5_esw_ipsec_vf_packet_offload_supported(struct mlx5_core_dev *dev,
+ 					       u16 vport_num);
++bool mlx5_esw_host_functions_enabled(const struct mlx5_core_dev *dev);
+ #else  /* CONFIG_MLX5_ESWITCH */
+ /* eswitch API stubs */
+ static inline int  mlx5_eswitch_init(struct mlx5_core_dev *dev) { return 0; }
+@@ -961,6 +962,12 @@ static inline bool mlx5_eswitch_block_ip
+ }
+ 
+ static inline void mlx5_eswitch_unblock_ipsec(struct mlx5_core_dev *dev) {}
++
++static inline bool
++mlx5_esw_host_functions_enabled(const struct mlx5_core_dev *dev)
++{
++	return true;
++}
+ #endif /* CONFIG_MLX5_ESWITCH */
+ 
+ #endif /* __MLX5_ESWITCH_H__ */
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@ -1213,7 +1213,8 @@ static int esw_add_fdb_peer_miss_rules(s
+ 	misc = MLX5_ADDR_OF(fte_match_param, spec->match_value,
+ 			    misc_parameters);
+ 
+-	if (mlx5_core_is_ecpf_esw_manager(peer_dev)) {
++	if (mlx5_core_is_ecpf_esw_manager(peer_dev) &&
++	    mlx5_esw_host_functions_enabled(peer_dev)) {
+ 		peer_vport = mlx5_eswitch_get_vport(peer_esw, MLX5_VPORT_PF);
+ 		esw_set_peer_miss_rule_source_port(esw, peer_esw, spec,
+ 						   MLX5_VPORT_PF);
+@@ -1239,19 +1240,21 @@ static int esw_add_fdb_peer_miss_rules(s
+ 		flows[peer_vport->index] = flow;
+ 	}
+ 
+-	mlx5_esw_for_each_vf_vport(peer_esw, i, peer_vport,
+-				   mlx5_core_max_vfs(peer_dev)) {
+-		esw_set_peer_miss_rule_source_port(esw,
+-						   peer_esw,
+-						   spec, peer_vport->vport);
++	if (mlx5_esw_host_functions_enabled(esw->dev)) {
++		mlx5_esw_for_each_vf_vport(peer_esw, i, peer_vport,
++					   mlx5_core_max_vfs(peer_dev)) {
++			esw_set_peer_miss_rule_source_port(esw, peer_esw,
++							   spec,
++							   peer_vport->vport);
+ 
+-		flow = mlx5_add_flow_rules(mlx5_eswitch_get_slow_fdb(esw),
+-					   spec, &flow_act, &dest, 1);
+-		if (IS_ERR(flow)) {
+-			err = PTR_ERR(flow);
+-			goto add_vf_flow_err;
++			flow = mlx5_add_flow_rules(mlx5_eswitch_get_slow_fdb(esw),
++						   spec, &flow_act, &dest, 1);
++			if (IS_ERR(flow)) {
++				err = PTR_ERR(flow);
++				goto add_vf_flow_err;
++			}
++			flows[peer_vport->index] = flow;
+ 		}
+-		flows[peer_vport->index] = flow;
+ 	}
+ 
+ 	if (mlx5_core_ec_sriov_enabled(peer_dev)) {
+@@ -1301,7 +1304,9 @@ add_vf_flow_err:
+ 		mlx5_del_flow_rules(flows[peer_vport->index]);
+ 	}
+ add_ecpf_flow_err:
+-	if (mlx5_core_is_ecpf_esw_manager(peer_dev)) {
++
++	if (mlx5_core_is_ecpf_esw_manager(peer_dev) &&
++	    mlx5_esw_host_functions_enabled(peer_dev)) {
+ 		peer_vport = mlx5_eswitch_get_vport(peer_esw, MLX5_VPORT_PF);
+ 		mlx5_del_flow_rules(flows[peer_vport->index]);
+ 	}
+@@ -4059,7 +4064,8 @@ mlx5_eswitch_vport_has_rep(const struct
+ {
+ 	/* Currently, only ECPF based device has representor for host PF. */
+ 	if (vport_num == MLX5_VPORT_PF &&
+-	    !mlx5_core_is_ecpf_esw_manager(esw->dev))
++	    (!mlx5_core_is_ecpf_esw_manager(esw->dev) ||
++	     !mlx5_esw_host_functions_enabled(esw->dev)))
+ 		return false;
+ 
+ 	if (vport_num == MLX5_VPORT_ECPF &&
