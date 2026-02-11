@@ -1,0 +1,138 @@
+From: Patrisious Haddad <phaddad@nvidia.com>
+Date: Tue, 17 Jun 2025 11:19:16 +0300
+Subject: RDMA/mlx5: Add multiple priorities support to RDMA TRANSPORT
+ userspace tables
+Patch-mainline: v6.17-rc1
+Git-commit: 40852c890119ebf39a741f50db13ae941f230d05
+References: jsc#PED-15334
+
+Support the creation of RDMA TRANSPORT tables over multiple priorities
+via matcher creation.
+
+Signed-off-by: Patrisious Haddad <phaddad@nvidia.com>
+Reviewed-by: Mark Bloch <mbloch@nvidia.com>
+Link: https://patch.msgid.link/bb38e50ae4504e979c6568d41939402a4cf15635.1750148083.git.leon@kernel.org
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/hw/mlx5/fs.c      |   42 +++++++++++++++++++++--------------
+ drivers/infiniband/hw/mlx5/fs.h      |    8 +++++-
+ drivers/infiniband/hw/mlx5/mlx5_ib.h |    4 +--
+ 3 files changed, 34 insertions(+), 20 deletions(-)
+
+--- a/drivers/infiniband/hw/mlx5/fs.c
++++ b/drivers/infiniband/hw/mlx5/fs.c
+@@ -1966,7 +1966,8 @@ _get_flow_table(struct mlx5_ib_dev *dev,
+ 		break;
+ 	case MLX5_FLOW_NAMESPACE_RDMA_TRANSPORT_RX:
+ 	case MLX5_FLOW_NAMESPACE_RDMA_TRANSPORT_TX:
+-		if (ib_port == 0 || user_priority > MLX5_RDMA_TRANSPORT_BYPASS_PRIO)
++		if (ib_port == 0 ||
++		    user_priority >= MLX5_RDMA_TRANSPORT_BYPASS_PRIO)
+ 			return ERR_PTR(-EINVAL);
+ 		ret = mlx5_ib_fill_transport_ns_info(dev, ns_type, &flags,
+ 						     &vport_idx, &vport,
+@@ -2016,10 +2017,10 @@ _get_flow_table(struct mlx5_ib_dev *dev,
+ 		prio = &dev->flow_db->rdma_tx[priority];
+ 		break;
+ 	case MLX5_FLOW_NAMESPACE_RDMA_TRANSPORT_RX:
+-		prio = &dev->flow_db->rdma_transport_rx[ib_port - 1];
++		prio = &dev->flow_db->rdma_transport_rx[priority][ib_port - 1];
+ 		break;
+ 	case MLX5_FLOW_NAMESPACE_RDMA_TRANSPORT_TX:
+-		prio = &dev->flow_db->rdma_transport_tx[ib_port - 1];
++		prio = &dev->flow_db->rdma_transport_tx[priority][ib_port - 1];
+ 		break;
+ 	default: return ERR_PTR(-EINVAL);
+ 	}
+@@ -3468,31 +3469,40 @@ static const struct ib_device_ops flow_o
+ 
+ int mlx5_ib_fs_init(struct mlx5_ib_dev *dev)
+ {
++	int i, j;
++
+ 	dev->flow_db = kzalloc(sizeof(*dev->flow_db), GFP_KERNEL);
+ 
+ 	if (!dev->flow_db)
+ 		return -ENOMEM;
+ 
+-	dev->flow_db->rdma_transport_rx = kcalloc(dev->num_ports,
+-					sizeof(struct mlx5_ib_flow_prio),
+-					GFP_KERNEL);
+-	if (!dev->flow_db->rdma_transport_rx)
+-		goto free_flow_db;
+-
+-	dev->flow_db->rdma_transport_tx = kcalloc(dev->num_ports,
+-					sizeof(struct mlx5_ib_flow_prio),
+-					GFP_KERNEL);
+-	if (!dev->flow_db->rdma_transport_tx)
+-		goto free_rdma_transport_rx;
++	for (i = 0; i < MLX5_RDMA_TRANSPORT_BYPASS_PRIO; i++) {
++		dev->flow_db->rdma_transport_rx[i] =
++			kcalloc(dev->num_ports,
++				sizeof(struct mlx5_ib_flow_prio), GFP_KERNEL);
++		if (!dev->flow_db->rdma_transport_rx[i])
++			goto free_rdma_transport_rx;
++	}
++
++	for (j = 0; j < MLX5_RDMA_TRANSPORT_BYPASS_PRIO; j++) {
++		dev->flow_db->rdma_transport_tx[j] =
++			kcalloc(dev->num_ports,
++				sizeof(struct mlx5_ib_flow_prio), GFP_KERNEL);
++		if (!dev->flow_db->rdma_transport_tx[j])
++			goto free_rdma_transport_tx;
++	}
+ 
+ 	mutex_init(&dev->flow_db->lock);
+ 
+ 	ib_set_device_ops(&dev->ib_dev, &flow_ops);
+ 	return 0;
+ 
++free_rdma_transport_tx:
++	while (j--)
++		kfree(dev->flow_db->rdma_transport_tx[j]);
+ free_rdma_transport_rx:
+-	kfree(dev->flow_db->rdma_transport_rx);
+-free_flow_db:
++	while (i--)
++		kfree(dev->flow_db->rdma_transport_rx[i]);
+ 	kfree(dev->flow_db);
+ 	return -ENOMEM;
+ }
+--- a/drivers/infiniband/hw/mlx5/fs.h
++++ b/drivers/infiniband/hw/mlx5/fs.h
+@@ -13,6 +13,8 @@ void mlx5_ib_fs_cleanup_anchor(struct ml
+ 
+ static inline void mlx5_ib_fs_cleanup(struct mlx5_ib_dev *dev)
+ {
++	int i;
++
+ 	/* When a steering anchor is created, a special flow table is also
+ 	 * created for the user to reference. Since the user can reference it,
+ 	 * the kernel cannot trust that when the user destroys the steering
+@@ -25,8 +27,10 @@ static inline void mlx5_ib_fs_cleanup(st
+ 	 * is a safe assumption that all references are gone.
+ 	 */
+ 	mlx5_ib_fs_cleanup_anchor(dev);
+-	kfree(dev->flow_db->rdma_transport_tx);
+-	kfree(dev->flow_db->rdma_transport_rx);
++	for (i = 0; i < MLX5_RDMA_TRANSPORT_BYPASS_PRIO; i++)
++		kfree(dev->flow_db->rdma_transport_tx[i]);
++	for (i = 0; i < MLX5_RDMA_TRANSPORT_BYPASS_PRIO; i++)
++		kfree(dev->flow_db->rdma_transport_rx[i]);
+ 	kfree(dev->flow_db);
+ }
+ #endif /* _MLX5_IB_FS_H */
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@ -320,8 +320,8 @@ struct mlx5_ib_flow_db {
+ 	struct mlx5_ib_flow_prio	rdma_tx[MLX5_IB_NUM_FLOW_FT];
+ 	struct mlx5_ib_flow_prio	opfcs[MLX5_IB_OPCOUNTER_MAX];
+ 	struct mlx5_flow_table		*lag_demux_ft;
+-	struct mlx5_ib_flow_prio        *rdma_transport_rx;
+-	struct mlx5_ib_flow_prio        *rdma_transport_tx;
++	struct mlx5_ib_flow_prio        *rdma_transport_rx[MLX5_RDMA_TRANSPORT_BYPASS_PRIO];
++	struct mlx5_ib_flow_prio        *rdma_transport_tx[MLX5_RDMA_TRANSPORT_BYPASS_PRIO];
+ 	/* Protect flow steering bypass flow tables
+ 	 * when add/del flow rules.
+ 	 * only single add/removal of flow steering rule could be done
