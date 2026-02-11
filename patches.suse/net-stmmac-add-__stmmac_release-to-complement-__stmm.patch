@@ -1,0 +1,116 @@
+From: "Russell King (Oracle)" <rmk+kernel@armlinux.org.uk>
+Date: Thu, 11 Sep 2025 12:10:02 +0100
+Subject: net: stmmac: add __stmmac_release() to complement __stmmac_open()
+Patch-mainline: v6.18-rc1
+Git-commit: 67ec43792b110540211485deb59e33839d8a2f5a
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+Rename stmmac_release() to __stmmac_release(), providing a new
+stmmac_release() method. Update stmmac_change_mtu() to use
+__stmmac_release(). Move the runtime PM handling into stmmac_open()
+and stmmac_release().
+
+This avoids stmmac_change_mtu() needlessly fiddling with the runtime
+PM state, and will allow future changes to remove code from
+__stmmac_open() and __stmmac_release() that should only happen when
+the net device is administratively brought up or down.
+
+Signed-off-by: Russell King (Oracle) <rmk+kernel@armlinux.org.uk>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/stmicro/stmmac/stmmac_main.c |   41 +++++++++++++---------
+ 1 file changed, 25 insertions(+), 16 deletions(-)
+
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -3908,10 +3908,6 @@ static int __stmmac_open(struct net_devi
+ 	if (!priv->tx_lpi_timer)
+ 		priv->tx_lpi_timer = eee_timer * 1000;
+ 
+-	ret = pm_runtime_resume_and_get(priv->device);
+-	if (ret < 0)
+-		return ret;
+-
+ 	if ((!priv->hw->xpcs ||
+ 	     xpcs_get_an_mode(priv->hw->xpcs, mode) != DW_AN_C73)) {
+ 		ret = stmmac_init_phy(dev);
+@@ -3919,7 +3915,7 @@ static int __stmmac_open(struct net_devi
+ 			netdev_err(priv->dev,
+ 				   "%s: Cannot attach to PHY (error: %d)\n",
+ 				   __func__, ret);
+-			goto init_phy_error;
++			return ret;
+ 		}
+ 	}
+ 
+@@ -3974,8 +3970,6 @@ irq_error:
+ 	stmmac_release_ptp(priv);
+ init_error:
+ 	phylink_disconnect_phy(priv->phylink);
+-init_phy_error:
+-	pm_runtime_put(priv->device);
+ 	return ret;
+ }
+ 
+@@ -3989,21 +3983,23 @@ static int stmmac_open(struct net_device
+ 	if (IS_ERR(dma_conf))
+ 		return PTR_ERR(dma_conf);
+ 
++	ret = pm_runtime_resume_and_get(priv->device);
++	if (ret < 0)
++		goto err;
++
+ 	ret = __stmmac_open(dev, dma_conf);
+-	if (ret)
++	if (ret) {
++		pm_runtime_put(priv->device);
++err:
+ 		free_dma_desc_resources(priv, dma_conf);
++	}
+ 
+ 	kfree(dma_conf);
++
+ 	return ret;
+ }
+ 
+-/**
+- *  stmmac_release - close entry point of the driver
+- *  @dev : device pointer.
+- *  Description:
+- *  This is the stop entry point of the driver.
+- */
+-static int stmmac_release(struct net_device *dev)
++static void __stmmac_release(struct net_device *dev)
+ {
+ 	struct stmmac_priv *priv = netdev_priv(dev);
+ 	u32 chan;
+@@ -4041,6 +4037,19 @@ static int stmmac_release(struct net_dev
+ 
+ 	if (stmmac_fpe_supported(priv))
+ 		ethtool_mmsv_stop(&priv->fpe_cfg.mmsv);
++}
++
++/**
++ *  stmmac_release - close entry point of the driver
++ *  @dev : device pointer.
++ *  Description:
++ *  This is the stop entry point of the driver.
++ */
++static int stmmac_release(struct net_device *dev)
++{
++	struct stmmac_priv *priv = netdev_priv(dev);
++
++	__stmmac_release(dev);
+ 
+ 	pm_runtime_put(priv->device);
+ 
+@@ -5854,7 +5863,7 @@ static int stmmac_change_mtu(struct net_
+ 			return PTR_ERR(dma_conf);
+ 		}
+ 
+-		stmmac_release(dev);
++		__stmmac_release(dev);
+ 
+ 		ret = __stmmac_open(dev, dma_conf);
+ 		if (ret) {
