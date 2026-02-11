@@ -1,0 +1,200 @@
+From: Carolina Jubran <cjubran@nvidia.com>
+Date: Sun, 29 Jun 2025 17:21:33 +0300
+Subject: selftest: netdevsim: Add devlink rate tc-bw test
+Patch-mainline: v6.17-rc1
+Git-commit: 236156d80d5efd942fc395a078d6ec6d810c2c40
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+Test verifies that netdevsim correctly implements devlink ops callbacks
+that set tc-bw on leaf or node rate object.
+
+Signed-off-by: Carolina Jubran <cjubran@nvidia.com>
+Reviewed-by: Cosmin Ratiu <cratiu@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Signed-off-by: Mark Bloch <mbloch@nvidia.com>
+Link: https://patch.msgid.link/20250629142138.361537-4-mbloch@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/netdevsim/dev.c                              |   43 ++++++++++++
+ drivers/net/netdevsim/netdevsim.h                        |    1 
+ tools/testing/selftests/drivers/net/netdevsim/devlink.sh |   53 +++++++++++++++
+ 3 files changed, 97 insertions(+)
+
+--- a/drivers/net/netdevsim/dev.c
++++ b/drivers/net/netdevsim/dev.c
+@@ -388,6 +388,17 @@ static const struct file_operations nsim
+ 	.owner = THIS_MODULE,
+ };
+ 
++static void nsim_dev_tc_bw_debugfs_init(struct dentry *ddir, u32 *tc_bw)
++{
++	int i;
++
++	for (i = 0; i < DEVLINK_RATE_TCS_MAX; i++) {
++		char name[16];
++
++		snprintf(name, sizeof(name), "tc%d_bw", i);
++		debugfs_create_u32(name, 0400, ddir, &tc_bw[i]);
++	}
++}
+ static int nsim_dev_port_debugfs_init(struct nsim_dev *nsim_dev,
+ 				      struct nsim_dev_port *nsim_dev_port)
+ {
+@@ -415,6 +426,8 @@ static int nsim_dev_port_debugfs_init(st
+ 								 nsim_dev_port->ddir,
+ 								 &nsim_dev_port->parent_name,
+ 								 &nsim_dev_rate_parent_fops);
++		nsim_dev_tc_bw_debugfs_init(nsim_dev_port->ddir,
++					    nsim_dev_port->tc_bw);
+ 	}
+ 	debugfs_create_symlink("dev", nsim_dev_port->ddir, dev_link_name);
+ 
+@@ -1172,6 +1185,19 @@ static int nsim_rate_bytes_to_units(char
+ 	return 0;
+ }
+ 
++static int nsim_leaf_tc_bw_set(struct devlink_rate *devlink_rate,
++			       void *priv, u32 *tc_bw,
++			       struct netlink_ext_ack *extack)
++{
++	struct nsim_dev_port *nsim_dev_port = priv;
++	int i;
++
++	for (i = 0; i < DEVLINK_RATE_TCS_MAX; i++)
++		nsim_dev_port->tc_bw[i] = tc_bw[i];
++
++	return 0;
++}
++
+ static int nsim_leaf_tx_share_set(struct devlink_rate *devlink_rate, void *priv,
+ 				  u64 tx_share, struct netlink_ext_ack *extack)
+ {
+@@ -1210,8 +1236,21 @@ struct nsim_rate_node {
+ 	char *parent_name;
+ 	u16 tx_share;
+ 	u16 tx_max;
++	u32 tc_bw[DEVLINK_RATE_TCS_MAX];
+ };
+ 
++static int nsim_node_tc_bw_set(struct devlink_rate *devlink_rate, void *priv,
++			       u32 *tc_bw, struct netlink_ext_ack *extack)
++{
++	struct nsim_rate_node *nsim_node = priv;
++	int i;
++
++	for (i = 0; i < DEVLINK_RATE_TCS_MAX; i++)
++		nsim_node->tc_bw[i] = tc_bw[i];
++
++	return 0;
++}
++
+ static int nsim_node_tx_share_set(struct devlink_rate *devlink_rate, void *priv,
+ 				  u64 tx_share, struct netlink_ext_ack *extack)
+ {
+@@ -1264,6 +1303,8 @@ static int nsim_rate_node_new(struct dev
+ 						     &nsim_node->parent_name,
+ 						     &nsim_dev_rate_parent_fops);
+ 
++	nsim_dev_tc_bw_debugfs_init(nsim_node->ddir, nsim_node->tc_bw);
++
+ 	*priv = nsim_node;
+ 	return 0;
+ }
+@@ -1340,8 +1381,10 @@ static const struct devlink_ops nsim_dev
+ 	.trap_policer_counter_get = nsim_dev_devlink_trap_policer_counter_get,
+ 	.rate_leaf_tx_share_set = nsim_leaf_tx_share_set,
+ 	.rate_leaf_tx_max_set = nsim_leaf_tx_max_set,
++	.rate_leaf_tc_bw_set = nsim_leaf_tc_bw_set,
+ 	.rate_node_tx_share_set = nsim_node_tx_share_set,
+ 	.rate_node_tx_max_set = nsim_node_tx_max_set,
++	.rate_node_tc_bw_set = nsim_node_tc_bw_set,
+ 	.rate_node_new = nsim_rate_node_new,
+ 	.rate_node_del = nsim_rate_node_del,
+ 	.rate_leaf_parent_set = nsim_rate_leaf_parent_set,
+--- a/drivers/net/netdevsim/netdevsim.h
++++ b/drivers/net/netdevsim/netdevsim.h
+@@ -275,6 +275,7 @@ struct nsim_dev_port {
+ 	struct dentry *ddir;
+ 	struct dentry *rate_parent;
+ 	char *parent_name;
++	u32 tc_bw[DEVLINK_RATE_TCS_MAX];
+ 	struct netdevsim *ns;
+ };
+ 
+--- a/tools/testing/selftests/drivers/net/netdevsim/devlink.sh
++++ b/tools/testing/selftests/drivers/net/netdevsim/devlink.sh
+@@ -608,6 +608,46 @@ rate_attr_parent_check()
+ 	check_err $? "Unexpected parent attr value $api_value != $parent"
+ }
+ 
++rate_attr_tc_bw_check()
++{
++	local handle=$1
++	local tc_bw=$2
++	local debug_file=$3
++
++	local tc_bw_str=""
++	for bw in $tc_bw; do
++		local tc=${bw%%:*}
++		local value=${bw##*:}
++		tc_bw_str="$tc_bw_str $tc:$value"
++	done
++	tc_bw_str=${tc_bw_str# }
++
++	rate_attr_set "$handle" tc-bw "$tc_bw_str"
++	check_err $? "Failed to set tc-bw values"
++
++	for bw in $tc_bw; do
++		local tc=${bw%%:*}
++		local value=${bw##*:}
++		local debug_value
++		debug_value=$(cat "$debug_file"/tc"${tc}"_bw)
++		check_err $? "Failed to read tc-bw value from debugfs for tc$tc"
++		[ "$debug_value" == "$value" ]
++		check_err $? "Unexpected tc-bw debug value for tc$tc: $debug_value != $value"
++	done
++
++	for bw in $tc_bw; do
++		local tc=${bw%%:*}
++		local expected_value=${bw##*:}
++		local api_value
++		api_value=$(rate_attr_get "$handle" tc_"$tc")
++		if [ "$api_value" = "null" ]; then
++			api_value=0
++		fi
++		[ "$api_value" == "$expected_value" ]
++		check_err $? "Unexpected tc-bw value for tc$tc: $api_value != $expected_value"
++	done
++}
++
+ rate_node_add()
+ {
+ 	local handle=$1
+@@ -649,6 +689,13 @@ rate_test()
+ 		rate=$(($rate+100))
+ 	done
+ 
++	local tc_bw="0:0 1:40 2:0 3:0 4:0 5:0 6:60 7:0"
++	for r_obj in $leafs
++	do
++		rate_attr_tc_bw_check "$r_obj" "$tc_bw" \
++			"$DEBUGFS_DIR"/ports/"${r_obj##*/}"
++	done
++
+ 	local node1_name='group1'
+ 	local node1="$DL_HANDLE/$node1_name"
+ 	rate_node_add "$node1"
+@@ -666,6 +713,12 @@ rate_test()
+ 	rate_attr_tx_rate_check $node1 tx_max $node_tx_max \
+ 		$DEBUGFS_DIR/rate_nodes/${node1##*/}/tx_max
+ 
++
++	local tc_bw="0:20 1:0 2:0 3:0 4:0 5:20 6:60 7:0"
++	rate_attr_tc_bw_check $node1 "$tc_bw" \
++		"$DEBUGFS_DIR"/rate_nodes/"${node1##*/}"
++
++
+ 	rate_node_del "$node1"
+ 	check_err $? "Failed to delete node $node1"
+ 	local num_nodes=`rate_nodes_get $DL_HANDLE | wc -w`
