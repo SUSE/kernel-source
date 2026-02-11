@@ -1,0 +1,61 @@
+From: Nilay Shroff <nilay@linux.ibm.com>
+Date: Mon, 12 May 2025 14:43:38 +0530
+Subject: [PATCH] block: unfreeze queue if realloc tag set fails during
+ nr_hw_queues update
+Git-commit: 2d8951aee844b7c6d146e25b5c3eebc1c72aa6ff
+Patch-mainline: v6.16
+References: jsc#PED-14161
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+In __blk_mq_update_nr_hw_queues(), the current sequence involves:
+
+1. unregistering sysfs/debugfs attributes
+2. freeze the queue
+3. reallocating the tag set
+4. updating the queue map
+5. reallocating hardware contexts
+6. updating the elevator (which unfreeze the queue again)
+7. re-register sysfs/debugfs attributes
+
+If tag set reallocation fails at step 3, the function skips steps 4–6
+and proceeds directly to step 7, re-registering the sysfs/debugfs
+attributes without unfreezing the queue first. This is incorrect and
+can lead to a system hang or lockdep splat, as the queue remains frozen
+and is never properly unfrozen.
+
+This patch addresses the issue by explicitly unfreezing the queue before
+re-registering the sysfs/debugfs attributes in the event of a tag set
+reallocation failure.
+
+Fixes: 9dc7a882ce96 ("block: move hctx debugfs/sysfs registering out of freezing queue")
+Signed-off-by: Nilay Shroff <nilay@linux.ibm.com>
+Reviewed-by: Ming Lei <ming.lei@redhat.com>
+Link: https://lore.kernel.org/r/20250512092952.135887-1-nilay@linux.ibm.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/blk-mq.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 4f79a9808fd1..cbc9a9f97a31 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -5002,8 +5002,11 @@ static void __blk_mq_update_nr_hw_queues(struct blk_mq_tag_set *set,
+ 	list_for_each_entry(q, &set->tag_list, tag_set_list)
+ 		blk_mq_freeze_queue_nomemsave(q);
+ 
+-	if (blk_mq_realloc_tag_set_tags(set, nr_hw_queues) < 0)
++	if (blk_mq_realloc_tag_set_tags(set, nr_hw_queues) < 0) {
++		list_for_each_entry(q, &set->tag_list, tag_set_list)
++			blk_mq_unfreeze_queue_nomemrestore(q);
+ 		goto reregister;
++	}
+ 
+ fallback:
+ 	blk_mq_update_queue_map(set);
+-- 
+2.43.0
+
