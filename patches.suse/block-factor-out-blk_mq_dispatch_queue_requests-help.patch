@@ -1,0 +1,92 @@
+From: Caleb Sander Mateos <csander@purestorage.com>
+Date: Fri, 25 Apr 2025 19:17:27 -0600
+Subject: [PATCH] block: factor out blk_mq_dispatch_queue_requests() helper
+Git-commit: a5728a1d1ef2d927c67e73fda94946c2c15106df
+Patch-mainline: v6.16
+References: jsc#PED-14161
+
+Factor out the logic from blk_mq_flush_plug_list() that calls
+->queue_rqs() with a fallback to ->queue_rq() into a helper function
+blk_mq_dispatch_queue_requests(). This is in preparation for using this
+code with other lists of requests.
+
+Signed-off-by: Caleb Sander Mateos <csander@purestorage.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Link: https://lore.kernel.org/r/20250426011728.4189119-3-csander@purestorage.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/blk-mq.c | 43 ++++++++++++++++++++++---------------------
+ 1 file changed, 22 insertions(+), 21 deletions(-)
+
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index fb514fd41d76..a777cb361ee3 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -2836,6 +2836,27 @@ static void __blk_mq_flush_list(struct request_queue *q, struct rq_list *rqs)
+ 	q->mq_ops->queue_rqs(rqs);
+ }
+ 
++static void blk_mq_dispatch_queue_requests(struct rq_list *rqs, unsigned depth)
++{
++	struct request_queue *q = rq_list_peek(rqs)->q;
++
++	trace_block_unplug(q, depth, true);
++
++	/*
++	 * Peek first request and see if we have a ->queue_rqs() hook.
++	 * If we do, we can dispatch the whole list in one go.
++	 * We already know at this point that all requests belong to the
++	 * same queue, caller must ensure that's the case.
++	 */
++	if (q->mq_ops->queue_rqs) {
++		blk_mq_run_dispatch_ops(q, __blk_mq_flush_list(q, rqs));
++		if (rq_list_empty(rqs))
++			return;
++	}
++
++	blk_mq_run_dispatch_ops(q, blk_mq_issue_direct(rqs));
++}
++
+ static void blk_mq_dispatch_list(struct rq_list *rqs, bool from_sched)
+ {
+ 	struct blk_mq_hw_ctx *this_hctx = NULL;
+@@ -2883,7 +2904,6 @@ static void blk_mq_dispatch_list(struct rq_list *rqs, bool from_sched)
+ 
+ void blk_mq_flush_plug_list(struct blk_plug *plug, bool from_schedule)
+ {
+-	struct request *rq;
+ 	unsigned int depth;
+ 
+ 	/*
+@@ -2899,26 +2919,7 @@ void blk_mq_flush_plug_list(struct blk_plug *plug, bool from_schedule)
+ 	plug->rq_count = 0;
+ 
+ 	if (!plug->multiple_queues && !plug->has_elevator && !from_schedule) {
+-		struct request_queue *q;
+-
+-		rq = rq_list_peek(&plug->mq_list);
+-		q = rq->q;
+-		trace_block_unplug(q, depth, true);
+-
+-		/*
+-		 * Peek first request and see if we have a ->queue_rqs() hook.
+-		 * If we do, we can dispatch the whole plug list in one go. We
+-		 * already know at this point that all requests belong to the
+-		 * same queue, caller must ensure that's the case.
+-		 */
+-		if (q->mq_ops->queue_rqs) {
+-			blk_mq_run_dispatch_ops(q,
+-				__blk_mq_flush_list(q, &plug->mq_list));
+-			if (rq_list_empty(&plug->mq_list))
+-				return;
+-		}
+-
+-		blk_mq_run_dispatch_ops(q, blk_mq_issue_direct(&plug->mq_list));
++		blk_mq_dispatch_queue_requests(&plug->mq_list, depth);
+ 		if (rq_list_empty(&plug->mq_list))
+ 			return;
+ 	}
+-- 
+2.43.0
+
