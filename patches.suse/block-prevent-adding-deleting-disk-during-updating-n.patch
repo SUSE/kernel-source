@@ -1,0 +1,238 @@
+From: Ming Lei <ming.lei@redhat.com>
+Date: Mon, 5 May 2025 22:17:46 +0800
+Subject: [PATCH] block: prevent adding/deleting disk during updating
+ nr_hw_queues
+Git-commit: 98e68f67020ce30e1a4d8e2d05d85a453738dfb8
+Patch-mainline: v6.16
+References: jsc#PED-14161
+
+Both adding/deleting disk code are reader of `nr_hw_queues`, so we can't
+allow them in-progress when updating nr_hw_queues, kernel panic and
+kasan has been reported in [1].
+
+Prevent adding/deleting disk during updating nr_hw_queues by adding
+rw_semaphore to tagset, write lock is grabbed in blk_mq_update_nr_hw_queues(),
+and read lock is acquired when adding/deleting disk.
+
+Also mark GFP_NOIO allocation scope for adding/deleting disk because
+blk_mq_update_nr_hw_queues() is part of some driver's error handler.
+
+This way avoids lot of trouble.
+
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Hannes Reinecke <hare@suse.de>
+Reviewed-by: Nilay Shroff <nilay@linux.ibm.com>
+Suggested-by: Nilay Shroff <nilay@linux.ibm.com>
+Reported-by: Nilay Shroff <nilay@linux.ibm.com>
+Closes: https://lore.kernel.org/linux-block/a5896cdb-a59a-4a37-9f99-20522f5d2987@linux.ibm.com/
+Signed-off-by: Ming Lei <ming.lei@redhat.com>
+Link: https://lore.kernel.org/r/20250505141805.2751237-9-ming.lei@redhat.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/blk-mq.c         |   4 ++
+ block/genhd.c          | 113 ++++++++++++++++++++++++++++-------------
+ include/linux/blk-mq.h |   3 ++
+ 3 files changed, 86 insertions(+), 34 deletions(-)
+
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 8caff40c7511..74f4b1d37376 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -4846,6 +4846,8 @@ int blk_mq_alloc_tag_set(struct blk_mq_tag_set *set)
+ 			goto out_free_srcu;
+ 	}
+ 
++	init_rwsem(&set->update_nr_hwq_lock);
++
+ 	ret = -ENOMEM;
+ 	set->tags = kcalloc_node(set->nr_hw_queues,
+ 				 sizeof(struct blk_mq_tags *), GFP_KERNEL,
+@@ -5141,9 +5143,11 @@ static void __blk_mq_update_nr_hw_queues(struct blk_mq_tag_set *set,
+ 
+ void blk_mq_update_nr_hw_queues(struct blk_mq_tag_set *set, int nr_hw_queues)
+ {
++	down_write(&set->update_nr_hwq_lock);
+ 	mutex_lock(&set->tag_list_lock);
+ 	__blk_mq_update_nr_hw_queues(set, nr_hw_queues);
+ 	mutex_unlock(&set->tag_list_lock);
++	up_write(&set->update_nr_hwq_lock);
+ }
+ EXPORT_SYMBOL_GPL(blk_mq_update_nr_hw_queues);
+ 
+diff --git a/block/genhd.c b/block/genhd.c
+index 50f3deeec5e3..e0dd8ecc925f 100644
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@ -415,19 +415,9 @@ static void add_disk_final(struct gendisk *disk)
+ 	set_bit(GD_ADDED, &disk->state);
+ }
+ 
+-/**
+- * add_disk_fwnode - add disk information to kernel list with fwnode
+- * @parent: parent device for the disk
+- * @disk: per-device partitioning information
+- * @groups: Additional per-device sysfs groups
+- * @fwnode: attached disk fwnode
+- *
+- * This function registers the partitioning information in @disk
+- * with the kernel. Also attach a fwnode to the disk device.
+- */
+-int __must_check add_disk_fwnode(struct device *parent, struct gendisk *disk,
+-				 const struct attribute_group **groups,
+-				 struct fwnode_handle *fwnode)
++static int __add_disk(struct device *parent, struct gendisk *disk,
++		      const struct attribute_group **groups,
++		      struct fwnode_handle *fwnode)
+ 
+ {
+ 	struct device *ddev = disk_to_dev(disk);
+@@ -550,7 +540,6 @@ int __must_check add_disk_fwnode(struct device *parent, struct gendisk *disk,
+ 		 */
+ 		disk->part0->bd_dev = MKDEV(disk->major, disk->first_minor);
+ 	}
+-	add_disk_final(disk);
+ 	return 0;
+ 
+ out_unregister_bdi:
+@@ -580,6 +569,45 @@ int __must_check add_disk_fwnode(struct device *parent, struct gendisk *disk,
+ 	}
+ 	return ret;
+ }
++
++/**
++ * add_disk_fwnode - add disk information to kernel list with fwnode
++ * @parent: parent device for the disk
++ * @disk: per-device partitioning information
++ * @groups: Additional per-device sysfs groups
++ * @fwnode: attached disk fwnode
++ *
++ * This function registers the partitioning information in @disk
++ * with the kernel. Also attach a fwnode to the disk device.
++ */
++int __must_check add_disk_fwnode(struct device *parent, struct gendisk *disk,
++				 const struct attribute_group **groups,
++				 struct fwnode_handle *fwnode)
++{
++	struct blk_mq_tag_set *set;
++	unsigned int memflags;
++	int ret;
++
++	if (queue_is_mq(disk->queue)) {
++		set = disk->queue->tag_set;
++		memflags = memalloc_noio_save();
++		down_read(&set->update_nr_hwq_lock);
++		ret = __add_disk(parent, disk, groups, fwnode);
++		up_read(&set->update_nr_hwq_lock);
++		memalloc_noio_restore(memflags);
++	} else {
++		ret = __add_disk(parent, disk, groups, fwnode);
++	}
++
++	/*
++	 * add_disk_final() needn't to read `nr_hw_queues`, so move it out
++	 * of read lock `set->update_nr_hwq_lock` for avoiding unnecessary
++	 * lock dependency on `disk->open_mutex` from scanning partition.
++	 */
++	if (!ret)
++		add_disk_final(disk);
++	return ret;
++}
+ EXPORT_SYMBOL_GPL(add_disk_fwnode);
+ 
+ /**
+@@ -660,26 +688,7 @@ void blk_mark_disk_dead(struct gendisk *disk)
+ }
+ EXPORT_SYMBOL_GPL(blk_mark_disk_dead);
+ 
+-/**
+- * del_gendisk - remove the gendisk
+- * @disk: the struct gendisk to remove
+- *
+- * Removes the gendisk and all its associated resources. This deletes the
+- * partitions associated with the gendisk, and unregisters the associated
+- * request_queue.
+- *
+- * This is the counter to the respective __device_add_disk() call.
+- *
+- * The final removal of the struct gendisk happens when its refcount reaches 0
+- * with put_disk(), which should be called after del_gendisk(), if
+- * __device_add_disk() was used.
+- *
+- * Drivers exist which depend on the release of the gendisk to be synchronous,
+- * it should not be deferred.
+- *
+- * Context: can sleep
+- */
+-void del_gendisk(struct gendisk *disk)
++static void __del_gendisk(struct gendisk *disk)
+ {
+ 	struct request_queue *q = disk->queue;
+ 	struct block_device *part;
+@@ -772,6 +781,42 @@ void del_gendisk(struct gendisk *disk)
+ 	if (start_drain)
+ 		blk_unfreeze_release_lock(q);
+ }
++
++/**
++ * del_gendisk - remove the gendisk
++ * @disk: the struct gendisk to remove
++ *
++ * Removes the gendisk and all its associated resources. This deletes the
++ * partitions associated with the gendisk, and unregisters the associated
++ * request_queue.
++ *
++ * This is the counter to the respective __device_add_disk() call.
++ *
++ * The final removal of the struct gendisk happens when its refcount reaches 0
++ * with put_disk(), which should be called after del_gendisk(), if
++ * __device_add_disk() was used.
++ *
++ * Drivers exist which depend on the release of the gendisk to be synchronous,
++ * it should not be deferred.
++ *
++ * Context: can sleep
++ */
++void del_gendisk(struct gendisk *disk)
++{
++	struct blk_mq_tag_set *set;
++	unsigned int memflags;
++
++	if (!queue_is_mq(disk->queue)) {
++		__del_gendisk(disk);
++	} else {
++		set = disk->queue->tag_set;
++		memflags = memalloc_noio_save();
++		down_read(&set->update_nr_hwq_lock);
++		__del_gendisk(disk);
++		up_read(&set->update_nr_hwq_lock);
++		memalloc_noio_restore(memflags);
++	}
++}
+ EXPORT_SYMBOL(del_gendisk);
+ 
+ /**
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index 8eb9b3310167..ef84d53095a6 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -9,6 +9,7 @@
+ #include <linux/prefetch.h>
+ #include <linux/srcu.h>
+ #include <linux/rw_hint.h>
++#include <linux/rwsem.h>
+ 
+ struct blk_mq_tags;
+ struct blk_flush_queue;
+@@ -527,6 +528,8 @@ struct blk_mq_tag_set {
+ 	struct mutex		tag_list_lock;
+ 	struct list_head	tag_list;
+ 	struct srcu_struct	*srcu;
++
++	struct rw_semaphore	update_nr_hwq_lock;
+ };
+ 
+ /**
+-- 
+2.43.0
+
