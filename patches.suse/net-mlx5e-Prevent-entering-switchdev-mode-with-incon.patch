@@ -1,0 +1,95 @@
+From: Jianbo Liu <jianbol@nvidia.com>
+Date: Mon, 29 Sep 2025 00:25:18 +0300
+Subject: net/mlx5e: Prevent entering switchdev mode with inconsistent netns
+Patch-mainline: v6.18-rc1
+Git-commit: 06fdc45f16c392dc3394c67e7c17ae63935715d3
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+When a PF enters switchdev mode, its netdevice becomes the uplink
+representor but remains in its current network namespace. All other
+representors (VFs, SFs) are created in the netns of the devlink
+instance.
+
+If the PF's netns has been moved and differs from the devlink's netns,
+enabling switchdev mode would create a state where the OVS control
+plane (ovs-vsctl) cannot manage the switch because the PF uplink
+representor and the other representors are split across different
+namespaces.
+
+To prevent this inconsistent configuration, block the request to enter
+switchdev mode if the PF netdevice's netns does not match the netns of
+its devlink instance.
+
+As part of this change, the PF's netns is first marked as immutable.
+This prevents race conditions where the netns could be changed after
+the check is performed but before the mode transition is complete, and
+it aligns the PF's behavior with that of the final uplink representor.
+
+Signed-off-by: Jianbo Liu <jianbol@nvidia.com>
+Reviewed-by: Cosmin Ratiu <cratiu@nvidia.com>
+Reviewed-by: Jiri Pirko <jiri@nvidia.com>
+Reviewed-by: Dragos Tatulea <dtatulea@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://patch.msgid.link/1759094723-843774-3-git-send-email-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c |   33 +++++++++++++
+ 1 file changed, 33 insertions(+)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@ -3774,6 +3774,29 @@ void mlx5_eswitch_unblock_mode(struct ml
+ 	up_write(&esw->mode_lock);
+ }
+ 
++/* Returns false only when uplink netdev exists and its netns is different from
++ * devlink's netns. True for all others so entering switchdev mode is allowed.
++ */
++static bool mlx5_devlink_netdev_netns_immutable_set(struct devlink *devlink,
++						    bool immutable)
++{
++	struct mlx5_core_dev *mdev = devlink_priv(devlink);
++	struct net_device *netdev;
++	bool ret;
++
++	netdev = mlx5_uplink_netdev_get(mdev);
++	if (!netdev)
++		return true;
++
++	rtnl_lock();
++	netdev->netns_local = immutable;
++	ret = net_eq(dev_net(netdev), devlink_net(devlink));
++	rtnl_unlock();
++
++	mlx5_uplink_netdev_put(mdev, netdev);
++	return ret;
++}
++
+ int mlx5_devlink_eswitch_mode_set(struct devlink *devlink, u16 mode,
+ 				  struct netlink_ext_ack *extack)
+ {
+@@ -3816,6 +3839,14 @@ int mlx5_devlink_eswitch_mode_set(struct
+ 	esw->eswitch_operation_in_progress = true;
+ 	up_write(&esw->mode_lock);
+ 
++	if (mode == DEVLINK_ESWITCH_MODE_SWITCHDEV &&
++	    !mlx5_devlink_netdev_netns_immutable_set(devlink, true)) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "Can't change E-Switch mode to switchdev when netdev net namespace has diverged from the devlink's.");
++		err = -EINVAL;
++		goto skip;
++	}
++
+ 	if (mode == DEVLINK_ESWITCH_MODE_LEGACY)
+ 		esw->dev->priv.flags |= MLX5_PRIV_FLAGS_SWITCH_LEGACY;
+ 	mlx5_eswitch_disable_locked(esw);
+@@ -3834,6 +3865,8 @@ int mlx5_devlink_eswitch_mode_set(struct
+ 	}
+ 
+ skip:
++	if (mode == DEVLINK_ESWITCH_MODE_SWITCHDEV && err)
++		mlx5_devlink_netdev_netns_immutable_set(devlink, false);
+ 	down_write(&esw->mode_lock);
+ 	esw->eswitch_operation_in_progress = false;
+ unlock:
