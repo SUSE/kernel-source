@@ -1,0 +1,162 @@
+From: Bart Van Assche <bvanassche@acm.org>
+Date: Tue, 15 Apr 2025 13:51:34 -0700
+Subject: [PATCH] block: Simplify blk_mq_dispatch_rq_list() and its callers
+Git-commit: e093b784ab98ce5aff4cd81b1072987131facfba
+Patch-mainline: v6.16
+References: jsc#PED-14161
+
+The 'nr_budgets' argument of blk_mq_dispatch_rq_list() is either the
+number of elements in the 'list' argument or zero. Instead of passing
+the number of list elements to blk_mq_dispatch_rq_list(), pass a boolean
+argument that indicates whether or not blk_mq_dispatch_rq_list() should
+request the block driver for a budget for each request in 'list'.
+
+Remove the code for counting list elements from blk_mq_dispatch_rq_list()
+callers where possible. Remove the code that decrements nr_budgets from
+blk_mq_dispatch_rq_list() because it is superfluous. Each request that
+is processed by blk_mq_dispatch_rq_list() is in one of these two states
+if 'get_budget' is false:
+* Either the request is on 'list' and the budget for the request has to
+  be released from the error path.
+* Or the request is not on 'list' and q->mq_ops->queue_rq() has already
+  released the budget (ret != BLK_STS_OK) or q->mq_ops->queue_rq() will
+  release the budget asynchronously (ret == BLK_STS_OK).
+
+Cc: Christoph Hellwig <hch@lst.de>
+Cc: Ming Lei <ming.lei@redhat.com>
+Cc: John Garry <john.g.garry@oracle.com>
+Signed-off-by: Bart Van Assche <bvanassche@acm.org>
+Link: https://lore.kernel.org/r/20250415205134.3650042-1-bvanassche@acm.org
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/blk-mq-sched.c | 12 +++++-------
+ block/blk-mq.c       | 16 +++++++---------
+ block/blk-mq.h       |  2 +-
+ 3 files changed, 13 insertions(+), 17 deletions(-)
+
+diff --git a/block/blk-mq-sched.c b/block/blk-mq-sched.c
+index 109611445d40..9b81771774ef 100644
+--- a/block/blk-mq-sched.c
++++ b/block/blk-mq-sched.c
+@@ -59,19 +59,17 @@ static bool blk_mq_dispatch_hctx_list(struct list_head *rq_list)
+ 		list_first_entry(rq_list, struct request, queuelist)->mq_hctx;
+ 	struct request *rq;
+ 	LIST_HEAD(hctx_list);
+-	unsigned int count = 0;
+ 
+ 	list_for_each_entry(rq, rq_list, queuelist) {
+ 		if (rq->mq_hctx != hctx) {
+ 			list_cut_before(&hctx_list, rq_list, &rq->queuelist);
+ 			goto dispatch;
+ 		}
+-		count++;
+ 	}
+ 	list_splice_tail_init(rq_list, &hctx_list);
+ 
+ dispatch:
+-	return blk_mq_dispatch_rq_list(hctx, &hctx_list, count);
++	return blk_mq_dispatch_rq_list(hctx, &hctx_list, false);
+ }
+ 
+ #define BLK_MQ_BUDGET_DELAY	3		/* ms units */
+@@ -167,7 +165,7 @@ static int __blk_mq_do_dispatch_sched(struct blk_mq_hw_ctx *hctx)
+ 			dispatched |= blk_mq_dispatch_hctx_list(&rq_list);
+ 		} while (!list_empty(&rq_list));
+ 	} else {
+-		dispatched = blk_mq_dispatch_rq_list(hctx, &rq_list, count);
++		dispatched = blk_mq_dispatch_rq_list(hctx, &rq_list, false);
+ 	}
+ 
+ 	if (busy)
+@@ -261,7 +259,7 @@ static int blk_mq_do_dispatch_ctx(struct blk_mq_hw_ctx *hctx)
+ 		/* round robin for fair dispatch */
+ 		ctx = blk_mq_next_ctx(hctx, rq->mq_ctx);
+ 
+-	} while (blk_mq_dispatch_rq_list(rq->mq_hctx, &rq_list, 1));
++	} while (blk_mq_dispatch_rq_list(rq->mq_hctx, &rq_list, false));
+ 
+ 	WRITE_ONCE(hctx->dispatch_from, ctx);
+ 	return ret;
+@@ -298,7 +296,7 @@ static int __blk_mq_sched_dispatch_requests(struct blk_mq_hw_ctx *hctx)
+ 	 */
+ 	if (!list_empty(&rq_list)) {
+ 		blk_mq_sched_mark_restart_hctx(hctx);
+-		if (!blk_mq_dispatch_rq_list(hctx, &rq_list, 0))
++		if (!blk_mq_dispatch_rq_list(hctx, &rq_list, true))
+ 			return 0;
+ 		need_dispatch = true;
+ 	} else {
+@@ -312,7 +310,7 @@ static int __blk_mq_sched_dispatch_requests(struct blk_mq_hw_ctx *hctx)
+ 	if (need_dispatch)
+ 		return blk_mq_do_dispatch_ctx(hctx);
+ 	blk_mq_flush_busy_ctxs(hctx, &rq_list);
+-	blk_mq_dispatch_rq_list(hctx, &rq_list, 0);
++	blk_mq_dispatch_rq_list(hctx, &rq_list, true);
+ 	return 0;
+ }
+ 
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index c2697db59109..e0fe12f1320f 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -2080,7 +2080,7 @@ static void blk_mq_commit_rqs(struct blk_mq_hw_ctx *hctx, int queued,
+  * Returns true if we did some work AND can potentially do more.
+  */
+ bool blk_mq_dispatch_rq_list(struct blk_mq_hw_ctx *hctx, struct list_head *list,
+-			     unsigned int nr_budgets)
++			     bool get_budget)
+ {
+ 	enum prep_dispatch prep;
+ 	struct request_queue *q = hctx->queue;
+@@ -2102,7 +2102,7 @@ bool blk_mq_dispatch_rq_list(struct blk_mq_hw_ctx *hctx, struct list_head *list,
+ 		rq = list_first_entry(list, struct request, queuelist);
+ 
+ 		WARN_ON_ONCE(hctx != rq->mq_hctx);
+-		prep = blk_mq_prep_dispatch_rq(rq, !nr_budgets);
++		prep = blk_mq_prep_dispatch_rq(rq, get_budget);
+ 		if (prep != PREP_DISPATCH_OK)
+ 			break;
+ 
+@@ -2111,12 +2111,6 @@ bool blk_mq_dispatch_rq_list(struct blk_mq_hw_ctx *hctx, struct list_head *list,
+ 		bd.rq = rq;
+ 		bd.last = list_empty(list);
+ 
+-		/*
+-		 * once the request is queued to lld, no need to cover the
+-		 * budget any more
+-		 */
+-		if (nr_budgets)
+-			nr_budgets--;
+ 		ret = q->mq_ops->queue_rq(hctx, &bd);
+ 		switch (ret) {
+ 		case BLK_STS_OK:
+@@ -2150,7 +2144,11 @@ bool blk_mq_dispatch_rq_list(struct blk_mq_hw_ctx *hctx, struct list_head *list,
+ 			((hctx->flags & BLK_MQ_F_TAG_QUEUE_SHARED) ||
+ 			blk_mq_is_shared_tags(hctx->flags));
+ 
+-		if (nr_budgets)
++		/*
++		 * If the caller allocated budgets, free the budgets of the
++		 * requests that have not yet been passed to the block driver.
++		 */
++		if (!get_budget)
+ 			blk_mq_release_budgets(q, list);
+ 
+ 		spin_lock(&hctx->lock);
+diff --git a/block/blk-mq.h b/block/blk-mq.h
+index 3011a78cf16a..d15ff1e130c8 100644
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@ -48,7 +48,7 @@ void blk_mq_exit_queue(struct request_queue *q);
+ int blk_mq_update_nr_requests(struct request_queue *q, unsigned int nr);
+ void blk_mq_wake_waiters(struct request_queue *q);
+ bool blk_mq_dispatch_rq_list(struct blk_mq_hw_ctx *hctx, struct list_head *,
+-			     unsigned int);
++			     bool);
+ void blk_mq_flush_busy_ctxs(struct blk_mq_hw_ctx *hctx, struct list_head *list);
+ struct request *blk_mq_dequeue_from_ctx(struct blk_mq_hw_ctx *hctx,
+ 					struct blk_mq_ctx *start);
+-- 
+2.43.0
+
