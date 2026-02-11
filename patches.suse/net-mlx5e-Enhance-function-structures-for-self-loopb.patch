@@ -1,0 +1,123 @@
+From: Tariq Toukan <tariqt@nvidia.com>
+Date: Thu, 30 Oct 2025 15:32:33 +0200
+Subject: net/mlx5e: Enhance function structures for self loopback prevention
+ application
+Patch-mainline: v6.19-rc1
+Git-commit: 091400a5d411ee7398095ba832361eb12b345f3d
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+The re-application of self loopback prevention attributes in TIRs is
+necessary in old firmwares (where tis_tir_td_order cap is cleared) after
+recreation of SQs.
+
+However, this is not needed in new firmware with tis_tir_td_order=1.
+
+As a preparation patch, enhance the function structures to differentiate
+between an explicit loopback prevention configuration apply, and the
+re-apply operation required by old firmware.
+
+Loopback selftests should now call mlx5e_modify_tirs_lb() directly, as
+their use case is not related to the firmware limitation.
+
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Reviewed-by: Carolina Jubran <cjubran@nvidia.com>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Link: https://patch.msgid.link/1761831159-1013140-2-git-send-email-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en.h          |    4 +++-
+ drivers/net/ethernet/mellanox/mlx5/core/en_common.c   |   16 ++++++++++++----
+ drivers/net/ethernet/mellanox/mlx5/core/en_main.c     |    2 +-
+ drivers/net/ethernet/mellanox/mlx5/core/en_selftest.c |    4 ++--
+ drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c |    2 +-
+ 5 files changed, 19 insertions(+), 9 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -1153,7 +1153,9 @@ extern const struct ethtool_ops mlx5e_et
+ int mlx5e_create_mkey(struct mlx5_core_dev *mdev, u32 pdn, u32 *mkey);
+ int mlx5e_create_mdev_resources(struct mlx5_core_dev *mdev, bool create_tises);
+ void mlx5e_destroy_mdev_resources(struct mlx5_core_dev *mdev);
+-int mlx5e_refresh_tirs(struct mlx5e_priv *priv, bool enable_uc_lb,
++int mlx5e_modify_tirs_lb(struct mlx5_core_dev *mdev, bool enable_uc_lb,
++			 bool enable_mc_lb);
++int mlx5e_refresh_tirs(struct mlx5_core_dev *mdev, bool enable_uc_lb,
+ 		       bool enable_mc_lb);
+ void mlx5e_mkey_set_relaxed_ordering(struct mlx5_core_dev *mdev, void *mkc);
+ 
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_common.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_common.c
+@@ -247,10 +247,9 @@ void mlx5e_destroy_mdev_resources(struct
+ 	memset(res, 0, sizeof(*res));
+ }
+ 
+-int mlx5e_refresh_tirs(struct mlx5e_priv *priv, bool enable_uc_lb,
+-		       bool enable_mc_lb)
++int mlx5e_modify_tirs_lb(struct mlx5_core_dev *mdev, bool enable_uc_lb,
++			 bool enable_mc_lb)
+ {
+-	struct mlx5_core_dev *mdev = priv->mdev;
+ 	struct mlx5e_tir *tir;
+ 	u8 lb_flags = 0;
+ 	int err  = 0;
+@@ -285,7 +284,16 @@ int mlx5e_refresh_tirs(struct mlx5e_priv
+ 
+ 	kvfree(in);
+ 	if (err)
+-		netdev_err(priv->netdev, "refresh tir(0x%x) failed, %d\n", tirn, err);
++		mlx5_core_err(mdev,
++			      "modify tir(0x%x) enable_lb uc(%d) mc(%d) failed, %d\n",
++			      tirn,
++			      enable_uc_lb, enable_mc_lb, err);
+ 
+ 	return err;
+ }
++
++int mlx5e_refresh_tirs(struct mlx5_core_dev *mdev, bool enable_uc_lb,
++		       bool enable_mc_lb)
++{
++	return mlx5e_modify_tirs_lb(mdev, enable_uc_lb, enable_mc_lb);
++}
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -6070,7 +6070,7 @@ static void mlx5e_nic_disable(struct mlx
+ 
+ static int mlx5e_update_nic_rx(struct mlx5e_priv *priv)
+ {
+-	return mlx5e_refresh_tirs(priv, false, false);
++	return mlx5e_refresh_tirs(priv->mdev, false, false);
+ }
+ 
+ static const struct mlx5e_profile mlx5e_nic_profile = {
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_selftest.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_selftest.c
+@@ -214,7 +214,7 @@ static int mlx5e_test_loopback_setup(str
+ 			return err;
+ 	}
+ 
+-	err = mlx5e_refresh_tirs(priv, true, false);
++	err = mlx5e_modify_tirs_lb(priv->mdev, true, false);
+ 	if (err)
+ 		goto out;
+ 
+@@ -243,7 +243,7 @@ static void mlx5e_test_loopback_cleanup(
+ 		mlx5_nic_vport_update_local_lb(priv->mdev, false);
+ 
+ 	dev_remove_pack(&lbtp->pt);
+-	mlx5e_refresh_tirs(priv, false, false);
++	mlx5e_modify_tirs_lb(priv->mdev, false, false);
+ }
+ 
+ static int mlx5e_cond_loopback(struct mlx5e_priv *priv)
+--- a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+@@ -331,7 +331,7 @@ void mlx5i_destroy_underlay_qp(struct ml
+ 
+ int mlx5i_update_nic_rx(struct mlx5e_priv *priv)
+ {
+-	return mlx5e_refresh_tirs(priv, true, true);
++	return mlx5e_refresh_tirs(priv->mdev, true, true);
+ }
+ 
+ int mlx5i_create_tis(struct mlx5_core_dev *mdev, u32 underlay_qpn, u32 *tisn)
