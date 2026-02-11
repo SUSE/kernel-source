@@ -1,0 +1,117 @@
+From: Christoph Hellwig <hch@lst.de>
+Date: Wed, 7 May 2025 14:04:35 +0200
+Subject: [PATCH] zonefs: use bdev_rw_virt in zonefs_read_super
+Git-commit: b2f676efe601586360e5f7461f6d36981ac1e6c9
+Patch-mainline: v6.16
+References: jsc#PED-14161
+
+Switch zonefs_read_super to allocate the superblock buffer using kmalloc
+which falls back to the page allocator for PAGE_SIZE allocation but
+gives us a kernel virtual address and then use bdev_rw_virt to perform
+the synchronous read into it.
+
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Acked-by: Damien Le Moal <dlemoal@kernel.org>
+Reviewed-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+Link: https://lore.kernel.org/r/20250507120451.4000627-12-hch@lst.de
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ fs/zonefs/super.c | 34 ++++++++++++----------------------
+ 1 file changed, 12 insertions(+), 22 deletions(-)
+
+diff --git a/fs/zonefs/super.c b/fs/zonefs/super.c
+index faf1eb87895d..d165eb979f21 100644
+--- a/fs/zonefs/super.c
++++ b/fs/zonefs/super.c
+@@ -1111,28 +1111,19 @@ static int zonefs_read_super(struct super_block *sb)
+ 	struct zonefs_sb_info *sbi = ZONEFS_SB(sb);
+ 	struct zonefs_super *super;
+ 	u32 crc, stored_crc;
+-	struct page *page;
+-	struct bio_vec bio_vec;
+-	struct bio bio;
+ 	int ret;
+ 
+-	page = alloc_page(GFP_KERNEL);
+-	if (!page)
++	super = kmalloc(PAGE_SIZE, GFP_KERNEL);
++	if (!super)
+ 		return -ENOMEM;
+ 
+-	bio_init(&bio, sb->s_bdev, &bio_vec, 1, REQ_OP_READ);
+-	bio.bi_iter.bi_sector = 0;
+-	__bio_add_page(&bio, page, PAGE_SIZE, 0);
+-
+-	ret = submit_bio_wait(&bio);
++	ret = bdev_rw_virt(sb->s_bdev, 0, super, PAGE_SIZE, REQ_OP_READ);
+ 	if (ret)
+-		goto free_page;
+-
+-	super = page_address(page);
++		goto free_super;
+ 
+ 	ret = -EINVAL;
+ 	if (le32_to_cpu(super->s_magic) != ZONEFS_MAGIC)
+-		goto free_page;
++		goto free_super;
+ 
+ 	stored_crc = le32_to_cpu(super->s_crc);
+ 	super->s_crc = 0;
+@@ -1140,14 +1131,14 @@ static int zonefs_read_super(struct super_block *sb)
+ 	if (crc != stored_crc) {
+ 		zonefs_err(sb, "Invalid checksum (Expected 0x%08x, got 0x%08x)",
+ 			   crc, stored_crc);
+-		goto free_page;
++		goto free_super;
+ 	}
+ 
+ 	sbi->s_features = le64_to_cpu(super->s_features);
+ 	if (sbi->s_features & ~ZONEFS_F_DEFINED_FEATURES) {
+ 		zonefs_err(sb, "Unknown features set 0x%llx\n",
+ 			   sbi->s_features);
+-		goto free_page;
++		goto free_super;
+ 	}
+ 
+ 	if (sbi->s_features & ZONEFS_F_UID) {
+@@ -1155,7 +1146,7 @@ static int zonefs_read_super(struct super_block *sb)
+ 				       le32_to_cpu(super->s_uid));
+ 		if (!uid_valid(sbi->s_uid)) {
+ 			zonefs_err(sb, "Invalid UID feature\n");
+-			goto free_page;
++			goto free_super;
+ 		}
+ 	}
+ 
+@@ -1164,7 +1155,7 @@ static int zonefs_read_super(struct super_block *sb)
+ 				       le32_to_cpu(super->s_gid));
+ 		if (!gid_valid(sbi->s_gid)) {
+ 			zonefs_err(sb, "Invalid GID feature\n");
+-			goto free_page;
++			goto free_super;
+ 		}
+ 	}
+ 
+@@ -1173,15 +1164,14 @@ static int zonefs_read_super(struct super_block *sb)
+ 
+ 	if (memchr_inv(super->s_reserved, 0, sizeof(super->s_reserved))) {
+ 		zonefs_err(sb, "Reserved area is being used\n");
+-		goto free_page;
++		goto free_super;
+ 	}
+ 
+ 	import_uuid(&sbi->s_uuid, super->s_uuid);
+ 	ret = 0;
+ 
+-free_page:
+-	__free_page(page);
+-
++free_super:
++	kfree(super);
+ 	return ret;
+ }
+ 
+-- 
+2.43.0
+
