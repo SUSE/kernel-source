@@ -1,0 +1,111 @@
+From: Kai Huang <kai.huang@intel.com>
+Date: Mon, 1 Sep 2025 18:09:30 +0200
+Subject: KVM/TDX: Explicitly do WBINVD when no more TDX SEAMCALLs
+Git-commit: 61221d07e815008ba758995d79fd442b5217f51a
+Patch-mainline: v6.18-rc1
+References: git-fixes
+
+On TDX platforms, during kexec, the kernel needs to make sure there
+are no dirty cachelines of TDX private memory before booting to the new
+kernel to avoid silent memory corruption to the new kernel.
+
+To do this, the kernel has a percpu boolean to indicate whether the
+cache of a CPU may be in incoherent state.  During kexec, namely in
+stop_this_cpu(), the kernel does WBINVD if that percpu boolean is true.
+TDX turns on that percpu boolean on a CPU when the kernel does SEAMCALL,
+Thus making sure the cache will be flushed during kexec.
+
+However, kexec has a race condition that, while remaining extremely rare,
+would be more likely in the presence of a relatively long operation such
+as WBINVD.
+
+In particular, the kexec-ing CPU invokes native_stop_other_cpus()
+to stop all remote CPUs before booting to the new kernel.
+native_stop_other_cpus() then sends a REBOOT vector IPI to remote CPUs
+and waits for them to stop; if that times out, it also sends NMIs to the
+still-alive CPUs and waits again for them to stop.  If the race happens,
+kexec proceeds before all CPUs have processed the NMI and stopped[1],
+and the system hangs.
+
+But after tdx_disable_virtualization_cpu(), no more TDX activity
+can happen on this cpu.  When kexec is enabled, flush the cache
+explicitly at that point; this moves the WBINVD to an earlier stage than
+stop_this_cpus(), avoiding a possibly lengthy operation at a time where
+it could cause this race.
+
+[1] https://lore.kernel.org/kvm/b963fcd60abe26c7ec5dc20b42f1a2ebbcc72397.1750934177.git.kai.huang@intel.com/
+
+[Make the new function a stub for !CONFIG_KEXEC_CORE. - Paolo]
+Signed-off-by: Kai Huang <kai.huang@intel.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+Acked-by: Paolo Bonzini <pbonzini@redhat.com>
+Tested-by: Farrah Chen <farrah.chen@intel.com>
+Link: https://lore.kernel.org/all/20250901160930.1785244-8-pbonzini%40redhat.com
+
+Acked-by: Nikolay Borisov <nik.borisov@suse.com>
+---
+ arch/x86/include/asm/tdx.h  |    7 +++++++
+ arch/x86/kvm/vmx/tdx.c      |   10 ++++++++++
+ arch/x86/virt/vmx/tdx/tdx.c |   19 +++++++++++++++++++
+ 3 files changed, 36 insertions(+)
+
+--- a/arch/x86/include/asm/tdx.h
++++ b/arch/x86/include/asm/tdx.h
+@@ -228,5 +228,12 @@ static inline const char *tdx_dump_mce_i
+ static inline const struct tdx_sys_info *tdx_get_sysinfo(void) { return NULL; }
+ #endif	/* CONFIG_INTEL_TDX_HOST */
+ 
++
++#ifdef CONFIG_KEXEC_CORE
++void tdx_cpu_flush_cache_for_kexec(void);
++#else
++static inline void tdx_cpu_flush_cache_for_kexec(void) { }
++#endif
++
+ #endif /* !__ASSEMBLY__ */
+ #endif /* _ASM_X86_TDX_H */
+--- a/arch/x86/kvm/vmx/tdx.c
++++ b/arch/x86/kvm/vmx/tdx.c
+@@ -423,6 +423,16 @@ void tdx_disable_virtualization_cpu(void
+ 		tdx_flush_vp(&arg);
+ 	}
+ 	local_irq_restore(flags);
++
++	/*
++	 * Flush cache now if kexec is possible: this is necessary to avoid
++	 * having dirty private memory cachelines when the new kernel boots,
++	 * but WBINVD is a relatively expensive operation and doing it during
++	 * kexec can exacerbate races in native_stop_other_cpus().  Do it
++	 * now, since this is a safe moment and there is going to be no more
++	 * TDX activity on this CPU from this point on.
++	 */
++	tdx_cpu_flush_cache_for_kexec();
+ }
+ 
+ #define TDX_SEAMCALL_RETRIES 10000
+--- a/arch/x86/virt/vmx/tdx/tdx.c
++++ b/arch/x86/virt/vmx/tdx/tdx.c
+@@ -1872,3 +1872,22 @@ u64 tdh_phymem_page_wbinvd_hkid(u64 hkid
+ 	return seamcall(TDH_PHYMEM_PAGE_WBINVD, &args);
+ }
+ EXPORT_SYMBOL_GPL(tdh_phymem_page_wbinvd_hkid);
++
++#ifdef CONFIG_KEXEC_CORE
++void tdx_cpu_flush_cache_for_kexec(void)
++{
++	lockdep_assert_preemption_disabled();
++
++	if (!this_cpu_read(cache_state_incoherent))
++		return;
++
++	/*
++	 * Private memory cachelines need to be clean at the time of
++	 * kexec.  Write them back now, as the caller promises that
++	 * there should be no more SEAMCALLs on this CPU.
++	 */
++	wbinvd();
++	this_cpu_write(cache_state_incoherent, false);
++}
++EXPORT_SYMBOL_GPL(tdx_cpu_flush_cache_for_kexec);
++#endif
