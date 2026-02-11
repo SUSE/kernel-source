@@ -1,0 +1,311 @@
+From: Maxime Chevallier <maxime.chevallier@bootlin.com>
+Date: Fri, 24 Oct 2025 09:07:18 +0200
+Subject: net: stmmac: Add a devlink attribute to control timestamping mode
+Patch-mainline: v6.19-rc1
+Git-commit: 6920fa0c764dbdd35d311d4df986226bb48165f6
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+The DWMAC1000 supports 2 timestamping configurations to configure how
+frequency adjustments are made to the ptp_clock, as well as the reported
+timestamp values.
+
+There was a previous attempt at upstreaming support for configuring this
+mode by Olivier Dautricourt and Julien Beraud a few years back [1]
+
+In a nutshell, the timestamping can be either set in fine mode or in
+coarse mode.
+
+In fine mode, which is the default, we use the overflow of an accumulator to
+trigger frequency adjustments, but by doing so we lose precision on the
+timetamps that are produced by the timestamping unit. The main drawback
+is that the sub-second increment value, used to generate timestamps, can't be
+set to lower than (2 / ptp_clock_freq).
+
+The "fine" qualification comes from the frequent frequency adjustments we are
+able to do, which is perfect for a PTP follower usecase.
+
+In Coarse mode, we don't do frequency adjustments based on an
+accumulator overflow. We can therefore have very fine subsecond
+increment values, allowing for better timestamping precision. However
+this mode works best when the ptp clock frequency is adjusted based on
+an external signal, such as a PPS input produced by a GPS clock. This
+mode is therefore perfect for a Grand-master usecase.
+
+Introduce a driver-specific devlink parameter "ts_coarse" to enable or
+disable coarse mode, keeping the "fine" mode as a default.
+
+This can then be changed with:
+
+  devlink dev param set <dev> name ts_coarse value true cmode runtime
+
+The associated documentation is also added.
+
+[1] : https://lore.kernel.org/netdev/20200514102808.31163-1-olivier.dautricourt@orolia.com/
+
+Signed-off-by: Maxime Chevallier <maxime.chevallier@bootlin.com>
+Reviewed-by: Russell King (Oracle) <rmk+kernel@armlinux.org.uk>
+Reviewed-by: Kory Maincent <kory.maincent@bootlin.com>
+Link: https://patch.msgid.link/20251024070720.71174-3-maxime.chevallier@bootlin.com
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ Documentation/networking/devlink/index.rst        |    1 
+ Documentation/networking/devlink/stmmac.rst       |   31 +++++
+ drivers/net/ethernet/stmicro/stmmac/Kconfig       |    1 
+ drivers/net/ethernet/stmicro/stmmac/stmmac.h      |    3 
+ drivers/net/ethernet/stmicro/stmmac/stmmac_main.c |  115 +++++++++++++++++++++-
+ 5 files changed, 148 insertions(+), 3 deletions(-)
+ create mode 100644 Documentation/networking/devlink/stmmac.rst
+
+--- a/Documentation/networking/devlink/index.rst
++++ b/Documentation/networking/devlink/index.rst
+@@ -99,5 +99,6 @@ parameters, info versions, and other fea
+    prestera
+    qed
+    sfc
++   stmmac
+    ti-cpsw-switch
+    zl3073x
+--- /dev/null
++++ b/Documentation/networking/devlink/stmmac.rst
+@@ -0,0 +1,31 @@
++.. SPDX-License-Identifier: GPL-2.0
++
++=======================================
++stmmac (synopsys dwmac) devlink support
++=======================================
++
++This document describes the devlink features implemented by the ``stmmac``
++device driver.
++
++Parameters
++==========
++
++The ``stmmac`` driver implements the following driver-specific parameters.
++
++.. list-table:: Driver-specific parameters implemented
++   :widths: 5 5 5 85
++
++   * - Name
++     - Type
++     - Mode
++     - Description
++   * - ``ts_coarse``
++     - Boolean
++     - runtime
++     - Enable the Coarse timestamping mode. In Coarse mode, the ptp clock is
++       expected to be updated through an external PPS input, but the subsecond
++       increment used for timestamping is set to 1/ptp_clock_rate. In Fine mode
++       (i.e. Coarse mode == false), the ptp clock frequency is adjusted more
++       frequently, but the subsecond increment is set to 2/ptp_clock_rate.
++       Coarse mode is suitable for PTP Grand Master operation. If unsure, leave
++       the parameter to False.
+--- a/drivers/net/ethernet/stmicro/stmmac/Kconfig
++++ b/drivers/net/ethernet/stmicro/stmmac/Kconfig
+@@ -10,6 +10,7 @@ config STMMAC_ETH
+ 	select PHYLINK
+ 	select CRC32
+ 	select RESET_CONTROLLER
++	select NET_DEVLINK
+ 	help
+ 	  This is the driver for the Ethernet IPs built around a
+ 	  Synopsys IP Core.
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac.h
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac.h
+@@ -257,6 +257,7 @@ struct stmmac_priv {
+ 	unsigned int rx_copybreak;
+ 	u32 rx_riwt[MTL_MAX_TX_QUEUES];
+ 	int hwts_rx_en;
++	bool tsfupdt_coarse;
+ 
+ 	void __iomem *ioaddr;
+ 	struct net_device *dev;
+@@ -366,6 +367,8 @@ struct stmmac_priv {
+ 	/* XDP BPF Program */
+ 	unsigned long *af_xdp_zc_qps;
+ 	struct bpf_prog *xdp_prog;
++
++	struct devlink *devlink;
+ };
+ 
+ enum stmmac_state {
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -39,6 +39,7 @@
+ #include <linux/phylink.h>
+ #include <linux/udp.h>
+ #include <linux/bpf_trace.h>
++#include <net/devlink.h>
+ #include <net/page_pool/helpers.h>
+ #include <net/pkt_cls.h>
+ #include <net/xdp_sock_drv.h>
+@@ -56,8 +57,7 @@
+  * with fine resolution and binary rollover. This avoid non-monotonic behavior
+  * (clock jumps) when changing timestamping settings at runtime.
+  */
+-#define STMMAC_HWTS_ACTIVE	(PTP_TCR_TSENA | PTP_TCR_TSCFUPDT | \
+-				 PTP_TCR_TSCTRLSSR)
++#define STMMAC_HWTS_ACTIVE	(PTP_TCR_TSENA | PTP_TCR_TSCTRLSSR)
+ 
+ #define	STMMAC_ALIGN(x)		ALIGN(ALIGN(x, SMP_CACHE_BYTES), 16)
+ #define	TSO_MAX_BUFF_SIZE	(SZ_16K - 1)
+@@ -180,6 +180,15 @@ int stmmac_bus_clks_config(struct stmmac
+ }
+ EXPORT_SYMBOL_GPL(stmmac_bus_clks_config);
+ 
++struct stmmac_devlink_priv {
++	struct stmmac_priv *stmmac_priv;
++};
++
++enum stmmac_dl_param_id {
++	STMMAC_DEVLINK_PARAM_ID_BASE = DEVLINK_PARAM_GENERIC_ID_MAX,
++	STMMAC_DEVLINK_PARAM_ID_TS_COARSE,
++};
++
+ /**
+  * stmmac_verify_args - verify the driver parameters.
+  * Description: it checks the driver parameters and set a default in case of
+@@ -809,6 +818,8 @@ static int stmmac_hwtstamp_set(struct ne
+ 	priv->hwts_tx_en = config.tx_type == HWTSTAMP_TX_ON;
+ 
+ 	priv->systime_flags = STMMAC_HWTS_ACTIVE;
++	if (!priv->tsfupdt_coarse)
++		priv->systime_flags |= PTP_TCR_TSCFUPDT;
+ 
+ 	if (priv->hwts_tx_en || priv->hwts_rx_en) {
+ 		priv->systime_flags |= tstamp_all | ptp_v2 |
+@@ -900,7 +911,8 @@ static int stmmac_init_timestamping(stru
+ 		return -EOPNOTSUPP;
+ 	}
+ 
+-	ret = stmmac_init_tstamp_counter(priv, STMMAC_HWTS_ACTIVE);
++	ret = stmmac_init_tstamp_counter(priv, STMMAC_HWTS_ACTIVE |
++					       PTP_TCR_TSCFUPDT);
+ 	if (ret) {
+ 		netdev_warn(priv->dev, "PTP init failed\n");
+ 		return ret;
+@@ -7340,6 +7352,95 @@ static const struct xdp_metadata_ops stm
+ 	.xmo_rx_timestamp		= stmmac_xdp_rx_timestamp,
+ };
+ 
++static int stmmac_dl_ts_coarse_set(struct devlink *dl, u32 id,
++				   struct devlink_param_gset_ctx *ctx,
++				   struct netlink_ext_ack *extack)
++{
++	struct stmmac_devlink_priv *dl_priv = devlink_priv(dl);
++	struct stmmac_priv *priv = dl_priv->stmmac_priv;
++
++	priv->tsfupdt_coarse = ctx->val.vbool;
++
++	if (priv->tsfupdt_coarse)
++		priv->systime_flags &= ~PTP_TCR_TSCFUPDT;
++	else
++		priv->systime_flags |= PTP_TCR_TSCFUPDT;
++
++	/* In Coarse mode, we can use a smaller subsecond increment, let's
++	 * reconfigure the systime, subsecond increment and addend.
++	 */
++	stmmac_update_subsecond_increment(priv);
++
++	return 0;
++}
++
++static int stmmac_dl_ts_coarse_get(struct devlink *dl, u32 id,
++				   struct devlink_param_gset_ctx *ctx)
++{
++	struct stmmac_devlink_priv *dl_priv = devlink_priv(dl);
++	struct stmmac_priv *priv = dl_priv->stmmac_priv;
++
++	ctx->val.vbool = priv->tsfupdt_coarse;
++
++	return 0;
++}
++
++static const struct devlink_param stmmac_devlink_params[] = {
++	DEVLINK_PARAM_DRIVER(STMMAC_DEVLINK_PARAM_ID_TS_COARSE, "ts_coarse",
++			     DEVLINK_PARAM_TYPE_BOOL,
++			     BIT(DEVLINK_PARAM_CMODE_RUNTIME),
++			     stmmac_dl_ts_coarse_get,
++			     stmmac_dl_ts_coarse_set, NULL),
++};
++
++/* None of the generic devlink parameters are implemented */
++static const struct devlink_ops stmmac_devlink_ops = {};
++
++static int stmmac_register_devlink(struct stmmac_priv *priv)
++{
++	struct stmmac_devlink_priv *dl_priv;
++	int ret;
++
++	/* For now, what is exposed over devlink is only relevant when
++	 * timestamping is available and we have a valid ptp clock rate
++	 */
++	if (!(priv->dma_cap.time_stamp || priv->dma_cap.atime_stamp) ||
++	    !priv->plat->clk_ptp_rate)
++		return 0;
++
++	priv->devlink = devlink_alloc(&stmmac_devlink_ops, sizeof(*dl_priv),
++				      priv->device);
++	if (!priv->devlink)
++		return -ENOMEM;
++
++	dl_priv = devlink_priv(priv->devlink);
++	dl_priv->stmmac_priv = priv;
++
++	ret = devlink_params_register(priv->devlink, stmmac_devlink_params,
++				      ARRAY_SIZE(stmmac_devlink_params));
++	if (ret)
++		goto dl_free;
++
++	devlink_register(priv->devlink);
++	return 0;
++
++dl_free:
++	devlink_free(priv->devlink);
++
++	return ret;
++}
++
++static void stmmac_unregister_devlink(struct stmmac_priv *priv)
++{
++	if (!priv->devlink)
++		return;
++
++	devlink_unregister(priv->devlink);
++	devlink_params_unregister(priv->devlink, stmmac_devlink_params,
++				  ARRAY_SIZE(stmmac_devlink_params));
++	devlink_free(priv->devlink);
++}
++
+ /**
+  * stmmac_dvr_probe
+  * @device: device pointer
+@@ -7630,6 +7731,10 @@ int stmmac_dvr_probe(struct device *devi
+ 		goto error_phy_setup;
+ 	}
+ 
++	ret = stmmac_register_devlink(priv);
++	if (ret)
++		goto error_devlink_setup;
++
+ 	ret = register_netdev(ndev);
+ 	if (ret) {
+ 		dev_err(priv->device, "%s: ERROR %i registering the device\n",
+@@ -7652,6 +7757,8 @@ int stmmac_dvr_probe(struct device *devi
+ 	return ret;
+ 
+ error_netdev_register:
++	stmmac_unregister_devlink(priv);
++error_devlink_setup:
+ 	phylink_destroy(priv->phylink);
+ error_phy_setup:
+ 	stmmac_pcs_clean(ndev);
+@@ -7690,6 +7797,8 @@ void stmmac_dvr_remove(struct device *de
+ #ifdef CONFIG_DEBUG_FS
+ 	stmmac_exit_fs(ndev);
+ #endif
++	stmmac_unregister_devlink(priv);
++
+ 	phylink_destroy(priv->phylink);
+ 	if (priv->plat->stmmac_rst)
+ 		reset_control_assert(priv->plat->stmmac_rst);
