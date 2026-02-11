@@ -1,0 +1,155 @@
+From: Patrisious Haddad <phaddad@nvidia.com>
+Date: Mon, 29 Sep 2025 00:08:08 +0300
+Subject: net/mlx5: Improve write-combining test reliability for ARM64 Grace
+ CPUs
+Patch-mainline: v6.18-rc1
+Git-commit: fd8c8216648cd8c047bd3bcad65424ed44b5b450
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+Write combining is an optimization feature in CPUs that is frequently
+used by modern devices to generate 32 or 64 byte TLPs at the PCIe level.
+These large TLPs allow certain optimizations in the driver to HW
+communication that improve performance. As WC is unpredictable and
+optional the HW designs all tolerate cases where combining doesn't
+happen and simply experience a performance degradation.
+
+Unfortunately many virtualization environments on all architectures have
+done things that completely disable WC inside the VM with no generic way
+to detect this. For example WC was fully blocked in ARM64 KVM until
+commit 8c47ce3e1d2c ("KVM: arm64: Set io memory s2 pte as normalnc for
+vfio pci device").
+
+Trying to use WC when it is known not to work has a measurable
+performance cost (~5%). Long ago mlx5 developed an boot time algorithm
+to test if WC is available or not by using unique mlx5 HW features to
+measure how many large TLPs the device is receiving. The SW generates a
+large number of combining opportunities and if any succeed then WC is
+declared working.
+
+In mlx5 the WC optimization feature is never used by the kernel except
+for the boot time test. The WC is only used by userspace in rdma-core.
+
+Sadly modern ARM CPUs, especially NVIDIA Grace, have a combining
+implementation that is very unreliable compared to pretty much
+everything prior. This is being fixed architecturally in new CPUs with a
+new ST64B instruction, but current shipping devices suffer this problem.
+
+Unreliable means the SW can present thousands of combining opportunities
+and the HW will not combine for any of them, which creates a performance
+degradation, and critically fails the mlx5 boot test. However, the CPU
+is very sensitive to the instruction sequence used, with the better
+options being sufficiently good that the performance loss from the
+unreliable CPU is not measurable.
+
+Broadly there are several options, from worst to best:
+1) A C loop doing a u64 memcpy.
+   This was used prior to commit ef302283ddfc
+   ("IB/mlx5: Use __iowrite64_copy() for write combining stores")
+   and failed almost all the time on Grace CPUs.
+
+2) ARM64 assembly with consecutive 8 byte stores. This was implemented
+   as an arch-generic __iowriteXX_copy() family of functions suitable
+   for performance use in drivers for WC. commit ead79118dae6
+   ("arm64/io: Provide a WC friendly __iowriteXX_copy()") provided the
+   ARM implementation.
+
+3) ARM64 assembly with consecutive 16 byte stores. This was rejected
+   from kernel use over fears of virtualization failures. Common ARM
+   VMMs will crash if STP is used against emulated memory.
+
+4) A single NEON store instruction. Userspace has used this option for a
+   very long time, it performs well.
+
+5) For future silicon the new ST64B instruction is guaranteed to
+   generate a 64 byte TLP 100% of the time
+
+The past upgrade from #1 to #2 was thought to be sufficient to solve
+this problem. However, more testing on more systems shows that #3 is
+still problematic at a low frequency and the kernel test fails.
+
+Thus, make the mlx5 use the same instructions as userspace during the
+boot time WC self test. This way the WC test matches the userspace and
+will properly detect the ability of HW to support the WC workload that
+userspace will generate. While #4 still has imperfect combining
+performance, it is substantially better than #2, and does actually give
+a performance win to applications. Self-test failures with #2 are like
+3/10 boots, on some systems, #4 has never seen a boot failure.
+
+There is no real general use case for a NEON based WC flow in the
+kernel. This is not suitable for any performance path work as getting
+into/out of a NEON context is fairly expensive compared to the gain of
+WC. Future CPUs are going to fix this issue by using an new ARM
+instruction and __iowriteXX_copy() will be updated to use that
+automatically, probably using the ALTERNATES mechanism.
+
+Since this problem is constrained to mlx5's unique situation of needing
+a non-performance code path to duplicate what mlx5 userspace is doing as
+a matter of self-testing, implement it as a one line inline assembly in
+the driver directly.
+
+Lastly, this was concluded from the discussion with ARM maintainers
+which confirms that this is the best approach for the solution:
+https://lore.kernel.org/r/aHqN_hpJl84T1Usi@arm.com
+
+Signed-off-by: Patrisious Haddad <phaddad@nvidia.com>
+Reviewed-by: Michael Guralnik <michaelgur@nvidia.com>
+Reviewed-by: Moshe Shemesh <moshe@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://patch.msgid.link/1759093688-841357-1-git-send-email-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/wc.c |   28 +++++++++++++++++++++++++--
+ 1 file changed, 26 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/wc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/wc.c
+@@ -7,6 +7,10 @@
+ #include "mlx5_core.h"
+ #include "wq.h"
+ 
++#if IS_ENABLED(CONFIG_KERNEL_MODE_NEON) && IS_ENABLED(CONFIG_ARM64)
++#include <asm/neon.h>
++#endif
++
+ #define TEST_WC_NUM_WQES 255
+ #define TEST_WC_LOG_CQ_SZ (order_base_2(TEST_WC_NUM_WQES))
+ #define TEST_WC_SQ_LOG_WQ_SZ TEST_WC_LOG_CQ_SZ
+@@ -255,6 +259,27 @@ static void mlx5_wc_destroy_sq(struct ml
+ 	mlx5_wq_destroy(&sq->wq_ctrl);
+ }
+ 
++static void mlx5_iowrite64_copy(struct mlx5_wc_sq *sq, __be32 mmio_wqe[16],
++				size_t mmio_wqe_size, unsigned int offset)
++{
++#if IS_ENABLED(CONFIG_KERNEL_MODE_NEON) && IS_ENABLED(CONFIG_ARM64)
++	if (cpu_has_neon()) {
++		kernel_neon_begin();
++		asm volatile
++		(".arch_extension simd;\n\t"
++		"ld1 {v0.16b, v1.16b, v2.16b, v3.16b}, [%0]\n\t"
++		"st1 {v0.16b, v1.16b, v2.16b, v3.16b}, [%1]"
++		:
++		: "r"(mmio_wqe), "r"(sq->bfreg.map + offset)
++		: "memory", "v0", "v1", "v2", "v3");
++		kernel_neon_end();
++		return;
++	}
++#endif
++	__iowrite64_copy(sq->bfreg.map + offset, mmio_wqe,
++			 mmio_wqe_size / 8);
++}
++
+ static void mlx5_wc_post_nop(struct mlx5_wc_sq *sq, unsigned int *offset,
+ 			     bool signaled)
+ {
+@@ -289,8 +314,7 @@ static void mlx5_wc_post_nop(struct mlx5
+ 	 */
+ 	wmb();
+ 
+-	__iowrite64_copy(sq->bfreg.map + *offset, mmio_wqe,
+-			 sizeof(mmio_wqe) / 8);
++	mlx5_iowrite64_copy(sq, mmio_wqe, sizeof(mmio_wqe), *offset);
+ 
+ 	*offset ^= buf_size;
+ }
