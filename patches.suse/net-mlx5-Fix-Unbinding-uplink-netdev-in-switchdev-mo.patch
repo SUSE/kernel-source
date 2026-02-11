@@ -1,0 +1,147 @@
+From: Shay Drory <shayd@nvidia.com>
+Date: Mon, 26 Jan 2026 09:14:53 +0200
+Subject: net/mlx5: Fix Unbinding uplink-netdev in switchdev mode
+Patch-mainline: v6.19-rc8
+Git-commit: 2ae8c7edea87f54609bda30963a099cd3c64b0bb
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+It is possible to unbind the uplink ETH driver while the E-Switch is
+in switchdev mode. This leads to netdevice reference counting issues[1],
+as the driver removal path was not designed to clean up from this state.
+
+During uplink ETH driver removal (_mlx5e_remove), the code now waits for
+any concurrent E-Switch mode transition to finish. It then removes the
+REPs auxiliary device, if exists. This ensures a graceful cleanup.
+
+[1]
+unregister_netdevice: waiting for eth2 to become free. Usage count = 2
+ref_tracker: netdev@00000000c912e04b has 1/1 users at
+     ib_device_set_netdev+0x130/0x270 [ib_core]
+     mlx5_ib_vport_rep_load+0xf4/0x3e0 [mlx5_ib]
+     mlx5_esw_offloads_rep_load+0xc7/0xe0 [mlx5_core]
+     esw_offloads_enable+0x583/0x900 [mlx5_core]
+     mlx5_eswitch_enable_locked+0x1b2/0x290 [mlx5_core]
+     mlx5_devlink_eswitch_mode_set+0x107/0x3e0 [mlx5_core]
+     devlink_nl_eswitch_set_doit+0x60/0xd0
+     genl_family_rcv_msg_doit+0xe0/0x130
+     genl_rcv_msg+0x183/0x290
+     netlink_rcv_skb+0x4b/0xf0
+     genl_rcv+0x24/0x40
+     netlink_unicast+0x255/0x380
+     netlink_sendmsg+0x1f3/0x420
+     __sock_sendmsg+0x38/0x60
+     __sys_sendto+0x119/0x180
+     __x64_sys_sendto+0x20/0x30
+
+Fixes: 7a9fb35e8c3a ("net/mlx5e: Do not reload ethernet ports when changing eswitch mode")
+Signed-off-by: Shay Drory <shayd@nvidia.com>
+Reviewed-by: Mark Bloch <mbloch@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Link: https://patch.msgid.link/1769411695-18820-2-git-send-email-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/dev.c              |   14 +++++++
+ drivers/net/ethernet/mellanox/mlx5/core/en_main.c          |    1 
+ drivers/net/ethernet/mellanox/mlx5/core/eswitch.h          |    5 ++
+ drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c |   26 +++++++++++++
+ drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h        |    1 
+ 5 files changed, 47 insertions(+)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/dev.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/dev.c
+@@ -575,3 +575,17 @@ bool mlx5_same_hw_devs(struct mlx5_core_
+ 	return plen && flen && flen == plen &&
+ 		!memcmp(fsystem_guid, psystem_guid, flen);
+ }
++
++void mlx5_core_reps_aux_devs_remove(struct mlx5_core_dev *dev)
++{
++	struct mlx5_priv *priv = &dev->priv;
++
++	if (priv->adev[MLX5_INTERFACE_PROTOCOL_ETH])
++		device_lock_assert(&priv->adev[MLX5_INTERFACE_PROTOCOL_ETH]->adev.dev);
++	else
++		mlx5_core_err(dev, "ETH driver already removed\n");
++	if (priv->adev[MLX5_INTERFACE_PROTOCOL_IB_REP])
++		del_adev(&priv->adev[MLX5_INTERFACE_PROTOCOL_IB_REP]->adev);
++	if (priv->adev[MLX5_INTERFACE_PROTOCOL_ETH_REP])
++		del_adev(&priv->adev[MLX5_INTERFACE_PROTOCOL_ETH_REP]->adev);
++}
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -6744,6 +6744,7 @@ static void _mlx5e_remove(struct auxilia
+ 	struct mlx5e_priv *priv = netdev_priv(netdev);
+ 	struct mlx5_core_dev *mdev = edev->mdev;
+ 
++	mlx5_eswitch_safe_aux_devs_remove(mdev);
+ 	mlx5_core_uplink_netdev_set(mdev, NULL);
+ 
+ 	if (priv->profile)
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@ -929,6 +929,7 @@ int mlx5_esw_ipsec_vf_packet_offload_set
+ int mlx5_esw_ipsec_vf_packet_offload_supported(struct mlx5_core_dev *dev,
+ 					       u16 vport_num);
+ bool mlx5_esw_host_functions_enabled(const struct mlx5_core_dev *dev);
++void mlx5_eswitch_safe_aux_devs_remove(struct mlx5_core_dev *dev);
+ #else  /* CONFIG_MLX5_ESWITCH */
+ /* eswitch API stubs */
+ static inline int  mlx5_eswitch_init(struct mlx5_core_dev *dev) { return 0; }
+@@ -1011,6 +1012,10 @@ mlx5_esw_vport_vhca_id(struct mlx5_eswit
+ {
+ 	return false;
+ }
++
++static inline void
++mlx5_eswitch_safe_aux_devs_remove(struct mlx5_core_dev *dev) {}
++
+ #endif /* CONFIG_MLX5_ESWITCH */
+ 
+ #endif /* __MLX5_ESWITCH_H__ */
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@ -3981,6 +3981,32 @@ static bool mlx5_devlink_switchdev_activ
+ 	return true;
+ }
+ 
++#define MLX5_ESW_HOLD_TIMEOUT_MS 7000
++#define MLX5_ESW_HOLD_RETRY_DELAY_MS 500
++
++void mlx5_eswitch_safe_aux_devs_remove(struct mlx5_core_dev *dev)
++{
++	unsigned long timeout;
++	bool hold_esw = true;
++
++	/* Wait for any concurrent eswitch mode transition to complete. */
++	if (!mlx5_esw_hold(dev)) {
++		timeout = jiffies + msecs_to_jiffies(MLX5_ESW_HOLD_TIMEOUT_MS);
++		while (!mlx5_esw_hold(dev)) {
++			if (!time_before(jiffies, timeout)) {
++				hold_esw = false;
++				break;
++			}
++			msleep(MLX5_ESW_HOLD_RETRY_DELAY_MS);
++		}
++	}
++	if (hold_esw) {
++		if (mlx5_eswitch_mode(dev) == MLX5_ESWITCH_OFFLOADS)
++			mlx5_core_reps_aux_devs_remove(dev);
++		mlx5_esw_release(dev);
++	}
++}
++
+ int mlx5_devlink_eswitch_mode_set(struct devlink *devlink, u16 mode,
+ 				  struct netlink_ext_ack *extack)
+ {
+--- a/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
+@@ -290,6 +290,7 @@ int mlx5_register_device(struct mlx5_cor
+ void mlx5_unregister_device(struct mlx5_core_dev *dev);
+ void mlx5_dev_set_lightweight(struct mlx5_core_dev *dev);
+ bool mlx5_dev_is_lightweight(struct mlx5_core_dev *dev);
++void mlx5_core_reps_aux_devs_remove(struct mlx5_core_dev *dev);
+ 
+ void mlx5_fw_reporters_create(struct mlx5_core_dev *dev);
+ int mlx5_query_mtpps(struct mlx5_core_dev *dev, u32 *mtpps, u32 mtpps_size);
