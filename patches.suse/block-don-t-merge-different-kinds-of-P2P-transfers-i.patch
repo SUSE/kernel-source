@@ -1,0 +1,112 @@
+From: Christoph Hellwig <hch@lst.de>
+Date: Wed, 25 Jun 2025 13:34:58 +0200
+Subject: [PATCH] block: don't merge different kinds of P2P transfers in a
+ single bio
+Git-commit: 38446014648c9f7b2843f87517c8f2b73906bb40
+Patch-mainline: v6.16
+References: jsc#PED-14161
+
+To get out of the DMA mapping helpers having to check every segment for
+it's P2P status, ensure that bios either contain P2P transfers or non-P2P
+transfers, and that a P2P bio only contains ranges from a single device.
+
+This means we do the page zone access in the bio add path where it should
+be still page hot, and will only have do the fairly expensive P2P topology
+lookup once per bio down in the DMA mapping path, and only for already
+marked bios.
+
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Keith Busch <kbusch@kernel.org>
+Reviewed-by: Logan Gunthorpe <logang@deltatee.com>
+Reviewed-by: Leon Romanovsky <leonro@nvidia.com>
+Link: https://lore.kernel.org/r/20250625113531.522027-2-hch@lst.de
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/bio-integrity.c     |  3 +++
+ block/bio.c               | 20 +++++++++++++-------
+ include/linux/blk_types.h |  2 ++
+ 3 files changed, 18 insertions(+), 7 deletions(-)
+
+diff --git a/block/bio-integrity.c b/block/bio-integrity.c
+index 10912988c8f5..6b077ca937f6 100644
+--- a/block/bio-integrity.c
++++ b/block/bio-integrity.c
+@@ -128,6 +128,9 @@ int bio_integrity_add_page(struct bio *bio, struct page *page,
+ 	if (bip->bip_vcnt > 0) {
+ 		struct bio_vec *bv = &bip->bip_vec[bip->bip_vcnt - 1];
+ 
++		if (!zone_device_pages_have_same_pgmap(bv->bv_page, page))
++			return 0;
++
+ 		if (bvec_try_merge_hw_page(q, bv, page, len, offset)) {
+ 			bip->bip_iter.bi_size += len;
+ 			return len;
+diff --git a/block/bio.c b/block/bio.c
+index 3c0a558c90f5..92c512e876c8 100644
+--- a/block/bio.c
++++ b/block/bio.c
+@@ -930,8 +930,6 @@ static bool bvec_try_merge_page(struct bio_vec *bv, struct page *page,
+ 		return false;
+ 	if (xen_domain() && !xen_biovec_phys_mergeable(bv, page))
+ 		return false;
+-	if (!zone_device_pages_have_same_pgmap(bv->bv_page, page))
+-		return false;
+ 
+ 	if ((vec_end_addr & PAGE_MASK) != ((page_addr + off) & PAGE_MASK)) {
+ 		if (IS_ENABLED(CONFIG_KMSAN))
+@@ -982,6 +980,9 @@ void __bio_add_page(struct bio *bio, struct page *page,
+ 	WARN_ON_ONCE(bio_flagged(bio, BIO_CLONED));
+ 	WARN_ON_ONCE(bio_full(bio, len));
+ 
++	if (is_pci_p2pdma_page(page))
++		bio->bi_opf |= REQ_P2PDMA | REQ_NOMERGE;
++
+ 	bvec_set_page(&bio->bi_io_vec[bio->bi_vcnt], page, len, off);
+ 	bio->bi_iter.bi_size += len;
+ 	bio->bi_vcnt++;
+@@ -1022,11 +1023,16 @@ int bio_add_page(struct bio *bio, struct page *page,
+ 	if (bio->bi_iter.bi_size > UINT_MAX - len)
+ 		return 0;
+ 
+-	if (bio->bi_vcnt > 0 &&
+-	    bvec_try_merge_page(&bio->bi_io_vec[bio->bi_vcnt - 1],
+-				page, len, offset)) {
+-		bio->bi_iter.bi_size += len;
+-		return len;
++	if (bio->bi_vcnt > 0) {
++		struct bio_vec *bv = &bio->bi_io_vec[bio->bi_vcnt - 1];
++
++		if (!zone_device_pages_have_same_pgmap(bv->bv_page, page))
++			return 0;
++
++		if (bvec_try_merge_page(bv, page, len, offset)) {
++			bio->bi_iter.bi_size += len;
++			return len;
++		}
+ 	}
+ 
+ 	if (bio->bi_vcnt >= bio->bi_max_vecs)
+diff --git a/include/linux/blk_types.h b/include/linux/blk_types.h
+index 930daff207df..09b99d52fd36 100644
+--- a/include/linux/blk_types.h
++++ b/include/linux/blk_types.h
+@@ -386,6 +386,7 @@ enum req_flag_bits {
+ 	__REQ_DRV,		/* for driver use */
+ 	__REQ_FS_PRIVATE,	/* for file system (submitter) use */
+ 	__REQ_ATOMIC,		/* for atomic write operations */
++	__REQ_P2PDMA,		/* contains P2P DMA pages */
+ 	/*
+ 	 * Command specific flags, keep last:
+ 	 */
+@@ -418,6 +419,7 @@ enum req_flag_bits {
+ #define REQ_DRV		(__force blk_opf_t)(1ULL << __REQ_DRV)
+ #define REQ_FS_PRIVATE	(__force blk_opf_t)(1ULL << __REQ_FS_PRIVATE)
+ #define REQ_ATOMIC	(__force blk_opf_t)(1ULL << __REQ_ATOMIC)
++#define REQ_P2PDMA	(__force blk_opf_t)(1ULL << __REQ_P2PDMA)
+ 
+ #define REQ_NOUNMAP	(__force blk_opf_t)(1ULL << __REQ_NOUNMAP)
+ 
+-- 
+2.43.0
+
