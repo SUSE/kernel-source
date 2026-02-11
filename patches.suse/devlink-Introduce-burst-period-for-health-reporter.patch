@@ -1,0 +1,127 @@
+From: Shahar Shitrit <shshitrit@nvidia.com>
+Date: Sun, 24 Aug 2025 11:43:52 +0300
+Subject: devlink: Introduce burst period for health reporter
+Patch-mainline: v6.18-rc1
+Git-commit: 6a06d8c40510ba1ecf27977f528b1eb74f290a60
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+Currently, the devlink health reporter starts the grace period
+immediately after handling an error, blocking any further recoveries
+until it finished.
+
+However, when a single root cause triggers multiple errors in a short
+time frame, it is desirable to treat them as a bulk of errors and to
+allow their recoveries, avoiding premature blocking of subsequent
+related errors, and reducing the risk of inconsistent or incomplete
+error handling.
+
+To address this, introduce a configurable burst period for devlink
+health reporter. Start this period when the first error is handled,
+and allow recovery attempts for reported errors during this window.
+Once burst period expires, begin the grace period to block further
+recoveries until it concludes.
+
+Timeline summary:
+
+----|--------|------------------------------/----------------------/--
+error is  error is       burst period           grace period
+reported  recovered  (recoveries allowed)    (recoveries blocked)
+
+For calculating the burst period duration, use the same
+last_recovery_ts as the grace period. Update it on recovery only
+when the burst period is inactive (either disabled or at the
+first error).
+
+This patch implements the framework for the burst period and
+effectively sets its value to 0 at reporter creation, so the current
+behavior remains unchanged, which ensures backward compatibility.
+
+A downstream patch will make the burst period configurable.
+
+Signed-off-by: Shahar Shitrit <shshitrit@nvidia.com>
+Reviewed-by: Jiri Pirko <jiri@nvidia.com>
+Signed-off-by: Mark Bloch <mbloch@nvidia.com>
+Link: https://patch.msgid.link/20250824084354.533182-4-mbloch@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/net/devlink.h |    3 +++
+ net/devlink/health.c  |   22 +++++++++++++++++++++-
+ 2 files changed, 24 insertions(+), 1 deletion(-)
+
+--- a/include/net/devlink.h
++++ b/include/net/devlink.h
+@@ -748,6 +748,8 @@ enum devlink_health_reporter_state {
+  * @test: callback to trigger a test event
+  * @default_graceful_period: default min time (in msec)
+  *	between recovery attempts
++ * @default_burst_period: default time (in msec) for
++ *	error recoveries before starting the grace period
+  */
+ 
+ struct devlink_health_reporter_ops {
+@@ -763,6 +765,7 @@ struct devlink_health_reporter_ops {
+ 	int (*test)(struct devlink_health_reporter *reporter,
+ 		    struct netlink_ext_ack *extack);
+ 	u64 default_graceful_period;
++	u64 default_burst_period;
+ };
+ 
+ /**
+--- a/net/devlink/health.c
++++ b/net/devlink/health.c
+@@ -60,6 +60,7 @@ struct devlink_health_reporter {
+ 	struct devlink_port *devlink_port;
+ 	struct devlink_fmsg *dump_fmsg;
+ 	u64 graceful_period;
++	u64 burst_period;
+ 	bool auto_recover;
+ 	bool auto_dump;
+ 	u8 health_state;
+@@ -123,6 +124,7 @@ __devlink_health_reporter_create(struct
+ 	reporter->ops = ops;
+ 	reporter->devlink = devlink;
+ 	reporter->graceful_period = ops->default_graceful_period;
++	reporter->burst_period = ops->default_burst_period;
+ 	reporter->auto_recover = !!ops->recover;
+ 	reporter->auto_dump = !!ops->dump;
+ 	return reporter;
+@@ -510,11 +512,25 @@ static void devlink_recover_notify(struc
+ 	devlink_nl_notify_send_desc(devlink, msg, &desc);
+ }
+ 
++static bool
++devlink_health_reporter_in_burst(struct devlink_health_reporter *reporter)
++{
++	unsigned long burst_threshold = reporter->last_recovery_ts +
++		msecs_to_jiffies(reporter->burst_period);
++
++	return time_is_after_jiffies(burst_threshold);
++}
++
+ void
+ devlink_health_reporter_recovery_done(struct devlink_health_reporter *reporter)
+ {
+ 	reporter->recovery_count++;
+-	reporter->last_recovery_ts = jiffies;
++	if (!devlink_health_reporter_in_burst(reporter))
++		/* When burst period is set, last_recovery_ts marks the first
++		 * recovery within the burst period, not necessarily the last
++		 * one.
++		 */
++		reporter->last_recovery_ts = jiffies;
+ }
+ EXPORT_SYMBOL_GPL(devlink_health_reporter_recovery_done);
+ 
+@@ -601,7 +617,11 @@ devlink_health_recover_abort(struct devl
+ 	if (prev_state != DEVLINK_HEALTH_REPORTER_STATE_HEALTHY)
+ 		return true;
+ 
++	if (devlink_health_reporter_in_burst(reporter))
++		return false;
++
+ 	recover_ts_threshold = reporter->last_recovery_ts +
++		msecs_to_jiffies(reporter->burst_period) +
+ 		msecs_to_jiffies(reporter->graceful_period);
+ 	if (reporter->last_recovery_ts && reporter->recovery_count &&
+ 	    time_is_after_jiffies(recover_ts_threshold))
