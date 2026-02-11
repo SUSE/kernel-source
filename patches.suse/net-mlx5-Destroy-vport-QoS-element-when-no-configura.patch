@@ -1,0 +1,141 @@
+From: Carolina Jubran <cjubran@nvidia.com>
+Date: Wed, 20 Aug 2025 16:32:05 +0300
+Subject: net/mlx5: Destroy vport QoS element when no configuration remains
+Patch-mainline: v6.17-rc3
+Git-commit: b697ef4d1d136948d282384e6cc3d1af469ea123
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+If a VF has been configured and the user later clears all QoS settings,
+the vport element remains in the firmware QoS tree. This leads to
+inconsistent behavior compared to VFs that were never configured, since
+the FW assumes that unconfigured VFs are outside the QoS hierarchy.
+As a result, the bandwidth share across VFs may differ, even though
+none of them appear to have any configuration.
+
+Align the driver behavior with the FW expectation by destroying the
+vport QoS element when all configurations are removed.
+
+Fixes: c9497c98901c ("net/mlx5: Add support for setting VF min rate")
+Fixes: cf7e73770d1b ("net/mlx5: Manage TC arbiter nodes and implement full support for tc-bw")
+Signed-off-by: Carolina Jubran <cjubran@nvidia.com>
+Reviewed-by: Cosmin Ratiu <cratiu@nvidia.com>
+Signed-off-by: Mark Bloch <mbloch@nvidia.com>
+Reviewed-by: Przemek Kitszel <przemyslaw.kitszel@intel.com>
+Link: https://patch.msgid.link/20250820133209.389065-5-mbloch@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/esw/qos.c |   57 ++++++++++++++++++----
+ 1 file changed, 49 insertions(+), 8 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/esw/qos.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/esw/qos.c
+@@ -1127,6 +1127,19 @@ static int mlx5_esw_qos_vport_enable(str
+ 	return err;
+ }
+ 
++static void mlx5_esw_qos_vport_disable_locked(struct mlx5_vport *vport)
++{
++	struct mlx5_eswitch *esw = vport->dev->priv.eswitch;
++
++	esw_assert_qos_lock_held(esw);
++	if (!vport->qos.sched_node)
++		return;
++
++	esw_qos_vport_disable(vport, NULL);
++	mlx5_esw_qos_vport_qos_free(vport);
++	esw_qos_put(esw);
++}
++
+ void mlx5_esw_qos_vport_disable(struct mlx5_vport *vport)
+ {
+ 	struct mlx5_eswitch *esw = vport->dev->priv.eswitch;
+@@ -1140,9 +1153,7 @@ void mlx5_esw_qos_vport_disable(struct m
+ 	parent = vport->qos.sched_node->parent;
+ 	WARN(parent, "Disabling QoS on port before detaching it from node");
+ 
+-	esw_qos_vport_disable(vport, NULL);
+-	mlx5_esw_qos_vport_qos_free(vport);
+-	esw_qos_put(esw);
++	mlx5_esw_qos_vport_disable_locked(vport);
+ unlock:
+ 	esw_qos_unlock(esw);
+ }
+@@ -1642,6 +1653,21 @@ static bool esw_qos_tc_bw_disabled(u32 *
+ 	return true;
+ }
+ 
++static void esw_vport_qos_prune_empty(struct mlx5_vport *vport)
++{
++	struct mlx5_esw_sched_node *vport_node = vport->qos.sched_node;
++
++	esw_assert_qos_lock_held(vport->dev->priv.eswitch);
++	if (!vport_node)
++		return;
++
++	if (vport_node->parent || vport_node->max_rate ||
++	    vport_node->min_rate || !esw_qos_tc_bw_disabled(vport_node->tc_bw))
++		return;
++
++	mlx5_esw_qos_vport_disable_locked(vport);
++}
++
+ int mlx5_esw_qos_init(struct mlx5_eswitch *esw)
+ {
+ 	if (esw->qos.domain)
+@@ -1675,6 +1701,10 @@ int mlx5_esw_devlink_rate_leaf_tx_share_
+ 
+ 	esw_qos_lock(esw);
+ 	err = mlx5_esw_qos_set_vport_min_rate(vport, tx_share, extack);
++	if (err)
++		goto out;
++	esw_vport_qos_prune_empty(vport);
++out:
+ 	esw_qos_unlock(esw);
+ 	return err;
+ }
+@@ -1696,6 +1726,10 @@ int mlx5_esw_devlink_rate_leaf_tx_max_se
+ 
+ 	esw_qos_lock(esw);
+ 	err = mlx5_esw_qos_set_vport_max_rate(vport, tx_max, extack);
++	if (err)
++		goto out;
++	esw_vport_qos_prune_empty(vport);
++out:
+ 	esw_qos_unlock(esw);
+ 	return err;
+ }
+@@ -1733,6 +1767,7 @@ int mlx5_esw_devlink_rate_leaf_tc_bw_set
+ 		if (vport_node->type == SCHED_NODE_TYPE_TC_ARBITER_TSAR)
+ 			err = esw_qos_vport_update(vport, SCHED_NODE_TYPE_VPORT,
+ 						   vport_node->parent, extack);
++		esw_vport_qos_prune_empty(vport);
+ 		goto unlock;
+ 	}
+ 
+@@ -1893,14 +1928,20 @@ int mlx5_esw_devlink_rate_leaf_parent_se
+ 					  void *priv, void *parent_priv,
+ 					  struct netlink_ext_ack *extack)
+ {
+-	struct mlx5_esw_sched_node *node;
++	struct mlx5_esw_sched_node *node = parent ? parent_priv : NULL;
+ 	struct mlx5_vport *vport = priv;
++	int err;
+ 
+-	if (!parent)
+-		return mlx5_esw_qos_vport_update_parent(vport, NULL, extack);
++	err = mlx5_esw_qos_vport_update_parent(vport, node, extack);
++	if (!err) {
++		struct mlx5_eswitch *esw = vport->dev->priv.eswitch;
++
++		esw_qos_lock(esw);
++		esw_vport_qos_prune_empty(vport);
++		esw_qos_unlock(esw);
++	}
+ 
+-	node = parent_priv;
+-	return mlx5_esw_qos_vport_update_parent(vport, node, extack);
++	return err;
+ }
+ 
+ static bool esw_qos_is_node_empty(struct mlx5_esw_sched_node *node)
