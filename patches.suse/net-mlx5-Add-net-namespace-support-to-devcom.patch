@@ -1,0 +1,137 @@
+From: Shay Drory <shayd@nvidia.com>
+Date: Mon, 15 Sep 2025 15:41:09 +0300
+Subject: net/mlx5: Add net namespace support to devcom
+Patch-mainline: v6.18-rc1
+Git-commit: 95f73447c269e196dc149bece65b2d83cdb42b08
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+Extend the devcom framework to support namespace-aware components.
+
+The existing devcom matching logic was based solely on numeric keys,
+limiting its use to the global (init_net) scope or requiring clients to
+ignore namespaces altogether, both of which are incorrect in
+multi-namespace environments.
+
+This patch introduces namespace support by allowing devcom clients to
+provide a namespace match attribute. The devcom pairing mechanism is
+updated to compare the namespace, enabling proper isolation and
+interaction of components across different net namespaces.
+
+With this change, components that require namespace aware pairing, such
+as SD groups or LAG, can now work correctly in multi-namespace
+scenarios. In particular, this opens the way to support hardware LAG
+within a net namespace.
+
+Signed-off-by: Shay Drory <shayd@nvidia.com>
+Reviewed-by: Mark Bloch <mbloch@nvidia.com>
+Reviewed-by: Parav Pandit <parav@nvidia.com>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://patch.msgid.link/1757940070-618661-4-git-send-email-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en_tc.c      |    3 +++
+ drivers/net/ethernet/mellanox/mlx5/core/lib/devcom.c |   13 +++++++++++++
+ drivers/net/ethernet/mellanox/mlx5/core/lib/devcom.h |    6 ++++++
+ drivers/net/ethernet/mellanox/mlx5/core/lib/sd.c     |    2 ++
+ 4 files changed, 24 insertions(+)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@ -66,6 +66,7 @@
+ #include "lib/devcom.h"
+ #include "lib/geneve.h"
+ #include "lib/fs_chains.h"
++#include "lib/mlx5.h"
+ #include "diag/en_tc_tracepoint.h"
+ #include <asm/div64.h>
+ #include "lag/lag.h"
+@@ -5450,6 +5451,8 @@ int mlx5e_tc_esw_init(struct mlx5_rep_up
+ 	err = dev_get_port_parent_id(priv->netdev, &ppid, false);
+ 	if (!err) {
+ 		memcpy(&attr.key.val, &ppid.id, sizeof(attr.key.val));
++		attr.flags = MLX5_DEVCOM_MATCH_FLAGS_NS;
++		attr.net = mlx5_core_net(esw->dev);
+ 		mlx5_esw_offloads_devcom_init(esw, &attr);
+ 	}
+ 
+--- a/drivers/net/ethernet/mellanox/mlx5/core/lib/devcom.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/lib/devcom.c
+@@ -4,6 +4,7 @@
+ #include <linux/mlx5/vport.h>
+ #include <linux/list.h>
+ #include "lib/devcom.h"
++#include "lib/mlx5.h"
+ #include "mlx5_core.h"
+ 
+ static LIST_HEAD(devcom_dev_list);
+@@ -23,7 +24,9 @@ struct mlx5_devcom_dev {
+ };
+ 
+ struct mlx5_devcom_key {
++	u32 flags;
+ 	union mlx5_devcom_match_key key;
++	possible_net_t net;
+ };
+ 
+ struct mlx5_devcom_comp {
+@@ -123,6 +126,9 @@ mlx5_devcom_comp_alloc(u64 id, const str
+ 
+ 	comp->id = id;
+ 	comp->key.key = attr->key;
++	comp->key.flags = attr->flags;
++	if (attr->flags & MLX5_DEVCOM_MATCH_FLAGS_NS)
++		write_pnet(&comp->key.net, attr->net);
+ 	comp->handler = handler;
+ 	init_rwsem(&comp->sem);
+ 	lockdep_register_key(&comp->lock_key);
+@@ -190,9 +196,16 @@ devcom_component_equal(struct mlx5_devco
+ 	if (devcom->id != id)
+ 		return false;
+ 
++	if (devcom->key.flags != attr->flags)
++		return false;
++
+ 	if (memcmp(&devcom->key.key, &attr->key, sizeof(devcom->key.key)))
+ 		return false;
+ 
++	if (devcom->key.flags & MLX5_DEVCOM_MATCH_FLAGS_NS &&
++	    !net_eq(read_pnet(&devcom->key.net), attr->net))
++		return false;
++
+ 	return true;
+ }
+ 
+--- a/drivers/net/ethernet/mellanox/mlx5/core/lib/devcom.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/lib/devcom.h
+@@ -6,12 +6,18 @@
+ 
+ #include <linux/mlx5/driver.h>
+ 
++enum mlx5_devom_match_flags {
++	MLX5_DEVCOM_MATCH_FLAGS_NS = BIT(0),
++};
++
+ union mlx5_devcom_match_key {
+ 	u64 val;
+ };
+ 
+ struct mlx5_devcom_match_attr {
++	u32 flags;
+ 	union mlx5_devcom_match_key key;
++	struct net *net;
+ };
+ 
+ enum mlx5_devcom_component {
+--- a/drivers/net/ethernet/mellanox/mlx5/core/lib/sd.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/lib/sd.c
+@@ -217,6 +217,8 @@ static int sd_register(struct mlx5_core_
+ 
+ 	sd = mlx5_get_sd(dev);
+ 	attr.key.val = sd->group_id;
++	attr.flags = MLX5_DEVCOM_MATCH_FLAGS_NS;
++	attr.net = mlx5_core_net(dev);
+ 	devcom = mlx5_devcom_register_component(dev->priv.devc, MLX5_DEVCOM_SD_GROUP,
+ 						&attr, NULL, dev);
+ 	if (IS_ERR(devcom))
