@@ -1,0 +1,241 @@
+From: Carolina Jubran <cjubran@nvidia.com>
+Date: Tue, 22 Jul 2025 12:13:29 +0300
+Subject: devlink: Fix excessive stack usage in rate TC bandwidth parsing
+Patch-mainline: v6.17-rc1
+Git-commit: 1bbdb81a98363fd5cd0c2ac16ad5346bdf814dff
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+The devlink_nl_rate_tc_bw_parse function uses a large stack array for
+devlink attributes, which triggers a warning about excessive stack
+usage:
+
+net/devlink/rate.c: In function 'devlink_nl_rate_tc_bw_parse':
+net/devlink/rate.c:382:1: error: the frame size of 1648 bytes is larger than 1536 bytes [-Werror=frame-larger-than=]
+
+Introduce a separate attribute set specifically for rate TC bandwidth
+parsing that only contains the two attributes actually used: index
+and bandwidth. This reduces the stack array from DEVLINK_ATTR_MAX
+entries to just 2 entries, solving the stack usage issue.
+
+Update devlink selftest to use the new 'index' and 'bw' attribute names
+consistent with the YAML spec.
+
+Example usage with ynl with the new spec:
+
+    ./tools/net/ynl/cli.py --spec Documentation/netlink/specs/devlink.yaml \
+      --do rate-set --json '{
+      "bus-name": "pci",
+      "dev-name": "0000:08:00.0",
+      "port-index": 1,
+      "rate-tc-bws": [
+        {"index": 0, "bw": 50},
+        {"index": 1, "bw": 50},
+        {"index": 2, "bw": 0},
+        {"index": 3, "bw": 0},
+        {"index": 4, "bw": 0},
+        {"index": 5, "bw": 0},
+        {"index": 6, "bw": 0},
+        {"index": 7, "bw": 0}
+      ]
+    }'
+
+    ./tools/net/ynl/cli.py --spec Documentation/netlink/specs/devlink.yaml \
+      --do rate-get --json '{
+      "bus-name": "pci",
+      "dev-name": "0000:08:00.0",
+      "port-index": 1
+    }'
+
+    output for rate-get:
+    {'bus-name': 'pci',
+     'dev-name': '0000:08:00.0',
+     'port-index': 1,
+     'rate-tc-bws': [{'bw': 50, 'index': 0},
+                     {'bw': 50, 'index': 1},
+                     {'bw': 0, 'index': 2},
+                     {'bw': 0, 'index': 3},
+                     {'bw': 0, 'index': 4},
+                     {'bw': 0, 'index': 5},
+                     {'bw': 0, 'index': 6},
+                     {'bw': 0, 'index': 7}],
+     'rate-tx-max': 0,
+     'rate-tx-priority': 0,
+     'rate-tx-share': 0,
+     'rate-tx-weight': 0,
+     'rate-type': 'leaf'}
+
+Fixes: 566e8f108fc7 ("devlink: Extend devlink rate API with traffic classes bandwidth management")
+Reported-by: Arnd Bergmann <arnd@arndb.de>
+Closes: https://lore.kernel.org/netdev/20250708160652.1810573-1-arnd@kernel.org/
+Reported-by: kernel test robot <lkp@intel.com>
+Closes: https://lore.kernel.org/oe-kbuild-all/202507171943.W7DJcs6Y-lkp@intel.com/
+Suggested-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Carolina Jubran <cjubran@nvidia.com>
+Tested-by: Carolina Jubran <cjubran@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Reviewed-by: Jiri Pirko <jiri@nvidia.com>
+Link: https://patch.msgid.link/1753175609-330621-1-git-send-email-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ Documentation/netlink/specs/devlink.yaml |   26 +++++++++++---------------
+ include/uapi/linux/devlink.h             |   11 +++++++++--
+ net/devlink/netlink_gen.c                |    6 +++---
+ net/devlink/netlink_gen.h                |    2 +-
+ net/devlink/rate.c                       |   20 ++++++++++----------
+ 5 files changed, 34 insertions(+), 31 deletions(-)
+
+--- a/Documentation/netlink/specs/devlink.yaml
++++ b/Documentation/netlink/specs/devlink.yaml
+@@ -853,18 +853,6 @@ attribute-sets:
+         type: nest
+         multi-attr: true
+         nested-attributes: dl-rate-tc-bws
+-      -
+-        name: rate-tc-index
+-        type: u8
+-        checks:
+-          max: rate-tc-index-max
+-      -
+-        name: rate-tc-bw
+-        type: u32
+-        doc: |
+-             Specifies the bandwidth share assigned to the Traffic Class.
+-             The bandwidth for the traffic class is determined
+-             in proportion to the sum of the shares of all configured classes.
+   -
+     name: dl-dev-stats
+     subset-of: devlink
+@@ -1271,12 +1259,20 @@ attribute-sets:
+         type: flag
+   -
+     name: dl-rate-tc-bws
+-    subset-of: devlink
++    name-prefix: devlink-rate-tc-attr-
+     attributes:
+       -
+-        name: rate-tc-index
++        name: index
++        type: u8
++        checks:
++          max: rate-tc-index-max
+       -
+-        name: rate-tc-bw
++        name: bw
++        type: u32
++        doc: |
++             Specifies the bandwidth share assigned to the Traffic Class.
++             The bandwidth for the traffic class is determined
++             in proportion to the sum of the shares of all configured classes.
+ 
+ operations:
+   enum-model: directional
+--- a/include/uapi/linux/devlink.h
++++ b/include/uapi/linux/devlink.h
+@@ -635,8 +635,6 @@ enum devlink_attr {
+ 	DEVLINK_ATTR_REGION_DIRECT,		/* flag */
+ 
+ 	DEVLINK_ATTR_RATE_TC_BWS,		/* nested */
+-	DEVLINK_ATTR_RATE_TC_INDEX,		/* u8 */
+-	DEVLINK_ATTR_RATE_TC_BW,		/* u32 */
+ 
+ 	/* Add new attributes above here, update the spec in
+ 	 * Documentation/netlink/specs/devlink.yaml and re-generate
+@@ -647,6 +645,15 @@ enum devlink_attr {
+ 	DEVLINK_ATTR_MAX = __DEVLINK_ATTR_MAX - 1
+ };
+ 
++enum devlink_rate_tc_attr {
++	DEVLINK_RATE_TC_ATTR_UNSPEC,
++	DEVLINK_RATE_TC_ATTR_INDEX,		/* u8 */
++	DEVLINK_RATE_TC_ATTR_BW,		/* u32 */
++
++	__DEVLINK_RATE_TC_ATTR_MAX,
++	DEVLINK_RATE_TC_ATTR_MAX = __DEVLINK_RATE_TC_ATTR_MAX - 1
++};
++
+ /* Mapping between internal resource described by the field and system
+  * structure
+  */
+--- a/net/devlink/netlink_gen.c
++++ b/net/devlink/netlink_gen.c
+@@ -45,9 +45,9 @@ const struct nla_policy devlink_dl_port_
+ 	[DEVLINK_PORT_FN_ATTR_CAPS] = NLA_POLICY_BITFIELD32(15),
+ };
+ 
+-const struct nla_policy devlink_dl_rate_tc_bws_nl_policy[DEVLINK_ATTR_RATE_TC_BW + 1] = {
+-	[DEVLINK_ATTR_RATE_TC_INDEX] = NLA_POLICY_MAX(NLA_U8, DEVLINK_RATE_TC_INDEX_MAX),
+-	[DEVLINK_ATTR_RATE_TC_BW] = { .type = NLA_U32, },
++const struct nla_policy devlink_dl_rate_tc_bws_nl_policy[DEVLINK_RATE_TC_ATTR_BW + 1] = {
++	[DEVLINK_RATE_TC_ATTR_INDEX] = NLA_POLICY_MAX(NLA_U8, DEVLINK_RATE_TC_INDEX_MAX),
++	[DEVLINK_RATE_TC_ATTR_BW] = { .type = NLA_U32, },
+ };
+ 
+ const struct nla_policy devlink_dl_selftest_id_nl_policy[DEVLINK_ATTR_SELFTEST_ID_FLASH + 1] = {
+--- a/net/devlink/netlink_gen.h
++++ b/net/devlink/netlink_gen.h
+@@ -13,7 +13,7 @@
+ 
+ /* Common nested types */
+ extern const struct nla_policy devlink_dl_port_function_nl_policy[DEVLINK_PORT_FN_ATTR_CAPS + 1];
+-extern const struct nla_policy devlink_dl_rate_tc_bws_nl_policy[DEVLINK_ATTR_RATE_TC_BW + 1];
++extern const struct nla_policy devlink_dl_rate_tc_bws_nl_policy[DEVLINK_RATE_TC_ATTR_BW + 1];
+ extern const struct nla_policy devlink_dl_selftest_id_nl_policy[DEVLINK_ATTR_SELFTEST_ID_FLASH + 1];
+ 
+ /* Ops table for devlink */
+--- a/net/devlink/rate.c
++++ b/net/devlink/rate.c
+@@ -90,8 +90,8 @@ static int devlink_rate_put_tc_bws(struc
+ 		if (!nla_tc_bw)
+ 			return -EMSGSIZE;
+ 
+-		if (nla_put_u8(msg, DEVLINK_ATTR_RATE_TC_INDEX, i) ||
+-		    nla_put_u32(msg, DEVLINK_ATTR_RATE_TC_BW, tc_bw[i]))
++		if (nla_put_u8(msg, DEVLINK_RATE_TC_ATTR_INDEX, i) ||
++		    nla_put_u32(msg, DEVLINK_RATE_TC_ATTR_BW, tc_bw[i]))
+ 			goto nla_put_failure;
+ 
+ 		nla_nest_end(msg, nla_tc_bw);
+@@ -346,26 +346,26 @@ static int devlink_nl_rate_tc_bw_parse(s
+ 				       unsigned long *bitmap,
+ 				       struct netlink_ext_ack *extack)
+ {
+-	struct nlattr *tb[DEVLINK_ATTR_MAX + 1];
++	struct nlattr *tb[DEVLINK_RATE_TC_ATTR_MAX + 1];
+ 	u8 tc_index;
+ 	int err;
+ 
+-	err = nla_parse_nested(tb, DEVLINK_ATTR_MAX, parent_nest,
++	err = nla_parse_nested(tb, DEVLINK_RATE_TC_ATTR_MAX, parent_nest,
+ 			       devlink_dl_rate_tc_bws_nl_policy, extack);
+ 	if (err)
+ 		return err;
+ 
+-	if (!tb[DEVLINK_ATTR_RATE_TC_INDEX]) {
++	if (!tb[DEVLINK_RATE_TC_ATTR_INDEX]) {
+ 		NL_SET_ERR_ATTR_MISS(extack, parent_nest,
+-				     DEVLINK_ATTR_RATE_TC_INDEX);
++				     DEVLINK_RATE_TC_ATTR_INDEX);
+ 		return -EINVAL;
+ 	}
+ 
+-	tc_index = nla_get_u8(tb[DEVLINK_ATTR_RATE_TC_INDEX]);
++	tc_index = nla_get_u8(tb[DEVLINK_RATE_TC_ATTR_INDEX]);
+ 
+-	if (!tb[DEVLINK_ATTR_RATE_TC_BW]) {
++	if (!tb[DEVLINK_RATE_TC_ATTR_BW]) {
+ 		NL_SET_ERR_ATTR_MISS(extack, parent_nest,
+-				     DEVLINK_ATTR_RATE_TC_BW);
++				     DEVLINK_RATE_TC_ATTR_BW);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -376,7 +376,7 @@ static int devlink_nl_rate_tc_bw_parse(s
+ 		return -EINVAL;
+ 	}
+ 
+-	tc_bw[tc_index] = nla_get_u32(tb[DEVLINK_ATTR_RATE_TC_BW]);
++	tc_bw[tc_index] = nla_get_u32(tb[DEVLINK_RATE_TC_ATTR_BW]);
+ 
+ 	return 0;
+ }
