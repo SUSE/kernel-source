@@ -1,0 +1,131 @@
+From: Lama Kayal <lkayal@nvidia.com>
+Date: Mon, 21 Jul 2025 10:13:19 +0300
+Subject: net/mlx5e: Remove duplicate mkey from SHAMPO header
+Patch-mainline: v6.17-rc1
+Git-commit: eeaf11464f38db9307b7d9ed6c7750b83c344ff8
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+SHAMPO structure holds two variations of the mkey, which is unnecessary,
+a duplication that's repeated per rq.
+
+Remove duplicate mkey information and keep only one version, the one
+used in the fast path, rename field to reflect field type clearly.
+
+Signed-off-by: Lama Kayal <lkayal@nvidia.com>
+Reviewed-by: Dragos Tatulea <dtatulea@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Reviewed-by: Michal Swiatkowski <michal.swiatkowski@linux.intel.com>
+Reviewed-by: Jacob Keller <jacob.e.keller@intel.com>
+Link: https://patch.msgid.link/1753081999-326247-4-git-send-email-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en.h      |    3 --
+ drivers/net/ethernet/mellanox/mlx5/core/en_main.c |   27 ++++++++++++++--------
+ drivers/net/ethernet/mellanox/mlx5/core/en_rx.c   |    2 -
+ 3 files changed, 20 insertions(+), 12 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -630,14 +630,13 @@ struct mlx5e_dma_info {
+ };
+ 
+ struct mlx5e_shampo_hd {
+-	u32 mkey;
+ 	struct mlx5e_frag_page *pages;
+ 	u32 hd_per_wq;
+ 	u16 hd_per_wqe;
+ 	unsigned long *bitmap;
+ 	u16 pi;
+ 	u16 ci;
+-	__be32 key;
++	__be32 mkey_be;
+ };
+ 
+ struct mlx5e_hw_gro_data {
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -545,18 +545,26 @@ static int mlx5e_create_rq_umr_mkey(stru
+ }
+ 
+ static int mlx5e_create_rq_hd_umr_mkey(struct mlx5_core_dev *mdev,
+-				       u16 hd_per_wq, u32 *umr_mkey)
++				       u16 hd_per_wq, __be32 *umr_mkey)
+ {
+ 	u32 max_ksm_size = BIT(MLX5_CAP_GEN(mdev, log_max_klm_list_size));
++	u32 mkey;
++	int err;
+ 
+ 	if (max_ksm_size < hd_per_wq) {
+ 		mlx5_core_err(mdev, "max ksm list size 0x%x is smaller than shampo header buffer list size 0x%x\n",
+ 			      max_ksm_size, hd_per_wq);
+ 		return -EINVAL;
+ 	}
+-	return mlx5e_create_umr_ksm_mkey(mdev, hd_per_wq,
+-					 MLX5E_SHAMPO_LOG_HEADER_ENTRY_SIZE,
+-					 umr_mkey);
++
++	err = mlx5e_create_umr_ksm_mkey(mdev, hd_per_wq,
++					MLX5E_SHAMPO_LOG_HEADER_ENTRY_SIZE,
++					&mkey);
++	if (err)
++		return err;
++
++	*umr_mkey = cpu_to_be32(mkey);
++	return 0;
+ }
+ 
+ static void mlx5e_init_frags_partition(struct mlx5e_rq *rq)
+@@ -780,11 +788,10 @@ static int mlx5_rq_shampo_alloc(struct m
+ 		goto err_shampo_hd_info_alloc;
+ 
+ 	err = mlx5e_create_rq_hd_umr_mkey(mdev, hd_per_wq,
+-					  &rq->mpwqe.shampo->mkey);
++					  &rq->mpwqe.shampo->mkey_be);
+ 	if (err)
+ 		goto err_umr_mkey;
+ 
+-	rq->mpwqe.shampo->key = cpu_to_be32(rq->mpwqe.shampo->mkey);
+ 	rq->mpwqe.shampo->hd_per_wqe =
+ 		mlx5e_shampo_hd_per_wqe(mdev, params, rqp);
+ 	wq_size = BIT(MLX5_GET(wq, wqc, log_wq_sz));
+@@ -829,7 +836,7 @@ static int mlx5_rq_shampo_alloc(struct m
+ err_hw_gro_data:
+ 	page_pool_destroy(rq->hd_page_pool);
+ err_hds_page_pool:
+-	mlx5_core_destroy_mkey(mdev, rq->mpwqe.shampo->mkey);
++	mlx5_core_destroy_mkey(mdev, be32_to_cpu(rq->mpwqe.shampo->mkey_be));
+ err_umr_mkey:
+ 	mlx5e_rq_shampo_hd_info_free(rq);
+ err_shampo_hd_info_alloc:
+@@ -846,7 +853,8 @@ static void mlx5e_rq_free_shampo(struct
+ 	if (rq->hd_page_pool != rq->page_pool)
+ 		page_pool_destroy(rq->hd_page_pool);
+ 	mlx5e_rq_shampo_hd_info_free(rq);
+-	mlx5_core_destroy_mkey(rq->mdev, rq->mpwqe.shampo->mkey);
++	mlx5_core_destroy_mkey(rq->mdev,
++			       be32_to_cpu(rq->mpwqe.shampo->mkey_be));
+ 	kvfree(rq->mpwqe.shampo);
+ }
+ 
+@@ -1114,7 +1122,8 @@ int mlx5e_create_rq(struct mlx5e_rq *rq,
+ 	if (test_bit(MLX5E_RQ_STATE_SHAMPO, &rq->state)) {
+ 		MLX5_SET(wq, wq, log_headers_buffer_entry_num,
+ 			 order_base_2(rq->mpwqe.shampo->hd_per_wq));
+-		MLX5_SET(wq, wq, headers_mkey, rq->mpwqe.shampo->mkey);
++		MLX5_SET(wq, wq, headers_mkey,
++			 be32_to_cpu(rq->mpwqe.shampo->mkey_be));
+ 	}
+ 
+ 	mlx5_fill_page_frag_array(&rq->wq_ctrl.buf,
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@ -674,7 +674,7 @@ static int mlx5e_build_shampo_hd_umr(str
+ 	wqe_bbs = MLX5E_KSM_UMR_WQEBBS(ksm_entries);
+ 	pi = mlx5e_icosq_get_next_pi(sq, wqe_bbs);
+ 	umr_wqe = mlx5_wq_cyc_get_wqe(&sq->wq, pi);
+-	build_ksm_umr(sq, umr_wqe, shampo->key, index, ksm_entries);
++	build_ksm_umr(sq, umr_wqe, shampo->mkey_be, index, ksm_entries);
+ 
+ 	WARN_ON_ONCE(ksm_entries & (MLX5E_SHAMPO_WQ_HEADER_PER_PAGE - 1));
+ 	while (i < ksm_entries) {
