@@ -1,0 +1,111 @@
+From: Christoph Hellwig <hch@lst.de>
+Date: Mon, 28 Apr 2025 07:09:51 -0700
+Subject: [PATCH] brd: use memcpy_{to,from]_page in brd_rw_bvec
+Git-commit: 53ec1abce79c986dc59e59d0c60d00088bcdf32a
+Patch-mainline: v6.16
+References: jsc#PED-14161
+
+Use the proper helpers to copy to/from potential highmem pages, which
+do a local instead of atomic kmap underneath, and perform
+flush_dcache_page where needed.  This also simplifies the code so much
+that the separate read write helpers are not required any more.
+
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Hannes Reinecke <hare@suse.de>
+Reviewed-by: Yu Kuai <yukuai3@huawei.com>
+Reviewed-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+Link: https://lore.kernel.org/r/20250428141014.2360063-6-hch@lst.de
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/block/brd.c | 58 ++++++++++-----------------------------------
+ 1 file changed, 13 insertions(+), 45 deletions(-)
+
+diff --git a/drivers/block/brd.c b/drivers/block/brd.c
+index 580b2d8ce99c..fa1290992a7f 100644
+--- a/drivers/block/brd.c
++++ b/drivers/block/brd.c
+@@ -99,43 +99,6 @@ static void brd_free_pages(struct brd_device *brd)
+ 	xa_destroy(&brd->brd_pages);
+ }
+ 
+-/*
+- * Copy n bytes from src to the brd starting at sector. Does not sleep.
+- */
+-static void copy_to_brd(struct brd_device *brd, const void *src,
+-			sector_t sector, size_t n)
+-{
+-	struct page *page;
+-	void *dst;
+-	unsigned int offset = (sector & (PAGE_SECTORS-1)) << SECTOR_SHIFT;
+-
+-	page = brd_lookup_page(brd, sector);
+-	BUG_ON(!page);
+-
+-	dst = kmap_atomic(page);
+-	memcpy(dst + offset, src, n);
+-	kunmap_atomic(dst);
+-}
+-
+-/*
+- * Copy n bytes to dst from the brd starting at sector. Does not sleep.
+- */
+-static void copy_from_brd(void *dst, struct brd_device *brd,
+-			sector_t sector, size_t n)
+-{
+-	struct page *page;
+-	void *src;
+-	unsigned int offset = (sector & (PAGE_SECTORS-1)) << SECTOR_SHIFT;
+-
+-	page = brd_lookup_page(brd, sector);
+-	if (page) {
+-		src = kmap_atomic(page);
+-		memcpy(dst, src + offset, n);
+-		kunmap_atomic(src);
+-	} else
+-		memset(dst, 0, n);
+-}
+-
+ /*
+  * Process a single segment.  The segment is capped to not cross page boundaries
+  * in both the bio and the brd backing memory.
+@@ -146,7 +109,8 @@ static bool brd_rw_bvec(struct brd_device *brd, struct bio *bio)
+ 	sector_t sector = bio->bi_iter.bi_sector;
+ 	u32 offset = (sector & (PAGE_SECTORS - 1)) << SECTOR_SHIFT;
+ 	blk_opf_t opf = bio->bi_opf;
+-	void *mem;
++	struct page *page;
++	void *kaddr;
+ 
+ 	bv.bv_len = min_t(u32, bv.bv_len, PAGE_SIZE - offset);
+ 
+@@ -168,15 +132,19 @@ static bool brd_rw_bvec(struct brd_device *brd, struct bio *bio)
+ 		}
+ 	}
+ 
+-	mem = bvec_kmap_local(&bv);
+-	if (!op_is_write(opf)) {
+-		copy_from_brd(mem, brd, sector, bv.bv_len);
+-		flush_dcache_page(bv.bv_page);
++	page = brd_lookup_page(brd, sector);
++
++	kaddr = bvec_kmap_local(&bv);
++	if (op_is_write(opf)) {
++		BUG_ON(!page);
++		memcpy_to_page(page, offset, kaddr, bv.bv_len);
+ 	} else {
+-		flush_dcache_page(bv.bv_page);
+-		copy_to_brd(brd, mem, sector, bv.bv_len);
++		if (page)
++			memcpy_from_page(kaddr, page, offset, bv.bv_len);
++		else
++			memset(kaddr, 0, bv.bv_len);
+ 	}
+-	kunmap_local(mem);
++	kunmap_local(kaddr);
+ 
+ 	bio_advance_iter_single(bio, &bio->bi_iter, bv.bv_len);
+ 	return true;
+-- 
+2.43.0
+
