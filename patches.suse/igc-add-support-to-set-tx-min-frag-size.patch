@@ -1,0 +1,158 @@
+From: Faizal Rahim <faizal.abdul.rahim@linux.intel.com>
+Date: Mon, 17 Mar 2025 23:07:39 -0400
+Subject: igc: add support to set tx-min-frag-size
+Patch-mainline: v6.16-rc1
+Git-commit: 55ececab98856be35e8a418a25e1081df931f1eb
+References: jsc#PED-14402
+
+Add support for setting tx-min-frag-size via the set_mm callback in igc.
+If the requested value is unsupported, round it up to the smallest
+supported i226 size (64, 128, 192, 256) and send a netlink message to
+inform the user.
+
+Co-developed-by: Vinicius Costa Gomes <vinicius.gomes@intel.com>
+Signed-off-by: Vinicius Costa Gomes <vinicius.gomes@intel.com>
+Reviewed-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Signed-off-by: Faizal Rahim <faizal.abdul.rahim@linux.intel.com>
+Tested-by: Mor Bar-Gabay <morx.bar.gabay@intel.com>
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/igc/igc.h         |    1 
+ drivers/net/ethernet/intel/igc/igc_defines.h |    1 
+ drivers/net/ethernet/intel/igc/igc_ethtool.c |    5 +++
+ drivers/net/ethernet/intel/igc/igc_tsn.c     |   39 ++++++++++++++++++++++++---
+ drivers/net/ethernet/intel/igc/igc_tsn.h     |    1 
+ 5 files changed, 44 insertions(+), 3 deletions(-)
+
+--- a/drivers/net/ethernet/intel/igc/igc.h
++++ b/drivers/net/ethernet/intel/igc/igc.h
+@@ -42,6 +42,7 @@ void igc_ethtool_set_ops(struct net_devi
+ 
+ struct igc_fpe_t {
+ 	struct ethtool_mmsv mmsv;
++	u32 tx_min_frag_size;
+ };
+ 
+ enum igc_mac_filter_type {
+--- a/drivers/net/ethernet/intel/igc/igc_defines.h
++++ b/drivers/net/ethernet/intel/igc/igc_defines.h
+@@ -583,6 +583,7 @@
+ #define IGC_TQAVCTRL_PREEMPT_ENA	0x00000002
+ #define IGC_TQAVCTRL_ENHANCED_QAV	0x00000008
+ #define IGC_TQAVCTRL_FUTSCDDIS		0x00000080
++#define IGC_TQAVCTRL_MIN_FRAG_MASK	0x0000C000
+ 
+ #define IGC_TXQCTL_QUEUE_MODE_LAUNCHT	0x00000001
+ #define IGC_TXQCTL_STRICT_CYCLE		0x00000002
+--- a/drivers/net/ethernet/intel/igc/igc_ethtool.c
++++ b/drivers/net/ethernet/intel/igc/igc_ethtool.c
+@@ -1789,6 +1789,11 @@ static int igc_ethtool_set_mm(struct net
+ 	struct igc_adapter *adapter = netdev_priv(netdev);
+ 	struct igc_fpe_t *fpe = &adapter->fpe;
+ 
++	fpe->tx_min_frag_size = igc_fpe_get_supported_frag_size(cmd->tx_min_frag_size);
++	if (fpe->tx_min_frag_size != cmd->tx_min_frag_size)
++		NL_SET_ERR_MSG_MOD(extack,
++				   "tx-min-frag-size value set is unsupported. Rounded up to supported value (64, 128, 192, 256)");
++
+ 	if (fpe->mmsv.pmac_enabled != cmd->pmac_enabled) {
+ 		if (cmd->pmac_enabled)
+ 			static_branch_inc(&igc_fpe_enabled);
+--- a/drivers/net/ethernet/intel/igc/igc_tsn.c
++++ b/drivers/net/ethernet/intel/igc/igc_tsn.c
+@@ -6,6 +6,13 @@
+ #include "igc_hw.h"
+ #include "igc_tsn.h"
+ 
++#define MIN_MULTPLIER_TX_MIN_FRAG	0
++#define MAX_MULTPLIER_TX_MIN_FRAG	3
++/* Frag size is based on the Section 8.12.2 of the SW User Manual */
++#define TX_MIN_FRAG_SIZE		64
++#define TX_MAX_FRAG_SIZE	(TX_MIN_FRAG_SIZE * \
++				 (MAX_MULTPLIER_TX_MIN_FRAG + 1))
++
+ DEFINE_STATIC_KEY_FALSE(igc_fpe_enabled);
+ 
+ static int igc_fpe_init_smd_frame(struct igc_ring *ring,
+@@ -128,6 +135,7 @@ static const struct ethtool_mmsv_ops igc
+ 
+ void igc_fpe_init(struct igc_adapter *adapter)
+ {
++	adapter->fpe.tx_min_frag_size = TX_MIN_FRAG_SIZE;
+ 	ethtool_mmsv_init(&adapter->fpe.mmsv, adapter->netdev, &igc_mmsv_ops);
+ }
+ 
+@@ -299,7 +307,7 @@ static int igc_tsn_disable_offload(struc
+ 	tqavctrl = rd32(IGC_TQAVCTRL);
+ 	tqavctrl &= ~(IGC_TQAVCTRL_TRANSMIT_MODE_TSN |
+ 		      IGC_TQAVCTRL_ENHANCED_QAV | IGC_TQAVCTRL_FUTSCDDIS |
+-		      IGC_TQAVCTRL_PREEMPT_ENA);
++		      IGC_TQAVCTRL_PREEMPT_ENA | IGC_TQAVCTRL_MIN_FRAG_MASK);
+ 
+ 	wr32(IGC_TQAVCTRL, tqavctrl);
+ 
+@@ -345,12 +353,35 @@ static void igc_tsn_set_retx_qbvfullthre
+ 	wr32(IGC_RETX_CTL, retxctl);
+ }
+ 
++static u8 igc_fpe_get_frag_size_mult(const struct igc_fpe_t *fpe)
++{
++	u8 mult = (fpe->tx_min_frag_size / TX_MIN_FRAG_SIZE) - 1;
++
++	return clamp_t(u8, mult, MIN_MULTPLIER_TX_MIN_FRAG,
++		       MAX_MULTPLIER_TX_MIN_FRAG);
++}
++
++u32 igc_fpe_get_supported_frag_size(u32 frag_size)
++{
++	const u32 supported_sizes[] = {64, 128, 192, 256};
++
++	/* Find the smallest supported size that is >= frag_size */
++	for (int i = 0; i < ARRAY_SIZE(supported_sizes); i++) {
++		if (frag_size <= supported_sizes[i])
++			return supported_sizes[i];
++	}
++
++	/* Should not happen */
++	return TX_MAX_FRAG_SIZE;
++}
++
+ static int igc_tsn_enable_offload(struct igc_adapter *adapter)
+ {
+ 	struct igc_hw *hw = &adapter->hw;
+ 	u32 tqavctrl, baset_l, baset_h;
+ 	u32 sec, nsec, cycle;
+ 	ktime_t base_time, systim;
++	u32 frag_size_mult;
+ 	int i;
+ 
+ 	wr32(IGC_TSAUXC, 0);
+@@ -519,13 +550,15 @@ skip_cbs:
+ 	}
+ 
+ 	tqavctrl = rd32(IGC_TQAVCTRL) & ~(IGC_TQAVCTRL_FUTSCDDIS |
+-		   IGC_TQAVCTRL_PREEMPT_ENA);
+-
++		   IGC_TQAVCTRL_PREEMPT_ENA | IGC_TQAVCTRL_MIN_FRAG_MASK);
+ 	tqavctrl |= IGC_TQAVCTRL_TRANSMIT_MODE_TSN | IGC_TQAVCTRL_ENHANCED_QAV;
+ 
+ 	if (adapter->fpe.mmsv.pmac_enabled)
+ 		tqavctrl |= IGC_TQAVCTRL_PREEMPT_ENA;
+ 
++	frag_size_mult = igc_fpe_get_frag_size_mult(&adapter->fpe);
++	tqavctrl |= FIELD_PREP(IGC_TQAVCTRL_MIN_FRAG_MASK, frag_size_mult);
++
+ 	adapter->qbv_count++;
+ 
+ 	cycle = adapter->cycle_time;
+--- a/drivers/net/ethernet/intel/igc/igc_tsn.h
++++ b/drivers/net/ethernet/intel/igc/igc_tsn.h
+@@ -14,6 +14,7 @@ enum igc_txd_popts_type {
+ DECLARE_STATIC_KEY_FALSE(igc_fpe_enabled);
+ 
+ void igc_fpe_init(struct igc_adapter *adapter);
++u32 igc_fpe_get_supported_frag_size(u32 frag_size);
+ int igc_tsn_offload_apply(struct igc_adapter *adapter);
+ int igc_tsn_reset(struct igc_adapter *adapter);
+ void igc_tsn_adjust_txtime_offset(struct igc_adapter *adapter);
