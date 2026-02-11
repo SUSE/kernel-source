@@ -1,0 +1,262 @@
+From: Jianbo Liu <jianbol@nvidia.com>
+Date: Thu, 18 Sep 2025 10:19:22 +0300
+Subject: net/mlx5e: Add flow groups for the packets decrypted by crypto
+ offload
+Patch-mainline: v6.18-rc1
+Git-commit: d8693cac22c7fa7ef13c836327f1720d3fe414f6
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+When using IPsec crypto offload, the hardware decrypts the packet
+payload but preserves the ESP header. This prevents the standard RSS
+mechanism from accessing the inner L4 (TCP/UDP) headers. As a result,
+the RSS hash is calculated only on the outer L3 IP headers, causing
+all traffic for a given IPsec tunnel to be directed to a single queue,
+leading to poor traffic distribution.
+
+Newer firmware introduces the ability to match on l4_type_ext, which
+exposes the L4 protocol type following an ESP header. This allows the
+driver to create steering rules that can identify the inner protocols
+of decrypted packets.
+
+This commit leverages this new capability to improve traffic
+distribution. It adds two new flow groups to steer decrypted packets
+to dedicated TIRs that was configured to perform RSS on the inner L4
+headers.
+
+These groups are inserted after the standard L4 group and before the
+group that handles undecrypted ESP packets added in this series. The
+first new group matches decrypted packets based on the outer IP
+version (or ethertype) and l4_type_ext. The second new group matches
+decrypted tunneled packets based on the inner IP version and
+l4_type_ext. Eight new traffic types are also defined to support this
+functionality.
+
+Signed-off-by: Jianbo Liu <jianbol@nvidia.com>
+Reviewed-by: Dragos Tatulea <dtatulea@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://patch.msgid.link/1758179963-649455-4-git-send-email-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en/fs.h      |    2 
+ drivers/net/ethernet/mellanox/mlx5/core/en_fs.c      |   15 ++++
+ drivers/net/ethernet/mellanox/mlx5/core/en_tc.c      |    3 
+ drivers/net/ethernet/mellanox/mlx5/core/lib/fs_ttc.c |   58 +++++++++++++++++--
+ drivers/net/ethernet/mellanox/mlx5/core/lib/fs_ttc.h |   13 ++++
+ 5 files changed, 85 insertions(+), 6 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/fs.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/fs.h
+@@ -57,7 +57,7 @@ struct mlx5e_l2_table {
+ 	bool                       promisc_enabled;
+ };
+ 
+-#define MLX5E_NUM_INDIR_TIRS (MLX5_NUM_TT - 1)
++#define MLX5E_NUM_INDIR_TIRS (MLX5_NUM_INDIR_TIRS)
+ 
+ #define MLX5_HASH_IP		(MLX5_HASH_FIELD_SEL_SRC_IP   |\
+ 				 MLX5_HASH_FIELD_SEL_DST_IP)
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_fs.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_fs.c
+@@ -901,6 +901,9 @@ static void mlx5e_set_inner_ttc_params(s
+ 	ft_attr->prio = MLX5E_NIC_PRIO;
+ 
+ 	for (tt = 0; tt < MLX5_NUM_TT; tt++) {
++		if (mlx5_ttc_is_decrypted_esp_tt(tt))
++			continue;
++
+ 		ttc_params->dests[tt].type = MLX5_FLOW_DESTINATION_TYPE_TIR;
+ 		ttc_params->dests[tt].tir_num =
+ 			tt == MLX5_TT_ANY ?
+@@ -910,6 +913,13 @@ static void mlx5e_set_inner_ttc_params(s
+ 	}
+ }
+ 
++static bool mlx5e_ipsec_rss_supported(struct mlx5_core_dev *mdev)
++{
++	return MLX5_CAP_NIC_RX_FT_FIELD_SUPPORT_2(mdev, ipsec_next_header) &&
++	       MLX5_CAP_NIC_RX_FT_FIELD_SUPPORT_2(mdev, outer_l4_type_ext) &&
++	       MLX5_CAP_NIC_RX_FT_FIELD_SUPPORT_2(mdev, inner_l4_type_ext);
++}
++
+ void mlx5e_set_ttc_params(struct mlx5e_flow_steering *fs,
+ 			  struct mlx5e_rx_res *rx_res,
+ 			  struct ttc_params *ttc_params, bool tunnel,
+@@ -925,9 +935,12 @@ void mlx5e_set_ttc_params(struct mlx5e_f
+ 	ft_attr->prio = MLX5E_NIC_PRIO;
+ 
+ 	ttc_params->ipsec_rss = ipsec_rss &&
+-		MLX5_CAP_NIC_RX_FT_FIELD_SUPPORT_2(fs->mdev, ipsec_next_header);
++				mlx5e_ipsec_rss_supported(fs->mdev);
+ 
+ 	for (tt = 0; tt < MLX5_NUM_TT; tt++) {
++		if (mlx5_ttc_is_decrypted_esp_tt(tt))
++			continue;
++
+ 		ttc_params->dests[tt].type = MLX5_FLOW_DESTINATION_TYPE_TIR;
+ 		ttc_params->dests[tt].tir_num =
+ 			tt == MLX5_TT_ANY ?
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@ -838,6 +838,9 @@ static void mlx5e_hairpin_set_ttc_params
+ 
+ 	ttc_params->ns_type = MLX5_FLOW_NAMESPACE_KERNEL;
+ 	for (tt = 0; tt < MLX5_NUM_TT; tt++) {
++		if (mlx5_ttc_is_decrypted_esp_tt(tt))
++			continue;
++
+ 		ttc_params->dests[tt].type = MLX5_FLOW_DESTINATION_TYPE_TIR;
+ 		ttc_params->dests[tt].tir_num =
+ 			tt == MLX5_TT_ANY ?
+--- a/drivers/net/ethernet/mellanox/mlx5/core/lib/fs_ttc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/lib/fs_ttc.c
+@@ -9,7 +9,7 @@
+ #include "mlx5_core.h"
+ #include "lib/fs_ttc.h"
+ 
+-#define MLX5_TTC_MAX_NUM_GROUPS		5
++#define MLX5_TTC_MAX_NUM_GROUPS		7
+ #define MLX5_TTC_GROUP_TCPUDP_SIZE	(MLX5_TT_IPV6_UDP + 1)
+ 
+ struct mlx5_fs_ttc_groups {
+@@ -188,10 +188,12 @@ static const struct mlx5_fs_ttc_groups t
+ 		},
+ 	},
+ 	[TTC_GROUPS_DEFAULT_ESP] = {
+-		.num_groups = 4,
++		.num_groups = 6,
+ 		.group_size = {
+ 			MLX5_TTC_GROUP_TCPUDP_SIZE + BIT(1) +
+ 			MLX5_NUM_TUNNEL_TT,
++			BIT(2), /* decrypted outer L4 */
++			BIT(2), /* decrypted inner L4 */
+ 			BIT(1), /* ESP */
+ 			BIT(1),
+ 			BIT(0),
+@@ -199,10 +201,12 @@ static const struct mlx5_fs_ttc_groups t
+ 	},
+ 	[TTC_GROUPS_USE_L4_TYPE_ESP] = {
+ 		.use_l4_type = true,
+-		.num_groups = 5,
++		.num_groups = 7,
+ 		.group_size = {
+ 			MLX5_TTC_GROUP_TCPUDP_SIZE,
+ 			BIT(1) + MLX5_NUM_TUNNEL_TT,
++			BIT(2), /* decrypted outer L4 */
++			BIT(2), /* decrypted inner L4 */
+ 			BIT(1), /* ESP */
+ 			BIT(1),
+ 			BIT(0),
+@@ -391,6 +395,9 @@ static int mlx5_generate_ttc_table_rules
+ 	for (tt = 0; tt < MLX5_NUM_TT; tt++) {
+ 		struct mlx5_ttc_rule *rule = &rules[tt];
+ 
++		if (mlx5_ttc_is_decrypted_esp_tt(tt))
++			continue;
++
+ 		if (test_bit(tt, params->ignore_dests))
+ 			continue;
+ 		rule->rule = mlx5_generate_ttc_rule(dev, ft, &params->dests[tt],
+@@ -436,15 +443,55 @@ del_rules:
+ }
+ 
+ static int mlx5_create_ttc_table_ipsec_groups(struct mlx5_ttc_table *ttc,
++					      bool use_ipv,
+ 					      u32 *in, int *next_ix)
+ {
+ 	u8 *mc = MLX5_ADDR_OF(create_flow_group_in, in, match_criteria);
+ 	const struct mlx5_fs_ttc_groups *groups = ttc->groups;
+ 	int ix = *next_ix;
+ 
++	MLX5_SET(fte_match_param, mc, outer_headers.ip_protocol, 0);
++
++	/* decrypted ESP outer group */
++	MLX5_SET_CFG(in, match_criteria_enable, MLX5_MATCH_OUTER_HEADERS);
++	MLX5_SET_TO_ONES(fte_match_param, mc, outer_headers.l4_type_ext);
++	MLX5_SET_CFG(in, start_flow_index, ix);
++	ix += groups->group_size[ttc->num_groups];
++	MLX5_SET_CFG(in, end_flow_index, ix - 1);
++	ttc->g[ttc->num_groups] = mlx5_create_flow_group(ttc->t, in);
++	if (IS_ERR(ttc->g[ttc->num_groups]))
++		goto err;
++	ttc->num_groups++;
++
++	MLX5_SET(fte_match_param, mc, outer_headers.l4_type_ext, 0);
++
++	/* decrypted ESP inner group */
++	MLX5_SET_CFG(in, match_criteria_enable, MLX5_MATCH_INNER_HEADERS);
++	if (use_ipv)
++		MLX5_SET(fte_match_param, mc, outer_headers.ip_version, 0);
++	else
++		MLX5_SET(fte_match_param, mc, outer_headers.ethertype, 0);
++	MLX5_SET_TO_ONES(fte_match_param, mc, inner_headers.ip_version);
++	MLX5_SET_TO_ONES(fte_match_param, mc, inner_headers.l4_type_ext);
++	MLX5_SET_CFG(in, start_flow_index, ix);
++	ix += groups->group_size[ttc->num_groups];
++	MLX5_SET_CFG(in, end_flow_index, ix - 1);
++	ttc->g[ttc->num_groups] = mlx5_create_flow_group(ttc->t, in);
++	if (IS_ERR(ttc->g[ttc->num_groups]))
++		goto err;
++	ttc->num_groups++;
++
++	MLX5_SET(fte_match_param, mc, inner_headers.ip_version, 0);
++	MLX5_SET(fte_match_param, mc, inner_headers.l4_type_ext, 0);
++
+ 	/* undecrypted ESP group */
+ 	MLX5_SET_CFG(in, match_criteria_enable,
+ 		     MLX5_MATCH_OUTER_HEADERS | MLX5_MATCH_MISC_PARAMETERS_2);
++	if (use_ipv)
++		MLX5_SET_TO_ONES(fte_match_param, mc, outer_headers.ip_version);
++	else
++		MLX5_SET_TO_ONES(fte_match_param, mc, outer_headers.ethertype);
++	MLX5_SET_TO_ONES(fte_match_param, mc, outer_headers.ip_protocol);
+ 	MLX5_SET_TO_ONES(fte_match_param, mc,
+ 			 misc_parameters_2.ipsec_next_header);
+ 	MLX5_SET_CFG(in, start_flow_index, ix);
+@@ -515,7 +562,7 @@ static int mlx5_create_ttc_table_groups(
+ 	ttc->num_groups++;
+ 
+ 	if (mlx5_ttc_has_esp_flow_group(ttc)) {
+-		err = mlx5_create_ttc_table_ipsec_groups(ttc, in, &ix);
++		err = mlx5_create_ttc_table_ipsec_groups(ttc, use_ipv, in, &ix);
+ 		if (err)
+ 			goto err;
+ 
+@@ -615,6 +662,9 @@ static int mlx5_generate_inner_ttc_table
+ 	for (tt = 0; tt < MLX5_NUM_TT; tt++) {
+ 		struct mlx5_ttc_rule *rule = &rules[tt];
+ 
++		if (mlx5_ttc_is_decrypted_esp_tt(tt))
++			continue;
++
+ 		if (test_bit(tt, params->ignore_dests))
+ 			continue;
+ 		rule->rule = mlx5_generate_inner_ttc_rule(dev, ft,
+--- a/drivers/net/ethernet/mellanox/mlx5/core/lib/fs_ttc.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/lib/fs_ttc.h
+@@ -18,6 +18,14 @@ enum mlx5_traffic_types {
+ 	MLX5_TT_IPV4,
+ 	MLX5_TT_IPV6,
+ 	MLX5_TT_ANY,
++	MLX5_TT_DECRYPTED_ESP_OUTER_IPV4_TCP,
++	MLX5_TT_DECRYPTED_ESP_OUTER_IPV6_TCP,
++	MLX5_TT_DECRYPTED_ESP_OUTER_IPV4_UDP,
++	MLX5_TT_DECRYPTED_ESP_OUTER_IPV6_UDP,
++	MLX5_TT_DECRYPTED_ESP_INNER_IPV4_TCP,
++	MLX5_TT_DECRYPTED_ESP_INNER_IPV6_TCP,
++	MLX5_TT_DECRYPTED_ESP_INNER_IPV4_UDP,
++	MLX5_TT_DECRYPTED_ESP_INNER_IPV6_UDP,
+ 	MLX5_NUM_TT,
+ 	MLX5_NUM_INDIR_TIRS = MLX5_TT_ANY,
+ };
+@@ -72,5 +80,10 @@ bool mlx5_tunnel_inner_ft_supported(stru
+ u8 mlx5_get_proto_by_tunnel_type(enum mlx5_tunnel_types tt);
+ 
+ bool mlx5_ttc_has_esp_flow_group(struct mlx5_ttc_table *ttc);
++static inline bool mlx5_ttc_is_decrypted_esp_tt(enum mlx5_traffic_types tt)
++{
++	return tt >= MLX5_TT_DECRYPTED_ESP_OUTER_IPV4_TCP &&
++	       tt <= MLX5_TT_DECRYPTED_ESP_INNER_IPV6_UDP;
++}
+ 
+ #endif /* __MLX5_FS_TTC_H__ */
