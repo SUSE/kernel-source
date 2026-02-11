@@ -1,0 +1,357 @@
+From: Leon Romanovsky <leonro@nvidia.com>
+Date: Wed, 19 Feb 2025 15:51:00 +0200
+Subject: xfrm: provide common xdo_dev_offload_ok callback implementation
+Patch-mainline: v6.15-rc1
+Git-commit: cc18f482e8b60a2bcf2d7d57b48740bd0837fc04
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+Almost all drivers except bond and nsim had same check if device
+can perform XFRM offload on that specific packet. The check was that
+packet doesn't have IPv4 options and IPv6 extensions.
+
+In NIC drivers, the IPv4 HELEN comparison was slightly different, but
+the intent was to check for the same conditions. So let's chose more
+strict variant as a common base.
+
+Reviewed-by: Zhu Yanjun <yanjun.zhu@linux.dev>
+Signed-off-by: Leon Romanovsky <leonro@nvidia.com>
+Signed-off-by: Steffen Klassert <steffen.klassert@secunet.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ Documentation/networking/xfrm_device.rst                         |    3 -
+ drivers/net/bonding/bond_main.c                                  |   16 ++-----
+ drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c                  |   21 ----------
+ drivers/net/ethernet/chelsio/inline_crypto/ch_ipsec/chcr_ipsec.c |   16 -------
+ drivers/net/ethernet/intel/ixgbe/ixgbe_ipsec.c                   |   21 ----------
+ drivers/net/ethernet/intel/ixgbevf/ipsec.c                       |   21 ----------
+ drivers/net/ethernet/marvell/octeontx2/nic/cn10k_ipsec.c         |   15 -------
+ drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.c         |   16 -------
+ drivers/net/ethernet/netronome/nfp/crypto/ipsec.c                |   11 -----
+ drivers/net/netdevsim/ipsec.c                                    |   11 -----
+ drivers/net/netdevsim/netdevsim.h                                |    1 
+ net/xfrm/xfrm_device.c                                           |   15 +++++++
+ 12 files changed, 22 insertions(+), 145 deletions(-)
+
+--- a/Documentation/networking/xfrm_device.rst
++++ b/Documentation/networking/xfrm_device.rst
+@@ -126,7 +126,8 @@ been setup for offload, it first calls i
+ the skb and the intended offload state to ask the driver if the offload
+ will serviceable.  This can check the packet information to be sure the
+ offload can be supported (e.g. IPv4 or IPv6, no IPv4 options, etc) and
+-return true of false to signify its support.
++return true or false to signify its support. In case driver doesn't implement
++this callback, the stack provides reasonable defaults.
+ 
+ Crypto offload mode:
+ When ready to send, the driver needs to inspect the Tx packet for the
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@ -676,22 +676,16 @@ out:
+ static bool bond_ipsec_offload_ok(struct sk_buff *skb, struct xfrm_state *xs)
+ {
+ 	struct net_device *real_dev;
+-	bool ok = false;
+ 
+ 	rcu_read_lock();
+ 	real_dev = bond_ipsec_dev(xs);
+-	if (!real_dev)
+-		goto out;
++	if (!real_dev || netif_is_bond_master(real_dev)) {
++		rcu_read_unlock();
++		return false;
++	}
+ 
+-	if (!real_dev->xfrmdev_ops ||
+-	    !real_dev->xfrmdev_ops->xdo_dev_offload_ok ||
+-	    netif_is_bond_master(real_dev))
+-		goto out;
+-
+-	ok = real_dev->xfrmdev_ops->xdo_dev_offload_ok(skb, xs);
+-out:
+ 	rcu_read_unlock();
+-	return ok;
++	return true;
+ }
+ 
+ /**
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+@@ -6550,26 +6550,6 @@ out_unlock:
+ 	mutex_unlock(&uld_mutex);
+ }
+ 
+-static bool cxgb4_ipsec_offload_ok(struct sk_buff *skb, struct xfrm_state *x)
+-{
+-	struct adapter *adap = netdev2adap(x->xso.dev);
+-	bool ret = false;
+-
+-	if (!mutex_trylock(&uld_mutex)) {
+-		dev_dbg(adap->pdev_dev,
+-			"crypto uld critical resource is under use\n");
+-		return ret;
+-	}
+-	if (chcr_offload_state(adap, CXGB4_XFRMDEV_OPS))
+-		goto out_unlock;
+-
+-	ret = adap->uld[CXGB4_ULD_IPSEC].xfrmdev_ops->xdo_dev_offload_ok(skb, x);
+-
+-out_unlock:
+-	mutex_unlock(&uld_mutex);
+-	return ret;
+-}
+-
+ static void cxgb4_advance_esn_state(struct xfrm_state *x)
+ {
+ 	struct adapter *adap = netdev2adap(x->xso.dev);
+@@ -6595,7 +6575,6 @@ static const struct xfrmdev_ops cxgb4_xf
+ 	.xdo_dev_state_add      = cxgb4_xfrm_add_state,
+ 	.xdo_dev_state_delete   = cxgb4_xfrm_del_state,
+ 	.xdo_dev_state_free     = cxgb4_xfrm_free_state,
+-	.xdo_dev_offload_ok     = cxgb4_ipsec_offload_ok,
+ 	.xdo_dev_state_advance_esn = cxgb4_advance_esn_state,
+ };
+ 
+--- a/drivers/net/ethernet/chelsio/inline_crypto/ch_ipsec/chcr_ipsec.c
++++ b/drivers/net/ethernet/chelsio/inline_crypto/ch_ipsec/chcr_ipsec.c
+@@ -71,7 +71,6 @@
+ static LIST_HEAD(uld_ctx_list);
+ static DEFINE_MUTEX(dev_mutex);
+ 
+-static bool ch_ipsec_offload_ok(struct sk_buff *skb, struct xfrm_state *x);
+ static int ch_ipsec_uld_state_change(void *handle, enum cxgb4_state new_state);
+ static int ch_ipsec_xmit(struct sk_buff *skb, struct net_device *dev);
+ static void *ch_ipsec_uld_add(const struct cxgb4_lld_info *infop);
+@@ -85,7 +84,6 @@ static const struct xfrmdev_ops ch_ipsec
+ 	.xdo_dev_state_add      = ch_ipsec_xfrm_add_state,
+ 	.xdo_dev_state_delete   = ch_ipsec_xfrm_del_state,
+ 	.xdo_dev_state_free     = ch_ipsec_xfrm_free_state,
+-	.xdo_dev_offload_ok     = ch_ipsec_offload_ok,
+ 	.xdo_dev_state_advance_esn = ch_ipsec_advance_esn_state,
+ };
+ 
+@@ -323,20 +321,6 @@ static void ch_ipsec_xfrm_free_state(str
+ 	module_put(THIS_MODULE);
+ }
+ 
+-static bool ch_ipsec_offload_ok(struct sk_buff *skb, struct xfrm_state *x)
+-{
+-	if (x->props.family == AF_INET) {
+-		/* Offload with IP options is not supported yet */
+-		if (ip_hdr(skb)->ihl > 5)
+-			return false;
+-	} else {
+-		/* Offload with IPv6 extension headers is not support yet */
+-		if (ipv6_ext_hdr(ipv6_hdr(skb)->nexthdr))
+-			return false;
+-	}
+-	return true;
+-}
+-
+ static void ch_ipsec_advance_esn_state(struct xfrm_state *x)
+ {
+ 	/* do nothing */
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_ipsec.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_ipsec.c
+@@ -817,30 +817,9 @@ static void ixgbe_ipsec_del_sa(struct xf
+ 	}
+ }
+ 
+-/**
+- * ixgbe_ipsec_offload_ok - can this packet use the xfrm hw offload
+- * @skb: current data packet
+- * @xs: pointer to transformer state struct
+- **/
+-static bool ixgbe_ipsec_offload_ok(struct sk_buff *skb, struct xfrm_state *xs)
+-{
+-	if (xs->props.family == AF_INET) {
+-		/* Offload with IPv4 options is not supported yet */
+-		if (ip_hdr(skb)->ihl != 5)
+-			return false;
+-	} else {
+-		/* Offload with IPv6 extension headers is not support yet */
+-		if (ipv6_ext_hdr(ipv6_hdr(skb)->nexthdr))
+-			return false;
+-	}
+-
+-	return true;
+-}
+-
+ static const struct xfrmdev_ops ixgbe_xfrmdev_ops = {
+ 	.xdo_dev_state_add = ixgbe_ipsec_add_sa,
+ 	.xdo_dev_state_delete = ixgbe_ipsec_del_sa,
+-	.xdo_dev_offload_ok = ixgbe_ipsec_offload_ok,
+ };
+ 
+ /**
+--- a/drivers/net/ethernet/intel/ixgbevf/ipsec.c
++++ b/drivers/net/ethernet/intel/ixgbevf/ipsec.c
+@@ -428,30 +428,9 @@ static void ixgbevf_ipsec_del_sa(struct
+ 	}
+ }
+ 
+-/**
+- * ixgbevf_ipsec_offload_ok - can this packet use the xfrm hw offload
+- * @skb: current data packet
+- * @xs: pointer to transformer state struct
+- **/
+-static bool ixgbevf_ipsec_offload_ok(struct sk_buff *skb, struct xfrm_state *xs)
+-{
+-	if (xs->props.family == AF_INET) {
+-		/* Offload with IPv4 options is not supported yet */
+-		if (ip_hdr(skb)->ihl != 5)
+-			return false;
+-	} else {
+-		/* Offload with IPv6 extension headers is not support yet */
+-		if (ipv6_ext_hdr(ipv6_hdr(skb)->nexthdr))
+-			return false;
+-	}
+-
+-	return true;
+-}
+-
+ static const struct xfrmdev_ops ixgbevf_xfrmdev_ops = {
+ 	.xdo_dev_state_add = ixgbevf_ipsec_add_sa,
+ 	.xdo_dev_state_delete = ixgbevf_ipsec_del_sa,
+-	.xdo_dev_offload_ok = ixgbevf_ipsec_offload_ok,
+ };
+ 
+ /**
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/cn10k_ipsec.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/cn10k_ipsec.c
+@@ -744,24 +744,9 @@ static void cn10k_ipsec_del_state(struct
+ 		queue_work(pf->ipsec.sa_workq, &pf->ipsec.sa_work);
+ }
+ 
+-static bool cn10k_ipsec_offload_ok(struct sk_buff *skb, struct xfrm_state *x)
+-{
+-	if (x->props.family == AF_INET) {
+-		/* Offload with IPv4 options is not supported yet */
+-		if (ip_hdr(skb)->ihl > 5)
+-			return false;
+-	} else {
+-		/* Offload with IPv6 extension headers is not support yet */
+-		if (ipv6_ext_hdr(ipv6_hdr(skb)->nexthdr))
+-			return false;
+-	}
+-	return true;
+-}
+-
+ static const struct xfrmdev_ops cn10k_ipsec_xfrmdev_ops = {
+ 	.xdo_dev_state_add	= cn10k_ipsec_add_state,
+ 	.xdo_dev_state_delete	= cn10k_ipsec_del_state,
+-	.xdo_dev_offload_ok	= cn10k_ipsec_offload_ok,
+ };
+ 
+ static void cn10k_ipsec_sa_wq_handler(struct work_struct *work)
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.c
+@@ -966,21 +966,6 @@ void mlx5e_ipsec_cleanup(struct mlx5e_pr
+ 	priv->ipsec = NULL;
+ }
+ 
+-static bool mlx5e_ipsec_offload_ok(struct sk_buff *skb, struct xfrm_state *x)
+-{
+-	if (x->props.family == AF_INET) {
+-		/* Offload with IPv4 options is not supported yet */
+-		if (ip_hdr(skb)->ihl > 5)
+-			return false;
+-	} else {
+-		/* Offload with IPv6 extension headers is not support yet */
+-		if (ipv6_ext_hdr(ipv6_hdr(skb)->nexthdr))
+-			return false;
+-	}
+-
+-	return true;
+-}
+-
+ static void mlx5e_xfrm_advance_esn_state(struct xfrm_state *x)
+ {
+ 	struct mlx5e_ipsec_sa_entry *sa_entry = to_ipsec_sa_entry(x);
+@@ -1247,7 +1232,6 @@ static const struct xfrmdev_ops mlx5e_ip
+ 	.xdo_dev_state_add	= mlx5e_xfrm_add_state,
+ 	.xdo_dev_state_delete	= mlx5e_xfrm_del_state,
+ 	.xdo_dev_state_free	= mlx5e_xfrm_free_state,
+-	.xdo_dev_offload_ok	= mlx5e_ipsec_offload_ok,
+ 	.xdo_dev_state_advance_esn = mlx5e_xfrm_advance_esn_state,
+ 
+ 	.xdo_dev_state_update_stats = mlx5e_xfrm_update_stats,
+--- a/drivers/net/ethernet/netronome/nfp/crypto/ipsec.c
++++ b/drivers/net/ethernet/netronome/nfp/crypto/ipsec.c
+@@ -565,20 +565,9 @@ static void nfp_net_xfrm_del_state(struc
+ 	xa_erase(&nn->xa_ipsec, x->xso.offload_handle - 1);
+ }
+ 
+-static bool nfp_net_ipsec_offload_ok(struct sk_buff *skb, struct xfrm_state *x)
+-{
+-	if (x->props.family == AF_INET)
+-		/* Offload with IPv4 options is not supported yet */
+-		return ip_hdr(skb)->ihl == 5;
+-
+-	/* Offload with IPv6 extension headers is not support yet */
+-	return !(ipv6_ext_hdr(ipv6_hdr(skb)->nexthdr));
+-}
+-
+ static const struct xfrmdev_ops nfp_net_ipsec_xfrmdev_ops = {
+ 	.xdo_dev_state_add = nfp_net_xfrm_add_state,
+ 	.xdo_dev_state_delete = nfp_net_xfrm_del_state,
+-	.xdo_dev_offload_ok = nfp_net_ipsec_offload_ok,
+ };
+ 
+ void nfp_net_ipsec_init(struct nfp_net *nn)
+--- a/drivers/net/netdevsim/ipsec.c
++++ b/drivers/net/netdevsim/ipsec.c
+@@ -217,20 +217,9 @@ static void nsim_ipsec_del_sa(struct xfr
+ 	ipsec->count--;
+ }
+ 
+-static bool nsim_ipsec_offload_ok(struct sk_buff *skb, struct xfrm_state *xs)
+-{
+-	struct netdevsim *ns = netdev_priv(xs->xso.real_dev);
+-	struct nsim_ipsec *ipsec = &ns->ipsec;
+-
+-	ipsec->ok++;
+-
+-	return true;
+-}
+-
+ static const struct xfrmdev_ops nsim_xfrmdev_ops = {
+ 	.xdo_dev_state_add	= nsim_ipsec_add_sa,
+ 	.xdo_dev_state_delete	= nsim_ipsec_del_sa,
+-	.xdo_dev_offload_ok	= nsim_ipsec_offload_ok,
+ };
+ 
+ bool nsim_ipsec_tx(struct netdevsim *ns, struct sk_buff *skb)
+--- a/drivers/net/netdevsim/netdevsim.h
++++ b/drivers/net/netdevsim/netdevsim.h
+@@ -54,7 +54,6 @@ struct nsim_ipsec {
+ 	struct dentry *pfile;
+ 	u32 count;
+ 	u32 tx;
+-	u32 ok;
+ };
+ 
+ #define NSIM_MACSEC_MAX_SECY_COUNT 3
+--- a/net/xfrm/xfrm_device.c
++++ b/net/xfrm/xfrm_device.c
+@@ -433,6 +433,21 @@ bool xfrm_dev_offload_ok(struct sk_buff
+ 	return false;
+ 
+ ok:
++	switch (x->props.family) {
++	case AF_INET:
++		/* Check for IPv4 options */
++		if (ip_hdr(skb)->ihl != 5)
++			return false;
++		break;
++	case AF_INET6:
++		/* Check for IPv6 extensions */
++		if (ipv6_ext_hdr(ipv6_hdr(skb)->nexthdr))
++			return false;
++		break;
++	default:
++		break;
++	}
++
+ 	if (dev->xfrmdev_ops->xdo_dev_offload_ok)
+ 		return dev->xfrmdev_ops->xdo_dev_offload_ok(skb, x);
+ 
