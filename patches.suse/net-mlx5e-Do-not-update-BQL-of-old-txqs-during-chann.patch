@@ -1,0 +1,58 @@
+From: Tariq Toukan <tariqt@nvidia.com>
+Date: Tue, 9 Dec 2025 14:56:16 +0200
+Subject: net/mlx5e: Do not update BQL of old txqs during channel
+ reconfiguration
+Patch-mainline: v6.19-rc2
+Git-commit: c8591decd9dbf395cb8ae398e70b0438fdd24aee
+References: jsc#PED-14197 jsc#PED-14199 jsc#PED-15315
+
+During channel reconfiguration (e.g., ethtool private flags changes),
+the driver can trigger a kernel BUG_ON in dql_completed() with the error
+"kernel BUG at lib/dynamic_queue_limits.c:99".
+
+The issue occurs in the following sequence:
+
+During mlx5e_safe_switch_params(), old channels are deactivated via
+mlx5e_deactivate_txqsq(). New channels are created and activated, taking
+ownership of the netdev_queues and their BQL state.
+
+When old channels are closed via mlx5e_close_txqsq(), there may be
+pending TX descriptors (sq->cc != sq->pc) that were in-flight during the
+deactivation.
+
+mlx5e_free_txqsq_descs() frees these pending descriptors and attempts to
+complete them via netdev_tx_completed_queue().
+
+However, the BQL state (dql->num_queued and dql->num_completed) have
+been reset in mlx5e_activate_txqsq and belong to the new queue owner,
+leading to dql->num_queued - dql->num_completed < nbytes.
+
+This triggers BUG_ON(count > num_queued - num_completed) in
+dql_completed().
+
+Fixes: 3b88a535a8e1 ("net/mlx5e: Defer channels closure to reduce interface down time")
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Signed-off-by: William Tu <witu@nvidia.com>
+Reviewed-by: Dragos Tatulea <dtatulea@nvidia.com>
+Link: https://patch.msgid.link/1765284977-1363052-9-git-send-email-tariqt@nvidia.com
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en_tx.c |    6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+@@ -933,7 +933,11 @@ void mlx5e_free_txqsq_descs(struct mlx5e
+ 	sq->dma_fifo_cc = dma_fifo_cc;
+ 	sq->cc = sqcc;
+ 
+-	netdev_tx_completed_queue(sq->txq, npkts, nbytes);
++	/* Do not update BQL for TXQs that got replaced by new active ones, as
++	 * netdev_tx_reset_queue() is called for them in mlx5e_activate_txqsq().
++	 */
++	if (sq == sq->priv->txq2sq[sq->txq_ix])
++		netdev_tx_completed_queue(sq->txq, npkts, nbytes);
+ }
+ 
+ #ifdef CONFIG_MLX5_CORE_IPOIB
