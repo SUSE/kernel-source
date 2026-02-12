@@ -1,0 +1,284 @@
+From 949d817c78cc6416d6e22f3f72a6960cd7412755 Mon Sep 17 00:00:00 2001
+From: Srinivasan Shanmugam <srinivasan.shanmugam@amd.com>
+Date: Wed, 30 Oct 2024 14:41:41 +0530
+Subject: drm/amdgpu/gfx11: Add cleaner shader for GFX11.0.3
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 949d817c78cc6416d6e22f3f72a6960cd7412755
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+This commit adds the cleaner shader microcode for GFX11.0.3 GPUs. The
+cleaner shader is a piece of GPU code that is used to clear or
+initialize certain GPU resources, such as Local Data Share (LDS), Vector
+General Purpose Registers (VGPRs), and Scalar General Purpose Registers
+(SGPRs).
+
+Clearing these resources is important for ensuring data isolation
+between different workloads running on the GPU. Without the cleaner
+shader, residual data from a previous workload could potentially be
+accessed by a subsequent workload, leading to data leaks and incorrect
+computation results.
+
+The cleaner shader microcode is represented as an array of 32-bit words
+(`gfx_11_0_3_cleaner_shader_hex`). This array is the binary
+representation of the cleaner shader code, which is written in a
+low-level GPU instruction set.
+
+When the cleaner shader feature is enabled, the AMDGPU driver loads this
+array into a specific location in the GPU memory. The GPU then reads
+this memory location to fetch and execute the cleaner shader
+instructions.
+
+The cleaner shader is executed automatically by the GPU at the end of
+each workload, before the next workload starts. This ensures that all
+GPU resources are in a clean state before the start of each workload.
+
+This addition is part of the cleaner shader feature implementation. The
+cleaner shader feature helps resource utilization by cleaning up GPU
+resources after they are used. It also enhances security and reliability
+by preventing data leaks between workloads.
+
+Cc: Christian König <christian.koenig@amd.com>
+Cc: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Srinivasan Shanmugam <srinivasan.shanmugam@amd.com>
+Suggested-by: Alex Deucher <alexander.deucher@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c        |  17 +++
+ .../amd/amdgpu/gfx_v11_0_3_cleaner_shader.asm | 118 ++++++++++++++++++
+ .../drm/amd/amdgpu/gfx_v11_0_cleaner_shader.h |  56 +++++++++
+ 3 files changed, 191 insertions(+)
+ create mode 100644 drivers/gpu/drm/amd/amdgpu/gfx_v11_0_3_cleaner_shader.asm
+ create mode 100644 drivers/gpu/drm/amd/amdgpu/gfx_v11_0_cleaner_shader.h
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c
+index cfe17a36b8ee..62e4c446793d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c
+@@ -46,6 +46,7 @@
+ #include "clearstate_gfx11.h"
+ #include "v11_structs.h"
+ #include "gfx_v11_0.h"
++#include "gfx_v11_0_cleaner_shader.h"
+ #include "gfx_v11_0_3.h"
+ #include "nbio_v4_3.h"
+ #include "mes_v11_0.h"
+@@ -1579,8 +1580,24 @@ static int gfx_v11_0_sw_init(struct amdgpu_ip_block *ip_block)
+ 	}
+ 
+ 	switch (amdgpu_ip_version(adev, GC_HWIP, 0)) {
++	case IP_VERSION(11, 0, 3):
++		adev->gfx.cleaner_shader_ptr = gfx_11_0_3_cleaner_shader_hex;
++		adev->gfx.cleaner_shader_size = sizeof(gfx_11_0_3_cleaner_shader_hex);
++		if (adev->gfx.me_fw_version  >= 2280 &&
++		    adev->gfx.pfp_fw_version >= 2370 &&
++		    adev->gfx.mec_fw_version >= 2450  &&
++		    adev->mes.fw_version[0] >= 99) {
++			adev->gfx.enable_cleaner_shader = true;
++			r = amdgpu_gfx_cleaner_shader_sw_init(adev, adev->gfx.cleaner_shader_size);
++			if (r) {
++				adev->gfx.enable_cleaner_shader = false;
++				dev_err(adev->dev, "Failed to initialize cleaner shader\n");
++			}
++		}
++		break;
+ 	default:
+ 		adev->gfx.enable_cleaner_shader = false;
++		break;
+ 	}
+ 
+ 	/* Enable CG flag in one VF mode for enabling RLC safe mode enter/exit */
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v11_0_3_cleaner_shader.asm b/drivers/gpu/drm/amd/amdgpu/gfx_v11_0_3_cleaner_shader.asm
+new file mode 100644
+index 000000000000..9b90b66368c7
+--- /dev/null
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v11_0_3_cleaner_shader.asm
+@@ -0,0 +1,118 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * Copyright 2024 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ */
++
++// This shader is to clean LDS, SGPRs and VGPRs. It is  first 64 Dwords or 256 bytes of 192 Dwords cleaner shader.
++//To turn this shader program on for complitaion change this to main and lower shader main to main_1
++
++// Navi3 : Clear SGPRs, VGPRs and LDS
++//   Launch 32 waves per CU (16 per SIMD) as a workgroup (threadgroup) to fill every wave slot
++//   Waves are "wave32" and have 64 VGPRs each, which uses all 1024 VGPRs per SIMD
++//   Waves are launched in "CU" mode, and the workgroup shares 64KB of LDS (half of the WGP's LDS)
++//      It takes 2 workgroups to use all of LDS: one on each CU of the WGP
++//   Each wave clears SGPRs 0 - 107
++//   Each wave clears VGPRs 0 - 63
++//   The first wave of the workgroup clears its 64KB of LDS
++//   The shader starts with "S_BARRIER" to ensure SPI has launched all waves of the workgroup
++//       before any wave in the workgroup could end.  Without this, it is possible not all SGPRs get cleared.
++
++shader main
++  asic(GFX11)
++  type(CS)
++  wave_size(32)
++// Note: original source code from SQ team
++
++// Takes about 2500 clocks to run.
++//   (theorhetical fastest = 1024clks vgpr + 640lds = 1660 clks)
++//
++  S_BARRIER
++
++  //
++  // CLEAR VGPRs
++  //
++  s_mov_b32     m0, 0x00000058  // Loop 96/8=12 times  (loop unrolled for performance)
++
++label_0005:
++  v_movreld_b32     v0, 0
++  v_movreld_b32     v1, 0
++  v_movreld_b32     v2, 0
++  v_movreld_b32     v3, 0
++  v_movreld_b32     v4, 0
++  v_movreld_b32     v5, 0
++  v_movreld_b32     v6, 0
++  v_movreld_b32     v7, 0
++  s_sub_u32     m0, m0, 8
++  s_cbranch_scc0  label_0005
++  //
++  //
++
++  s_mov_b32     s2, 0x80000000                      // Bit31 is first_wave
++  s_and_b32     s2, s2, s0                          // sgpr0 has tg_size (first_wave) term as in ucode only COMPUTE_PGM_RSRC2.tg_size_en is set
++  s_cbranch_scc0  label_0023                        // Clean LDS if its first wave of ThreadGroup/WorkGroup
++  // CLEAR LDS
++  //
++  s_mov_b32 exec_lo, 0xffffffff
++  s_mov_b32 exec_hi, 0xffffffff
++  v_mbcnt_lo_u32_b32  v1, exec_hi, 0          // Set V1 to thread-ID (0..63)
++  v_mbcnt_hi_u32_b32  v1, exec_lo, v1        // Set V1 to thread-ID (0..63)
++  v_mul_u32_u24  v1, 0x00000008, v1          // * 8, so each thread is a double-dword address (8byte)
++  s_mov_b32     s2, 0x00000003f                    // 64 loop iterations
++  s_mov_b32     m0, 0xffffffff
++  // Clear all of LDS space
++  // Each FirstWave of WorkGroup clears 64kbyte block
++
++label_001F:
++  ds_write2_b64  v1, v[2:3], v[2:3] offset1:32
++  ds_write2_b64  v1, v[4:5], v[4:5] offset0:64 offset1:96
++  v_add_co_u32     v1, vcc, 0x00000400, v1
++  s_sub_u32     s2, s2, 1
++  s_cbranch_scc0  label_001F
++  //
++  // CLEAR SGPRs
++  //
++label_0023:
++  s_mov_b32     m0, 0x00000068  // Loop 108/4=27 times  (loop unrolled for performance)
++label_sgpr_loop:
++  s_movreld_b32     s0, 0
++  s_movreld_b32     s1, 0
++  s_movreld_b32     s2, 0
++  s_movreld_b32     s3, 0
++  s_sub_u32         m0, m0, 4
++  s_cbranch_scc0  label_sgpr_loop
++
++  //clear vcc
++  s_mov_b64 vcc, 0          //clear vcc
++  s_mov_b32 flat_scratch_lo, 0   //clear  flat scratch lo SGPR
++  s_mov_b32 flat_scratch_hi, 0   //clear  flat scratch hi SGPR
++  s_mov_b64 ttmp0, 0        //Clear ttmp0 and ttmp1
++  s_mov_b64 ttmp2, 0        //Clear ttmp2 and ttmp3
++  s_mov_b64 ttmp4, 0        //Clear ttmp4 and ttmp5
++  s_mov_b64 ttmp6, 0        //Clear ttmp6 and ttmp7
++  s_mov_b64 ttmp8, 0        //Clear ttmp8 and ttmp9
++  s_mov_b64 ttmp10, 0       //Clear ttmp10 and ttmp11
++  s_mov_b64 ttmp12, 0       //Clear ttmp12 and ttmp13
++  s_mov_b64 ttmp14, 0       //Clear ttmp14 and ttmp15
++
++ s_endpgm
++
++end
++
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v11_0_cleaner_shader.h b/drivers/gpu/drm/amd/amdgpu/gfx_v11_0_cleaner_shader.h
+new file mode 100644
+index 000000000000..3218cc04f543
+--- /dev/null
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v11_0_cleaner_shader.h
+@@ -0,0 +1,56 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * Copyright 2024 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ */
++
++/* Define the cleaner shader gfx_11_0_3 */
++static const u32 gfx_11_0_3_cleaner_shader_hex[] = {
++	0xb0804006, 0xbe8200ff,
++	0x00000058, 0xbefd0080,
++	0x7e008480, 0x7e028480,
++	0x7e048480, 0x7e068480,
++	0x7e088480, 0x7e0a8480,
++	0x7e0c8480, 0x7e0e8480,
++	0xbefd0002, 0x80828802,
++	0xbfa1fff5, 0xbe8200ff,
++	0x80000000, 0x8b020002,
++	0xbfa10012, 0xbefe00c1,
++	0xbeff00c1, 0xd71f0001,
++	0x0001007f, 0xd7200001,
++	0x0002027e, 0x16020288,
++	0xbe8200bf, 0xbefd00c1,
++	0xd9382000, 0x00020201,
++	0xd9386040, 0x00040401,
++	0xd7006a01, 0x000202ff,
++	0x00000400, 0x80828102,
++	0xbfa1fff7, 0xbefd00ff,
++	0x00000068, 0xbe804280,
++	0xbe814280, 0xbe824280,
++	0xbe834280, 0x80fd847d,
++	0xbfa1fffa, 0xbeea0180,
++	0xbeec0180, 0xbeee0180,
++	0xbef00180, 0xbef20180,
++	0xbef40180, 0xbef60180,
++	0xbef80180, 0xbefa0180,
++	0xbfb00000, 0xbf9f0000,
++	0xbf9f0000, 0xbf9f0000,
++	0xbf9f0000, 0xbf9f0000,
++};
+-- 
+2.52.0
+
