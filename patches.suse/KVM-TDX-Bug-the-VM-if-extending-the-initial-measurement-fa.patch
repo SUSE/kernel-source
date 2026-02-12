@@ -1,0 +1,87 @@
+From: Sean Christopherson <seanjc@google.com>
+Date: Thu, 30 Oct 2025 13:09:50 -0700
+Subject: KVM: TDX: Bug the VM if extending the initial measurement fails
+Git-commit: ad44aa4c5d3f40f4254a25a2ebab8cb9be0e37a3
+Patch-mainline: v6.19-rc1
+References: git-fixes
+
+WARN and terminate the VM if TDH_MR_EXTEND fails, as extending the
+measurement should fail if and only if there is a KVM bug, or if the S-EPT
+mapping is invalid.  Now that KVM makes all state transitions mutually
+exclusive via tdx_vm_state_guard, it should be impossible for S-EPT
+mappings to be removed between kvm_tdp_mmu_map_private_pfn() and
+tdh_mr_extend().
+
+Holding slots_lock prevents zaps due to memslot updates,
+filemap_invalidate_lock() prevents zaps due to guest_memfd PUNCH_HOLE,
+vcpu->mutex locks prevents updates from other vCPUs, kvm->lock prevents
+VM-scoped ioctls from creating havoc (e.g. by creating new vCPUs), and all
+usage of kvm_zap_gfn_range() is mutually exclusive with S-EPT entries that
+can be used for the initial image.
+
+For kvm_zap_gfn_range(), the call from sev.c is obviously mutually
+exclusive, TDX disallows KVM_X86_QUIRK_IGNORE_GUEST_PAT so the same goes
+for kvm_noncoherent_dma_assignment_start_or_stop(), and
+__kvm_set_or_clear_apicv_inhibit() is blocked by virtue of holding all
+VM and vCPU mutexes (and the APIC page has its own KVM-internal memslot
+that is never created for TDX VMs, and so can't possibly be used for the
+initial image, which means that too is mutually exclusive irrespective of
+locking).
+
+Opportunistically return early if the region doesn't need to be measured
+in order to reduce line lengths and avoid wraps.  Similarly, immediately
+and explicitly return if TDH_MR_EXTEND fails to make it clear that KVM
+needs to bail entirely if extending the measurement fails.
+
+Reviewed-by: Binbin Wu <binbin.wu@linux.intel.com>
+Reviewed-by: Kai Huang <kai.huang@intel.com>
+Reviewed-by: Yan Zhao <yan.y.zhao@intel.com>
+Tested-by: Yan Zhao <yan.y.zhao@intel.com>
+Tested-by: Kai Huang <kai.huang@intel.com>
+Link: https://patch.msgid.link/20251030200951.3402865-28-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Acked-by: Nikolay Borisov <nik.borisov@suse.com>
+---
+ arch/x86/kvm/vmx/tdx.c | 24 +++++++++++++-----------
+ 1 file changed, 13 insertions(+), 11 deletions(-)
+
+diff --git a/arch/x86/kvm/vmx/tdx.c b/arch/x86/kvm/vmx/tdx.c
+index ab62aee2aaa4..977cc41c96b4 100644
+--- a/arch/x86/kvm/vmx/tdx.c
++++ b/arch/x86/kvm/vmx/tdx.c
+@@ -3133,21 +3133,23 @@ static int tdx_gmem_post_populate(struct kvm *kvm, gfn_t gfn, kvm_pfn_t pfn,
+ 
+ 	put_page(src_page);
+ 
+-	if (ret)
++	if (ret || !(arg->flags & KVM_TDX_MEASURE_MEMORY_REGION))
+ 		return ret;
+ 
+-	if (arg->flags & KVM_TDX_MEASURE_MEMORY_REGION) {
+-		for (i = 0; i < PAGE_SIZE; i += TDX_EXTENDMR_CHUNKSIZE) {
+-			err = tdh_mr_extend(&kvm_tdx->td, gpa + i, &entry,
+-					    &level_state);
+-			if (err) {
+-				ret = -EIO;
+-				break;
+-			}
+-		}
++	/*
++	 * Note, MR.EXTEND can fail if the S-EPT mapping is somehow removed
++	 * between mapping the pfn and now, but slots_lock prevents memslot
++	 * updates, filemap_invalidate_lock() prevents guest_memfd updates,
++	 * mmu_notifier events can't reach S-EPT entries, and KVM's internal
++	 * zapping flows are mutually exclusive with S-EPT mappings.
++	 */
++	for (i = 0; i < PAGE_SIZE; i += TDX_EXTENDMR_CHUNKSIZE) {
++		err = tdh_mr_extend(&kvm_tdx->td, gpa + i, &entry, &level_state);
++		if (TDX_BUG_ON_2(err, TDH_MR_EXTEND, entry, level_state, kvm))
++			return -EIO;
+ 	}
+ 
+-	return ret;
++	return 0;
+ }
+ 
+ static int tdx_vcpu_init_mem_region(struct kvm_vcpu *vcpu, struct kvm_tdx_cmd *cmd)
+
