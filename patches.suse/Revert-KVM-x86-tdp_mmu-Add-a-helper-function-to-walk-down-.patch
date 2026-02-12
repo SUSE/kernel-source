@@ -1,0 +1,118 @@
+From: Sean Christopherson <seanjc@google.com>
+Date: Thu, 30 Oct 2025 13:09:29 -0700
+Subject: Revert "KVM: x86/tdp_mmu: Add a helper function to walk down the TDP
+ MMU"
+Git-commit: fe7413e39810235fc812d5d85053cb1957388090
+Patch-mainline: v6.19-rc1
+References: git-fixes
+
+Remove the helper and exports that were added to allow TDX code to reuse
+kvm_tdp_map_page() for its gmem post-populate flow now that a dedicated
+TDP MMU API is provided to install a mapping given a gfn+pfn pair.
+
+This reverts commit 2608f105760115e94a03efd9f12f8fbfd1f9af4b.
+
+Reviewed-by: Rick Edgecombe <rick.p.edgecombe@intel.com>
+Reviewed-by: Binbin Wu <binbin.wu@linux.intel.com>
+Reviewed-by: Kai Huang <kai.huang@intel.com>
+Reviewed-by: Yan Zhao <yan.y.zhao@intel.com>
+Tested-by: Yan Zhao <yan.y.zhao@intel.com>
+Tested-by: Kai Huang <kai.huang@intel.com>
+Link: https://patch.msgid.link/20251030200951.3402865-7-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Acked-by: Nikolay Borisov <nik.borisov@suse.com>
+---
+ arch/x86/kvm/mmu.h         |    2 --
+ arch/x86/kvm/mmu/mmu.c     |    4 ++--
+ arch/x86/kvm/mmu/tdp_mmu.c |   37 +++++--------------------------------
+ 3 files changed, 7 insertions(+), 36 deletions(-)
+
+--- a/arch/x86/kvm/mmu.h
++++ b/arch/x86/kvm/mmu.h
+@@ -257,8 +257,6 @@ extern bool tdp_mmu_enabled;
+ #define tdp_mmu_enabled false
+ #endif
+ 
+-bool kvm_tdp_mmu_gpa_is_mapped(struct kvm_vcpu *vcpu, u64 gpa);
+-int kvm_tdp_map_page(struct kvm_vcpu *vcpu, gpa_t gpa, u64 error_code, u8 *level);
+ int kvm_tdp_mmu_map_private_pfn(struct kvm_vcpu *vcpu, gfn_t gfn, kvm_pfn_t pfn);
+ 
+ static inline bool kvm_memslots_have_rmaps(struct kvm *kvm)
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -4679,7 +4679,8 @@ int kvm_tdp_page_fault(struct kvm_vcpu *
+ 	return direct_page_fault(vcpu, fault);
+ }
+ 
+-int kvm_tdp_map_page(struct kvm_vcpu *vcpu, gpa_t gpa, u64 error_code, u8 *level)
++static int kvm_tdp_map_page(struct kvm_vcpu *vcpu, gpa_t gpa, u64 error_code,
++			    u8 *level)
+ {
+ 	int r;
+ 
+@@ -4721,7 +4722,6 @@ int kvm_tdp_map_page(struct kvm_vcpu *vc
+ 		return -EIO;
+ 	}
+ }
+-EXPORT_SYMBOL_GPL(kvm_tdp_map_page);
+ 
+ long kvm_arch_vcpu_pre_fault_memory(struct kvm_vcpu *vcpu,
+ 				    struct kvm_pre_fault_memory *range)
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@ -1896,13 +1896,16 @@ bool kvm_tdp_mmu_write_protect_gfn(struc
+  *
+  * Must be called between kvm_tdp_mmu_walk_lockless_{begin,end}.
+  */
+-static int __kvm_tdp_mmu_get_walk(struct kvm_vcpu *vcpu, u64 addr, u64 *sptes,
+-				  struct kvm_mmu_page *root)
++int kvm_tdp_mmu_get_walk(struct kvm_vcpu *vcpu, u64 addr, u64 *sptes,
++			 int *root_level)
+ {
++	struct kvm_mmu_page *root = root_to_sp(vcpu->arch.mmu->root.hpa);
+ 	struct tdp_iter iter;
+ 	gfn_t gfn = addr >> PAGE_SHIFT;
+ 	int leaf = -1;
+ 
++	*root_level = vcpu->arch.mmu->root_role.level;
++
+ 	tdp_mmu_for_each_pte(iter, vcpu->kvm, root, gfn, gfn + 1) {
+ 		leaf = iter.level;
+ 		sptes[leaf] = iter.old_spte;
+@@ -1911,36 +1914,6 @@ static int __kvm_tdp_mmu_get_walk(struct
+ 	return leaf;
+ }
+ 
+-int kvm_tdp_mmu_get_walk(struct kvm_vcpu *vcpu, u64 addr, u64 *sptes,
+-			 int *root_level)
+-{
+-	struct kvm_mmu_page *root = root_to_sp(vcpu->arch.mmu->root.hpa);
+-	*root_level = vcpu->arch.mmu->root_role.level;
+-
+-	return __kvm_tdp_mmu_get_walk(vcpu, addr, sptes, root);
+-}
+-
+-bool kvm_tdp_mmu_gpa_is_mapped(struct kvm_vcpu *vcpu, u64 gpa)
+-{
+-	struct kvm *kvm = vcpu->kvm;
+-	bool is_direct = kvm_is_addr_direct(kvm, gpa);
+-	hpa_t root = is_direct ? vcpu->arch.mmu->root.hpa :
+-				 vcpu->arch.mmu->mirror_root_hpa;
+-	u64 sptes[PT64_ROOT_MAX_LEVEL + 1], spte;
+-	int leaf;
+-
+-	lockdep_assert_held(&kvm->mmu_lock);
+-	rcu_read_lock();
+-	leaf = __kvm_tdp_mmu_get_walk(vcpu, gpa, sptes, root_to_sp(root));
+-	rcu_read_unlock();
+-	if (leaf < 0)
+-		return false;
+-
+-	spte = sptes[leaf];
+-	return is_shadow_present_pte(spte) && is_last_spte(spte, leaf);
+-}
+-EXPORT_SYMBOL_GPL(kvm_tdp_mmu_gpa_is_mapped);
+-
+ /*
+  * Returns the last level spte pointer of the shadow page walk for the given
+  * gpa, and sets *spte to the spte value. This spte may be non-preset. If no
