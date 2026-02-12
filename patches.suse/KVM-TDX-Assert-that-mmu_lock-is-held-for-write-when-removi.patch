@@ -1,0 +1,63 @@
+From: Sean Christopherson <seanjc@google.com>
+Date: Thu, 30 Oct 2025 13:09:43 -0700
+Subject: KVM: TDX: Assert that mmu_lock is held for write when removing S-EPT
+ entries
+Git-commit: 2ff14116982c663066f3cdb4e2af5dfa7a812caa
+Patch-mainline: v6.19-rc1
+References: git-fixes
+
+Unconditionally assert that mmu_lock is held for write when removing S-EPT
+entries, not just when removing S-EPT entries triggers certain conditions,
+e.g. needs to do TDH_MEM_TRACK or kick vCPUs out of the guest.
+Conditionally asserting implies that it's safe to hold mmu_lock for read
+when those paths aren't hit, which is simply not true, as KVM doesn't
+support removing S-EPT entries under read-lock.
+
+Only two paths lead to remove_external_spte(), and both paths asserts that
+mmu_lock is held for write (tdp_mmu_set_spte() via lockdep, and
+handle_removed_pt() via KVM_BUG_ON()).
+
+Deliberately leave lockdep assertions in the "no vCPUs" helpers to document
+that wait_for_sept_zap is guarded by holding mmu_lock for write, and keep
+the conditional assert in tdx_track() as well, but with a comment to help
+explain why holding mmu_lock for write matters (above and beyond why
+tdx_sept_remove_private_spte()'s requirements).
+
+Reviewed-by: Binbin Wu <binbin.wu@linux.intel.com>
+Reviewed-by: Kai Huang <kai.huang@intel.com>
+Reviewed-by: Yan Zhao <yan.y.zhao@intel.com>
+Tested-by: Yan Zhao <yan.y.zhao@intel.com>
+Tested-by: Kai Huang <kai.huang@intel.com>
+Link: https://patch.msgid.link/20251030200951.3402865-21-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Acked-by: Nikolay Borisov <nik.borisov@suse.com>
+---
+ arch/x86/kvm/vmx/tdx.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/arch/x86/kvm/vmx/tdx.c b/arch/x86/kvm/vmx/tdx.c
+index a9d1aabbefbf..ee17c8aacfa4 100644
+--- a/arch/x86/kvm/vmx/tdx.c
++++ b/arch/x86/kvm/vmx/tdx.c
+@@ -1715,6 +1715,11 @@ static void tdx_track(struct kvm *kvm)
+ 	if (unlikely(kvm_tdx->state != TD_STATE_RUNNABLE))
+ 		return;
+ 
++	/*
++	 * The full sequence of TDH.MEM.TRACK and forcing vCPUs out of guest
++	 * mode must be serialized, as TDH.MEM.TRACK will fail if the previous
++	 * tracking epoch hasn't completed.
++	 */
+ 	lockdep_assert_held_write(&kvm->mmu_lock);
+ 
+ 	err = tdh_mem_track(&kvm_tdx->td);
+@@ -1762,6 +1767,8 @@ static void tdx_sept_remove_private_spte(struct kvm *kvm, gfn_t gfn,
+ 	gpa_t gpa = gfn_to_gpa(gfn);
+ 	u64 err, entry, level_state;
+ 
++	lockdep_assert_held_write(&kvm->mmu_lock);
++
+ 	/*
+ 	 * HKID is released after all private pages have been removed, and set
+ 	 * before any might be populated. Warn if zapping is attempted when
+
