@@ -1,0 +1,181 @@
+From f9ee6b5748e6ee09d135c588832a5022cadc8da7 Mon Sep 17 00:00:00 2001
+From: Ankit Nautiyal <ankit.k.nautiyal@intel.com>
+Date: Mon, 30 Sep 2024 22:05:40 +0530
+Subject: drm/i915/display: Refactor enable_joiner_pipes
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: f9ee6b5748e6ee09d135c588832a5022cadc8da7
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Pass the current pipe into enabled_joiner_pipes(), and let it figure out
+the proper bitmasks for us. Since the enabled_joiner_pipes now gets the
+primary and secondary pipes wrt a given pipe, the helpers
+to get primary pipe and secondary pipes are no longer required.
+
+V2: 
+-Simplify helper get_joiner_primary_pipes. (Ville)
+-Nuke get_joiner_secondary_pipes. (Ville)
+-Add more drm_WARNs final primary/secondary pipes. (Ville)
+V3: Drop ultrajoiner stuff and add it in subsequent patches. (Ville)
+V4: 
+-Replace input variable name primary_pipes to primary_pipe for
+enabled_joiner_pipes()
+-Avoid get_joiner_primary_pipe and use primary_pipes set by
+enabled_joiner_pipes(). (Ville)
+
+Signed-off-by: Ankit Nautiyal <ankit.k.nautiyal@intel.com>
+Suggested-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20240930163549.416410-5-ankit.k.nautiyal@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/intel_display.c | 92 ++++++++++----------
+ 1 file changed, 45 insertions(+), 47 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index 2d6260c3bca5..711811b3cb5e 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -3663,8 +3663,16 @@ static u8 expected_bigjoiner_secondary_pipes(u8 bigjoiner_primary_pipes)
+ 	return expected_secondary_pipes(bigjoiner_primary_pipes, 2);
+ }
+ 
++static u8 get_joiner_primary_pipe(enum pipe pipe, u8 primary_pipes)
++{
++	primary_pipes &= GENMASK(pipe, 0);
++
++	return primary_pipes ? BIT(fls(primary_pipes) - 1) : 0;
++}
++
+ static void enabled_joiner_pipes(struct drm_i915_private *dev_priv,
+-				 u8 *primary_pipes, u8 *secondary_pipes)
++				 enum pipe pipe,
++				 u8 *primary_pipe, u8 *secondary_pipes)
+ {
+ 	struct intel_display *display = to_intel_display(&dev_priv->drm);
+ 	u8 primary_uncompressed_joiner_pipes, primary_bigjoiner_pipes;
+@@ -3703,45 +3711,38 @@ static void enabled_joiner_pipes(struct drm_i915_private *dev_priv,
+ 		 expected_uncompressed_joiner_secondary_pipes(primary_uncompressed_joiner_pipes),
+ 		 secondary_uncompressed_joiner_pipes);
+ 
+-	*primary_pipes = primary_uncompressed_joiner_pipes | primary_bigjoiner_pipes;
+-
+-	*secondary_pipes = secondary_uncompressed_joiner_pipes | secondary_bigjoiner_pipes;
+-
+-	/* Joiner pipes should always be consecutive primary and secondary */
+-	drm_WARN(display->drm, *secondary_pipes != *primary_pipes << 1,
+-		 "Joiner misconfigured (primary pipes %#x, secondary pipes %#x)\n",
+-		 *primary_pipes, *secondary_pipes);
+-}
+-
+-static enum pipe get_joiner_primary_pipe(enum pipe pipe, u8 primary_pipes, u8 secondary_pipes)
+-{
+-	if ((secondary_pipes & BIT(pipe)) == 0)
+-		return pipe;
+-
+-	/* ignore everything above our pipe */
+-	primary_pipes &= ~GENMASK(7, pipe);
+-
+-	/* highest remaining bit should be our primary pipe */
+-	return fls(primary_pipes) - 1;
+-}
+-
+-static u8 get_joiner_secondary_pipes(enum pipe pipe, u8 primary_pipes, u8 secondary_pipes)
+-{
+-	enum pipe primary_pipe, next_primary_pipe;
+-
+-	primary_pipe = get_joiner_primary_pipe(pipe, primary_pipes, secondary_pipes);
++	*primary_pipe = 0;
++	*secondary_pipes = 0;
+ 
+-	if ((primary_pipes & BIT(primary_pipe)) == 0)
+-		return 0;
++	if (uncompressed_joiner_pipes & BIT(pipe)) {
++		*primary_pipe = get_joiner_primary_pipe(pipe, primary_uncompressed_joiner_pipes);
++		*secondary_pipes = secondary_uncompressed_joiner_pipes &
++				   expected_uncompressed_joiner_secondary_pipes(*primary_pipe);
++
++		drm_WARN(display->drm,
++			 expected_uncompressed_joiner_secondary_pipes(*primary_pipe) !=
++			 *secondary_pipes,
++			 "Wrong uncompressed joiner secondary pipes for primary_pipe %#x (expected %#x, current %#x)\n",
++			 *primary_pipe,
++			 expected_uncompressed_joiner_secondary_pipes(*primary_pipe),
++			 *secondary_pipes);
++		return;
++	}
+ 
+-	/* ignore our primary pipe and everything below it */
+-	primary_pipes &= ~GENMASK(primary_pipe, 0);
+-	/* make sure a high bit is set for the ffs() */
+-	primary_pipes |= BIT(7);
+-	/* lowest remaining bit should be the next primary pipe */
+-	next_primary_pipe = ffs(primary_pipes) - 1;
++	if (bigjoiner_pipes & BIT(pipe)) {
++		*primary_pipe = get_joiner_primary_pipe(pipe, primary_bigjoiner_pipes);
++		*secondary_pipes = secondary_bigjoiner_pipes &
++				   expected_bigjoiner_secondary_pipes(*primary_pipe);
+ 
+-	return secondary_pipes & GENMASK(next_primary_pipe - 1, primary_pipe);
++		drm_WARN(display->drm,
++			 expected_bigjoiner_secondary_pipes(*primary_pipe) !=
++			 *secondary_pipes,
++			 "Wrong bigjoiner secondary pipes for primary_pipe %#x (expected %#x, current %#x)\n",
++			 *primary_pipe,
++			 expected_bigjoiner_secondary_pipes(*primary_pipe),
++			 *secondary_pipes);
++		return;
++	}
+ }
+ 
+ static u8 hsw_panel_transcoders(struct drm_i915_private *i915)
+@@ -3760,7 +3761,7 @@ static u8 hsw_enabled_transcoders(struct intel_crtc *crtc)
+ 	struct drm_i915_private *dev_priv = to_i915(dev);
+ 	u8 panel_transcoder_mask = hsw_panel_transcoders(dev_priv);
+ 	enum transcoder cpu_transcoder;
+-	u8 primary_pipes, secondary_pipes;
++	u8 primary_pipe, secondary_pipes;
+ 	u8 enabled_transcoders = 0;
+ 
+ 	/*
+@@ -3813,10 +3814,9 @@ static u8 hsw_enabled_transcoders(struct intel_crtc *crtc)
+ 		enabled_transcoders |= BIT(cpu_transcoder);
+ 
+ 	/* joiner secondary -> consider the primary pipe's transcoder as well */
+-	enabled_joiner_pipes(dev_priv, &primary_pipes, &secondary_pipes);
++	enabled_joiner_pipes(dev_priv, crtc->pipe, &primary_pipe, &secondary_pipes);
+ 	if (secondary_pipes & BIT(crtc->pipe)) {
+-		cpu_transcoder = (enum transcoder)
+-			get_joiner_primary_pipe(crtc->pipe, primary_pipes, secondary_pipes);
++		cpu_transcoder = (enum transcoder)ffs(primary_pipe) - 1;
+ 		if (transcoder_ddi_func_is_enabled(dev_priv, cpu_transcoder))
+ 			enabled_transcoders |= BIT(cpu_transcoder);
+ 	}
+@@ -3947,17 +3947,15 @@ static void intel_joiner_get_config(struct intel_crtc_state *crtc_state)
+ {
+ 	struct intel_crtc *crtc = to_intel_crtc(crtc_state->uapi.crtc);
+ 	struct drm_i915_private *i915 = to_i915(crtc->base.dev);
+-	u8 primary_pipes, secondary_pipes;
++	u8 primary_pipe, secondary_pipes;
+ 	enum pipe pipe = crtc->pipe;
+ 
+-	enabled_joiner_pipes(i915, &primary_pipes, &secondary_pipes);
++	enabled_joiner_pipes(i915, pipe, &primary_pipe, &secondary_pipes);
+ 
+-	if (((primary_pipes | secondary_pipes) & BIT(pipe)) == 0)
++	if (((primary_pipe | secondary_pipes) & BIT(pipe)) == 0)
+ 		return;
+ 
+-	crtc_state->joiner_pipes =
+-		BIT(get_joiner_primary_pipe(pipe, primary_pipes, secondary_pipes)) |
+-		get_joiner_secondary_pipes(pipe, primary_pipes, secondary_pipes);
++	crtc_state->joiner_pipes = primary_pipe | secondary_pipes;
+ }
+ 
+ static bool hsw_get_pipe_config(struct intel_crtc *crtc,
+-- 
+2.52.0
+
