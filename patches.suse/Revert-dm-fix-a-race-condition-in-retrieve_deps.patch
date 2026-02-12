@@ -1,0 +1,157 @@
+From: Benjamin Marzinski <bmarzins@redhat.com>
+Date: Tue, 27 Jan 2026 19:12:23 -0500
+Subject: Revert "dm: fix a race condition in retrieve_deps"
+Patch-mainline: Queued in subsystem maintainer repository
+Git-repo: git://git.kernel.org/pub/scm/linux/kernel/git/axboe/linux.git
+Git-commit: 4550a71b179be9e2a17015c018b231a2daca2dd1
+References: git-fixes
+
+This reverts commit f6007dce0cd35d634d9be91ef3515a6385dcee16.
+
+Commit f6007dce0cd3 ("dm: fix a race condition in retrieve_deps") was
+added to fix a race between retrieving the list of dm table devices and
+multipath_message() modifying the list of table devices. But Commit
+a48f6b82c5c4 ("dm mpath: don't call dm_get_device in multipath_message")
+removed the call to dm_get_device() from multipath_message(). After that
+commit, the only calls to dm_get_device() and dm_put_device() are in
+target constructors and destructors, so the race with retrieve_deps() is
+no longer possible.
+
+Suggested-by: Martin Wilck <mwilck@suse.com>
+Signed-off-by: Benjamin Marzinski <bmarzins@redhat.com>
+Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+Acked-by: Martin Wilck <mwilck@suse.com>
+---
+ drivers/md/dm-core.h  |    1 -
+ drivers/md/dm-ioctl.c |    7 +------
+ drivers/md/dm-table.c |   32 ++++++++------------------------
+ 3 files changed, 9 insertions(+), 31 deletions(-)
+
+--- a/drivers/md/dm-core.h
++++ b/drivers/md/dm-core.h
+@@ -219,7 +219,6 @@ struct dm_table {
+ 
+ 	/* a list of devices used by this table */
+ 	struct list_head devices;
+-	struct rw_semaphore devices_lock;
+ 
+ 	/* events get handed up using this callback */
+ 	void (*event_fn)(void *data);
+--- a/drivers/md/dm-ioctl.c
++++ b/drivers/md/dm-ioctl.c
+@@ -1648,8 +1648,6 @@ static void retrieve_deps(struct dm_tabl
+ 	struct dm_dev_internal *dd;
+ 	struct dm_target_deps *deps;
+ 
+-	down_read(&table->devices_lock);
+-
+ 	deps = get_result_buffer(param, param_size, &len);
+ 
+ 	/*
+@@ -1664,7 +1662,7 @@ static void retrieve_deps(struct dm_tabl
+ 	needed = struct_size(deps, dev, count);
+ 	if (len < needed) {
+ 		param->flags |= DM_BUFFER_FULL_FLAG;
+-		goto out;
++		return;
+ 	}
+ 
+ 	/*
+@@ -1676,9 +1674,6 @@ static void retrieve_deps(struct dm_tabl
+ 		deps->dev[count++] = huge_encode_dev(dd->dm_dev->bdev->bd_dev);
+ 
+ 	param->data_size = param->data_start + needed;
+-
+-out:
+-	up_read(&table->devices_lock);
+ }
+ 
+ static int table_deps(struct file *filp, struct dm_ioctl *param, size_t param_size)
+--- a/drivers/md/dm-table.c
++++ b/drivers/md/dm-table.c
+@@ -140,7 +140,6 @@ int dm_table_create(struct dm_table **re
+ 		return -ENOMEM;
+ 
+ 	INIT_LIST_HEAD(&t->devices);
+-	init_rwsem(&t->devices_lock);
+ 
+ 	if (!num_targets)
+ 		num_targets = KEYS_PER_NODE;
+@@ -381,20 +380,16 @@ int dm_get_device(struct dm_target *ti,
+ 	if (dev == disk_devt(t->md->disk))
+ 		return -EINVAL;
+ 
+-	down_write(&t->devices_lock);
+-
+ 	dd = find_device(&t->devices, dev);
+ 	if (!dd) {
+ 		dd = kmalloc(sizeof(*dd), GFP_KERNEL);
+-		if (!dd) {
+-			r = -ENOMEM;
+-			goto unlock_ret_r;
+-		}
++		if (!dd)
++			return -ENOMEM;
+ 
+ 		r = dm_get_table_device(t->md, dev, mode, &dd->dm_dev);
+ 		if (r) {
+ 			kfree(dd);
+-			goto unlock_ret_r;
++			return r;
+ 		}
+ 
+ 		refcount_set(&dd->count, 1);
+@@ -404,17 +399,12 @@ int dm_get_device(struct dm_target *ti,
+ 	} else if (dd->dm_dev->mode != (mode | dd->dm_dev->mode)) {
+ 		r = upgrade_mode(dd, mode, t->md);
+ 		if (r)
+-			goto unlock_ret_r;
++			return r;
+ 	}
+ 	refcount_inc(&dd->count);
+ out:
+-	up_write(&t->devices_lock);
+ 	*result = dd->dm_dev;
+ 	return 0;
+-
+-unlock_ret_r:
+-	up_write(&t->devices_lock);
+-	return r;
+ }
+ EXPORT_SYMBOL(dm_get_device);
+ 
+@@ -465,12 +455,9 @@ static int dm_set_device_limits(struct d
+ void dm_put_device(struct dm_target *ti, struct dm_dev *d)
+ {
+ 	int found = 0;
+-	struct dm_table *t = ti->table;
+-	struct list_head *devices = &t->devices;
++	struct list_head *devices = &ti->table->devices;
+ 	struct dm_dev_internal *dd;
+ 
+-	down_write(&t->devices_lock);
+-
+ 	list_for_each_entry(dd, devices, list) {
+ 		if (dd->dm_dev == d) {
+ 			found = 1;
+@@ -479,17 +466,14 @@ void dm_put_device(struct dm_target *ti,
+ 	}
+ 	if (!found) {
+ 		DMERR("%s: device %s not in table devices list",
+-		      dm_device_name(t->md), d->name);
+-		goto unlock_ret;
++		      dm_device_name(ti->table->md), d->name);
++		return;
+ 	}
+ 	if (refcount_dec_and_test(&dd->count)) {
+-		dm_put_table_device(t->md, d);
++		dm_put_table_device(ti->table->md, d);
+ 		list_del(&dd->list);
+ 		kfree(dd);
+ 	}
+-
+-unlock_ret:
+-	up_write(&t->devices_lock);
+ }
+ EXPORT_SYMBOL(dm_put_device);
+ 
