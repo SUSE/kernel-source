@@ -1,0 +1,199 @@
+From 84b2b38451a34e86f25bbfc5c5d50aab46713cd5 Mon Sep 17 00:00:00 2001
+From: Ankit Nautiyal <ankit.k.nautiyal@intel.com>
+Date: Thu, 26 Sep 2024 19:13:22 +0530
+Subject: drm/i915/dp: Add helper to compute num pipes required
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 84b2b38451a34e86f25bbfc5c5d50aab46713cd5
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Add a helper to compute the number of pipes required.
+This will depend on whether the joiner is required or is forced through
+the debugfs. If no joiner is required the helper returns 1.
+
+V2: 
+-Return 1 if no joiner is required. (Ville)
+-Change the suffix from joined_pipes to num_pipes. (Ville)
+-Use number of pipes while calculating joined_pipe masks and
+max_dotclk. (Ville)
+V3: Simplify and rename the helper to intel_dp_num_joined_pipes(). Ville
+V4: Remove redundant 'fallthrough' statement. (Ville)
+
+Signed-off-by: Ankit Nautiyal <ankit.k.nautiyal@intel.com>
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20240926134322.3728021-5-ankit.k.nautiyal@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../drm/i915/display/intel_display_debugfs.c  |  1 +
+ drivers/gpu/drm/i915/display/intel_dp.c       | 46 +++++++++++--------
+ drivers/gpu/drm/i915/display/intel_dp.h       |  6 +--
+ drivers/gpu/drm/i915/display/intel_dp_mst.c   | 23 ++++------
+ 4 files changed, 40 insertions(+), 36 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display_debugfs.c b/drivers/gpu/drm/i915/display/intel_display_debugfs.c
+index ae3715f0f1d8..5923bbc232be 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_debugfs.c
++++ b/drivers/gpu/drm/i915/display/intel_display_debugfs.c
+@@ -1343,6 +1343,7 @@ static ssize_t i915_joiner_write(struct file *file,
+ 
+ 	switch (force_joined_pipes) {
+ 	case 0:
++	case 1:
+ 	case 2:
+ 		connector->force_joined_pipes = force_joined_pipes;
+ 		break;
+diff --git a/drivers/gpu/drm/i915/display/intel_dp.c b/drivers/gpu/drm/i915/display/intel_dp.c
+index a1a64758d30d..f2a2541c1091 100644
+--- a/drivers/gpu/drm/i915/display/intel_dp.c
++++ b/drivers/gpu/drm/i915/display/intel_dp.c
+@@ -1264,17 +1264,30 @@ intel_dp_mode_valid_downstream(struct intel_connector *connector,
+ 	return MODE_OK;
+ }
+ 
+-bool intel_dp_need_joiner(struct intel_dp *intel_dp,
+-			  struct intel_connector *connector,
+-			  int hdisplay, int clock)
++static
++bool intel_dp_needs_bigjoiner(struct intel_dp *intel_dp,
++			      struct intel_connector *connector,
++			      int hdisplay, int clock)
+ {
+ 	struct drm_i915_private *i915 = dp_to_i915(intel_dp);
+ 
+ 	if (!intel_dp_has_joiner(intel_dp))
+ 		return false;
+ 
+-	return clock > i915->display.cdclk.max_dotclk_freq || hdisplay > 5120 ||
+-	       connector->force_joined_pipes == 2;
++	return clock > i915->display.cdclk.max_dotclk_freq || hdisplay > 5120;
++}
++
++int intel_dp_num_joined_pipes(struct intel_dp *intel_dp,
++			      struct intel_connector *connector,
++			      int hdisplay, int clock)
++{
++	if (connector->force_joined_pipes)
++		return connector->force_joined_pipes;
++
++	if (intel_dp_needs_bigjoiner(intel_dp, connector, hdisplay, clock))
++		return 2;
++
++	return 1;
+ }
+ 
+ bool intel_dp_has_dsc(const struct intel_connector *connector)
+@@ -1311,7 +1324,7 @@ intel_dp_mode_valid(struct drm_connector *_connector,
+ 	u16 dsc_max_compressed_bpp = 0;
+ 	u8 dsc_slice_count = 0;
+ 	enum drm_mode_status status;
+-	bool dsc = false, joiner = false;
++	bool dsc = false;
+ 	int num_joined_pipes;
+ 
+ 	status = intel_cpu_transcoder_mode_valid(dev_priv, mode);
+@@ -1333,13 +1346,9 @@ intel_dp_mode_valid(struct drm_connector *_connector,
+ 		target_clock = fixed_mode->clock;
+ 	}
+ 
+-	if (intel_dp_need_joiner(intel_dp, connector,
+-				 mode->hdisplay, target_clock)) {
+-		joiner = true;
+-		max_dotclk *= 2;
+-	}
+-
+-	num_joined_pipes = joiner ? 2 : 1;
++	num_joined_pipes = intel_dp_num_joined_pipes(intel_dp, connector,
++						     mode->hdisplay, target_clock);
++	max_dotclk *= num_joined_pipes;
+ 
+ 	if (target_clock > max_dotclk)
+ 		return MODE_CLOCK_HIGH;
+@@ -2507,12 +2516,11 @@ intel_dp_compute_link_config(struct intel_encoder *encoder,
+ 	    !intel_dp_supports_fec(intel_dp, connector, pipe_config))
+ 		return -EINVAL;
+ 
+-	if (intel_dp_need_joiner(intel_dp, connector,
+-				 adjusted_mode->crtc_hdisplay,
+-				 adjusted_mode->crtc_clock))
+-		pipe_config->joiner_pipes = GENMASK(crtc->pipe + 1, crtc->pipe);
+-
+-	num_joined_pipes = intel_crtc_num_joined_pipes(pipe_config);
++	num_joined_pipes = intel_dp_num_joined_pipes(intel_dp, connector,
++						     adjusted_mode->crtc_hdisplay,
++						     adjusted_mode->crtc_clock);
++	if (num_joined_pipes > 1)
++		pipe_config->joiner_pipes = GENMASK(crtc->pipe + num_joined_pipes - 1, crtc->pipe);
+ 
+ 	joiner_needs_dsc = intel_dp_joiner_needs_dsc(i915, num_joined_pipes);
+ 
+diff --git a/drivers/gpu/drm/i915/display/intel_dp.h b/drivers/gpu/drm/i915/display/intel_dp.h
+index 3b869429e575..53d1217800ef 100644
+--- a/drivers/gpu/drm/i915/display/intel_dp.h
++++ b/drivers/gpu/drm/i915/display/intel_dp.h
+@@ -151,9 +151,9 @@ int intel_dp_dsc_sink_max_compressed_bpp(const struct intel_connector *connector
+ u8 intel_dp_dsc_get_slice_count(const struct intel_connector *connector,
+ 				int mode_clock, int mode_hdisplay,
+ 				int num_joined_pipes);
+-bool intel_dp_need_joiner(struct intel_dp *intel_dp,
+-			  struct intel_connector *connector,
+-			  int hdisplay, int clock);
++int intel_dp_num_joined_pipes(struct intel_dp *intel_dp,
++			      struct intel_connector *connector,
++			      int hdisplay, int clock);
+ 
+ static inline unsigned int intel_dp_unused_lane_mask(int lane_count)
+ {
+diff --git a/drivers/gpu/drm/i915/display/intel_dp_mst.c b/drivers/gpu/drm/i915/display/intel_dp_mst.c
+index bdc8ccb9fb8d..7be8fb047b6c 100644
+--- a/drivers/gpu/drm/i915/display/intel_dp_mst.c
++++ b/drivers/gpu/drm/i915/display/intel_dp_mst.c
+@@ -599,12 +599,11 @@ static int intel_dp_mst_compute_config(struct intel_encoder *encoder,
+ 	if (adjusted_mode->flags & DRM_MODE_FLAG_DBLSCAN)
+ 		return -EINVAL;
+ 
+-	if (intel_dp_need_joiner(intel_dp, connector,
+-				 adjusted_mode->crtc_hdisplay,
+-				 adjusted_mode->crtc_clock))
+-		pipe_config->joiner_pipes = GENMASK(crtc->pipe + 1, crtc->pipe);
+-
+-	num_joined_pipes = intel_crtc_num_joined_pipes(pipe_config);
++	num_joined_pipes = intel_dp_num_joined_pipes(intel_dp, connector,
++						     adjusted_mode->crtc_hdisplay,
++						     adjusted_mode->crtc_clock);
++	if (num_joined_pipes > 1)
++		pipe_config->joiner_pipes = GENMASK(crtc->pipe + num_joined_pipes - 1, crtc->pipe);
+ 
+ 	pipe_config->sink_format = INTEL_OUTPUT_FORMAT_RGB;
+ 	pipe_config->output_format = INTEL_OUTPUT_FORMAT_RGB;
+@@ -1446,7 +1445,7 @@ intel_dp_mst_mode_valid_ctx(struct drm_connector *connector,
+ 	int max_dotclk = to_i915(connector->dev)->display.cdclk.max_dotclk_freq;
+ 	int max_rate, mode_rate, max_lanes, max_link_clock;
+ 	int ret;
+-	bool dsc = false, joiner = false;
++	bool dsc = false;
+ 	u16 dsc_max_compressed_bpp = 0;
+ 	u8 dsc_slice_count = 0;
+ 	int target_clock = mode->clock;
+@@ -1490,13 +1489,9 @@ intel_dp_mst_mode_valid_ctx(struct drm_connector *connector,
+ 	 *   corresponding link capabilities of the sink) in case the
+ 	 *   stream is uncompressed for it by the last branch device.
+ 	 */
+-	if (intel_dp_need_joiner(intel_dp, intel_connector,
+-				 mode->hdisplay, target_clock)) {
+-		joiner = true;
+-		max_dotclk *= 2;
+-	}
+-
+-	num_joined_pipes = joiner ? 2 : 1;
++	num_joined_pipes = intel_dp_num_joined_pipes(intel_dp, intel_connector,
++						     mode->hdisplay, target_clock);
++	max_dotclk *= num_joined_pipes;
+ 
+ 	ret = drm_modeset_lock(&mgr->base.lock, ctx);
+ 	if (ret)
+-- 
+2.52.0
+
