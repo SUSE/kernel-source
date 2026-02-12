@@ -1,0 +1,162 @@
+From: Ming Lei <ming.lei@redhat.com>
+Date: Sat, 30 Aug 2025 10:18:23 +0800
+Subject: [PATCH] blk-mq: Replace tags->lock with SRCU for tag iterators
+Git-commit: 995412e23bb2560a73db444e4c60bf5826b33aaa
+Patch-mainline: v6.16-rc1
+References: jsc#PED-14161
+
+Replace the spinlock in blk_mq_find_and_get_req() with an SRCU read lock
+around the tag iterators.
+
+This is done by:
+
+- Holding the SRCU read lock in blk_mq_queue_tag_busy_iter(),
+blk_mq_tagset_busy_iter(), and blk_mq_hctx_has_requests().
+
+- Removing the now-redundant tags->lock from blk_mq_find_and_get_req().
+
+This change fixes lockup issue in scsi_host_busy() in case of shost->host_blocked.
+
+Also avoids big tags->lock when reading disk sysfs attribute `inflight`.
+
+Reviewed-by: Hannes Reinecke <hare@suse.de>
+Signed-off-by: Ming Lei <ming.lei@redhat.com>
+Reviewed-by: Yu Kuai <yukuai3@huawei.com>
+Reviewed-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/blk-mq-tag.c | 12 ++++++++----
+ block/blk-mq.c     | 24 ++++--------------------
+ 2 files changed, 12 insertions(+), 24 deletions(-)
+
+diff --git a/block/blk-mq-tag.c b/block/blk-mq-tag.c
+index 3c2ec6e86d54..086c67849e06 100644
+--- a/block/blk-mq-tag.c
++++ b/block/blk-mq-tag.c
+@@ -256,13 +256,10 @@ static struct request *blk_mq_find_and_get_req(struct blk_mq_tags *tags,
+ 		unsigned int bitnr)
+ {
+ 	struct request *rq;
+-	unsigned long flags;
+ 
+-	spin_lock_irqsave(&tags->lock, flags);
+ 	rq = tags->rqs[bitnr];
+ 	if (!rq || rq->tag != bitnr || !req_ref_inc_not_zero(rq))
+ 		rq = NULL;
+-	spin_unlock_irqrestore(&tags->lock, flags);
+ 	return rq;
+ }
+ 
+@@ -440,7 +437,9 @@ void blk_mq_tagset_busy_iter(struct blk_mq_tag_set *tagset,
+ 		busy_tag_iter_fn *fn, void *priv)
+ {
+ 	unsigned int flags = tagset->flags;
+-	int i, nr_tags;
++	int i, nr_tags, srcu_idx;
++
++	srcu_idx = srcu_read_lock(&tagset->tags_srcu);
+ 
+ 	nr_tags = blk_mq_is_shared_tags(flags) ? 1 : tagset->nr_hw_queues;
+ 
+@@ -449,6 +448,7 @@ void blk_mq_tagset_busy_iter(struct blk_mq_tag_set *tagset,
+ 			__blk_mq_all_tag_iter(tagset->tags[i], fn, priv,
+ 					      BT_TAG_ITER_STARTED);
+ 	}
++	srcu_read_unlock(&tagset->tags_srcu, srcu_idx);
+ }
+ EXPORT_SYMBOL(blk_mq_tagset_busy_iter);
+ 
+@@ -499,6 +499,8 @@ EXPORT_SYMBOL(blk_mq_tagset_wait_completed_request);
+ void blk_mq_queue_tag_busy_iter(struct request_queue *q, busy_tag_iter_fn *fn,
+ 		void *priv)
+ {
++	int srcu_idx;
++
+ 	/*
+ 	 * __blk_mq_update_nr_hw_queues() updates nr_hw_queues and hctx_table
+ 	 * while the queue is frozen. So we can use q_usage_counter to avoid
+@@ -507,6 +509,7 @@ void blk_mq_queue_tag_busy_iter(struct request_queue *q, busy_tag_iter_fn *fn,
+ 	if (!percpu_ref_tryget(&q->q_usage_counter))
+ 		return;
+ 
++	srcu_idx = srcu_read_lock(&q->tag_set->tags_srcu);
+ 	if (blk_mq_is_shared_tags(q->tag_set->flags)) {
+ 		struct blk_mq_tags *tags = q->tag_set->shared_tags;
+ 		struct sbitmap_queue *bresv = &tags->breserved_tags;
+@@ -536,6 +539,7 @@ void blk_mq_queue_tag_busy_iter(struct request_queue *q, busy_tag_iter_fn *fn,
+ 			bt_for_each(hctx, q, btags, fn, priv, false);
+ 		}
+ 	}
++	srcu_read_unlock(&q->tag_set->tags_srcu, srcu_idx);
+ 	blk_queue_exit(q);
+ }
+ 
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 1c3cdf17af79..9abcd4c5d6a2 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -3415,7 +3415,6 @@ static void blk_mq_clear_rq_mapping(struct blk_mq_tags *drv_tags,
+ 				    struct blk_mq_tags *tags)
+ {
+ 	struct page *page;
+-	unsigned long flags;
+ 
+ 	/*
+ 	 * There is no need to clear mapping if driver tags is not initialized
+@@ -3439,15 +3438,6 @@ static void blk_mq_clear_rq_mapping(struct blk_mq_tags *drv_tags,
+ 			}
+ 		}
+ 	}
+-
+-	/*
+-	 * Wait until all pending iteration is done.
+-	 *
+-	 * Request reference is cleared and it is guaranteed to be observed
+-	 * after the ->lock is released.
+-	 */
+-	spin_lock_irqsave(&drv_tags->lock, flags);
+-	spin_unlock_irqrestore(&drv_tags->lock, flags);
+ }
+ 
+ void blk_mq_free_rqs(struct blk_mq_tag_set *set, struct blk_mq_tags *tags,
+@@ -3670,8 +3660,12 @@ static bool blk_mq_hctx_has_requests(struct blk_mq_hw_ctx *hctx)
+ 	struct rq_iter_data data = {
+ 		.hctx	= hctx,
+ 	};
++	int srcu_idx;
+ 
++	srcu_idx = srcu_read_lock(&hctx->queue->tag_set->tags_srcu);
+ 	blk_mq_all_tag_iter(tags, blk_mq_has_request, &data);
++	srcu_read_unlock(&hctx->queue->tag_set->tags_srcu, srcu_idx);
++
+ 	return data.has_rq;
+ }
+ 
+@@ -3891,7 +3885,6 @@ static void blk_mq_clear_flush_rq_mapping(struct blk_mq_tags *tags,
+ 		unsigned int queue_depth, struct request *flush_rq)
+ {
+ 	int i;
+-	unsigned long flags;
+ 
+ 	/* The hw queue may not be mapped yet */
+ 	if (!tags)
+@@ -3901,15 +3894,6 @@ static void blk_mq_clear_flush_rq_mapping(struct blk_mq_tags *tags,
+ 
+ 	for (i = 0; i < queue_depth; i++)
+ 		cmpxchg(&tags->rqs[i], flush_rq, NULL);
+-
+-	/*
+-	 * Wait until all pending iteration is done.
+-	 *
+-	 * Request reference is cleared and it is guaranteed to be observed
+-	 * after the ->lock is released.
+-	 */
+-	spin_lock_irqsave(&tags->lock, flags);
+-	spin_unlock_irqrestore(&tags->lock, flags);
+ }
+ 
+ static void blk_free_flush_queue_callback(struct rcu_head *head)
+-- 
+2.43.0
+
