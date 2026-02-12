@@ -1,0 +1,108 @@
+From 63b41d207dc12ee2632fcad6229bfca2c54da5d9 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Mon, 30 Sep 2024 20:04:07 +0300
+Subject: drm/i915/dsb: Introduce intel_dsb_vblank_evade()
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 63b41d207dc12ee2632fcad6229bfca2c54da5d9
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Add a helper for performing vblank evasion on the DSB. DSB based
+plane updates will need this to guarantee all the double buffered
+arming registers will get programmed atomically within the same
+frame.
+
+With VRR we more or less have two vblanks to worry about:
+- vmax vblank start in case no push was sent
+- vmin vblank start in case a push was already sent during
+  the vertical active. Only a concern for mailbox updates,
+  which I suppose could happen if the legacy cursor updates
+  take the non-fastpath without setting
+  state->legacy_cursor_update to false.
+Since we don't know which case is relevant we'll just evade
+both.
+
+We must also make sure to evade both the delayed vblank
+(for pipe/plane registers) and the undelayed vblank
+(for transcoder registers and chained DSBs w/
+DSB_WAIT_FOR_VBLANK).
+
+Todo: come up with a sensible usec number for the evasion...
+
+Reviewed-by: Animesh Manna <animesh.manna@intel.com>
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20240930170415.23841-6-ville.syrjala@linux.intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/intel_dsb.c | 31 ++++++++++++++++++++++++
+ drivers/gpu/drm/i915/display/intel_dsb.h |  2 ++
+ 2 files changed, 33 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_dsb.c b/drivers/gpu/drm/i915/display/intel_dsb.c
+index 9d323347b4de..71208be9225e 100644
+--- a/drivers/gpu/drm/i915/display/intel_dsb.c
++++ b/drivers/gpu/drm/i915/display/intel_dsb.c
+@@ -128,6 +128,12 @@ pre_commit_crtc_state(struct intel_atomic_state *state,
+ 		return old_crtc_state;
+ }
+ 
++static int dsb_vblank_delay(const struct intel_crtc_state *crtc_state)
++{
++	return intel_mode_vblank_start(&crtc_state->hw.adjusted_mode) -
++		intel_mode_vdisplay(&crtc_state->hw.adjusted_mode);
++}
++
+ static int dsb_vtotal(struct intel_atomic_state *state,
+ 		      struct intel_crtc *crtc)
+ {
+@@ -527,6 +533,31 @@ static u32 dsb_error_int_en(struct intel_display *display)
+ 	return errors;
+ }
+ 
++void intel_dsb_vblank_evade(struct intel_atomic_state *state,
++			    struct intel_dsb *dsb)
++{
++	struct intel_crtc *crtc = dsb->crtc;
++	const struct intel_crtc_state *crtc_state = pre_commit_crtc_state(state, crtc);
++	/* FIXME calibrate sensibly */
++	int latency = intel_usecs_to_scanlines(&crtc_state->hw.adjusted_mode, 20);
++	int vblank_delay = dsb_vblank_delay(crtc_state);
++	int start, end;
++
++	if (pre_commit_is_vrr_active(state, crtc)) {
++		end = intel_vrr_vmin_vblank_start(crtc_state);
++		start = end - vblank_delay - latency;
++		intel_dsb_wait_scanline_out(state, dsb, start, end);
++
++		end = intel_vrr_vmax_vblank_start(crtc_state);
++		start = end - vblank_delay - latency;
++		intel_dsb_wait_scanline_out(state, dsb, start, end);
++	} else {
++		end = intel_mode_vblank_start(&crtc_state->hw.adjusted_mode);
++		start = end - vblank_delay - latency;
++		intel_dsb_wait_scanline_out(state, dsb, start, end);
++	}
++}
++
+ static void _intel_dsb_chain(struct intel_atomic_state *state,
+ 			     struct intel_dsb *dsb,
+ 			     struct intel_dsb *chained_dsb,
+diff --git a/drivers/gpu/drm/i915/display/intel_dsb.h b/drivers/gpu/drm/i915/display/intel_dsb.h
+index ff3b89dfffc1..cce5cb1c6071 100644
+--- a/drivers/gpu/drm/i915/display/intel_dsb.h
++++ b/drivers/gpu/drm/i915/display/intel_dsb.h
+@@ -46,6 +46,8 @@ void intel_dsb_wait_scanline_in(struct intel_atomic_state *state,
+ void intel_dsb_wait_scanline_out(struct intel_atomic_state *state,
+ 				 struct intel_dsb *dsb,
+ 				 int lower, int upper);
++void intel_dsb_vblank_evade(struct intel_atomic_state *state,
++			    struct intel_dsb *dsb);
+ void intel_dsb_chain(struct intel_atomic_state *state,
+ 		     struct intel_dsb *dsb,
+ 		     struct intel_dsb *chained_dsb,
+-- 
+2.52.0
+
