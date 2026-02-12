@@ -1,0 +1,129 @@
+From 82ab75c4520cfa77c0409e70a2623561233cd109 Mon Sep 17 00:00:00 2001
+From: Chaitanya Kumar Borah <chaitanya.kumar.borah@intel.com>
+Date: Wed, 23 Oct 2024 10:11:22 +0530
+Subject: drm/i915/display: Allow fastset for change in HDR infoframe
+Git-commit: 82ab75c4520cfa77c0409e70a2623561233cd109
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Changes in Dynamic Range and Mastering infoframe
+should not trigger a full modeset. Therefore, allow
+fastset. DP SDP programming is already hooked up in the
+fastset flow but HDMI AVI infoframe update is not, add it.
+Any other infoframe that can be fastset should be added to
+the helper intel_hdmi_fastset_infoframes().
+
+V3: - Create a wrapper intel_ddi_update_pipe_hdmi to stick to
+   uniform naming (Jani)
+ - Do not disable HDMI AVI infoframe if already disabled (Uma)
+
+V2: - Update HDMI AVI infoframe during fastset.
+
+Signed-off-by: Chaitanya Kumar Borah <chaitanya.kumar.borah@intel.com>
+Reviewed-by: Uma Shankar <uma.shankar@intel.com>
+Signed-off-by: Animesh Manna <animesh.manna@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241023044122.3889137-1-chaitanya.kumar.borah@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/intel_ddi.c     | 11 +++++++++
+ drivers/gpu/drm/i915/display/intel_display.c |  3 ++-
+ drivers/gpu/drm/i915/display/intel_hdmi.c    | 24 ++++++++++++++++++++
+ drivers/gpu/drm/i915/display/intel_hdmi.h    |  3 +++
+ 4 files changed, 40 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_ddi.c b/drivers/gpu/drm/i915/display/intel_ddi.c
+index 0535daed6a9f..49b5cc01ce40 100644
+--- a/drivers/gpu/drm/i915/display/intel_ddi.c
++++ b/drivers/gpu/drm/i915/display/intel_ddi.c
+@@ -3513,6 +3513,13 @@ static void intel_ddi_update_pipe_dp(struct intel_atomic_state *state,
+ 	drm_connector_update_privacy_screen(conn_state);
+ }
+ 
++static void intel_ddi_update_pipe_hdmi(struct intel_encoder *encoder,
++				       const struct intel_crtc_state *crtc_state,
++				       const struct drm_connector_state *conn_state)
++{
++	intel_hdmi_fastset_infoframes(encoder, crtc_state, conn_state);
++}
++
+ void intel_ddi_update_pipe(struct intel_atomic_state *state,
+ 			   struct intel_encoder *encoder,
+ 			   const struct intel_crtc_state *crtc_state,
+@@ -3524,6 +3531,10 @@ void intel_ddi_update_pipe(struct intel_atomic_state *state,
+ 		intel_ddi_update_pipe_dp(state, encoder, crtc_state,
+ 					 conn_state);
+ 
++	if (intel_crtc_has_type(crtc_state, INTEL_OUTPUT_HDMI))
++		intel_ddi_update_pipe_hdmi(encoder, crtc_state,
++					   conn_state);
++
+ 	intel_hdcp_update_pipe(state, encoder, crtc_state, conn_state);
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index a410e502f7ac..863927f429aa 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -5702,7 +5702,8 @@ intel_pipe_config_compare(const struct intel_crtc_state *current_config,
+ 	PIPE_CONF_CHECK_INFOFRAME(avi);
+ 	PIPE_CONF_CHECK_INFOFRAME(spd);
+ 	PIPE_CONF_CHECK_INFOFRAME(hdmi);
+-	PIPE_CONF_CHECK_INFOFRAME(drm);
++	if (!fastset)
++		PIPE_CONF_CHECK_INFOFRAME(drm);
+ 	PIPE_CONF_CHECK_DP_VSC_SDP(vsc);
+ 	PIPE_CONF_CHECK_DP_AS_SDP(as_sdp);
+ 
+diff --git a/drivers/gpu/drm/i915/display/intel_hdmi.c b/drivers/gpu/drm/i915/display/intel_hdmi.c
+index e1a1351bc94f..c6ce6bb88d7c 100644
+--- a/drivers/gpu/drm/i915/display/intel_hdmi.c
++++ b/drivers/gpu/drm/i915/display/intel_hdmi.c
+@@ -1212,6 +1212,30 @@ static void vlv_set_infoframes(struct intel_encoder *encoder,
+ 			      &crtc_state->infoframes.hdmi);
+ }
+ 
++void intel_hdmi_fastset_infoframes(struct intel_encoder *encoder,
++				   const struct intel_crtc_state *crtc_state,
++				   const struct drm_connector_state *conn_state)
++{
++	struct intel_display *display = to_intel_display(encoder);
++	i915_reg_t reg = HSW_TVIDEO_DIP_CTL(display,
++					    crtc_state->cpu_transcoder);
++	u32 val = intel_de_read(display, reg);
++
++	if ((crtc_state->infoframes.enable &
++		intel_hdmi_infoframe_enable(HDMI_INFOFRAME_TYPE_DRM)) == 0 &&
++			(val & VIDEO_DIP_ENABLE_DRM_GLK) == 0)
++		return;
++
++	val &= ~(VIDEO_DIP_ENABLE_DRM_GLK);
++
++	intel_de_write(display, reg, val);
++	intel_de_posting_read(display, reg);
++
++	intel_write_infoframe(encoder, crtc_state,
++			      HDMI_INFOFRAME_TYPE_DRM,
++			      &crtc_state->infoframes.drm);
++}
++
+ static void hsw_set_infoframes(struct intel_encoder *encoder,
+ 			       bool enable,
+ 			       const struct intel_crtc_state *crtc_state,
+diff --git a/drivers/gpu/drm/i915/display/intel_hdmi.h b/drivers/gpu/drm/i915/display/intel_hdmi.h
+index 9b97623665c5..466f48df8a74 100644
+--- a/drivers/gpu/drm/i915/display/intel_hdmi.h
++++ b/drivers/gpu/drm/i915/display/intel_hdmi.h
+@@ -42,6 +42,9 @@ u32 intel_hdmi_infoframes_enabled(struct intel_encoder *encoder,
+ u32 intel_hdmi_infoframe_enable(unsigned int type);
+ void intel_hdmi_read_gcp_infoframe(struct intel_encoder *encoder,
+ 				   struct intel_crtc_state *crtc_state);
++void intel_hdmi_fastset_infoframes(struct intel_encoder *encoder,
++				   const struct intel_crtc_state *crtc_state,
++				   const struct drm_connector_state *conn_state);
+ void intel_read_infoframe(struct intel_encoder *encoder,
+ 			  const struct intel_crtc_state *crtc_state,
+ 			  enum hdmi_infoframe_type type,
+-- 
+2.52.0
+
