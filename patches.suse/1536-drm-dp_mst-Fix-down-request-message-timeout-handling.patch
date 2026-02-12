@@ -1,0 +1,79 @@
+From 3f611855031f94385c2eeb32b1f99dd7a9fa566b Mon Sep 17 00:00:00 2001
+From: Imre Deak <imre.deak@intel.com>
+Date: Tue, 3 Dec 2024 19:46:32 +0200
+Subject: drm/dp_mst: Fix down request message timeout handling
+Git-commit: 3f611855031f94385c2eeb32b1f99dd7a9fa566b
+Patch-mainline: v6.13-rc2
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+If receiving a reply for an MST down request message times out, the
+thread receiving the reply in drm_dp_mst_handle_down_rep() could try to
+dereference the drm_dp_sideband_msg_tx txmsg request message after the
+thread waiting for the reply - calling drm_dp_mst_wait_tx_reply() - has
+timed out and freed txmsg, hence leading to a use-after-free in
+drm_dp_mst_handle_down_rep().
+
+Prevent the above by holding the drm_dp_mst_topology_mgr::qlock in
+drm_dp_mst_handle_down_rep() for the whole duration txmsg is looked up
+from the request list and dereferenced.
+
+V2: Fix unlocking mgr->qlock after verify_rx_request_type() fails.
+
+Cc: Lyude Paul <lyude@redhat.com>
+Reviewed-by: Lyude Paul <lyude@redhat.com>
+Signed-off-by: Imre Deak <imre.deak@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241203174632.2941402-1-imre.deak@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/display/drm_dp_mst_topology.c | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/display/drm_dp_mst_topology.c b/drivers/gpu/drm/display/drm_dp_mst_topology.c
+index 6ec8680998d5..ab21855d5c0f 100644
+--- a/drivers/gpu/drm/display/drm_dp_mst_topology.c
++++ b/drivers/gpu/drm/display/drm_dp_mst_topology.c
+@@ -3984,9 +3984,9 @@ static int drm_dp_mst_handle_down_rep(struct drm_dp_mst_topology_mgr *mgr)
+ 
+ 	/* find the message */
+ 	mutex_lock(&mgr->qlock);
++
+ 	txmsg = list_first_entry_or_null(&mgr->tx_msg_downq,
+ 					 struct drm_dp_sideband_msg_tx, next);
+-	mutex_unlock(&mgr->qlock);
+ 
+ 	/* Were we actually expecting a response, and from this mstb? */
+ 	if (!txmsg || txmsg->dst != mstb) {
+@@ -3995,11 +3995,17 @@ static int drm_dp_mst_handle_down_rep(struct drm_dp_mst_topology_mgr *mgr)
+ 		hdr = &msg->initial_hdr;
+ 		drm_dbg_kms(mgr->dev, "Got MST reply with no msg %p %d %d %02x %02x\n",
+ 			    mstb, hdr->seqno, hdr->lct, hdr->rad[0], msg->msg[0]);
++
++		mutex_unlock(&mgr->qlock);
++
+ 		goto out_clear_reply;
+ 	}
+ 
+-	if (!verify_rx_request_type(mgr, txmsg, msg))
++	if (!verify_rx_request_type(mgr, txmsg, msg)) {
++		mutex_unlock(&mgr->qlock);
++
+ 		goto out_clear_reply;
++	}
+ 
+ 	drm_dp_sideband_parse_reply(mgr, msg, &txmsg->reply);
+ 
+@@ -4013,9 +4019,9 @@ static int drm_dp_mst_handle_down_rep(struct drm_dp_mst_topology_mgr *mgr)
+ 			    txmsg->reply.u.nak.nak_data);
+ 	}
+ 
+-	mutex_lock(&mgr->qlock);
+ 	txmsg->state = DRM_DP_SIDEBAND_TX_RX;
+ 	list_del(&txmsg->next);
++
+ 	mutex_unlock(&mgr->qlock);
+ 
+ 	wake_up_all(&mgr->tx_waitq);
+-- 
+2.52.0
+
