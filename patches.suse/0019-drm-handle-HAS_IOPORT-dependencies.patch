@@ -1,0 +1,167 @@
+From f663c6ae36205bdaae55f679f1c5d7a3221f9d00 Mon Sep 17 00:00:00 2001
+From: Niklas Schnelle <schnelle@linux.ibm.com>
+Date: Thu, 24 Oct 2024 19:54:42 +0200
+Subject: drm: handle HAS_IOPORT dependencies
+Git-commit: f663c6ae36205bdaae55f679f1c5d7a3221f9d00
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+In a future patch HAS_IOPORT=n will disable inb()/outb() and friends at
+compile time. We thus need to add HAS_IOPORT as dependency for those
+drivers using them. In the bochs driver there is optional MMIO support
+detected at runtime, warn if this isn't taken when HAS_IOPORT is not
+defined.
+
+There is also a direct and hard coded use in cirrus.c which according to
+the comment is only necessary during resume.  Let's just skip this as
+for example s390 which doesn't have I/O port support also doesen't
+support suspend/resume.
+
+Co-developed-by: Arnd Bergmann <arnd@kernel.org>
+Signed-off-by: Arnd Bergmann <arnd@kernel.org>
+Acked-by: Lucas De Marchi <lucas.demarchi@intel.com> # xe
+Signed-off-by: Niklas Schnelle <schnelle@linux.ibm.com>
+Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/gma500/Kconfig |  2 +-
+ drivers/gpu/drm/qxl/Kconfig    |  2 +-
+ drivers/gpu/drm/tiny/bochs.c   | 19 ++++++++++++++-----
+ drivers/gpu/drm/tiny/cirrus.c  |  2 ++
+ drivers/gpu/drm/xe/Kconfig     |  2 +-
+ 5 files changed, 19 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/gma500/Kconfig b/drivers/gpu/drm/gma500/Kconfig
+index efb4a2dd2f80..23b7c14de5e2 100644
+--- a/drivers/gpu/drm/gma500/Kconfig
++++ b/drivers/gpu/drm/gma500/Kconfig
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ config DRM_GMA500
+ 	tristate "Intel GMA500/600/3600/3650 KMS Framebuffer"
+-	depends on DRM && PCI && X86 && MMU
++	depends on DRM && PCI && X86 && MMU && HAS_IOPORT
+ 	select DRM_KMS_HELPER
+ 	select FB_IOMEM_HELPERS if DRM_FBDEV_EMULATION
+ 	select I2C
+diff --git a/drivers/gpu/drm/qxl/Kconfig b/drivers/gpu/drm/qxl/Kconfig
+index ca3f51c2a8fe..17d6927e5e23 100644
+--- a/drivers/gpu/drm/qxl/Kconfig
++++ b/drivers/gpu/drm/qxl/Kconfig
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ config DRM_QXL
+ 	tristate "QXL virtual GPU"
+-	depends on DRM && PCI && MMU
++	depends on DRM && PCI && MMU && HAS_IOPORT
+ 	select DRM_KMS_HELPER
+ 	select DRM_TTM
+ 	select DRM_TTM_HELPER
+diff --git a/drivers/gpu/drm/tiny/bochs.c b/drivers/gpu/drm/tiny/bochs.c
+index 31fc5d839e10..e738bb858316 100644
+--- a/drivers/gpu/drm/tiny/bochs.c
++++ b/drivers/gpu/drm/tiny/bochs.c
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <linux/bug.h>
+ #include <linux/module.h>
+ #include <linux/pci.h>
+ 
+@@ -95,12 +96,17 @@ struct bochs_device {
+ 
+ /* ---------------------------------------------------------------------- */
+ 
++static __always_inline bool bochs_uses_mmio(struct bochs_device *bochs)
++{
++	return !IS_ENABLED(CONFIG_HAS_IOPORT) || bochs->mmio;
++}
++
+ static void bochs_vga_writeb(struct bochs_device *bochs, u16 ioport, u8 val)
+ {
+ 	if (WARN_ON(ioport < 0x3c0 || ioport > 0x3df))
+ 		return;
+ 
+-	if (bochs->mmio) {
++	if (bochs_uses_mmio(bochs)) {
+ 		int offset = ioport - 0x3c0 + 0x400;
+ 
+ 		writeb(val, bochs->mmio + offset);
+@@ -114,7 +120,7 @@ static u8 bochs_vga_readb(struct bochs_device *bochs, u16 ioport)
+ 	if (WARN_ON(ioport < 0x3c0 || ioport > 0x3df))
+ 		return 0xff;
+ 
+-	if (bochs->mmio) {
++	if (bochs_uses_mmio(bochs)) {
+ 		int offset = ioport - 0x3c0 + 0x400;
+ 
+ 		return readb(bochs->mmio + offset);
+@@ -127,7 +133,7 @@ static u16 bochs_dispi_read(struct bochs_device *bochs, u16 reg)
+ {
+ 	u16 ret = 0;
+ 
+-	if (bochs->mmio) {
++	if (bochs_uses_mmio(bochs)) {
+ 		int offset = 0x500 + (reg << 1);
+ 
+ 		ret = readw(bochs->mmio + offset);
+@@ -140,7 +146,7 @@ static u16 bochs_dispi_read(struct bochs_device *bochs, u16 reg)
+ 
+ static void bochs_dispi_write(struct bochs_device *bochs, u16 reg, u16 val)
+ {
+-	if (bochs->mmio) {
++	if (bochs_uses_mmio(bochs)) {
+ 		int offset = 0x500 + (reg << 1);
+ 
+ 		writew(val, bochs->mmio + offset);
+@@ -228,7 +234,7 @@ static int bochs_hw_init(struct drm_device *dev)
+ 			DRM_ERROR("Cannot map mmio region\n");
+ 			return -ENOMEM;
+ 		}
+-	} else {
++	} else if (IS_ENABLED(CONFIG_HAS_IOPORT)) {
+ 		ioaddr = VBE_DISPI_IOPORT_INDEX;
+ 		iosize = 2;
+ 		if (!request_region(ioaddr, iosize, "bochs-drm")) {
+@@ -236,6 +242,9 @@ static int bochs_hw_init(struct drm_device *dev)
+ 			return -EBUSY;
+ 		}
+ 		bochs->ioports = 1;
++	} else {
++		dev_err(dev->dev, "I/O ports are not supported\n");
++		return -EIO;
+ 	}
+ 
+ 	id = bochs_dispi_read(bochs, VBE_DISPI_INDEX_ID);
+diff --git a/drivers/gpu/drm/tiny/cirrus.c b/drivers/gpu/drm/tiny/cirrus.c
+index 751326e3d9c3..e31e1df029ab 100644
+--- a/drivers/gpu/drm/tiny/cirrus.c
++++ b/drivers/gpu/drm/tiny/cirrus.c
+@@ -509,8 +509,10 @@ static void cirrus_crtc_helper_atomic_enable(struct drm_crtc *crtc,
+ 
+ 	cirrus_mode_set(cirrus, &crtc_state->mode);
+ 
++#ifdef CONFIG_HAS_IOPORT
+ 	/* Unblank (needed on S3 resume, vgabios doesn't do it then) */
+ 	outb(VGA_AR_ENABLE_DISPLAY, VGA_ATT_W);
++#endif
+ 
+ 	drm_dev_exit(idx);
+ }
+diff --git a/drivers/gpu/drm/xe/Kconfig b/drivers/gpu/drm/xe/Kconfig
+index 7bbe46a98ff1..116f58774135 100644
+--- a/drivers/gpu/drm/xe/Kconfig
++++ b/drivers/gpu/drm/xe/Kconfig
+@@ -49,7 +49,7 @@ config DRM_XE
+ 
+ config DRM_XE_DISPLAY
+ 	bool "Enable display support"
+-	depends on DRM_XE && DRM_XE=m
++	depends on DRM_XE && DRM_XE=m && HAS_IOPORT
+ 	select FB_IOMEM_HELPERS
+ 	select I2C
+ 	select I2C_ALGOBIT
+-- 
+2.52.0
+
