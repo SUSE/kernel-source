@@ -1,0 +1,140 @@
+From afc73333d922e01758abd77f92f6867ab3449cb4 Mon Sep 17 00:00:00 2001
+From: Imre Deak <imre.deak@intel.com>
+Date: Fri, 25 Oct 2024 19:02:53 +0300
+Subject: drm/i915/dp: Ensure panel power remains enabled during connector
+ detection
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: afc73333d922e01758abd77f92f6867ab3449cb4
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+The sink's capabilities, like the DSC caps, depend on the source OUI
+written to the sink's DPCD registers and so this OUI value should be
+valid for the whole duration of the detection. An eDP sink will reset
+this OUI value when the panel power is disabled, so prevent the
+disabling - happening by default after a 1 sec idle period - for the
+whole duration of detection.
+
+V2: Update the documentation for intel_pps_on(). (Jani)
+
+Cc: Jani Nikula <jani.nikula@linux.intel.com>
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Signed-off-by: Imre Deak <imre.deak@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241025160259.3088727-3-imre.deak@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/intel_dp.c  | 18 +++++++++++++-----
+ drivers/gpu/drm/i915/display/intel_pps.c | 14 +++++++++++++-
+ drivers/gpu/drm/i915/display/intel_pps.h |  1 +
+ 3 files changed, 27 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_dp.c b/drivers/gpu/drm/i915/display/intel_dp.c
+index a19ecb845a78..b86ede9a1aa5 100644
+--- a/drivers/gpu/drm/i915/display/intel_dp.c
++++ b/drivers/gpu/drm/i915/display/intel_dp.c
+@@ -5619,6 +5619,8 @@ intel_dp_detect(struct drm_connector *connector,
+ 
+ 	intel_dp_flush_connector_commits(intel_connector);
+ 
++	intel_pps_vdd_on(intel_dp);
++
+ 	/* Can't disconnect eDP */
+ 	if (intel_dp_is_edp(intel_dp))
+ 		status = edp_detect(intel_dp);
+@@ -5649,12 +5651,15 @@ intel_dp_detect(struct drm_connector *connector,
+ 
+ 		intel_dp_tunnel_disconnect(intel_dp);
+ 
+-		goto out;
++		goto out_unset_edid;
+ 	}
+ 
+ 	ret = intel_dp_tunnel_detect(intel_dp, ctx);
+-	if (ret == -EDEADLK)
+-		return ret;
++	if (ret == -EDEADLK) {
++		status = ret;
++
++		goto out_vdd_off;
++	}
+ 
+ 	if (ret == 1)
+ 		intel_connector->base.epoch_counter++;
+@@ -5682,7 +5687,7 @@ intel_dp_detect(struct drm_connector *connector,
+ 		 * with EDID on it
+ 		 */
+ 		status = connector_status_disconnected;
+-		goto out;
++		goto out_unset_edid;
+ 	}
+ 
+ 	/*
+@@ -5711,7 +5716,7 @@ intel_dp_detect(struct drm_connector *connector,
+ 
+ 	intel_dp_check_device_service_irq(intel_dp);
+ 
+-out:
++out_unset_edid:
+ 	if (status != connector_status_connected && !intel_dp->is_mst)
+ 		intel_dp_unset_edid(intel_dp);
+ 
+@@ -5720,6 +5725,9 @@ intel_dp_detect(struct drm_connector *connector,
+ 						 status,
+ 						 intel_dp->dpcd,
+ 						 intel_dp->downstream_ports);
++out_vdd_off:
++	intel_pps_vdd_off(intel_dp);
++
+ 	return status;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/display/intel_pps.c b/drivers/gpu/drm/i915/display/intel_pps.c
+index 0bd8e4de8b69..a1b2c400d6a5 100644
+--- a/drivers/gpu/drm/i915/display/intel_pps.c
++++ b/drivers/gpu/drm/i915/display/intel_pps.c
+@@ -797,7 +797,8 @@ bool intel_pps_vdd_on_unlocked(struct intel_dp *intel_dp)
+ }
+ 
+ /*
+- * Must be paired with intel_pps_off().
++ * Must be paired with intel_pps_vdd_off() or - to disable
++ * both VDD and panel power - intel_pps_off().
+  * Nested calls to these functions are not allowed since
+  * we drop the lock. Caller must use some higher level
+  * locking to prevent nested calls from other threads.
+@@ -944,6 +945,17 @@ void intel_pps_vdd_off_unlocked(struct intel_dp *intel_dp, bool sync)
+ 		edp_panel_vdd_schedule_off(intel_dp);
+ }
+ 
++void intel_pps_vdd_off(struct intel_dp *intel_dp)
++{
++	intel_wakeref_t wakeref;
++
++	if (!intel_dp_is_edp(intel_dp))
++		return;
++
++	with_intel_pps_lock(intel_dp, wakeref)
++		intel_pps_vdd_off_unlocked(intel_dp, false);
++}
++
+ void intel_pps_on_unlocked(struct intel_dp *intel_dp)
+ {
+ 	struct intel_display *display = to_intel_display(intel_dp);
+diff --git a/drivers/gpu/drm/i915/display/intel_pps.h b/drivers/gpu/drm/i915/display/intel_pps.h
+index bc5046d53626..c83007152f07 100644
+--- a/drivers/gpu/drm/i915/display/intel_pps.h
++++ b/drivers/gpu/drm/i915/display/intel_pps.h
+@@ -34,6 +34,7 @@ void intel_pps_off_unlocked(struct intel_dp *intel_dp);
+ void intel_pps_check_power_unlocked(struct intel_dp *intel_dp);
+ 
+ void intel_pps_vdd_on(struct intel_dp *intel_dp);
++void intel_pps_vdd_off(struct intel_dp *intel_dp);
+ void intel_pps_on(struct intel_dp *intel_dp);
+ void intel_pps_off(struct intel_dp *intel_dp);
+ void intel_pps_vdd_off_sync(struct intel_dp *intel_dp);
+-- 
+2.52.0
+
