@@ -1,0 +1,128 @@
+From 98d277a79126a2df8a2617215846d01f823cfffa Mon Sep 17 00:00:00 2001
+From: Ulf Hansson <ulf.hansson@linaro.org>
+Date: Wed, 2 Oct 2024 14:22:25 +0200
+Subject: PM: domains: Support required OPPs in dev_pm_domain_attach_list()
+Git-commit: 98d277a79126a2df8a2617215846d01f823cfffa
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+In the multiple PM domain case we need platform code to specify the index
+of the corresponding required OPP in DT for a device, which is what
+*_opp_attach_genpd() is there to help us with.
+
+However, attaching a device to its PM domains is in general better done
+with dev_pm_domain_attach_list(). To avoid having two different ways to
+manage this and to prepare for the removal of *_opp_attach_genpd(), let's
+extend dev_pm_domain_attach|detach_list() to manage the required OPPs too.
+
+Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+Acked-by: Viresh Kumar <viresh.kumar@linaro.org>
+Link: https://lore.kernel.org/r/20241002122232.194245-5-ulf.hansson@linaro.org
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/base/power/common.c | 21 ++++++++++++++++++++-
+ include/linux/pm_domain.h   |  8 ++++++++
+ 2 files changed, 28 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/base/power/common.c b/drivers/base/power/common.c
+index cca2fd0a1aed..781968a128ff 100644
+--- a/drivers/base/power/common.c
++++ b/drivers/base/power/common.c
+@@ -11,6 +11,7 @@
+ #include <linux/pm_clock.h>
+ #include <linux/acpi.h>
+ #include <linux/pm_domain.h>
++#include <linux/pm_opp.h>
+ 
+ #include "power.h"
+ 
+@@ -222,13 +223,15 @@ int dev_pm_domain_attach_list(struct device *dev,
+ 	if (!pds)
+ 		return -ENOMEM;
+ 
+-	size = sizeof(*pds->pd_devs) + sizeof(*pds->pd_links);
++	size = sizeof(*pds->pd_devs) + sizeof(*pds->pd_links) +
++	       sizeof(*pds->opp_tokens);
+ 	pds->pd_devs = kcalloc(num_pds, size, GFP_KERNEL);
+ 	if (!pds->pd_devs) {
+ 		ret = -ENOMEM;
+ 		goto free_pds;
+ 	}
+ 	pds->pd_links = (void *)(pds->pd_devs + num_pds);
++	pds->opp_tokens = (void *)(pds->pd_links + num_pds);
+ 
+ 	if (link_flags && pd_flags & PD_FLAG_DEV_LINK_ON)
+ 		link_flags |= DL_FLAG_RPM_ACTIVE;
+@@ -244,6 +247,19 @@ int dev_pm_domain_attach_list(struct device *dev,
+ 			goto err_attach;
+ 		}
+ 
++		if (pd_flags & PD_FLAG_REQUIRED_OPP) {
++			struct dev_pm_opp_config config = {
++				.required_dev = pd_dev,
++				.required_dev_index = i,
++			};
++
++			ret = dev_pm_opp_set_config(dev, &config);
++			if (ret < 0)
++				goto err_link;
++
++			pds->opp_tokens[i] = ret;
++		}
++
+ 		if (link_flags) {
+ 			struct device_link *link;
+ 
+@@ -264,9 +280,11 @@ int dev_pm_domain_attach_list(struct device *dev,
+ 	return num_pds;
+ 
+ err_link:
++	dev_pm_opp_clear_config(pds->opp_tokens[i]);
+ 	dev_pm_domain_detach(pd_dev, true);
+ err_attach:
+ 	while (--i >= 0) {
++		dev_pm_opp_clear_config(pds->opp_tokens[i]);
+ 		if (pds->pd_links[i])
+ 			device_link_del(pds->pd_links[i]);
+ 		dev_pm_domain_detach(pds->pd_devs[i], true);
+@@ -361,6 +379,7 @@ void dev_pm_domain_detach_list(struct dev_pm_domain_list *list)
+ 		return;
+ 
+ 	for (i = 0; i < list->num_pds; i++) {
++		dev_pm_opp_clear_config(list->opp_tokens[i]);
+ 		if (list->pd_links[i])
+ 			device_link_del(list->pd_links[i]);
+ 		dev_pm_domain_detach(list->pd_devs[i], true);
+diff --git a/include/linux/pm_domain.h b/include/linux/pm_domain.h
+index cf4b11be3709..f51f11160add 100644
+--- a/include/linux/pm_domain.h
++++ b/include/linux/pm_domain.h
+@@ -30,9 +30,16 @@
+  *				supplier and its PM domain when creating the
+  *				device-links.
+  *
++ * PD_FLAG_REQUIRED_OPP:	Assign required_devs for the required OPPs. The
++ *				index of the required OPP must correspond to the
++ *				index in the array of the pd_names. If pd_names
++ *				isn't specified, the index just follows the
++ *				index for the attached PM domain.
++ *
+  */
+ #define PD_FLAG_NO_DEV_LINK		BIT(0)
+ #define PD_FLAG_DEV_LINK_ON		BIT(1)
++#define PD_FLAG_REQUIRED_OPP		BIT(2)
+ 
+ struct dev_pm_domain_attach_data {
+ 	const char * const *pd_names;
+@@ -43,6 +50,7 @@ struct dev_pm_domain_attach_data {
+ struct dev_pm_domain_list {
+ 	struct device **pd_devs;
+ 	struct device_link **pd_links;
++	u32 *opp_tokens;
+ 	u32 num_pds;
+ };
+ 
+-- 
+2.52.0
+
