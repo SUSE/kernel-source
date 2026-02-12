@@ -1,0 +1,88 @@
+From c4dab0828c13b962c8cd3c20e5d02487e0944e7d Mon Sep 17 00:00:00 2001
+From: Hans de Goede <hdegoede@redhat.com>
+Date: Fri, 8 Nov 2024 16:12:34 +0100
+Subject: mei: vsc: Improve error logging in vsc_identify_silicon()
+Git-commit: c4dab0828c13b962c8cd3c20e5d02487e0944e7d
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+vsc_identify_silicon() returns -EINVAL in various places without logging
+what is going on.
+
+And there are several bug reports about mei_vsc_hw_reset() failing with
+-EINVAL before the "silicon stepping version is %u:%u" message get logged,
+indicating this is coming from vsc_identify_silicon():
+
+[   10.949657] intel_vsc intel_vsc: hw_reset failed ret = -22
+[   10.988899] intel_vsc intel_vsc: hw_reset failed ret = -22
+[   11.027140] intel_vsc intel_vsc: hw_reset failed ret = -22
+[   11.027151] intel_vsc intel_vsc: reset: reached maximal consecutive resets: disabling the device
+[   11.027155] intel_vsc intel_vsc: reset failed ret = -19
+[   11.027157] intel_vsc intel_vsc: link layer initialization failed.
+[   11.027159] intel_vsc intel_vsc: error -ENODEV: init hw failed
+
+Add proper error logging to mei_vsc_hw_reset() so that it will be clear
+why it is failing when it fails.
+
+Link: https://github.com/intel/ivsc-driver/issues/51
+Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+Link: https://lore.kernel.org/r/20241108151234.36884-1-hdegoede@redhat.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/misc/mei/vsc-fw-loader.c | 26 ++++++++++++++++----------
+ 1 file changed, 16 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/misc/mei/vsc-fw-loader.c b/drivers/misc/mei/vsc-fw-loader.c
+index 9f129bc641f6..0d7e17322869 100644
+--- a/drivers/misc/mei/vsc-fw-loader.c
++++ b/drivers/misc/mei/vsc-fw-loader.c
+@@ -317,28 +317,34 @@ static int vsc_identify_silicon(struct vsc_fw_loader *fw_loader)
+ 	cmd->data.dump_mem.addr = cpu_to_le32(VSC_EFUSE_ADDR);
+ 	cmd->data.dump_mem.len = cpu_to_le16(sizeof(__le32));
+ 	ret = vsc_tp_rom_xfer(fw_loader->tp, cmd, ack, VSC_ROM_PKG_SIZE);
+-	if (ret)
+-		return ret;
+-	if (ack->token == VSC_TOKEN_ERROR)
+-		return -EINVAL;
++	if (ret || ack->token == VSC_TOKEN_ERROR) {
++		dev_err(fw_loader->dev, "CMD_DUMP_MEM error %d token %d\n", ret, ack->token);
++		return ret ?: -EINVAL;
++	}
+ 
+ 	cmd->magic = cpu_to_le32(VSC_MAGIC_NUM);
+ 	cmd->cmd_id = VSC_CMD_GET_CONT;
+ 	ret = vsc_tp_rom_xfer(fw_loader->tp, cmd, ack, VSC_ROM_PKG_SIZE);
+-	if (ret)
+-		return ret;
+-	if (ack->token != VSC_TOKEN_DUMP_RESP)
+-		return -EINVAL;
++	if (ret || ack->token != VSC_TOKEN_DUMP_RESP) {
++		dev_err(fw_loader->dev, "CMD_GETCONT error %d token %d\n", ret, ack->token);
++		return ret ?: -EINVAL;
++	}
+ 
+ 	version = FIELD_GET(VSC_MAINSTEPPING_VERSION_MASK, ack->payload[0]);
+ 	sub_version = FIELD_GET(VSC_SUBSTEPPING_VERSION_MASK, ack->payload[0]);
+ 
+-	if (version != VSC_MAINSTEPPING_VERSION_A)
++	if (version != VSC_MAINSTEPPING_VERSION_A) {
++		dev_err(fw_loader->dev, "maintstepping mismatch expected %d got %d\n",
++			VSC_MAINSTEPPING_VERSION_A, version);
+ 		return -EINVAL;
++	}
+ 
+ 	if (sub_version != VSC_SUBSTEPPING_VERSION_0 &&
+-	    sub_version != VSC_SUBSTEPPING_VERSION_1)
++	    sub_version != VSC_SUBSTEPPING_VERSION_1) {
++		dev_err(fw_loader->dev, "substepping %d is out of supported range %d - %d\n",
++			sub_version, VSC_SUBSTEPPING_VERSION_0, VSC_SUBSTEPPING_VERSION_1);
+ 		return -EINVAL;
++	}
+ 
+ 	dev_info(fw_loader->dev, "silicon stepping version is %u:%u\n",
+ 		 version, sub_version);
+-- 
+2.52.0
+
