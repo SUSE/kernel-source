@@ -1,0 +1,301 @@
+From 6843cd85430054735b2178dcabee39bc57a4eebf Mon Sep 17 00:00:00 2001
+From: Jani Nikula <jani.nikula@intel.com>
+Date: Thu, 12 Sep 2024 17:34:12 +0300
+Subject: drm/i915/display: add intel_display_snapshot abstraction
+Git-commit: 6843cd85430054735b2178dcabee39bc57a4eebf
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+The error state capture still handles display info at a too detailed
+level. Start abstracting the whole display snapshot capture and printing
+at a higher level. Move overlay to display snapshot first.
+
+Use the same nomenclature and style as in xe devcoredump, in preparation
+for perhaps some day bolting the snapshots there as well.
+
+V3: Fix build harder for CONFIG_DRM_I915_CAPTURE_ERROR=n
+
+V2: Fix build for CONFIG_DRM_I915_CAPTURE_ERROR=n (kernel test robot)
+
+Reviewed-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/ba6a36759600c2d35405c41a0fc9d69f676df77d.1726151571.git.jani.nikula@intel.com
+Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/Makefile                 |  1 +
+ .../drm/i915/display/intel_display_snapshot.c | 42 +++++++++++++++++++
+ .../drm/i915/display/intel_display_snapshot.h | 16 +++++++
+ drivers/gpu/drm/i915/display/intel_overlay.c  | 16 ++++---
+ drivers/gpu/drm/i915/display/intel_overlay.h  | 25 +++++++----
+ drivers/gpu/drm/i915/i915_gpu_error.c         | 12 +++---
+ drivers/gpu/drm/i915/i915_gpu_error.h         |  6 +--
+ 7 files changed, 94 insertions(+), 24 deletions(-)
+ create mode 100644 drivers/gpu/drm/i915/display/intel_display_snapshot.c
+ create mode 100644 drivers/gpu/drm/i915/display/intel_display_snapshot.h
+
+diff --git a/drivers/gpu/drm/i915/Makefile b/drivers/gpu/drm/i915/Makefile
+index c63fa2133ccb..9fcd9e09bc0b 100644
+--- a/drivers/gpu/drm/i915/Makefile
++++ b/drivers/gpu/drm/i915/Makefile
+@@ -242,6 +242,7 @@ i915-y += \
+ 	display/intel_display_power_well.o \
+ 	display/intel_display_reset.o \
+ 	display/intel_display_rps.o \
++	display/intel_display_snapshot.o \
+ 	display/intel_display_wa.o \
+ 	display/intel_dmc.o \
+ 	display/intel_dmc_wl.o \
+diff --git a/drivers/gpu/drm/i915/display/intel_display_snapshot.c b/drivers/gpu/drm/i915/display/intel_display_snapshot.c
+new file mode 100644
+index 000000000000..78b019dcd41d
+--- /dev/null
++++ b/drivers/gpu/drm/i915/display/intel_display_snapshot.c
+@@ -0,0 +1,42 @@
++// SPDX-License-Identifier: MIT
++/* Copyright © 2024 Intel Corporation */
++
++#include <linux/slab.h>
++
++#include "intel_display_snapshot.h"
++#include "intel_overlay.h"
++
++struct intel_display_snapshot {
++	struct intel_overlay_snapshot *overlay;
++};
++
++struct intel_display_snapshot *intel_display_snapshot_capture(struct intel_display *display)
++{
++	struct intel_display_snapshot *snapshot;
++
++	snapshot = kzalloc(sizeof(*snapshot), GFP_ATOMIC);
++	if (!snapshot)
++		return NULL;
++
++	snapshot->overlay = intel_overlay_snapshot_capture(display);
++
++	return snapshot;
++}
++
++void intel_display_snapshot_print(const struct intel_display_snapshot *snapshot,
++				  struct drm_printer *p)
++{
++	if (!snapshot)
++		return;
++
++	intel_overlay_snapshot_print(snapshot->overlay, p);
++}
++
++void intel_display_snapshot_free(struct intel_display_snapshot *snapshot)
++{
++	if (!snapshot)
++		return;
++
++	kfree(snapshot->overlay);
++	kfree(snapshot);
++}
+diff --git a/drivers/gpu/drm/i915/display/intel_display_snapshot.h b/drivers/gpu/drm/i915/display/intel_display_snapshot.h
+new file mode 100644
+index 000000000000..7ed27cdea644
+--- /dev/null
++++ b/drivers/gpu/drm/i915/display/intel_display_snapshot.h
+@@ -0,0 +1,16 @@
++/* SPDX-License-Identifier: MIT */
++/* Copyright © 2024 Intel Corporation */
++
++#ifndef __INTEL_DISPLAY_SNAPSHOT_H__
++#define __INTEL_DISPLAY_SNAPSHOT_H__
++
++struct drm_printer;
++struct intel_display;
++struct intel_display_snapshot;
++
++struct intel_display_snapshot *intel_display_snapshot_capture(struct intel_display *display);
++void intel_display_snapshot_print(const struct intel_display_snapshot *snapshot,
++				  struct drm_printer *p);
++void intel_display_snapshot_free(struct intel_display_snapshot *snapshot);
++
++#endif /* __INTEL_DISPLAY_SNAPSHOT_H__ */
+diff --git a/drivers/gpu/drm/i915/display/intel_overlay.c b/drivers/gpu/drm/i915/display/intel_overlay.c
+index 06b1122ec13e..b89541458765 100644
+--- a/drivers/gpu/drm/i915/display/intel_overlay.c
++++ b/drivers/gpu/drm/i915/display/intel_overlay.c
+@@ -1457,18 +1457,19 @@ void intel_overlay_cleanup(struct drm_i915_private *dev_priv)
+ 
+ #if IS_ENABLED(CONFIG_DRM_I915_CAPTURE_ERROR)
+ 
+-struct intel_overlay_error_state {
++struct intel_overlay_snapshot {
+ 	struct overlay_registers regs;
+ 	unsigned long base;
+ 	u32 dovsta;
+ 	u32 isr;
+ };
+ 
+-struct intel_overlay_error_state *
+-intel_overlay_capture_error_state(struct drm_i915_private *dev_priv)
++struct intel_overlay_snapshot *
++intel_overlay_snapshot_capture(struct intel_display *display)
+ {
++	struct drm_i915_private *dev_priv = to_i915(display->drm);
+ 	struct intel_overlay *overlay = dev_priv->display.overlay;
+-	struct intel_overlay_error_state *error;
++	struct intel_overlay_snapshot *error;
+ 
+ 	if (!overlay || !overlay->active)
+ 		return NULL;
+@@ -1487,9 +1488,12 @@ intel_overlay_capture_error_state(struct drm_i915_private *dev_priv)
+ }
+ 
+ void
+-intel_overlay_print_error_state(struct drm_printer *p,
+-				struct intel_overlay_error_state *error)
++intel_overlay_snapshot_print(const struct intel_overlay_snapshot *error,
++			     struct drm_printer *p)
+ {
++	if (!error)
++		return;
++
+ 	drm_printf(p, "Overlay, status: 0x%08x, interrupt: 0x%08x\n",
+ 		   error->dovsta, error->isr);
+ 	drm_printf(p, "  Register file at 0x%08lx:\n", error->base);
+diff --git a/drivers/gpu/drm/i915/display/intel_overlay.h b/drivers/gpu/drm/i915/display/intel_overlay.h
+index f28a09c062d0..eafac24d1de8 100644
+--- a/drivers/gpu/drm/i915/display/intel_overlay.h
++++ b/drivers/gpu/drm/i915/display/intel_overlay.h
+@@ -6,12 +6,15 @@
+ #ifndef __INTEL_OVERLAY_H__
+ #define __INTEL_OVERLAY_H__
+ 
++#include <linux/types.h>
++
+ struct drm_device;
+ struct drm_file;
+ struct drm_i915_private;
+ struct drm_printer;
++struct intel_display;
+ struct intel_overlay;
+-struct intel_overlay_error_state;
++struct intel_overlay_snapshot;
+ 
+ #ifdef I915
+ void intel_overlay_setup(struct drm_i915_private *dev_priv);
+@@ -22,10 +25,6 @@ int intel_overlay_put_image_ioctl(struct drm_device *dev, void *data,
+ int intel_overlay_attrs_ioctl(struct drm_device *dev, void *data,
+ 			      struct drm_file *file_priv);
+ void intel_overlay_reset(struct drm_i915_private *dev_priv);
+-struct intel_overlay_error_state *
+-intel_overlay_capture_error_state(struct drm_i915_private *dev_priv);
+-void intel_overlay_print_error_state(struct drm_printer *p,
+-				     struct intel_overlay_error_state *error);
+ #else
+ static inline void intel_overlay_setup(struct drm_i915_private *dev_priv)
+ {
+@@ -50,13 +49,21 @@ static inline int intel_overlay_attrs_ioctl(struct drm_device *dev, void *data,
+ static inline void intel_overlay_reset(struct drm_i915_private *dev_priv)
+ {
+ }
+-static inline struct intel_overlay_error_state *
+-intel_overlay_capture_error_state(struct drm_i915_private *dev_priv)
++#endif
++
++#if IS_ENABLED(CONFIG_DRM_I915_CAPTURE_ERROR) && defined(I915)
++struct intel_overlay_snapshot *
++intel_overlay_snapshot_capture(struct intel_display *display);
++void intel_overlay_snapshot_print(const struct intel_overlay_snapshot *error,
++				  struct drm_printer *p);
++#else
++static inline struct intel_overlay_snapshot *
++intel_overlay_snapshot_capture(struct intel_display *display)
+ {
+ 	return NULL;
+ }
+-static inline void intel_overlay_print_error_state(struct drm_printer *p,
+-						   struct intel_overlay_error_state *error)
++static inline void intel_overlay_snapshot_print(const struct intel_overlay_snapshot *error,
++						struct drm_printer *p)
+ {
+ }
+ #endif
+diff --git a/drivers/gpu/drm/i915/i915_gpu_error.c b/drivers/gpu/drm/i915/i915_gpu_error.c
+index 4baee1aa74dc..c4402d7cc1cd 100644
+--- a/drivers/gpu/drm/i915/i915_gpu_error.c
++++ b/drivers/gpu/drm/i915/i915_gpu_error.c
+@@ -40,8 +40,8 @@
+ #include <drm/drm_cache.h>
+ #include <drm/drm_print.h>
+ 
++#include "display/intel_display_snapshot.h"
+ #include "display/intel_dmc.h"
+-#include "display/intel_overlay.h"
+ 
+ #include "gem/i915_gem_context.h"
+ #include "gem/i915_gem_lmem.h"
+@@ -905,11 +905,10 @@ static void __err_print_to_sgl(struct drm_i915_error_state_buf *m,
+ 		err_print_gt_info(m, error->gt);
+ 	}
+ 
+-	if (error->overlay)
+-		intel_overlay_print_error_state(&p, error->overlay);
+-
+ 	err_print_capabilities(m, error);
+ 	err_print_params(m, &error->params);
++
++	intel_display_snapshot_print(error->display_snapshot, &p);
+ }
+ 
+ static int err_print_to_sgl(struct i915_gpu_coredump *error)
+@@ -1077,7 +1076,7 @@ void __i915_gpu_coredump_free(struct kref *error_ref)
+ 		cleanup_gt(gt);
+ 	}
+ 
+-	kfree(error->overlay);
++	intel_display_snapshot_free(error->display_snapshot);
+ 
+ 	cleanup_params(error);
+ 
+@@ -2097,6 +2096,7 @@ static struct i915_gpu_coredump *
+ __i915_gpu_coredump(struct intel_gt *gt, intel_engine_mask_t engine_mask, u32 dump_flags)
+ {
+ 	struct drm_i915_private *i915 = gt->i915;
++	struct intel_display *display = &i915->display;
+ 	struct i915_gpu_coredump *error;
+ 
+ 	/* Check if GPU capture has been disabled */
+@@ -2138,7 +2138,7 @@ __i915_gpu_coredump(struct intel_gt *gt, intel_engine_mask_t engine_mask, u32 du
+ 		error->simulated |= error->gt->simulated;
+ 	}
+ 
+-	error->overlay = intel_overlay_capture_error_state(i915);
++	error->display_snapshot = intel_display_snapshot_capture(display);
+ 
+ 	return error;
+ }
+diff --git a/drivers/gpu/drm/i915/i915_gpu_error.h b/drivers/gpu/drm/i915/i915_gpu_error.h
+index 7c255bb1c319..1a11942d7800 100644
+--- a/drivers/gpu/drm/i915/i915_gpu_error.h
++++ b/drivers/gpu/drm/i915/i915_gpu_error.h
+@@ -31,7 +31,7 @@
+ struct drm_i915_private;
+ struct i915_vma_compress;
+ struct intel_engine_capture_vma;
+-struct intel_overlay_error_state;
++struct intel_display_snapshot;
+ 
+ struct i915_vma_coredump {
+ 	struct i915_vma_coredump *next;
+@@ -218,9 +218,9 @@ struct i915_gpu_coredump {
+ 	struct i915_params params;
+ 	struct intel_display_params display_params;
+ 
+-	struct intel_overlay_error_state *overlay;
+-
+ 	struct scatterlist *sgl, *fit;
++
++	struct intel_display_snapshot *display_snapshot;
+ };
+ 
+ struct i915_gpu_error {
+-- 
+2.52.0
+
