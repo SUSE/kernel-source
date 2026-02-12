@@ -1,0 +1,100 @@
+From b0413571bc4421977c08fdf2179ccacd88f60446 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Mon, 30 Sep 2024 20:04:05 +0300
+Subject: drm/i915/dsb: Generate the DSB buffer in commit_tail()
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: b0413571bc4421977c08fdf2179ccacd88f60446
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Once we start using DSB for plane updates we'll need to defer
+generating the DSB buffer until the clear color has been
+read out. So we need to move at some of the DSB stuff into
+commit_tail(). That is perhaps a better place for it anyway
+as the ioctl thread can move on immediately without spending
+time building the DSB commands.
+
+We always have the MMIO fallback (in case the DSB buffer
+allocation fails), so there's no real reason to keep any
+of this in the synchronous part of the ioctl.
+
+Because the DSB LUT programming doesn't depend on the plane
+clear color we can still do that part before waiting for
+fences/etc. which should help paralleize things a bit more.
+The DSB plane programming will need to happen after those
+however as that depends on the clear color.
+
+Reviewed-by: Animesh Manna <animesh.manna@intel.com>
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20240930170415.23841-4-ville.syrjala@linux.intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/intel_display.c | 23 +++++++++-----------
+ 1 file changed, 10 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index ed2a0298646b..dfbe1d4de627 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -6981,17 +6981,12 @@ int intel_atomic_check(struct drm_device *dev,
+ 
+ static int intel_atomic_prepare_commit(struct intel_atomic_state *state)
+ {
+-	struct intel_crtc_state __maybe_unused *crtc_state;
+-	struct intel_crtc *crtc;
+-	int i, ret;
++	int ret;
+ 
+ 	ret = drm_atomic_helper_prepare_planes(state->base.dev, &state->base);
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	for_each_new_intel_crtc_in_state(state, crtc, crtc_state, i)
+-		intel_color_prepare_commit(state, crtc);
+-
+ 	return 0;
+ }
+ 
+@@ -7582,6 +7577,12 @@ static void intel_atomic_prepare_plane_clear_colors(struct intel_atomic_state *s
+ 	}
+ }
+ 
++static void intel_atomic_dsb_prepare(struct intel_atomic_state *state,
++				     struct intel_crtc *crtc)
++{
++	intel_color_prepare_commit(state, crtc);
++}
++
+ static void intel_atomic_commit_tail(struct intel_atomic_state *state)
+ {
+ 	struct drm_device *dev = state->base.dev;
+@@ -7592,6 +7593,9 @@ static void intel_atomic_commit_tail(struct intel_atomic_state *state)
+ 	intel_wakeref_t wakeref = 0;
+ 	int i;
+ 
++	for_each_new_intel_crtc_in_state(state, crtc, new_crtc_state, i)
++		intel_atomic_dsb_prepare(state, crtc);
++
+ 	intel_atomic_commit_fence_wait(state);
+ 
+ 	intel_td_flush(dev_priv);
+@@ -7903,13 +7907,6 @@ int intel_atomic_commit(struct drm_device *dev, struct drm_atomic_state *_state,
+ 		ret = intel_atomic_swap_state(state);
+ 
+ 	if (ret) {
+-		struct intel_crtc_state *new_crtc_state;
+-		struct intel_crtc *crtc;
+-		int i;
+-
+-		for_each_new_intel_crtc_in_state(state, crtc, new_crtc_state, i)
+-			intel_color_cleanup_commit(new_crtc_state);
+-
+ 		drm_atomic_helper_unprepare_planes(dev, &state->base);
+ 		intel_runtime_pm_put(&dev_priv->runtime_pm, state->wakeref);
+ 		return ret;
+-- 
+2.52.0
+
