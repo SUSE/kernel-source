@@ -1,0 +1,216 @@
+From: Keith Busch <kbusch@kernel.org>
+Date: Wed, 13 Aug 2025 08:31:50 -0700
+Subject: [PATCH] blk-mq-dma: add scatter-less integrity data DMA mapping
+Git-commit: fec9b16dc5550191fd85af118271ea00e8dcc5f8
+Patch-mainline: v6.16-rc1
+References: jsc#PED-14161
+
+Similar to regular data, introduce more efficient integrity mapping
+helpers that does away with the scatterlist structure. This uses the
+block mapping iterator to add IOVA segments if IOMMU is enabled, or maps
+directly if not. This also supports P2P segements if integrity data ever
+wants to allocate that type of memory.
+
+Signed-off-by: Keith Busch <kbusch@kernel.org>
+Reviewed-by: Kanchan Joshi <joshi.k@samsung.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Martin K. Petersen <martin.petersen@oracle.com>
+Link: https://lore.kernel.org/r/20250813153153.3260897-7-kbusch@meta.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/blk-mq-dma.c            | 104 +++++++++++++++++++++++++++++++---
+ include/linux/blk-integrity.h |  17 ++++++
+ include/linux/blk-mq-dma.h    |   1 +
+ 3 files changed, 115 insertions(+), 7 deletions(-)
+
+diff --git a/block/blk-mq-dma.c b/block/blk-mq-dma.c
+index 31dd8f58f081..60a244a129c3 100644
+--- a/block/blk-mq-dma.c
++++ b/block/blk-mq-dma.c
+@@ -2,6 +2,7 @@
+ /*
+  * Copyright (C) 2025 Christoph Hellwig
+  */
++#include <linux/blk-integrity.h>
+ #include <linux/blk-mq-dma.h>
+ #include "blk.h"
+ 
+@@ -10,6 +11,24 @@ struct phys_vec {
+ 	u32		len;
+ };
+ 
++static bool __blk_map_iter_next(struct blk_map_iter *iter)
++{
++	if (iter->iter.bi_size)
++		return true;
++	if (!iter->bio || !iter->bio->bi_next)
++		return false;
++
++	iter->bio = iter->bio->bi_next;
++	if (iter->is_integrity) {
++		iter->iter = bio_integrity(iter->bio)->bip_iter;
++		iter->bvecs = bio_integrity(iter->bio)->bip_vec;
++	} else {
++		iter->iter = iter->bio->bi_iter;
++		iter->bvecs = iter->bio->bi_io_vec;
++	}
++	return true;
++}
++
+ static bool blk_map_iter_next(struct request *req, struct blk_map_iter *iter,
+ 			      struct phys_vec *vec)
+ {
+@@ -33,13 +52,8 @@ static bool blk_map_iter_next(struct request *req, struct blk_map_iter *iter,
+ 	while (!iter->iter.bi_size || !iter->iter.bi_bvec_done) {
+ 		struct bio_vec next;
+ 
+-		if (!iter->iter.bi_size) {
+-			if (!iter->bio || !iter->bio->bi_next)
+-				break;
+-			iter->bio = iter->bio->bi_next;
+-			iter->iter = iter->bio->bi_iter;
+-			iter->bvecs = iter->bio->bi_io_vec;
+-		}
++		if (!__blk_map_iter_next(iter))
++			break;
+ 
+ 		next = mp_bvec_iter_bvec(iter->bvecs, iter->iter);
+ 		if (bv.bv_len + next.bv_len > max_size ||
+@@ -290,3 +304,79 @@ int __blk_rq_map_sg(struct request *rq, struct scatterlist *sglist,
+ 	return nsegs;
+ }
+ EXPORT_SYMBOL(__blk_rq_map_sg);
++
++#ifdef CONFIG_BLK_DEV_INTEGRITY
++/**
++ * blk_rq_integrity_dma_map_iter_start - map the first integrity DMA segment
++ * 					 for a request
++ * @req:	request to map
++ * @dma_dev:	device to map to
++ * @state:	DMA IOVA state
++ * @iter:	block layer DMA iterator
++ *
++ * Start DMA mapping @req integrity data to @dma_dev.  @state and @iter are
++ * provided by the caller and don't need to be initialized.  @state needs to be
++ * stored for use at unmap time, @iter is only needed at map time.
++ *
++ * Returns %false if there is no segment to map, including due to an error, or
++ * %true if it did map a segment.
++ *
++ * If a segment was mapped, the DMA address for it is returned in @iter.addr
++ * and the length in @iter.len.  If no segment was mapped the status code is
++ * returned in @iter.status.
++ *
++ * The caller can call blk_rq_dma_map_coalesce() to check if further segments
++ * need to be mapped after this, or go straight to blk_rq_dma_map_iter_next()
++ * to try to map the following segments.
++ */
++bool blk_rq_integrity_dma_map_iter_start(struct request *req,
++		struct device *dma_dev,  struct dma_iova_state *state,
++		struct blk_dma_iter *iter)
++{
++	unsigned len = bio_integrity_bytes(&req->q->limits.integrity,
++					   blk_rq_sectors(req));
++	struct bio *bio = req->bio;
++
++	iter->iter = (struct blk_map_iter) {
++		.bio = bio,
++		.iter = bio_integrity(bio)->bip_iter,
++		.bvecs = bio_integrity(bio)->bip_vec,
++		.is_integrity = true,
++	};
++	return blk_dma_map_iter_start(req, dma_dev, state, iter, len);
++}
++EXPORT_SYMBOL_GPL(blk_rq_integrity_dma_map_iter_start);
++
++/**
++ * blk_rq_integrity_dma_map_iter_start - map the next integrity DMA segment for
++ * 					 a request
++ * @req:	request to map
++ * @dma_dev:	device to map to
++ * @state:	DMA IOVA state
++ * @iter:	block layer DMA iterator
++ *
++ * Iterate to the next integrity mapping after a previous call to
++ * blk_rq_integrity_dma_map_iter_start().  See there for a detailed description
++ * of the arguments.
++ *
++ * Returns %false if there is no segment to map, including due to an error, or
++ * %true if it did map a segment.
++ *
++ * If a segment was mapped, the DMA address for it is returned in @iter.addr and
++ * the length in @iter.len.  If no segment was mapped the status code is
++ * returned in @iter.status.
++ */
++bool blk_rq_integrity_dma_map_iter_next(struct request *req,
++               struct device *dma_dev, struct blk_dma_iter *iter)
++{
++	struct phys_vec vec;
++
++	if (!blk_map_iter_next(req, &iter->iter, &vec))
++		return false;
++
++	if (iter->p2pdma.map == PCI_P2PDMA_MAP_BUS_ADDR)
++		return blk_dma_map_bus(iter, &vec);
++	return blk_dma_map_direct(req, dma_dev, iter, &vec);
++}
++EXPORT_SYMBOL_GPL(blk_rq_integrity_dma_map_iter_next);
++#endif
+diff --git a/include/linux/blk-integrity.h b/include/linux/blk-integrity.h
+index e67a2b6e8f11..78fe2459e661 100644
+--- a/include/linux/blk-integrity.h
++++ b/include/linux/blk-integrity.h
+@@ -4,6 +4,7 @@
+ 
+ #include <linux/blk-mq.h>
+ #include <linux/bio-integrity.h>
++#include <linux/blk-mq-dma.h>
+ 
+ struct request;
+ 
+@@ -31,6 +32,11 @@ int blk_rq_integrity_map_user(struct request *rq, void __user *ubuf,
+ 			      ssize_t bytes);
+ int blk_get_meta_cap(struct block_device *bdev, unsigned int cmd,
+ 		     struct logical_block_metadata_cap __user *argp);
++bool blk_rq_integrity_dma_map_iter_start(struct request *req,
++		struct device *dma_dev,  struct dma_iova_state *state,
++		struct blk_dma_iter *iter);
++bool blk_rq_integrity_dma_map_iter_next(struct request *req,
++		struct device *dma_dev, struct blk_dma_iter *iter);
+ 
+ static inline bool
+ blk_integrity_queue_supports_integrity(struct request_queue *q)
+@@ -115,6 +121,17 @@ static inline int blk_rq_integrity_map_user(struct request *rq,
+ {
+ 	return -EINVAL;
+ }
++static inline bool blk_rq_integrity_dma_map_iter_start(struct request *req,
++		struct device *dma_dev,  struct dma_iova_state *state,
++		struct blk_dma_iter *iter)
++{
++	return false;
++}
++static inline bool blk_rq_integrity_dma_map_iter_next(struct request *req,
++		struct device *dma_dev, struct blk_dma_iter *iter)
++{
++	return false;
++}
+ static inline struct blk_integrity *bdev_get_integrity(struct block_device *b)
+ {
+ 	return NULL;
+diff --git a/include/linux/blk-mq-dma.h b/include/linux/blk-mq-dma.h
+index 881880095e0d..0f45ea110ca1 100644
+--- a/include/linux/blk-mq-dma.h
++++ b/include/linux/blk-mq-dma.h
+@@ -9,6 +9,7 @@ struct blk_map_iter {
+ 	struct bvec_iter		iter;
+ 	struct bio			*bio;
+ 	struct bio_vec			*bvecs;
++	bool				is_integrity;
+ };
+ 
+ struct blk_dma_iter {
+-- 
+2.43.0
+
