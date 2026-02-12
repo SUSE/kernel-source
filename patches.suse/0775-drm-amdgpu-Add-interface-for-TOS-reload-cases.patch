@@ -1,0 +1,115 @@
+From 0ff382261371f76411c8a74d3feea89948af3b81 Mon Sep 17 00:00:00 2001
+From: Lijo Lazar <lijo.lazar@amd.com>
+Date: Mon, 2 Sep 2024 11:20:22 +0530
+Subject: drm/amdgpu: Add interface for TOS reload cases
+Git-commit: 0ff382261371f76411c8a74d3feea89948af3b81
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Add interface to check if a different TOS needs to be loaded than the
+one which is which is already active on the SOC. Presently the interface
+is restricted to specific variants of PSPv13.0.
+
+Signed-off-by: Lijo Lazar <lijo.lazar@amd.com>
+Reviewed-by: Feifei Xu <Feifei.Xu@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Rajneesh Bhardwaj <rajneesh.bhardwaj@amd.com>
+Tested-by: Rajneesh Bhardwaj <rajneesh.bhardwaj@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c | 13 +++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h |  2 ++
+ drivers/gpu/drm/amd/amdgpu/psp_v13_0.c  | 25 +++++++++++++++++++++++++
+ 3 files changed, 40 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
+index 7452b2dd775b..944dad9ad29f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
+@@ -2266,6 +2266,19 @@ bool amdgpu_psp_get_ras_capability(struct psp_context *psp)
+ 	}
+ }
+ 
++bool amdgpu_psp_tos_reload_needed(struct amdgpu_device *adev)
++{
++	struct psp_context *psp = &adev->psp;
++
++	if (amdgpu_sriov_vf(adev))
++		return false;
++
++	if (psp->funcs && psp->funcs->is_reload_needed)
++		return psp->funcs->is_reload_needed(psp);
++
++	return false;
++}
++
+ static int psp_hw_start(struct psp_context *psp)
+ {
+ 	struct amdgpu_device *adev = psp->adev;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h
+index f61ba076573c..76fa18ffc045 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h
+@@ -139,6 +139,7 @@ struct psp_funcs {
+ 	int (*fatal_error_recovery_quirk)(struct psp_context *psp);
+ 	bool (*get_ras_capability)(struct psp_context *psp);
+ 	bool (*is_aux_sos_load_required)(struct psp_context *psp);
++	bool (*is_reload_needed)(struct psp_context *psp);
+ };
+ 
+ struct ta_funcs {
+@@ -560,5 +561,6 @@ bool amdgpu_psp_get_ras_capability(struct psp_context *psp);
+ 
+ int psp_config_sq_perfmon(struct psp_context *psp, uint32_t xcp_id,
+ 	bool core_override_enable, bool reg_override_enable, bool perfmon_override_enable);
++bool amdgpu_psp_tos_reload_needed(struct amdgpu_device *adev);
+ 
+ #endif
+diff --git a/drivers/gpu/drm/amd/amdgpu/psp_v13_0.c b/drivers/gpu/drm/amd/amdgpu/psp_v13_0.c
+index 51e470e8d67d..c4b775aaee9f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/psp_v13_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/psp_v13_0.c
+@@ -823,6 +823,30 @@ static bool psp_v13_0_is_aux_sos_load_required(struct psp_context *psp)
+ 	return (pmfw_ver < 0x557300);
+ }
+ 
++static bool psp_v13_0_is_reload_needed(struct psp_context *psp)
++{
++	uint32_t ucode_ver;
++
++	if (!psp_v13_0_is_sos_alive(psp))
++		return false;
++
++	/* Restrict reload support only to specific IP versions */
++	switch (amdgpu_ip_version(psp->adev, MP0_HWIP, 0)) {
++	case IP_VERSION(13, 0, 2):
++	case IP_VERSION(13, 0, 6):
++	case IP_VERSION(13, 0, 14):
++		/* TOS version read from microcode header */
++		ucode_ver = psp->sos.fw_version;
++		/* Read TOS version from hardware */
++		psp_v13_0_init_sos_version(psp);
++		return (ucode_ver != psp->sos.fw_version);
++	default:
++		return false;
++	}
++
++	return false;
++}
++
+ static const struct psp_funcs psp_v13_0_funcs = {
+ 	.init_microcode = psp_v13_0_init_microcode,
+ 	.wait_for_bootloader = psp_v13_0_wait_for_bootloader_steady_state,
+@@ -847,6 +871,7 @@ static const struct psp_funcs psp_v13_0_funcs = {
+ 	.fatal_error_recovery_quirk = psp_v13_0_fatal_error_recovery_quirk,
+ 	.get_ras_capability = psp_v13_0_get_ras_capability,
+ 	.is_aux_sos_load_required = psp_v13_0_is_aux_sos_load_required,
++	.is_reload_needed = psp_v13_0_is_reload_needed,
+ };
+ 
+ void psp_v13_0_set_psp_funcs(struct psp_context *psp)
+-- 
+2.52.0
+
