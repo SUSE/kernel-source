@@ -1,0 +1,90 @@
+From f45cc1d373aeeabaaed0cef6c938bfcbbbd9962f Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Tue, 1 Oct 2024 22:58:02 +0300
+Subject: drm/i915: Extract i915gm_irq_cstate_wa_{disable,enable}()
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: f45cc1d373aeeabaaed0cef6c938bfcbbbd9962f
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Extract the i915gm/i945gm vblank irq C-state workaround to
+separate functions. We'll need to reuse these in order to
+guarantee timely CRC interrupt delivery as well.
+
+The irq.vblank_enabled count is currently protected by the
+drm vblank locks, so let's assert that the innermost of those
+is held, in anticipation of other callers.
+
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241001195803.3371-4-ville.syrjala@linux.intel.com
+Reviewed-by: Jani Nikula <jani.nikula@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../gpu/drm/i915/display/intel_display_irq.c  | 34 +++++++++++++------
+ 1 file changed, 24 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display_irq.c b/drivers/gpu/drm/i915/display/intel_display_irq.c
+index 43a0b3565bc8..feeb3a29972a 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_irq.c
++++ b/drivers/gpu/drm/i915/display/intel_display_irq.c
+@@ -1259,6 +1259,28 @@ void gen11_display_irq_handler(struct drm_i915_private *i915)
+ 	enable_rpm_wakeref_asserts(&i915->runtime_pm);
+ }
+ 
++static void i915gm_irq_cstate_wa_enable(struct drm_i915_private *i915)
++{
++	lockdep_assert_held(&i915->drm.vblank_time_lock);
++
++	/*
++	 * Vblank interrupts fail to wake the device up from C2+.
++	 * Disabling render clock gating during C-states avoids
++	 * the problem. There is a small power cost so we do this
++	 * only when vblank interrupts are actually enabled.
++	 */
++	if (i915->display.irq.vblank_enabled++ == 0)
++		intel_uncore_write(&i915->uncore, SCPD0, _MASKED_BIT_ENABLE(CSTATE_RENDER_CLOCK_GATE_DISABLE));
++}
++
++static void i915gm_irq_cstate_wa_disable(struct drm_i915_private *i915)
++{
++	lockdep_assert_held(&i915->drm.vblank_time_lock);
++
++	if (--i915->display.irq.vblank_enabled == 0)
++		intel_uncore_write(&i915->uncore, SCPD0, _MASKED_BIT_DISABLE(CSTATE_RENDER_CLOCK_GATE_DISABLE));
++}
++
+ int i8xx_enable_vblank(struct drm_crtc *crtc)
+ {
+ 	struct drm_i915_private *dev_priv = to_i915(crtc->dev);
+@@ -1287,14 +1309,7 @@ int i915gm_enable_vblank(struct drm_crtc *crtc)
+ {
+ 	struct drm_i915_private *i915 = to_i915(crtc->dev);
+ 
+-	/*
+-	 * Vblank interrupts fail to wake the device up from C2+.
+-	 * Disabling render clock gating during C-states avoids
+-	 * the problem. There is a small power cost so we do this
+-	 * only when vblank interrupts are actually enabled.
+-	 */
+-	if (i915->display.irq.vblank_enabled++ == 0)
+-		intel_uncore_write(&i915->uncore, SCPD0, _MASKED_BIT_ENABLE(CSTATE_RENDER_CLOCK_GATE_DISABLE));
++	i915gm_irq_cstate_wa_enable(i915);
+ 
+ 	return i8xx_enable_vblank(crtc);
+ }
+@@ -1305,8 +1320,7 @@ void i915gm_disable_vblank(struct drm_crtc *crtc)
+ 
+ 	i8xx_disable_vblank(crtc);
+ 
+-	if (--i915->display.irq.vblank_enabled == 0)
+-		intel_uncore_write(&i915->uncore, SCPD0, _MASKED_BIT_DISABLE(CSTATE_RENDER_CLOCK_GATE_DISABLE));
++	i915gm_irq_cstate_wa_disable(i915);
+ }
+ 
+ int i965_enable_vblank(struct drm_crtc *crtc)
+-- 
+2.52.0
+
