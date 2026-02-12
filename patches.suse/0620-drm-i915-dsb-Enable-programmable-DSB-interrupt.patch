@@ -1,0 +1,127 @@
+From 9e9953715ed7cd2097f42832ae6b48da53b72679 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Mon, 30 Sep 2024 20:04:06 +0300
+Subject: drm/i915/dsb: Enable programmable DSB interrupt
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 9e9953715ed7cd2097f42832ae6b48da53b72679
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+The DSB can signal a programmable interrupt in response to
+a specific DSB command getting executed. Hook that up.
+
+For now we'll just use this to signal the completion of the
+commit via a vblank event. If, in the future, we'll need to
+do other things in response to DSB interrupts we may need to
+come up with some kind of fancier DSB interrupt framework where
+the caller can specify a custom handler...
+
+Reviewed-by: Animesh Manna <animesh.manna@intel.com>
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20240930170415.23841-5-ville.syrjala@linux.intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../drm/i915/display/intel_display_types.h    |  2 ++
+ drivers/gpu/drm/i915/display/intel_dsb.c      | 29 +++++++++++++++++--
+ drivers/gpu/drm/i915/display/intel_dsb.h      |  1 +
+ 3 files changed, 30 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display_types.h b/drivers/gpu/drm/i915/display/intel_display_types.h
+index 17fc21f6ae36..e0ec21266047 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_types.h
++++ b/drivers/gpu/drm/i915/display/intel_display_types.h
+@@ -1358,6 +1358,8 @@ struct intel_crtc {
+ 
+ 	/* armed event for async flip */
+ 	struct drm_pending_vblank_event *flip_done_event;
++	/* armed event for DSB based updates */
++	struct drm_pending_vblank_event *dsb_event;
+ 
+ 	/* Access to these should be protected by dev_priv->irq_lock. */
+ 	bool cpu_fifo_underrun_disabled;
+diff --git a/drivers/gpu/drm/i915/display/intel_dsb.c b/drivers/gpu/drm/i915/display/intel_dsb.c
+index 45ec56b2d50f..9d323347b4de 100644
+--- a/drivers/gpu/drm/i915/display/intel_dsb.c
++++ b/drivers/gpu/drm/i915/display/intel_dsb.c
+@@ -4,6 +4,8 @@
+  *
+  */
+ 
++#include <drm/drm_vblank.h>
++
+ #include "i915_drv.h"
+ #include "i915_irq.h"
+ #include "i915_reg.h"
+@@ -379,6 +381,12 @@ void intel_dsb_nonpost_end(struct intel_dsb *dsb)
+ 	intel_dsb_noop(dsb, 4);
+ }
+ 
++void intel_dsb_interrupt(struct intel_dsb *dsb)
++{
++	intel_dsb_emit(dsb, 0,
++		       DSB_OPCODE_INTERRUPT << DSB_OPCODE_SHIFT);
++}
++
+ static void intel_dsb_emit_wait_dsl(struct intel_dsb *dsb,
+ 				    u32 opcode, int lower, int upper)
+ {
+@@ -544,7 +552,7 @@ static void _intel_dsb_chain(struct intel_atomic_state *state,
+ 
+ 	intel_dsb_reg_write(dsb, DSB_INTERRUPT(pipe, chained_dsb->id),
+ 			    dsb_error_int_status(display) | DSB_PROG_INT_STATUS |
+-			    dsb_error_int_en(display));
++			    dsb_error_int_en(display) | DSB_PROG_INT_EN);
+ 
+ 	if (ctrl & DSB_WAIT_FOR_VBLANK) {
+ 		int dewake_scanline = dsb_dewake_scanline_start(state, crtc);
+@@ -612,7 +620,7 @@ static void _intel_dsb_commit(struct intel_dsb *dsb, u32 ctrl,
+ 
+ 	intel_de_write_fw(display, DSB_INTERRUPT(pipe, dsb->id),
+ 			  dsb_error_int_status(display) | DSB_PROG_INT_STATUS |
+-			  dsb_error_int_en(display));
++			  dsb_error_int_en(display) | DSB_PROG_INT_EN);
+ 
+ 	intel_de_write_fw(display, DSB_HEAD(pipe, dsb->id),
+ 			  intel_dsb_buffer_ggtt_offset(&dsb->dsb_buf));
+@@ -775,6 +783,23 @@ void intel_dsb_irq_handler(struct intel_display *display,
+ 	tmp = intel_de_read_fw(display, DSB_INTERRUPT(pipe, dsb_id));
+ 	intel_de_write_fw(display, DSB_INTERRUPT(pipe, dsb_id), tmp);
+ 
++	if (tmp & DSB_PROG_INT_STATUS) {
++		spin_lock(&display->drm->event_lock);
++
++		if (crtc->dsb_event) {
++			/*
++			 * Update vblank counter/timestmap in case it
++			 * hasn't been done yet for this frame.
++			 */
++			drm_crtc_accurate_vblank_count(&crtc->base);
++
++			drm_crtc_send_vblank_event(&crtc->base, crtc->dsb_event);
++			crtc->dsb_event = NULL;
++		}
++
++		spin_unlock(&display->drm->event_lock);
++	}
++
+ 	errors = tmp & dsb_error_int_status(display);
+ 	if (errors)
+ 		drm_err(display->drm, "[CRTC:%d:%s] DSB %d error interrupt: 0x%x\n",
+diff --git a/drivers/gpu/drm/i915/display/intel_dsb.h b/drivers/gpu/drm/i915/display/intel_dsb.h
+index c352c12aa59f..ff3b89dfffc1 100644
+--- a/drivers/gpu/drm/i915/display/intel_dsb.h
++++ b/drivers/gpu/drm/i915/display/intel_dsb.h
+@@ -39,6 +39,7 @@ void intel_dsb_reg_write_masked(struct intel_dsb *dsb,
+ void intel_dsb_noop(struct intel_dsb *dsb, int count);
+ void intel_dsb_nonpost_start(struct intel_dsb *dsb);
+ void intel_dsb_nonpost_end(struct intel_dsb *dsb);
++void intel_dsb_interrupt(struct intel_dsb *dsb);
+ void intel_dsb_wait_scanline_in(struct intel_atomic_state *state,
+ 				struct intel_dsb *dsb,
+ 				int lower, int upper);
+-- 
+2.52.0
+
