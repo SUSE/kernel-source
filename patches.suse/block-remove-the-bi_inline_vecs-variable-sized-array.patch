@@ -1,0 +1,133 @@
+From: Christoph Hellwig <hch@lst.de>
+Date: Mon, 8 Sep 2025 12:56:39 +0200
+Subject: [PATCH] block: remove the bi_inline_vecs variable sized array from
+ struct bio
+Git-commit: d86eaa0f3c56da286853b698b45c8ce404291082
+Patch-mainline: v6.18-rc1
+References: jsc#PED-14161
+
+Bios are embedded into other structures, and at least spare is unhappy
+about embedding structures with variable sized arrays.  There's no
+real need to the array anyway, we can replace it with a helper pointing
+to the memory just behind the bio, and with the previous cleanups there
+is very few site doing anything special with it.
+
+[hare: removed bcachefs references]
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: John Garry <john.g.garry@oracle.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/bio.c                   |  3 ++-
+ drivers/md/bcache/movinggc.c  |  6 +++---
+ drivers/md/bcache/writeback.c |  6 +++---
+ drivers/md/dm-vdo/vio.c       |  2 +-
+ include/linux/bio.h           |  2 +-
+ include/linux/blk_types.h     | 12 +++++-------
+ 8 files changed, 17 insertions(+), 19 deletions(-)
+
+diff --git a/block/bio.c b/block/bio.c
+index bd8bf179981a..971d96afaf8d 100644
+--- a/block/bio.c
++++ b/block/bio.c
+@@ -617,7 +617,8 @@ struct bio *bio_kmalloc(unsigned short nr_vecs, gfp_t gfp_mask)
+ 
+ 	if (nr_vecs > BIO_MAX_INLINE_VECS)
+ 		return NULL;
+-	return kmalloc(struct_size(bio, bi_inline_vecs, nr_vecs), gfp_mask);
++	return kmalloc(sizeof(*bio) + nr_vecs * sizeof(struct bio_vec),
++			gfp_mask);
+ }
+ EXPORT_SYMBOL(bio_kmalloc);
+ 
+diff --git a/drivers/md/bcache/movinggc.c b/drivers/md/bcache/movinggc.c
+index 4fc80c6d5b31..73918e55bf04 100644
+--- a/drivers/md/bcache/movinggc.c
++++ b/drivers/md/bcache/movinggc.c
+@@ -145,9 +145,9 @@ static void read_moving(struct cache_set *c)
+ 			continue;
+ 		}
+ 
+-		io = kzalloc(struct_size(io, bio.bio.bi_inline_vecs,
+-					 DIV_ROUND_UP(KEY_SIZE(&w->key), PAGE_SECTORS)),
+-			     GFP_KERNEL);
++		io = kzalloc(sizeof(*io) + sizeof(struct bio_vec) *
++				DIV_ROUND_UP(KEY_SIZE(&w->key), PAGE_SECTORS),
++				GFP_KERNEL);
+ 		if (!io)
+ 			goto err;
+ 
+diff --git a/drivers/md/bcache/writeback.c b/drivers/md/bcache/writeback.c
+index 36dd8f14a6df..6ba73dc1a3df 100644
+--- a/drivers/md/bcache/writeback.c
++++ b/drivers/md/bcache/writeback.c
+@@ -536,9 +536,9 @@ static void read_dirty(struct cached_dev *dc)
+ 		for (i = 0; i < nk; i++) {
+ 			w = keys[i];
+ 
+-			io = kzalloc(struct_size(io, bio.bi_inline_vecs,
+-						DIV_ROUND_UP(KEY_SIZE(&w->key), PAGE_SECTORS)),
+-				     GFP_KERNEL);
++			io = kzalloc(sizeof(*io) + sizeof(struct bio_vec) *
++				DIV_ROUND_UP(KEY_SIZE(&w->key), PAGE_SECTORS),
++				GFP_KERNEL);
+ 			if (!io)
+ 				goto err;
+ 
+diff --git a/drivers/md/dm-vdo/vio.c b/drivers/md/dm-vdo/vio.c
+index e7f4153e55e3..8fc22fb14196 100644
+--- a/drivers/md/dm-vdo/vio.c
++++ b/drivers/md/dm-vdo/vio.c
+@@ -212,7 +212,7 @@ int vio_reset_bio_with_size(struct vio *vio, char *data, int size, bio_end_io_t
+ 		return VDO_SUCCESS;
+ 
+ 	bio->bi_ioprio = 0;
+-	bio->bi_io_vec = bio->bi_inline_vecs;
++	bio->bi_io_vec = bio_inline_vecs(bio);
+ 	bio->bi_max_vecs = vio->block_count + 1;
+ 	if (VDO_ASSERT(size <= vio_size, "specified size %d is not greater than allocated %d",
+ 		       size, vio_size) != VDO_SUCCESS)
+diff --git a/include/linux/bio.h b/include/linux/bio.h
+index eb7f4fbd8aa9..27cbff5b0356 100644
+--- a/include/linux/bio.h
++++ b/include/linux/bio.h
+@@ -408,7 +408,7 @@ void bio_init(struct bio *bio, struct block_device *bdev, struct bio_vec *table,
+ static inline void bio_init_inline(struct bio *bio, struct block_device *bdev,
+ 	      unsigned short max_vecs, blk_opf_t opf)
+ {
+-	bio_init(bio, bdev, bio->bi_inline_vecs, max_vecs, opf);
++	bio_init(bio, bdev, bio_inline_vecs(bio), max_vecs, opf);
+ }
+ extern void bio_uninit(struct bio *);
+ void bio_reset(struct bio *bio, struct block_device *bdev, blk_opf_t opf);
+diff --git a/include/linux/blk_types.h b/include/linux/blk_types.h
+index 930daff207df..bbb7893e0542 100644
+--- a/include/linux/blk_types.h
++++ b/include/linux/blk_types.h
+@@ -269,18 +269,16 @@ struct bio {
+ 	struct bio_vec		*bi_io_vec;	/* the actual vec list */
+ 
+ 	struct bio_set		*bi_pool;
+-
+-	/*
+-	 * We can inline a number of vecs at the end of the bio, to avoid
+-	 * double allocations for a small number of bio_vecs. This member
+-	 * MUST obviously be kept at the very end of the bio.
+-	 */
+-	struct bio_vec		bi_inline_vecs[];
+ };
+ 
+ #define BIO_RESET_BYTES		offsetof(struct bio, bi_max_vecs)
+ #define BIO_MAX_SECTORS		(UINT_MAX >> SECTOR_SHIFT)
+ 
++static inline struct bio_vec *bio_inline_vecs(struct bio *bio)
++{
++	return (struct bio_vec *)(bio + 1);
++}
++
+ /*
+  * bio flags
+  */
+-- 
+2.43.0
+
