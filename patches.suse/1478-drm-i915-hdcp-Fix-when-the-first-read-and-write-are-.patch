@@ -1,0 +1,103 @@
+From 376a33c4a0d8344bb575e1a6eeb748ee4d4675d3 Mon Sep 17 00:00:00 2001
+From: Suraj Kandpal <suraj.kandpal@intel.com>
+Date: Mon, 4 Nov 2024 09:29:51 +0530
+Subject: drm/i915/hdcp: Fix when the first read and write are retried
+Git-commit: 376a33c4a0d8344bb575e1a6eeb748ee4d4675d3
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Make sure that the first read/write in hdcp2_authentication_key_exchange
+are only retried when we have either DP/DPMST encoder connected,
+since we do this to give docks and dp encoders some extra time to
+get their HDCP DPCD registers ready only for DP/DPMST encoders as
+this issue is only observed here no need to burden other encoders
+with extra retries as this causes the HDMI connector to have some
+other timing issue and fails HDCP authentication.
+
+--v2
+-Add intent of patch [Chaitanya]
+-Add reasoning for loop [Jani]
+-Make sure we forfiet the 50ms wait for non DP/DPMST encoders.
+
+--v3
+-Remove the is_dp_encoder check [Jani/Chaitanya]
+-Make the commit message more clearer [Jani]
+
+Fixes: 9d5a05f86d2f ("drm/i915/hdcp: Retry first read and writes to downstream")
+Signed-off-by: Suraj Kandpal <suraj.kandpal@intel.com>
+Reviewed-by: Chaitanya Kumar Borah <chaitanya.kumar.borah@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241104035951.517837-1-suraj.kandpal@intel.com
+(cherry picked from commit 44499559496c1dac43583f4387d38de1b612a69b)
+
+Signed-off-by: Tvrtko Ursulin <tursulin@ursulin.net>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/intel_hdcp.c | 32 ++++++++++++++---------
+ 1 file changed, 20 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_hdcp.c b/drivers/gpu/drm/i915/display/intel_hdcp.c
+index f6d42ec6949e..f57e4dba2873 100644
+--- a/drivers/gpu/drm/i915/display/intel_hdcp.c
++++ b/drivers/gpu/drm/i915/display/intel_hdcp.c
+@@ -1503,6 +1503,8 @@ static int hdcp2_deauthenticate_port(struct intel_connector *connector)
+ static int hdcp2_authentication_key_exchange(struct intel_connector *connector)
+ {
+ 	struct intel_display *display = to_intel_display(connector);
++	struct intel_digital_port *dig_port =
++		intel_attached_dig_port(connector);
+ 	struct intel_hdcp *hdcp = &connector->hdcp;
+ 	union {
+ 		struct hdcp2_ake_init ake_init;
+@@ -1513,30 +1515,36 @@ static int hdcp2_authentication_key_exchange(struct intel_connector *connector)
+ 	} msgs;
+ 	const struct intel_hdcp_shim *shim = hdcp->shim;
+ 	size_t size;
+-	int ret, i;
++	int ret, i, max_retries;
+ 
+ 	/* Init for seq_num */
+ 	hdcp->seq_num_v = 0;
+ 	hdcp->seq_num_m = 0;
+ 
++	if (intel_encoder_is_dp(&dig_port->base) ||
++	    intel_encoder_is_mst(&dig_port->base))
++		max_retries = 10;
++	else
++		max_retries = 1;
++
+ 	ret = hdcp2_prepare_ake_init(connector, &msgs.ake_init);
+ 	if (ret < 0)
+ 		return ret;
+ 
+ 	/*
+ 	 * Retry the first read and write to downstream at least 10 times
+-	 * with a 50ms delay if not hdcp2 capable(dock decides to stop advertising
+-	 * hdcp2 capability for some reason). The reason being that
+-	 * during suspend resume dock usually keeps the HDCP2 registers inaccesible
+-	 * causing AUX error. This wouldn't be a big problem if the userspace
+-	 * just kept retrying with some delay while it continues to play low
+-	 * value content but most userpace applications end up throwing an error
+-	 * when it receives one from KMD. This makes sure we give the dock
+-	 * and the sink devices to complete its power cycle and then try HDCP
+-	 * authentication. The values of 10 and delay of 50ms was decided based
+-	 * on multiple trial and errors.
++	 * with a 50ms delay if not hdcp2 capable for DP/DPMST encoders
++	 * (dock decides to stop advertising hdcp2 capability for some reason).
++	 * The reason being that during suspend resume dock usually keeps the
++	 * HDCP2 registers inaccesible causing AUX error. This wouldn't be a
++	 * big problem if the userspace just kept retrying with some delay while
++	 * it continues to play low value content but most userpace applications
++	 * end up throwing an error when it receives one from KMD. This makes
++	 * sure we give the dock and the sink devices to complete its power cycle
++	 * and then try HDCP authentication. The values of 10 and delay of 50ms
++	 * was decided based on multiple trial and errors.
+ 	 */
+-	for (i = 0; i < 10; i++) {
++	for (i = 0; i < max_retries; i++) {
+ 		if (!intel_hdcp2_get_capability(connector)) {
+ 			msleep(50);
+ 			continue;
+-- 
+2.52.0
+
