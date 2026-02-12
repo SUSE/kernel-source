@@ -1,0 +1,207 @@
+From: Keith Busch <kbusch@kernel.org>
+Date: Wed, 3 Sep 2025 12:33:17 -0700
+Subject: [PATCH] blk-mq-dma: bring back p2p request flags
+Git-commit: d57447ffb5fadffdba920f2fb933296fb6c5ff57
+Patch-mainline: v6.18-rc1
+References: jsc#PED-14161
+
+We only need to consider data and metadata dma mapping types separately.
+The request and bio integrity payload have enough flag bits to
+internally track the mapping type for each. Use these so the caller
+doesn't need to track them, and provide separete request and integrity
+helpers to the common code. This will make it easier to scale new
+mappings, like the proposed MMIO attribute, without burdening the caller
+to track such things.
+
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Martin K. Petersen <martin.petersen@oracle.com>
+Reviewed-by: Leon Romanovsky <leonro@nvidia.com>
+Signed-off-by: Keith Busch <kbusch@kernel.org>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/blk-mq-dma.c            |  4 ++++
+ drivers/nvme/host/pci.c       | 21 ++++-----------------
+ include/linux/bio-integrity.h |  1 +
+ include/linux/blk-integrity.h | 15 +++++++++++++++
+ include/linux/blk-mq-dma.h    | 11 +++++++++--
+ include/linux/blk_types.h     |  2 ++
+ 6 files changed, 35 insertions(+), 19 deletions(-)
+
+diff --git a/block/blk-mq-dma.c b/block/blk-mq-dma.c
+index 660b5e200ccf..449950029872 100644
+--- a/block/blk-mq-dma.c
++++ b/block/blk-mq-dma.c
+@@ -174,6 +174,10 @@ static bool blk_dma_map_iter_start(struct request *req, struct device *dma_dev,
+ 	switch (pci_p2pdma_state(&iter->p2pdma, dma_dev,
+ 				 phys_to_page(vec.paddr))) {
+ 	case PCI_P2PDMA_MAP_BUS_ADDR:
++		if (iter->iter.is_integrity)
++			bio_integrity(req->bio)->bip_flags |= BIP_P2P_DMA;
++		else
++			req->cmd_flags |= REQ_P2PDMA;
+ 		return blk_dma_map_bus(iter, &vec);
+ 	case PCI_P2PDMA_MAP_THRU_HOST_BRIDGE:
+ 		/*
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index d8a9dee55de3..28e203b894eb 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -260,12 +260,6 @@ enum nvme_iod_flags {
+ 	/* single segment dma mapping */
+ 	IOD_SINGLE_SEGMENT	= 1U << 2,
+ 
+-	/* DMA mapped with PCI_P2PDMA_MAP_BUS_ADDR */
+-	IOD_P2P_BUS_ADDR	= 1U << 3,
+-
+-	/* Metadata DMA mapped with PCI_P2PDMA_MAP_BUS_ADDR */
+-	IOD_META_P2P_BUS_ADDR	= 1U << 4,
+-
+ 	/* Metadata using non-coalesced MPTR */
+ 	IOD_SINGLE_META_SEGMENT	= 1U << 5,
+ };
+@@ -737,9 +731,8 @@ static void nvme_unmap_metadata(struct request *req)
+ 		return;
+ 	}
+ 
+-	if (!blk_rq_dma_unmap(req, dma_dev, &iod->meta_dma_state,
+-				iod->meta_total_len,
+-				iod->flags & IOD_META_P2P_BUS_ADDR)) {
++	if (!blk_rq_integrity_dma_unmap(req, dma_dev, &iod->meta_dma_state,
++					iod->meta_total_len)) {
+ 		if (nvme_pci_cmd_use_meta_sgl(&iod->cmd))
+ 			nvme_free_sgls(req, sge, &sge[1]);
+ 		else
+@@ -766,8 +759,7 @@ static void nvme_unmap_data(struct request *req)
+ 		return;
+ 	}
+ 
+-	if (!blk_rq_dma_unmap(req, dma_dev, &iod->dma_state, iod->total_len,
+-				iod->flags & IOD_P2P_BUS_ADDR)) {
++	if (!blk_rq_dma_unmap(req, dma_dev, &iod->dma_state, iod->total_len)) {
+ 		if (nvme_pci_cmd_use_sgl(&iod->cmd))
+ 			nvme_free_sgls(req, iod->descriptors[0],
+ 				       &iod->cmd.common.dptr.sgl);
+@@ -1043,9 +1035,6 @@ static blk_status_t nvme_map_data(struct request *req)
+ 	if (!blk_rq_dma_map_iter_start(req, dev->dev, &iod->dma_state, &iter))
+ 		return iter.status;
+ 
+-	if (iter.p2pdma.map == PCI_P2PDMA_MAP_BUS_ADDR)
+-		iod->flags |= IOD_P2P_BUS_ADDR;
+-
+ 	if (use_sgl == SGL_FORCED ||
+ 	    (use_sgl == SGL_SUPPORTED &&
+ 	     (sgl_threshold && nvme_pci_avg_seg_size(req) >= sgl_threshold)))
+@@ -1068,9 +1057,7 @@ static blk_status_t nvme_pci_setup_meta_sgls(struct request *req)
+ 						&iod->meta_dma_state, &iter))
+ 		return iter.status;
+ 
+-	if (iter.p2pdma.map == PCI_P2PDMA_MAP_BUS_ADDR)
+-		iod->flags |= IOD_META_P2P_BUS_ADDR;
+-	else if (blk_rq_dma_map_coalesce(&iod->meta_dma_state))
++	if (blk_rq_dma_map_coalesce(&iod->meta_dma_state))
+ 		entries = 1;
+ 
+ 	/*
+diff --git a/include/linux/bio-integrity.h b/include/linux/bio-integrity.h
+index 0a25716820fe..851254f36eb3 100644
+--- a/include/linux/bio-integrity.h
++++ b/include/linux/bio-integrity.h
+@@ -13,6 +13,7 @@ enum bip_flags {
+ 	BIP_CHECK_GUARD		= 1 << 5, /* guard check */
+ 	BIP_CHECK_REFTAG	= 1 << 6, /* reftag check */
+ 	BIP_CHECK_APPTAG	= 1 << 7, /* apptag check */
++	BIP_P2P_DMA		= 1 << 8, /* using P2P address */
+ };
+ 
+ struct bio_integrity_payload {
+diff --git a/include/linux/blk-integrity.h b/include/linux/blk-integrity.h
+index 78fe2459e661..b659373788f6 100644
+--- a/include/linux/blk-integrity.h
++++ b/include/linux/blk-integrity.h
+@@ -27,6 +27,15 @@ static inline bool queue_limits_stack_integrity_bdev(struct queue_limits *t,
+ 
+ #ifdef CONFIG_BLK_DEV_INTEGRITY
+ int blk_rq_map_integrity_sg(struct request *, struct scatterlist *);
++
++static inline bool blk_rq_integrity_dma_unmap(struct request *req,
++		struct device *dma_dev, struct dma_iova_state *state,
++		size_t mapped_len)
++{
++	return blk_dma_unmap(req, dma_dev, state, mapped_len,
++			bio_integrity(req->bio)->bip_flags & BIP_P2P_DMA);
++}
++
+ int blk_rq_count_integrity_sg(struct request_queue *, struct bio *);
+ int blk_rq_integrity_map_user(struct request *rq, void __user *ubuf,
+ 			      ssize_t bytes);
+@@ -115,6 +124,12 @@ static inline int blk_rq_map_integrity_sg(struct request *q,
+ {
+ 	return 0;
+ }
++static inline bool blk_rq_integrity_dma_unmap(struct request *req,
++		struct device *dma_dev, struct dma_iova_state *state,
++		size_t mapped_len)
++{
++	return false;
++}
+ static inline int blk_rq_integrity_map_user(struct request *rq,
+ 					    void __user *ubuf,
+ 					    ssize_t bytes)
+diff --git a/include/linux/blk-mq-dma.h b/include/linux/blk-mq-dma.h
+index 0f45ea110ca1..51829958d872 100644
+--- a/include/linux/blk-mq-dma.h
++++ b/include/linux/blk-mq-dma.h
+@@ -43,7 +43,7 @@ static inline bool blk_rq_dma_map_coalesce(struct dma_iova_state *state)
+ }
+ 
+ /**
+- * blk_rq_dma_unmap - try to DMA unmap a request
++ * blk_dma_unmap - try to DMA unmap a request
+  * @req:	request to unmap
+  * @dma_dev:	device to unmap from
+  * @state:	DMA IOVA state
+@@ -53,7 +53,7 @@ static inline bool blk_rq_dma_map_coalesce(struct dma_iova_state *state)
+  * Returns %false if the callers need to manually unmap every DMA segment
+  * mapped using @iter or %true if no work is left to be done.
+  */
+-static inline bool blk_rq_dma_unmap(struct request *req, struct device *dma_dev,
++static inline bool blk_dma_unmap(struct request *req, struct device *dma_dev,
+ 		struct dma_iova_state *state, size_t mapped_len, bool is_p2p)
+ {
+ 	if (is_p2p)
+@@ -68,4 +68,11 @@ static inline bool blk_rq_dma_unmap(struct request *req, struct device *dma_dev,
+ 	return !dma_need_unmap(dma_dev);
+ }
+ 
++static inline bool blk_rq_dma_unmap(struct request *req, struct device *dma_dev,
++		struct dma_iova_state *state, size_t mapped_len)
++{
++	return blk_dma_unmap(req, dma_dev, state, mapped_len,
++				req->cmd_flags & REQ_P2PDMA);
++}
++
+ #endif /* BLK_MQ_DMA_H */
+diff --git a/include/linux/blk_types.h b/include/linux/blk_types.h
+index bbb7893e0542..4bd098fd61cb 100644
+--- a/include/linux/blk_types.h
++++ b/include/linux/blk_types.h
+@@ -384,6 +384,7 @@ enum req_flag_bits {
+ 	__REQ_DRV,		/* for driver use */
+ 	__REQ_FS_PRIVATE,	/* for file system (submitter) use */
+ 	__REQ_ATOMIC,		/* for atomic write operations */
++	__REQ_P2PDMA,		/* contains P2P DMA pages */
+ 	/*
+ 	 * Command specific flags, keep last:
+ 	 */
+@@ -416,6 +417,7 @@ enum req_flag_bits {
+ #define REQ_DRV		(__force blk_opf_t)(1ULL << __REQ_DRV)
+ #define REQ_FS_PRIVATE	(__force blk_opf_t)(1ULL << __REQ_FS_PRIVATE)
+ #define REQ_ATOMIC	(__force blk_opf_t)(1ULL << __REQ_ATOMIC)
++#define REQ_P2PDMA	(__force blk_opf_t)(1ULL << __REQ_P2PDMA)
+ 
+ #define REQ_NOUNMAP	(__force blk_opf_t)(1ULL << __REQ_NOUNMAP)
+ 
+-- 
+2.43.0
+
