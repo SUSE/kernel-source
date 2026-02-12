@@ -1,0 +1,212 @@
+From fb9898243a7b8133c969c9bbd5d5470f7c2e1374 Mon Sep 17 00:00:00 2001
+From: "Jesse.zhang@amd.com" <jesse.zhang@amd.com>
+Date: Thu, 7 Nov 2024 22:53:47 +0800
+Subject: drm/amdgpu: Add sysfs interface for vcn reset mask
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: fb9898243a7b8133c969c9bbd5d5470f7c2e1374
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Add the sysfs interface for vcn:
+vcn_reset_mask
+
+The interface is read-only and show the resets supported by the IP.
+For example, full adapter reset (mode1/mode2/BACO/etc),
+soft reset, queue reset, and pipe reset.
+
+V2: the sysfs node returns a text string instead of some flags (Christian)
+
+V3: add a generic helper which takes the ring as parameter
+    and print the strings in the order they are applied (Christian)
+
+    check amdgpu_gpu_recovery  before creating sysfs file itself,
+    and initialize supported_reset_types in IP version files (Lijo)
+V4: s/sdma/vcn/ in the reset mask setup
+
+Acked-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Jesse Zhang <Jesse.Zhang@amd.com>
+Suggested-by: Alex Deucher <alexander.deucher@amd.com>
+Reviewed-by: Tim Huang <tim.huang@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c | 35 +++++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.h |  4 +++
+ drivers/gpu/drm/amd/amdgpu/vcn_v4_0.c   |  9 +++++++
+ drivers/gpu/drm/amd/amdgpu/vcn_v4_0_3.c |  9 +++++++
+ drivers/gpu/drm/amd/amdgpu/vcn_v5_0_0.c | 10 +++++++
+ 5 files changed, 67 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c
+index aecb78e0519f..5ced59bf0f00 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c
+@@ -1283,3 +1283,38 @@ int amdgpu_vcn_psp_update_sram(struct amdgpu_device *adev, int inst_idx,
+ 
+ 	return psp_execute_ip_fw_load(&adev->psp, &ucode);
+ }
++
++static ssize_t amdgpu_get_vcn_reset_mask(struct device *dev,
++						struct device_attribute *attr,
++						char *buf)
++{
++	struct drm_device *ddev = dev_get_drvdata(dev);
++	struct amdgpu_device *adev = drm_to_adev(ddev);
++
++	if (!adev)
++		return -ENODEV;
++
++	return amdgpu_show_reset_mask(buf, adev->vcn.supported_reset);
++}
++
++static DEVICE_ATTR(vcn_reset_mask, 0444,
++		   amdgpu_get_vcn_reset_mask, NULL);
++
++int amdgpu_vcn_sysfs_reset_mask_init(struct amdgpu_device *adev)
++{
++	int r = 0;
++
++	if (adev->vcn.num_vcn_inst) {
++		r = device_create_file(adev->dev, &dev_attr_vcn_reset_mask);
++		if (r)
++			return r;
++	}
++
++	return r;
++}
++
++void amdgpu_vcn_sysfs_reset_mask_fini(struct amdgpu_device *adev)
++{
++	if (adev->vcn.num_vcn_inst)
++		device_remove_file(adev->dev, &dev_attr_vcn_reset_mask);
++}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.h
+index 765b809d48a2..1e32311c1dff 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.h
+@@ -333,6 +333,8 @@ struct amdgpu_vcn {
+ 
+ 	/* IP reg dump */
+ 	uint32_t		*ip_dump;
++
++	uint32_t		supported_reset;
+ };
+ 
+ struct amdgpu_fw_shared_rb_ptrs_struct {
+@@ -519,5 +521,7 @@ int amdgpu_vcn_ras_sw_init(struct amdgpu_device *adev);
+ int amdgpu_vcn_psp_update_sram(struct amdgpu_device *adev, int inst_idx,
+ 			       enum AMDGPU_UCODE_ID ucode_id);
+ int amdgpu_vcn_save_vcpu_bo(struct amdgpu_device *adev);
++int amdgpu_vcn_sysfs_reset_mask_init(struct amdgpu_device *adev);
++void amdgpu_vcn_sysfs_reset_mask_fini(struct amdgpu_device *adev);
+ 
+ #endif
+diff --git a/drivers/gpu/drm/amd/amdgpu/vcn_v4_0.c b/drivers/gpu/drm/amd/amdgpu/vcn_v4_0.c
+index 5512259cac79..fcc8511e91ee 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vcn_v4_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/vcn_v4_0.c
+@@ -225,6 +225,10 @@ static int vcn_v4_0_sw_init(struct amdgpu_ip_block *ip_block)
+ 		vcn_v4_0_fw_shared_init(adev, i);
+ 	}
+ 
++	/* TODO: Add queue reset mask when FW fully supports it */
++	adev->vcn.supported_reset =
++		amdgpu_get_soft_full_reset_mask(&adev->vcn.inst[0].ring_enc[0]);
++
+ 	if (amdgpu_sriov_vf(adev)) {
+ 		r = amdgpu_virt_alloc_mm_table(adev);
+ 		if (r)
+@@ -247,6 +251,10 @@ static int vcn_v4_0_sw_init(struct amdgpu_ip_block *ip_block)
+ 		adev->vcn.ip_dump = ptr;
+ 	}
+ 
++	r = amdgpu_vcn_sysfs_reset_mask_init(adev);
++	if (r)
++		return r;
++
+ 	return 0;
+ }
+ 
+@@ -284,6 +292,7 @@ static int vcn_v4_0_sw_fini(struct amdgpu_ip_block *ip_block)
+ 	if (r)
+ 		return r;
+ 
++	amdgpu_vcn_sysfs_reset_mask_fini(adev);
+ 	r = amdgpu_vcn_sw_fini(adev);
+ 
+ 	kfree(adev->vcn.ip_dump);
+diff --git a/drivers/gpu/drm/amd/amdgpu/vcn_v4_0_3.c b/drivers/gpu/drm/amd/amdgpu/vcn_v4_0_3.c
+index cf808a153fce..63e837f83646 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vcn_v4_0_3.c
++++ b/drivers/gpu/drm/amd/amdgpu/vcn_v4_0_3.c
+@@ -187,6 +187,10 @@ static int vcn_v4_0_3_sw_init(struct amdgpu_ip_block *ip_block)
+ 			amdgpu_vcn_fwlog_init(&adev->vcn.inst[i]);
+ 	}
+ 
++	/* TODO: Add queue reset mask when FW fully supports it */
++	adev->vcn.supported_reset =
++		amdgpu_get_soft_full_reset_mask(&adev->vcn.inst[0].ring_enc[0]);
++
+ 	if (amdgpu_sriov_vf(adev)) {
+ 		r = amdgpu_virt_alloc_mm_table(adev);
+ 		if (r)
+@@ -213,6 +217,10 @@ static int vcn_v4_0_3_sw_init(struct amdgpu_ip_block *ip_block)
+ 		adev->vcn.ip_dump = ptr;
+ 	}
+ 
++	r = amdgpu_vcn_sysfs_reset_mask_init(adev);
++	if (r)
++		return r;
++
+ 	return 0;
+ }
+ 
+@@ -246,6 +254,7 @@ static int vcn_v4_0_3_sw_fini(struct amdgpu_ip_block *ip_block)
+ 	if (r)
+ 		return r;
+ 
++	amdgpu_vcn_sysfs_reset_mask_fini(adev);
+ 	r = amdgpu_vcn_sw_fini(adev);
+ 
+ 	kfree(adev->vcn.ip_dump);
+diff --git a/drivers/gpu/drm/amd/amdgpu/vcn_v5_0_0.c b/drivers/gpu/drm/amd/amdgpu/vcn_v5_0_0.c
+index fe2cc1a80c13..bd3d2bbdc16b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vcn_v5_0_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/vcn_v5_0_0.c
+@@ -170,6 +170,10 @@ static int vcn_v5_0_0_sw_init(struct amdgpu_ip_block *ip_block)
+ 			amdgpu_vcn_fwlog_init(&adev->vcn.inst[i]);
+ 	}
+ 
++	/* TODO: Add queue reset mask when FW fully supports it */
++	adev->vcn.supported_reset =
++		amdgpu_get_soft_full_reset_mask(&adev->vcn.inst[0].ring_enc[0]);
++
+ 	if (adev->pg_flags & AMD_PG_SUPPORT_VCN_DPG)
+ 		adev->vcn.pause_dpg_mode = vcn_v5_0_0_pause_dpg_mode;
+ 
+@@ -181,6 +185,11 @@ static int vcn_v5_0_0_sw_init(struct amdgpu_ip_block *ip_block)
+ 	} else {
+ 		adev->vcn.ip_dump = ptr;
+ 	}
++
++	r = amdgpu_vcn_sysfs_reset_mask_init(adev);
++	if (r)
++		return r;
++
+ 	return 0;
+ }
+ 
+@@ -215,6 +224,7 @@ static int vcn_v5_0_0_sw_fini(struct amdgpu_ip_block *ip_block)
+ 	if (r)
+ 		return r;
+ 
++	amdgpu_vcn_sysfs_reset_mask_fini(adev);
+ 	r = amdgpu_vcn_sw_fini(adev);
+ 
+ 	kfree(adev->vcn.ip_dump);
+-- 
+2.52.0
+
