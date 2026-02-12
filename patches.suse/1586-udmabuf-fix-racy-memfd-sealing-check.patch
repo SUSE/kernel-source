@@ -1,0 +1,65 @@
+From 9cb189a882738c1d28b349d4e7c6a1ef9b3d8f87 Mon Sep 17 00:00:00 2001
+From: Jann Horn <jannh@google.com>
+Date: Wed, 4 Dec 2024 17:26:19 +0100
+Subject: udmabuf: fix racy memfd sealing check
+Git-commit: 9cb189a882738c1d28b349d4e7c6a1ef9b3d8f87
+Patch-mainline: v6.13-rc4
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+The current check_memfd_seals() is racy: Since we first do
+check_memfd_seals() and then udmabuf_pin_folios() without holding any
+relevant lock across both, F_SEAL_WRITE can be set in between.
+This is problematic because we can end up holding pins to pages in a
+write-sealed memfd.
+
+Fix it using the inode lock, that's probably the easiest way.
+In the future, we might want to consider moving this logic into memfd,
+especially if anyone else wants to use memfd_pin_folios().
+
+Reported-by: Julian Orth <ju.orth@gmail.com>
+Closes: https://bugzilla.kernel.org/show_bug.cgi?id=219106
+Closes: https://lore.kernel.org/r/CAG48ez0w8HrFEZtJkfmkVKFDhE5aP7nz=obrimeTgpD+StkV9w@mail.gmail.com
+Fixes: fbb0de795078 ("Add udmabuf misc device")
+Cc: stable@vger.kernel.org
+Signed-off-by: Jann Horn <jannh@google.com>
+Acked-by: Joel Fernandes (Google) <joel@joelfernandes.org>
+Acked-by: Vivek Kasireddy <vivek.kasireddy@intel.com>
+Signed-off-by: Vivek Kasireddy <vivek.kasireddy@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241204-udmabuf-fixes-v2-1-23887289de1c@google.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/dma-buf/udmabuf.c | 13 +++++++++----
+ 1 file changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/dma-buf/udmabuf.c b/drivers/dma-buf/udmabuf.c
+index 8ce1f074c2d3..c1d8c2766d6d 100644
+--- a/drivers/dma-buf/udmabuf.c
++++ b/drivers/dma-buf/udmabuf.c
+@@ -436,14 +436,19 @@ static long udmabuf_create(struct miscdevice *device,
+ 			goto err;
+ 		}
+ 
++		/*
++		 * Take the inode lock to protect against concurrent
++		 * memfd_add_seals(), which takes this lock in write mode.
++		 */
++		inode_lock_shared(file_inode(memfd));
+ 		ret = check_memfd_seals(memfd);
+-		if (ret < 0) {
+-			fput(memfd);
+-			goto err;
+-		}
++		if (ret)
++			goto out_unlock;
+ 
+ 		ret = udmabuf_pin_folios(ubuf, memfd, list[i].offset,
+ 					 list[i].size, folios);
++out_unlock:
++		inode_unlock_shared(file_inode(memfd));
+ 		fput(memfd);
+ 		if (ret)
+ 			goto err;
+-- 
+2.52.0
+
