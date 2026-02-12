@@ -1,0 +1,140 @@
+From 16d1d39db536205746eaaf43ee70780b893cd27a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Mon, 16 Sep 2024 19:24:09 +0300
+Subject: drm/i915: Extract ilk_must_disable_lp_wm()
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 16d1d39db536205746eaaf43ee70780b893cd27a
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Pull the ilk/snb/ivb LP watermark disable checks into a separate
+function similar to the gmch counterpart (i9xx_must_disable_cxsr()).
+Reduces the clutter in intel_plane_atomic_calc_changes() significantly.
+
+Reviewed-by: Arun R Murthy <arun.r.murthy@intel.com>
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20240916162413.8555-4-ville.syrjala@linux.intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../gpu/drm/i915/display/intel_atomic_plane.c | 95 +++++++++++--------
+ 1 file changed, 57 insertions(+), 38 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_atomic_plane.c b/drivers/gpu/drm/i915/display/intel_atomic_plane.c
+index 18c516298e79..cf6e9c6bb5fe 100644
+--- a/drivers/gpu/drm/i915/display/intel_atomic_plane.c
++++ b/drivers/gpu/drm/i915/display/intel_atomic_plane.c
+@@ -493,6 +493,61 @@ static bool i9xx_must_disable_cxsr(const struct intel_crtc_state *new_crtc_state
+ 	return old_ctl != new_ctl;
+ }
+ 
++static bool ilk_must_disable_lp_wm(const struct intel_crtc_state *new_crtc_state,
++				   const struct intel_plane_state *old_plane_state,
++				   const struct intel_plane_state *new_plane_state)
++{
++	struct intel_plane *plane = to_intel_plane(new_plane_state->uapi.plane);
++	bool old_visible = old_plane_state->uapi.visible;
++	bool new_visible = new_plane_state->uapi.visible;
++	bool modeset, turn_on;
++
++	if (plane->id == PLANE_CURSOR)
++		return false;
++
++	modeset = intel_crtc_needs_modeset(new_crtc_state);
++	turn_on = new_visible && (!old_visible || modeset);
++
++	/*
++	 * ILK/SNB DVSACNTR/Sprite Enable
++	 * IVB SPR_CTL/Sprite Enable
++	 * "When in Self Refresh Big FIFO mode, a write to enable the
++	 *  plane will be internally buffered and delayed while Big FIFO
++	 *  mode is exiting."
++	 *
++	 * Which means that enabling the sprite can take an extra frame
++	 * when we start in big FIFO mode (LP1+). Thus we need to drop
++	 * down to LP0 and wait for vblank in order to make sure the
++	 * sprite gets enabled on the next vblank after the register write.
++	 * Doing otherwise would risk enabling the sprite one frame after
++	 * we've already signalled flip completion. We can resume LP1+
++	 * once the sprite has been enabled.
++	 *
++	 * With experimental results seems this is needed also for primary
++	 * plane, not only sprite plane.
++	 */
++	if (turn_on)
++		return true;
++
++	/*
++	 * WaCxSRDisabledForSpriteScaling:ivb
++	 * IVB SPR_SCALE/Scaling Enable
++	 * "Low Power watermarks must be disabled for at least one
++	 *  frame before enabling sprite scaling, and kept disabled
++	 *  until sprite scaling is disabled."
++	 *
++	 * ILK/SNB DVSASCALE/Scaling Enable
++	 * "When in Self Refresh Big FIFO mode, scaling enable will be
++	 *  masked off while Big FIFO mode is exiting."
++	 *
++	 * Despite the w/a only being listed for IVB we assume that
++	 * the ILK/SNB note has similar ramifications, hence we apply
++	 * the w/a on all three platforms.
++	 */
++	return !intel_plane_is_scaled(old_plane_state) &&
++		intel_plane_is_scaled(new_plane_state);
++}
++
+ static int intel_plane_atomic_calc_changes(const struct intel_crtc_state *old_crtc_state,
+ 					   struct intel_crtc_state *new_crtc_state,
+ 					   const struct intel_plane_state *old_plane_state,
+@@ -568,44 +623,8 @@ static int intel_plane_atomic_calc_changes(const struct intel_crtc_state *old_cr
+ 	    i9xx_must_disable_cxsr(new_crtc_state, old_plane_state, new_plane_state))
+ 		new_crtc_state->disable_cxsr = true;
+ 
+-	/*
+-	 * ILK/SNB DVSACNTR/Sprite Enable
+-	 * IVB SPR_CTL/Sprite Enable
+-	 * "When in Self Refresh Big FIFO mode, a write to enable the
+-	 *  plane will be internally buffered and delayed while Big FIFO
+-	 *  mode is exiting."
+-	 *
+-	 * Which means that enabling the sprite can take an extra frame
+-	 * when we start in big FIFO mode (LP1+). Thus we need to drop
+-	 * down to LP0 and wait for vblank in order to make sure the
+-	 * sprite gets enabled on the next vblank after the register write.
+-	 * Doing otherwise would risk enabling the sprite one frame after
+-	 * we've already signalled flip completion. We can resume LP1+
+-	 * once the sprite has been enabled.
+-	 *
+-	 *
+-	 * WaCxSRDisabledForSpriteScaling:ivb
+-	 * IVB SPR_SCALE/Scaling Enable
+-	 * "Low Power watermarks must be disabled for at least one
+-	 *  frame before enabling sprite scaling, and kept disabled
+-	 *  until sprite scaling is disabled."
+-	 *
+-	 * ILK/SNB DVSASCALE/Scaling Enable
+-	 * "When in Self Refresh Big FIFO mode, scaling enable will be
+-	 *  masked off while Big FIFO mode is exiting."
+-	 *
+-	 * Despite the w/a only being listed for IVB we assume that
+-	 * the ILK/SNB note has similar ramifications, hence we apply
+-	 * the w/a on all three platforms.
+-	 *
+-	 * With experimental results seems this is needed also for primary
+-	 * plane, not only sprite plane.
+-	 */
+-	if (plane->id != PLANE_CURSOR &&
+-	    (IS_IRONLAKE(dev_priv) || IS_SANDYBRIDGE(dev_priv) ||
+-	     IS_IVYBRIDGE(dev_priv)) &&
+-	    (turn_on || (!intel_plane_is_scaled(old_plane_state) &&
+-			 intel_plane_is_scaled(new_plane_state))))
++	if ((IS_IRONLAKE(dev_priv) || IS_SANDYBRIDGE(dev_priv) || IS_IVYBRIDGE(dev_priv)) &&
++	    ilk_must_disable_lp_wm(new_crtc_state, old_plane_state, new_plane_state))
+ 		new_crtc_state->disable_lp_wm = true;
+ 
+ 	if (intel_plane_do_async_flip(plane, old_crtc_state, new_crtc_state)) {
+-- 
+2.52.0
+
