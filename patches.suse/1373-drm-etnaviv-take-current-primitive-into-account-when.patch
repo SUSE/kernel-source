@@ -1,0 +1,85 @@
+From e1f3220b957a55a875d668f3e2fadd6315c8bbf4 Mon Sep 17 00:00:00 2001
+From: Lucas Stach <l.stach@pengutronix.de>
+Date: Fri, 5 Jul 2024 22:00:13 +0200
+Subject: drm/etnaviv: take current primitive into account when checking for
+ hung GPU
+Git-commit: e1f3220b957a55a875d668f3e2fadd6315c8bbf4
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Large draws can make the GPU appear to be stuck to the current hangcheck
+logic as the FE address will not move until the draw is finished. However,
+the FE has a debug register, which records the current primitive ID within
+a draw. Using this debug register we can extend the timeout as long as the
+draw progresses.
+
+Reviewed-by: Christian Gmeiner <cgmeiner@igalia.com>
+Reviewed-by: Philipp Zabel <p.zabel@pengutronix.de>
+Signed-off-by: Lucas Stach <l.stach@pengutronix.de>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/etnaviv/etnaviv_gpu.h   |  1 +
+ drivers/gpu/drm/etnaviv/etnaviv_sched.c | 17 +++++++++++++++--
+ 2 files changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/etnaviv/etnaviv_gpu.h b/drivers/gpu/drm/etnaviv/etnaviv_gpu.h
+index 31322195b9e4..4d8a7d48ade3 100644
+--- a/drivers/gpu/drm/etnaviv/etnaviv_gpu.h
++++ b/drivers/gpu/drm/etnaviv/etnaviv_gpu.h
+@@ -144,6 +144,7 @@ struct etnaviv_gpu {
+ 
+ 	/* hang detection */
+ 	u32 hangcheck_dma_addr;
++	u32 hangcheck_primid;
+ 	u32 hangcheck_fence;
+ 
+ 	void __iomem *mmio;
+diff --git a/drivers/gpu/drm/etnaviv/etnaviv_sched.c b/drivers/gpu/drm/etnaviv/etnaviv_sched.c
+index 23ced5896c7c..5b67eda122db 100644
+--- a/drivers/gpu/drm/etnaviv/etnaviv_sched.c
++++ b/drivers/gpu/drm/etnaviv/etnaviv_sched.c
+@@ -11,6 +11,7 @@
+ #include "etnaviv_gpu.h"
+ #include "etnaviv_sched.h"
+ #include "state.xml.h"
++#include "state_hi.xml.h"
+ 
+ static int etnaviv_job_hang_limit = 0;
+ module_param_named(job_hang_limit, etnaviv_job_hang_limit, int , 0444);
+@@ -35,7 +36,7 @@ static enum drm_gpu_sched_stat etnaviv_sched_timedout_job(struct drm_sched_job
+ {
+ 	struct etnaviv_gem_submit *submit = to_etnaviv_submit(sched_job);
+ 	struct etnaviv_gpu *gpu = submit->gpu;
+-	u32 dma_addr;
++	u32 dma_addr, primid = 0;
+ 	int change;
+ 
+ 	/*
+@@ -52,10 +53,22 @@ static enum drm_gpu_sched_stat etnaviv_sched_timedout_job(struct drm_sched_job
+ 	 */
+ 	dma_addr = gpu_read(gpu, VIVS_FE_DMA_ADDRESS);
+ 	change = dma_addr - gpu->hangcheck_dma_addr;
++	if (submit->exec_state == ETNA_PIPE_3D) {
++		/* guard against concurrent usage from perfmon_sample */
++		mutex_lock(&gpu->lock);
++		gpu_write(gpu, VIVS_MC_PROFILE_CONFIG0,
++			  VIVS_MC_PROFILE_CONFIG0_FE_CURRENT_PRIM <<
++			  VIVS_MC_PROFILE_CONFIG0_FE__SHIFT);
++		primid = gpu_read(gpu, VIVS_MC_PROFILE_FE_READ);
++		mutex_unlock(&gpu->lock);
++	}
+ 	if (gpu->state == ETNA_GPU_STATE_RUNNING &&
+ 	    (gpu->completed_fence != gpu->hangcheck_fence ||
+-	     change < 0 || change > 16)) {
++	     change < 0 || change > 16 ||
++	     (submit->exec_state == ETNA_PIPE_3D &&
++	      gpu->hangcheck_primid != primid))) {
+ 		gpu->hangcheck_dma_addr = dma_addr;
++		gpu->hangcheck_primid = primid;
+ 		gpu->hangcheck_fence = gpu->completed_fence;
+ 		goto out_no_timeout;
+ 	}
+-- 
+2.52.0
+
