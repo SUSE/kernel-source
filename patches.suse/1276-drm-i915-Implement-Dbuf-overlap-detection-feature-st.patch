@@ -1,0 +1,134 @@
+From 98d2f2530fcc62efcfc816ac5ca352269db95765 Mon Sep 17 00:00:00 2001
+From: Stanislav Lisovskiy <stanislav.lisovskiy@intel.com>
+Date: Wed, 30 Oct 2024 12:33:19 +0200
+Subject: drm/i915: Implement Dbuf overlap detection feature starting from LNL
+Git-commit: 98d2f2530fcc62efcfc816ac5ca352269db95765
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+From LNL onwards there is a new hardware feature, which
+allows to detect if the driver wrongly allocated DBuf
+entries and they happen to overlap. If enabled this will
+cause a specific interrupt to occur.
+We now handle it in the driver, by writing correspondent
+error message to kernel log.
+
+V2: Initialize dbuf overlap flag in runtime_defaults (Jani Nikula)
+
+V3: Unmask the overlap detection interrupt (Uma)
+
+V4: use display over i915 (Jani Nikula)
+
+V5: Use display instead of dev_priv (Jani Nikula)
+
+V6: rebased to resolve merge conflicts
+
+Bspec: 69450, 69464
+Signed-off-by: Stanislav Lisovskiy <stanislav.lisovskiy@intel.com>
+Signed-off-by: Vinod Govindapillai <vinod.govindapillai@intel.com>
+Reviewed-by: Mika Kahola <mika.kahola@intel.com>
+Signed-off-by: Matt Roper <matthew.d.roper@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241030103319.207235-1-vinod.govindapillai@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/intel_display_device.c |  5 +++++
+ drivers/gpu/drm/i915/display/intel_display_device.h |  2 ++
+ drivers/gpu/drm/i915/display/intel_display_irq.c    | 10 ++++++++++
+ drivers/gpu/drm/i915/i915_reg.h                     |  2 ++
+ 4 files changed, 19 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display_device.c b/drivers/gpu/drm/i915/display/intel_display_device.c
+index a2ae07f6d1b7..83fa9036e3c7 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_device.c
++++ b/drivers/gpu/drm/i915/display/intel_display_device.c
+@@ -1314,6 +1314,7 @@ static const struct intel_display_device_info xe2_lpd_display = {
+ 	.__runtime_defaults.fbc_mask =
+ 		BIT(INTEL_FBC_A) | BIT(INTEL_FBC_B) |
+ 		BIT(INTEL_FBC_C) | BIT(INTEL_FBC_D),
++	.__runtime_defaults.has_dbuf_overlap_detection = true,
+ };
+ 
+ static const struct intel_display_device_info xe2_hpd_display = {
+@@ -1784,6 +1785,10 @@ static void __intel_display_device_info_runtime_init(struct drm_i915_private *i9
+ 		if (IS_DISPLAY_VER(i915, 10, 12) &&
+ 		    (dfsm & GLK_DFSM_DISPLAY_DSC_DISABLE))
+ 			display_runtime->has_dsc = 0;
++
++		if (DISPLAY_VER(display) >= 20 &&
++		    (dfsm & XE2LPD_DFSM_DBUF_OVERLAP_DISABLE))
++			display_runtime->has_dbuf_overlap_detection = false;
+ 	}
+ 
+ 	if (DISPLAY_VER(i915) >= 20) {
+diff --git a/drivers/gpu/drm/i915/display/intel_display_device.h b/drivers/gpu/drm/i915/display/intel_display_device.h
+index 13da16e3d815..43144a037f9f 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_device.h
++++ b/drivers/gpu/drm/i915/display/intel_display_device.h
+@@ -143,6 +143,7 @@ struct intel_display_platforms {
+ #define HAS_CDCLK_SQUASH(i915)		(DISPLAY_INFO(i915)->has_cdclk_squash)
+ #define HAS_CUR_FBC(i915)		(!HAS_GMCH(i915) && IS_DISPLAY_VER(i915, 7, 13))
+ #define HAS_D12_PLANE_MINIMIZATION(i915) (IS_ROCKETLAKE(i915) || IS_ALDERLAKE_S(i915))
++#define HAS_DBUF_OVERLAP_DETECTION(__i915) (DISPLAY_RUNTIME_INFO(__i915)->has_dbuf_overlap_detection)
+ #define HAS_DDI(i915)			(DISPLAY_INFO(i915)->has_ddi)
+ #define HAS_DISPLAY(i915)		(DISPLAY_RUNTIME_INFO(i915)->pipe_mask != 0)
+ #define HAS_DMC(i915)			(DISPLAY_RUNTIME_INFO(i915)->has_dmc)
+@@ -248,6 +249,7 @@ struct intel_display_runtime_info {
+ 	bool has_dmc;
+ 	bool has_dsc;
+ 	bool edp_typec_support;
++	bool has_dbuf_overlap_detection;
+ };
+ 
+ struct intel_display_device_info {
+diff --git a/drivers/gpu/drm/i915/display/intel_display_irq.c b/drivers/gpu/drm/i915/display/intel_display_irq.c
+index 0478fe3cdd86..e1547ebce60e 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_irq.c
++++ b/drivers/gpu/drm/i915/display/intel_display_irq.c
+@@ -903,6 +903,13 @@ gen8_de_misc_irq_handler(struct drm_i915_private *dev_priv, u32 iir)
+ 	struct intel_display *display = &dev_priv->display;
+ 	bool found = false;
+ 
++	if (HAS_DBUF_OVERLAP_DETECTION(display)) {
++		if (iir & XE2LPD_DBUF_OVERLAP_DETECTED) {
++			drm_warn(display->drm,  "DBuf overlap detected\n");
++			found = true;
++		}
++	}
++
+ 	if (DISPLAY_VER(dev_priv) >= 14) {
+ 		if (iir & (XELPDP_PMDEMAND_RSP |
+ 			   XELPDP_PMDEMAND_RSPTOUT_ERR)) {
+@@ -1790,6 +1797,9 @@ void gen8_de_irq_postinstall(struct drm_i915_private *dev_priv)
+ 			de_port_masked |= DSI0_TE | DSI1_TE;
+ 	}
+ 
++	if (HAS_DBUF_OVERLAP_DETECTION(display))
++		de_misc_masked |= XE2LPD_DBUF_OVERLAP_DETECTED;
++
+ 	if (HAS_DSB(dev_priv))
+ 		de_pipe_masked |= GEN12_DSB_INT(INTEL_DSB_0) |
+ 			GEN12_DSB_INT(INTEL_DSB_1) |
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index 89e4381f8baa..22be4a731d27 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -2589,6 +2589,7 @@
+ #define  GEN8_DE_MISC_GSE		REG_BIT(27)
+ #define  GEN8_DE_EDP_PSR		REG_BIT(19)
+ #define  XELPDP_PMDEMAND_RSP		REG_BIT(3)
++#define  XE2LPD_DBUF_OVERLAP_DETECTED	REG_BIT(1)
+ 
+ #define GEN8_DE_MISC_IRQ_REGS		I915_IRQ_REGS(GEN8_DE_MISC_IMR, \
+ 						      GEN8_DE_MISC_IER, \
+@@ -2895,6 +2896,7 @@
+ #define   SKL_DFSM_PIPE_C_DISABLE	(1 << 28)
+ #define   TGL_DFSM_PIPE_D_DISABLE	(1 << 22)
+ #define   GLK_DFSM_DISPLAY_DSC_DISABLE	(1 << 7)
++#define   XE2LPD_DFSM_DBUF_OVERLAP_DISABLE	(1 << 3)
+ 
+ #define XE2LPD_DE_CAP			_MMIO(0x41100)
+ #define   XE2LPD_DE_CAP_3DLUT_MASK	REG_GENMASK(31, 30)
+-- 
+2.52.0
+
