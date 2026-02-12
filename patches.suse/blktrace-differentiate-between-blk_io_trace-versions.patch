@@ -1,0 +1,100 @@
+From: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+Date: Wed, 22 Oct 2025 13:41:09 +0200
+Subject: [PATCH] blktrace: differentiate between blk_io_trace versions
+Git-commit: 915bb53860c3a6cc3dd2c9a5e0d1988ada0e377d
+Patch-mainline: v6.19-rc1
+References: jsc#PED-14161
+
+Differentiate between blk_io_trace and blk_io_trace2 when relaying to
+user-space depending on which version has been requested by the blktrace
+utility.
+
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Damien Le Moal <dlemoal@kernel.org>
+Reviewed-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ kernel/trace/blktrace.c | 58 ++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 57 insertions(+), 1 deletion(-)
+
+diff --git a/kernel/trace/blktrace.c b/kernel/trace/blktrace.c
+index 185f19c9f772..5f8ecf88a196 100644
+--- a/kernel/trace/blktrace.c
++++ b/kernel/trace/blktrace.c
+@@ -91,7 +91,29 @@ static void record_blktrace_event(struct blk_io_trace *t, pid_t pid, int cpu,
+ 		memcpy((void *)t + sizeof(*t) + cgid_len, pdu_data, pdu_len);
+ }
+ 
+-static void relay_blktrace_event(struct blk_trace *bt, unsigned long sequence,
++static void record_blktrace_event2(struct blk_io_trace2 *t2, pid_t pid, int cpu,
++				   sector_t sector, int bytes, u64 what,
++				   dev_t dev, int error, u64 cgid,
++				   ssize_t cgid_len, void *pdu_data,
++				   int pdu_len)
++{
++	t2->pid = pid;
++	t2->cpu = cpu;
++
++	t2->sector = sector;
++	t2->bytes = bytes;
++	t2->action = what;
++	t2->device = dev;
++	t2->error = error;
++	t2->pdu_len = pdu_len + cgid_len;
++
++	if (cgid_len)
++		memcpy((void *)t2 + sizeof(*t2), &cgid, cgid_len);
++	if (pdu_len)
++		memcpy((void *)t2 + sizeof(*t2) + cgid_len, pdu_data, pdu_len);
++}
++
++static void relay_blktrace_event1(struct blk_trace *bt, unsigned long sequence,
+ 				 pid_t pid, int cpu, sector_t sector, int bytes,
+ 				 u64 what, int error, u64 cgid,
+ 				 ssize_t cgid_len, void *pdu_data, int pdu_len)
+@@ -111,6 +133,40 @@ static void relay_blktrace_event(struct blk_trace *bt, unsigned long sequence,
+ 			      cgid, cgid_len, pdu_data, pdu_len);
+ }
+ 
++static void relay_blktrace_event2(struct blk_trace *bt, unsigned long sequence,
++				  pid_t pid, int cpu, sector_t sector,
++				  int bytes, u64 what, int error, u64 cgid,
++				  ssize_t cgid_len, void *pdu_data, int pdu_len)
++{
++	struct blk_io_trace2 *t;
++	size_t trace_len = sizeof(struct blk_io_trace2) + pdu_len + cgid_len;
++
++	t = relay_reserve(bt->rchan, trace_len);
++	if (!t)
++		return;
++
++	t->magic = BLK_IO_TRACE_MAGIC | BLK_IO_TRACE2_VERSION;
++	t->sequence = sequence;
++	t->time = ktime_to_ns(ktime_get());
++
++	record_blktrace_event2(t, pid, cpu, sector, bytes, what, bt->dev, error,
++			       cgid, cgid_len, pdu_data, pdu_len);
++}
++
++static void relay_blktrace_event(struct blk_trace *bt, unsigned long sequence,
++				 pid_t pid, int cpu, sector_t sector, int bytes,
++				 u64 what, int error, u64 cgid,
++				 ssize_t cgid_len, void *pdu_data, int pdu_len)
++{
++	if (bt->version == 2)
++		return relay_blktrace_event2(bt, sequence, pid, cpu, sector,
++					     bytes, what, error, cgid, cgid_len,
++					     pdu_data, pdu_len);
++	return relay_blktrace_event1(bt, sequence, pid, cpu, sector, bytes,
++				     lower_32_bits(what), error, cgid, cgid_len,
++				     pdu_data, pdu_len);
++}
++
+ /*
+  * Send out a notify message.
+  */
+-- 
+2.43.0
+
