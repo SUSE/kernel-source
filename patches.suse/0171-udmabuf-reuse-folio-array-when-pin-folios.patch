@@ -1,0 +1,165 @@
+From c87a1268e9c589cd346e820298e5ef35f884aea0 Mon Sep 17 00:00:00 2001
+From: Huan Yang <link@vivo.com>
+Date: Wed, 18 Sep 2024 10:52:30 +0800
+Subject: udmabuf: reuse folio array when pin folios
+Git-commit: c87a1268e9c589cd346e820298e5ef35f884aea0
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+When invoke memfd_pin_folios, we need offer an array to save each folio
+which we pinned.
+
+The current way is dynamic alloc an array(use kvmalloc), get folios,
+save into udmabuf and then free.
+
+Depend on the size, kvmalloc can do something different:
+
+Below PAGE_SIZE, slab allocator will be used, which have good alloc
+performance, due to it cached page.
+
+PAGE_SIZE - PCP Order, PCP(per-cpu-pageset) also given buddy page a
+cache in each CPU, so different CPU no need to hold some lock(zone or
+some) to get the locally page. If PCP cached page, the access also fast.
+
+PAGE_SIZE - BUDDY_MAX, try to get page from buddy, due to kvmalloc adjusted
+the gfp flags, if zone freelist can't alloc page(fast path), we will not
+enter slowpath to reclaim memory. Due to need hold lock and check, may
+slow, but still fast than vmalloc.
+
+Anything wrong will fallback into vmalloc to alloc memory, it obtains
+contiguous virtual addresses by loop alloc order 0 page(PAGE_SIZE), and
+then map it into vmalloc area. If necessary, page alloc may enter
+slowpath to reclaim memory. Hence, if fallback into vmalloc, it's slow.
+
+When create, we need to iter each udmabuf item, then pin it's range
+folios, if each item's range folio's count is large, we may fallback each
+into vmalloc.
+
+This patch find the largest range folio in items, then alloc this size's
+folio array. When pin range folios, reuse this array.
+
+Signed-off-by: Huan Yang <link@vivo.com>
+Acked-by: Vivek Kasireddy <vivek.kasireddy@intel.com>
+Signed-off-by: Vivek Kasireddy <vivek.kasireddy@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20240918025238.2957823-8-link@vivo.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/dma-buf/udmabuf.c | 36 +++++++++++++++++++++---------------
+ 1 file changed, 21 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/dma-buf/udmabuf.c b/drivers/dma-buf/udmabuf.c
+index 24badfefa6b4..8ce1f074c2d3 100644
+--- a/drivers/dma-buf/udmabuf.c
++++ b/drivers/dma-buf/udmabuf.c
+@@ -338,28 +338,20 @@ static int export_udmabuf(struct udmabuf *ubuf,
+ }
+ 
+ static long udmabuf_pin_folios(struct udmabuf *ubuf, struct file *memfd,
+-			       loff_t start, loff_t size)
++			       loff_t start, loff_t size, struct folio **folios)
+ {
+ 	pgoff_t nr_pinned = ubuf->nr_pinned;
+ 	pgoff_t upgcnt = ubuf->pagecount;
+-	struct folio **folios = NULL;
+ 	u32 cur_folio, cur_pgcnt;
+ 	pgoff_t pgoff, pgcnt;
+ 	long nr_folios;
+-	long ret = 0;
+ 	loff_t end;
+ 
+ 	pgcnt = size >> PAGE_SHIFT;
+-	folios = kvmalloc_array(pgcnt, sizeof(*folios), GFP_KERNEL);
+-	if (!folios)
+-		return -ENOMEM;
+-
+ 	end = start + (pgcnt << PAGE_SHIFT) - 1;
+ 	nr_folios = memfd_pin_folios(memfd, start, end, folios, pgcnt, &pgoff);
+-	if (nr_folios <= 0) {
+-		ret = nr_folios ? nr_folios : -EINVAL;
+-		goto end;
+-	}
++	if (nr_folios <= 0)
++		return nr_folios ? nr_folios : -EINVAL;
+ 
+ 	cur_pgcnt = 0;
+ 	for (cur_folio = 0; cur_folio < nr_folios; ++cur_folio) {
+@@ -388,14 +380,15 @@ static long udmabuf_pin_folios(struct udmabuf *ubuf, struct file *memfd,
+ end:
+ 	ubuf->pagecount = upgcnt;
+ 	ubuf->nr_pinned = nr_pinned;
+-	kvfree(folios);
+-	return ret;
++	return 0;
+ }
+ 
+ static long udmabuf_create(struct miscdevice *device,
+ 			   struct udmabuf_create_list *head,
+ 			   struct udmabuf_create_item *list)
+ {
++	unsigned long max_nr_folios = 0;
++	struct folio **folios = NULL;
+ 	pgoff_t pgcnt = 0, pglimit;
+ 	struct udmabuf *ubuf;
+ 	long ret = -EINVAL;
+@@ -407,14 +400,19 @@ static long udmabuf_create(struct miscdevice *device,
+ 
+ 	pglimit = (size_limit_mb * 1024 * 1024) >> PAGE_SHIFT;
+ 	for (i = 0; i < head->count; i++) {
++		pgoff_t subpgcnt;
++
+ 		if (!PAGE_ALIGNED(list[i].offset))
+ 			goto err_noinit;
+ 		if (!PAGE_ALIGNED(list[i].size))
+ 			goto err_noinit;
+ 
+-		pgcnt += list[i].size >> PAGE_SHIFT;
++		subpgcnt = list[i].size >> PAGE_SHIFT;
++		pgcnt += subpgcnt;
+ 		if (pgcnt > pglimit)
+ 			goto err_noinit;
++
++		max_nr_folios = max_t(unsigned long, subpgcnt, max_nr_folios);
+ 	}
+ 
+ 	if (!pgcnt)
+@@ -424,6 +422,12 @@ static long udmabuf_create(struct miscdevice *device,
+ 	if (ret)
+ 		goto err;
+ 
++	folios = kvmalloc_array(max_nr_folios, sizeof(*folios), GFP_KERNEL);
++	if (!folios) {
++		ret = -ENOMEM;
++		goto err;
++	}
++
+ 	for (i = 0; i < head->count; i++) {
+ 		struct file *memfd = fget(list[i].memfd);
+ 
+@@ -439,7 +443,7 @@ static long udmabuf_create(struct miscdevice *device,
+ 		}
+ 
+ 		ret = udmabuf_pin_folios(ubuf, memfd, list[i].offset,
+-					 list[i].size);
++					 list[i].size, folios);
+ 		fput(memfd);
+ 		if (ret)
+ 			goto err;
+@@ -450,12 +454,14 @@ static long udmabuf_create(struct miscdevice *device,
+ 	if (ret < 0)
+ 		goto err;
+ 
++	kvfree(folios);
+ 	return ret;
+ 
+ err:
+ 	deinit_udmabuf(ubuf);
+ err_noinit:
+ 	kfree(ubuf);
++	kvfree(folios);
+ 	return ret;
+ }
+ 
+-- 
+2.52.0
+
