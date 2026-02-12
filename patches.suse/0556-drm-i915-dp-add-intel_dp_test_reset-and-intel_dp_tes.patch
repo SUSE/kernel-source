@@ -1,0 +1,166 @@
+From b0e9af07cbfeee89dc4df21bb68c0c741d3b511a Mon Sep 17 00:00:00 2001
+From: Jani Nikula <jani.nikula@intel.com>
+Date: Fri, 20 Sep 2024 14:56:51 +0300
+Subject: drm/i915/dp: add intel_dp_test_reset() and
+ intel_dp_test_short_pulse()
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: b0e9af07cbfeee89dc4df21bb68c0c741d3b511a
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Abstract more DP test stuff. Now the only place touching
+intel_dp->compliance is intel_dp_test.c.
+
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/ea2ad218bdba21be30bd15a3707663508518dfa5.1726833193.git.jani.nikula@intel.com
+Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/intel_dp.c      | 27 ++------------
+ drivers/gpu/drm/i915/display/intel_dp_test.c | 37 ++++++++++++++++++++
+ drivers/gpu/drm/i915/display/intel_dp_test.h |  2 ++
+ 3 files changed, 42 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_dp.c b/drivers/gpu/drm/i915/display/intel_dp.c
+index 38aeb337ef53..16dc1d26d2a2 100644
+--- a/drivers/gpu/drm/i915/display/intel_dp.c
++++ b/drivers/gpu/drm/i915/display/intel_dp.c
+@@ -5161,16 +5161,11 @@ static bool intel_dp_check_link_service_irq(struct intel_dp *intel_dp)
+ static bool
+ intel_dp_short_pulse(struct intel_dp *intel_dp)
+ {
+-	struct drm_i915_private *dev_priv = dp_to_i915(intel_dp);
+ 	u8 old_sink_count = intel_dp->sink_count;
+ 	bool reprobe_needed = false;
+ 	bool ret;
+ 
+-	/*
+-	 * Clearing compliance test variables to allow capturing
+-	 * of values for next automated test request.
+-	 */
+-	memset(&intel_dp->compliance, 0, sizeof(intel_dp->compliance));
++	intel_dp_test_reset(intel_dp);
+ 
+ 	/*
+ 	 * Now read the DPCD to see if it's actually running
+@@ -5195,24 +5190,8 @@ intel_dp_short_pulse(struct intel_dp *intel_dp)
+ 
+ 	intel_psr_short_pulse(intel_dp);
+ 
+-	switch (intel_dp->compliance.test_type) {
+-	case DP_TEST_LINK_TRAINING:
+-		drm_dbg_kms(&dev_priv->drm,
+-			    "Link Training Compliance Test requested\n");
+-		/* Send a Hotplug Uevent to userspace to start modeset */
+-		drm_kms_helper_hotplug_event(&dev_priv->drm);
+-		break;
+-	case DP_TEST_LINK_PHY_TEST_PATTERN:
+-		drm_dbg_kms(&dev_priv->drm,
+-			    "PHY test pattern Compliance Test requested\n");
+-		/*
+-		 * Schedule long hpd to do the test
+-		 *
+-		 * FIXME get rid of the ad-hoc phy test modeset code
+-		 * and properly incorporate it into the normal modeset.
+-		 */
++	if (intel_dp_test_short_pulse(intel_dp))
+ 		reprobe_needed = true;
+-	}
+ 
+ 	return !reprobe_needed;
+ }
+@@ -5569,7 +5548,7 @@ intel_dp_detect(struct drm_connector *connector,
+ 		status = connector_status_disconnected;
+ 
+ 	if (status == connector_status_disconnected) {
+-		memset(&intel_dp->compliance, 0, sizeof(intel_dp->compliance));
++		intel_dp_test_reset(intel_dp);
+ 		memset(intel_connector->dp.dsc_dpcd, 0, sizeof(intel_connector->dp.dsc_dpcd));
+ 		intel_dp->psr.sink_panel_replay_support = false;
+ 		intel_dp->psr.sink_panel_replay_su_support = false;
+diff --git a/drivers/gpu/drm/i915/display/intel_dp_test.c b/drivers/gpu/drm/i915/display/intel_dp_test.c
+index 8426c8ef947e..e05819300d77 100644
+--- a/drivers/gpu/drm/i915/display/intel_dp_test.c
++++ b/drivers/gpu/drm/i915/display/intel_dp_test.c
+@@ -6,6 +6,7 @@
+ #include <drm/display/drm_dp.h>
+ #include <drm/display/drm_dp_helper.h>
+ #include <drm/drm_edid.h>
++#include <drm/drm_probe_helper.h>
+ 
+ #include "i915_drv.h"
+ #include "i915_reg.h"
+@@ -17,6 +18,15 @@
+ #include "intel_dp_mst.h"
+ #include "intel_dp_test.h"
+ 
++void intel_dp_test_reset(struct intel_dp *intel_dp)
++{
++	/*
++	 * Clearing compliance test variables to allow capturing
++	 * of values for next automated test request.
++	 */
++	memset(&intel_dp->compliance, 0, sizeof(intel_dp->compliance));
++}
++
+ /* Adjust link config limits based on compliance test requests. */
+ void intel_dp_test_compute_config(struct intel_dp *intel_dp,
+ 				  struct intel_crtc_state *pipe_config,
+@@ -510,6 +520,33 @@ bool intel_dp_test_phy(struct intel_dp *intel_dp)
+ 	return true;
+ }
+ 
++bool intel_dp_test_short_pulse(struct intel_dp *intel_dp)
++{
++	struct intel_display *display = to_intel_display(intel_dp);
++	bool reprobe_needed = false;
++
++	switch (intel_dp->compliance.test_type) {
++	case DP_TEST_LINK_TRAINING:
++		drm_dbg_kms(display->drm,
++			    "Link Training Compliance Test requested\n");
++		/* Send a Hotplug Uevent to userspace to start modeset */
++		drm_kms_helper_hotplug_event(display->drm);
++		break;
++	case DP_TEST_LINK_PHY_TEST_PATTERN:
++		drm_dbg_kms(display->drm,
++			    "PHY test pattern Compliance Test requested\n");
++		/*
++		 * Schedule long hpd to do the test
++		 *
++		 * FIXME get rid of the ad-hoc phy test modeset code
++		 * and properly incorporate it into the normal modeset.
++		 */
++		reprobe_needed = true;
++	}
++
++	return reprobe_needed;
++}
++
+ static ssize_t i915_displayport_test_active_write(struct file *file,
+ 						  const char __user *ubuf,
+ 						  size_t len, loff_t *offp)
+diff --git a/drivers/gpu/drm/i915/display/intel_dp_test.h b/drivers/gpu/drm/i915/display/intel_dp_test.h
+index d64158b5a468..dcc167e4c7f6 100644
+--- a/drivers/gpu/drm/i915/display/intel_dp_test.h
++++ b/drivers/gpu/drm/i915/display/intel_dp_test.h
+@@ -11,11 +11,13 @@ struct intel_display;
+ struct intel_dp;
+ struct link_config_limits;
+ 
++void intel_dp_test_reset(struct intel_dp *intel_dp);
+ void intel_dp_test_request(struct intel_dp *intel_dp);
+ void intel_dp_test_compute_config(struct intel_dp *intel_dp,
+ 				  struct intel_crtc_state *pipe_config,
+ 				  struct link_config_limits *limits);
+ bool intel_dp_test_phy(struct intel_dp *intel_dp);
++bool intel_dp_test_short_pulse(struct intel_dp *intel_dp);
+ void intel_dp_test_debugfs_register(struct intel_display *display);
+ 
+ #endif /* __INTEL_DP_TEST_H__ */
+-- 
+2.52.0
+
