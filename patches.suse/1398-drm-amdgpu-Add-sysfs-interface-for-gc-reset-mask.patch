@@ -1,0 +1,348 @@
+From 6c8d1f4b042e706ccd7575beb0397a75d545d71b Mon Sep 17 00:00:00 2001
+From: "Jesse.zhang@amd.com" <Jesse.zhang@amd.com>
+Date: Tue, 5 Nov 2024 15:22:56 +0800
+Subject: drm/amdgpu: Add sysfs interface for gc reset mask
+Git-commit: 6c8d1f4b042e706ccd7575beb0397a75d545d71b
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Add two sysfs interfaces for gfx and compute:
+gfx_reset_mask
+compute_reset_mask
+
+These interfaces are read-only and show the resets supported by the IP.
+For example, full adapter reset (mode1/mode2/BACO/etc),
+soft reset, queue reset, and pipe reset.
+
+V2: the sysfs node returns a text string instead of some flags (Christian)
+V3: add a generic helper which takes the ring as parameter
+    and print the strings in the order they are applied (Christian)
+
+    check amdgpu_gpu_recovery  before creating sysfs file itself,
+    and initialize supported_reset_types in IP version files (Lijo)
+V4: Fixing uninitialized variables (Tim)
+
+Signed-off-by: Jesse Zhang <Jesse.Zhang@amd.com>
+Suggested-by: Alex Deucher <alexander.deucher@amd.com>
+Reviewed-by: Tim Huang <tim.huang@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h        |  8 +++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c | 44 ++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c    | 70 ++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.h    |  2 +
+ drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c     |  5 ++
+ drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c     | 18 ++++++
+ drivers/gpu/drm/amd/amdgpu/gfx_v12_0.c     |  6 ++
+ drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c      |  6 ++
+ drivers/gpu/drm/amd/amdgpu/gfx_v9_4_3.c    | 13 ++++
+ 9 files changed, 172 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 7645e498faa4..d8bc6da50016 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -299,6 +299,12 @@ extern int amdgpu_wbrf;
+ #define AMDGPU_RESET_VCE			(1 << 13)
+ #define AMDGPU_RESET_VCE1			(1 << 14)
+ 
++/* reset mask */
++#define AMDGPU_RESET_TYPE_FULL (1 << 0) /* full adapter reset, mode1/mode2/BACO/etc. */
++#define AMDGPU_RESET_TYPE_SOFT_RESET (1 << 1) /* IP level soft reset */
++#define AMDGPU_RESET_TYPE_PER_QUEUE (1 << 2) /* per queue */
++#define AMDGPU_RESET_TYPE_PER_PIPE (1 << 3) /* per pipe */
++
+ /* max cursor sizes (in pixels) */
+ #define CIK_CURSOR_WIDTH 128
+ #define CIK_CURSOR_HEIGHT 128
+@@ -1464,6 +1470,8 @@ struct dma_fence *amdgpu_device_get_gang(struct amdgpu_device *adev);
+ struct dma_fence *amdgpu_device_switch_gang(struct amdgpu_device *adev,
+ 					    struct dma_fence *gang);
+ bool amdgpu_device_has_display_hardware(struct amdgpu_device *adev);
++ssize_t amdgpu_get_soft_full_reset_mask(struct amdgpu_ring *ring);
++ssize_t amdgpu_show_reset_mask(char *buf, uint32_t supported_reset);
+ 
+ /* atpx handler */
+ #if defined(CONFIG_VGA_SWITCHEROO)
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 0450eab6ade7..38a17571da75 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -6715,3 +6715,47 @@ uint32_t amdgpu_device_wait_on_rreg(struct amdgpu_device *adev,
+ 	}
+ 	return ret;
+ }
++
++ssize_t amdgpu_get_soft_full_reset_mask(struct amdgpu_ring *ring)
++{
++	ssize_t size = 0;
++
++	if (!ring || !ring->adev)
++		return size;
++
++	if (amdgpu_device_should_recover_gpu(ring->adev))
++		size |= AMDGPU_RESET_TYPE_FULL;
++
++	if (unlikely(!ring->adev->debug_disable_soft_recovery) &&
++	    !amdgpu_sriov_vf(ring->adev) && ring->funcs->soft_recovery)
++		size |= AMDGPU_RESET_TYPE_SOFT_RESET;
++
++	return size;
++}
++
++ssize_t amdgpu_show_reset_mask(char *buf, uint32_t supported_reset)
++{
++	ssize_t size = 0;
++
++	if (supported_reset == 0) {
++		size += sysfs_emit_at(buf, size, "unsupported");
++		size += sysfs_emit_at(buf, size, "\n");
++		return size;
++
++	}
++
++	if (supported_reset & AMDGPU_RESET_TYPE_SOFT_RESET)
++		size += sysfs_emit_at(buf, size, "soft ");
++
++	if (supported_reset & AMDGPU_RESET_TYPE_PER_QUEUE)
++		size += sysfs_emit_at(buf, size, "queue ");
++
++	if (supported_reset & AMDGPU_RESET_TYPE_PER_PIPE)
++		size += sysfs_emit_at(buf, size, "pipe ");
++
++	if (supported_reset & AMDGPU_RESET_TYPE_FULL)
++		size += sysfs_emit_at(buf, size, "full ");
++
++	size += sysfs_emit_at(buf, size, "\n");
++	return size;
++}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
+index 2f3f09dfb1fd..6cc6484bde06 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
+@@ -1588,6 +1588,32 @@ static ssize_t amdgpu_gfx_set_enforce_isolation(struct device *dev,
+ 	return count;
+ }
+ 
++static ssize_t amdgpu_gfx_get_gfx_reset_mask(struct device *dev,
++						struct device_attribute *attr,
++						char *buf)
++{
++	struct drm_device *ddev = dev_get_drvdata(dev);
++	struct amdgpu_device *adev = drm_to_adev(ddev);
++
++	if (!adev)
++		return -ENODEV;
++
++	return amdgpu_show_reset_mask(buf, adev->gfx.gfx_supported_reset);
++}
++
++static ssize_t amdgpu_gfx_get_compute_reset_mask(struct device *dev,
++						struct device_attribute *attr,
++						char *buf)
++{
++	struct drm_device *ddev = dev_get_drvdata(dev);
++	struct amdgpu_device *adev = drm_to_adev(ddev);
++
++	if (!adev)
++		return -ENODEV;
++
++	return amdgpu_show_reset_mask(buf, adev->gfx.compute_supported_reset);
++}
++
+ static DEVICE_ATTR(run_cleaner_shader, 0200,
+ 		   NULL, amdgpu_gfx_set_run_cleaner_shader);
+ 
+@@ -1601,6 +1627,11 @@ static DEVICE_ATTR(current_compute_partition, 0644,
+ 
+ static DEVICE_ATTR(available_compute_partition, 0444,
+ 		   amdgpu_gfx_get_available_compute_partition, NULL);
++static DEVICE_ATTR(gfx_reset_mask, 0444,
++		   amdgpu_gfx_get_gfx_reset_mask, NULL);
++
++static DEVICE_ATTR(compute_reset_mask, 0444,
++		   amdgpu_gfx_get_compute_reset_mask, NULL);
+ 
+ static int amdgpu_gfx_sysfs_xcp_init(struct amdgpu_device *adev)
+ {
+@@ -1666,6 +1697,40 @@ static void amdgpu_gfx_sysfs_isolation_shader_fini(struct amdgpu_device *adev)
+ 		device_remove_file(adev->dev, &dev_attr_run_cleaner_shader);
+ }
+ 
++static int amdgpu_gfx_sysfs_reset_mask_init(struct amdgpu_device *adev)
++{
++	int r = 0;
++
++	if (!amdgpu_gpu_recovery)
++		return r;
++
++	if (adev->gfx.num_gfx_rings) {
++		r = device_create_file(adev->dev, &dev_attr_gfx_reset_mask);
++		if (r)
++			return r;
++	}
++
++	if (adev->gfx.num_compute_rings) {
++		r = device_create_file(adev->dev, &dev_attr_compute_reset_mask);
++		if (r)
++			return r;
++	}
++
++	return r;
++}
++
++static void amdgpu_gfx_sysfs_reset_mask_fini(struct amdgpu_device *adev)
++{
++	if (!amdgpu_gpu_recovery)
++		return;
++
++	if (adev->gfx.num_gfx_rings)
++		device_remove_file(adev->dev, &dev_attr_gfx_reset_mask);
++
++	if (adev->gfx.num_compute_rings)
++		device_remove_file(adev->dev, &dev_attr_compute_reset_mask);
++}
++
+ int amdgpu_gfx_sysfs_init(struct amdgpu_device *adev)
+ {
+ 	int r;
+@@ -1680,6 +1745,10 @@ int amdgpu_gfx_sysfs_init(struct amdgpu_device *adev)
+ 	if (r)
+ 		dev_err(adev->dev, "failed to create isolation sysfs files");
+ 
++	r = amdgpu_gfx_sysfs_reset_mask_init(adev);
++	if (r)
++		dev_err(adev->dev, "failed to create reset mask sysfs files");
++
+ 	return r;
+ }
+ 
+@@ -1687,6 +1756,7 @@ void amdgpu_gfx_sysfs_fini(struct amdgpu_device *adev)
+ {
+ 	amdgpu_gfx_sysfs_xcp_fini(adev);
+ 	amdgpu_gfx_sysfs_isolation_shader_fini(adev);
++	amdgpu_gfx_sysfs_reset_mask_fini(adev);
+ }
+ 
+ int amdgpu_gfx_cleaner_shader_sw_init(struct amdgpu_device *adev,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.h
+index fd73e527f446..8b5bd63b5773 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.h
+@@ -424,6 +424,8 @@ struct amdgpu_gfx {
+ 	/* reset mask */
+ 	uint32_t                        grbm_soft_reset;
+ 	uint32_t                        srbm_soft_reset;
++	uint32_t 			gfx_supported_reset;
++	uint32_t 			compute_supported_reset;
+ 
+ 	/* gfx off */
+ 	bool                            gfx_off_state;      /* true: enabled, false: disabled */
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c
+index d1a18ca584dd..24dce803a829 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c
+@@ -4825,6 +4825,11 @@ static int gfx_v10_0_sw_init(struct amdgpu_ip_block *ip_block)
+ 			}
+ 		}
+ 	}
++	/* TODO: Add queue reset mask when FW fully supports it */
++	adev->gfx.gfx_supported_reset =
++		amdgpu_get_soft_full_reset_mask(&adev->gfx.gfx_ring[0]);
++	adev->gfx.compute_supported_reset =
++		amdgpu_get_soft_full_reset_mask(&adev->gfx.compute_ring[0]);
+ 
+ 	r = amdgpu_gfx_kiq_init(adev, GFX10_MEC_HPD_SIZE, 0);
+ 	if (r) {
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c
+index 62e4c446793d..28fe8d23c91f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c
+@@ -1691,6 +1691,24 @@ static int gfx_v11_0_sw_init(struct amdgpu_ip_block *ip_block)
+ 		}
+ 	}
+ 
++	adev->gfx.gfx_supported_reset =
++		amdgpu_get_soft_full_reset_mask(&adev->gfx.gfx_ring[0]);
++	adev->gfx.compute_supported_reset =
++		amdgpu_get_soft_full_reset_mask(&adev->gfx.compute_ring[0]);
++	switch (amdgpu_ip_version(adev, GC_HWIP, 0)) {
++	case IP_VERSION(11, 0, 0):
++	case IP_VERSION(11, 0, 2):
++	case IP_VERSION(11, 0, 3):
++		if ((adev->gfx.me_fw_version >= 2280) &&
++			    (adev->gfx.mec_fw_version >= 2410)) {
++				adev->gfx.compute_supported_reset |= AMDGPU_RESET_TYPE_PER_QUEUE;
++				adev->gfx.gfx_supported_reset |= AMDGPU_RESET_TYPE_PER_QUEUE;
++		}
++		break;
++	default:
++		break;
++	}
++
+ 	if (!adev->enable_mes_kiq) {
+ 		r = amdgpu_gfx_kiq_init(adev, GFX11_MEC_HPD_SIZE, 0);
+ 		if (r) {
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v12_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v12_0.c
+index 1b99f90cd193..fe7c48f2fb2a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v12_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v12_0.c
+@@ -1437,6 +1437,12 @@ static int gfx_v12_0_sw_init(struct amdgpu_ip_block *ip_block)
+ 		}
+ 	}
+ 
++	/* TODO: Add queue reset mask when FW fully supports it */
++	adev->gfx.gfx_supported_reset =
++		amdgpu_get_soft_full_reset_mask(&adev->gfx.gfx_ring[0]);
++	adev->gfx.compute_supported_reset =
++		amdgpu_get_soft_full_reset_mask(&adev->gfx.compute_ring[0]);
++
+ 	if (!adev->enable_mes_kiq) {
+ 		r = amdgpu_gfx_kiq_init(adev, GFX12_MEC_HPD_SIZE, 0);
+ 		if (r) {
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
+index a880dce16ae2..0b6f09f2cc9b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
+@@ -2374,6 +2374,12 @@ static int gfx_v9_0_sw_init(struct amdgpu_ip_block *ip_block)
+ 		}
+ 	}
+ 
++	/* TODO: Add queue reset mask when FW fully supports it */
++	adev->gfx.gfx_supported_reset =
++		amdgpu_get_soft_full_reset_mask(&adev->gfx.gfx_ring[0]);
++	adev->gfx.compute_supported_reset =
++		amdgpu_get_soft_full_reset_mask(&adev->gfx.compute_ring[0]);
++
+ 	r = amdgpu_gfx_kiq_init(adev, GFX9_MEC_HPD_SIZE, 0);
+ 	if (r) {
+ 		DRM_ERROR("Failed to init KIQ BOs!\n");
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v9_4_3.c b/drivers/gpu/drm/amd/amdgpu/gfx_v9_4_3.c
+index 983088805c3a..e2b3dda57030 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v9_4_3.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v9_4_3.c
+@@ -1157,6 +1157,19 @@ static int gfx_v9_4_3_sw_init(struct amdgpu_ip_block *ip_block)
+ 			return r;
+ 	}
+ 
++	adev->gfx.compute_supported_reset =
++		amdgpu_get_soft_full_reset_mask(&adev->gfx.compute_ring[0]);
++	switch (amdgpu_ip_version(adev, GC_HWIP, 0)) {
++	case IP_VERSION(9, 4, 3):
++	case IP_VERSION(9, 4, 4):
++		if (adev->gfx.mec_fw_version >= 155) {
++			adev->gfx.compute_supported_reset |= AMDGPU_RESET_TYPE_PER_QUEUE;
++			adev->gfx.compute_supported_reset |= AMDGPU_RESET_TYPE_PER_PIPE;
++		}
++		break;
++	default:
++		break;
++	}
+ 	r = gfx_v9_4_3_gpu_early_init(adev);
+ 	if (r)
+ 		return r;
+-- 
+2.52.0
+
