@@ -1,0 +1,94 @@
+From: Chaitanya Kulkarni <ckulkarnilinux@gmail.com>
+Date: Mon, 27 Oct 2025 19:46:19 -0700
+Subject: [PATCH] blktrace: use debug print to report dropped events
+Git-commit: 4a0940bdcac260be1e3460e99464fa63d317c6a2
+Patch-mainline: v6.19-rc1
+References: jsc#PED-14161
+
+The WARN_ON_ONCE introduced in
+commit f9ee38bbf70f ("blktrace: add block trace commands for zone operations")
+triggers kernel warnings when zone operations are traced with blktrace
+version 1. This can spam the kernel log during normal operation with
+zoned block devices when userspace is using the legacy blktrace
+protocol.
+
+Currently blktrace implementation drops newly added REQ_OP_ZONE_XXX
+when blktrace userspce version is set to 1.
+
+Remove the WARN_ON_ONCE and quietly filter these events. Add a
+rate-limited debug message to help diagnose potential issues without
+flooding the kernel log. The debug message can be enabled via dynamic
+debug when needed for troubleshooting.
+
+This approach is more appropriate as encountering zone operations with
+blktrace v1 is an expected condition that should be handled gracefully
+rather than warned about, since users may be running older blktrace
+userspace tools that only support version 1 of the protocol.
+
+With this patch :-
+linux-block (for-next) # git log -1
+commit c8966006a0971d2b4bf94c0426eb7e4407c6853f (HEAD -> for-next)
+Author: Chaitanya Kulkarni <ckulkarnilinux@gmail.com>
+Date:   Mon Oct 27 19:26:53 2025 -0700
+
+    blktrace: use debug print to report dropped events
+linux-block (for-next) # cdblktests
+blktests (master) # ./check blktrace
+blktrace/001 (blktrace zone management command tracing)      [passed]
+    runtime  3.805s  ...  3.889s
+blktests (master) # dmesg  -c
+blktests (master) #  echo "file kernel/trace/blktrace.c +p" > /sys/kernel/debug/dynamic_debug/control
+blktests (master) # ./check blktrace
+blktrace/001 (blktrace zone management command tracing)      [passed]
+    runtime  3.889s  ...  3.881s
+blktests (master) # dmesg  -c
+[   77.826237] blktrace: blktrace v1 cannot trace zone operation 0x1000190001
+[   77.826260] blktrace: blktrace v1 cannot trace zone operation 0x1000190004
+[   77.826282] blktrace: blktrace v1 cannot trace zone operation 0x1001490007
+[   77.826288] blktrace: blktrace v1 cannot trace zone operation 0x1001890008
+[   77.826343] blktrace: blktrace v1 cannot trace zone operation 0x1000190001
+[   77.826347] blktrace: blktrace v1 cannot trace zone operation 0x1000190004
+[   77.826350] blktrace: blktrace v1 cannot trace zone operation 0x1001490007
+[   77.826354] blktrace: blktrace v1 cannot trace zone operation 0x1001890008
+[   77.826373] blktrace: blktrace v1 cannot trace zone operation 0x1000190001
+[   77.826377] blktrace: blktrace v1 cannot trace zone operation 0x1000190004
+blktests (master) #  echo "file kernel/trace/blktrace.c -p" > /sys/kernel/debug/dynamic_debug/control
+blktests (master) # ./check blktrace
+blktrace/001 (blktrace zone management command tracing)      [passed]
+    runtime  3.881s  ...  3.824s
+blktests (master) # dmesg  -c
+blktests (master) #
+
+Reported-by: syzbot+153e64c0aa875d7e4c37@syzkaller.appspotmail.com
+Fixes: f9ee38bbf70f ("blktrace: add block trace commands for zone operations")
+Signed-off-by: Chaitanya Kulkarni <ckulkarnilinux@gmail.com>
+Reviewed-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+Reviewed-by: Damien Le Moal <dlemoal@kernel.org>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ kernel/trace/blktrace.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/kernel/trace/blktrace.c b/kernel/trace/blktrace.c
+index 6ad3807a5b73..776ae4190f36 100644
+--- a/kernel/trace/blktrace.c
++++ b/kernel/trace/blktrace.c
+@@ -364,9 +364,12 @@ static void __blk_add_trace(struct blk_trace *bt, sector_t sector, int bytes,
+ 		break;
+ 	}
+ 
+-	if (WARN_ON_ONCE(bt->version == 1 &&
+-		     (what >> BLK_TC_SHIFT) > BLK_TC_END_V1))
++	/* Drop trace events for zone operations with blktrace v1 */
++	if (bt->version == 1 && (what >> BLK_TC_SHIFT) > BLK_TC_END_V1) {
++		pr_debug_ratelimited("blktrace v1 cannot trace zone operation 0x%llx\n",
++				(unsigned long long)what);
+ 		return;
++	}
+ 
+ 	if (cgid)
+ 		what |= __BLK_TA_CGROUP;
+-- 
+2.43.0
+
