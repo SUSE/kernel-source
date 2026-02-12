@@ -1,0 +1,190 @@
+From 8cb028a1bbd960a1ff71b7300e557be9269f98fd Mon Sep 17 00:00:00 2001
+From: Austin Zheng <Austin.Zheng@amd.com>
+Date: Mon, 16 Sep 2024 13:09:19 -0400
+Subject: drm/amd/display: Unify blank_phantom and blank_pixel_data
+Git-commit: 8cb028a1bbd960a1ff71b7300e557be9269f98fd
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+[Why]
+dcn32_blank_phantom() does not consider the subVP+ODM case when blanking.
+Only one of the pipes will get blanked. Remaining pipes are not blanked.
+Will cause underflow in the phantom pipe when enabling the CRTC.
+
+[How]
+Use blank_pixel_data() instead of blank_phantom().
+remove dcn32_blank_phantom() since logic is identical.
+Different DPG dimensions get programmed when blanking phantom pipes.
+Previously had phantom pipes use DPG dimensions of the main stream.
+Now use DPG dimensions of the phantom streams
+
+Reviewed-by: Alvin Lee <alvin.lee2@amd.com>
+Signed-off-by: Austin Zheng <Austin.Zheng@amd.com>
+Signed-off-by: Rodrigo Siqueira <rodrigo.siqueira@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c      | 12 +----
+ .../amd/display/dc/hwss/dcn20/dcn20_hwseq.c   | 15 ++----
+ .../amd/display/dc/hwss/dcn32/dcn32_hwseq.c   | 46 -------------------
+ .../amd/display/dc/hwss/dcn32/dcn32_hwseq.h   |  5 --
+ .../amd/display/dc/hwss/dcn32/dcn32_init.c    |  1 -
+ .../amd/display/dc/hwss/dcn401/dcn401_init.c  |  1 -
+ 6 files changed, 6 insertions(+), 74 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index 9631ca22dd3d..2ddde2541c29 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -1235,16 +1235,8 @@ static void disable_dangling_plane(struct dc *dc, struct dc_state *context)
+ 			 */
+ 			if (is_phantom) {
+ 				if (tg->funcs->enable_crtc) {
+-					int main_pipe_width = 0, main_pipe_height = 0;
+-					struct dc_stream_state *old_paired_stream = dc_state_get_paired_subvp_stream(dc->current_state, old_stream);
+-
+-					if (old_paired_stream) {
+-						main_pipe_width = old_paired_stream->dst.width;
+-						main_pipe_height = old_paired_stream->dst.height;
+-					}
+-
+-					if (dc->hwss.blank_phantom)
+-						dc->hwss.blank_phantom(dc, tg, main_pipe_width, main_pipe_height);
++					if (dc->hwseq->funcs.blank_pixel_data)
++						dc->hwseq->funcs.blank_pixel_data(dc, pipe, true);
+ 					tg->funcs->enable_crtc(tg);
+ 				}
+ 			}
+diff --git a/drivers/gpu/drm/amd/display/dc/hwss/dcn20/dcn20_hwseq.c b/drivers/gpu/drm/amd/display/dc/hwss/dcn20/dcn20_hwseq.c
+index e89499536c46..1a32e53c1b22 100644
+--- a/drivers/gpu/drm/amd/display/dc/hwss/dcn20/dcn20_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/hwss/dcn20/dcn20_hwseq.c
+@@ -2054,22 +2054,15 @@ void dcn20_program_front_end_for_ctx(
+ 	 */
+ 	for (i = 0; i < dc->res_pool->pipe_count; i++) {
+ 		struct dc_stream_state *stream = dc->current_state->res_ctx.pipe_ctx[i].stream;
++		pipe = &dc->current_state->res_ctx.pipe_ctx[i];
+ 
+ 		if (context->res_ctx.pipe_ctx[i].update_flags.bits.disable && stream &&
+-				dc_state_get_pipe_subvp_type(dc->current_state, &dc->current_state->res_ctx.pipe_ctx[i]) == SUBVP_PHANTOM) {
++				dc_state_get_pipe_subvp_type(dc->current_state, pipe) == SUBVP_PHANTOM) {
+ 			struct timing_generator *tg = dc->current_state->res_ctx.pipe_ctx[i].stream_res.tg;
+ 
+ 			if (tg->funcs->enable_crtc) {
+-				if (dc->hwss.blank_phantom) {
+-					int main_pipe_width = 0, main_pipe_height = 0;
+-					struct dc_stream_state *phantom_stream = dc_state_get_paired_subvp_stream(dc->current_state, dc->current_state->res_ctx.pipe_ctx[i].stream);
+-
+-					if (phantom_stream) {
+-						main_pipe_width = phantom_stream->dst.width;
+-						main_pipe_height = phantom_stream->dst.height;
+-					}
+-
+-					dc->hwss.blank_phantom(dc, tg, main_pipe_width, main_pipe_height);
++				if (dc->hwseq->funcs.blank_pixel_data) {
++					dc->hwseq->funcs.blank_pixel_data(dc, pipe, true);
+ 				}
+ 				tg->funcs->enable_crtc(tg);
+ 			}
+diff --git a/drivers/gpu/drm/amd/display/dc/hwss/dcn32/dcn32_hwseq.c b/drivers/gpu/drm/amd/display/dc/hwss/dcn32/dcn32_hwseq.c
+index a985d191f500..119c6d08200f 100644
+--- a/drivers/gpu/drm/amd/display/dc/hwss/dcn32/dcn32_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/hwss/dcn32/dcn32_hwseq.c
+@@ -1698,52 +1698,6 @@ void dcn32_init_blank(
+ 		hws->funcs.wait_for_blank_complete(opp);
+ }
+ 
+-void dcn32_blank_phantom(struct dc *dc,
+-		struct timing_generator *tg,
+-		int width,
+-		int height)
+-{
+-	struct dce_hwseq *hws = dc->hwseq;
+-	enum dc_color_space color_space;
+-	struct tg_color black_color = {0};
+-	struct output_pixel_processor *opp = NULL;
+-	uint32_t num_opps, opp_id_src0, opp_id_src1;
+-	uint32_t otg_active_width, otg_active_height;
+-	uint32_t i;
+-
+-	/* program opp dpg blank color */
+-	color_space = COLOR_SPACE_SRGB;
+-	color_space_to_black_color(dc, color_space, &black_color);
+-
+-	otg_active_width = width;
+-	otg_active_height = height;
+-
+-	/* get the OPTC source */
+-	tg->funcs->get_optc_source(tg, &num_opps, &opp_id_src0, &opp_id_src1);
+-	ASSERT(opp_id_src0 < dc->res_pool->res_cap->num_opp);
+-
+-	for (i = 0; i < dc->res_pool->res_cap->num_opp; i++) {
+-		if (dc->res_pool->opps[i] != NULL && dc->res_pool->opps[i]->inst == opp_id_src0) {
+-			opp = dc->res_pool->opps[i];
+-			break;
+-		}
+-	}
+-
+-	if (opp && opp->funcs->opp_set_disp_pattern_generator)
+-		opp->funcs->opp_set_disp_pattern_generator(
+-				opp,
+-				CONTROLLER_DP_TEST_PATTERN_SOLID_COLOR,
+-				CONTROLLER_DP_COLOR_SPACE_UDEFINED,
+-				COLOR_DEPTH_UNDEFINED,
+-				&black_color,
+-				otg_active_width,
+-				otg_active_height,
+-				0);
+-
+-	if (tg->funcs->is_tg_enabled(tg))
+-		hws->funcs.wait_for_blank_complete(opp);
+-}
+-
+ /* phantom stream id's can change often, but can be identical between contexts.
+ *  This function checks for the condition the streams are identical to avoid
+ *  redundant pipe transitions.
+diff --git a/drivers/gpu/drm/amd/display/dc/hwss/dcn32/dcn32_hwseq.h b/drivers/gpu/drm/amd/display/dc/hwss/dcn32/dcn32_hwseq.h
+index cac4a08b92a4..0303a5953673 100644
+--- a/drivers/gpu/drm/amd/display/dc/hwss/dcn32/dcn32_hwseq.h
++++ b/drivers/gpu/drm/amd/display/dc/hwss/dcn32/dcn32_hwseq.h
+@@ -119,11 +119,6 @@ void dcn32_init_blank(
+ 		struct dc *dc,
+ 		struct timing_generator *tg);
+ 
+-void dcn32_blank_phantom(struct dc *dc,
+-		struct timing_generator *tg,
+-		int width,
+-		int height);
+-
+ bool dcn32_is_pipe_topology_transition_seamless(struct dc *dc,
+ 		const struct dc_state *cur_ctx,
+ 		const struct dc_state *new_ctx);
+diff --git a/drivers/gpu/drm/amd/display/dc/hwss/dcn32/dcn32_init.c b/drivers/gpu/drm/amd/display/dc/hwss/dcn32/dcn32_init.c
+index 8e0946fd5b7f..dbcd2dfb19c1 100644
+--- a/drivers/gpu/drm/amd/display/dc/hwss/dcn32/dcn32_init.c
++++ b/drivers/gpu/drm/amd/display/dc/hwss/dcn32/dcn32_init.c
+@@ -117,7 +117,6 @@ static const struct hw_sequencer_funcs dcn32_funcs = {
+ 	.update_phantom_vp_position = dcn32_update_phantom_vp_position,
+ 	.update_dsc_pg = dcn32_update_dsc_pg,
+ 	.apply_update_flags_for_phantom = dcn32_apply_update_flags_for_phantom,
+-	.blank_phantom = dcn32_blank_phantom,
+ 	.is_pipe_topology_transition_seamless = dcn32_is_pipe_topology_transition_seamless,
+ 	.calculate_pix_rate_divider = dcn32_calculate_pix_rate_divider,
+ 	.program_outstanding_updates = dcn32_program_outstanding_updates,
+diff --git a/drivers/gpu/drm/amd/display/dc/hwss/dcn401/dcn401_init.c b/drivers/gpu/drm/amd/display/dc/hwss/dcn401/dcn401_init.c
+index af0d40a5cb77..a1392e776709 100644
+--- a/drivers/gpu/drm/amd/display/dc/hwss/dcn401/dcn401_init.c
++++ b/drivers/gpu/drm/amd/display/dc/hwss/dcn401/dcn401_init.c
+@@ -93,7 +93,6 @@ static const struct hw_sequencer_funcs dcn401_funcs = {
+ 	.update_phantom_vp_position = dcn32_update_phantom_vp_position,
+ 	.update_dsc_pg = dcn32_update_dsc_pg,
+ 	.apply_update_flags_for_phantom = dcn32_apply_update_flags_for_phantom,
+-	.blank_phantom = dcn32_blank_phantom,
+ 	.wait_for_dcc_meta_propagation = dcn401_wait_for_dcc_meta_propagation,
+ 	.is_pipe_topology_transition_seamless = dcn32_is_pipe_topology_transition_seamless,
+ 	.fams2_global_control_lock = dcn401_fams2_global_control_lock,
+-- 
+2.52.0
+
