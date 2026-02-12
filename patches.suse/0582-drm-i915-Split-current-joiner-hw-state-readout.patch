@@ -1,0 +1,141 @@
+From 4e6ebb419a02950840a4a610a5bfca8fe55b03c7 Mon Sep 17 00:00:00 2001
+From: Ankit Nautiyal <ankit.k.nautiyal@intel.com>
+Date: Mon, 30 Sep 2024 22:05:37 +0530
+Subject: drm/i915: Split current joiner hw state readout
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 4e6ebb419a02950840a4a610a5bfca8fe55b03c7
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+We need to add a new sanity checks and also do
+some preparations for adding ultrajoiner hw state readout.
+Lets first split reading of the uncompressed joiner and bigjoiner
+bit masks into separate functions.
+
+V2: Fixed checkpatch warnings (Ankit)
+V3: Use struct intel_display in the new functions. (Ankit)
+V4: Use check for bigjoiner before reading the regs. (Ville)
+
+Signed-off-by: Stanislav Lisovskiy <stanislav.lisovskiy@intel.com>
+Signed-off-by: Ankit Nautiyal <ankit.k.nautiyal@intel.com>
+Reviewed-by: Suraj Kandpal <suraj.kandpal@intel.com>
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20240930163549.416410-2-ankit.k.nautiyal@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/intel_display.c | 74 +++++++++++++++-----
+ 1 file changed, 55 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index f7667931f9d9..8d37973864ee 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -3580,26 +3580,57 @@ static bool transcoder_ddi_func_is_enabled(struct drm_i915_private *dev_priv,
+ 	return tmp & TRANS_DDI_FUNC_ENABLE;
+ }
+ 
+-static void enabled_joiner_pipes(struct drm_i915_private *dev_priv,
+-				 u8 *primary_pipes, u8 *secondary_pipes)
++static void enabled_uncompressed_joiner_pipes(struct intel_display *display,
++					      u8 *primary_pipes, u8 *secondary_pipes)
+ {
++	struct drm_i915_private *i915 = to_i915(display->drm);
+ 	struct intel_crtc *crtc;
+ 
+ 	*primary_pipes = 0;
+ 	*secondary_pipes = 0;
+ 
+-	if (!HAS_BIGJOINER(dev_priv))
++	if (!HAS_UNCOMPRESSED_JOINER(display))
+ 		return;
+ 
+-	for_each_intel_crtc_in_pipe_mask(&dev_priv->drm, crtc,
+-					 joiner_pipes(dev_priv)) {
++	for_each_intel_crtc_in_pipe_mask(&i915->drm, crtc,
++					 joiner_pipes(i915)) {
+ 		enum intel_display_power_domain power_domain;
+ 		enum pipe pipe = crtc->pipe;
+ 		intel_wakeref_t wakeref;
+ 
+-		power_domain = intel_dsc_power_domain(crtc, (enum transcoder) pipe);
+-		with_intel_display_power_if_enabled(dev_priv, power_domain, wakeref) {
+-			u32 tmp = intel_de_read(dev_priv, ICL_PIPE_DSS_CTL1(pipe));
++		power_domain = POWER_DOMAIN_PIPE(pipe);
++		with_intel_display_power_if_enabled(i915, power_domain, wakeref) {
++			u32 tmp = intel_de_read(display, ICL_PIPE_DSS_CTL1(pipe));
++
++			if (tmp & UNCOMPRESSED_JOINER_PRIMARY)
++				*primary_pipes |= BIT(pipe);
++			if (tmp & UNCOMPRESSED_JOINER_SECONDARY)
++				*secondary_pipes |= BIT(pipe);
++		}
++	}
++}
++
++static void enabled_bigjoiner_pipes(struct intel_display *display,
++				    u8 *primary_pipes, u8 *secondary_pipes)
++{
++	struct drm_i915_private *i915 = to_i915(display->drm);
++	struct intel_crtc *crtc;
++
++	*primary_pipes = 0;
++	*secondary_pipes = 0;
++
++	if (!HAS_BIGJOINER(display))
++		return;
++
++	for_each_intel_crtc_in_pipe_mask(&i915->drm, crtc,
++					 joiner_pipes(i915)) {
++		enum intel_display_power_domain power_domain;
++		enum pipe pipe = crtc->pipe;
++		intel_wakeref_t wakeref;
++
++		power_domain = intel_dsc_power_domain(crtc, (enum transcoder)pipe);
++		with_intel_display_power_if_enabled(i915, power_domain, wakeref) {
++			u32 tmp = intel_de_read(display, ICL_PIPE_DSS_CTL1(pipe));
+ 
+ 			if (!(tmp & BIG_JOINER_ENABLE))
+ 				continue;
+@@ -3609,20 +3640,25 @@ static void enabled_joiner_pipes(struct drm_i915_private *dev_priv,
+ 			else
+ 				*secondary_pipes |= BIT(pipe);
+ 		}
++	}
++}
+ 
+-		if (!HAS_UNCOMPRESSED_JOINER(dev_priv))
+-			continue;
++static void enabled_joiner_pipes(struct drm_i915_private *dev_priv,
++				 u8 *primary_pipes, u8 *secondary_pipes)
++{
++	struct intel_display *display = to_intel_display(&dev_priv->drm);
++	u8 primary_uncompressed_joiner_pipes, primary_bigjoiner_pipes;
++	u8 secondary_uncompressed_joiner_pipes, secondary_bigjoiner_pipes;
+ 
+-		power_domain = POWER_DOMAIN_PIPE(pipe);
+-		with_intel_display_power_if_enabled(dev_priv, power_domain, wakeref) {
+-			u32 tmp = intel_de_read(dev_priv, ICL_PIPE_DSS_CTL1(pipe));
++	enabled_uncompressed_joiner_pipes(display, &primary_uncompressed_joiner_pipes,
++					  &secondary_uncompressed_joiner_pipes);
+ 
+-			if (tmp & UNCOMPRESSED_JOINER_PRIMARY)
+-				*primary_pipes |= BIT(pipe);
+-			if (tmp & UNCOMPRESSED_JOINER_SECONDARY)
+-				*secondary_pipes |= BIT(pipe);
+-		}
+-	}
++	enabled_bigjoiner_pipes(display, &primary_bigjoiner_pipes,
++				&secondary_bigjoiner_pipes);
++
++	*primary_pipes = primary_uncompressed_joiner_pipes | primary_bigjoiner_pipes;
++
++	*secondary_pipes = secondary_uncompressed_joiner_pipes | secondary_bigjoiner_pipes;
+ 
+ 	/* Joiner pipes should always be consecutive primary and secondary */
+ 	drm_WARN(&dev_priv->drm, *secondary_pipes != *primary_pipes << 1,
+-- 
+2.52.0
+
