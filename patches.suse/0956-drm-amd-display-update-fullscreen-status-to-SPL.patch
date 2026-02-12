@@ -1,0 +1,112 @@
+From 30194b716bd8ff6215b4a49a088ede8de1a36d15 Mon Sep 17 00:00:00 2001
+From: Samson Tam <Samson.Tam@amd.com>
+Date: Wed, 9 Oct 2024 10:00:04 -0400
+Subject: drm/amd/display: update fullscreen status to SPL
+Git-commit: 30194b716bd8ff6215b4a49a088ede8de1a36d15
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+[Why]
+Current fullscreen check in SPL using dm_helpers is out-of-sync
+with dc state. This causes an issue during minimal transition
+where we pick an invalid intermediate state because the pre and
+post fullscreen status are different.
+
+[How]
+Add sharpening_required flag to dc_stream_state. Use this flag to
+indicate if we are in fullscreen or not. Propagate flag to SPL for
+fullscreen status. Remove workaround in DML
+
+Reviewed-by: Alvin Lee <alvin.lee2@amd.com>
+Signed-off-by: Samson Tam <Samson.Tam@amd.com>
+Signed-off-by: Wayne Lin <wayne.lin@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c                     | 5 +++++
+ drivers/gpu/drm/amd/display/dc/dc_spl_translate.c            | 2 +-
+ drivers/gpu/drm/amd/display/dc/dc_stream.h                   | 3 +++
+ .../drm/amd/display/dc/dml2/dml21/dml21_translation_helper.c | 1 -
+ 4 files changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index 743f3292d98e..5a12fc75f97f 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -2756,6 +2756,9 @@ static enum surface_update_type check_update_surfaces_for_stream(
+ 		if (stream_update->scaler_sharpener_update)
+ 			su_flags->bits.scaler_sharpener = 1;
+ 
++		if (stream_update->sharpening_required)
++			su_flags->bits.sharpening_required = 1;
++
+ 		if (su_flags->raw != 0)
+ 			overall_type = UPDATE_TYPE_FULL;
+ 
+@@ -3107,6 +3110,8 @@ static void copy_stream_update_to_stream(struct dc *dc,
+ 	}
+ 	if (update->scaler_sharpener_update)
+ 		stream->scaler_sharpener_update = *update->scaler_sharpener_update;
++	if (update->sharpening_required)
++		stream->sharpening_required = *update->sharpening_required;
+ }
+ 
+ static void backup_planes_and_stream_state(
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_spl_translate.c b/drivers/gpu/drm/amd/display/dc/dc_spl_translate.c
+index eeffe44be9e3..24aa9df892f3 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_spl_translate.c
++++ b/drivers/gpu/drm/amd/display/dc/dc_spl_translate.c
+@@ -195,7 +195,7 @@ void translate_SPL_in_params_from_pipe_ctx(struct pipe_ctx *pipe_ctx, struct spl
+ 	/* Check if it is stream is in fullscreen and if its HDR.
+ 	 * Use this to determine sharpness levels
+ 	 */
+-	spl_in->is_fullscreen = dm_helpers_is_fullscreen(pipe_ctx->stream->ctx, pipe_ctx->stream);
++	spl_in->is_fullscreen = pipe_ctx->stream->sharpening_required;
+ 	spl_in->is_hdr_on = dm_helpers_is_hdr_on(pipe_ctx->stream->ctx, pipe_ctx->stream);
+ 	spl_in->sdr_white_level_nits = plane_state->sdr_white_level_nits;
+ }
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_stream.h b/drivers/gpu/drm/amd/display/dc/dc_stream.h
+index 14ea47eda0c8..413970588a26 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_stream.h
++++ b/drivers/gpu/drm/amd/display/dc/dc_stream.h
+@@ -143,6 +143,7 @@ union stream_update_flags {
+ 		uint32_t crtc_timing_adjust : 1;
+ 		uint32_t fams_changed : 1;
+ 		uint32_t scaler_sharpener : 1;
++		uint32_t sharpening_required : 1;
+ 	} bits;
+ 
+ 	uint32_t raw;
+@@ -310,6 +311,7 @@ struct dc_stream_state {
+ 
+ 	struct luminance_data lumin_data;
+ 	bool scaler_sharpener_update;
++	bool sharpening_required;
+ };
+ 
+ #define ABM_LEVEL_IMMEDIATE_DISABLE 255
+@@ -356,6 +358,7 @@ struct dc_stream_update {
+ 	struct dc_cursor_position *cursor_position;
+ 	bool *hw_cursor_req;
+ 	bool *scaler_sharpener_update;
++	bool *sharpening_required;
+ };
+ 
+ bool dc_is_stream_unchanged(
+diff --git a/drivers/gpu/drm/amd/display/dc/dml2/dml21/dml21_translation_helper.c b/drivers/gpu/drm/amd/display/dc/dml2/dml21/dml21_translation_helper.c
+index d901b9f7bc6a..7a01a956e4bb 100644
+--- a/drivers/gpu/drm/amd/display/dc/dml2/dml21/dml21_translation_helper.c
++++ b/drivers/gpu/drm/amd/display/dc/dml2/dml21/dml21_translation_helper.c
+@@ -514,7 +514,6 @@ static void populate_dml21_stream_overrides_from_stream_state(
+ 		break;
+ 	}
+ 	if (!stream->ctx->dc->debug.enable_single_display_2to1_odm_policy ||
+-			((stream->ctx->dc->debug.force_sharpness > 1) && stream->ctx->dc->config.use_spl) ||
+ 			stream->debug.force_odm_combine_segments > 0)
+ 		stream_desc->overrides.disable_dynamic_odm = true;
+ 	stream_desc->overrides.disable_subvp = stream->ctx->dc->debug.force_disable_subvp || stream->hw_cursor_req;
+-- 
+2.52.0
+
