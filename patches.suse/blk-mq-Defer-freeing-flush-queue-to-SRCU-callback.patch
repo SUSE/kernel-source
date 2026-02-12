@@ -1,0 +1,79 @@
+From: Ming Lei <ming.lei@redhat.com>
+Date: Sat, 30 Aug 2025 10:18:22 +0800
+Subject: [PATCH] blk-mq: Defer freeing flush queue to SRCU callback
+Git-commit: 135b8521f21d4d4d4fde74e73b80d8e4d417e20a
+Patch-mainline: v6.16-rc1
+References: jsc#PED-14161
+
+The freeing of the flush queue/request in blk_mq_exit_hctx() can race with
+tag iterators that may still be accessing it. To prevent a potential
+use-after-free, the deallocation should be deferred until after a grace
+period. With this way, we can replace the big tags->lock in tags iterator
+code path with srcu for solving the issue.
+
+This patch introduces an SRCU-based deferred freeing mechanism for the
+flush queue.
+
+The changes include:
+- Adding a `rcu_head` to `struct blk_flush_queue`.
+- Creating a new callback function, `blk_free_flush_queue_callback`,
+  to handle the actual freeing.
+- Replacing the direct call to `blk_free_flush_queue()` in
+  `blk_mq_exit_hctx()` with `call_srcu()`, using the `tags_srcu`
+  instance to ensure synchronization with tag iterators.
+
+Reviewed-by: Hannes Reinecke <hare@suse.de>
+Reviewed-by: Yu Kuai <yukuai3@huawei.com>
+Signed-off-by: Ming Lei <ming.lei@redhat.com>
+Reviewed-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/blk-mq.c | 11 ++++++++++-
+ block/blk.h    |  1 +
+ 2 files changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index e1b44173029c..1c3cdf17af79 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -3912,6 +3912,14 @@ static void blk_mq_clear_flush_rq_mapping(struct blk_mq_tags *tags,
+ 	spin_unlock_irqrestore(&tags->lock, flags);
+ }
+ 
++static void blk_free_flush_queue_callback(struct rcu_head *head)
++{
++	struct blk_flush_queue *fq =
++		container_of(head, struct blk_flush_queue, rcu_head);
++
++	blk_free_flush_queue(fq);
++}
++
+ /* hctx->ctxs will be freed in queue's release handler */
+ static void blk_mq_exit_hctx(struct request_queue *q,
+ 		struct blk_mq_tag_set *set,
+@@ -3931,7 +3939,8 @@ static void blk_mq_exit_hctx(struct request_queue *q,
+ 	if (set->ops->exit_hctx)
+ 		set->ops->exit_hctx(hctx, hctx_idx);
+ 
+-	blk_free_flush_queue(hctx->fq);
++	call_srcu(&set->tags_srcu, &hctx->fq->rcu_head,
++			blk_free_flush_queue_callback);
+ 	hctx->fq = NULL;
+ 
+ 	xa_erase(&q->hctx_table, hctx_idx);
+diff --git a/block/blk.h b/block/blk.h
+index 46f566f9b126..7d420c247d81 100644
+--- a/block/blk.h
++++ b/block/blk.h
+@@ -41,6 +41,7 @@ struct blk_flush_queue {
+ 	struct list_head	flush_queue[2];
+ 	unsigned long		flush_data_in_flight;
+ 	struct request		*flush_rq;
++	struct rcu_head		rcu_head;
+ };
+ 
+ bool is_flush_rq(struct request *req);
+-- 
+2.43.0
+
