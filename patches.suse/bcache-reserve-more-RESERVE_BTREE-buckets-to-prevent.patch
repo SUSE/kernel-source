@@ -1,0 +1,109 @@
+From: Mingzhe Zou <mingzhe.zou@easystack.cn>
+Date: Tue, 27 May 2025 13:16:01 +0800
+Subject: [PATCH] bcache: reserve more RESERVE_BTREE buckets to prevent
+ allocator hang
+Git-commit: 208c1559c5b18894e3380b3807b6364bd14f7584
+Patch-mainline: v6.16-rc1
+References: jsc#PED-14161
+
+Reported an IO hang and unrecoverable error in our testing environment.
+
+After careful research, we found that bch_allocator_thread is stuck,
+the call stack is as follows:
+[<0>] __switch_to+0xbc/0x108
+[<0>] __closure_sync+0x7c/0xbc [bcache]
+[<0>] bch_prio_write+0x430/0x448 [bcache]
+[<0>] bch_allocator_thread+0xb44/0xb70 [bcache]
+[<0>] kthread+0x124/0x130
+[<0>] ret_from_fork+0x10/0x18
+
+Moreover, the RESERVE_BTREE type bucket slot are empty and journal_full
+occurs at the same time.
+
+When the cache disk is first used, the sb.nJournal_buckets defaults to 0.
+So, only 8 RESERVE_BTREE type buckets are reserved. If RESERVE_BTREE type
+buckets used up or btree_check_reserve() failed when request handle btree
+split, the request will be repeatedly retried and wait for alloc thread to
+fill in.
+
+After the alloc thread fills the buckets, it will call bch_prio_write().
+If journal_full occurs simultaneously at this time, journal_reclaim() and
+btree_flush_write() will be called sequentially, journal_write cannot be
+completed.
+
+This is a low probability event, we believe that reserve more RESERVE_BTREE
+buckets can avoid the worst situation.
+
+Fixes: 682811b3ce1a ("bcache: fix for allocator and register thread race")
+Signed-off-by: Mingzhe Zou <mingzhe.zou@easystack.cn>
+Signed-off-by: Coly Li <colyli@kernel.org>
+Link: https://lore.kernel.org/r/20250527051601.74407-4-colyli@kernel.org
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/md/bcache/super.c | 48 ++++++++++++++++++++++++++++++++-------
+ 1 file changed, 40 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/md/bcache/super.c b/drivers/md/bcache/super.c
+index 9e6dfe2ec147..12fb3e557fb1 100644
+--- a/drivers/md/bcache/super.c
++++ b/drivers/md/bcache/super.c
+@@ -2237,15 +2237,47 @@ static int cache_alloc(struct cache *ca)
+ 	bio_init(&ca->journal.bio, NULL, ca->journal.bio.bi_inline_vecs, 8, 0);
+ 
+ 	/*
+-	 * when ca->sb.njournal_buckets is not zero, journal exists,
+-	 * and in bch_journal_replay(), tree node may split,
+-	 * so bucket of RESERVE_BTREE type is needed,
+-	 * the worst situation is all journal buckets are valid journal,
+-	 * and all the keys need to replay,
+-	 * so the number of  RESERVE_BTREE type buckets should be as much
+-	 * as journal buckets
++	 * When the cache disk is first registered, ca->sb.njournal_buckets
++	 * is zero, and it is assigned in run_cache_set().
++	 *
++	 * When ca->sb.njournal_buckets is not zero, journal exists,
++	 * and in bch_journal_replay(), tree node may split.
++	 * The worst situation is all journal buckets are valid journal,
++	 * and all the keys need to replay, so the number of RESERVE_BTREE
++	 * type buckets should be as much as journal buckets.
++	 *
++	 * If the number of RESERVE_BTREE type buckets is too few, the
++	 * bch_allocator_thread() may hang up and unable to allocate
++	 * bucket. The situation is roughly as follows:
++	 *
++	 * 1. In bch_data_insert_keys(), if the operation is not op->replace,
++	 *    it will call the bch_journal(), which increments the journal_ref
++	 *    counter. This counter is only decremented after bch_btree_insert
++	 *    completes.
++	 *
++	 * 2. When calling bch_btree_insert, if the btree needs to split,
++	 *    it will call btree_split() and btree_check_reserve() to check
++	 *    whether there are enough reserved buckets in the RESERVE_BTREE
++	 *    slot. If not enough, bcache_btree_root() will repeatedly retry.
++	 *
++	 * 3. Normally, the bch_allocator_thread is responsible for filling
++	 *    the reservation slots from the free_inc bucket list. When the
++	 *    free_inc bucket list is exhausted, the bch_allocator_thread
++	 *    will call invalidate_buckets() until free_inc is refilled.
++	 *    Then bch_allocator_thread calls bch_prio_write() once. and
++	 *    bch_prio_write() will call bch_journal_meta() and waits for
++	 *    the journal write to complete.
++	 *
++	 * 4. During journal_write, journal_write_unlocked() is be called.
++	 *    If journal full occurs, journal_reclaim() and btree_flush_write()
++	 *    will be called sequentially, then retry journal_write.
++	 *
++	 * 5. When 2 and 4 occur together, IO will hung up and cannot recover.
++	 *
++	 * Therefore, reserve more RESERVE_BTREE type buckets.
+ 	 */
+-	btree_buckets = ca->sb.njournal_buckets ?: 8;
++	btree_buckets = clamp_t(size_t, ca->sb.nbuckets >> 7,
++				32, SB_JOURNAL_BUCKETS);
+ 	free = roundup_pow_of_two(ca->sb.nbuckets) >> 10;
+ 	if (!free) {
+ 		ret = -EPERM;
+-- 
+2.43.0
+
