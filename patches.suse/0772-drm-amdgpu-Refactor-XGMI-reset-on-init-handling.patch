@@ -1,0 +1,254 @@
+From 631af731ee9cc7f5a5c0ab1de94da68195920214 Mon Sep 17 00:00:00 2001
+From: Lijo Lazar <lijo.lazar@amd.com>
+Date: Mon, 26 Aug 2024 18:52:14 +0530
+Subject: drm/amdgpu: Refactor XGMI reset on init handling
+Git-commit: 631af731ee9cc7f5a5c0ab1de94da68195920214
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Use XGMI hive information to rely on resetting XGMI devices on
+initialization rather than using mgpu structure. mgpu structure may have
+other devices as well.
+
+Signed-off-by: Lijo Lazar <lijo.lazar@amd.com>
+Reviewed-by: Feifei Xu <feifxu@amd.com>
+Acked-by: Rajneesh Bhardwaj <rajneesh.bhardwaj@amd.com>
+Tested-by: Rajneesh Bhardwaj <rajneesh.bhardwaj@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c | 10 +--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c    |  6 --
+ drivers/gpu/drm/amd/amdgpu/amdgpu_xgmi.c   | 73 ++++++++++++++++++++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_xgmi.h   |  2 +
+ drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c      | 14 +++--
+ drivers/gpu/drm/amd/amdgpu/soc15.c         |  5 ++
+ 6 files changed, 91 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index a32fe1a8ffbd..0a0934200ce3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -165,7 +165,8 @@ struct amdgpu_init_level amdgpu_init_minimal_xgmi = {
+ 	.level = AMDGPU_INIT_LEVEL_MINIMAL_XGMI,
+ 	.hwini_ip_block_mask =
+ 		BIT(AMD_IP_BLOCK_TYPE_GMC) | BIT(AMD_IP_BLOCK_TYPE_SMC) |
+-		BIT(AMD_IP_BLOCK_TYPE_COMMON) | BIT(AMD_IP_BLOCK_TYPE_IH)
++		BIT(AMD_IP_BLOCK_TYPE_COMMON) | BIT(AMD_IP_BLOCK_TYPE_IH) |
++		BIT(AMD_IP_BLOCK_TYPE_PSP)
+ };
+ 
+ static inline bool amdgpu_ip_member_of_hwini(struct amdgpu_device *adev,
+@@ -2841,6 +2842,7 @@ static int amdgpu_device_init_schedulers(struct amdgpu_device *adev)
+  */
+ static int amdgpu_device_ip_init(struct amdgpu_device *adev)
+ {
++	bool init_badpage;
+ 	int i, r;
+ 
+ 	r = amdgpu_ras_init(adev);
+@@ -2954,7 +2956,8 @@ static int amdgpu_device_ip_init(struct amdgpu_device *adev)
+ 	 * Note: theoretically, this should be called before all vram allocations
+ 	 * to protect retired page from abusing
+ 	 */
+-	r = amdgpu_ras_recovery_init(adev, true);
++	init_badpage = (adev->init_lvl->level != AMDGPU_INIT_LEVEL_MINIMAL_XGMI);
++	r = amdgpu_ras_recovery_init(adev, init_badpage);
+ 	if (r)
+ 		goto init_failed;
+ 
+@@ -4512,8 +4515,7 @@ int amdgpu_device_init(struct amdgpu_device *adev,
+ 		vga_switcheroo_init_domain_pm_ops(adev->dev, &adev->vga_pm_domain);
+ 
+ 	if (adev->init_lvl->level == AMDGPU_INIT_LEVEL_MINIMAL_XGMI)
+-		queue_delayed_work(system_wq, &mgpu_info.delayed_reset_work,
+-				   msecs_to_jiffies(AMDGPU_RESUME_MS));
++		amdgpu_xgmi_reset_on_init(adev);
+ 
+ 	amdgpu_device_check_iommu_direct_map(adev);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
+index 7e63fc05e18b..1d9eda883bb8 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
+@@ -3216,12 +3216,6 @@ int amdgpu_ras_recovery_init(struct amdgpu_device *adev, bool init_bp_info)
+ 	max_eeprom_records_count = amdgpu_ras_eeprom_max_record_count(&con->eeprom_control);
+ 	amdgpu_ras_validate_threshold(adev, max_eeprom_records_count);
+ 
+-	/* Todo: During test the SMU might fail to read the eeprom through I2C
+-	 * when the GPU is pending on XGMI reset during probe time
+-	 * (Mostly after second bus reset), skip it now
+-	 */
+-	if (adev->init_lvl->level == AMDGPU_INIT_LEVEL_MINIMAL_XGMI)
+-		return 0;
+ 	if (init_bp_info) {
+ 		ret = amdgpu_ras_init_badpage_info(adev);
+ 		if (ret)
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_xgmi.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_xgmi.c
+index 74135d611cba..b17e63c98a99 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_xgmi.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_xgmi.c
+@@ -860,8 +860,7 @@ int amdgpu_xgmi_add_device(struct amdgpu_device *adev)
+ 	if (!adev->gmc.xgmi.supported)
+ 		return 0;
+ 
+-	if ((adev->init_lvl->level != AMDGPU_INIT_LEVEL_MINIMAL_XGMI) &&
+-	    amdgpu_device_ip_get_ip_block(adev, AMD_IP_BLOCK_TYPE_PSP)) {
++	if (amdgpu_device_ip_get_ip_block(adev, AMD_IP_BLOCK_TYPE_PSP)) {
+ 		ret = psp_xgmi_initialize(&adev->psp, false, true);
+ 		if (ret) {
+ 			dev_err(adev->dev,
+@@ -907,8 +906,7 @@ int amdgpu_xgmi_add_device(struct amdgpu_device *adev)
+ 
+ 	task_barrier_add_task(&hive->tb);
+ 
+-	if ((adev->init_lvl->level != AMDGPU_INIT_LEVEL_MINIMAL_XGMI) &&
+-	    amdgpu_device_ip_get_ip_block(adev, AMD_IP_BLOCK_TYPE_PSP)) {
++	if (amdgpu_device_ip_get_ip_block(adev, AMD_IP_BLOCK_TYPE_PSP)) {
+ 		list_for_each_entry(tmp_adev, &hive->device_list, gmc.xgmi.head) {
+ 			/* update node list for other device in the hive */
+ 			if (tmp_adev != adev) {
+@@ -985,7 +983,7 @@ int amdgpu_xgmi_add_device(struct amdgpu_device *adev)
+ 		}
+ 	}
+ 
+-	if (!ret && (adev->init_lvl->level != AMDGPU_INIT_LEVEL_MINIMAL_XGMI))
++	if (!ret)
+ 		ret = amdgpu_xgmi_sysfs_add_dev_info(adev, hive);
+ 
+ exit_unlock:
+@@ -1500,3 +1498,68 @@ int amdgpu_xgmi_ras_sw_init(struct amdgpu_device *adev)
+ 
+ 	return 0;
+ }
++
++static void amdgpu_xgmi_reset_on_init_work(struct work_struct *work)
++{
++	struct amdgpu_hive_info *hive =
++		container_of(work, struct amdgpu_hive_info, reset_on_init_work);
++	struct amdgpu_reset_context reset_context;
++	struct amdgpu_device *tmp_adev;
++	struct list_head device_list;
++	int r;
++
++	mutex_lock(&hive->hive_lock);
++
++	INIT_LIST_HEAD(&device_list);
++	list_for_each_entry(tmp_adev, &hive->device_list, gmc.xgmi.head)
++		list_add_tail(&tmp_adev->reset_list, &device_list);
++
++	tmp_adev = list_first_entry(&device_list, struct amdgpu_device,
++				    reset_list);
++	amdgpu_device_lock_reset_domain(tmp_adev->reset_domain);
++
++	reset_context.method = AMD_RESET_METHOD_ON_INIT;
++	reset_context.reset_req_dev = tmp_adev;
++	reset_context.hive = hive;
++	reset_context.reset_device_list = &device_list;
++	set_bit(AMDGPU_NEED_FULL_RESET, &reset_context.flags);
++	set_bit(AMDGPU_SKIP_COREDUMP, &reset_context.flags);
++
++	amdgpu_reset_do_xgmi_reset_on_init(&reset_context);
++	mutex_unlock(&hive->hive_lock);
++	amdgpu_device_unlock_reset_domain(tmp_adev->reset_domain);
++
++	list_for_each_entry(tmp_adev, &hive->device_list, gmc.xgmi.head) {
++		r = amdgpu_ras_init_badpage_info(tmp_adev);
++		if (r && r != -EHWPOISON)
++			dev_err(tmp_adev->dev,
++				"error during bad page data initializtion");
++	}
++}
++
++static void amdgpu_xgmi_schedule_reset_on_init(struct amdgpu_hive_info *hive)
++{
++	INIT_WORK(&hive->reset_on_init_work, amdgpu_xgmi_reset_on_init_work);
++	amdgpu_reset_domain_schedule(hive->reset_domain,
++				     &hive->reset_on_init_work);
++}
++
++int amdgpu_xgmi_reset_on_init(struct amdgpu_device *adev)
++{
++	struct amdgpu_hive_info *hive;
++	int num_devs;
++
++	hive = amdgpu_get_xgmi_hive(adev);
++	if (!hive)
++		return -EINVAL;
++
++	mutex_lock(&hive->hive_lock);
++	num_devs = atomic_read(&hive->number_devices);
++	if (num_devs == adev->gmc.xgmi.num_physical_nodes)
++		amdgpu_xgmi_schedule_reset_on_init(hive);
++
++	mutex_unlock(&hive->hive_lock);
++	amdgpu_put_xgmi_hive(hive);
++
++	return 0;
++}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_xgmi.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_xgmi.h
+index a3bfc16de6d4..d652727ca565 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_xgmi.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_xgmi.h
+@@ -45,6 +45,7 @@ struct amdgpu_hive_info {
+ 	struct amdgpu_reset_domain *reset_domain;
+ 	atomic_t ras_recovery;
+ 	struct ras_event_manager event_mgr;
++	struct work_struct reset_on_init_work;
+ };
+ 
+ struct amdgpu_pcs_ras_field {
+@@ -75,5 +76,6 @@ static inline bool amdgpu_xgmi_same_hive(struct amdgpu_device *adev,
+ 		adev->gmc.xgmi.hive_id == bo_adev->gmc.xgmi.hive_id);
+ }
+ int amdgpu_xgmi_ras_sw_init(struct amdgpu_device *adev);
++int amdgpu_xgmi_reset_on_init(struct amdgpu_device *adev);
+ 
+ #endif
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
+index 7a45f3fdc734..79436346f8b0 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
+@@ -2416,11 +2416,17 @@ static int gmc_v9_0_hw_fini(void *handle)
+ 	if (adev->mmhub.funcs->update_power_gating)
+ 		adev->mmhub.funcs->update_power_gating(adev, false);
+ 
+-	amdgpu_irq_put(adev, &adev->gmc.vm_fault, 0);
++	/*
++	 * For minimal init, late_init is not called, hence VM fault/RAS irqs
++	 * are not enabled.
++	 */
++	if (adev->init_lvl->level != AMDGPU_INIT_LEVEL_MINIMAL_XGMI) {
++		amdgpu_irq_put(adev, &adev->gmc.vm_fault, 0);
+ 
+-	if (adev->gmc.ecc_irq.funcs &&
+-		amdgpu_ras_is_supported(adev, AMDGPU_RAS_BLOCK__UMC))
+-		amdgpu_irq_put(adev, &adev->gmc.ecc_irq, 0);
++		if (adev->gmc.ecc_irq.funcs &&
++		    amdgpu_ras_is_supported(adev, AMDGPU_RAS_BLOCK__UMC))
++			amdgpu_irq_put(adev, &adev->gmc.ecc_irq, 0);
++	}
+ 
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/soc15.c b/drivers/gpu/drm/amd/amdgpu/soc15.c
+index d0daf18960c7..0ec35830c593 100644
+--- a/drivers/gpu/drm/amd/amdgpu/soc15.c
++++ b/drivers/gpu/drm/amd/amdgpu/soc15.c
+@@ -1297,7 +1297,12 @@ static int soc15_common_hw_fini(void *handle)
+ 	if (amdgpu_sriov_vf(adev))
+ 		xgpu_ai_mailbox_put_irq(adev);
+ 
++	/*
++	 * For minimal init, late_init is not called, hence RAS irqs are not
++	 * enabled.
++	 */
+ 	if ((!amdgpu_sriov_vf(adev)) &&
++	    (adev->init_lvl->level != AMDGPU_INIT_LEVEL_MINIMAL_XGMI) &&
+ 	    adev->nbio.ras_if &&
+ 	    amdgpu_ras_is_supported(adev, adev->nbio.ras_if->block)) {
+ 		if (adev->nbio.ras &&
+-- 
+2.52.0
+
