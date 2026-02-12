@@ -1,0 +1,255 @@
+From 502d76308d45a9ef79b9266c5a090e9e6954faaa Mon Sep 17 00:00:00 2001
+From: Sunil Khatri <sunil.khatri@amd.com>
+Date: Thu, 17 Oct 2024 19:34:27 +0530
+Subject: drm/amdgpu: validate resume before function call
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 502d76308d45a9ef79b9266c5a090e9e6954faaa
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Before making a function call to resume, validate
+the function pointer like we do in sw_init.
+
+Use the helper function amdgpu_ip_block_resume where
+same checks and calls are repeated.
+
+Signed-off-by: Sunil Khatri <sunil.khatri@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/aldebaran.c      | 13 ++---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h         |  2 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c  | 64 ++++++++++++---------
+ drivers/gpu/drm/amd/amdgpu/sienna_cichlid.c | 20 ++-----
+ drivers/gpu/drm/amd/amdgpu/smu_v13_0_10.c   | 10 +---
+ 5 files changed, 49 insertions(+), 60 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/aldebaran.c b/drivers/gpu/drm/amd/amdgpu/aldebaran.c
+index 07f195a89e9a..3a588fecb0c5 100644
+--- a/drivers/gpu/drm/amd/amdgpu/aldebaran.c
++++ b/drivers/gpu/drm/amd/amdgpu/aldebaran.c
+@@ -239,7 +239,7 @@ static int aldebaran_mode2_restore_ip(struct amdgpu_device *adev)
+ 		dev_err(adev->dev, "Failed to get BIF handle\n");
+ 		return -EINVAL;
+ 	}
+-	r = cmn_block->version->funcs->resume(cmn_block);
++	r = amdgpu_ip_block_resume(cmn_block);
+ 	if (r)
+ 		return r;
+ 
+@@ -275,15 +275,10 @@ static int aldebaran_mode2_restore_ip(struct amdgpu_device *adev)
+ 		      adev->ip_blocks[i].version->type ==
+ 			      AMD_IP_BLOCK_TYPE_SDMA))
+ 			continue;
+-		r = adev->ip_blocks[i].version->funcs->resume(&adev->ip_blocks[i]);
+-		if (r) {
+-			dev_err(adev->dev,
+-				"resume of IP block <%s> failed %d\n",
+-				adev->ip_blocks[i].version->funcs->name, r);
+-			return r;
+-		}
+ 
+-		adev->ip_blocks[i].status.hw = true;
++		r = amdgpu_ip_block_resume(&adev->ip_blocks[i]);
++		if (r)
++			return r;
+ 	}
+ 
+ 	for (i = 0; i < adev->num_ip_blocks; i++) {
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 9c93d0a47904..3af5acff8518 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -365,6 +365,8 @@ bool amdgpu_device_ip_is_valid(struct amdgpu_device *adev,
+ 			      enum amd_ip_block_type block_type);
+ int amdgpu_ip_block_suspend(struct amdgpu_ip_block *ip_block);
+ 
++int amdgpu_ip_block_resume(struct amdgpu_ip_block *ip_block);
++
+ #define AMDGPU_MAX_IP_NUM 16
+ 
+ struct amdgpu_ip_block_status {
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 5ff42b67db17..2728ac3e1030 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -291,6 +291,24 @@ int amdgpu_ip_block_suspend(struct amdgpu_ip_block *ip_block)
+ 	return 0;
+ }
+ 
++int amdgpu_ip_block_resume(struct amdgpu_ip_block *ip_block)
++{
++	int r;
++
++	if (ip_block->version->funcs->resume) {
++		r = ip_block->version->funcs->resume(ip_block);
++		if (r) {
++			dev_err(ip_block->adev->dev,
++				"resume of IP block <%s> failed %d\n",
++				ip_block->version->funcs->name, r);
++			return r;
++		}
++	}
++
++	ip_block->status.hw = true;
++	return 0;
++}
++
+ /**
+  * DOC: board_info
+  *
+@@ -2763,12 +2781,9 @@ static int amdgpu_device_fw_loading(struct amdgpu_device *adev)
+ 				break;
+ 
+ 			if (amdgpu_in_reset(adev) || adev->in_suspend) {
+-				r = adev->ip_blocks[i].version->funcs->resume(&adev->ip_blocks[i]);
+-				if (r) {
+-					DRM_ERROR("resume of IP block <%s> failed %d\n",
+-							  adev->ip_blocks[i].version->funcs->name, r);
++				r = amdgpu_ip_block_resume(&adev->ip_blocks[i]);
++				if (r)
+ 					return r;
+-				}
+ 			} else {
+ 				r = adev->ip_blocks[i].version->funcs->hw_init(&adev->ip_blocks[i]);
+ 				if (r) {
+@@ -2776,9 +2791,8 @@ static int amdgpu_device_fw_loading(struct amdgpu_device *adev)
+ 							  adev->ip_blocks[i].version->funcs->name, r);
+ 					return r;
+ 				}
++				adev->ip_blocks[i].status.hw = true;
+ 			}
+-
+-			adev->ip_blocks[i].status.hw = true;
+ 			break;
+ 		}
+ 	}
+@@ -3683,15 +3697,19 @@ static int amdgpu_device_ip_reinit_late_sriov(struct amdgpu_device *adev)
+ 				block->status.hw)
+ 				continue;
+ 
+-			if (block->version->type == AMD_IP_BLOCK_TYPE_SMC)
+-				r = block->version->funcs->resume(&adev->ip_blocks[i]);
+-			else
++			if (block->version->type == AMD_IP_BLOCK_TYPE_SMC) {
++				r = amdgpu_ip_block_resume(&adev->ip_blocks[i]);
++				if (r)
++					return r;
++			} else {
+ 				r = block->version->funcs->hw_init(&adev->ip_blocks[i]);
+-
+-			DRM_INFO("RE-INIT-late: %s %s\n", block->version->funcs->name, r?"failed":"succeeded");
+-			if (r)
+-				return r;
+-			block->status.hw = true;
++				if (r) {
++					DRM_ERROR("hw_init of IP block <%s> failed %d\n",
++						  adev->ip_blocks[i].version->funcs->name, r);
++					return r;
++				}
++				block->status.hw = true;
++			}
+ 		}
+ 	}
+ 
+@@ -3722,13 +3740,9 @@ static int amdgpu_device_ip_resume_phase1(struct amdgpu_device *adev)
+ 		    adev->ip_blocks[i].version->type == AMD_IP_BLOCK_TYPE_IH ||
+ 		    (adev->ip_blocks[i].version->type == AMD_IP_BLOCK_TYPE_PSP && amdgpu_sriov_vf(adev))) {
+ 
+-			r = adev->ip_blocks[i].version->funcs->resume(&adev->ip_blocks[i]);
+-			if (r) {
+-				DRM_ERROR("resume of IP block <%s> failed %d\n",
+-					  adev->ip_blocks[i].version->funcs->name, r);
++			r = amdgpu_ip_block_resume(&adev->ip_blocks[i]);
++			if (r)
+ 				return r;
+-			}
+-			adev->ip_blocks[i].status.hw = true;
+ 		}
+ 	}
+ 
+@@ -3760,13 +3774,9 @@ static int amdgpu_device_ip_resume_phase2(struct amdgpu_device *adev)
+ 		    adev->ip_blocks[i].version->type == AMD_IP_BLOCK_TYPE_IH ||
+ 		    adev->ip_blocks[i].version->type == AMD_IP_BLOCK_TYPE_PSP)
+ 			continue;
+-		r = adev->ip_blocks[i].version->funcs->resume(&adev->ip_blocks[i]);
+-		if (r) {
+-			DRM_ERROR("resume of IP block <%s> failed %d\n",
+-				  adev->ip_blocks[i].version->funcs->name, r);
++		r = amdgpu_ip_block_resume(&adev->ip_blocks[i]);
++		if (r)
+ 			return r;
+-		}
+-		adev->ip_blocks[i].status.hw = true;
+ 	}
+ 
+ 	return 0;
+diff --git a/drivers/gpu/drm/amd/amdgpu/sienna_cichlid.c b/drivers/gpu/drm/amd/amdgpu/sienna_cichlid.c
+index 341de4e38eeb..9b01e074af47 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sienna_cichlid.c
++++ b/drivers/gpu/drm/amd/amdgpu/sienna_cichlid.c
+@@ -169,15 +169,9 @@ static int sienna_cichlid_mode2_restore_ip(struct amdgpu_device *adev)
+ 
+ 	for (i = 0; i < adev->num_ip_blocks; i++) {
+ 		if (adev->ip_blocks[i].version->type == AMD_IP_BLOCK_TYPE_IH) {
+-			r = adev->ip_blocks[i].version->funcs->resume(&adev->ip_blocks[i]);
+-			if (r) {
+-				dev_err(adev->dev,
+-					"resume of IP block <%s> failed %d\n",
+-					adev->ip_blocks[i].version->funcs->name, r);
++			r = amdgpu_ip_block_resume(&adev->ip_blocks[i]);
++			if (r)
+ 				return r;
+-			}
+-
+-			adev->ip_blocks[i].status.hw = true;
+ 		}
+ 	}
+ 
+@@ -187,15 +181,9 @@ static int sienna_cichlid_mode2_restore_ip(struct amdgpu_device *adev)
+ 		      adev->ip_blocks[i].version->type ==
+ 			      AMD_IP_BLOCK_TYPE_SDMA))
+ 			continue;
+-		r = adev->ip_blocks[i].version->funcs->resume(&adev->ip_blocks[i]);
+-		if (r) {
+-			dev_err(adev->dev,
+-				"resume of IP block <%s> failed %d\n",
+-				adev->ip_blocks[i].version->funcs->name, r);
++		r = amdgpu_ip_block_resume(&adev->ip_blocks[i]);
++		if (r)
+ 			return r;
+-		}
+-
+-		adev->ip_blocks[i].status.hw = true;
+ 	}
+ 
+ 	for (i = 0; i < adev->num_ip_blocks; i++) {
+diff --git a/drivers/gpu/drm/amd/amdgpu/smu_v13_0_10.c b/drivers/gpu/drm/amd/amdgpu/smu_v13_0_10.c
+index 12e792ca873b..e70ebad3f9fa 100644
+--- a/drivers/gpu/drm/amd/amdgpu/smu_v13_0_10.c
++++ b/drivers/gpu/drm/amd/amdgpu/smu_v13_0_10.c
+@@ -180,15 +180,9 @@ static int smu_v13_0_10_mode2_restore_ip(struct amdgpu_device *adev)
+ 		      adev->ip_blocks[i].version->type ==
+ 			      AMD_IP_BLOCK_TYPE_SDMA))
+ 			continue;
+-		r = adev->ip_blocks[i].version->funcs->resume(&adev->ip_blocks[i]);
+-		if (r) {
+-			dev_err(adev->dev,
+-				"resume of IP block <%s> failed %d\n",
+-				adev->ip_blocks[i].version->funcs->name, r);
++		r = amdgpu_ip_block_resume(&adev->ip_blocks[i]);
++		if (r)
+ 			return r;
+-		}
+-
+-		adev->ip_blocks[i].status.hw = true;
+ 	}
+ 
+ 	for (i = 0; i < adev->num_ip_blocks; i++) {
+-- 
+2.52.0
+
