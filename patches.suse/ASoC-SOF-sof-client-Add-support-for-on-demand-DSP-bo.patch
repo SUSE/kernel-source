@@ -1,0 +1,169 @@
+From 2cf7a9ced3c1a999f7de8711cb2a212557fbd800 Mon Sep 17 00:00:00 2001
+From: Peter Ujfalusi <peter.ujfalusi@linux.intel.com>
+Date: Mon, 15 Dec 2025 15:29:42 +0200
+Subject: [PATCH] ASoC: SOF: sof-client: Add support for on-demand DSP boot
+Git-commit: 2cf7a9ced3c1a999f7de8711cb2a212557fbd800
+Patch-mainline: v7.0-rc1
+References: jsc#PED-14430
+
+With the introduction of on-demand DSP boot the rpm status not necessary
+tells that the DSP firmware is booted up.
+
+Introduce the sof_client_boot_dsp() which can be used to make sure that
+the DSP is booted and it can handle IPCs.
+
+Update the client drivers to use the new function where it is expected that
+the DSP is booted up.
+
+Signed-off-by: Peter Ujfalusi <peter.ujfalusi@linux.intel.com>
+Reviewed-by: Bard Liao <yung-chuan.liao@linux.intel.com>
+Reviewed-by: Kai Vehmanen <kai.vehmanen@linux.intel.com>
+Reviewed-by: Liam Girdwood <liam.r.girdwood@intel.com>
+Link: https://patch.msgid.link/20251215132946.2155-5-peter.ujfalusi@linux.intel.com
+Signed-off-by: Mark Brown <broonie@kernel.org>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ sound/soc/sof/sof-client-ipc-flood-test.c      |    7 +++---
+ sound/soc/sof/sof-client-ipc-kernel-injector.c |    4 ++-
+ sound/soc/sof/sof-client-ipc-msg-injector.c    |   14 ++++++++-----
+ sound/soc/sof/sof-client-probes.c              |   26 +++++++++++++++++++------
+ sound/soc/sof/sof-client.c                     |    6 +++++
+ sound/soc/sof/sof-client.h                     |    3 ++
+ 6 files changed, 45 insertions(+), 15 deletions(-)
+
+--- a/sound/soc/sof/sof-client-ipc-flood-test.c
++++ b/sound/soc/sof/sof-client-ipc-flood-test.c
+@@ -219,9 +219,10 @@ static ssize_t sof_ipc_flood_dfs_write(s
+ 		goto out;
+ 	}
+ 
+-	/* flood test */
+-	ret = sof_debug_ipc_flood_test(cdev, flood_duration_test,
+-				       ipc_duration_ms, ipc_count);
++	ret = sof_client_boot_dsp(cdev);
++	if (!ret)
++		ret = sof_debug_ipc_flood_test(cdev, flood_duration_test,
++					       ipc_duration_ms, ipc_count);
+ 
+ 	err = pm_runtime_put_autosuspend(dev);
+ 	if (err < 0)
+--- a/sound/soc/sof/sof-client-ipc-kernel-injector.c
++++ b/sound/soc/sof/sof-client-ipc-kernel-injector.c
+@@ -63,7 +63,9 @@ static ssize_t sof_kernel_msg_inject_dfs
+ 		return ret;
+ 	}
+ 
+-	sof_client_ipc_rx_message(cdev, hdr, priv->kernel_buffer);
++	ret = sof_client_boot_dsp(cdev);
++	if (!ret)
++		sof_client_ipc_rx_message(cdev, hdr, priv->kernel_buffer);
+ 
+ 	ret = pm_runtime_put_autosuspend(dev);
+ 	if (ret < 0)
+--- a/sound/soc/sof/sof-client-ipc-msg-injector.c
++++ b/sound/soc/sof/sof-client-ipc-msg-injector.c
+@@ -131,11 +131,15 @@ static int sof_msg_inject_send_message(s
+ 		return ret;
+ 	}
+ 
+-	/* send the message */
+-	ret = sof_client_ipc_tx_message(cdev, priv->tx_buffer, priv->rx_buffer,
+-					priv->max_msg_size);
+-	if (ret)
+-		dev_err(dev, "IPC message send failed: %d\n", ret);
++	ret = sof_client_boot_dsp(cdev);
++	if (!ret) {
++		/* send the message */
++		ret = sof_client_ipc_tx_message(cdev, priv->tx_buffer,
++						priv->rx_buffer,
++						priv->max_msg_size);
++		if (ret)
++			dev_err(dev, "IPC message send failed: %d\n", ret);
++	}
+ 
+ 	err = pm_runtime_put_autosuspend(dev);
+ 	if (err < 0)
+--- a/sound/soc/sof/sof-client-probes.c
++++ b/sound/soc/sof/sof-client-probes.c
+@@ -123,6 +123,10 @@ static int sof_probes_compr_set_params(s
+ 	if (ret)
+ 		return ret;
+ 
++	ret = sof_client_boot_dsp(cdev);
++	if (ret)
++		return ret;
++
+ 	ret = ipc->init(cdev, priv->extractor_stream_tag, rtd->dma_bytes);
+ 	if (ret < 0) {
+ 		dev_err(dai->dev, "Failed to init probe: %d\n", ret);
+@@ -224,6 +228,10 @@ static ssize_t sof_probes_dfs_points_rea
+ 		goto exit;
+ 	}
+ 
++	ret = sof_client_boot_dsp(cdev);
++	if (ret)
++		goto pm_error;
++
+ 	ret = ipc->points_info(cdev, &desc, &num_desc, type);
+ 	if (ret < 0)
+ 		goto pm_error;
+@@ -312,9 +320,12 @@ sof_probes_dfs_points_write(struct file
+ 		goto exit;
+ 	}
+ 
+-	ret = ipc->points_add(cdev, desc, bytes / sizeof(*desc));
+-	if (!ret)
+-		ret = count;
++	ret = sof_client_boot_dsp(cdev);
++	if (!ret) {
++		ret = ipc->points_add(cdev, desc, bytes / sizeof(*desc));
++		if (!ret)
++			ret = count;
++	}
+ 
+ 	err = pm_runtime_put_autosuspend(dev);
+ 	if (err < 0)
+@@ -367,9 +378,12 @@ sof_probes_dfs_points_remove_write(struc
+ 		goto exit;
+ 	}
+ 
+-	ret = ipc->points_remove(cdev, &array[1], array[0]);
+-	if (!ret)
+-		ret = count;
++	ret = sof_client_boot_dsp(cdev);
++	if (!ret) {
++		ret = ipc->points_remove(cdev, &array[1], array[0]);
++		if (!ret)
++			ret = count;
++	}
+ 
+ 	err = pm_runtime_put_autosuspend(dev);
+ 	if (err < 0)
+--- a/sound/soc/sof/sof-client.c
++++ b/sound/soc/sof/sof-client.c
+@@ -486,6 +486,12 @@ enum sof_ipc_type sof_client_get_ipc_typ
+ }
+ EXPORT_SYMBOL_NS_GPL(sof_client_get_ipc_type, SND_SOC_SOF_CLIENT);
+ 
++int sof_client_boot_dsp(struct sof_client_dev *cdev)
++{
++	return snd_sof_boot_dsp_firmware(sof_client_dev_to_sof_dev(cdev));
++}
++EXPORT_SYMBOL_NS_GPL(sof_client_boot_dsp, SND_SOC_SOF_CLIENT);
++
+ /* module refcount management of SOF core */
+ int sof_client_core_module_get(struct sof_client_dev *cdev)
+ {
+--- a/sound/soc/sof/sof-client.h
++++ b/sound/soc/sof/sof-client.h
+@@ -50,6 +50,9 @@ const struct sof_ipc_fw_version *sof_cli
+ size_t sof_client_get_ipc_max_payload_size(struct sof_client_dev *cdev);
+ enum sof_ipc_type sof_client_get_ipc_type(struct sof_client_dev *cdev);
+ 
++/* DSP/firmware boot request */
++int sof_client_boot_dsp(struct sof_client_dev *cdev);
++
+ /* module refcount management of SOF core */
+ int sof_client_core_module_get(struct sof_client_dev *cdev);
+ void sof_client_core_module_put(struct sof_client_dev *cdev);
