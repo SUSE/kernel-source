@@ -1,0 +1,321 @@
+From ae5d0397b7e6a563aeb8708b08cad17390755a8f Mon Sep 17 00:00:00 2001
+From: Ankit Nautiyal <ankit.k.nautiyal@intel.com>
+Date: Wed, 18 Sep 2024 12:00:16 +0530
+Subject: drm/i915/display: Enhance iterators for modeset en/disable
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: ae5d0397b7e6a563aeb8708b08cad17390755a8f
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Joiners have specific enabling and disabling order dependent on primary
+and secondary pipes. This becomes more complex with ultrajoiner where we
+have ultrajoiner primary/secondary pipes in addition to bigjoiner
+primary/secondary pipes. To unify the approach that works for present
+and future joiner cases, use primary and secondary pipe masks to
+iterate over pipes.
+
+If joiner is used, derive bigoiner primary and secondary pipe masks
+and use following sequences:
+Disabling : disable primary pipes followed by secondary pipes,
+Enabling: enable secondary pipes followed by primary pipes.
+
+This works well with ultrajoiner too, as ultrajoiner has 2 bigjoiner
+primary/secondary pairs (AC, BD).
+
+For non joiner case, enable/disable based on usual pipe order A-D, D-A
+respectively.
+
+V2: 
+-Simplify the iterator macro. (Ville)
+-Use struct intel_display. (Ville)
+-Add prefix _intel to the helper name. (Ville)
+
+Signed-off-by: Ankit Nautiyal <ankit.k.nautiyal@intel.com>
+Suggested-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20240918063016.2667721-3-ankit.k.nautiyal@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/intel_ddi.c     | 14 +++----
+ drivers/gpu/drm/i915/display/intel_display.c | 40 ++++++++++++--------
+ drivers/gpu/drm/i915/display/intel_display.h | 26 +++++++++++++
+ drivers/gpu/drm/i915/display/intel_dp_mst.c  | 14 +++----
+ 4 files changed, 64 insertions(+), 30 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_ddi.c b/drivers/gpu/drm/i915/display/intel_ddi.c
+index b1c294236cc8..85e519a21542 100644
+--- a/drivers/gpu/drm/i915/display/intel_ddi.c
++++ b/drivers/gpu/drm/i915/display/intel_ddi.c
+@@ -3115,11 +3115,12 @@ static void intel_ddi_post_disable_hdmi_or_sst(struct intel_atomic_state *state,
+ 					       const struct intel_crtc_state *old_crtc_state,
+ 					       const struct drm_connector_state *old_conn_state)
+ {
++	struct intel_display *display = to_intel_display(encoder);
+ 	struct drm_i915_private *dev_priv = to_i915(encoder->base.dev);
+ 	struct intel_crtc *pipe_crtc;
++	int i;
+ 
+-	for_each_intel_crtc_in_pipe_mask(&dev_priv->drm, pipe_crtc,
+-					 intel_crtc_joined_pipe_mask(old_crtc_state)) {
++	for_each_pipe_crtc_modeset_disable(display, pipe_crtc, old_crtc_state, i) {
+ 		const struct intel_crtc_state *old_pipe_crtc_state =
+ 			intel_atomic_get_old_crtc_state(state, pipe_crtc);
+ 
+@@ -3130,8 +3131,7 @@ static void intel_ddi_post_disable_hdmi_or_sst(struct intel_atomic_state *state,
+ 
+ 	intel_ddi_disable_transcoder_func(old_crtc_state);
+ 
+-	for_each_intel_crtc_in_pipe_mask(&dev_priv->drm, pipe_crtc,
+-					 intel_crtc_joined_pipe_mask(old_crtc_state)) {
++	for_each_pipe_crtc_modeset_disable(display, pipe_crtc, old_crtc_state, i) {
+ 		const struct intel_crtc_state *old_pipe_crtc_state =
+ 			intel_atomic_get_old_crtc_state(state, pipe_crtc);
+ 
+@@ -3382,8 +3382,9 @@ static void intel_enable_ddi(struct intel_atomic_state *state,
+ 			     const struct intel_crtc_state *crtc_state,
+ 			     const struct drm_connector_state *conn_state)
+ {
+-	struct drm_i915_private *i915 = to_i915(encoder->base.dev);
++	struct intel_display *display = to_intel_display(encoder);
+ 	struct intel_crtc *pipe_crtc;
++	int i;
+ 
+ 	intel_ddi_enable_transcoder_func(encoder, crtc_state);
+ 
+@@ -3394,8 +3395,7 @@ static void intel_enable_ddi(struct intel_atomic_state *state,
+ 
+ 	intel_ddi_wait_for_fec_status(encoder, crtc_state, true);
+ 
+-	for_each_intel_crtc_in_pipe_mask_reverse(&i915->drm, pipe_crtc,
+-						 intel_crtc_joined_pipe_mask(crtc_state)) {
++	for_each_pipe_crtc_modeset_enable(display, pipe_crtc, crtc_state, i) {
+ 		const struct intel_crtc_state *pipe_crtc_state =
+ 			intel_atomic_get_new_crtc_state(state, pipe_crtc);
+ 
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index 9f108d5e00ef..7cdc12188df9 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -299,6 +299,21 @@ bool intel_crtc_is_bigjoiner_secondary(const struct intel_crtc_state *crtc_state
+ 	return BIT(crtc->pipe) & bigjoiner_secondary_pipes(crtc_state);
+ }
+ 
++u8 _intel_modeset_primary_pipes(const struct intel_crtc_state *crtc_state)
++{
++	struct intel_crtc *crtc = to_intel_crtc(crtc_state->uapi.crtc);
++
++	if (!is_bigjoiner(crtc_state))
++		return BIT(crtc->pipe);
++
++	return bigjoiner_primary_pipes(crtc_state);
++}
++
++u8 _intel_modeset_secondary_pipes(const struct intel_crtc_state *crtc_state)
++{
++	return bigjoiner_secondary_pipes(crtc_state);
++}
++
+ u8 intel_crtc_joiner_secondary_pipes(const struct intel_crtc_state *crtc_state)
+ {
+ 	if (crtc_state->joiner_pipes)
+@@ -1729,18 +1744,16 @@ static void hsw_crtc_enable(struct intel_atomic_state *state,
+ 	struct drm_i915_private *dev_priv = to_i915(crtc->base.dev);
+ 	enum transcoder cpu_transcoder = new_crtc_state->cpu_transcoder;
+ 	struct intel_crtc *pipe_crtc;
++	int i;
+ 
+ 	if (drm_WARN_ON(&dev_priv->drm, crtc->active))
+ 		return;
+-
+-	for_each_intel_crtc_in_pipe_mask_reverse(&dev_priv->drm, pipe_crtc,
+-						 intel_crtc_joined_pipe_mask(new_crtc_state))
++	for_each_pipe_crtc_modeset_enable(display, pipe_crtc, new_crtc_state, i)
+ 		intel_dmc_enable_pipe(display, pipe_crtc->pipe);
+ 
+ 	intel_encoders_pre_pll_enable(state, crtc);
+ 
+-	for_each_intel_crtc_in_pipe_mask_reverse(&dev_priv->drm, pipe_crtc,
+-						 intel_crtc_joined_pipe_mask(new_crtc_state)) {
++	for_each_pipe_crtc_modeset_enable(display, pipe_crtc, new_crtc_state, i) {
+ 		const struct intel_crtc_state *pipe_crtc_state =
+ 			intel_atomic_get_new_crtc_state(state, pipe_crtc);
+ 
+@@ -1750,8 +1763,7 @@ static void hsw_crtc_enable(struct intel_atomic_state *state,
+ 
+ 	intel_encoders_pre_enable(state, crtc);
+ 
+-	for_each_intel_crtc_in_pipe_mask_reverse(&dev_priv->drm, pipe_crtc,
+-						 intel_crtc_joined_pipe_mask(new_crtc_state)) {
++	for_each_pipe_crtc_modeset_enable(display, pipe_crtc, new_crtc_state, i) {
+ 		const struct intel_crtc_state *pipe_crtc_state =
+ 			intel_atomic_get_new_crtc_state(state, pipe_crtc);
+ 
+@@ -1769,8 +1781,7 @@ static void hsw_crtc_enable(struct intel_atomic_state *state,
+ 	if (!transcoder_is_dsi(cpu_transcoder))
+ 		hsw_configure_cpu_transcoder(new_crtc_state);
+ 
+-	for_each_intel_crtc_in_pipe_mask_reverse(&dev_priv->drm, pipe_crtc,
+-						 intel_crtc_joined_pipe_mask(new_crtc_state)) {
++	for_each_pipe_crtc_modeset_enable(display, pipe_crtc, new_crtc_state, i) {
+ 		const struct intel_crtc_state *pipe_crtc_state =
+ 			intel_atomic_get_new_crtc_state(state, pipe_crtc);
+ 
+@@ -1805,8 +1816,7 @@ static void hsw_crtc_enable(struct intel_atomic_state *state,
+ 
+ 	intel_encoders_enable(state, crtc);
+ 
+-	for_each_intel_crtc_in_pipe_mask_reverse(&dev_priv->drm, pipe_crtc,
+-						 intel_crtc_joined_pipe_mask(new_crtc_state)) {
++	for_each_pipe_crtc_modeset_enable(display, pipe_crtc, new_crtc_state, i) {
+ 		const struct intel_crtc_state *pipe_crtc_state =
+ 			intel_atomic_get_new_crtc_state(state, pipe_crtc);
+ 		enum pipe hsw_workaround_pipe;
+@@ -1889,10 +1899,10 @@ static void hsw_crtc_disable(struct intel_atomic_state *state,
+ 			     struct intel_crtc *crtc)
+ {
+ 	struct intel_display *display = to_intel_display(state);
+-	struct drm_i915_private *i915 = to_i915(display->drm);
+ 	const struct intel_crtc_state *old_crtc_state =
+ 		intel_atomic_get_old_crtc_state(state, crtc);
+ 	struct intel_crtc *pipe_crtc;
++	int i;
+ 
+ 	/*
+ 	 * FIXME collapse everything to one hook.
+@@ -1901,8 +1911,7 @@ static void hsw_crtc_disable(struct intel_atomic_state *state,
+ 	intel_encoders_disable(state, crtc);
+ 	intel_encoders_post_disable(state, crtc);
+ 
+-	for_each_intel_crtc_in_pipe_mask(&i915->drm, pipe_crtc,
+-					 intel_crtc_joined_pipe_mask(old_crtc_state)) {
++	for_each_pipe_crtc_modeset_disable(display, pipe_crtc, old_crtc_state, i) {
+ 		const struct intel_crtc_state *old_pipe_crtc_state =
+ 			intel_atomic_get_old_crtc_state(state, pipe_crtc);
+ 
+@@ -1911,8 +1920,7 @@ static void hsw_crtc_disable(struct intel_atomic_state *state,
+ 
+ 	intel_encoders_post_pll_disable(state, crtc);
+ 
+-	for_each_intel_crtc_in_pipe_mask(&i915->drm, pipe_crtc,
+-					 intel_crtc_joined_pipe_mask(old_crtc_state))
++	for_each_pipe_crtc_modeset_disable(display, pipe_crtc, old_crtc_state, i)
+ 		intel_dmc_disable_pipe(display, pipe_crtc->pipe);
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/display/intel_display.h b/drivers/gpu/drm/i915/display/intel_display.h
+index 64ca0f1ae013..783562dc013b 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.h
++++ b/drivers/gpu/drm/i915/display/intel_display.h
+@@ -392,6 +392,30 @@ enum phy_fia {
+ 			     ((connector) = to_intel_connector((__state)->base.connectors[__i].ptr), \
+ 			     (new_connector_state) = to_intel_digital_connector_state((__state)->base.connectors[__i].new_state), 1))
+ 
++#define for_each_crtc_in_masks(display, crtc, first_pipes, second_pipes, i) \
++	for ((i) = 0; \
++	     (i) < (I915_MAX_PIPES * 2) && ((crtc) = intel_crtc_for_pipe(display, (i) % I915_MAX_PIPES), 1); \
++	     (i)++) \
++		for_each_if((crtc) && ((first_pipes) | ((second_pipes) << I915_MAX_PIPES)) & BIT(i))
++
++#define for_each_crtc_in_masks_reverse(display, crtc, first_pipes, second_pipes, i) \
++	for ((i) = (I915_MAX_PIPES * 2 - 1); \
++	     (i) >= 0 && ((crtc) = intel_crtc_for_pipe(display, (i) % I915_MAX_PIPES), 1); \
++	     (i)--) \
++		for_each_if((crtc) && ((first_pipes) | ((second_pipes) << I915_MAX_PIPES)) & BIT(i))
++
++#define for_each_pipe_crtc_modeset_disable(display, crtc, crtc_state, i) \
++	for_each_crtc_in_masks(display, crtc, \
++			       _intel_modeset_primary_pipes(crtc_state), \
++			       _intel_modeset_secondary_pipes(crtc_state), \
++			       i)
++
++#define for_each_pipe_crtc_modeset_enable(display, crtc, crtc_state, i) \
++	for_each_crtc_in_masks_reverse(display, crtc, \
++				       _intel_modeset_primary_pipes(crtc_state), \
++				       _intel_modeset_secondary_pipes(crtc_state), \
++				       i)
++
+ int intel_atomic_check(struct drm_device *dev, struct drm_atomic_state *state);
+ int intel_atomic_add_affected_planes(struct intel_atomic_state *state,
+ 				     struct intel_crtc *crtc);
+@@ -419,6 +443,8 @@ bool intel_crtc_is_joiner_primary(const struct intel_crtc_state *crtc_state);
+ bool intel_crtc_is_bigjoiner_primary(const struct intel_crtc_state *crtc_state);
+ bool intel_crtc_is_bigjoiner_secondary(const struct intel_crtc_state *crtc_state);
+ u8 intel_crtc_joiner_secondary_pipes(const struct intel_crtc_state *crtc_state);
++u8 _intel_modeset_primary_pipes(const struct intel_crtc_state *crtc_state);
++u8 _intel_modeset_secondary_pipes(const struct intel_crtc_state *crtc_state);
+ struct intel_crtc *intel_primary_crtc(const struct intel_crtc_state *crtc_state);
+ bool intel_crtc_get_pipe_config(struct intel_crtc_state *crtc_state);
+ bool intel_pipe_config_compare(const struct intel_crtc_state *current_config,
+diff --git a/drivers/gpu/drm/i915/display/intel_dp_mst.c b/drivers/gpu/drm/i915/display/intel_dp_mst.c
+index 77b049411417..78dd83f44732 100644
+--- a/drivers/gpu/drm/i915/display/intel_dp_mst.c
++++ b/drivers/gpu/drm/i915/display/intel_dp_mst.c
+@@ -1008,6 +1008,7 @@ static void intel_mst_post_disable_dp(struct intel_atomic_state *state,
+ 				      const struct intel_crtc_state *old_crtc_state,
+ 				      const struct drm_connector_state *old_conn_state)
+ {
++	struct intel_display *display = to_intel_display(encoder);
+ 	struct intel_dp_mst_encoder *intel_mst = enc_to_mst(encoder);
+ 	struct intel_digital_port *dig_port = intel_mst->primary;
+ 	struct intel_dp *intel_dp = &dig_port->dp;
+@@ -1024,6 +1025,7 @@ static void intel_mst_post_disable_dp(struct intel_atomic_state *state,
+ 	struct drm_i915_private *dev_priv = to_i915(connector->base.dev);
+ 	struct intel_crtc *pipe_crtc;
+ 	bool last_mst_stream;
++	int i;
+ 
+ 	intel_dp->active_mst_links--;
+ 	last_mst_stream = intel_dp->active_mst_links == 0;
+@@ -1031,8 +1033,7 @@ static void intel_mst_post_disable_dp(struct intel_atomic_state *state,
+ 		    DISPLAY_VER(dev_priv) >= 12 && last_mst_stream &&
+ 		    !intel_dp_mst_is_master_trans(old_crtc_state));
+ 
+-	for_each_intel_crtc_in_pipe_mask(&dev_priv->drm, pipe_crtc,
+-					 intel_crtc_joined_pipe_mask(old_crtc_state)) {
++	for_each_pipe_crtc_modeset_disable(display, pipe_crtc, old_crtc_state, i) {
+ 		const struct intel_crtc_state *old_pipe_crtc_state =
+ 			intel_atomic_get_old_crtc_state(state, pipe_crtc);
+ 
+@@ -1056,8 +1057,7 @@ static void intel_mst_post_disable_dp(struct intel_atomic_state *state,
+ 
+ 	intel_ddi_disable_transcoder_func(old_crtc_state);
+ 
+-	for_each_intel_crtc_in_pipe_mask(&dev_priv->drm, pipe_crtc,
+-					 intel_crtc_joined_pipe_mask(old_crtc_state)) {
++	for_each_pipe_crtc_modeset_disable(display, pipe_crtc, old_crtc_state, i) {
+ 		const struct intel_crtc_state *old_pipe_crtc_state =
+ 			intel_atomic_get_old_crtc_state(state, pipe_crtc);
+ 
+@@ -1266,6 +1266,7 @@ static void intel_mst_enable_dp(struct intel_atomic_state *state,
+ 				const struct intel_crtc_state *pipe_config,
+ 				const struct drm_connector_state *conn_state)
+ {
++	struct intel_display *display = to_intel_display(encoder);
+ 	struct intel_dp_mst_encoder *intel_mst = enc_to_mst(encoder);
+ 	struct intel_digital_port *dig_port = intel_mst->primary;
+ 	struct intel_dp *intel_dp = &dig_port->dp;
+@@ -1276,7 +1277,7 @@ static void intel_mst_enable_dp(struct intel_atomic_state *state,
+ 	enum transcoder trans = pipe_config->cpu_transcoder;
+ 	bool first_mst_stream = intel_dp->active_mst_links == 1;
+ 	struct intel_crtc *pipe_crtc;
+-	int ret;
++	int ret, i;
+ 
+ 	drm_WARN_ON(&dev_priv->drm, pipe_config->has_pch_encoder);
+ 
+@@ -1323,8 +1324,7 @@ static void intel_mst_enable_dp(struct intel_atomic_state *state,
+ 
+ 	intel_enable_transcoder(pipe_config);
+ 
+-	for_each_intel_crtc_in_pipe_mask_reverse(&dev_priv->drm, pipe_crtc,
+-						 intel_crtc_joined_pipe_mask(pipe_config)) {
++	for_each_pipe_crtc_modeset_enable(display, pipe_crtc, pipe_config, i) {
+ 		const struct intel_crtc_state *pipe_crtc_state =
+ 			intel_atomic_get_new_crtc_state(state, pipe_crtc);
+ 
+-- 
+2.52.0
+
