@@ -1,0 +1,235 @@
+From 4c3d525f65733e760f3700c0f3c83e8e46d2dcd8 Mon Sep 17 00:00:00 2001
+From: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Date: Sun, 2 Jun 2024 15:04:50 +0300
+Subject: drm/imx: ldb: switch to imx_legacy_bridge / drm_bridge_connector
+Git-commit: 4c3d525f65733e760f3700c0f3c83e8e46d2dcd8
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Use the imx_legacy bridge driver instead of handlign display modes via
+the connector node.
+
+All existing usecases already support attaching using
+the DRM_BRIDGE_ATTACH_NO_CONNECTOR flag, while the imx_legacy bridge
+doesn't support creating connector at all. Switch to
+drm_bridge_connector at the same time.
+
+Reviewed-by: Philipp Zabel <p.zabel@pengutronix.de>
+Tested-by: Chris Healy <cphealy@gmail.com>
+Tested-by: Philipp Zabel <p.zabel@pengutronix.de> # on imx6q-nitrogen6x
+Link: https://patchwork.freedesktop.org/patch/msgid/20240602-drm-imx-cleanup-v3-10-e549e2a43100@linaro.org
+Signed-off-by: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/imx/ipuv3/Kconfig   |   1 +
+ drivers/gpu/drm/imx/ipuv3/imx-ldb.c | 103 ++++++++--------------------
+ 2 files changed, 30 insertions(+), 74 deletions(-)
+
+diff --git a/drivers/gpu/drm/imx/ipuv3/Kconfig b/drivers/gpu/drm/imx/ipuv3/Kconfig
+index f083d313d1d3..5a40c878ebb0 100644
+--- a/drivers/gpu/drm/imx/ipuv3/Kconfig
++++ b/drivers/gpu/drm/imx/ipuv3/Kconfig
+@@ -32,6 +32,7 @@ config DRM_IMX_LDB
+ 	select MFD_SYSCON
+ 	select DRM_BRIDGE
+ 	select DRM_PANEL_BRIDGE
++	select DRM_IMX_LEGACY_BRIDGE
+ 	help
+ 	  Choose this to enable the internal LVDS Display Bridge (LDB)
+ 	  found on i.MX53 and i.MX6 processors.
+diff --git a/drivers/gpu/drm/imx/ipuv3/imx-ldb.c b/drivers/gpu/drm/imx/ipuv3/imx-ldb.c
+index bc7ad9697130..ff74018ac5cd 100644
+--- a/drivers/gpu/drm/imx/ipuv3/imx-ldb.c
++++ b/drivers/gpu/drm/imx/ipuv3/imx-ldb.c
+@@ -19,17 +19,16 @@
+ #include <linux/regmap.h>
+ #include <linux/videodev2.h>
+ 
+-#include <video/of_display_timing.h>
+-#include <video/of_videomode.h>
+-
+ #include <drm/drm_atomic.h>
+ #include <drm/drm_atomic_helper.h>
+ #include <drm/drm_bridge.h>
++#include <drm/drm_bridge_connector.h>
+ #include <drm/drm_managed.h>
+ #include <drm/drm_of.h>
+ #include <drm/drm_print.h>
+ #include <drm/drm_probe_helper.h>
+ #include <drm/drm_simple_kms_helper.h>
++#include <drm/bridge/imx.h>
+ 
+ #include "imx-drm.h"
+ 
+@@ -53,7 +52,6 @@
+ struct imx_ldb_channel;
+ 
+ struct imx_ldb_encoder {
+-	struct drm_connector connector;
+ 	struct drm_encoder encoder;
+ 	struct imx_ldb_channel *channel;
+ };
+@@ -67,17 +65,9 @@ struct imx_ldb_channel {
+ 
+ 	struct device_node *child;
+ 	int chno;
+-	struct drm_display_mode mode;
+-	int mode_valid;
+ 	u32 bus_format;
+-	u32 bus_flags;
+ };
+ 
+-static inline struct imx_ldb_channel *con_to_imx_ldb_ch(struct drm_connector *c)
+-{
+-	return container_of(c, struct imx_ldb_encoder, connector)->channel;
+-}
+-
+ static inline struct imx_ldb_channel *enc_to_imx_ldb_ch(struct drm_encoder *e)
+ {
+ 	return container_of(e, struct imx_ldb_encoder, encoder)->channel;
+@@ -127,25 +117,6 @@ static void imx_ldb_ch_set_bus_format(struct imx_ldb_channel *imx_ldb_ch,
+ 	}
+ }
+ 
+-static int imx_ldb_connector_get_modes(struct drm_connector *connector)
+-{
+-	struct imx_ldb_channel *imx_ldb_ch = con_to_imx_ldb_ch(connector);
+-	int num_modes;
+-
+-	if (imx_ldb_ch->mode_valid) {
+-		struct drm_display_mode *mode;
+-
+-		mode = drm_mode_duplicate(connector->dev, &imx_ldb_ch->mode);
+-		if (!mode)
+-			return -EINVAL;
+-		mode->type |= DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED;
+-		drm_mode_probed_add(connector, mode);
+-		num_modes++;
+-	}
+-
+-	return num_modes;
+-}
+-
+ static void imx_ldb_set_clock(struct imx_ldb *ldb, int mux, int chno,
+ 		unsigned long serial_clk, unsigned long di_clk)
+ {
+@@ -347,11 +318,12 @@ static int imx_ldb_encoder_atomic_check(struct drm_encoder *encoder,
+ 	/* Bus format description in DT overrides connector display info. */
+ 	if (!bus_format && di->num_bus_formats) {
+ 		bus_format = di->bus_formats[0];
+-		imx_crtc_state->bus_flags = di->bus_flags;
+ 	} else {
+ 		bus_format = imx_ldb_ch->bus_format;
+-		imx_crtc_state->bus_flags = imx_ldb_ch->bus_flags;
+ 	}
++
++	imx_crtc_state->bus_flags = di->bus_flags;
++
+ 	switch (bus_format) {
+ 	case MEDIA_BUS_FMT_RGB666_1X7X3_SPWG:
+ 		imx_crtc_state->bus_format = MEDIA_BUS_FMT_RGB666_1X18;
+@@ -371,18 +343,6 @@ static int imx_ldb_encoder_atomic_check(struct drm_encoder *encoder,
+ }
+ 
+ 
+-static const struct drm_connector_funcs imx_ldb_connector_funcs = {
+-	.fill_modes = drm_helper_probe_single_connector_modes,
+-	.destroy = imx_drm_connector_destroy,
+-	.reset = drm_atomic_helper_connector_reset,
+-	.atomic_duplicate_state = drm_atomic_helper_connector_duplicate_state,
+-	.atomic_destroy_state = drm_atomic_helper_connector_destroy_state,
+-};
+-
+-static const struct drm_connector_helper_funcs imx_ldb_connector_helper_funcs = {
+-	.get_modes = imx_ldb_connector_get_modes,
+-};
+-
+ static const struct drm_encoder_helper_funcs imx_ldb_encoder_helper_funcs = {
+ 	.atomic_mode_set = imx_ldb_encoder_atomic_mode_set,
+ 	.enable = imx_ldb_encoder_enable,
+@@ -420,7 +380,6 @@ static int imx_ldb_register(struct drm_device *drm,
+ 		return PTR_ERR(ldb_encoder);
+ 
+ 	ldb_encoder->channel = imx_ldb_ch;
+-	connector = &ldb_encoder->connector;
+ 	encoder = &ldb_encoder->encoder;
+ 
+ 	ret = imx_drm_encoder_parse_of(drm, encoder, imx_ldb_ch->child);
+@@ -439,24 +398,16 @@ static int imx_ldb_register(struct drm_device *drm,
+ 
+ 	drm_encoder_helper_add(encoder, &imx_ldb_encoder_helper_funcs);
+ 
+-	if (imx_ldb_ch->bridge) {
+-		ret = drm_bridge_attach(encoder, imx_ldb_ch->bridge, NULL, 0);
+-		if (ret)
+-			return ret;
+-	} else {
+-		/*
+-		 * We want to add the connector whenever there is no bridge
+-		 * that brings its own, not only when there is a panel. For
+-		 * historical reasons, the ldb driver can also work without
+-		 * a panel.
+-		 */
+-		drm_connector_helper_add(connector,
+-					 &imx_ldb_connector_helper_funcs);
+-		drm_connector_init(drm, connector,
+-				   &imx_ldb_connector_funcs,
+-				   DRM_MODE_CONNECTOR_LVDS);
+-		drm_connector_attach_encoder(connector, encoder);
+-	}
++	ret = drm_bridge_attach(encoder, imx_ldb_ch->bridge, NULL,
++				DRM_BRIDGE_ATTACH_NO_CONNECTOR);
++	if (ret)
++		return ret;
++
++	connector = drm_bridge_connector_init(drm, encoder);
++	if (IS_ERR(connector))
++		return PTR_ERR(connector);
++
++	drm_connector_attach_encoder(connector, encoder);
+ 
+ 	return 0;
+ }
+@@ -631,17 +582,7 @@ static int imx_ldb_probe(struct platform_device *pdev)
+ 			ret = PTR_ERR(channel->bridge);
+ 			if (ret != -ENODEV)
+ 				goto free_child;
+-
+ 			channel->bridge = NULL;
+-
+-			ret = of_get_drm_display_mode(child,
+-						      &channel->mode,
+-						      &channel->bus_flags,
+-						      OF_USE_NATIVE_MODE);
+-			if (ret)
+-				goto free_child;
+-
+-			channel->mode_valid = 1;
+ 		}
+ 
+ 		bus_format = of_get_bus_format(dev, child);
+@@ -658,6 +599,20 @@ static int imx_ldb_probe(struct platform_device *pdev)
+ 			goto free_child;
+ 		}
+ 		channel->bus_format = bus_format;
++
++		/*
++		 * legacy bridge doesn't handle bus_format, so create it after
++		 * checking the bus_format property.
++		 */
++		if (!channel->bridge) {
++			channel->bridge = devm_imx_drm_legacy_bridge(dev, child,
++								     DRM_MODE_CONNECTOR_LVDS);
++			if (IS_ERR(channel->bridge)) {
++				ret = PTR_ERR(channel->bridge);
++				goto free_child;
++			}
++		}
++
+ 		channel->child = child;
+ 	}
+ 
+-- 
+2.52.0
+
