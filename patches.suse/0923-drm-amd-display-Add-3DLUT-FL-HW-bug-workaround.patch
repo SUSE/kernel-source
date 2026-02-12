@@ -1,0 +1,323 @@
+From df60dcf5b58a642e531609d0d673bb63a11ed06e Mon Sep 17 00:00:00 2001
+From: Ilya Bakoulin <Ilya.Bakoulin@amd.com>
+Date: Mon, 16 Sep 2024 14:38:19 -0400
+Subject: drm/amd/display: Add 3DLUT FL HW bug workaround
+Git-commit: df60dcf5b58a642e531609d0d673bb63a11ed06e
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+[Why]
+There is a known HW bug that causes the internal 3DLUT fetch signal to
+be lost at VREADY, regardless of whether the OTG lock is being held or
+not. A workaround is necessary to make sure that this internal signal
+stays up after OTG unlock.
+
+[How]
+Set the 3DLUT_ENABLE bit immediately before and after the unlock. Also
+use VUPDATE_KEEPOUT to prevent lock transition in the region between
+VSTARTUP and VREADY, which could cause issues with this WA sequence.
+
+Also including misc. 3DLUT DMA-related sequence fixes to address a few
+regressions causing corruption.
+
+Reviewed-by: Dillon Varone <dillon.varone@amd.com>
+Signed-off-by: Ilya Bakoulin <Ilya.Bakoulin@amd.com>
+Signed-off-by: Roman Li <roman.li@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c      | 30 +++++++---
+ .../amd/display/dc/hwss/dcn20/dcn20_hwseq.c   |  8 ++-
+ .../amd/display/dc/hwss/dcn401/dcn401_hwseq.c | 60 ++++++++++++++++++-
+ .../amd/display/dc/hwss/dcn401/dcn401_hwseq.h |  2 +
+ .../amd/display/dc/hwss/dcn401/dcn401_init.c  |  1 +
+ .../display/dc/hwss/hw_sequencer_private.h    |  1 +
+ .../amd/display/dc/inc/hw/timing_generator.h  |  2 +
+ .../amd/display/dc/optc/dcn401/dcn401_optc.c  | 31 ++++++++++
+ 8 files changed, 122 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index d1e397d5f84e..743f3292d98e 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -2650,7 +2650,8 @@ static enum surface_update_type det_surface_update(const struct dc *dc,
+ 		elevate_update_type(&overall_type, type);
+ 	}
+ 
+-	if (update_flags->bits.lut_3d) {
++	if (update_flags->bits.lut_3d &&
++			u->surface->mcm_luts.lut3d_data.lut3d_src != DC_CM2_TRANSFER_FUNC_SOURCE_VIDMEM) {
+ 		type = UPDATE_TYPE_FULL;
+ 		elevate_update_type(&overall_type, type);
+ 	}
+@@ -2926,10 +2927,20 @@ static void copy_surface_update_to_plane(
+ 			sizeof(struct dc_transfer_func_distributed_points));
+ 	}
+ 
+-	if (srf_update->func_shaper)
++	if (srf_update->cm2_params) {
++		surface->mcm_shaper_3dlut_setting = srf_update->cm2_params->component_settings.shaper_3dlut_setting;
++		surface->mcm_lut1d_enable = srf_update->cm2_params->component_settings.lut1d_enable;
++		surface->mcm_luts = srf_update->cm2_params->cm2_luts;
++	}
++
++	if (srf_update->func_shaper) {
+ 		memcpy(&surface->in_shaper_func, srf_update->func_shaper,
+ 		sizeof(surface->in_shaper_func));
+ 
++		if (surface->mcm_shaper_3dlut_setting >= DC_CM2_SHAPER_3DLUT_SETTING_ENABLE_SHAPER)
++			surface->mcm_luts.shaper = &surface->in_shaper_func;
++	}
++
+ 	if (srf_update->lut3d_func)
+ 		memcpy(&surface->lut3d_func, srf_update->lut3d_func,
+ 		sizeof(surface->lut3d_func));
+@@ -2942,10 +2953,17 @@ static void copy_surface_update_to_plane(
+ 		surface->sdr_white_level_nits =
+ 				srf_update->sdr_white_level_nits;
+ 
+-	if (srf_update->blend_tf)
++	if (srf_update->blend_tf) {
+ 		memcpy(&surface->blend_tf, srf_update->blend_tf,
+ 		sizeof(surface->blend_tf));
+ 
++		if (surface->mcm_lut1d_enable)
++			surface->mcm_luts.lut1d_func = &surface->blend_tf;
++	}
++
++	if (srf_update->cm2_params || srf_update->blend_tf)
++		surface->lut_bank_a = !surface->lut_bank_a;
++
+ 	if (srf_update->input_csc_color_matrix)
+ 		surface->input_csc_color_matrix =
+ 			*srf_update->input_csc_color_matrix;
+@@ -2957,11 +2975,7 @@ static void copy_surface_update_to_plane(
+ 	if (srf_update->gamut_remap_matrix)
+ 		surface->gamut_remap_matrix =
+ 			*srf_update->gamut_remap_matrix;
+-	if (srf_update->cm2_params) {
+-		surface->mcm_shaper_3dlut_setting = srf_update->cm2_params->component_settings.shaper_3dlut_setting;
+-		surface->mcm_lut1d_enable = srf_update->cm2_params->component_settings.lut1d_enable;
+-		surface->mcm_luts = srf_update->cm2_params->cm2_luts;
+-	}
++
+ 	if (srf_update->cursor_csc_color_matrix)
+ 		surface->cursor_csc_color_matrix =
+ 			*srf_update->cursor_csc_color_matrix;
+diff --git a/drivers/gpu/drm/amd/display/dc/hwss/dcn20/dcn20_hwseq.c b/drivers/gpu/drm/amd/display/dc/hwss/dcn20/dcn20_hwseq.c
+index 1a32e53c1b22..9da5b50bea8a 100644
+--- a/drivers/gpu/drm/amd/display/dc/hwss/dcn20/dcn20_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/hwss/dcn20/dcn20_hwseq.c
+@@ -1458,8 +1458,12 @@ void dcn20_pipe_control_lock(
+ 	} else {
+ 		if (lock)
+ 			pipe->stream_res.tg->funcs->lock(pipe->stream_res.tg);
+-		else
+-			pipe->stream_res.tg->funcs->unlock(pipe->stream_res.tg);
++		else {
++			if (dc->hwseq->funcs.perform_3dlut_wa_unlock)
++				dc->hwseq->funcs.perform_3dlut_wa_unlock(pipe);
++			else
++				pipe->stream_res.tg->funcs->unlock(pipe->stream_res.tg);
++		}
+ 	}
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/hwss/dcn401/dcn401_hwseq.c b/drivers/gpu/drm/amd/display/dc/hwss/dcn401/dcn401_hwseq.c
+index 65176b59dcb2..413dcbf4decf 100644
+--- a/drivers/gpu/drm/amd/display/dc/hwss/dcn401/dcn401_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/hwss/dcn401/dcn401_hwseq.c
+@@ -506,7 +506,7 @@ void dcn401_populate_mcm_luts(struct dc *dc,
+ 	dcn401_get_mcm_lut_xable_from_pipe_ctx(dc, pipe_ctx, &shaper_xable, &lut3d_xable, &lut1d_xable);
+ 
+ 	/* 1D LUT */
+-	if (mcm_luts.lut1d_func && lut3d_xable != MCM_LUT_DISABLE) {
++	if (mcm_luts.lut1d_func) {
+ 		memset(&m_lut_params, 0, sizeof(m_lut_params));
+ 		if (mcm_luts.lut1d_func->type == TF_TYPE_HWPWL)
+ 			m_lut_params.pwl = &mcm_luts.lut1d_func->pwl;
+@@ -521,7 +521,7 @@ void dcn401_populate_mcm_luts(struct dc *dc,
+ 				mpc->funcs->populate_lut(mpc, MCM_LUT_1DLUT, m_lut_params, lut_bank_a, mpcc_id);
+ 		}
+ 		if (mpc->funcs->program_lut_mode)
+-			mpc->funcs->program_lut_mode(mpc, MCM_LUT_1DLUT, lut1d_xable, lut_bank_a, mpcc_id);
++			mpc->funcs->program_lut_mode(mpc, MCM_LUT_1DLUT, lut1d_xable && m_lut_params.pwl, lut_bank_a, mpcc_id);
+ 	}
+ 
+ 	/* Shaper */
+@@ -669,11 +669,17 @@ bool dcn401_set_mcm_luts(struct pipe_ctx *pipe_ctx,
+ {
+ 	struct dpp *dpp_base = pipe_ctx->plane_res.dpp;
+ 	int mpcc_id = pipe_ctx->plane_res.hubp->inst;
+-	struct mpc *mpc = pipe_ctx->stream_res.opp->ctx->dc->res_pool->mpc;
++	struct dc *dc = pipe_ctx->stream_res.opp->ctx->dc;
++	struct mpc *mpc = dc->res_pool->mpc;
+ 	bool result;
+ 	const struct pwl_params *lut_params = NULL;
+ 	bool rval;
+ 
++	if (plane_state->mcm_luts.lut3d_data.lut3d_src == DC_CM2_TRANSFER_FUNC_SOURCE_VIDMEM) {
++		dcn401_populate_mcm_luts(dc, pipe_ctx, plane_state->mcm_luts, plane_state->lut_bank_a);
++		return true;
++	}
++
+ 	mpc->funcs->set_movable_cm_location(mpc, MPCC_MOVABLE_CM_LOCATION_BEFORE, mpcc_id);
+ 	pipe_ctx->plane_state->mcm_location = MPCC_MOVABLE_CM_LOCATION_BEFORE;
+ 	// 1D LUT
+@@ -1814,6 +1820,54 @@ void dcn401_interdependent_update_lock(struct dc *dc,
+ 	}
+ }
+ 
++void dcn401_perform_3dlut_wa_unlock(struct pipe_ctx *pipe_ctx)
++{
++	/* If 3DLUT FL is enabled and 3DLUT is in use, follow the workaround sequence for pipe unlock to make sure that
++	 * HUBP will properly fetch 3DLUT contents after unlock.
++	 *
++	 * This is meant to work around a known HW issue where VREADY will cancel the pending 3DLUT_ENABLE signal regardless
++	 * of whether OTG lock is currently being held or not.
++	 */
++	struct pipe_ctx *wa_pipes[MAX_PIPES] = { NULL };
++	struct pipe_ctx *odm_pipe, *mpc_pipe;
++	int i, wa_pipe_ct = 0;
++
++	for (odm_pipe = pipe_ctx; odm_pipe != NULL; odm_pipe = odm_pipe->next_odm_pipe) {
++		for (mpc_pipe = odm_pipe; mpc_pipe != NULL; mpc_pipe = mpc_pipe->bottom_pipe) {
++			if (mpc_pipe->plane_state && mpc_pipe->plane_state->mcm_luts.lut3d_data.lut3d_src
++						== DC_CM2_TRANSFER_FUNC_SOURCE_VIDMEM
++					&& mpc_pipe->plane_state->mcm_shaper_3dlut_setting
++						== DC_CM2_SHAPER_3DLUT_SETTING_ENABLE_SHAPER_3DLUT) {
++				wa_pipes[wa_pipe_ct++] = mpc_pipe;
++			}
++		}
++	}
++
++	if (wa_pipe_ct > 0) {
++		if (pipe_ctx->stream_res.tg->funcs->set_vupdate_keepout)
++			pipe_ctx->stream_res.tg->funcs->set_vupdate_keepout(pipe_ctx->stream_res.tg, true);
++
++		for (i = 0; i < wa_pipe_ct; ++i) {
++			if (wa_pipes[i]->plane_res.hubp->funcs->hubp_enable_3dlut_fl)
++				wa_pipes[i]->plane_res.hubp->funcs->hubp_enable_3dlut_fl(wa_pipes[i]->plane_res.hubp, true);
++		}
++
++		pipe_ctx->stream_res.tg->funcs->unlock(pipe_ctx->stream_res.tg);
++		if (pipe_ctx->stream_res.tg->funcs->wait_update_lock_status)
++			pipe_ctx->stream_res.tg->funcs->wait_update_lock_status(pipe_ctx->stream_res.tg, false);
++
++		for (i = 0; i < wa_pipe_ct; ++i) {
++			if (wa_pipes[i]->plane_res.hubp->funcs->hubp_enable_3dlut_fl)
++				wa_pipes[i]->plane_res.hubp->funcs->hubp_enable_3dlut_fl(wa_pipes[i]->plane_res.hubp, true);
++		}
++
++		if (pipe_ctx->stream_res.tg->funcs->set_vupdate_keepout)
++			pipe_ctx->stream_res.tg->funcs->set_vupdate_keepout(pipe_ctx->stream_res.tg, false);
++	} else {
++		pipe_ctx->stream_res.tg->funcs->unlock(pipe_ctx->stream_res.tg);
++	}
++}
++
+ void dcn401_program_outstanding_updates(struct dc *dc,
+ 		struct dc_state *context)
+ {
+diff --git a/drivers/gpu/drm/amd/display/dc/hwss/dcn401/dcn401_hwseq.h b/drivers/gpu/drm/amd/display/dc/hwss/dcn401/dcn401_hwseq.h
+index 66d679080c44..28a513dfc005 100644
+--- a/drivers/gpu/drm/amd/display/dc/hwss/dcn401/dcn401_hwseq.h
++++ b/drivers/gpu/drm/amd/display/dc/hwss/dcn401/dcn401_hwseq.h
+@@ -95,4 +95,6 @@ void dcn401_reset_back_end_for_pipe(
+ void dcn401_reset_hw_ctx_wrap(
+ 		struct dc *dc,
+ 		struct dc_state *context);
++void dcn401_perform_3dlut_wa_unlock(struct pipe_ctx *pipe_ctx);
++
+ #endif /* __DC_HWSS_DCN401_H__ */
+diff --git a/drivers/gpu/drm/amd/display/dc/hwss/dcn401/dcn401_init.c b/drivers/gpu/drm/amd/display/dc/hwss/dcn401/dcn401_init.c
+index a1392e776709..c73305e57d39 100644
+--- a/drivers/gpu/drm/amd/display/dc/hwss/dcn401/dcn401_init.c
++++ b/drivers/gpu/drm/amd/display/dc/hwss/dcn401/dcn401_init.c
+@@ -138,6 +138,7 @@ static const struct hwseq_private_funcs dcn401_private_funcs = {
+ 	.apply_single_controller_ctx_to_hw = dce110_apply_single_controller_ctx_to_hw,
+ 	.reset_back_end_for_pipe = dcn401_reset_back_end_for_pipe,
+ 	.populate_mcm_luts = NULL,
++	.perform_3dlut_wa_unlock = dcn401_perform_3dlut_wa_unlock,
+ };
+ 
+ void dcn401_hw_sequencer_init_functions(struct dc *dc)
+diff --git a/drivers/gpu/drm/amd/display/dc/hwss/hw_sequencer_private.h b/drivers/gpu/drm/amd/display/dc/hwss/hw_sequencer_private.h
+index 0ac675456979..22a5d4a03c98 100644
+--- a/drivers/gpu/drm/amd/display/dc/hwss/hw_sequencer_private.h
++++ b/drivers/gpu/drm/amd/display/dc/hwss/hw_sequencer_private.h
+@@ -182,6 +182,7 @@ struct hwseq_private_funcs {
+ 			struct pipe_ctx *pipe_ctx,
+ 			struct dc_cm2_func_luts mcm_luts,
+ 			bool lut_bank_a);
++	void (*perform_3dlut_wa_unlock)(struct pipe_ctx *pipe_ctx);
+ };
+ 
+ struct dce_hwseq {
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/timing_generator.h b/drivers/gpu/drm/amd/display/dc/inc/hw/timing_generator.h
+index 4e08e80eafe8..b74e18cc1e66 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/timing_generator.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/timing_generator.h
+@@ -345,6 +345,8 @@ struct timing_generator_funcs {
+ 	bool (*get_optc_double_buffer_pending)(struct timing_generator *tg);
+ 	bool (*get_otg_double_buffer_pending)(struct timing_generator *tg);
+ 	bool (*get_pipe_update_pending)(struct timing_generator *tg);
++	void (*set_vupdate_keepout)(struct timing_generator *tg, bool enable);
++	bool (*wait_update_lock_status)(struct timing_generator *tg, bool locked);
+ };
+ 
+ #endif
+diff --git a/drivers/gpu/drm/amd/display/dc/optc/dcn401/dcn401_optc.c b/drivers/gpu/drm/amd/display/dc/optc/dcn401/dcn401_optc.c
+index db670fc17264..783ca9acc762 100644
+--- a/drivers/gpu/drm/amd/display/dc/optc/dcn401/dcn401_optc.c
++++ b/drivers/gpu/drm/amd/display/dc/optc/dcn401/dcn401_optc.c
+@@ -430,6 +430,35 @@ static void optc401_program_global_sync(
+ 	REG_UPDATE(OTG_PSTATE_REGISTER, OTG_PSTATE_KEEPOUT_START, pstate_keepout);
+ }
+ 
++static void optc401_set_vupdate_keepout(struct timing_generator *tg, bool enable)
++{
++	struct optc *optc1 = DCN10TG_FROM_TG(tg);
++
++	REG_SET_3(OTG_VUPDATE_KEEPOUT, 0,
++		MASTER_UPDATE_LOCK_VUPDATE_KEEPOUT_START_OFFSET, 0,
++		MASTER_UPDATE_LOCK_VUPDATE_KEEPOUT_END_OFFSET, optc1->vready_offset + 10,
++		OTG_MASTER_UPDATE_LOCK_VUPDATE_KEEPOUT_EN, enable);
++
++	return;
++}
++
++static bool optc401_wait_update_lock_status(struct timing_generator *tg, bool locked)
++{
++	struct optc *optc1 = DCN10TG_FROM_TG(tg);
++	uint32_t lock_status = 0;
++
++	REG_WAIT(OTG_MASTER_UPDATE_LOCK,
++			UPDATE_LOCK_STATUS, locked,
++			1, 150000);
++
++	REG_GET(OTG_MASTER_UPDATE_LOCK, UPDATE_LOCK_STATUS, &lock_status);
++
++	if (lock_status != locked)
++		return false;
++
++	return true;
++}
++
+ static struct timing_generator_funcs dcn401_tg_funcs = {
+ 		.validate_timing = optc1_validate_timing,
+ 		.program_timing = optc1_program_timing,
+@@ -496,6 +525,8 @@ static struct timing_generator_funcs dcn401_tg_funcs = {
+ 		.get_optc_double_buffer_pending = optc3_get_optc_double_buffer_pending,
+ 		.get_otg_double_buffer_pending = optc3_get_otg_update_pending,
+ 		.get_pipe_update_pending = optc3_get_pipe_update_pending,
++		.set_vupdate_keepout = optc401_set_vupdate_keepout,
++		.wait_update_lock_status = optc401_wait_update_lock_status,
+ };
+ 
+ void dcn401_timing_generator_init(struct optc *optc1)
+-- 
+2.52.0
+
