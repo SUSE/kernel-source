@@ -1,0 +1,211 @@
+From ab52d2717ac073816038f578f492e970a31376ce Mon Sep 17 00:00:00 2001
+From: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Date: Fri, 25 Oct 2024 03:20:13 +0300
+Subject: drm/msm/dpu: move rot90 checking to dpu_plane_atomic_check_sspp()
+Git-commit: ab52d2717ac073816038f578f492e970a31376ce
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Move a call to dpu_plane_check_inline_rotation() to the
+dpu_plane_atomic_check_sspp() function, so that the rot90 constraints
+are checked for both SSPP blocks. Also move rotation field from struct
+dpu_plane_state to struct dpu_sw_pipe_cfg.
+
+Signed-off-by: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Reviewed-by: Abhinav Kumar <quic_abhinavk@quicinc.com>
+Patchwork: https://patchwork.freedesktop.org/patch/621485/
+Link: https://lore.kernel.org/r/20241025-dpu-virtual-wide-v6-6-0310fd519765@linaro.org
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/msm/disp/dpu1/dpu_hw_sspp.h |  2 +
+ drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c   | 55 +++++++++++----------
+ drivers/gpu/drm/msm/disp/dpu1/dpu_plane.h   |  2 -
+ 3 files changed, 31 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_sspp.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_sspp.h
+index 8998d1862e16..9ae475420c05 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_sspp.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_sspp.h
+@@ -144,10 +144,12 @@ struct dpu_hw_pixel_ext {
+  * @src_rect:  src ROI, caller takes into account the different operations
+  *             such as decimation, flip etc to program this field
+  * @dest_rect: destination ROI.
++ * @rotation: simplified drm rotation hint
+  */
+ struct dpu_sw_pipe_cfg {
+ 	struct drm_rect src_rect;
+ 	struct drm_rect dst_rect;
++	unsigned int rotation;
+ };
+ 
+ /**
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c
+index a5f29851361f..5e230391fabc 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c
+@@ -528,8 +528,7 @@ static const struct dpu_csc_cfg *_dpu_plane_get_csc(struct dpu_sw_pipe *pipe,
+ 
+ static void _dpu_plane_setup_scaler(struct dpu_sw_pipe *pipe,
+ 		const struct msm_format *fmt, bool color_fill,
+-		struct dpu_sw_pipe_cfg *pipe_cfg,
+-		unsigned int rotation)
++		struct dpu_sw_pipe_cfg *pipe_cfg)
+ {
+ 	struct dpu_hw_sspp *pipe_hw = pipe->sspp;
+ 	const struct drm_format_info *info = drm_format_info(fmt->pixel_format);
+@@ -552,7 +551,7 @@ static void _dpu_plane_setup_scaler(struct dpu_sw_pipe *pipe,
+ 			dst_height,
+ 			&scaler3_cfg, fmt,
+ 			info->hsub, info->vsub,
+-			rotation);
++			pipe_cfg->rotation);
+ 
+ 	/* configure pixel extension based on scalar config */
+ 	_dpu_plane_setup_pixel_ext(&scaler3_cfg, &pixel_ext,
+@@ -604,7 +603,7 @@ static void _dpu_plane_color_fill_pipe(struct dpu_plane_state *pstate,
+ 	if (pipe->sspp->ops.setup_rects)
+ 		pipe->sspp->ops.setup_rects(pipe, &pipe_cfg);
+ 
+-	_dpu_plane_setup_scaler(pipe, fmt, true, &pipe_cfg, pstate->rotation);
++	_dpu_plane_setup_scaler(pipe, fmt, true, &pipe_cfg);
+ }
+ 
+ /**
+@@ -696,12 +695,17 @@ static void dpu_plane_cleanup_fb(struct drm_plane *plane,
+ }
+ 
+ static int dpu_plane_check_inline_rotation(struct dpu_plane *pdpu,
+-						const struct dpu_sspp_sub_blks *sblk,
+-						struct drm_rect src, const struct msm_format *fmt)
++					   struct dpu_sw_pipe *pipe,
++					   struct drm_rect src,
++					   const struct msm_format *fmt)
+ {
++	const struct dpu_sspp_sub_blks *sblk = pipe->sspp->cap->sblk;
+ 	size_t num_formats;
+ 	const u32 *supported_formats;
+ 
++	if (!test_bit(DPU_SSPP_INLINE_ROTATION, &pipe->sspp->cap->features))
++		return -EINVAL;
++
+ 	if (!sblk->rotation_cfg) {
+ 		DPU_ERROR("invalid rotation cfg\n");
+ 		return -EINVAL;
+@@ -731,6 +735,7 @@ static int dpu_plane_atomic_check_pipe(struct dpu_plane *pdpu,
+ {
+ 	uint32_t min_src_size;
+ 	struct dpu_kms *kms = _dpu_plane_get_kms(&pdpu->base);
++	int ret;
+ 
+ 	min_src_size = MSM_FORMAT_IS_YUV(fmt) ? 2 : 1;
+ 
+@@ -768,6 +773,12 @@ static int dpu_plane_atomic_check_pipe(struct dpu_plane *pdpu,
+ 		return -EINVAL;
+ 	}
+ 
++	if (pipe_cfg->rotation & DRM_MODE_ROTATE_90) {
++		ret = dpu_plane_check_inline_rotation(pdpu, pipe, pipe_cfg->src_rect, fmt);
++		if (ret)
++			return ret;
++	}
++
+ 	/* max clk check */
+ 	if (_dpu_plane_calc_clk(mode, pipe_cfg) > kms->perf.max_core_clk_rate) {
+ 		DPU_DEBUG_PLANE(pdpu, "plane exceeds max mdp core clk limits\n");
+@@ -891,7 +902,6 @@ static int dpu_plane_atomic_check_sspp(struct drm_plane *plane,
+ 	struct dpu_sw_pipe_cfg *pipe_cfg = &pstate->pipe_cfg;
+ 	struct dpu_sw_pipe_cfg *r_pipe_cfg = &pstate->r_pipe_cfg;
+ 	uint32_t max_linewidth;
+-	unsigned int rotation;
+ 	uint32_t supported_rotations;
+ 	const struct dpu_sspp_cfg *pipe_hw_caps;
+ 	const struct dpu_sspp_sub_blks *sblk;
+@@ -915,6 +925,15 @@ static int dpu_plane_atomic_check_sspp(struct drm_plane *plane,
+ 
+ 	max_linewidth = pdpu->catalog->caps->max_linewidth;
+ 
++	supported_rotations = DRM_MODE_REFLECT_MASK | DRM_MODE_ROTATE_0;
++
++	if (pipe_hw_caps->features & BIT(DPU_SSPP_INLINE_ROTATION))
++		supported_rotations |= DRM_MODE_ROTATE_90;
++
++	pipe_cfg->rotation = drm_rotation_simplify(new_plane_state->rotation,
++						   supported_rotations);
++	r_pipe_cfg->rotation = pipe_cfg->rotation;
++
+ 	ret = dpu_plane_atomic_check_pipe(pdpu, pipe, pipe_cfg, fmt,
+ 					  &crtc_state->adjusted_mode);
+ 	if (ret)
+@@ -938,6 +957,7 @@ static int dpu_plane_atomic_check_sspp(struct drm_plane *plane,
+ 		    drm_rect_height(&pipe_cfg->src_rect) != drm_rect_height(&pipe_cfg->dst_rect) ||
+ 		    (!test_bit(DPU_SSPP_SMART_DMA_V1, &pipe->sspp->cap->features) &&
+ 		     !test_bit(DPU_SSPP_SMART_DMA_V2, &pipe->sspp->cap->features)) ||
++		    pipe_cfg->rotation & DRM_MODE_ROTATE_90 ||
+ 		    MSM_FORMAT_IS_YUV(fmt)) {
+ 			DPU_DEBUG_PLANE(pdpu, "invalid src " DRM_RECT_FMT " line:%u, can't use split source\n",
+ 					DRM_RECT_ARG(&pipe_cfg->src_rect), max_linewidth);
+@@ -961,23 +981,6 @@ static int dpu_plane_atomic_check_sspp(struct drm_plane *plane,
+ 			return ret;
+ 	}
+ 
+-	supported_rotations = DRM_MODE_REFLECT_MASK | DRM_MODE_ROTATE_0;
+-
+-	if (pipe_hw_caps->features & BIT(DPU_SSPP_INLINE_ROTATION))
+-		supported_rotations |= DRM_MODE_ROTATE_90;
+-
+-	rotation = drm_rotation_simplify(new_plane_state->rotation,
+-					supported_rotations);
+-
+-	if ((pipe_hw_caps->features & BIT(DPU_SSPP_INLINE_ROTATION)) &&
+-		(rotation & DRM_MODE_ROTATE_90)) {
+-		ret = dpu_plane_check_inline_rotation(pdpu, sblk, pipe_cfg->src_rect, fmt);
+-		if (ret)
+-			return ret;
+-	}
+-
+-	pstate->rotation = rotation;
+-
+ 	return 0;
+ }
+ 
+@@ -1117,14 +1120,14 @@ static void dpu_plane_sspp_update_pipe(struct drm_plane *plane,
+ 				pipe_cfg);
+ 	}
+ 
+-	_dpu_plane_setup_scaler(pipe, fmt, false, pipe_cfg, pstate->rotation);
++	_dpu_plane_setup_scaler(pipe, fmt, false, pipe_cfg);
+ 
+ 	if (pipe->sspp->ops.setup_multirect)
+ 		pipe->sspp->ops.setup_multirect(
+ 				pipe);
+ 
+ 	if (pipe->sspp->ops.setup_format) {
+-		unsigned int rotation = pstate->rotation;
++		unsigned int rotation = pipe_cfg->rotation;
+ 
+ 		src_flags = 0x0;
+ 
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.h
+index 348b0075d1ce..31ee8b55c4dd 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.h
+@@ -30,7 +30,6 @@
+  * @plane_fetch_bw: calculated BW per plane
+  * @plane_clk: calculated clk per plane
+  * @needs_dirtyfb: whether attached CRTC needs pixel data explicitly flushed
+- * @rotation: simplified drm rotation hint
+  * @layout:     framebuffer memory layout
+  */
+ struct dpu_plane_state {
+@@ -48,7 +47,6 @@ struct dpu_plane_state {
+ 	u64 plane_clk;
+ 
+ 	bool needs_dirtyfb;
+-	unsigned int rotation;
+ 
+ 	struct dpu_hw_fmt_layout layout;
+ };
+-- 
+2.52.0
+
