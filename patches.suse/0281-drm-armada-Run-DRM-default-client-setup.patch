@@ -1,0 +1,247 @@
+From 9f62b01b805df67b9beb1b9e46cb817888452160 Mon Sep 17 00:00:00 2001
+From: Thomas Zimmermann <tzimmermann@suse.de>
+Date: Tue, 24 Sep 2024 09:13:11 +0200
+Subject: drm/armada: Run DRM default client setup
+Git-commit: 9f62b01b805df67b9beb1b9e46cb817888452160
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Rework fbdev probing to support fbdev_probe in struct drm_driver
+and remove the old fb_probe callback. Provide an initializer macro
+for struct drm_driver that sets the callback according to the kernel
+configuration.
+
+Call drm_client_setup() to run the kernel's default client setup
+for DRM. Set fbdev_probe in struct drm_driver, so that the client
+setup can start the common fbdev client.
+
+The armada driver specifies a preferred color mode of 32. As this
+is the default if no format has been given, leave it out entirely.
+
+V5: 
+- select DRM_CLIENT_SELECTION
+V4: 
+- revert an unrelated cleanup (Javier)
+
+Signed-off-by: Thomas Zimmermann <tzimmermann@suse.de>
+Cc: Russell King <linux@armlinux.org.uk>
+Acked-by: Javier Martinez Canillas <javierm@redhat.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20240924071734.98201-74-tzimmermann@suse.de
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/armada/Kconfig        |   1 +
+ drivers/gpu/drm/armada/armada_drm.h   |  11 ++-
+ drivers/gpu/drm/armada/armada_drv.c   |   4 +-
+ drivers/gpu/drm/armada/armada_fbdev.c | 113 ++------------------------
+ 4 files changed, 17 insertions(+), 112 deletions(-)
+
+diff --git a/drivers/gpu/drm/armada/Kconfig b/drivers/gpu/drm/armada/Kconfig
+index e5597d7c9ae1..b22c891a670b 100644
+--- a/drivers/gpu/drm/armada/Kconfig
++++ b/drivers/gpu/drm/armada/Kconfig
+@@ -2,6 +2,7 @@
+ config DRM_ARMADA
+ 	tristate "DRM support for Marvell Armada SoCs"
+ 	depends on DRM && HAVE_CLK && ARM && MMU
++	select DRM_CLIENT_SELECTION
+ 	select DRM_KMS_HELPER
+ 	select FB_IOMEM_HELPERS if DRM_FBDEV_EMULATION
+ 	help
+diff --git a/drivers/gpu/drm/armada/armada_drm.h b/drivers/gpu/drm/armada/armada_drm.h
+index c303e8c7ff6c..3c0ff221a43b 100644
+--- a/drivers/gpu/drm/armada/armada_drm.h
++++ b/drivers/gpu/drm/armada/armada_drm.h
+@@ -16,6 +16,8 @@ struct armada_crtc;
+ struct armada_gem_object;
+ struct clk;
+ struct drm_display_mode;
++struct drm_fb_helper;
++struct drm_fb_helper_surface_size;
+ 
+ static inline void
+ armada_updatel(uint32_t val, uint32_t mask, void __iomem *ptr)
+@@ -74,10 +76,13 @@ struct armada_private {
+ #define drm_to_armada_dev(dev) container_of(dev, struct armada_private, drm)
+ 
+ #if defined(CONFIG_DRM_FBDEV_EMULATION)
+-void armada_fbdev_setup(struct drm_device *dev);
++int armada_fbdev_driver_fbdev_probe(struct drm_fb_helper *fbh,
++				    struct drm_fb_helper_surface_size *sizes);
++#define ARMADA_FBDEV_DRIVER_OPS \
++	.fbdev_probe = armada_fbdev_driver_fbdev_probe
+ #else
+-static inline void armada_fbdev_setup(struct drm_device *dev)
+-{ }
++#define ARMADA_FBDEV_DRIVER_OPS \
++	.fbdev_probe = NULL
+ #endif
+ 
+ int armada_overlay_plane_create(struct drm_device *, unsigned long);
+diff --git a/drivers/gpu/drm/armada/armada_drv.c b/drivers/gpu/drm/armada/armada_drv.c
+index e51ecc4f7ef4..3dc5f0499e4c 100644
+--- a/drivers/gpu/drm/armada/armada_drv.c
++++ b/drivers/gpu/drm/armada/armada_drv.c
+@@ -12,6 +12,7 @@
+ 
+ #include <drm/drm_aperture.h>
+ #include <drm/drm_atomic_helper.h>
++#include <drm/drm_client_setup.h>
+ #include <drm/drm_drv.h>
+ #include <drm/drm_ioctl.h>
+ #include <drm/drm_managed.h>
+@@ -39,6 +40,7 @@ DEFINE_DRM_GEM_FOPS(armada_drm_fops);
+ static const struct drm_driver armada_drm_driver = {
+ 	.gem_prime_import	= armada_gem_prime_import,
+ 	.dumb_create		= armada_gem_dumb_create,
++	ARMADA_FBDEV_DRIVER_OPS,
+ 	.major			= 1,
+ 	.minor			= 0,
+ 	.name			= "armada-drm",
+@@ -137,7 +139,7 @@ static int armada_drm_bind(struct device *dev)
+ 	armada_drm_debugfs_init(priv->drm.primary);
+ #endif
+ 
+-	armada_fbdev_setup(&priv->drm);
++	drm_client_setup(&priv->drm, NULL);
+ 
+ 	return 0;
+ 
+diff --git a/drivers/gpu/drm/armada/armada_fbdev.c b/drivers/gpu/drm/armada/armada_fbdev.c
+index d223176912b6..6ee7ce04ee71 100644
+--- a/drivers/gpu/drm/armada/armada_fbdev.c
++++ b/drivers/gpu/drm/armada/armada_fbdev.c
+@@ -39,8 +39,10 @@ static const struct fb_ops armada_fb_ops = {
+ 	.fb_destroy	= armada_fbdev_fb_destroy,
+ };
+ 
+-static int armada_fbdev_create(struct drm_fb_helper *fbh,
+-	struct drm_fb_helper_surface_size *sizes)
++static const struct drm_fb_helper_funcs armada_fbdev_helper_funcs;
++
++int armada_fbdev_driver_fbdev_probe(struct drm_fb_helper *fbh,
++				    struct drm_fb_helper_surface_size *sizes)
+ {
+ 	struct drm_device *dev = fbh->dev;
+ 	struct drm_mode_fb_cmd2 mode;
+@@ -98,6 +100,7 @@ static int armada_fbdev_create(struct drm_fb_helper *fbh,
+ 	info->fix.smem_len = obj->obj.size;
+ 	info->screen_size = obj->obj.size;
+ 	info->screen_base = ptr;
++	fbh->funcs = &armada_fbdev_helper_funcs;
+ 	fbh->fb = &dfb->fb;
+ 
+ 	drm_fb_helper_fill_info(info, fbh, sizes);
+@@ -112,109 +115,3 @@ static int armada_fbdev_create(struct drm_fb_helper *fbh,
+ 	dfb->fb.funcs->destroy(&dfb->fb);
+ 	return ret;
+ }
+-
+-static int armada_fb_probe(struct drm_fb_helper *fbh,
+-	struct drm_fb_helper_surface_size *sizes)
+-{
+-	int ret = 0;
+-
+-	if (!fbh->fb) {
+-		ret = armada_fbdev_create(fbh, sizes);
+-		if (ret == 0)
+-			ret = 1;
+-	}
+-	return ret;
+-}
+-
+-static const struct drm_fb_helper_funcs armada_fb_helper_funcs = {
+-	.fb_probe	= armada_fb_probe,
+-};
+-
+-/*
+- * Fbdev client and struct drm_client_funcs
+- */
+-
+-static void armada_fbdev_client_unregister(struct drm_client_dev *client)
+-{
+-	struct drm_fb_helper *fbh = drm_fb_helper_from_client(client);
+-
+-	if (fbh->info) {
+-		drm_fb_helper_unregister_info(fbh);
+-	} else {
+-		drm_client_release(&fbh->client);
+-		drm_fb_helper_unprepare(fbh);
+-		kfree(fbh);
+-	}
+-}
+-
+-static int armada_fbdev_client_restore(struct drm_client_dev *client)
+-{
+-	drm_fb_helper_lastclose(client->dev);
+-
+-	return 0;
+-}
+-
+-static int armada_fbdev_client_hotplug(struct drm_client_dev *client)
+-{
+-	struct drm_fb_helper *fbh = drm_fb_helper_from_client(client);
+-	struct drm_device *dev = client->dev;
+-	int ret;
+-
+-	if (dev->fb_helper)
+-		return drm_fb_helper_hotplug_event(dev->fb_helper);
+-
+-	ret = drm_fb_helper_init(dev, fbh);
+-	if (ret)
+-		goto err_drm_err;
+-
+-	if (!drm_drv_uses_atomic_modeset(dev))
+-		drm_helper_disable_unused_functions(dev);
+-
+-	ret = drm_fb_helper_initial_config(fbh);
+-	if (ret)
+-		goto err_drm_fb_helper_fini;
+-
+-	return 0;
+-
+-err_drm_fb_helper_fini:
+-	drm_fb_helper_fini(fbh);
+-err_drm_err:
+-	drm_err(dev, "armada: Failed to setup fbdev emulation (ret=%d)\n", ret);
+-	return ret;
+-}
+-
+-static const struct drm_client_funcs armada_fbdev_client_funcs = {
+-	.owner		= THIS_MODULE,
+-	.unregister	= armada_fbdev_client_unregister,
+-	.restore	= armada_fbdev_client_restore,
+-	.hotplug	= armada_fbdev_client_hotplug,
+-};
+-
+-void armada_fbdev_setup(struct drm_device *dev)
+-{
+-	struct drm_fb_helper *fbh;
+-	int ret;
+-
+-	drm_WARN(dev, !dev->registered, "Device has not been registered.\n");
+-	drm_WARN(dev, dev->fb_helper, "fb_helper is already set!\n");
+-
+-	fbh = kzalloc(sizeof(*fbh), GFP_KERNEL);
+-	if (!fbh)
+-		return;
+-	drm_fb_helper_prepare(dev, fbh, 32, &armada_fb_helper_funcs);
+-
+-	ret = drm_client_init(dev, &fbh->client, "fbdev", &armada_fbdev_client_funcs);
+-	if (ret) {
+-		drm_err(dev, "Failed to register client: %d\n", ret);
+-		goto err_drm_client_init;
+-	}
+-
+-	drm_client_register(&fbh->client);
+-
+-	return;
+-
+-err_drm_client_init:
+-	drm_fb_helper_unprepare(fbh);
+-	kfree(fbh);
+-	return;
+-}
+-- 
+2.52.0
+
