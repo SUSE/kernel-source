@@ -1,0 +1,119 @@
+From 8fe7cf58ff0e46769b86b3890d657c8996b86bc6 Mon Sep 17 00:00:00 2001
+From: Alex Deucher <alexander.deucher@amd.com>
+Date: Mon, 14 Oct 2024 10:51:10 -0400
+Subject: drm/amdkfd: add an interface to query whether is KFD is active
+Git-commit: 8fe7cf58ff0e46769b86b3890d657c8996b86bc6
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Add an interface to query whether KFD has any active queues.
+
+V2: fix build issues
+
+Acked-by: Srinivasan Shanmugam <srinivasan.shanmugam@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c |  9 ++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h |  7 ++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_device.c    | 25 ++++++++++++++++++++++
+ 3 files changed, 41 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
+index b545940e512b..24343c312480 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
+@@ -890,6 +890,15 @@ int amdgpu_amdkfd_start_sched(struct amdgpu_device *adev, uint32_t node_id)
+ 	return kgd2kfd_start_sched(adev->kfd.dev, node_id);
+ }
+ 
++/* check if there are KFD queues active */
++bool amdgpu_amdkfd_compute_active(struct amdgpu_device *adev, uint32_t node_id)
++{
++	if (!adev->kfd.init_complete)
++		return false;
++
++	return kgd2kfd_compute_active(adev->kfd.dev, node_id);
++}
++
+ /* Config CGTT_SQ_CLK_CTRL */
+ int amdgpu_amdkfd_config_sq_perfmon(struct amdgpu_device *adev, uint32_t xcp_id,
+ 	bool core_override_enable, bool reg_override_enable, bool perfmon_override_enable)
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+index 7e0a22072536..4b80ad860639 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+@@ -268,6 +268,7 @@ int amdgpu_amdkfd_start_sched(struct amdgpu_device *adev, uint32_t node_id);
+ int amdgpu_amdkfd_stop_sched(struct amdgpu_device *adev, uint32_t node_id);
+ int amdgpu_amdkfd_config_sq_perfmon(struct amdgpu_device *adev, uint32_t xcp_id,
+ 	bool core_override_enable, bool reg_override_enable, bool perfmon_override_enable);
++bool amdgpu_amdkfd_compute_active(struct amdgpu_device *adev, uint32_t node_id);
+ 
+ 
+ /* Read user wptr from a specified user address space with page fault
+@@ -431,6 +432,7 @@ int kgd2kfd_check_and_lock_kfd(void);
+ void kgd2kfd_unlock_kfd(void);
+ int kgd2kfd_start_sched(struct kfd_dev *kfd, uint32_t node_id);
+ int kgd2kfd_stop_sched(struct kfd_dev *kfd, uint32_t node_id);
++bool kgd2kfd_compute_active(struct kfd_dev *kfd, uint32_t node_id);
+ #else
+ static inline int kgd2kfd_init(void)
+ {
+@@ -511,5 +513,10 @@ static inline int kgd2kfd_stop_sched(struct kfd_dev *kfd, uint32_t node_id)
+ {
+ 	return 0;
+ }
++
++static inline bool kgd2kfd_compute_active(struct kfd_dev *kfd, uint32_t node_id)
++{
++	return false;
++}
+ #endif
+ #endif /* AMDGPU_AMDKFD_H_INCLUDED */
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device.c b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+index fad1c8f2bc83..348925254bff 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+@@ -1392,6 +1392,13 @@ void kfd_dec_compute_active(struct kfd_node *node)
+ 	WARN_ONCE(count < 0, "Compute profile ref. count error");
+ }
+ 
++static bool kfd_compute_active(struct kfd_node *node)
++{
++	if (atomic_read(&node->kfd->compute_profile))
++		return true;
++	return false;
++}
++
+ void kgd2kfd_smi_event_throttle(struct kfd_dev *kfd, uint64_t throttle_bitmask)
+ {
+ 	/*
+@@ -1485,6 +1492,24 @@ int kgd2kfd_stop_sched(struct kfd_dev *kfd, uint32_t node_id)
+ 	return node->dqm->ops.halt(node->dqm);
+ }
+ 
++bool kgd2kfd_compute_active(struct kfd_dev *kfd, uint32_t node_id)
++{
++	struct kfd_node *node;
++
++	if (!kfd->init_complete)
++		return false;
++
++	if (node_id >= kfd->num_nodes) {
++		dev_warn(kfd->adev->dev, "Invalid node ID: %u exceeds %u\n",
++			 node_id, kfd->num_nodes - 1);
++		return false;
++	}
++
++	node = kfd->nodes[node_id];
++
++	return kfd_compute_active(node);
++}
++
+ #if defined(CONFIG_DEBUG_FS)
+ 
+ /* This function will send a package to HIQ to hang the HWS
+-- 
+2.52.0
+
