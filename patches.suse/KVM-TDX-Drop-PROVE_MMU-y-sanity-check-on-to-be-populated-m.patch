@@ -1,0 +1,81 @@
+From: Sean Christopherson <seanjc@google.com>
+Date: Thu, 30 Oct 2025 13:09:26 -0700
+Subject: KVM: TDX: Drop PROVE_MMU=y sanity check on to-be-populated mappings
+Git-commit: 5294a4b93e07ab74ef334434b927a5a33aa0ecfe
+Patch-mainline: v6.19-rc1
+References: git-fixes
+
+Drop TDX's sanity check that a mirror EPT mapping isn't zapped between
+creating said mapping and doing TDH.MEM.PAGE.ADD, as the check is
+simultaneously superfluous and incomplete.  Per commit 2608f1057601
+("KVM: x86/tdp_mmu: Add a helper function to walk down the TDP MMU"), the
+justification for introducing kvm_tdp_mmu_gpa_is_mapped() was to check
+that the target gfn was pre-populated, with a link that points to this
+snippet:
+
+ : > One small question:
+ : >
+ : > What if the memory region passed to KVM_TDX_INIT_MEM_REGION hasn't been pre-
+ : > populated?  If we want to make KVM_TDX_INIT_MEM_REGION work with these regions,
+ : > then we still need to do the real map.  Or we can make KVM_TDX_INIT_MEM_REGION
+ : > return error when it finds the region hasn't been pre-populated?
+ :
+ : Return an error.  I don't love the idea of bleeding so many TDX details into
+ : userspace, but I'm pretty sure that ship sailed a long, long time ago.
+
+But that justification makes little sense for the final code, as the check
+on nr_premapped after TDH.MEM.PAGE.ADD will detect and return an error if
+KVM attempted to zap a S-EPT entry (tdx_sept_zap_private_spte() will fail
+on TDH.MEM.RANGE.BLOCK due lack of a valid S-EPT entry).  And as evidenced
+by the "is mapped?" code being guarded with CONFIG_KVM_PROVE_MMU=y, KVM is
+NOT relying on the check for general correctness.
+
+The sanity check is also incomplete in the sense that mmu_lock is dropped
+between the check and TDH.MEM.PAGE.ADD, i.e. will only detect KVM bugs that
+zap SPTEs in a very specific window (note, this also applies to the check
+on nr_premapped).
+
+Removing the sanity check will allow removing kvm_tdp_mmu_gpa_is_mapped(),
+which has no business being exposed to vendor code, and more importantly
+will pave the way for eliminating the "pre-map" approach entirely in favor
+of doing TDH.MEM.PAGE.ADD under mmu_lock.
+
+Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+Reviewed-by: Kai Huang <kai.huang@intel.com>
+Reviewed-by: Binbin Wu <binbin.wu@linux.intel.com>
+Reviewed-by: Yan Zhao <yan.y.zhao@intel.com>
+Tested-by: Yan Zhao <yan.y.zhao@intel.com>
+Tested-by: Kai Huang <kai.huang@intel.com>
+Link: https://patch.msgid.link/20251030200951.3402865-4-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Acked-by: Nikolay Borisov <nik.borisov@suse.com>
+---
+ arch/x86/kvm/vmx/tdx.c | 14 --------------
+ 1 file changed, 14 deletions(-)
+
+diff --git a/arch/x86/kvm/vmx/tdx.c b/arch/x86/kvm/vmx/tdx.c
+index 0a49c863c811..e59705da2779 100644
+--- a/arch/x86/kvm/vmx/tdx.c
++++ b/arch/x86/kvm/vmx/tdx.c
+@@ -3191,20 +3191,6 @@ static int tdx_gmem_post_populate(struct kvm *kvm, gfn_t gfn, kvm_pfn_t pfn,
+ 	if (ret < 0)
+ 		goto out;
+ 
+-	/*
+-	 * The private mem cannot be zapped after kvm_tdp_map_page()
+-	 * because all paths are covered by slots_lock and the
+-	 * filemap invalidate lock.  Check that they are indeed enough.
+-	 */
+-	if (IS_ENABLED(CONFIG_KVM_PROVE_MMU)) {
+-		scoped_guard(read_lock, &kvm->mmu_lock) {
+-			if (KVM_BUG_ON(!kvm_tdp_mmu_gpa_is_mapped(vcpu, gpa), kvm)) {
+-				ret = -EIO;
+-				goto out;
+-			}
+-		}
+-	}
+-
+ 	ret = 0;
+ 	err = tdh_mem_page_add(&kvm_tdx->td, gpa, pfn_to_page(pfn),
+ 			       src_page, &entry, &level_state);
+
