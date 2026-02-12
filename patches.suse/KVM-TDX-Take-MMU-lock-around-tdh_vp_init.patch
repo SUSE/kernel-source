@@ -1,0 +1,78 @@
+From: Rick Edgecombe <rick.p.edgecombe@intel.com>
+Date: Mon, 27 Oct 2025 17:28:24 -0700
+Subject: KVM: TDX: Take MMU lock around tdh_vp_init()
+Git-commit: 9a89894f30d5795c5ac46a9ee9c009d610306025
+Patch-mainline: v6.19-rc1
+References: git-fixes
+
+Take MMU lock around tdh_vp_init() in KVM_TDX_INIT_VCPU to prevent
+meeting contention during retries in some no-fail MMU paths.
+
+The TDX module takes various try-locks internally, which can cause
+SEAMCALLs to return an error code when contention is met. Dealing with
+an error in some of the MMU paths that make SEAMCALLs is not straight
+forward, so KVM takes steps to ensure that these will meet no contention
+during a single BUSY error retry. The whole scheme relies on KVM to take
+appropriate steps to avoid making any SEAMCALLs that could contend while
+the retry is happening.
+
+Unfortunately, there is a case where contention could be met if userspace
+does something unusual. Specifically, hole punching a gmem fd while
+initializing the TD vCPU. The impact would be triggering a KVM_BUG_ON().
+
+The resource being contended is called the "TDR resource" in TDX docs
+parlance. The tdh_vp_init() can take this resource as exclusive if the
+'version' passed is 1, which happens to be version the kernel passes. The
+various MMU operations (tdh_mem_range_block(), tdh_mem_track() and
+tdh_mem_page_remove()) take it as shared.
+
+There isn't a KVM lock that maps conceptually and in a lock order friendly
+way to the TDR lock. So to minimize infrastructure, just take MMU lock
+around tdh_vp_init(). This makes the operations we care about mutually
+exclusive. Since the other operations are under a write mmu_lock, the code
+could just take the lock for read, however this is weirdly inverted from
+the actual underlying resource being contended. Since this is covering an
+edge case that shouldn't be hit in normal usage, be a little less weird
+and take the mmu_lock for write around the call.
+
+Fixes: 02ab57707bdb ("KVM: TDX: Implement hooks to propagate changes of TDP MMU mirror page table")
+Reported-by: Yan Zhao <yan.y.zhao@intel.com>
+Suggested-by: Yan Zhao <yan.y.zhao@intel.com>
+Link: https://patch.msgid.link/20251028002824.1470939-1-rick.p.edgecombe@intel.com
+Signed-off-by: Rick Edgecombe <rick.p.edgecombe@intel.com>
+[sean: tweak comment and capture PUNCH_HOLE interaction]
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Acked-by: Nikolay Borisov <nik.borisov@suse.com>
+---
+ arch/x86/kvm/vmx/tdx.c | 17 ++++++++++++++---
+ 1 file changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/arch/x86/kvm/vmx/tdx.c b/arch/x86/kvm/vmx/tdx.c
+index 865d18b34988..b5087d40f50b 100644
+--- a/arch/x86/kvm/vmx/tdx.c
++++ b/arch/x86/kvm/vmx/tdx.c
+@@ -2969,9 +2969,20 @@ static int tdx_td_vcpu_init(struct kvm_vcpu *vcpu, u64 vcpu_rcx)
+ 		}
+ 	}
+ 
+-	err = tdh_vp_init(&tdx->vp, vcpu_rcx, vcpu->vcpu_id);
+-	if (TDX_BUG_ON(err, TDH_VP_INIT, vcpu->kvm))
+-		return -EIO;
++	/*
++	 * tdh_vp_init() can take an exclusive lock of the TDR resource inside
++	 * the TDX-Module.  The TDR resource is also taken as shared in several
++	 * no-fail MMU paths, which could return TDX_OPERAND_BUSY on contention
++	 * (TDX-Module locks are try-lock implementations with no slow path).
++	 * Take mmu_lock for write to reflect the nature of the lock taken by
++	 * the TDX-Module, and to ensure the no-fail MMU paths succeed, e.g. if
++	 * a concurrent PUNCH_HOLE on guest_memfd triggers removal of SPTEs.
++	 */
++	scoped_guard(write_lock, &vcpu->kvm->mmu_lock) {
++		err = tdh_vp_init(&tdx->vp, vcpu_rcx, vcpu->vcpu_id);
++		if (TDX_BUG_ON(err, TDH_VP_INIT, vcpu->kvm))
++			return -EIO;
++	}
+ 
+ 	vcpu->arch.mp_state = KVM_MP_STATE_RUNNABLE;
+ 
+
