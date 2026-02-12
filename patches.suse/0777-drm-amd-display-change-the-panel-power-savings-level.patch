@@ -1,0 +1,142 @@
+From 8d20a066fa9beb1ec559b12945414a51d17d07e5 Mon Sep 17 00:00:00 2001
+From: Hamza Mahfooz <hamza.mahfooz@amd.com>
+Date: Fri, 9 Aug 2024 16:42:53 -0400
+Subject: drm/amd/display: change the panel power savings level without a
+ modeset
+Git-commit: 8d20a066fa9beb1ec559b12945414a51d17d07e5
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+We don't actually need to request that the compositor does a full
+modeset to modify the panel power savings level, we can instead
+just make a request to DMUB, to set the new level dynamically.
+
+Cc: Harry Wentland <harry.wentland@amd.com>
+Cc: Leo Li <sunpeng.li@amd.com>
+Cc: Mario Limonciello <mario.limonciello@amd.com>
+Cc: Sebastian Wick <sebastian@sebastianwick.net>
+Signed-off-by: Hamza Mahfooz <hamza.mahfooz@amd.com>
+Tested-by: Mario Limonciello <mario.limonciello@amd.com>
+Reviewed-by: Mario Limonciello <mario.limonciello@amd.com>
+Closes: https://gitlab.gnome.org/GNOME/mutter/-/issues/3578
+Signed-off-by: Mario Limonciello <mario.limonciello@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 17 +++++++-
+ drivers/gpu/drm/amd/display/dc/core/dc.c      | 39 +++++++++++--------
+ drivers/gpu/drm/amd/display/dc/dc.h           |  2 +
+ 3 files changed, 41 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 8d97f17ffe66..8dd7aef41fa4 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -6925,9 +6925,14 @@ static ssize_t panel_power_savings_store(struct device *device,
+ 					 const char *buf, size_t count)
+ {
+ 	struct drm_connector *connector = dev_get_drvdata(device);
++	struct amdgpu_dm_connector *aconn = to_amdgpu_dm_connector(connector);
+ 	struct drm_device *dev = connector->dev;
++	struct amdgpu_device *adev = drm_to_adev(dev);
++	struct dc *dc = adev->dm.dc;
++	struct pipe_ctx *pipe_ctx;
+ 	long val;
+ 	int ret;
++	int i;
+ 
+ 	ret = kstrtol(buf, 0, &val);
+ 
+@@ -6942,7 +6947,17 @@ static ssize_t panel_power_savings_store(struct device *device,
+ 		ABM_LEVEL_IMMEDIATE_DISABLE;
+ 	drm_modeset_unlock(&dev->mode_config.connection_mutex);
+ 
+-	drm_kms_helper_hotplug_event(dev);
++	mutex_lock(&adev->dm.dc_lock);
++	for (i = 0; i < dc->res_pool->pipe_count; i++) {
++		pipe_ctx = &dc->current_state->res_ctx.pipe_ctx[i];
++
++		if (pipe_ctx->stream &&
++		    pipe_ctx->stream->link == aconn->dc_link) {
++			dc_set_abm_level(dc, pipe_ctx, val);
++			break;
++		}
++	}
++	mutex_unlock(&adev->dm.dc_lock);
+ 
+ 	return count;
+ }
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index a88f1b6ea64c..d9a1d2b776e9 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -3260,6 +3260,23 @@ static bool update_planes_and_stream_state(struct dc *dc,
+ 
+ }
+ 
++void dc_set_abm_level(struct dc *dc, struct pipe_ctx *pipe_ctx, int level)
++{
++	struct timing_generator *tg = pipe_ctx->stream_res.tg;
++	struct abm *abm = pipe_ctx->stream_res.abm;
++
++	if (!abm)
++		return;
++
++	if (tg->funcs->is_blanked && !tg->funcs->is_blanked(tg))
++		tg->funcs->wait_for_state(tg, CRTC_STATE_VBLANK);
++
++	if (level == ABM_LEVEL_IMMEDIATE_DISABLE)
++		dc->hwss.set_abm_immediate_disable(pipe_ctx);
++	else
++		abm->funcs->set_abm_level(abm, level);
++}
++
+ static void commit_planes_do_stream_update(struct dc *dc,
+ 		struct dc_stream_state *stream,
+ 		struct dc_stream_update *stream_update,
+@@ -3388,22 +3405,12 @@ static void commit_planes_do_stream_update(struct dc *dc,
+ 				dc->link_srv->set_dpms_on(dc->current_state, pipe_ctx);
+ 			}
+ 
+-			if (stream_update->abm_level && pipe_ctx->stream_res.abm) {
+-				bool should_program_abm = true;
+-
+-				// if otg funcs defined check if blanked before programming
+-				if (pipe_ctx->stream_res.tg->funcs->is_blanked)
+-					if (pipe_ctx->stream_res.tg->funcs->is_blanked(pipe_ctx->stream_res.tg))
+-						should_program_abm = false;
+-
+-				if (should_program_abm) {
+-					if (*stream_update->abm_level == ABM_LEVEL_IMMEDIATE_DISABLE) {
+-						dc->hwss.set_abm_immediate_disable(pipe_ctx);
+-					} else {
+-						pipe_ctx->stream_res.abm->funcs->set_abm_level(
+-							pipe_ctx->stream_res.abm, stream->abm_level);
+-					}
+-				}
++			if (stream_update->abm_level) {
++				dc_set_abm_level(dc, pipe_ctx,
++						 *stream_update->abm_level ==
++						 ABM_LEVEL_IMMEDIATE_DISABLE ?
++						 ABM_LEVEL_IMMEDIATE_DISABLE :
++						 stream->abm_level);
+ 			}
+ 		}
+ 	}
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index 3992ad73165b..8c769d6519ea 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -2503,6 +2503,8 @@ void dc_z10_save_init(struct dc *dc);
+ bool dc_is_dmub_outbox_supported(struct dc *dc);
+ bool dc_enable_dmub_notifications(struct dc *dc);
+ 
++void dc_set_abm_level(struct dc *dc, struct pipe_ctx *pipe_ctx, int level);
++
+ bool dc_abm_save_restore(
+ 		struct dc *dc,
+ 		struct dc_stream_state *stream,
+-- 
+2.52.0
+
