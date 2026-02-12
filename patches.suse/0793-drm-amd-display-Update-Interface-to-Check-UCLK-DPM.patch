@@ -1,0 +1,143 @@
+From b8d046985c2dc41a0e264a391da4606099f8d44f Mon Sep 17 00:00:00 2001
+From: Austin Zheng <Austin.Zheng@amd.com>
+Date: Tue, 10 Sep 2024 16:41:20 -0400
+Subject: drm/amd/display: Update Interface to Check UCLK DPM
+Git-commit: b8d046985c2dc41a0e264a391da4606099f8d44f
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+[Why]
+Videos using YUV420 format may result in high power being used.
+Disabling MPO may result in lower power usage.
+Update interface that can be used to check power profile of a dc_state.
+
+[How]
+Allow pstate switching in VBlank as last entry in strategy candidates.
+Add helper functions that can be used to determine power level:
+-get power profile after a dc_state has undergone full validation
+
+Reviewed-by: Aric Cyr <aric.cyr@amd.com>
+Signed-off-by: Austin Zheng <Austin.Zheng@amd.com>
+Signed-off-by: Aurabindo Pillai <aurabindo.pillai@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c        |  9 ++++++++-
+ .../dml21/src/dml2_pmo/dml2_pmo_dcn4_fams2.c    |  1 +
+ drivers/gpu/drm/amd/display/dc/inc/core_types.h |  4 ++++
+ .../dc/resource/dcn315/dcn315_resource.c        |  6 ++++++
+ .../dc/resource/dcn401/dcn401_resource.c        | 17 +++++++++++++++++
+ 5 files changed, 36 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index ec2e2eb0c090..8daf12293694 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -6041,8 +6041,15 @@ void dc_set_edp_power(const struct dc *dc, struct dc_link *edp_link,
+ struct dc_power_profile dc_get_power_profile_for_dc_state(const struct dc_state *context)
+ {
+ 	struct dc_power_profile profile = { 0 };
++	struct dc *dc = NULL;
+ 
+-	profile.power_level += !context->bw_ctx.bw.dcn.clk.p_state_change_support;
++	if (!context || !context->clk_mgr || !context->clk_mgr->ctx || !context->clk_mgr->ctx->dc)
++		return profile;
++
++	dc = context->clk_mgr->ctx->dc;
++
++	if (dc->res_pool->funcs->get_power_profile)
++		profile.power_level = dc->res_pool->funcs->get_power_profile(context);
+ 
+ 	return profile;
+ }
+diff --git a/drivers/gpu/drm/amd/display/dc/dml2/dml21/src/dml2_pmo/dml2_pmo_dcn4_fams2.c b/drivers/gpu/drm/amd/display/dc/dml2/dml21/src/dml2_pmo/dml2_pmo_dcn4_fams2.c
+index dd9971867f74..720ecede3a4c 100644
+--- a/drivers/gpu/drm/amd/display/dc/dml2/dml21/src/dml2_pmo/dml2_pmo_dcn4_fams2.c
++++ b/drivers/gpu/drm/amd/display/dc/dml2/dml21/src/dml2_pmo/dml2_pmo_dcn4_fams2.c
+@@ -1799,6 +1799,7 @@ bool pmo_dcn4_fams2_init_for_pstate_support(struct dml2_pmo_init_for_pstate_supp
+ 	}
+ 
+ 	if (s->pmo_dcn4.num_pstate_candidates > 0) {
++		s->pmo_dcn4.pstate_strategy_candidates[s->pmo_dcn4.num_pstate_candidates-1].allow_state_increase = true;
+ 		s->pmo_dcn4.cur_pstate_candidate = -1;
+ 		return true;
+ 	} else {
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/core_types.h b/drivers/gpu/drm/amd/display/dc/inc/core_types.h
+index bfb8b8502d20..8597e866bfe6 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/core_types.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/core_types.h
+@@ -215,6 +215,10 @@ struct resource_funcs {
+ 
+ 	void (*get_panel_config_defaults)(struct dc_panel_config *panel_config);
+ 	void (*build_pipe_pix_clk_params)(struct pipe_ctx *pipe_ctx);
++	/*
++	 * Get indicator of power from a context that went through full validation
++	 */
++	int (*get_power_profile)(const struct dc_state *context);
+ };
+ 
+ struct audio_support{
+diff --git a/drivers/gpu/drm/amd/display/dc/resource/dcn315/dcn315_resource.c b/drivers/gpu/drm/amd/display/dc/resource/dcn315/dcn315_resource.c
+index 3f4b9dba4112..f6b840f046a5 100644
+--- a/drivers/gpu/drm/amd/display/dc/resource/dcn315/dcn315_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/resource/dcn315/dcn315_resource.c
+@@ -1812,6 +1812,11 @@ static void dcn315_get_panel_config_defaults(struct dc_panel_config *panel_confi
+ 	*panel_config = panel_config_defaults;
+ }
+ 
++static int dcn315_get_power_profile(const struct dc_state *context)
++{
++	return !context->bw_ctx.bw.dcn.clk.p_state_change_support;
++}
++
+ static struct dc_cap_funcs cap_funcs = {
+ 	.get_dcc_compression_cap = dcn20_get_dcc_compression_cap
+ };
+@@ -1840,6 +1845,7 @@ static struct resource_funcs dcn315_res_pool_funcs = {
+ 	.update_bw_bounding_box = dcn315_update_bw_bounding_box,
+ 	.patch_unknown_plane_state = dcn20_patch_unknown_plane_state,
+ 	.get_panel_config_defaults = dcn315_get_panel_config_defaults,
++	.get_power_profile = dcn315_get_power_profile,
+ };
+ 
+ static bool dcn315_resource_construct(
+diff --git a/drivers/gpu/drm/amd/display/dc/resource/dcn401/dcn401_resource.c b/drivers/gpu/drm/amd/display/dc/resource/dcn401/dcn401_resource.c
+index f2653a86d3e7..59184abab1a7 100644
+--- a/drivers/gpu/drm/amd/display/dc/resource/dcn401/dcn401_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/resource/dcn401/dcn401_resource.c
+@@ -1688,6 +1688,22 @@ static void dcn401_build_pipe_pix_clk_params(struct pipe_ctx *pipe_ctx)
+ 	}
+ }
+ 
++static int dcn401_get_power_profile(const struct dc_state *context)
++{
++	int uclk_mhz = context->bw_ctx.bw.dcn.clk.dramclk_khz / 1000;
++	int dpm_level = 0;
++
++	for (int i = 0; i < context->clk_mgr->bw_params->clk_table.num_entries_per_clk.num_memclk_levels; i++) {
++		if (context->clk_mgr->bw_params->clk_table.entries[i].memclk_mhz == 0 ||
++			uclk_mhz < context->clk_mgr->bw_params->clk_table.entries[i].memclk_mhz)
++			break;
++		if (uclk_mhz > context->clk_mgr->bw_params->clk_table.entries[i].memclk_mhz)
++			dpm_level++;
++	}
++
++	return dpm_level;
++}
++
+ static struct resource_funcs dcn401_res_pool_funcs = {
+ 	.destroy = dcn401_destroy_resource_pool,
+ 	.link_enc_create = dcn401_link_encoder_create,
+@@ -1714,6 +1730,7 @@ static struct resource_funcs dcn401_res_pool_funcs = {
+ 	.prepare_mcache_programming = dcn401_prepare_mcache_programming,
+ 	.build_pipe_pix_clk_params = dcn401_build_pipe_pix_clk_params,
+ 	.calculate_mall_ways_from_bytes = dcn32_calculate_mall_ways_from_bytes,
++	.get_power_profile = dcn401_get_power_profile,
+ };
+ 
+ static uint32_t read_pipe_fuses(struct dc_context *ctx)
+-- 
+2.52.0
+
