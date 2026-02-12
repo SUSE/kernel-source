@@ -1,0 +1,125 @@
+From ea02ea9437deebb3d997e9662022159953ecf7e0 Mon Sep 17 00:00:00 2001
+From: "Jesse.zhang@amd.com" <Jesse.zhang@amd.com>
+Date: Tue, 29 Oct 2024 14:33:05 +0800
+Subject: drm/amdgpu: Add sysfs interface for vpe reset mask
+Git-commit: ea02ea9437deebb3d997e9662022159953ecf7e0
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Add the sysfs interface for vpe:
+    vpe_reset_mask
+
+The interface is read-only and show the resets supported by the IP.
+For example, full adapter reset (mode1/mode2/BACO/etc),
+soft reset, queue reset, and pipe reset.
+
+V2: the sysfs node returns a text string instead of some flags (Christian)
+V3: add a generic helper which takes the ring as parameter
+    and print the strings in the order they are applied (Christian)
+
+    check amdgpu_gpu_recovery  before creating sysfs file itself,
+    and initialize supported_reset_types in IP version files (Lijo)
+
+Signed-off-by: Jesse Zhang <Jesse.Zhang@amd.com>
+Suggested-by: Alex Deucher <alexander.deucher@amd.com>
+Reviewed-by: Tim Huang <tim.huang@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vpe.c | 43 +++++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vpe.h |  3 ++
+ 2 files changed, 46 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vpe.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vpe.c
+index 46713a158d90..3e6f9dfb61bb 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vpe.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vpe.c
+@@ -377,6 +377,13 @@ static int vpe_sw_init(struct amdgpu_ip_block *ip_block)
+ 	ret = vpe_init_microcode(vpe);
+ 	if (ret)
+ 		goto out;
++
++	/* TODO: Add queue reset mask when FW fully supports it */
++	adev->vpe.supported_reset =
++		 amdgpu_get_soft_full_reset_mask(&adev->vpe.ring);
++	ret = amdgpu_vpe_sysfs_reset_mask_init(adev);
++	if (ret)
++		goto out;
+ out:
+ 	return ret;
+ }
+@@ -389,6 +396,7 @@ static int vpe_sw_fini(struct amdgpu_ip_block *ip_block)
+ 	release_firmware(vpe->fw);
+ 	vpe->fw = NULL;
+ 
++	amdgpu_vpe_sysfs_reset_mask_fini(adev);
+ 	vpe_ring_fini(vpe);
+ 
+ 	amdgpu_bo_free_kernel(&adev->vpe.cmdbuf_obj,
+@@ -865,6 +873,41 @@ static void vpe_ring_end_use(struct amdgpu_ring *ring)
+ 	schedule_delayed_work(&adev->vpe.idle_work, VPE_IDLE_TIMEOUT);
+ }
+ 
++static ssize_t amdgpu_get_vpe_reset_mask(struct device *dev,
++						struct device_attribute *attr,
++						char *buf)
++{
++	struct drm_device *ddev = dev_get_drvdata(dev);
++	struct amdgpu_device *adev = drm_to_adev(ddev);
++
++	if (!adev)
++		return -ENODEV;
++
++	return amdgpu_show_reset_mask(buf, adev->vpe.supported_reset);
++}
++
++static DEVICE_ATTR(vpe_reset_mask, 0444,
++		   amdgpu_get_vpe_reset_mask, NULL);
++
++int amdgpu_vpe_sysfs_reset_mask_init(struct amdgpu_device *adev)
++{
++	int r = 0;
++
++	if (adev->vpe.num_instances) {
++		r = device_create_file(adev->dev, &dev_attr_vpe_reset_mask);
++		if (r)
++			return r;
++	}
++
++	return r;
++}
++
++void amdgpu_vpe_sysfs_reset_mask_fini(struct amdgpu_device *adev)
++{
++	if (adev->vpe.num_instances)
++		device_remove_file(adev->dev, &dev_attr_vpe_reset_mask);
++}
++
+ static const struct amdgpu_ring_funcs vpe_ring_funcs = {
+ 	.type = AMDGPU_RING_TYPE_VPE,
+ 	.align_mask = 0xf,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vpe.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_vpe.h
+index 231d86d0953e..695da740a97e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vpe.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vpe.h
+@@ -79,6 +79,7 @@ struct amdgpu_vpe {
+ 
+ 	uint32_t			num_instances;
+ 	bool				collaborate_mode;
++	uint32_t			supported_reset;
+ };
+ 
+ int amdgpu_vpe_psp_update_sram(struct amdgpu_device *adev);
+@@ -86,6 +87,8 @@ int amdgpu_vpe_init_microcode(struct amdgpu_vpe *vpe);
+ int amdgpu_vpe_ring_init(struct amdgpu_vpe *vpe);
+ int amdgpu_vpe_ring_fini(struct amdgpu_vpe *vpe);
+ int amdgpu_vpe_configure_dpm(struct amdgpu_vpe *vpe);
++void amdgpu_vpe_sysfs_reset_mask_fini(struct amdgpu_device *adev);
++int amdgpu_vpe_sysfs_reset_mask_init(struct amdgpu_device *adev);
+ 
+ #define vpe_ring_init(vpe) ((vpe)->funcs->ring_init ? (vpe)->funcs->ring_init((vpe)) : 0)
+ #define vpe_ring_start(vpe) ((vpe)->funcs->ring_start ? (vpe)->funcs->ring_start((vpe)) : 0)
+-- 
+2.52.0
+
