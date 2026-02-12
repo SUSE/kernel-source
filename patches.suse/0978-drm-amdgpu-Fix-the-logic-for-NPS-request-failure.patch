@@ -1,0 +1,74 @@
+From d37bc6a4ed252083c8f883597389e7f33ad8b670 Mon Sep 17 00:00:00 2001
+From: Lijo Lazar <lijo.lazar@amd.com>
+Date: Thu, 17 Oct 2024 14:32:12 +0530
+Subject: drm/amdgpu: Fix the logic for NPS request failure
+Git-commit: d37bc6a4ed252083c8f883597389e7f33ad8b670
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+On a hive, NPS request is placed by the first one for all devices in the
+hive. If the request fails, mark the mode as UNKNOWN so that subsequent
+devices on unload don't request it. Also, fix the mutex double lock
+issue in error condition, should have been mutex_unlock.
+
+Fixes: ee52489d1210 ("drm/amdgpu: Place NPS mode request on unload")
+Signed-off-by: Lijo Lazar <lijo.lazar@amd.com>
+Reviewed-by: Rajneesh Bhardwaj <rajneesh.bhardwaj@amd.com>
+Acked-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_xgmi.c | 28 ++++++++++++++----------
+ 1 file changed, 16 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_xgmi.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_xgmi.c
+index fcdbcff57632..3ef5066ca529 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_xgmi.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_xgmi.c
+@@ -1586,26 +1586,30 @@ int amdgpu_xgmi_request_nps_change(struct amdgpu_device *adev,
+ 	 * devices don't request anymore.
+ 	 */
+ 	mutex_lock(&hive->hive_lock);
++	if (atomic_read(&hive->requested_nps_mode) ==
++	    UNKNOWN_MEMORY_PARTITION_MODE) {
++		dev_dbg(adev->dev, "Unexpected entry for hive NPS change");
++		mutex_unlock(&hive->hive_lock);
++		return 0;
++	}
+ 	list_for_each_entry(tmp_adev, &hive->device_list, gmc.xgmi.head) {
+ 		r = adev->gmc.gmc_funcs->request_mem_partition_mode(
+ 			tmp_adev, req_nps_mode);
+ 		if (r)
+-			goto err;
++			break;
++	}
++	if (r) {
++		/* Request back current mode if one of the requests failed */
++		cur_nps_mode =
++			adev->gmc.gmc_funcs->query_mem_partition_mode(tmp_adev);
++		list_for_each_entry_continue_reverse(
++			tmp_adev, &hive->device_list, gmc.xgmi.head)
++			adev->gmc.gmc_funcs->request_mem_partition_mode(
++				tmp_adev, cur_nps_mode);
+ 	}
+ 	/* Set to UNKNOWN so that other devices don't request anymore */
+ 	atomic_set(&hive->requested_nps_mode, UNKNOWN_MEMORY_PARTITION_MODE);
+-
+ 	mutex_unlock(&hive->hive_lock);
+ 
+-	return 0;
+-err:
+-	/* Request back current mode if one of the requests failed */
+-	cur_nps_mode = adev->gmc.gmc_funcs->query_mem_partition_mode(tmp_adev);
+-	list_for_each_entry_continue_reverse(tmp_adev, &hive->device_list,
+-					     gmc.xgmi.head)
+-		adev->gmc.gmc_funcs->request_mem_partition_mode(tmp_adev,
+-								cur_nps_mode);
+-	mutex_lock(&hive->hive_lock);
+-
+ 	return r;
+ }
+-- 
+2.52.0
+
