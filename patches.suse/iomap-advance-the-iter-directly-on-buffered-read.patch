@@ -1,0 +1,123 @@
+From: Brian Foster <bfoster@redhat.com>
+Date: Mon, 24 Feb 2025 09:47:46 -0500
+Subject: [PATCH] iomap: advance the iter directly on buffered read
+Git-commit: d9dc477ff6a25c3812be2b24d81add8e6561c6ed
+Patch-mainline: v6.15-rc1
+References: jsc#PED-14161
+
+iomap buffered read advances the iter via iter.processed. To
+continue separating iter advance from return status, update
+iomap_readpage_iter() to advance the iter instead of returning the
+number of bytes processed. In turn, drop the offset parameter and
+sample the updated iter->pos at the start of the function. Update
+the callers to loop based on remaining length in the current
+iteration instead of number of bytes processed.
+
+Signed-off-by: Brian Foster <bfoster@redhat.com>
+Link: https://lore.kernel.org/r/20250224144757.237706-2-bfoster@redhat.com
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: "Darrick J. Wong" <djwong@kernel.org>
+Signed-off-by: Christian Brauner <brauner@kernel.org>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ fs/iomap/buffered-io.c | 45 +++++++++++++++++++-----------------------
+ 1 file changed, 20 insertions(+), 25 deletions(-)
+
+diff --git a/fs/iomap/buffered-io.c b/fs/iomap/buffered-io.c
+index 8368a4ae716f..582a64f565e6 100644
+--- a/fs/iomap/buffered-io.c
++++ b/fs/iomap/buffered-io.c
+@@ -362,15 +362,14 @@ static inline bool iomap_block_needs_zeroing(const struct iomap_iter *iter,
+ 		pos >= i_size_read(iter->inode);
+ }
+ 
+-static loff_t iomap_readpage_iter(const struct iomap_iter *iter,
+-		struct iomap_readpage_ctx *ctx, loff_t offset)
++static loff_t iomap_readpage_iter(struct iomap_iter *iter,
++		struct iomap_readpage_ctx *ctx)
+ {
+ 	const struct iomap *iomap = &iter->iomap;
+-	loff_t pos = iter->pos + offset;
+-	loff_t length = iomap_length(iter) - offset;
++	loff_t pos = iter->pos;
++	loff_t length = iomap_length(iter);
+ 	struct folio *folio = ctx->cur_folio;
+ 	struct iomap_folio_state *ifs;
+-	loff_t orig_pos = pos;
+ 	size_t poff, plen;
+ 	sector_t sector;
+ 
+@@ -434,25 +433,22 @@ static loff_t iomap_readpage_iter(const struct iomap_iter *iter,
+ 	 * we can skip trailing ones as they will be handled in the next
+ 	 * iteration.
+ 	 */
+-	return pos - orig_pos + plen;
++	length = pos - iter->pos + plen;
++	return iomap_iter_advance(iter, &length);
+ }
+ 
+-static loff_t iomap_read_folio_iter(const struct iomap_iter *iter,
++static loff_t iomap_read_folio_iter(struct iomap_iter *iter,
+ 		struct iomap_readpage_ctx *ctx)
+ {
+-	struct folio *folio = ctx->cur_folio;
+-	size_t offset = offset_in_folio(folio, iter->pos);
+-	loff_t length = min_t(loff_t, folio_size(folio) - offset,
+-			      iomap_length(iter));
+-	loff_t done, ret;
+-
+-	for (done = 0; done < length; done += ret) {
+-		ret = iomap_readpage_iter(iter, ctx, done);
+-		if (ret <= 0)
++	loff_t ret;
++
++	while (iomap_length(iter)) {
++		ret = iomap_readpage_iter(iter, ctx);
++		if (ret)
+ 			return ret;
+ 	}
+ 
+-	return done;
++	return 0;
+ }
+ 
+ int iomap_read_folio(struct folio *folio, const struct iomap_ops *ops)
+@@ -489,15 +485,14 @@ int iomap_read_folio(struct folio *folio, const struct iomap_ops *ops)
+ }
+ EXPORT_SYMBOL_GPL(iomap_read_folio);
+ 
+-static loff_t iomap_readahead_iter(const struct iomap_iter *iter,
++static loff_t iomap_readahead_iter(struct iomap_iter *iter,
+ 		struct iomap_readpage_ctx *ctx)
+ {
+-	loff_t length = iomap_length(iter);
+-	loff_t done, ret;
++	loff_t ret;
+ 
+-	for (done = 0; done < length; done += ret) {
++	while (iomap_length(iter)) {
+ 		if (ctx->cur_folio &&
+-		    offset_in_folio(ctx->cur_folio, iter->pos + done) == 0) {
++		    offset_in_folio(ctx->cur_folio, iter->pos) == 0) {
+ 			if (!ctx->cur_folio_in_bio)
+ 				folio_unlock(ctx->cur_folio);
+ 			ctx->cur_folio = NULL;
+@@ -506,12 +501,12 @@ static loff_t iomap_readahead_iter(const struct iomap_iter *iter,
+ 			ctx->cur_folio = readahead_folio(ctx->rac);
+ 			ctx->cur_folio_in_bio = false;
+ 		}
+-		ret = iomap_readpage_iter(iter, ctx, done);
+-		if (ret <= 0)
++		ret = iomap_readpage_iter(iter, ctx);
++		if (ret)
+ 			return ret;
+ 	}
+ 
+-	return done;
++	return 0;
+ }
+ 
+ /**
+-- 
+2.43.0
+
