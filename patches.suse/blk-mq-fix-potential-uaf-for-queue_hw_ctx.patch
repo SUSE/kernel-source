@@ -1,0 +1,110 @@
+From: Fengnan Chang <fengnanchang@gmail.com>
+Date: Fri, 28 Nov 2025 16:53:14 +0800
+Subject: [PATCH] blk-mq: fix potential uaf for 'queue_hw_ctx'
+Git-commit: 89e1fb7ceffd898505ad7fa57acec0585bfaa2cc
+Patch-mainline: v6.19-rc1
+References: jsc#PED-14161
+
+This is just apply Kuai's patch in [1] with mirror changes.
+
+blk_mq_realloc_hw_ctxs() will free the 'queue_hw_ctx'(e.g. undate
+submit_queues through configfs for null_blk), while it might still be
+used from other context(e.g. switch elevator to none):
+
+t1					t2
+elevator_switch
+ blk_mq_unquiesce_queue
+  blk_mq_run_hw_queues
+   queue_for_each_hw_ctx
+    // assembly code for hctx = (q)->queue_hw_ctx[i]
+    mov    0x48(%rbp),%rdx -> read old queue_hw_ctx
+
+					__blk_mq_update_nr_hw_queues
+					 blk_mq_realloc_hw_ctxs
+					  hctxs = q->queue_hw_ctx
+					  q->queue_hw_ctx = new_hctxs
+					  kfree(hctxs)
+    movslq %ebx,%rax
+    mov    (%rdx,%rax,8),%rdi ->uaf
+
+This problem was found by code review, and I comfirmed that the concurrent
+scenario do exist(specifically 'q->queue_hw_ctx' can be changed during
+blk_mq_run_hw_queues()), however, the uaf problem hasn't been repoduced yet
+without hacking the kernel.
+
+Sicne the queue is freezed in __blk_mq_update_nr_hw_queues(), fix the
+problem by protecting 'queue_hw_ctx' through rcu where it can be accessed
+without grabbing 'q_usage_counter'.
+
+[1] https://lore.kernel.org/all/20220225072053.2472431-1-yukuai3@huawei.com/
+
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Signed-off-by: Fengnan Chang <changfengnan@bytedance.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/blk-mq.c         |  7 ++++++-
+ include/linux/blk-mq.h | 13 ++++++++++++-
+ include/linux/blkdev.h |  2 +-
+ 3 files changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 1ef81110eb8a..4e96bb246247 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -4535,7 +4535,12 @@ static void __blk_mq_realloc_hw_ctxs(struct blk_mq_tag_set *set,
+ 		if (hctxs)
+ 			memcpy(new_hctxs, hctxs, q->nr_hw_queues *
+ 			       sizeof(*hctxs));
+-		q->queue_hw_ctx = new_hctxs;
++		rcu_assign_pointer(q->queue_hw_ctx, new_hctxs);
++		/*
++		 * Make sure reading the old queue_hw_ctx from other
++		 * context concurrently won't trigger uaf.
++		 */
++		synchronize_rcu_expedited();
+ 		kfree(hctxs);
+ 		hctxs = new_hctxs;
+ 	}
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index 9208ff90ae16..eb7254b3dddd 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -1015,9 +1015,20 @@ static inline void *blk_mq_rq_to_pdu(struct request *rq)
+ 	return rq + 1;
+ }
+ 
++static inline struct blk_mq_hw_ctx *queue_hctx(struct request_queue *q, int id)
++{
++	struct blk_mq_hw_ctx *hctx;
++
++	rcu_read_lock();
++	hctx = rcu_dereference(q->queue_hw_ctx)[id];
++	rcu_read_unlock();
++
++	return hctx;
++}
++
+ #define queue_for_each_hw_ctx(q, hctx, i)				\
+ 	for ((i) = 0; (i) < (q)->nr_hw_queues &&			\
+-	     ({ hctx = (q)->queue_hw_ctx[i]; 1; }); (i)++)
++	     ({ hctx = queue_hctx((q), i); 1; }); (i)++)
+ 
+ #define hctx_for_each_ctx(hctx, ctx, i)					\
+ 	for ((i) = 0; (i) < (hctx)->nr_ctx &&				\
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 6195f89648db..72e34acd439c 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -503,7 +503,7 @@ struct request_queue {
+ 
+ 	/* hw dispatch queues */
+ 	unsigned int		nr_hw_queues;
+-	struct blk_mq_hw_ctx	**queue_hw_ctx;
++	struct blk_mq_hw_ctx * __rcu *queue_hw_ctx;
+ 
+ 	struct percpu_ref	q_usage_counter;
+ 	struct lock_class_key	io_lock_cls_key;
+-- 
+2.43.0
+
