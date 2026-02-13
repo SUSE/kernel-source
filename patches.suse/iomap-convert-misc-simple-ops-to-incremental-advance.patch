@@ -1,0 +1,156 @@
+From: Brian Foster <bfoster@redhat.com>
+Date: Mon, 24 Feb 2025 09:47:48 -0500
+Subject: [PATCH] iomap: convert misc simple ops to incremental advance
+Git-commit: f145377da150b9606f3d51d66b03eca86514ea27
+Patch-mainline: v6.15-rc1
+References: jsc#PED-14161
+
+Update several of the remaining iomap operations to advance the iter
+directly rather than via return value. This includes page faults,
+fiemap, seek data/hole and swapfile activation.
+
+Signed-off-by: Brian Foster <bfoster@redhat.com>
+Link: https://lore.kernel.org/r/20250224144757.237706-4-bfoster@redhat.com
+Reviewed-by: "Darrick J. Wong" <djwong@kernel.org>
+Signed-off-by: Christian Brauner <brauner@kernel.org>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ fs/iomap/buffered-io.c |  2 +-
+ fs/iomap/fiemap.c      | 18 +++++++++---------
+ fs/iomap/seek.c        | 12 ++++++------
+ fs/iomap/swapfile.c    |  7 +++++--
+ 4 files changed, 21 insertions(+), 18 deletions(-)
+
+diff --git a/fs/iomap/buffered-io.c b/fs/iomap/buffered-io.c
+index 582a64f565e6..1518acbf8b09 100644
+--- a/fs/iomap/buffered-io.c
++++ b/fs/iomap/buffered-io.c
+@@ -1478,7 +1478,7 @@ static loff_t iomap_folio_mkwrite_iter(struct iomap_iter *iter,
+ 		folio_mark_dirty(folio);
+ 	}
+ 
+-	return length;
++	return iomap_iter_advance(iter, &length);
+ }
+ 
+ vm_fault_t iomap_page_mkwrite(struct vm_fault *vmf, const struct iomap_ops *ops,
+diff --git a/fs/iomap/fiemap.c b/fs/iomap/fiemap.c
+index 610ca6f1ec9b..8a0d8b034218 100644
+--- a/fs/iomap/fiemap.c
++++ b/fs/iomap/fiemap.c
+@@ -39,24 +39,24 @@ static int iomap_to_fiemap(struct fiemap_extent_info *fi,
+ 			iomap->length, flags);
+ }
+ 
+-static loff_t iomap_fiemap_iter(const struct iomap_iter *iter,
++static loff_t iomap_fiemap_iter(struct iomap_iter *iter,
+ 		struct fiemap_extent_info *fi, struct iomap *prev)
+ {
++	u64 length = iomap_length(iter);
+ 	int ret;
+ 
+ 	if (iter->iomap.type == IOMAP_HOLE)
+-		return iomap_length(iter);
++		goto advance;
+ 
+ 	ret = iomap_to_fiemap(fi, prev, 0);
+ 	*prev = iter->iomap;
+-	switch (ret) {
+-	case 0:		/* success */
+-		return iomap_length(iter);
+-	case 1:		/* extent array full */
+-		return 0;
+-	default:	/* error */
++	if (ret < 0)
+ 		return ret;
+-	}
++	if (ret == 1)	/* extent array full */
++		return 0;
++
++advance:
++	return iomap_iter_advance(iter, &length);
+ }
+ 
+ int iomap_fiemap(struct inode *inode, struct fiemap_extent_info *fi,
+diff --git a/fs/iomap/seek.c b/fs/iomap/seek.c
+index a845c012b50c..83c687d6ccc0 100644
+--- a/fs/iomap/seek.c
++++ b/fs/iomap/seek.c
+@@ -10,7 +10,7 @@
+ #include <linux/pagemap.h>
+ #include <linux/pagevec.h>
+ 
+-static loff_t iomap_seek_hole_iter(const struct iomap_iter *iter,
++static loff_t iomap_seek_hole_iter(struct iomap_iter *iter,
+ 		loff_t *hole_pos)
+ {
+ 	loff_t length = iomap_length(iter);
+@@ -20,13 +20,13 @@ static loff_t iomap_seek_hole_iter(const struct iomap_iter *iter,
+ 		*hole_pos = mapping_seek_hole_data(iter->inode->i_mapping,
+ 				iter->pos, iter->pos + length, SEEK_HOLE);
+ 		if (*hole_pos == iter->pos + length)
+-			return length;
++			return iomap_iter_advance(iter, &length);
+ 		return 0;
+ 	case IOMAP_HOLE:
+ 		*hole_pos = iter->pos;
+ 		return 0;
+ 	default:
+-		return length;
++		return iomap_iter_advance(iter, &length);
+ 	}
+ }
+ 
+@@ -56,19 +56,19 @@ iomap_seek_hole(struct inode *inode, loff_t pos, const struct iomap_ops *ops)
+ }
+ EXPORT_SYMBOL_GPL(iomap_seek_hole);
+ 
+-static loff_t iomap_seek_data_iter(const struct iomap_iter *iter,
++static loff_t iomap_seek_data_iter(struct iomap_iter *iter,
+ 		loff_t *hole_pos)
+ {
+ 	loff_t length = iomap_length(iter);
+ 
+ 	switch (iter->iomap.type) {
+ 	case IOMAP_HOLE:
+-		return length;
++		return iomap_iter_advance(iter, &length);
+ 	case IOMAP_UNWRITTEN:
+ 		*hole_pos = mapping_seek_hole_data(iter->inode->i_mapping,
+ 				iter->pos, iter->pos + length, SEEK_DATA);
+ 		if (*hole_pos < 0)
+-			return length;
++			return iomap_iter_advance(iter, &length);
+ 		return 0;
+ 	default:
+ 		*hole_pos = iter->pos;
+diff --git a/fs/iomap/swapfile.c b/fs/iomap/swapfile.c
+index b90d0eda9e51..4395e46a4dc7 100644
+--- a/fs/iomap/swapfile.c
++++ b/fs/iomap/swapfile.c
+@@ -94,9 +94,11 @@ static int iomap_swapfile_fail(struct iomap_swapfile_info *isi, const char *str)
+  * swap only cares about contiguous page-aligned physical extents and makes no
+  * distinction between written and unwritten extents.
+  */
+-static loff_t iomap_swapfile_iter(const struct iomap_iter *iter,
++static loff_t iomap_swapfile_iter(struct iomap_iter *iter,
+ 		struct iomap *iomap, struct iomap_swapfile_info *isi)
+ {
++	u64 length = iomap_length(iter);
++
+ 	switch (iomap->type) {
+ 	case IOMAP_MAPPED:
+ 	case IOMAP_UNWRITTEN:
+@@ -132,7 +134,8 @@ static loff_t iomap_swapfile_iter(const struct iomap_iter *iter,
+ 			return error;
+ 		memcpy(&isi->iomap, iomap, sizeof(isi->iomap));
+ 	}
+-	return iomap_length(iter);
++
++	return iomap_iter_advance(iter, &length);
+ }
+ 
+ /*
+-- 
+2.43.0
+
