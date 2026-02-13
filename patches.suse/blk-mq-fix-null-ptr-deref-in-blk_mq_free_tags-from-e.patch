@@ -1,0 +1,69 @@
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Tue, 23 Sep 2025 15:01:01 +0800
+Subject: [PATCH] blk-mq: fix null-ptr-deref in blk_mq_free_tags() from error
+ path
+Git-commit: 670bfe683850cb29957a9d71f997e9774eb24de6
+Patch-mainline: v6.18-rc1
+References: jsc#PED-14161
+
+blk_mq_free_tags() can be called after blk_mq_init_tags(), while
+tags->page_list is still not initialized, causing null-ptr-deref.
+
+Fix this problem by initializing tags->page_list at blk_mq_init_tags(),
+meanwhile, also free tags directly from error path because there is no
+srcu barrier.
+
+Fixes: ad0d05dbddc1 ("blk-mq: Defer freeing of tags page_list to SRCU callback")
+Reported-by: syzbot+5c5d41e80248d610221f@syzkaller.appspotmail.com
+Closes: https://lore.kernel.org/all/68d1b079.a70a0220.1b52b.0000.GAE@google.com/
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/blk-mq-tag.c | 9 +++++++++
+ block/blk-mq.c     | 2 --
+ 2 files changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/block/blk-mq-tag.c b/block/blk-mq-tag.c
+index 271fa005c51e..c7a4d4b9cc87 100644
+--- a/block/blk-mq-tag.c
++++ b/block/blk-mq-tag.c
+@@ -566,6 +566,8 @@ struct blk_mq_tags *blk_mq_init_tags(unsigned int total_tags,
+ 	tags->nr_tags = total_tags;
+ 	tags->nr_reserved_tags = reserved_tags;
+ 	spin_lock_init(&tags->lock);
++	INIT_LIST_HEAD(&tags->page_list);
++
+ 	if (bt_alloc(&tags->bitmap_tags, depth, round_robin, node))
+ 		goto out_free_tags;
+ 	if (bt_alloc(&tags->breserved_tags, reserved_tags, round_robin, node))
+@@ -603,6 +605,13 @@ void blk_mq_free_tags(struct blk_mq_tag_set *set, struct blk_mq_tags *tags)
+ {
+ 	sbitmap_queue_free(&tags->bitmap_tags);
+ 	sbitmap_queue_free(&tags->breserved_tags);
++
++	/* if tags pages is not allocated yet, free tags directly */
++	if (list_empty(&tags->page_list)) {
++		kfree(tags);
++		return;
++	}
++
+ 	call_srcu(&set->tags_srcu, &tags->rcu_head, blk_mq_free_tags_callback);
+ }
+ 
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 4ccf11cadf8c..09f579414161 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -3582,8 +3582,6 @@ static int blk_mq_alloc_rqs(struct blk_mq_tag_set *set,
+ 	if (node == NUMA_NO_NODE)
+ 		node = set->numa_node;
+ 
+-	INIT_LIST_HEAD(&tags->page_list);
+-
+ 	/*
+ 	 * rq_size is the size of the request plus driver payload, rounded
+ 	 * to the cacheline size
+-- 
+2.43.0
+
