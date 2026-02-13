@@ -1,0 +1,106 @@
+From: Nilay Shroff <nilay@linux.ibm.com>
+Date: Thu, 13 Nov 2025 14:28:22 +0530
+Subject: [PATCH] block: define alloc_sched_data and free_sched_data methods
+ for kyber
+Git-commit: d4c3ef56a1618cb7d55a4be74a09cda09165745a
+Patch-mainline: v6.19-rc1
+References: jsc#PED-14161
+
+Currently, the Kyber elevator allocates its private data dynamically in
+->init_sched and frees it in ->exit_sched. However, since ->init_sched
+is invoked during elevator switch after acquiring both ->freeze_lock and
+->elevator_lock, it may trigger the lockdep splat [1] due to dependency
+on pcpu_alloc_mutex.
+
+To resolve this, move the elevator data allocation and deallocation
+logic from ->init_sched and ->exit_sched into the newly introduced
+->alloc_sched_data and ->free_sched_data methods. These callbacks are
+invoked before acquiring ->freeze_lock and ->elevator_lock, ensuring
+that memory allocation happens safely without introducing additional
+locking dependencies.
+
+This change breaks the dependency chain involving pcpu_alloc_mutex and
+prevents the reported lockdep warning.
+
+[1] https://lore.kernel.org/all/CAGVVp+VNW4M-5DZMNoADp6o2VKFhi7KxWpTDkcnVyjO0=-D5+A@mail.gmail.com/
+
+Reported-by: Changhui Zhong <czhong@redhat.com>
+Reported-by: Yi Zhang <yi.zhang@redhat.com>
+Closes: https://lore.kernel.org/all/CAGVVp+VNW4M-5DZMNoADp6o2VKFhi7KxWpTDkcnVyjO0=-D5+A@mail.gmail.com/
+Tested-by: Yi Zhang <yi.zhang@redhat.com>
+Reviewed-by: Ming Lei <ming.lei@redhat.com>
+Reviewed-by: Yu Kuai <yukuai@fnnas.com>
+Signed-off-by: Nilay Shroff <nilay@linux.ibm.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/kyber-iosched.c | 30 ++++++++++++++++++++++--------
+ 1 file changed, 22 insertions(+), 8 deletions(-)
+
+diff --git a/block/kyber-iosched.c b/block/kyber-iosched.c
+index 18efd6ef2a2b..c1b36ffd19ce 100644
+--- a/block/kyber-iosched.c
++++ b/block/kyber-iosched.c
+@@ -409,30 +409,42 @@ static void kyber_depth_updated(struct request_queue *q)
+ 
+ static int kyber_init_sched(struct request_queue *q, struct elevator_queue *eq)
+ {
+-	struct kyber_queue_data *kqd;
+-
+-	kqd = kyber_queue_data_alloc(q);
+-	if (IS_ERR(kqd))
+-		return PTR_ERR(kqd);
+-
+ 	blk_stat_enable_accounting(q);
+ 
+ 	blk_queue_flag_clear(QUEUE_FLAG_SQ_SCHED, q);
+ 
+-	eq->elevator_data = kqd;
+ 	q->elevator = eq;
+ 	kyber_depth_updated(q);
+ 
+ 	return 0;
+ }
+ 
++static void *kyber_alloc_sched_data(struct request_queue *q)
++{
++	struct kyber_queue_data *kqd;
++
++	kqd = kyber_queue_data_alloc(q);
++	if (IS_ERR(kqd))
++		return NULL;
++
++	return kqd;
++}
++
+ static void kyber_exit_sched(struct elevator_queue *e)
+ {
+ 	struct kyber_queue_data *kqd = e->elevator_data;
+-	int i;
+ 
+ 	timer_shutdown_sync(&kqd->timer);
+ 	blk_stat_disable_accounting(kqd->q);
++}
++
++static void kyber_free_sched_data(void *elv_data)
++{
++	struct kyber_queue_data *kqd = elv_data;
++	int i;
++
++	if (!kqd)
++		return;
+ 
+ 	for (i = 0; i < KYBER_NUM_DOMAINS; i++)
+ 		sbitmap_queue_free(&kqd->domain_tokens[i]);
+@@ -1004,6 +1016,8 @@ static struct elevator_type kyber_sched = {
+ 		.exit_sched = kyber_exit_sched,
+ 		.init_hctx = kyber_init_hctx,
+ 		.exit_hctx = kyber_exit_hctx,
++		.alloc_sched_data = kyber_alloc_sched_data,
++		.free_sched_data = kyber_free_sched_data,
+ 		.limit_depth = kyber_limit_depth,
+ 		.bio_merge = kyber_bio_merge,
+ 		.prepare_request = kyber_prepare_request,
+-- 
+2.43.0
+
