@@ -1,0 +1,154 @@
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Wed, 10 Sep 2025 16:04:43 +0800
+Subject: [PATCH] blk-mq: fix potential deadlock while nr_requests grown
+Git-commit: b86433721f46d934940528f28d49c1dedb690df1
+Patch-mainline: v6.18-rc1
+References: jsc#PED-14161
+
+Allocate and free sched_tags while queue is freezed can deadlock[1],
+this is a long term problem, hence allocate memory before freezing
+queue and free memory after queue is unfreezed.
+
+[1] https://lore.kernel.org/all/0659ea8d-a463-47c8-9180-43c719e106eb@linux.ibm.com/
+Fixes: e3a2b3f931f5 ("blk-mq: allow changing of queue depth through sysfs")
+
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Reviewed-by: Nilay Shroff <nilay@linux.ibm.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/blk-mq.c    | 22 +++++++++-------------
+ block/blk-mq.h    |  5 ++++-
+ block/blk-sysfs.c | 29 +++++++++++++++++++++--------
+ 3 files changed, 34 insertions(+), 22 deletions(-)
+
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 299aac458185..4ccf11cadf8c 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -4926,11 +4926,13 @@ void blk_mq_free_tag_set(struct blk_mq_tag_set *set)
+ }
+ EXPORT_SYMBOL(blk_mq_free_tag_set);
+ 
+-int blk_mq_update_nr_requests(struct request_queue *q, unsigned int nr)
++struct elevator_tags *blk_mq_update_nr_requests(struct request_queue *q,
++						struct elevator_tags *et,
++						unsigned int nr)
+ {
+ 	struct blk_mq_tag_set *set = q->tag_set;
++	struct elevator_tags *old_et = NULL;
+ 	struct blk_mq_hw_ctx *hctx;
+-	int ret = 0;
+ 	unsigned long i;
+ 
+ 	blk_mq_quiesce_queue(q);
+@@ -4965,24 +4967,18 @@ int blk_mq_update_nr_requests(struct request_queue *q, unsigned int nr)
+ 		}
+ 	} else {
+ 		/* Non-shared sched tags, and tags grow */
+-		queue_for_each_hw_ctx(q, hctx, i) {
+-			if (!hctx->sched_tags)
+-				continue;
+-			ret = blk_mq_tag_update_depth(hctx, &hctx->sched_tags,
+-						      nr);
+-			if (ret)
+-				goto out;
+-		}
++		queue_for_each_hw_ctx(q, hctx, i)
++			hctx->sched_tags = et->tags[i];
++		old_et =  q->elevator->et;
++		q->elevator->et = et;
+ 	}
+ 
+ 	q->nr_requests = nr;
+ 	if (q->elevator && q->elevator->type->ops.depth_updated)
+ 		q->elevator->type->ops.depth_updated(q);
+ 
+-out:
+ 	blk_mq_unquiesce_queue(q);
+-
+-	return ret;
++	return old_et;
+ }
+ 
+ /*
+diff --git a/block/blk-mq.h b/block/blk-mq.h
+index 3a1d4c37d1bc..0ef96f510477 100644
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@ -6,6 +6,7 @@
+ #include "blk-stat.h"
+ 
+ struct blk_mq_tag_set;
++struct elevator_tags;
+ 
+ struct blk_mq_ctxs {
+ 	struct kobject kobj;
+@@ -45,7 +46,9 @@ void blk_mq_submit_bio(struct bio *bio);
+ int blk_mq_poll(struct request_queue *q, blk_qc_t cookie, struct io_comp_batch *iob,
+ 		unsigned int flags);
+ void blk_mq_exit_queue(struct request_queue *q);
+-int blk_mq_update_nr_requests(struct request_queue *q, unsigned int nr);
++struct elevator_tags *blk_mq_update_nr_requests(struct request_queue *q,
++						struct elevator_tags *tags,
++						unsigned int nr);
+ void blk_mq_wake_waiters(struct request_queue *q);
+ bool blk_mq_dispatch_rq_list(struct blk_mq_hw_ctx *hctx, struct list_head *,
+ 			     bool);
+diff --git a/block/blk-sysfs.c b/block/blk-sysfs.c
+index ff66d1b47169..76c47fe9b8d6 100644
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@ -64,11 +64,12 @@ static ssize_t queue_requests_show(struct gendisk *disk, char *page)
+ static ssize_t
+ queue_requests_store(struct gendisk *disk, const char *page, size_t count)
+ {
+-	unsigned long nr;
+-	int ret, err;
+-	unsigned int memflags;
+ 	struct request_queue *q = disk->queue;
+ 	struct blk_mq_tag_set *set = q->tag_set;
++	struct elevator_tags *et = NULL;
++	unsigned int memflags;
++	unsigned long nr;
++	int ret;
+ 
+ 	ret = queue_var_store(&nr, page, count);
+ 	if (ret < 0)
+@@ -99,16 +100,28 @@ queue_requests_store(struct gendisk *disk, const char *page, size_t count)
+ 		goto unlock;
+ 	}
+ 
++	if (!blk_mq_is_shared_tags(set->flags) && q->elevator &&
++	    nr > q->elevator->et->nr_requests) {
++		/*
++		 * Tags will grow, allocate memory before freezing queue to
++		 * prevent deadlock.
++		 */
++		et = blk_mq_alloc_sched_tags(set, q->nr_hw_queues, nr);
++		if (!et) {
++			ret = -ENOMEM;
++			goto unlock;
++		}
++	}
++
+ 	memflags = blk_mq_freeze_queue(q);
+ 	mutex_lock(&q->elevator_lock);
+-
+-	err = blk_mq_update_nr_requests(disk->queue, nr);
+-	if (err)
+-		ret = err;
+-
++	et = blk_mq_update_nr_requests(q, et, nr);
+ 	mutex_unlock(&q->elevator_lock);
+ 	blk_mq_unfreeze_queue(q, memflags);
+ 
++	if (et)
++		blk_mq_free_sched_tags(et, set);
++
+ unlock:
+ 	up_write(&set->update_nr_hwq_lock);
+ 	return ret;
+-- 
+2.43.0
+
