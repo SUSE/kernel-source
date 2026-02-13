@@ -1,0 +1,151 @@
+From: Chiachang Wang <chiachangwang@google.com>
+Date: Thu, 13 Mar 2025 02:36:40 +0000
+Subject: xfrm: Migrate offload configuration
+Patch-mainline: v6.16-rc1
+Git-commit: ab244a394c7f13f6573744b9ca72bb22151a3ec4
+References: jsc#PED-14197
+
+Add hardware offload configuration to XFRM_MSG_MIGRATE
+using an option netlink attribute XFRMA_OFFLOAD_DEV.
+
+In the existing xfrm_state_migrate(), the xfrm_init_state()
+is called assuming no hardware offload by default. Even the
+original xfrm_state is configured with offload, the setting will
+be reset. If the device is configured with hardware offload,
+it's reasonable to allow the device to maintain its hardware
+offload mode. But the device will end up with offload disabled
+after receiving a migration event when the device migrates the
+connection from one netdev to another one.
+
+The devices that support migration may work with different
+underlying networks, such as mobile devices. The hardware setting
+should be forwarded to the different netdev based on the
+migration configuration. This change provides the capability
+for user space to migrate from one netdev to another.
+
+Test: Tested with kernel test in the Android tree located
+      in https://android.googlesource.com/kernel/tests/
+      The xfrm_tunnel_test.py under the tests folder in
+      particular.
+Signed-off-by: Chiachang Wang <chiachangwang@google.com>
+Reviewed-by: Leon Romanovsky <leonro@nvidia.com>
+Signed-off-by: Steffen Klassert <steffen.klassert@secunet.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/net/xfrm.h     |    8 ++++++--
+ net/key/af_key.c       |    2 +-
+ net/xfrm/xfrm_policy.c |    4 ++--
+ net/xfrm/xfrm_state.c  |    9 ++++++++-
+ net/xfrm/xfrm_user.c   |   15 ++++++++++++---
+ 5 files changed, 29 insertions(+), 9 deletions(-)
+
+--- a/include/net/xfrm.h
++++ b/include/net/xfrm.h
+@@ -1849,12 +1849,16 @@ struct xfrm_state *xfrm_migrate_state_fi
+ 						u32 if_id);
+ struct xfrm_state *xfrm_state_migrate(struct xfrm_state *x,
+ 				      struct xfrm_migrate *m,
+-				      struct xfrm_encap_tmpl *encap);
++				      struct xfrm_encap_tmpl *encap,
++				      struct net *net,
++				      struct xfrm_user_offload *xuo,
++				      struct netlink_ext_ack *extack);
+ int xfrm_migrate(const struct xfrm_selector *sel, u8 dir, u8 type,
+ 		 struct xfrm_migrate *m, int num_bundles,
+ 		 struct xfrm_kmaddress *k, struct net *net,
+ 		 struct xfrm_encap_tmpl *encap, u32 if_id,
+-		 struct netlink_ext_ack *extack);
++		 struct netlink_ext_ack *extack,
++		 struct xfrm_user_offload *xuo);
+ #endif
+ 
+ int km_new_mapping(struct xfrm_state *x, xfrm_address_t *ipaddr, __be16 sport);
+--- a/net/key/af_key.c
++++ b/net/key/af_key.c
+@@ -2630,7 +2630,7 @@ static int pfkey_migrate(struct sock *sk
+ 	}
+ 
+ 	return xfrm_migrate(&sel, dir, XFRM_POLICY_TYPE_MAIN, m, i,
+-			    kma ? &k : NULL, net, NULL, 0, NULL);
++			    kma ? &k : NULL, net, NULL, 0, NULL, NULL);
+ 
+  out:
+ 	return err;
+--- a/net/xfrm/xfrm_policy.c
++++ b/net/xfrm/xfrm_policy.c
+@@ -4610,7 +4610,7 @@ int xfrm_migrate(const struct xfrm_selec
+ 		 struct xfrm_migrate *m, int num_migrate,
+ 		 struct xfrm_kmaddress *k, struct net *net,
+ 		 struct xfrm_encap_tmpl *encap, u32 if_id,
+-		 struct netlink_ext_ack *extack)
++		 struct netlink_ext_ack *extack, struct xfrm_user_offload *xuo)
+ {
+ 	int i, err, nx_cur = 0, nx_new = 0;
+ 	struct xfrm_policy *pol = NULL;
+@@ -4643,7 +4643,7 @@ int xfrm_migrate(const struct xfrm_selec
+ 		if ((x = xfrm_migrate_state_find(mp, net, if_id))) {
+ 			x_cur[nx_cur] = x;
+ 			nx_cur++;
+-			xc = xfrm_state_migrate(x, mp, encap);
++			xc = xfrm_state_migrate(x, mp, encap, net, xuo, extack);
+ 			if (xc) {
+ 				x_new[nx_new] = xc;
+ 				nx_new++;
+--- a/net/xfrm/xfrm_state.c
++++ b/net/xfrm/xfrm_state.c
+@@ -1938,7 +1938,10 @@ EXPORT_SYMBOL(xfrm_migrate_state_find);
+ 
+ struct xfrm_state *xfrm_state_migrate(struct xfrm_state *x,
+ 				      struct xfrm_migrate *m,
+-				      struct xfrm_encap_tmpl *encap)
++				      struct xfrm_encap_tmpl *encap,
++				      struct net *net,
++				      struct xfrm_user_offload *xuo,
++				      struct netlink_ext_ack *extack)
+ {
+ 	struct xfrm_state *xc;
+ 
+@@ -1954,6 +1957,10 @@ struct xfrm_state *xfrm_state_migrate(st
+ 	memcpy(&xc->id.daddr, &m->new_daddr, sizeof(xc->id.daddr));
+ 	memcpy(&xc->props.saddr, &m->new_saddr, sizeof(xc->props.saddr));
+ 
++	/* configure the hardware if offload is requested */
++	if (xuo && xfrm_dev_state_add(net, xc, xuo, extack))
++		goto error;
++
+ 	/* add state */
+ 	if (xfrm_addr_equal(&x->id.daddr, &m->new_daddr, m->new_family)) {
+ 		/* a care is needed when the destination address of the
+--- a/net/xfrm/xfrm_user.c
++++ b/net/xfrm/xfrm_user.c
+@@ -3003,6 +3003,7 @@ static int xfrm_do_migrate(struct sk_buf
+ 	int n = 0;
+ 	struct net *net = sock_net(skb->sk);
+ 	struct xfrm_encap_tmpl  *encap = NULL;
++	struct xfrm_user_offload *xuo = NULL;
+ 	u32 if_id = 0;
+ 
+ 	if (!attrs[XFRMA_MIGRATE]) {
+@@ -3033,11 +3034,19 @@ static int xfrm_do_migrate(struct sk_buf
+ 	if (attrs[XFRMA_IF_ID])
+ 		if_id = nla_get_u32(attrs[XFRMA_IF_ID]);
+ 
++	if (attrs[XFRMA_OFFLOAD_DEV]) {
++		xuo = kmemdup(nla_data(attrs[XFRMA_OFFLOAD_DEV]),
++			      sizeof(*xuo), GFP_KERNEL);
++		if (!xuo) {
++			err = -ENOMEM;
++			goto error;
++		}
++	}
+ 	err = xfrm_migrate(&pi->sel, pi->dir, type, m, n, kmp, net, encap,
+-			   if_id, extack);
+-
++			   if_id, extack, xuo);
++error:
+ 	kfree(encap);
+-
++	kfree(xuo);
+ 	return err;
+ }
+ #else
