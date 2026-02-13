@@ -1,0 +1,103 @@
+From: Xue He <xue01.he@samsung.com>
+Date: Tue, 18 Nov 2025 07:32:30 +0000
+Subject: [PATCH] block: plug attempts to batch allocate tags multiple times
+Git-commit: 152c331bcd805eddd520979c51cea46582e260fc
+Patch-mainline: v6.19-rc1
+References: jsc#PED-14161
+
+This patch aims to enable batch allocation of sufficient tags after
+batch IO submission with plug mechanism, thereby avoiding the need for
+frequent individual requests when the initial allocation is
+insufficient.
+Acked-by: Hannes Reinecke <hare@suse.com>
+-----------------------------------------------------------
+HW:
+16 CPUs/16 poll queues
+Disk: Samsung PM9A3 Gen4 3.84T
+
+CMD:
+[global]
+ioengine=io_uring
+group_reporting=1
+time_based=1
+runtime=1m
+refill_buffers=1
+norandommap=1
+randrepeat=0
+fixedbufs=1
+registerfiles=1
+rw=randread
+iodepth=128
+iodepth_batch_submit=32
+iodepth_batch_complete_min=32
+iodepth_batch_complete_max=128
+iodepth_low=32
+bs=4k
+numjobs=1
+direct=1
+hipri=1
+
+[job1]
+filename=/dev/nvme0n1
+name=batch_test
+------------------------------------------------------------
+Perf:
+base code: __blk_mq_alloc_requests() 1.47%
+patch: __blk_mq_alloc_requests() 0.75%
+------------------------------------------------------------
+
+Signed-off-by: hexue <xue01.he@samsung.com>
+Reviewed-by: Ming Lei <ming.lei@redhat.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ block/blk-mq.c | 33 +++++++++++++++++++--------------
+ 1 file changed, 19 insertions(+), 14 deletions(-)
+
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 0d38daaa4705..f2650c97a75e 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -468,21 +468,26 @@ __blk_mq_alloc_requests_batch(struct blk_mq_alloc_data *data)
+ 	unsigned long tag_mask;
+ 	int i, nr = 0;
+ 
+-	tag_mask = blk_mq_get_tags(data, data->nr_tags, &tag_offset);
+-	if (unlikely(!tag_mask))
+-		return NULL;
++	do {
++		tag_mask = blk_mq_get_tags(data, data->nr_tags - nr, &tag_offset);
++		if (unlikely(!tag_mask)) {
++			if (nr == 0)
++				return NULL;
++			break;
++		}
++		tags = blk_mq_tags_from_data(data);
++		for (i = 0; tag_mask; i++) {
++			if (!(tag_mask & (1UL << i)))
++				continue;
++			tag = tag_offset + i;
++			prefetch(tags->static_rqs[tag]);
++			tag_mask &= ~(1UL << i);
++			rq = blk_mq_rq_ctx_init(data, tags, tag);
++			rq_list_add_head(data->cached_rqs, rq);
++			nr++;
++		}
++	} while (data->nr_tags > nr);
+ 
+-	tags = blk_mq_tags_from_data(data);
+-	for (i = 0; tag_mask; i++) {
+-		if (!(tag_mask & (1UL << i)))
+-			continue;
+-		tag = tag_offset + i;
+-		prefetch(tags->static_rqs[tag]);
+-		tag_mask &= ~(1UL << i);
+-		rq = blk_mq_rq_ctx_init(data, tags, tag);
+-		rq_list_add_head(data->cached_rqs, rq);
+-		nr++;
+-	}
+ 	if (!(data->rq_flags & RQF_SCHED_TAGS))
+ 		blk_mq_add_active_requests(data->hctx, nr);
+ 	/* caller already holds a reference, add for remainder */
+-- 
+2.43.0
+
