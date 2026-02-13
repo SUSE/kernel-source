@@ -1,0 +1,108 @@
+From: Fengnan Chang <changfengnan@bytedance.com>
+Date: Fri, 14 Nov 2025 17:21:49 +0800
+Subject: [PATCH] block: enable per-cpu bio cache by default
+Git-commit: 48f22f80938d94c34319f90674de6102ca37eabc
+Patch-mainline: v6.19-rc1
+References: jsc#PED-14161
+
+Since after commit 12e4e8c7ab59 ("io_uring/rw: enable bio caches for
+IRQ rw"), bio_put is safe for task and irq context, bio_alloc_bioset is
+safe for task context and no one calls in irq context, so we can enable
+per cpu bio cache by default.
+
+Benchmarked with t/io_uring and ext4+nvme:
+taskset -c 6 /root/fio/t/io_uring  -p0 -d128 -b4096 -s1 -c1 -F1 -B1 -R1
+-X1 -n1 -P1  /mnt/testfile
+base IOPS is 562K, patch IOPS is 574K. The CPU usage of bio_alloc_bioset
+decrease from 1.42% to 1.22%.
+
+The worst case is allocate bio in CPU A but free in CPU B, still use
+t/io_uring and ext4+nvme:
+base IOPS is 648K, patch IOPS is 647K.
+
+Also use fio test ext4/xfs with libaio/sync/io_uring on null_blk and
+nvme, no obvious performance regression.
+
+Signed-off-by: Fengnan Chang <changfengnan@bytedance.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/bio.c   | 26 ++++++++++++--------------
+ block/fops.c  |  4 ----
+ io_uring/rw.c |  1 -
+ 3 files changed, 12 insertions(+), 19 deletions(-)
+
+diff --git a/block/bio.c b/block/bio.c
+index 7b13bdf72de0..fa5ff36b443f 100644
+--- a/block/bio.c
++++ b/block/bio.c
+@@ -517,20 +517,18 @@ struct bio *bio_alloc_bioset(struct block_device *bdev, unsigned short nr_vecs,
+ 	if (WARN_ON_ONCE(!mempool_initialized(&bs->bvec_pool) && nr_vecs > 0))
+ 		return NULL;
+ 
+-	if (opf & REQ_ALLOC_CACHE) {
+-		if (bs->cache && nr_vecs <= BIO_INLINE_VECS) {
+-			bio = bio_alloc_percpu_cache(bdev, nr_vecs, opf,
+-						     gfp_mask, bs);
+-			if (bio)
+-				return bio;
+-			/*
+-			 * No cached bio available, bio returned below marked with
+-			 * REQ_ALLOC_CACHE to particpate in per-cpu alloc cache.
+-			 */
+-		} else {
+-			opf &= ~REQ_ALLOC_CACHE;
+-		}
+-	}
++	if (bs->cache && nr_vecs <= BIO_INLINE_VECS) {
++		opf |= REQ_ALLOC_CACHE;
++		bio = bio_alloc_percpu_cache(bdev, nr_vecs, opf,
++					     gfp_mask, bs);
++		if (bio)
++			return bio;
++		/*
++		 * No cached bio available, bio returned below marked with
++		 * REQ_ALLOC_CACHE to participate in per-cpu alloc cache.
++		 */
++	} else
++		opf &= ~REQ_ALLOC_CACHE;
+ 
+ 	/*
+ 	 * submit_bio_noacct() converts recursion to iteration; this means if
+diff --git a/block/fops.c b/block/fops.c
+index 4dad9c2d5796..4d32785b31d9 100644
+--- a/block/fops.c
++++ b/block/fops.c
+@@ -184,8 +184,6 @@ static ssize_t __blkdev_direct_IO(struct kiocb *iocb, struct iov_iter *iter,
+ 	loff_t pos = iocb->ki_pos;
+ 	int ret = 0;
+ 
+-	if (iocb->ki_flags & IOCB_ALLOC_CACHE)
+-		opf |= REQ_ALLOC_CACHE;
+ 	bio = bio_alloc_bioset(bdev, nr_pages, opf, GFP_KERNEL,
+ 			       &blkdev_dio_pool);
+ 	dio = container_of(bio, struct blkdev_dio, bio);
+@@ -333,8 +331,6 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
+ 	loff_t pos = iocb->ki_pos;
+ 	int ret = 0;
+ 
+-	if (iocb->ki_flags & IOCB_ALLOC_CACHE)
+-		opf |= REQ_ALLOC_CACHE;
+ 	bio = bio_alloc_bioset(bdev, nr_pages, opf, GFP_KERNEL,
+ 			       &blkdev_dio_pool);
+ 	dio = container_of(bio, struct blkdev_dio, bio);
+diff --git a/io_uring/rw.c b/io_uring/rw.c
+index 331af6bf4234..70ca88cc1f54 100644
+--- a/io_uring/rw.c
++++ b/io_uring/rw.c
+@@ -855,7 +855,6 @@ static int io_rw_init_file(struct io_kiocb *req, fmode_t mode, int rw_type)
+ 	ret = kiocb_set_rw_flags(kiocb, rw->flags, rw_type);
+ 	if (unlikely(ret))
+ 		return ret;
+-	kiocb->ki_flags |= IOCB_ALLOC_CACHE;
+ 
+ 	/*
+ 	 * If the file is marked O_NONBLOCK, still allow retry for it if it
+-- 
+2.43.0
+
