@@ -1,0 +1,174 @@
+From: Christoph Hellwig <hch@lst.de>
+Date: Thu, 6 Feb 2025 07:40:05 +0100
+Subject: [PATCH] iomap: optionally use ioends for direct I/O
+Git-commit: e523f2d4c974a819730830ce1c38834ee0cd7318
+Patch-mainline: v6.15-rc1
+References: jsc#PED-14161
+
+struct iomap_ioend currently tracks outstanding buffered writes and has
+some really nice code in core iomap and XFS to merge contiguous I/Os
+an defer them to userspace for completion in a very efficient way.
+
+For zoned writes we'll also need a per-bio user context completion to
+record the written blocks, and the infrastructure for that would look
+basically like the ioend handling for buffered I/O.
+
+So instead of reinventing the wheel, reuse the existing infrastructure.
+
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Link: https://lore.kernel.org/r/20250206064035.2323428-8-hch@lst.de
+Reviewed-by: "Darrick J. Wong" <djwong@kernel.org>
+Signed-off-by: Christian Brauner <brauner@kernel.org>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ fs/iomap/direct-io.c  | 48 +++++++++++++++++++++++++++++++++++++++++--
+ fs/iomap/internal.h   |  1 +
+ fs/iomap/ioend.c      |  2 ++
+ include/linux/iomap.h | 10 +++++----
+ 4 files changed, 55 insertions(+), 6 deletions(-)
+
+diff --git a/fs/iomap/direct-io.c b/fs/iomap/direct-io.c
+index 277ece243770..138d246ec29d 100644
+--- a/fs/iomap/direct-io.c
++++ b/fs/iomap/direct-io.c
+@@ -1,7 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0
+ /*
+  * Copyright (C) 2010 Red Hat, Inc.
+- * Copyright (c) 2016-2021 Christoph Hellwig.
++ * Copyright (c) 2016-2025 Christoph Hellwig.
+  */
+ #include <linux/module.h>
+ #include <linux/compiler.h>
+@@ -12,6 +12,7 @@
+ #include <linux/backing-dev.h>
+ #include <linux/uio.h>
+ #include <linux/task_io_accounting_ops.h>
++#include "internal.h"
+ #include "trace.h"
+ 
+ #include "../internal.h"
+@@ -20,6 +21,7 @@
+  * Private flags for iomap_dio, must not overlap with the public ones in
+  * iomap.h:
+  */
++#define IOMAP_DIO_NO_INVALIDATE	(1U << 25)
+ #define IOMAP_DIO_CALLER_COMP	(1U << 26)
+ #define IOMAP_DIO_INLINE_COMP	(1U << 27)
+ #define IOMAP_DIO_WRITE_THROUGH	(1U << 28)
+@@ -119,7 +121,8 @@ ssize_t iomap_dio_complete(struct iomap_dio *dio)
+ 	 * ->end_io() when necessary, otherwise a racing buffer read would cache
+ 	 * zeros from unwritten extents.
+ 	 */
+-	if (!dio->error && dio->size && (dio->flags & IOMAP_DIO_WRITE))
++	if (!dio->error && dio->size && (dio->flags & IOMAP_DIO_WRITE) &&
++	    !(dio->flags & IOMAP_DIO_NO_INVALIDATE))
+ 		kiocb_invalidate_post_direct_write(iocb, dio->size);
+ 
+ 	inode_dio_end(file_inode(iocb->ki_filp));
+@@ -241,6 +244,47 @@ void iomap_dio_bio_end_io(struct bio *bio)
+ }
+ EXPORT_SYMBOL_GPL(iomap_dio_bio_end_io);
+ 
++u32 iomap_finish_ioend_direct(struct iomap_ioend *ioend)
++{
++	struct iomap_dio *dio = ioend->io_bio.bi_private;
++	bool should_dirty = (dio->flags & IOMAP_DIO_DIRTY);
++	u32 vec_count = ioend->io_bio.bi_vcnt;
++
++	if (ioend->io_error)
++		iomap_dio_set_error(dio, ioend->io_error);
++
++	if (atomic_dec_and_test(&dio->ref)) {
++		/*
++		 * Try to avoid another context switch for the completion given
++		 * that we are already called from the ioend completion
++		 * workqueue, but never invalidate pages from this thread to
++		 * avoid deadlocks with buffered I/O completions.  Tough luck if
++		 * you hit the tiny race with someone dirtying the range now
++		 * between this check and the actual completion.
++		 */
++		if (!dio->iocb->ki_filp->f_mapping->nrpages) {
++			dio->flags |= IOMAP_DIO_INLINE_COMP;
++			dio->flags |= IOMAP_DIO_NO_INVALIDATE;
++		}
++		dio->flags &= ~IOMAP_DIO_CALLER_COMP;
++		iomap_dio_done(dio);
++	}
++
++	if (should_dirty) {
++		bio_check_pages_dirty(&ioend->io_bio);
++	} else {
++		bio_release_pages(&ioend->io_bio, false);
++		bio_put(&ioend->io_bio);
++	}
++
++	/*
++	 * Return the number of bvecs completed as even direct I/O completions
++	 * do significant per-folio work and we'll still want to give up the
++	 * CPU after a lot of completions.
++	 */
++	return vec_count;
++}
++
+ static int iomap_dio_zero(const struct iomap_iter *iter, struct iomap_dio *dio,
+ 		loff_t pos, unsigned len)
+ {
+diff --git a/fs/iomap/internal.h b/fs/iomap/internal.h
+index 36d5c56e073e..f6992a3bf66a 100644
+--- a/fs/iomap/internal.h
++++ b/fs/iomap/internal.h
+@@ -5,5 +5,6 @@
+ #define IOEND_BATCH_SIZE	4096
+ 
+ u32 iomap_finish_ioend_buffered(struct iomap_ioend *ioend);
++u32 iomap_finish_ioend_direct(struct iomap_ioend *ioend);
+ 
+ #endif /* _IOMAP_INTERNAL_H */
+diff --git a/fs/iomap/ioend.c b/fs/iomap/ioend.c
+index 97d43c50cdf7..44f254ecab55 100644
+--- a/fs/iomap/ioend.c
++++ b/fs/iomap/ioend.c
+@@ -41,6 +41,8 @@ static u32 iomap_finish_ioend(struct iomap_ioend *ioend, int error)
+ 
+ 	if (!atomic_dec_and_test(&ioend->io_remaining))
+ 		return 0;
++	if (ioend->io_flags & IOMAP_IOEND_DIRECT)
++		return iomap_finish_ioend_direct(ioend);
+ 	return iomap_finish_ioend_buffered(ioend);
+ }
+ 
+diff --git a/include/linux/iomap.h b/include/linux/iomap.h
+index 90c27875e39d..5768b9f2a1cc 100644
+--- a/include/linux/iomap.h
++++ b/include/linux/iomap.h
+@@ -343,20 +343,22 @@ sector_t iomap_bmap(struct address_space *mapping, sector_t bno,
+ #define IOMAP_IOEND_UNWRITTEN		(1U << 1)
+ /* don't merge into previous ioend */
+ #define IOMAP_IOEND_BOUNDARY		(1U << 2)
++/* is direct I/O */
++#define IOMAP_IOEND_DIRECT		(1U << 3)
+ 
+ /*
+  * Flags that if set on either ioend prevent the merge of two ioends.
+  * (IOMAP_IOEND_BOUNDARY also prevents merges, but only one-way)
+  */
+ #define IOMAP_IOEND_NOMERGE_FLAGS \
+-	(IOMAP_IOEND_SHARED | IOMAP_IOEND_UNWRITTEN)
++	(IOMAP_IOEND_SHARED | IOMAP_IOEND_UNWRITTEN | IOMAP_IOEND_DIRECT)
+ 
+ /*
+  * Structure for writeback I/O completions.
+  *
+- * File systems implementing ->submit_ioend can split a bio generated
+- * by iomap.  In that case the parent ioend it was split from is recorded
+- * in ioend->io_parent.
++ * File systems implementing ->submit_ioend (for buffered I/O) or ->submit_io
++ * for direct I/O) can split a bio generated by iomap.  In that case the parent
++ * ioend it was split from is recorded in ioend->io_parent.
+  */
+ struct iomap_ioend {
+ 	struct list_head	io_list;	/* next ioend in chain */
+-- 
+2.43.0
+
