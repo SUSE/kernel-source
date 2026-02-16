@@ -1,0 +1,134 @@
+From: Nilay Shroff <nilay@linux.ibm.com>
+Date: Thu, 26 Jun 2025 10:49:19 +0530
+Subject: [PATCH] nvme: correctly account for namespace head reference counter
+Git-commit: ba806c900379899e5cdd6ca165b900e2081e1c99
+Patch-mainline: v6.16-rc1
+References: jsc#PED-14161
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The blktests nvme/058 manifests an issue where the NVMe subsystem
+kobject entry remains stale in sysfs, causing a failure during
+subsequent NVMe module reloads[1]. Specifically, when attempting to
+register a new NVMe subsystem, the driver encounters a kobejct name
+collision because a stale kobject still exists. Though, please note
+that nvme/058 doesn't report any failure and test case passes and
+it's only during subsequent NVMe module reloads, the stale nvme sub-
+system kobject entry in sysfs causes the observed symptom[1].
+
+This issue stems from an imbalance in the get/put usage of the namespace
+head (nshead) reference counter. The nshead holds a reference to the
+associated NVMe subsystem. If the nshead reference is not properly
+released, it prevents the cleanup of the subsystem's kobject, leaving
+nvme subsystem stale entry behind in sysfs.
+
+During the failure case, the last namespace path referencing a nshead
+is removed, but the nshead reference was not released. This occurs
+because the release logic currently only puts the nshead reference
+when its state is LIVE. However, in configurations where ANA (Asymmetric
+Namespace Access) is enabled, a namespace may be associated with an ANA
+state that is neither optimized nor non-optimized. In this case, the
+nshead may never transition to LIVE, and the corresponding nshead
+reference is then never dropped. In fact nvme/058 associates some of
+nvme namespaces to an inaccessible ANA state and with that nshead is
+created but it's state is not transitioned to LIVE. So the current
+logic would then causes nshead reference to be leaked for non-LIVE
+states.
+
+Another scenario, during namespace allocation, the driver first
+allocates a nshead and then issues an Identify Namespace command. If
+this command fails — which can happen in tests like nvme/058 that
+rapidly enables and disables namespaces — we must release the reference
+to the newly allocated nshead. However this reference release is
+currently missing in the failure, causing a nshead reference leak.
+
+To fix this, we now unconditionally release the nshead reference when
+the last nvme path referencing to the nshead is removed, regardless of
+the head’s state. Also during identify namespace failure case we now
+properly release the nshead reference. So this ensures proper cleanup
+of the nshead, and consequently, the NVMe subsystem and its associated
+kobject.
+
+This change prevents stale kobject entries from lingering in sysfs and
+eliminates the module reload failures observed just after running
+nvme/058.
+
+[1] https://lore.kernel.org/all/CAHj4cs8fOBS-eSjsd5LUBzy7faKXJtgLkCN+mDy_-ezCLLLq+Q@mail.gmail.com/
+
+Reported-by: yi.zhang@redhat.com
+Closes: https://lore.kernel.org/all/CAHj4cs8fOBS-eSjsd5LUBzy7faKXJtgLkCN+mDy_-ezCLLLq+Q@mail.gmail.com/
+Fixes: 62188639ec16 ("nvme-multipath: introduce delayed removal of the multipath head node")
+Tested-by: yi.zhang@redhat.com
+Signed-off-by: Nilay Shroff <nilay@linux.ibm.com>
+Reviewed-by: Hannes Reinecke <hare@suse.de>
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/nvme/host/core.c      | 16 +++++++++++++++-
+ drivers/nvme/host/multipath.c |  5 ++++-
+ 2 files changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index 2ae36bce615e..7493e5aa984c 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -4086,6 +4086,7 @@ static void nvme_alloc_ns(struct nvme_ctrl *ctrl, struct nvme_ns_info *info)
+ 	struct nvme_ns *ns;
+ 	struct gendisk *disk;
+ 	int node = ctrl->numa_node;
++	bool last_path = false;
+ 
+ 	ns = kzalloc_node(sizeof(*ns), GFP_KERNEL, node);
+ 	if (!ns)
+@@ -4178,9 +4179,22 @@ static void nvme_alloc_ns(struct nvme_ctrl *ctrl, struct nvme_ns_info *info)
+  out_unlink_ns:
+ 	mutex_lock(&ctrl->subsys->lock);
+ 	list_del_rcu(&ns->siblings);
+-	if (list_empty(&ns->head->list))
++	if (list_empty(&ns->head->list)) {
+ 		list_del_init(&ns->head->entry);
++		/*
++		 * If multipath is not configured, we still create a namespace
++		 * head (nshead), but head->disk is not initialized in that
++		 * case.  As a result, only a single reference to nshead is held
++		 * (via kref_init()) when it is created. Therefore, ensure that
++		 * we do not release the reference to nshead twice if head->disk
++		 * is not present.
++		 */
++		if (ns->head->disk)
++			last_path = true;
++	}
+ 	mutex_unlock(&ctrl->subsys->lock);
++	if (last_path)
++		nvme_put_ns_head(ns->head);
+ 	nvme_put_ns_head(ns->head);
+  out_cleanup_disk:
+ 	put_disk(disk);
+diff --git a/drivers/nvme/host/multipath.c b/drivers/nvme/host/multipath.c
+index 1062467595f3..e03f3a29bd75 100644
+--- a/drivers/nvme/host/multipath.c
++++ b/drivers/nvme/host/multipath.c
+@@ -690,8 +690,8 @@ static void nvme_remove_head(struct nvme_ns_head *head)
+ 		nvme_cdev_del(&head->cdev, &head->cdev_device);
+ 		synchronize_srcu(&head->srcu);
+ 		del_gendisk(head->disk);
+-		nvme_put_ns_head(head);
+ 	}
++	nvme_put_ns_head(head);
+ }
+ 
+ static void nvme_remove_head_work(struct work_struct *work)
+@@ -1291,6 +1291,9 @@ void nvme_mpath_remove_disk(struct nvme_ns_head *head)
+ {
+ 	bool remove = false;
+ 
++	if (!head->disk)
++		return;
++
+ 	mutex_lock(&head->subsys->lock);
+ 	/*
+ 	 * We are called when all paths have been removed, and at that point
+-- 
+2.43.0
+
