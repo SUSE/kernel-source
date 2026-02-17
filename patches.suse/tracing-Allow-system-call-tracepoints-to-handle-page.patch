@@ -1,0 +1,101 @@
+From: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Date: Tue, 8 Oct 2024 21:07:15 -0400
+Subject: tracing: Allow system call tracepoints to handle page faults
+Patch-mainline: v6.13-rc1
+Git-commit: a363d27cdbc2bc2d1899b5a1520b64e3590fcd9a
+References: jsc#PED-14653
+
+Use Tasks Trace RCU to protect iteration of system call enter/exit
+tracepoint probes to allow those probes to handle page faults.
+
+In preparation for this change, all tracers registering to system call
+enter/exit tracepoints should expect those to be called with preemption
+enabled.
+
+This allows tracers to fault-in userspace system call arguments such as
+path strings within their probe callbacks.
+
+Cc: Michael Jeanson <mjeanson@efficios.com>
+Cc: Masami Hiramatsu <mhiramat@kernel.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Alexei Starovoitov <ast@kernel.org>
+Cc: Yonghong Song <yhs@fb.com>
+Cc: Paul E. McKenney <paulmck@kernel.org>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Arnaldo Carvalho de Melo <acme@kernel.org>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Cc: Namhyung Kim <namhyung@kernel.org>
+Cc: Andrii Nakryiko <andrii.nakryiko@gmail.com>
+Cc: bpf@vger.kernel.org
+Cc: Joel Fernandes <joel@joelfernandes.org>
+Link: https://lore.kernel.org/20241009010718.2050182-6-mathieu.desnoyers@efficios.com
+Signed-off-by: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Signed-off-by: Steven Rostedt (Google) <rostedt@goodmis.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ include/linux/tracepoint.h |   18 ++++++++++++++++--
+ init/Kconfig               |    1 +
+ 2 files changed, 17 insertions(+), 2 deletions(-)
+
+--- a/include/linux/tracepoint.h
++++ b/include/linux/tracepoint.h
+@@ -17,6 +17,7 @@
+ #include <linux/errno.h>
+ #include <linux/types.h>
+ #include <linux/rcupdate.h>
++#include <linux/rcupdate_trace.h>
+ #include <linux/tracepoint-defs.h>
+ #include <linux/static_call.h>
+ 
+@@ -107,6 +108,7 @@ void for_each_tracepoint_in_module(struc
+ #ifdef CONFIG_TRACEPOINTS
+ static inline void tracepoint_synchronize_unregister(void)
+ {
++	synchronize_rcu_tasks_trace();
+ 	synchronize_rcu();
+ }
+ #else
+@@ -196,6 +198,12 @@ static inline struct tracepoint *tracepo
+ /*
+  * it_func[0] is never NULL because there is at least one element in the array
+  * when the array itself is non NULL.
++ *
++ * With @syscall=0, the tracepoint callback array dereference is
++ * protected by disabling preemption.
++ * With @syscall=1, the tracepoint callback array dereference is
++ * protected by Tasks Trace RCU, which allows probes to handle page
++ * faults.
+  */
+ #define __DO_TRACE(name, args, cond, syscall)				\
+ 	do {								\
+@@ -204,11 +212,17 @@ static inline struct tracepoint *tracepo
+ 		if (!(cond))						\
+ 			return;						\
+ 									\
+-		preempt_disable_notrace();				\
++		if (syscall)						\
++			rcu_read_lock_trace();				\
++		else							\
++			preempt_disable_notrace();			\
+ 									\
+ 		__DO_TRACE_CALL(name, TP_ARGS(args));			\
+ 									\
+-		preempt_enable_notrace();				\
++		if (syscall)						\
++			rcu_read_unlock_trace();			\
++		else							\
++			preempt_enable_notrace();			\
+ 	} while (0)
+ 
+ /*
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -1989,6 +1989,7 @@ config BINDGEN_VERSION_TEXT
+ #
+ config TRACEPOINTS
+ 	bool
++	select TASKS_TRACE_RCU
+ 
+ source "kernel/Kconfig.kexec"
+ 
