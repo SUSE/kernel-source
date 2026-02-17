@@ -1,0 +1,79 @@
+From: Cosmin Ratiu <cratiu@nvidia.com>
+Date: Fri, 11 Apr 2025 10:49:55 +0300
+Subject: xfrm: Remove unneeded device check from validate_xmit_xfrm
+Patch-mainline: v6.16-rc1
+Git-commit: d53dda291bbd993a29b84d358d282076e3d01506
+References: jsc#PED-14197
+
+validate_xmit_xfrm checks whether a packet already passed through it on
+the master device (xso.dev) and skips processing the skb again on the
+slave device (xso.real_dev).
+
+This check was added in commit [1] to avoid tx packets on a bond device
+pass through xfrm twice and get two sets of headers, but the check was
+soon obsoleted by commit [2], which was added around the same time to
+fix a similar but unrelated problem. Commit [3] set XFRM_XMIT only when
+packets are hw offloaded.
+
+xso.dev is usually equal to xso.real_dev, unless bonding is used, in
+which case the bonding driver uses xso.real_dev to manage offloaded xfrm
+states.
+
+Since commit [3], the check added in commit [1] is unused on all cases,
+since packets going through validate_xmit_xfrm twice bail out on the
+check added in commit [2]. Here's a breakdown of relevant scenarios:
+
+1. ESP offload off: validate_xmit_xfrm returns early on !xo.
+2. ESP offload on, no bond: skb->dev == xso.real_dev == xso.dev.
+3. ESP offload on, bond, xs on bond dev: 1st pass adds XFRM_XMIT, 2nd
+   pass returns early on XFRM_XMIT.
+3. ESP offload on, bond, xs on slave dev: 1st pass returns early on
+   !xo, 2nd pass adds XFRM_XMIT.
+4. ESP offload on, bond, xs on both bond AND slave dev: only 1 offload
+   possible in secpath. Either 1st pass adds XFRM_XMIT and 2nd pass returns
+   early on XFRM_XMIT, or 1st pass is sw and returns early on !xo.
+6. ESP offload on, crypto fallback triggered in esp_xmit/esp6_xmit: 1st
+   pass does sw crypto & secpath_reset, 2nd pass returns on !xo.
+
+This commit removes the unnecessary check, so xso.real_dev becomes what
+it is in practice: a private field managed by bonding driver.
+The check immediately below that can be simplified as well.
+
+[1] commit 272c2330adc9 ("xfrm: bail early on slave pass over skb")
+[2] commit 94579ac3f6d0 ("xfrm: Fix double ESP trailer insertion in
+IPsec crypto offload.")
+[3] commit c7dbf4c08868 ("xfrm: Provide private skb extensions for
+segmented and hw offloaded ESP packets")
+
+Signed-off-by: Cosmin Ratiu <cratiu@nvidia.com>
+Reviewed-by: Leon Romanovsky <leonro@nvidia.com>
+Reviewed-by: Nikolay Aleksandrov <razor@blackwall.org>
+Signed-off-by: Steffen Klassert <steffen.klassert@secunet.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ net/xfrm/xfrm_device.c |    7 +------
+ 1 file changed, 1 insertion(+), 6 deletions(-)
+
+--- a/net/xfrm/xfrm_device.c
++++ b/net/xfrm/xfrm_device.c
+@@ -143,10 +143,6 @@ struct sk_buff *validate_xmit_xfrm(struc
+ 		return NULL;
+ 	}
+ 
+-	/* This skb was already validated on the upper/virtual dev */
+-	if ((x->xso.dev != dev) && (x->xso.real_dev == dev))
+-		return skb;
+-
+ 	local_irq_save(flags);
+ 	sd = this_cpu_ptr(&softnet_data);
+ 	err = !skb_queue_empty(&sd->xfrm_backlog);
+@@ -157,8 +153,7 @@ struct sk_buff *validate_xmit_xfrm(struc
+ 		return skb;
+ 	}
+ 
+-	if (skb_is_gso(skb) && (unlikely(x->xso.dev != dev) ||
+-				unlikely(xmit_xfrm_check_overflow(skb)))) {
++	if (skb_is_gso(skb) && unlikely(xmit_xfrm_check_overflow(skb))) {
+ 		struct sk_buff *segs;
+ 
+ 		/* Packet got rerouted, fixup features and segment it. */
