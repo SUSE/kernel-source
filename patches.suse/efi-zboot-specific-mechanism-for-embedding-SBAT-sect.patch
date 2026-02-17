@@ -1,0 +1,146 @@
+From: Vitaly Kuznetsov <vkuznets@redhat.com>
+Date: Tue, 13 May 2025 14:58:07 +0200
+Subject: efi: zboot specific mechanism for embedding SBAT section
+Patch-mainline: v6.16-rc1
+Git-commit: 0f9a1739dd0e1ca3942e51dc3ec18f0d68c23be5
+References: jsc#PED-14259
+
+SBAT is a mechanism which improves SecureBoot revocations of UEFI binaries
+by introducing a generation-based technique. Compromised or vulnerable UEFI
+binaries can be prevented from booting by bumping the minimal required
+generation for the specific component in the bootloader. More information
+on the SBAT can be obtained here:
+
+https://github.com/rhboot/shim/blob/main/SBAT.md
+
+Upstream Linux kernel does not currently participate in any way in SBAT as
+there's no existing policy in how SBAT generation number should be
+defined. Keep the status quo and provide a mechanism for distro vendors and
+anyone else who signs their kernel for SecureBoot to include their own SBAT
+data. This leaves the decision on the policy to the vendor. Basically, each
+distro implementing SecureBoot today, will have an option to inject their
+own SBAT data during kernel build and before it gets signed by their
+SecureBoot CA. Different distro do not need to agree on the common SBAT
+component names or generation numbers as each distro ships its own 'shim'
+with their own 'vendor_cert'/'vendor_db'
+
+Implement support for embedding SBAT data for architectures using
+zboot (arm64, loongarch, riscv). Put '.sbat' section in between '.data' and
+'.text' as the former also covers '.bss' and thus must be the last one.
+
+Reviewed-by: Ard Biesheuvel <ardb@kernel.org>
+Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+Acked-by: Chun-Yi Lee <jlee@suse.com>
+---
+ drivers/firmware/efi/Kconfig                |   24 ++++++++++++++++++++++++
+ drivers/firmware/efi/libstub/Makefile.zboot |    4 ++++
+ drivers/firmware/efi/libstub/zboot-header.S |   22 ++++++++++++++++++++--
+ drivers/firmware/efi/libstub/zboot.lds      |   11 +++++++++++
+ 4 files changed, 59 insertions(+), 2 deletions(-)
+
+--- a/drivers/firmware/efi/Kconfig
++++ b/drivers/firmware/efi/Kconfig
+@@ -281,6 +281,30 @@ config EFI_EMBEDDED_FIRMWARE
+ 	bool
+ 	select CRYPTO_LIB_SHA256
+ 
++config EFI_SBAT
++       def_bool y if EFI_SBAT_FILE!=""
++
++config EFI_SBAT_FILE
++	string "Embedded SBAT section file path"
++	depends on EFI_ZBOOT
++	help
++	  SBAT section provides a way to improve SecureBoot revocations of UEFI
++	  binaries by introducing a generation-based mechanism. With SBAT, older
++	  UEFI binaries can be prevented from booting by bumping the minimal
++	  required generation for the specific component in the bootloader.
++
++	  Note: SBAT information is distribution specific, i.e. the owner of the
++	  signing SecureBoot certificate must define the SBAT policy. Linux
++	  kernel upstream does not define SBAT components and their generations.
++
++	  See https://github.com/rhboot/shim/blob/main/SBAT.md for the additional
++	  details.
++
++	  Specify a file with SBAT data which is going to be embedded as '.sbat'
++	  section into the kernel.
++
++	  If unsure, leave blank.
++
+ endmenu
+ 
+ config UEFI_CPER
+--- a/drivers/firmware/efi/libstub/Makefile.zboot
++++ b/drivers/firmware/efi/libstub/Makefile.zboot
+@@ -44,6 +44,10 @@ AFLAGS_zboot-header.o += -DMACHINE_TYPE=
+ $(obj)/zboot-header.o: $(srctree)/drivers/firmware/efi/libstub/zboot-header.S FORCE
+ 	$(call if_changed_rule,as_o_S)
+ 
++ifneq ($(CONFIG_EFI_SBAT_FILE),)
++$(obj)/zboot-header.o: $(CONFIG_EFI_SBAT_FILE)
++endif
++
+ ZBOOT_DEPS := $(obj)/zboot-header.o $(objtree)/drivers/firmware/efi/libstub/lib.a
+ 
+ LDFLAGS_vmlinuz.efi.elf := -T $(srctree)/drivers/firmware/efi/libstub/zboot.lds
+--- a/drivers/firmware/efi/libstub/zboot-header.S
++++ b/drivers/firmware/efi/libstub/zboot-header.S
+@@ -123,11 +123,29 @@ __efistub_efi_zboot_header:
+ 			IMAGE_SCN_MEM_READ | \
+ 			IMAGE_SCN_MEM_EXECUTE
+ 
++#ifdef CONFIG_EFI_SBAT
++	.ascii		".sbat\0\0\0"
++	.long		__sbat_size
++	.long		_sbat - .Ldoshdr
++	.long		__sbat_size
++	.long		_sbat - .Ldoshdr
++
++	.long		0, 0
++	.short		0, 0
++	.long		IMAGE_SCN_CNT_INITIALIZED_DATA | \
++			IMAGE_SCN_MEM_READ | \
++			IMAGE_SCN_MEM_DISCARDABLE
++
++	.pushsection ".sbat", "a", @progbits
++	.incbin CONFIG_EFI_SBAT_FILE
++	.popsection
++#endif
++
+ 	.ascii		".data\0\0\0"
+ 	.long		__data_size
+-	.long		_etext - .Ldoshdr
++	.long		_data - .Ldoshdr
+ 	.long		__data_rawsize
+-	.long		_etext - .Ldoshdr
++	.long		_data - .Ldoshdr
+ 
+ 	.long		0, 0
+ 	.short		0, 0
+--- a/drivers/firmware/efi/libstub/zboot.lds
++++ b/drivers/firmware/efi/libstub/zboot.lds
+@@ -29,7 +29,17 @@ SECTIONS
+ 		. = _etext;
+ 	}
+ 
++#ifdef CONFIG_EFI_SBAT
++        .sbat : ALIGN(4096) {
++		_sbat = .;
++		*(.sbat)
++		_esbat = ALIGN(4096);
++		. = _esbat;
++	}
++#endif
++
+ 	.data : ALIGN(4096) {
++		_data = .;
+ 		*(.data* .init.data*)
+ 		_edata = ALIGN(512);
+ 		. = _edata;
+@@ -52,3 +62,4 @@ PROVIDE(__efistub__gzdata_size =
+ 
+ PROVIDE(__data_rawsize = ABSOLUTE(_edata - _etext));
+ PROVIDE(__data_size = ABSOLUTE(_end - _etext));
++PROVIDE(__sbat_size = ABSOLUTE(_esbat - _sbat));
