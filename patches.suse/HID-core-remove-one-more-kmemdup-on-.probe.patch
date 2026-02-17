@@ -1,0 +1,78 @@
+From: Benjamin Tissoires <bentiss@kernel.org>
+Date: Tue, 1 Oct 2024 16:30:07 +0200
+Subject: HID: core: remove one more kmemdup on .probe()
+Patch-mainline: v6.13-rc1
+Git-commit: 7316fef4b993c4435f9fe55e7f2590baf25621ec
+References: jsc#PED-14653
+
+That last kmemdup while opening the report descriptor was required to
+have a common kfree() on it.
+
+Move that kmemdup in the only special case it's required (if there is a
+.report_fixup()), and add a more elaborated check before freeing
+hdev->rdesc, to avoid a double free.
+
+Reviewed-by: Peter Hutterer <peter.hutterer@who-t.net>
+Link: https://patch.msgid.link/20241001-hid-bpf-hid-generic-v3-3-2ef1019468df@kernel.org
+Signed-off-by: Benjamin Tissoires <bentiss@kernel.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ drivers/hid/hid-core.c |   28 ++++++++++++++++++++--------
+ 1 file changed, 20 insertions(+), 8 deletions(-)
+
+--- a/drivers/hid/hid-core.c
++++ b/drivers/hid/hid-core.c
+@@ -685,7 +685,14 @@ static void hid_close_report(struct hid_
+ 		INIT_LIST_HEAD(&report_enum->report_list);
+ 	}
+ 
+-	kfree(device->rdesc);
++	/*
++	 * If the HID driver had a rdesc_fixup() callback, dev->rdesc
++	 * will be allocated by hid-core and needs to be freed.
++	 * Otherwise, it is either equal to dev_rdesc or bpf_rdesc, in
++	 * which cases it'll be freed later on device removal or destroy.
++	 */
++	if (device->rdesc != device->dev_rdesc && device->rdesc != device->bpf_rdesc)
++		kfree(device->rdesc);
+ 	device->rdesc = NULL;
+ 	device->rsize = 0;
+ 
+@@ -1214,7 +1221,6 @@ int hid_open_report(struct hid_device *d
+ 	struct hid_item item;
+ 	unsigned int size;
+ 	const __u8 *start;
+-	__u8 *buf = NULL;
+ 	const __u8 *end;
+ 	const __u8 *next;
+ 	int ret;
+@@ -1241,17 +1247,23 @@ int hid_open_report(struct hid_device *d
+ 		 * on a copy of our report descriptor so it can
+ 		 * change it.
+ 		 */
+-		buf = kmemdup(start, size, GFP_KERNEL);
++		__u8 *buf = kmemdup(start, size, GFP_KERNEL);
++
+ 		if (buf == NULL)
+ 			return -ENOMEM;
+ 
+ 		start = device->driver->report_fixup(device, buf, &size);
+-	}
+ 
+-	start = kmemdup(start, size, GFP_KERNEL);
+-	kfree(buf);
+-	if (start == NULL)
+-		return -ENOMEM;
++		/*
++		 * The second kmemdup is required in case report_fixup() returns
++		 * a static read-only memory, but we have no idea if that memory
++		 * needs to be cleaned up or not at the end.
++		 */
++		start = kmemdup(start, size, GFP_KERNEL);
++		kfree(buf);
++		if (start == NULL)
++			return -ENOMEM;
++	}
+ 
+ 	device->rdesc = start;
+ 	device->rsize = size;
