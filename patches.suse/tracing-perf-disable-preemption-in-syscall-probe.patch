@@ -1,0 +1,132 @@
+From: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Date: Tue, 8 Oct 2024 21:07:13 -0400
+Subject: tracing/perf: disable preemption in syscall probe
+Patch-mainline: v6.13-rc1
+Git-commit: 65e7462a16cea593025ca3b34c5d74e69b027ee0
+References: jsc#PED-14653
+
+In preparation for allowing system call enter/exit instrumentation to
+handle page faults, make sure that perf can handle this change by
+explicitly disabling preemption within the perf system call tracepoint
+probes to respect the current expectations within perf ring buffer code.
+
+This change does not yet allow perf to take page faults per se within
+its probe, but allows its existing probes to adapt to the upcoming
+change.
+
+Cc: Michael Jeanson <mjeanson@efficios.com>
+Cc: Masami Hiramatsu <mhiramat@kernel.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Alexei Starovoitov <ast@kernel.org>
+Cc: Yonghong Song <yhs@fb.com>
+Cc: Paul E. McKenney <paulmck@kernel.org>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Arnaldo Carvalho de Melo <acme@kernel.org>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Cc: Namhyung Kim <namhyung@kernel.org>
+Cc: Andrii Nakryiko <andrii.nakryiko@gmail.com>
+Cc: bpf@vger.kernel.org
+Cc: Joel Fernandes <joel@joelfernandes.org>
+Link: https://lore.kernel.org/20241009010718.2050182-4-mathieu.desnoyers@efficios.com
+Signed-off-by: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Signed-off-by: Steven Rostedt (Google) <rostedt@goodmis.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ include/trace/perf.h          |   42 ++++++++++++++++++++++++++++++++++++++----
+ kernel/trace/trace_syscalls.c |   12 ++++++++++++
+ 2 files changed, 50 insertions(+), 4 deletions(-)
+
+--- a/include/trace/perf.h
++++ b/include/trace/perf.h
+@@ -12,10 +12,10 @@
+ #undef __perf_task
+ #define __perf_task(t)	(__task = (t))
+ 
+-#undef DECLARE_EVENT_CLASS
+-#define DECLARE_EVENT_CLASS(call, proto, args, tstruct, assign, print)	\
++#undef __DECLARE_EVENT_CLASS
++#define __DECLARE_EVENT_CLASS(call, proto, args, tstruct, assign, print) \
+ static notrace void							\
+-perf_trace_##call(void *__data, proto)					\
++do_perf_trace_##call(void *__data, proto)				\
+ {									\
+ 	struct trace_event_call *event_call = __data;			\
+ 	struct trace_event_data_offsets_##call __maybe_unused __data_offsets;\
+@@ -55,8 +55,39 @@ perf_trace_##call(void *__data, proto)
+ 				  head, __task);			\
+ }
+ 
++/*
++ * Define unused __count and __task variables to use @args to pass
++ * arguments to do_perf_trace_##call. This is needed because the
++ * macros __perf_count and __perf_task introduce the side-effect to
++ * store copies into those local variables.
++ */
++#undef DECLARE_EVENT_CLASS
++#define DECLARE_EVENT_CLASS(call, proto, args, tstruct, assign, print)	\
++__DECLARE_EVENT_CLASS(call, PARAMS(proto), PARAMS(args), PARAMS(tstruct), \
++		      PARAMS(assign), PARAMS(print))			\
++static notrace void							\
++perf_trace_##call(void *__data, proto)					\
++{									\
++	u64 __count __attribute__((unused));				\
++	struct task_struct *__task __attribute__((unused));		\
++									\
++	do_perf_trace_##call(__data, args);				\
++}
++
+ #undef DECLARE_EVENT_SYSCALL_CLASS
+-#define DECLARE_EVENT_SYSCALL_CLASS DECLARE_EVENT_CLASS
++#define DECLARE_EVENT_SYSCALL_CLASS(call, proto, args, tstruct, assign, print) \
++__DECLARE_EVENT_CLASS(call, PARAMS(proto), PARAMS(args), PARAMS(tstruct), \
++		      PARAMS(assign), PARAMS(print))			\
++static notrace void							\
++perf_trace_##call(void *__data, proto)					\
++{									\
++	u64 __count __attribute__((unused));				\
++	struct task_struct *__task __attribute__((unused));		\
++									\
++	preempt_disable_notrace();					\
++	do_perf_trace_##call(__data, args);				\
++	preempt_enable_notrace();					\
++}
+ 
+ /*
+  * This part is compiled out, it is only here as a build time check
+@@ -76,4 +107,7 @@ static inline void perf_test_probe_##cal
+ 	DEFINE_EVENT(template, name, PARAMS(proto), PARAMS(args))
+ 
+ #include TRACE_INCLUDE(TRACE_INCLUDE_FILE)
++
++#undef __DECLARE_EVENT_CLASS
++
+ #endif /* CONFIG_PERF_EVENTS */
+--- a/kernel/trace/trace_syscalls.c
++++ b/kernel/trace/trace_syscalls.c
+@@ -584,6 +584,12 @@ static void perf_syscall_enter(void *ign
+ 	int rctx;
+ 	int size;
+ 
++	/*
++	 * Syscall probe called with preemption enabled, but the ring
++	 * buffer and per-cpu data require preemption to be disabled.
++	 */
++	guard(preempt_notrace)();
++
+ 	syscall_nr = trace_get_syscall_nr(current, regs);
+ 	if (syscall_nr < 0 || syscall_nr >= NR_syscalls)
+ 		return;
+@@ -686,6 +692,12 @@ static void perf_syscall_exit(void *igno
+ 	int rctx;
+ 	int size;
+ 
++	/*
++	 * Syscall probe called with preemption enabled, but the ring
++	 * buffer and per-cpu data require preemption to be disabled.
++	 */
++	guard(preempt_notrace)();
++
+ 	syscall_nr = trace_get_syscall_nr(current, regs);
+ 	if (syscall_nr < 0 || syscall_nr >= NR_syscalls)
+ 		return;
