@@ -1,0 +1,133 @@
+From: Josh Poimboeuf <jpoimboe@kernel.org>
+Date: Tue, 8 Oct 2024 12:17:19 -0700
+Subject: tracepoints: Use new static branch API
+Patch-mainline: v6.13-rc1
+Git-commit: 4a8840af5f53f2902eba91130fae650879f18e7a
+References: jsc#PED-14653
+
+The old static key API is deprecated.  Switch to the new one.
+
+Cc: Masami Hiramatsu <mhiramat@kernel.org>
+Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Cc: Alice Ryhl <aliceryhl@google.com>
+Link: https://lore.kernel.org/7a08dae3c5eddb14b13864923c1b58ac1f4af83c.1728414936.git.jpoimboe@kernel.org
+Signed-off-by: Josh Poimboeuf <jpoimboe@kernel.org>
+Signed-off-by: Steven Rostedt (Google) <rostedt@goodmis.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ include/linux/tracepoint-defs.h  |    4 ++--
+ include/linux/tracepoint.h       |    8 ++++----
+ kernel/trace/trace_events_hist.c |    2 +-
+ kernel/trace/trace_events_user.c |    4 ++--
+ kernel/tracepoint.c              |    4 ++--
+ 5 files changed, 11 insertions(+), 11 deletions(-)
+
+--- a/include/linux/tracepoint-defs.h
++++ b/include/linux/tracepoint-defs.h
+@@ -31,7 +31,7 @@ struct tracepoint_func {
+ 
+ struct tracepoint {
+ 	const char *name;		/* Tracepoint name */
+-	struct static_key key;
++	struct static_key_false key;
+ 	struct static_call_key *static_call_key;
+ 	void *static_call_tramp;
+ 	void *iterator;
+@@ -83,7 +83,7 @@ struct bpf_raw_event_map {
+ 
+ #ifdef CONFIG_TRACEPOINTS
+ # define tracepoint_enabled(tp) \
+-	static_key_false(&(__tracepoint_##tp).key)
++	static_branch_unlikely(&(__tracepoint_##tp).key)
+ #else
+ # define tracepoint_enabled(tracepoint) false
+ #endif
+--- a/include/linux/tracepoint.h
++++ b/include/linux/tracepoint.h
+@@ -248,7 +248,7 @@ static inline struct tracepoint *tracepo
+ #define __DECLARE_TRACE_RCU(name, proto, args, cond)			\
+ 	static inline void trace_##name##_rcuidle(proto)		\
+ 	{								\
+-		if (static_key_false(&__tracepoint_##name.key))		\
++		if (static_branch_unlikely(&__tracepoint_##name.key))	\
+ 			__DO_TRACE(name,				\
+ 				TP_ARGS(args),				\
+ 				TP_CONDITION(cond), 1);			\
+@@ -274,7 +274,7 @@ static inline struct tracepoint *tracepo
+ 	extern struct tracepoint __tracepoint_##name;			\
+ 	static inline void trace_##name(proto)				\
+ 	{								\
+-		if (static_key_false(&__tracepoint_##name.key))		\
++		if (static_branch_unlikely(&__tracepoint_##name.key))	\
+ 			__DO_TRACE(name,				\
+ 				TP_ARGS(args),				\
+ 				TP_CONDITION(cond), 0);			\
+@@ -311,7 +311,7 @@ static inline struct tracepoint *tracepo
+ 	static inline bool						\
+ 	trace_##name##_enabled(void)					\
+ 	{								\
+-		return static_key_false(&__tracepoint_##name.key);	\
++		return static_branch_unlikely(&__tracepoint_##name.key);\
+ 	}
+ 
+ /*
+@@ -328,7 +328,7 @@ static inline struct tracepoint *tracepo
+ 	struct tracepoint __tracepoint_##_name	__used			\
+ 	__section("__tracepoints") = {					\
+ 		.name = __tpstrtab_##_name,				\
+-		.key = STATIC_KEY_INIT_FALSE,				\
++		.key = STATIC_KEY_FALSE_INIT,				\
+ 		.static_call_key = &STATIC_CALL_KEY(tp_func_##_name),	\
+ 		.static_call_tramp = STATIC_CALL_TRAMP_ADDR(tp_func_##_name), \
+ 		.iterator = &__traceiter_##_name,			\
+--- a/kernel/trace/trace_events_hist.c
++++ b/kernel/trace/trace_events_hist.c
+@@ -822,7 +822,7 @@ static inline void trace_synth(struct sy
+ {
+ 	struct tracepoint *tp = event->tp;
+ 
+-	if (unlikely(atomic_read(&tp->key.enabled) > 0)) {
++	if (unlikely(static_key_enabled(&tp->key))) {
+ 		struct tracepoint_func *probe_func_ptr;
+ 		synth_probe_func_t probe_func;
+ 		void *__data;
+--- a/kernel/trace/trace_events_user.c
++++ b/kernel/trace/trace_events_user.c
+@@ -1676,7 +1676,7 @@ static void update_enable_bit_for(struct
+ 	struct tracepoint *tp = &user->tracepoint;
+ 	char status = 0;
+ 
+-	if (atomic_read(&tp->key.enabled) > 0) {
++	if (static_key_enabled(&tp->key)) {
+ 		struct tracepoint_func *probe_func_ptr;
+ 		user_event_func_t probe_func;
+ 
+@@ -2280,7 +2280,7 @@ static ssize_t user_events_write_core(st
+ 	 * It's possible key.enabled disables after this check, however
+ 	 * we don't mind if a few events are included in this condition.
+ 	 */
+-	if (likely(atomic_read(&tp->key.enabled) > 0)) {
++	if (likely(static_key_enabled(&tp->key))) {
+ 		struct tracepoint_func *probe_func_ptr;
+ 		user_event_func_t probe_func;
+ 		struct iov_iter copy;
+--- a/kernel/tracepoint.c
++++ b/kernel/tracepoint.c
+@@ -358,7 +358,7 @@ static int tracepoint_add_func(struct tr
+ 		tracepoint_update_call(tp, tp_funcs);
+ 		/* Both iterator and static call handle NULL tp->funcs */
+ 		rcu_assign_pointer(tp->funcs, tp_funcs);
+-		static_key_enable(&tp->key);
++		static_branch_enable(&tp->key);
+ 		break;
+ 	case TP_FUNC_2:		/* 1->2 */
+ 		/* Set iterator static call */
+@@ -414,7 +414,7 @@ static int tracepoint_remove_func(struct
+ 		if (tp->unregfunc && static_key_enabled(&tp->key))
+ 			tp->unregfunc();
+ 
+-		static_key_disable(&tp->key);
++		static_branch_disable(&tp->key);
+ 		/* Set iterator static call */
+ 		tracepoint_update_call(tp, tp_funcs);
+ 		/* Both iterator and static call handle NULL tp->funcs */
