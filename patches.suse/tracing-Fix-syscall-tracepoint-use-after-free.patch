@@ -1,0 +1,89 @@
+From: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Date: Thu, 31 Oct 2024 11:20:55 -0400
+Subject: tracing: Fix syscall tracepoint use-after-free
+Patch-mainline: v6.13-rc1
+Git-commit: 2e8a12b82c40466204a832cf1a3ae9e9080710dc
+References: jsc#PED-14653
+
+The grace period used internally within tracepoint.c:release_probes()
+uses call_rcu() to batch waiting for quiescence of old probe arrays,
+rather than using the tracepoint_synchronize_unregister() which blocks
+while waiting for quiescence.
+
+With the introduction of faultable syscall tracepoints, this causes
+use-after-free issues reproduced with syzkaller.
+
+Fix this by using the appropriate call_rcu() or call_rcu_tasks_trace()
+before invoking the rcu_free_old_probes callback. This can be chosen
+using the tracepoint_is_faultable() API.
+
+A similar issue exists in bpf use of call_rcu(). Fixing this is left to
+a separate change.
+
+Reported-by: syzbot+b390c8062d8387b6272a@syzkaller.appspotmail.com
+Fixes: a363d27cdbc2 ("tracing: Allow system call tracepoints to handle page faults")
+Tested-by: Jordan Rife <jrife@google.com>
+Cc: Michael Jeanson <mjeanson@efficios.com>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Masami Hiramatsu <mhiramat@kernel.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Alexei Starovoitov <ast@kernel.org>
+Cc: Yonghong Song <yhs@fb.com>
+Cc: Paul E. McKenney <paulmck@kernel.org>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Arnaldo Carvalho de Melo <acme@kernel.org>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Cc: Namhyung Kim <namhyung@kernel.org>
+Cc: Andrii Nakryiko <andrii.nakryiko@gmail.com>
+Cc: bpf@vger.kernel.org
+Cc: Joel Fernandes <joel@joelfernandes.org>
+Cc: Jordan Rife <jrife@google.com>
+Cc: linux-trace-kernel@vger.kernel.org
+Link: https://lore.kernel.org/20241031152056.744137-4-mathieu.desnoyers@efficios.com
+Signed-off-by: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Signed-off-by: Steven Rostedt (Google) <rostedt@goodmis.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ kernel/tracepoint.c |   11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+--- a/kernel/tracepoint.c
++++ b/kernel/tracepoint.c
+@@ -106,13 +106,16 @@ static void rcu_free_old_probes(struct r
+ 	kfree(container_of(head, struct tp_probes, rcu));
+ }
+ 
+-static inline void release_probes(struct tracepoint_func *old)
++static inline void release_probes(struct tracepoint *tp, struct tracepoint_func *old)
+ {
+ 	if (old) {
+ 		struct tp_probes *tp_probes = container_of(old,
+ 			struct tp_probes, probes[0]);
+ 
+-		call_rcu(&tp_probes->rcu, rcu_free_old_probes);
++		if (tracepoint_is_faultable(tp))
++			call_rcu_tasks_trace(&tp_probes->rcu, rcu_free_old_probes);
++		else
++			call_rcu(&tp_probes->rcu, rcu_free_old_probes);
+ 	}
+ }
+ 
+@@ -334,7 +337,7 @@ static int tracepoint_add_func(struct tr
+ 		break;
+ 	}
+ 
+-	release_probes(old);
++	release_probes(tp, old);
+ 	return 0;
+ }
+ 
+@@ -405,7 +408,7 @@ static int tracepoint_remove_func(struct
+ 		WARN_ON_ONCE(1);
+ 		break;
+ 	}
+-	release_probes(old);
++	release_probes(tp, old);
+ 	return 0;
+ }
+ 
