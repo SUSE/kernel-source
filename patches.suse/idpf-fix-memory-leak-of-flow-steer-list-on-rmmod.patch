@@ -1,0 +1,184 @@
+From: Sreedevi Joshi <sreedevi.joshi@intel.com>
+Date: Tue, 30 Sep 2025 16:23:51 -0500
+Subject: idpf: fix memory leak of flow steer list on rmmod
+Patch-mainline: v6.19-rc5
+Git-commit: f9841bd28b600526ca4f6713b0ca49bf7bb98452
+References: CVE-2026-23024 bsc#1257572
+
+The flow steering list maintains entries that are added and removed as
+ethtool creates and deletes flow steering rules. Module removal with active
+entries causes memory leak as the list is not properly cleaned up.
+
+Prevent this by iterating through the remaining entries in the list and
+freeing the associated memory during module removal. Add a spinlock
+(flow_steer_list_lock) to protect the list access from multiple threads.
+
+Fixes: ada3e24b84a0 ("idpf: add flow steering support")
+Reviewed-by: Przemek Kitszel <przemyslaw.kitszel@intel.com>
+Reviewed-by: Aleksandr Loktionov <aleksandr.loktionov@intel.com>
+Signed-off-by: Sreedevi Joshi <sreedevi.joshi@intel.com>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Tested-by: Mina Almasry <almasrymina@google.com>
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/idpf/idpf.h         |    2 +
+ drivers/net/ethernet/intel/idpf/idpf_ethtool.c |   15 +++++++++++--
+ drivers/net/ethernet/intel/idpf/idpf_lib.c     |   28 ++++++++++++++++++++++++-
+ 3 files changed, 42 insertions(+), 3 deletions(-)
+
+--- a/drivers/net/ethernet/intel/idpf/idpf.h
++++ b/drivers/net/ethernet/intel/idpf/idpf.h
+@@ -529,6 +529,7 @@ struct idpf_vector_lifo {
+  * @max_q: Maximum possible queues
+  * @req_qs_chunks: Queue chunk data for requested queues
+  * @mac_filter_list_lock: Lock to protect mac filters
++ * @flow_steer_list_lock: Lock to protect fsteer filters
+  * @flags: See enum idpf_vport_config_flags
+  */
+ struct idpf_vport_config {
+@@ -536,6 +537,7 @@ struct idpf_vport_config {
+ 	struct idpf_vport_max_q max_q;
+ 	struct virtchnl2_add_queues *req_qs_chunks;
+ 	spinlock_t mac_filter_list_lock;
++	spinlock_t flow_steer_list_lock;
+ 	DECLARE_BITMAP(flags, IDPF_VPORT_CONFIG_FLAGS_NBITS);
+ };
+ 
+--- a/drivers/net/ethernet/intel/idpf/idpf_ethtool.c
++++ b/drivers/net/ethernet/intel/idpf/idpf_ethtool.c
+@@ -18,6 +18,7 @@ static int idpf_get_rxnfc(struct net_dev
+ {
+ 	struct idpf_netdev_priv *np = netdev_priv(netdev);
+ 	struct idpf_vport_user_config_data *user_config;
++	struct idpf_vport_config *vport_config;
+ 	struct idpf_fsteer_fltr *f;
+ 	struct idpf_vport *vport;
+ 	unsigned int cnt = 0;
+@@ -25,7 +26,8 @@ static int idpf_get_rxnfc(struct net_dev
+ 
+ 	idpf_vport_ctrl_lock(netdev);
+ 	vport = idpf_netdev_to_vport(netdev);
+-	user_config = &np->adapter->vport_config[np->vport_idx]->user_config;
++	vport_config = np->adapter->vport_config[np->vport_idx];
++	user_config = &vport_config->user_config;
+ 
+ 	switch (cmd->cmd) {
+ 	case ETHTOOL_GRXRINGS:
+@@ -37,15 +39,18 @@ static int idpf_get_rxnfc(struct net_dev
+ 		break;
+ 	case ETHTOOL_GRXCLSRULE:
+ 		err = -EINVAL;
++		spin_lock_bh(&vport_config->flow_steer_list_lock);
+ 		list_for_each_entry(f, &user_config->flow_steer_list, list)
+ 			if (f->loc == cmd->fs.location) {
+ 				cmd->fs.ring_cookie = f->q_index;
+ 				err = 0;
+ 				break;
+ 			}
++		spin_unlock_bh(&vport_config->flow_steer_list_lock);
+ 		break;
+ 	case ETHTOOL_GRXCLSRLALL:
+ 		cmd->data = idpf_fsteer_max_rules(vport);
++		spin_lock_bh(&vport_config->flow_steer_list_lock);
+ 		list_for_each_entry(f, &user_config->flow_steer_list, list) {
+ 			if (cnt == cmd->rule_cnt) {
+ 				err = -EMSGSIZE;
+@@ -56,6 +61,7 @@ static int idpf_get_rxnfc(struct net_dev
+ 		}
+ 		if (!err)
+ 			cmd->rule_cnt = user_config->num_fsteer_fltrs;
++		spin_unlock_bh(&vport_config->flow_steer_list_lock);
+ 		break;
+ 	default:
+ 		break;
+@@ -224,6 +230,7 @@ static int idpf_add_flow_steer(struct ne
+ 
+ 	fltr->loc = fsp->location;
+ 	fltr->q_index = q_index;
++	spin_lock_bh(&vport_config->flow_steer_list_lock);
+ 	list_for_each_entry(f, &user_config->flow_steer_list, list) {
+ 		if (f->loc >= fltr->loc)
+ 			break;
+@@ -234,6 +241,7 @@ static int idpf_add_flow_steer(struct ne
+ 		 list_add(&fltr->list, &user_config->flow_steer_list);
+ 
+ 	user_config->num_fsteer_fltrs++;
++	spin_unlock_bh(&vport_config->flow_steer_list_lock);
+ 
+ out:
+ 	kfree(rule);
+@@ -286,17 +294,20 @@ static int idpf_del_flow_steer(struct ne
+ 		goto out;
+ 	}
+ 
++	spin_lock_bh(&vport_config->flow_steer_list_lock);
+ 	list_for_each_entry_safe(f, iter,
+ 				 &user_config->flow_steer_list, list) {
+ 		if (f->loc == fsp->location) {
+ 			list_del(&f->list);
+ 			kfree(f);
+ 			user_config->num_fsteer_fltrs--;
+-			goto out;
++			goto out_unlock;
+ 		}
+ 	}
+ 	err = -EINVAL;
+ 
++out_unlock:
++	spin_unlock_bh(&vport_config->flow_steer_list_lock);
+ out:
+ 	kfree(rule);
+ 	return err;
+--- a/drivers/net/ethernet/intel/idpf/idpf_lib.c
++++ b/drivers/net/ethernet/intel/idpf/idpf_lib.c
+@@ -441,6 +441,29 @@ send_dealloc_vecs:
+ }
+ 
+ /**
++ * idpf_del_all_flow_steer_filters - Delete all flow steer filters in list
++ * @vport: main vport struct
++ *
++ * Takes flow_steer_list_lock spinlock.  Deletes all filters
++ */
++static void idpf_del_all_flow_steer_filters(struct idpf_vport *vport)
++{
++	struct idpf_vport_config *vport_config;
++	struct idpf_fsteer_fltr *f, *ftmp;
++
++	vport_config = vport->adapter->vport_config[vport->idx];
++
++	spin_lock_bh(&vport_config->flow_steer_list_lock);
++	list_for_each_entry_safe(f, ftmp, &vport_config->user_config.flow_steer_list,
++				 list) {
++		list_del(&f->list);
++		kfree(f);
++	}
++	vport_config->user_config.num_fsteer_fltrs = 0;
++	spin_unlock_bh(&vport_config->flow_steer_list_lock);
++}
++
++/**
+  * idpf_find_mac_filter - Search filter list for specific mac filter
+  * @vconfig: Vport config structure
+  * @macaddr: The MAC address
+@@ -1092,8 +1115,10 @@ static void idpf_vport_dealloc(struct id
+ 		idpf_vport_stop(vport);
+ 		idpf_decfg_netdev(vport);
+ 	}
+-	if (test_bit(IDPF_REMOVE_IN_PROG, adapter->flags))
++	if (test_bit(IDPF_REMOVE_IN_PROG, adapter->flags)) {
+ 		idpf_del_all_mac_filters(vport);
++		idpf_del_all_flow_steer_filters(vport);
++	}
+ 
+ 	if (adapter->netdevs[i]) {
+ 		struct idpf_netdev_priv *np = netdev_priv(adapter->netdevs[i]);
+@@ -1609,6 +1634,7 @@ void idpf_init_task(struct work_struct *
+ 	init_waitqueue_head(&vport->sw_marker_wq);
+ 
+ 	spin_lock_init(&vport_config->mac_filter_list_lock);
++	spin_lock_init(&vport_config->flow_steer_list_lock);
+ 
+ 	INIT_LIST_HEAD(&vport_config->user_config.mac_filter_list);
+ 	INIT_LIST_HEAD(&vport_config->user_config.flow_steer_list);
