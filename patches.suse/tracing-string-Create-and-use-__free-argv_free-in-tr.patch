@@ -1,0 +1,102 @@
+From: Steven Rostedt <rostedt@goodmis.org>
+Date: Fri, 20 Dec 2024 10:33:13 -0500
+Subject: tracing/string: Create and use __free(argv_free) in trace_dynevent.c
+Patch-mainline: v6.14-rc1
+Git-commit: 9e49ca756d207f4313fb7af48648a67da8e4e250
+References: jsc#PED-14653
+
+The function dyn_event_release() uses argv_split() which must be freed via
+argv_free(). It contains several error paths that do a goto out to call
+argv_free() for cleanup. This makes the code complex and error prone.
+
+Create a new __free() directive __free(argv_free) that will call
+argv_free() for data allocated with argv_split(), and use it in the
+dyn_event_release() function.
+
+Cc: Kees Cook <kees@kernel.org>
+Cc: Masami Hiramatsu <mhiramat@kernel.org>
+Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Andy Shevchenko <andy@kernel.org>
+Cc: linux-hardening@vger.kernel.org
+Link: https://lore.kernel.org/20241220103313.4a74ec8e@gandalf.local.home
+Signed-off-by: Steven Rostedt (Google) <rostedt@goodmis.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ include/linux/string.h        |    3 +++
+ kernel/trace/trace_dynevent.c |   23 +++++++----------------
+ 2 files changed, 10 insertions(+), 16 deletions(-)
+
+--- a/include/linux/string.h
++++ b/include/linux/string.h
+@@ -4,6 +4,7 @@
+ 
+ #include <linux/args.h>
+ #include <linux/array_size.h>
++#include <linux/cleanup.h>	/* for DEFINE_FREE() */
+ #include <linux/compiler.h>	/* for inline */
+ #include <linux/types.h>	/* for size_t */
+ #include <linux/stddef.h>	/* for NULL */
+@@ -312,6 +313,8 @@ extern void *kmemdup_array(const void *s
+ extern char **argv_split(gfp_t gfp, const char *str, int *argcp);
+ extern void argv_free(char **argv);
+ 
++DEFINE_FREE(argv_free, char **, if (!IS_ERR_OR_NULL(_T)) argv_free(_T))
++
+ /* lib/cmdline.c */
+ extern int get_option(char **str, int *pint);
+ extern char *get_options(const char *str, int nints, int *ints);
+--- a/kernel/trace/trace_dynevent.c
++++ b/kernel/trace/trace_dynevent.c
+@@ -74,24 +74,19 @@ int dyn_event_release(const char *raw_co
+ 	struct dyn_event *pos, *n;
+ 	char *system = NULL, *event, *p;
+ 	int argc, ret = -ENOENT;
+-	char **argv;
++	char **argv __free(argv_free) = argv_split(GFP_KERNEL, raw_command, &argc);
+ 
+-	argv = argv_split(GFP_KERNEL, raw_command, &argc);
+ 	if (!argv)
+ 		return -ENOMEM;
+ 
+ 	if (argv[0][0] == '-') {
+-		if (argv[0][1] != ':') {
+-			ret = -EINVAL;
+-			goto out;
+-		}
++		if (argv[0][1] != ':')
++			return -EINVAL;
+ 		event = &argv[0][2];
+ 	} else {
+ 		event = strchr(argv[0], ':');
+-		if (!event) {
+-			ret = -EINVAL;
+-			goto out;
+-		}
++		if (!event)
++			return -EINVAL;
+ 		event++;
+ 	}
+ 
+@@ -101,10 +96,8 @@ int dyn_event_release(const char *raw_co
+ 		event = p + 1;
+ 		*p = '\0';
+ 	}
+-	if (!system && event[0] == '\0') {
+-		ret = -EINVAL;
+-		goto out;
+-	}
++	if (!system && event[0] == '\0')
++		return -EINVAL;
+ 
+ 	mutex_lock(&event_mutex);
+ 	for_each_dyn_event_safe(pos, n) {
+@@ -120,8 +113,6 @@ int dyn_event_release(const char *raw_co
+ 	}
+ 	tracing_reset_all_online_cpus();
+ 	mutex_unlock(&event_mutex);
+-out:
+-	argv_free(argv);
+ 	return ret;
+ }
+ 
