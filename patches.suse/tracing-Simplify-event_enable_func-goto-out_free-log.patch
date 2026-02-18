@@ -1,0 +1,111 @@
+From: Steven Rostedt <rostedt@goodmis.org>
+Date: Thu, 19 Dec 2024 15:12:02 -0500
+Subject: tracing: Simplify event_enable_func() goto out_free logic
+Patch-mainline: v6.14-rc1
+Git-commit: c949dfb97443b0aee0cfe138049a17e66bbc62e9
+References: jsc#PED-14653
+
+The event_enable_func() function allocates the data descriptor early in
+the function just to assign its data->count value via:
+
+  kstrtoul(number, 0, &data->count);
+
+This makes the code more complex as there are several error paths before
+the data descriptor is actually used. This means there needs to be a
+goto out_free; to clean it up.
+
+Use a local variable "count" to do the update and move the data allocation
+just before it is used. This removes the "out_free" label as the data can
+be freed on the failure path of where it is used.
+
+Cc: Masami Hiramatsu <mhiramat@kernel.org>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Link: https://lore.kernel.org/20241219201345.190820140@goodmis.org
+Signed-off-by: Steven Rostedt (Google) <rostedt@goodmis.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ kernel/trace/trace_events.c |   28 ++++++++++++++--------------
+ 1 file changed, 14 insertions(+), 14 deletions(-)
+
+--- a/kernel/trace/trace_events.c
++++ b/kernel/trace/trace_events.c
+@@ -3770,6 +3770,7 @@ event_enable_func(struct trace_array *tr
+ 	struct trace_event_file *file;
+ 	struct ftrace_probe_ops *ops;
+ 	struct event_probe_data *data;
++	unsigned long count = -1;
+ 	const char *system;
+ 	const char *event;
+ 	char *number;
+@@ -3810,14 +3811,6 @@ event_enable_func(struct trace_array *tr
+ 
+ 	ret = -ENOMEM;
+ 
+-	data = kzalloc(sizeof(*data), GFP_KERNEL);
+-	if (!data)
+-		goto out;
+-
+-	data->enable = enable;
+-	data->count = -1;
+-	data->file = file;
+-
+ 	if (!param)
+ 		goto out_reg;
+ 
+@@ -3825,28 +3818,36 @@ event_enable_func(struct trace_array *tr
+ 
+ 	ret = -EINVAL;
+ 	if (!strlen(number))
+-		goto out_free;
++		goto out;
+ 
+ 	/*
+ 	 * We use the callback data field (which is a pointer)
+ 	 * as our counter.
+ 	 */
+-	ret = kstrtoul(number, 0, &data->count);
++	ret = kstrtoul(number, 0, &count);
+ 	if (ret)
+-		goto out_free;
++		goto out;
+ 
+  out_reg:
+ 	/* Don't let event modules unload while probe registered */
+ 	ret = trace_event_try_get_ref(file->event_call);
+ 	if (!ret) {
+ 		ret = -EBUSY;
+-		goto out_free;
++		goto out;
+ 	}
+ 
+ 	ret = __ftrace_event_enable_disable(file, 1, 1);
+ 	if (ret < 0)
+ 		goto out_put;
+ 
++	data = kzalloc(sizeof(*data), GFP_KERNEL);
++	if (!data)
++		goto out_put;
++
++	data->enable = enable;
++	data->count = count;
++	data->file = file;
++
+ 	ret = register_ftrace_function_probe(glob, tr, ops, data);
+ 	/*
+ 	 * The above returns on success the # of functions enabled,
+@@ -3865,11 +3866,10 @@ event_enable_func(struct trace_array *tr
+ 	return ret;
+ 
+  out_disable:
++	kfree(data);
+ 	__ftrace_event_enable_disable(file, 0, 1);
+  out_put:
+ 	trace_event_put_ref(file->event_call);
+- out_free:
+-	kfree(data);
+ 	goto out;
+ }
+ 
