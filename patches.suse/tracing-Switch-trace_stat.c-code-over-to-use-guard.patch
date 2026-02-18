@@ -1,0 +1,117 @@
+From: Steven Rostedt <rostedt@goodmis.org>
+Date: Thu, 19 Dec 2024 15:12:12 -0500
+Subject: tracing: Switch trace_stat.c code over to use guard()
+Patch-mainline: v6.14-rc1
+Git-commit: 08b767317192e7a20d6d95ff7eca6d9bbc48c192
+References: jsc#PED-14653
+
+There are a couple functions in trace_stat.c that have "goto out" or
+equivalent on error in order to release locks that were taken. This can be
+error prone or just simply make the code more complex.
+
+Switch every location that ends with unlocking a mutex on error over to
+using the guard(mutex)() infrastructure to let the compiler worry about
+releasing locks. This makes the code easier to read and understand.
+
+Cc: Masami Hiramatsu <mhiramat@kernel.org>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Link: https://lore.kernel.org/20241219201346.870318466@goodmis.org
+Signed-off-by: Steven Rostedt (Google) <rostedt@goodmis.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ kernel/trace/trace_stat.c |   26 ++++++++++----------------
+ 1 file changed, 10 insertions(+), 16 deletions(-)
+
+--- a/kernel/trace/trace_stat.c
++++ b/kernel/trace/trace_stat.c
+@@ -128,7 +128,7 @@ static int stat_seq_init(struct stat_ses
+ 	int ret = 0;
+ 	int i;
+ 
+-	mutex_lock(&session->stat_mutex);
++	guard(mutex)(&session->stat_mutex);
+ 	__reset_stat_session(session);
+ 
+ 	if (!ts->stat_cmp)
+@@ -136,11 +136,11 @@ static int stat_seq_init(struct stat_ses
+ 
+ 	stat = ts->stat_start(ts);
+ 	if (!stat)
+-		goto exit;
++		return 0;
+ 
+ 	ret = insert_stat(root, stat, ts->stat_cmp);
+ 	if (ret)
+-		goto exit;
++		return ret;
+ 
+ 	/*
+ 	 * Iterate over the tracer stat entries and store them in an rbtree.
+@@ -157,13 +157,10 @@ static int stat_seq_init(struct stat_ses
+ 			goto exit_free_rbtree;
+ 	}
+ 
+-exit:
+-	mutex_unlock(&session->stat_mutex);
+ 	return ret;
+ 
+ exit_free_rbtree:
+ 	__reset_stat_session(session);
+-	mutex_unlock(&session->stat_mutex);
+ 	return ret;
+ }
+ 
+@@ -308,7 +305,7 @@ static int init_stat_file(struct stat_se
+ int register_stat_tracer(struct tracer_stat *trace)
+ {
+ 	struct stat_session *session, *node;
+-	int ret = -EINVAL;
++	int ret;
+ 
+ 	if (!trace)
+ 		return -EINVAL;
+@@ -316,18 +313,18 @@ int register_stat_tracer(struct tracer_s
+ 	if (!trace->stat_start || !trace->stat_next || !trace->stat_show)
+ 		return -EINVAL;
+ 
++	guard(mutex)(&all_stat_sessions_mutex);
++
+ 	/* Already registered? */
+-	mutex_lock(&all_stat_sessions_mutex);
+ 	list_for_each_entry(node, &all_stat_sessions, session_list) {
+ 		if (node->ts == trace)
+-			goto out;
++			return -EINVAL;
+ 	}
+ 
+-	ret = -ENOMEM;
+ 	/* Init the session */
+ 	session = kzalloc(sizeof(*session), GFP_KERNEL);
+ 	if (!session)
+-		goto out;
++		return -ENOMEM;
+ 
+ 	session->ts = trace;
+ 	INIT_LIST_HEAD(&session->session_list);
+@@ -336,16 +333,13 @@ int register_stat_tracer(struct tracer_s
+ 	ret = init_stat_file(session);
+ 	if (ret) {
+ 		destroy_session(session);
+-		goto out;
++		return ret;
+ 	}
+ 
+-	ret = 0;
+ 	/* Register */
+ 	list_add_tail(&session->session_list, &all_stat_sessions);
+- out:
+-	mutex_unlock(&all_stat_sessions_mutex);
+ 
+-	return ret;
++	return 0;
+ }
+ 
+ void unregister_stat_tracer(struct tracer_stat *trace)
