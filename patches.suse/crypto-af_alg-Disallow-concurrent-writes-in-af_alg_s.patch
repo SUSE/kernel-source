@@ -1,0 +1,86 @@
+From: Herbert Xu <herbert@gondor.apana.org.au>
+Date: Tue, 16 Sep 2025 17:20:59 +0800
+Subject: crypto: af_alg - Disallow concurrent writes in af_alg_sendmsg
+Patch-mainline: v6.17-rc7
+Git-commit: 1b34cbbf4f011a121ef7b2d7d6e6920a036d5285
+References: bsc#1251966 CVE-2025-39964
+
+Issuing two writes to the same af_alg socket is bogus as the
+data will be interleaved in an unpredictable fashion.  Furthermore,
+concurrent writes may create inconsistencies in the internal
+socket state.
+
+Disallow this by adding a new ctx->write field that indiciates
+exclusive ownership for writing.
+
+Fixes: 8ff590903d5 ("crypto: algif_skcipher - User-space interface for skcipher operations")
+Reported-by: Muhammad Alifa Ramdhan <ramdhan@starlabs.sg>
+Reported-by: Bing-Jhong Billy Jheng <billy@starlabs.sg>
+Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+[nstange@suse.de: take care of initializing ->write explicitly, as
+ is required w/o 21dfbcd1f5cb ("crypto: algif_aead - fix uninitialized
+ ctx->init").]
+Acked-by: Nicolai Stange <nstange@suse.de>
+---
+ crypto/af_alg.c         |    7 +++++++
+ crypto/algif_skcipher.c |    1 +
+ include/crypto/if_alg.h |    8 +++++---
+ 3 files changed, 13 insertions(+), 3 deletions(-)
+
+--- a/crypto/af_alg.c
++++ b/crypto/af_alg.c
+@@ -893,6 +893,12 @@ int af_alg_sendmsg(struct socket *sock,
+ 	}
+ 
+ 	lock_sock(sk);
++	if (ctx->write) {
++		release_sock(sk);
++		return -EBUSY;
++	}
++	ctx->write = true;
++
+ 	if (!ctx->more && ctx->used) {
+ 		err = -EINVAL;
+ 		goto unlock;
+@@ -995,6 +1001,7 @@ int af_alg_sendmsg(struct socket *sock,
+ 
+ unlock:
+ 	af_alg_data_wakeup(sk);
++	ctx->write = false;
+ 	release_sock(sk);
+ 
+ 	return copied ?: err;
+--- a/crypto/algif_skcipher.c
++++ b/crypto/algif_skcipher.c
+@@ -391,6 +391,7 @@ static int skcipher_accept_parent_nokey(
+ 	ctx->more = 0;
+ 	ctx->merge = 0;
+ 	ctx->enc = 0;
++	ctx->write = 0;
+ 	af_alg_init_completion(&ctx->completion);
+ 
+ 	ask->private = ctx;
+--- a/include/crypto/if_alg.h
++++ b/include/crypto/if_alg.h
+@@ -145,6 +145,7 @@ struct af_alg_async_req {
+  *			SG?
+  * @enc:		Cryptographic operation to be performed when
+  *			recvmsg is invoked.
++ * @write:		True if we are in the middle of a write.
+  * @len:		Length of memory allocated for this data structure.
+  */
+ struct af_alg_ctx {
+@@ -158,9 +159,10 @@ struct af_alg_ctx {
+ 	size_t used;
+ 	atomic_t rcvused;
+ 
+-	bool more;
+-	bool merge;
+-	bool enc;
++	u32		more:1,
++			merge:1,
++			enc:1,
++			write:1;
+ 
+ 	unsigned int len;
+ };
