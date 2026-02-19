@@ -1,0 +1,234 @@
+From 0ab6ea261c1fe4edbf4d99dfe65d8ebaae905092 Mon Sep 17 00:00:00 2001
+From: Baihan Li <libaihan@huawei.com>
+Date: Fri, 3 Jan 2025 17:38:24 +0800
+Subject: drm/hisilicon/hibmc: add dp module in hibmc
+Git-commit: 0ab6ea261c1fe4edbf4d99dfe65d8ebaae905092
+Patch-mainline: v6.14-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+To support DP interface displaying in hibmc driver. Add
+a encoder and connector for DP modual. The HPD function
+and get_edid function will be add in next series, so temporarily
+using 1024x768 as default in hibmc_dp_connector_get_modes()
+
+Signed-off-by: Baihan Li <libaihan@huawei.com>
+Signed-off-by: Yongbang Shi <shiyongbang@huawei.com>
+Reviewed-by: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Reviewed-by: Tian Tao <tiantao6@hisilicon.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250103093824.1963816-6-shiyongbang@huawei.com
+Signed-off-by: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/hisilicon/hibmc/Makefile      |   2 +-
+ .../gpu/drm/hisilicon/hibmc/hibmc_drm_dp.c    | 118 ++++++++++++++++++
+ .../gpu/drm/hisilicon/hibmc/hibmc_drm_drv.c   |  14 +++
+ .../gpu/drm/hisilicon/hibmc/hibmc_drm_drv.h   |   5 +
+ 4 files changed, 138 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/gpu/drm/hisilicon/hibmc/hibmc_drm_dp.c
+
+diff --git a/drivers/gpu/drm/hisilicon/hibmc/Makefile b/drivers/gpu/drm/hisilicon/hibmc/Makefile
+index 214228052ccf..95a4ed599d98 100644
+--- a/drivers/gpu/drm/hisilicon/hibmc/Makefile
++++ b/drivers/gpu/drm/hisilicon/hibmc/Makefile
+@@ -1,5 +1,5 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ hibmc-drm-y := hibmc_drm_drv.o hibmc_drm_de.o hibmc_drm_vdac.o hibmc_drm_i2c.o \
+-	       dp/dp_aux.o dp/dp_link.o dp/dp_hw.o
++	       dp/dp_aux.o dp/dp_link.o dp/dp_hw.o hibmc_drm_dp.o
+ 
+ obj-$(CONFIG_DRM_HISI_HIBMC) += hibmc-drm.o
+diff --git a/drivers/gpu/drm/hisilicon/hibmc/hibmc_drm_dp.c b/drivers/gpu/drm/hisilicon/hibmc/hibmc_drm_dp.c
+new file mode 100644
+index 000000000000..603d6b198a54
+--- /dev/null
++++ b/drivers/gpu/drm/hisilicon/hibmc/hibmc_drm_dp.c
+@@ -0,0 +1,118 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++// Copyright (c) 2024 Hisilicon Limited.
++
++#include <linux/io.h>
++
++#include <drm/drm_probe_helper.h>
++#include <drm/drm_simple_kms_helper.h>
++#include <drm/drm_atomic_helper.h>
++#include <drm/drm_modes.h>
++#include <drm/drm_drv.h>
++#include <drm/drm_edid.h>
++
++#include "hibmc_drm_drv.h"
++#include "dp/dp_hw.h"
++
++static int hibmc_dp_connector_get_modes(struct drm_connector *connector)
++{
++	int count;
++
++	count = drm_add_modes_noedid(connector, connector->dev->mode_config.max_width,
++				     connector->dev->mode_config.max_height);
++	drm_set_preferred_mode(connector, 1024, 768); // temporary implementation
++
++	return count;
++}
++
++static const struct drm_connector_helper_funcs hibmc_dp_conn_helper_funcs = {
++	.get_modes = hibmc_dp_connector_get_modes,
++};
++
++static const struct drm_connector_funcs hibmc_dp_conn_funcs = {
++	.reset = drm_atomic_helper_connector_reset,
++	.fill_modes = drm_helper_probe_single_connector_modes,
++	.destroy = drm_connector_cleanup,
++	.atomic_duplicate_state = drm_atomic_helper_connector_duplicate_state,
++	.atomic_destroy_state = drm_atomic_helper_connector_destroy_state,
++};
++
++static inline int hibmc_dp_prepare(struct hibmc_dp *dp, struct drm_display_mode *mode)
++{
++	int ret;
++
++	hibmc_dp_display_en(dp, false);
++
++	ret = hibmc_dp_mode_set(dp, mode);
++	if (ret)
++		drm_err(dp->drm_dev, "hibmc dp mode set failed: %d\n", ret);
++
++	return ret;
++}
++
++static void hibmc_dp_encoder_enable(struct drm_encoder *drm_encoder,
++				    struct drm_atomic_state *state)
++{
++	struct hibmc_dp *dp = container_of(drm_encoder, struct hibmc_dp, encoder);
++	struct drm_display_mode *mode = &drm_encoder->crtc->state->mode;
++
++	if (hibmc_dp_prepare(dp, mode))
++		return;
++
++	hibmc_dp_display_en(dp, true);
++}
++
++static void hibmc_dp_encoder_disable(struct drm_encoder *drm_encoder,
++				     struct drm_atomic_state *state)
++{
++	struct hibmc_dp *dp = container_of(drm_encoder, struct hibmc_dp, encoder);
++
++	hibmc_dp_display_en(dp, false);
++}
++
++static const struct drm_encoder_helper_funcs hibmc_dp_encoder_helper_funcs = {
++	.atomic_enable = hibmc_dp_encoder_enable,
++	.atomic_disable = hibmc_dp_encoder_disable,
++};
++
++int hibmc_dp_init(struct hibmc_drm_private *priv)
++{
++	struct drm_device *dev = &priv->dev;
++	struct drm_crtc *crtc = &priv->crtc;
++	struct hibmc_dp *dp = &priv->dp;
++	struct drm_connector *connector = &dp->connector;
++	struct drm_encoder *encoder = &dp->encoder;
++	int ret;
++
++	dp->mmio = priv->mmio;
++	dp->drm_dev = dev;
++
++	ret = hibmc_dp_hw_init(&priv->dp);
++	if (ret) {
++		drm_err(dev, "hibmc dp hw init failed: %d\n", ret);
++		return ret;
++	}
++
++	hibmc_dp_display_en(&priv->dp, false);
++
++	encoder->possible_crtcs = drm_crtc_mask(crtc);
++	ret = drmm_encoder_init(dev, encoder, NULL, DRM_MODE_ENCODER_TMDS, NULL);
++	if (ret) {
++		drm_err(dev, "init dp encoder failed: %d\n", ret);
++		return ret;
++	}
++
++	drm_encoder_helper_add(encoder, &hibmc_dp_encoder_helper_funcs);
++
++	ret = drm_connector_init(dev, connector, &hibmc_dp_conn_funcs,
++				 DRM_MODE_CONNECTOR_DisplayPort);
++	if (ret) {
++		drm_err(dev, "init dp connector failed: %d\n", ret);
++		return ret;
++	}
++
++	drm_connector_helper_add(connector, &hibmc_dp_conn_helper_funcs);
++
++	drm_connector_attach_encoder(connector, encoder);
++
++	return 0;
++}
+diff --git a/drivers/gpu/drm/hisilicon/hibmc/hibmc_drm_drv.c b/drivers/gpu/drm/hisilicon/hibmc/hibmc_drm_drv.c
+index 7f814c32ed34..e6de6d5edf6b 100644
+--- a/drivers/gpu/drm/hisilicon/hibmc/hibmc_drm_drv.c
++++ b/drivers/gpu/drm/hisilicon/hibmc/hibmc_drm_drv.c
+@@ -28,6 +28,10 @@
+ #include "hibmc_drm_drv.h"
+ #include "hibmc_drm_regs.h"
+ 
++#define HIBMC_DP_HOST_SERDES_CTRL		0x1f001c
++#define HIBMC_DP_HOST_SERDES_CTRL_VAL		0x8a00
++#define HIBMC_DP_HOST_SERDES_CTRL_MASK		0x7ffff
++
+ DEFINE_DRM_GEM_FOPS(hibmc_fops);
+ 
+ static irqreturn_t hibmc_interrupt(int irq, void *arg)
+@@ -117,6 +121,14 @@ static int hibmc_kms_init(struct hibmc_drm_private *priv)
+ 		return ret;
+ 	}
+ 
++	/* if DP existed, init DP */
++	if ((readl(priv->mmio + HIBMC_DP_HOST_SERDES_CTRL) &
++	     HIBMC_DP_HOST_SERDES_CTRL_MASK) == HIBMC_DP_HOST_SERDES_CTRL_VAL) {
++		ret = hibmc_dp_init(priv);
++		if (ret)
++			drm_err(dev, "failed to init dp: %d\n", ret);
++	}
++
+ 	ret = hibmc_vdac_init(priv);
+ 	if (ret) {
+ 		drm_err(dev, "failed to init vdac: %d\n", ret);
+@@ -327,6 +339,8 @@ static int hibmc_pci_probe(struct pci_dev *pdev,
+ 		goto err_return;
+ 	}
+ 
++	pci_set_master(pdev);
++
+ 	ret = hibmc_load(dev);
+ 	if (ret) {
+ 		drm_err(dev, "failed to load hibmc: %d\n", ret);
+diff --git a/drivers/gpu/drm/hisilicon/hibmc/hibmc_drm_drv.h b/drivers/gpu/drm/hisilicon/hibmc/hibmc_drm_drv.h
+index 42f0ab8f9b5a..d982f1e4b958 100644
+--- a/drivers/gpu/drm/hisilicon/hibmc/hibmc_drm_drv.h
++++ b/drivers/gpu/drm/hisilicon/hibmc/hibmc_drm_drv.h
+@@ -20,6 +20,8 @@
+ 
+ #include <drm/drm_framebuffer.h>
+ 
++#include "dp/dp_hw.h"
++
+ struct hibmc_vdac {
+ 	struct drm_device *dev;
+ 	struct drm_encoder encoder;
+@@ -37,6 +39,7 @@ struct hibmc_drm_private {
+ 	struct drm_plane primary_plane;
+ 	struct drm_crtc crtc;
+ 	struct hibmc_vdac vdac;
++	struct hibmc_dp dp;
+ };
+ 
+ static inline struct hibmc_vdac *to_hibmc_vdac(struct drm_connector *connector)
+@@ -59,4 +62,6 @@ int hibmc_vdac_init(struct hibmc_drm_private *priv);
+ 
+ int hibmc_ddc_create(struct drm_device *drm_dev, struct hibmc_vdac *connector);
+ 
++int hibmc_dp_init(struct hibmc_drm_private *priv);
++
+ #endif
+-- 
+2.52.0
+
