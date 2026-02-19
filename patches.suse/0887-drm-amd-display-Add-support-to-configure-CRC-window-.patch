@@ -1,0 +1,626 @@
+From b6fcc3867d746c181d253b110236985b9b2ee2aa Mon Sep 17 00:00:00 2001
+From: Wayne Lin <Wayne.Lin@amd.com>
+Date: Fri, 6 Dec 2024 13:51:46 +0800
+Subject: drm/amd/display: Add support to configure CRC window on specific CRC
+ instance
+Git-commit: b6fcc3867d746c181d253b110236985b9b2ee2aa
+Patch-mainline: v6.14-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+[Why]
+Have the need to specify the CRC window on specific CRC engine.
+dc_stream_configure_crc() today calculates CRC on crc engine 0 only and always
+resets CRC engine at first.
+
+[How]
+Add index parameter to dc_stream_configure_crc() for selecting the desired crc
+engine. Additionally, add another parameter to specify whether to skip the
+default reset of crc engine.
+
+Reviewed-by: HaoPing Liu <haoping.liu@amd.com>
+Signed-off-by: Wayne Lin <Wayne.Lin@amd.com>
+Signed-off-by: Tom Chung <chiahsuan.chung@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c |   2 +-
+ drivers/gpu/drm/amd/display/dc/core/dc.c      |  11 +-
+ drivers/gpu/drm/amd/display/dc/dc_stream.h    |   4 +-
+ .../dc/dce110/dce110_timing_generator.c       | 169 ++++++++++++------
+ .../dc/dce120/dce120_timing_generator.c       |  90 +++++++---
+ .../amd/display/dc/inc/hw/timing_generator.h  |   3 +
+ .../amd/display/dc/optc/dcn10/dcn10_optc.c    |  86 ++++++---
+ .../amd/display/dc/optc/dcn35/dcn35_optc.c    | 101 ++++++++---
+ 8 files changed, 329 insertions(+), 137 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c
+index 0b4d084ffd1b..d3cc41e49b79 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c
+@@ -515,7 +515,7 @@ int amdgpu_dm_crtc_configure_crc_source(struct drm_crtc *crtc,
+ 	/* Enable or disable CRTC CRC generation */
+ 	if (dm_is_crc_source_crtc(source) || source == AMDGPU_DM_PIPE_CRC_SOURCE_NONE) {
+ 		if (!dc_stream_configure_crc(stream_state->ctx->dc,
+-					     stream_state, NULL, enable, enable)) {
++					     stream_state, NULL, enable, enable, 0, true)) {
+ 			ret = -EINVAL;
+ 			goto unlock;
+ 		}
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index cb6293d8ba77..cecaadf741ad 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -687,15 +687,17 @@ dc_stream_forward_multiple_crc_window(struct dc_stream_state *stream,
+  * @enable: Enable CRC if true, disable otherwise.
+  * @continuous: Capture CRC on every frame if true. Otherwise, only capture
+  *              once.
++ * @idx: Capture CRC on which CRC engine instance
++ * @reset: Reset CRC engine before the configuration
+  *
+- * By default, only CRC0 is configured, and the entire frame is used to
+- * calculate the CRC.
++ * By default, the entire frame is used to calculate the CRC.
+  *
+  * Return: %false if the stream is not found or CRC capture is not supported;
+  *         %true if the stream has been configured.
+  */
+ bool dc_stream_configure_crc(struct dc *dc, struct dc_stream_state *stream,
+-			     struct crc_params *crc_window, bool enable, bool continuous)
++			     struct crc_params *crc_window, bool enable, bool continuous,
++			     uint8_t idx, bool reset)
+ {
+ 	struct pipe_ctx *pipe;
+ 	struct crc_params param;
+@@ -739,6 +741,9 @@ bool dc_stream_configure_crc(struct dc *dc, struct dc_stream_state *stream,
+ 	param.continuous_mode = continuous;
+ 	param.enable = enable;
+ 
++	param.crc_eng_inst = idx;
++	param.reset = reset;
++
+ 	tg = pipe->stream_res.tg;
+ 
+ 	/* Only call if supported */
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_stream.h b/drivers/gpu/drm/amd/display/dc/dc_stream.h
+index dbf0832eb706..3e303c7808fb 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_stream.h
++++ b/drivers/gpu/drm/amd/display/dc/dc_stream.h
+@@ -550,7 +550,9 @@ bool dc_stream_configure_crc(struct dc *dc,
+ 			     struct dc_stream_state *stream,
+ 			     struct crc_params *crc_window,
+ 			     bool enable,
+-			     bool continuous);
++			     bool continuous,
++			     uint8_t idx,
++			     bool reset);
+ 
+ bool dc_stream_get_crc(struct dc *dc,
+ 		       struct dc_stream_state *stream,
+diff --git a/drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator.c b/drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator.c
+index e32dd96a99cb..61b0807693fb 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator.c
++++ b/drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator.c
+@@ -2127,65 +2127,126 @@ bool dce110_configure_crc(struct timing_generator *tg,
+ 
+ 	cntl_addr = CRTC_REG(mmCRTC_CRC_CNTL);
+ 
+-	/* First, disable CRC before we configure it. */
+-	dm_write_reg(tg->ctx, cntl_addr, 0);
++	if (!params->enable || params->reset)
++		/* First, disable CRC before we configure it. */
++		dm_write_reg(tg->ctx, cntl_addr, 0);
+ 
+ 	if (!params->enable)
+ 		return true;
+ 
+ 	/* Program frame boundaries */
+-	/* Window A x axis start and end. */
+-	value = 0;
+-	addr = CRTC_REG(mmCRTC_CRC0_WINDOWA_X_CONTROL);
+-	set_reg_field_value(value, params->windowa_x_start,
+-			    CRTC_CRC0_WINDOWA_X_CONTROL,
+-			    CRTC_CRC0_WINDOWA_X_START);
+-	set_reg_field_value(value, params->windowa_x_end,
+-			    CRTC_CRC0_WINDOWA_X_CONTROL,
+-			    CRTC_CRC0_WINDOWA_X_END);
+-	dm_write_reg(tg->ctx, addr, value);
+-
+-	/* Window A y axis start and end. */
+-	value = 0;
+-	addr = CRTC_REG(mmCRTC_CRC0_WINDOWA_Y_CONTROL);
+-	set_reg_field_value(value, params->windowa_y_start,
+-			    CRTC_CRC0_WINDOWA_Y_CONTROL,
+-			    CRTC_CRC0_WINDOWA_Y_START);
+-	set_reg_field_value(value, params->windowa_y_end,
+-			    CRTC_CRC0_WINDOWA_Y_CONTROL,
+-			    CRTC_CRC0_WINDOWA_Y_END);
+-	dm_write_reg(tg->ctx, addr, value);
+-
+-	/* Window B x axis start and end. */
+-	value = 0;
+-	addr = CRTC_REG(mmCRTC_CRC0_WINDOWB_X_CONTROL);
+-	set_reg_field_value(value, params->windowb_x_start,
+-			    CRTC_CRC0_WINDOWB_X_CONTROL,
+-			    CRTC_CRC0_WINDOWB_X_START);
+-	set_reg_field_value(value, params->windowb_x_end,
+-			    CRTC_CRC0_WINDOWB_X_CONTROL,
+-			    CRTC_CRC0_WINDOWB_X_END);
+-	dm_write_reg(tg->ctx, addr, value);
+-
+-	/* Window B y axis start and end. */
+-	value = 0;
+-	addr = CRTC_REG(mmCRTC_CRC0_WINDOWB_Y_CONTROL);
+-	set_reg_field_value(value, params->windowb_y_start,
+-			    CRTC_CRC0_WINDOWB_Y_CONTROL,
+-			    CRTC_CRC0_WINDOWB_Y_START);
+-	set_reg_field_value(value, params->windowb_y_end,
+-			    CRTC_CRC0_WINDOWB_Y_CONTROL,
+-			    CRTC_CRC0_WINDOWB_Y_END);
+-	dm_write_reg(tg->ctx, addr, value);
+-
+-	/* Set crc mode and selection, and enable. Only using CRC0*/
+-	value = 0;
+-	set_reg_field_value(value, params->continuous_mode ? 1 : 0,
+-			    CRTC_CRC_CNTL, CRTC_CRC_CONT_EN);
+-	set_reg_field_value(value, params->selection,
+-			    CRTC_CRC_CNTL, CRTC_CRC0_SELECT);
+-	set_reg_field_value(value, 1, CRTC_CRC_CNTL, CRTC_CRC_EN);
+-	dm_write_reg(tg->ctx, cntl_addr, value);
++	switch (params->crc_eng_inst) {
++	case 0:
++		/* Window A x axis start and end. */
++		value = 0;
++		addr = CRTC_REG(mmCRTC_CRC0_WINDOWA_X_CONTROL);
++		set_reg_field_value(value, params->windowa_x_start,
++				    CRTC_CRC0_WINDOWA_X_CONTROL,
++				    CRTC_CRC0_WINDOWA_X_START);
++		set_reg_field_value(value, params->windowa_x_end,
++				    CRTC_CRC0_WINDOWA_X_CONTROL,
++				    CRTC_CRC0_WINDOWA_X_END);
++		dm_write_reg(tg->ctx, addr, value);
++
++		/* Window A y axis start and end. */
++		value = 0;
++		addr = CRTC_REG(mmCRTC_CRC0_WINDOWA_Y_CONTROL);
++		set_reg_field_value(value, params->windowa_y_start,
++				    CRTC_CRC0_WINDOWA_Y_CONTROL,
++				    CRTC_CRC0_WINDOWA_Y_START);
++		set_reg_field_value(value, params->windowa_y_end,
++				    CRTC_CRC0_WINDOWA_Y_CONTROL,
++				    CRTC_CRC0_WINDOWA_Y_END);
++		dm_write_reg(tg->ctx, addr, value);
++
++		/* Window B x axis start and end. */
++		value = 0;
++		addr = CRTC_REG(mmCRTC_CRC0_WINDOWB_X_CONTROL);
++		set_reg_field_value(value, params->windowb_x_start,
++				    CRTC_CRC0_WINDOWB_X_CONTROL,
++				    CRTC_CRC0_WINDOWB_X_START);
++		set_reg_field_value(value, params->windowb_x_end,
++				    CRTC_CRC0_WINDOWB_X_CONTROL,
++				    CRTC_CRC0_WINDOWB_X_END);
++		dm_write_reg(tg->ctx, addr, value);
++
++		/* Window B y axis start and end. */
++		value = 0;
++		addr = CRTC_REG(mmCRTC_CRC0_WINDOWB_Y_CONTROL);
++		set_reg_field_value(value, params->windowb_y_start,
++				    CRTC_CRC0_WINDOWB_Y_CONTROL,
++				    CRTC_CRC0_WINDOWB_Y_START);
++		set_reg_field_value(value, params->windowb_y_end,
++				    CRTC_CRC0_WINDOWB_Y_CONTROL,
++				    CRTC_CRC0_WINDOWB_Y_END);
++		dm_write_reg(tg->ctx, addr, value);
++
++		/* Set crc mode and selection, and enable.*/
++		value = 0;
++		set_reg_field_value(value, params->continuous_mode ? 1 : 0,
++				    CRTC_CRC_CNTL, CRTC_CRC_CONT_EN);
++		set_reg_field_value(value, params->selection,
++				    CRTC_CRC_CNTL, CRTC_CRC0_SELECT);
++		set_reg_field_value(value, 1, CRTC_CRC_CNTL, CRTC_CRC_EN);
++		dm_write_reg(tg->ctx, cntl_addr, value);
++		break;
++	case 1:
++		/* Window A x axis start and end. */
++		value = 0;
++		addr = CRTC_REG(mmCRTC_CRC1_WINDOWA_X_CONTROL);
++		set_reg_field_value(value, params->windowa_x_start,
++				    CRTC_CRC1_WINDOWA_X_CONTROL,
++				    CRTC_CRC1_WINDOWA_X_START);
++		set_reg_field_value(value, params->windowa_x_end,
++				    CRTC_CRC1_WINDOWA_X_CONTROL,
++				    CRTC_CRC1_WINDOWA_X_END);
++		dm_write_reg(tg->ctx, addr, value);
++
++		/* Window A y axis start and end. */
++		value = 0;
++		addr = CRTC_REG(mmCRTC_CRC1_WINDOWA_Y_CONTROL);
++		set_reg_field_value(value, params->windowa_y_start,
++				    CRTC_CRC1_WINDOWA_Y_CONTROL,
++				    CRTC_CRC1_WINDOWA_Y_START);
++		set_reg_field_value(value, params->windowa_y_end,
++				    CRTC_CRC1_WINDOWA_Y_CONTROL,
++				    CRTC_CRC1_WINDOWA_Y_END);
++		dm_write_reg(tg->ctx, addr, value);
++
++		/* Window B x axis start and end. */
++		value = 0;
++		addr = CRTC_REG(mmCRTC_CRC1_WINDOWB_X_CONTROL);
++		set_reg_field_value(value, params->windowb_x_start,
++				    CRTC_CRC1_WINDOWB_X_CONTROL,
++				    CRTC_CRC1_WINDOWB_X_START);
++		set_reg_field_value(value, params->windowb_x_end,
++				    CRTC_CRC1_WINDOWB_X_CONTROL,
++				    CRTC_CRC1_WINDOWB_X_END);
++		dm_write_reg(tg->ctx, addr, value);
++
++		/* Window B y axis start and end. */
++		value = 0;
++		addr = CRTC_REG(mmCRTC_CRC1_WINDOWB_Y_CONTROL);
++		set_reg_field_value(value, params->windowb_y_start,
++				    CRTC_CRC1_WINDOWB_Y_CONTROL,
++				    CRTC_CRC1_WINDOWB_Y_START);
++		set_reg_field_value(value, params->windowb_y_end,
++				    CRTC_CRC1_WINDOWB_Y_CONTROL,
++				    CRTC_CRC1_WINDOWB_Y_END);
++		dm_write_reg(tg->ctx, addr, value);
++
++		/* Set crc mode and selection, and enable.*/
++		value = 0;
++		set_reg_field_value(value, params->continuous_mode ? 1 : 0,
++				    CRTC_CRC_CNTL, CRTC_CRC_CONT_EN);
++		set_reg_field_value(value, params->selection,
++				    CRTC_CRC_CNTL, CRTC_CRC1_SELECT);
++		set_reg_field_value(value, 1, CRTC_CRC_CNTL, CRTC_CRC_EN);
++		dm_write_reg(tg->ctx, cntl_addr, value);
++		break;
++	default:
++		return false;
++	}
+ 
+ 	return true;
+ }
+diff --git a/drivers/gpu/drm/amd/display/dc/dce120/dce120_timing_generator.c b/drivers/gpu/drm/amd/display/dc/dce120/dce120_timing_generator.c
+index 4984adce077e..31c4f44ceaac 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce120/dce120_timing_generator.c
++++ b/drivers/gpu/drm/amd/display/dc/dce120/dce120_timing_generator.c
+@@ -1100,39 +1100,73 @@ static bool dce120_configure_crc(struct timing_generator *tg,
+ 	if (!dce120_is_tg_enabled(tg))
+ 		return false;
+ 
+-	/* First, disable CRC before we configure it. */
+-	dm_write_reg_soc15(tg->ctx, mmCRTC0_CRTC_CRC_CNTL,
+-			   tg110->offsets.crtc, 0);
++	if (!params->enable || params->reset)
++		/* First, disable CRC before we configure it. */
++		dm_write_reg_soc15(tg->ctx, mmCRTC0_CRTC_CRC_CNTL,
++				   tg110->offsets.crtc, 0);
+ 
+ 	if (!params->enable)
+ 		return true;
+ 
+ 	/* Program frame boundaries */
+-	/* Window A x axis start and end. */
+-	CRTC_REG_UPDATE_2(CRTC0_CRTC_CRC0_WINDOWA_X_CONTROL,
+-			  CRTC_CRC0_WINDOWA_X_START, params->windowa_x_start,
+-			  CRTC_CRC0_WINDOWA_X_END, params->windowa_x_end);
+-
+-	/* Window A y axis start and end. */
+-	CRTC_REG_UPDATE_2(CRTC0_CRTC_CRC0_WINDOWA_Y_CONTROL,
+-			  CRTC_CRC0_WINDOWA_Y_START, params->windowa_y_start,
+-			  CRTC_CRC0_WINDOWA_Y_END, params->windowa_y_end);
+-
+-	/* Window B x axis start and end. */
+-	CRTC_REG_UPDATE_2(CRTC0_CRTC_CRC0_WINDOWB_X_CONTROL,
+-			  CRTC_CRC0_WINDOWB_X_START, params->windowb_x_start,
+-			  CRTC_CRC0_WINDOWB_X_END, params->windowb_x_end);
+-
+-	/* Window B y axis start and end. */
+-	CRTC_REG_UPDATE_2(CRTC0_CRTC_CRC0_WINDOWB_Y_CONTROL,
+-			  CRTC_CRC0_WINDOWB_Y_START, params->windowb_y_start,
+-			  CRTC_CRC0_WINDOWB_Y_END, params->windowb_y_end);
+-
+-	/* Set crc mode and selection, and enable. Only using CRC0*/
+-	CRTC_REG_UPDATE_3(CRTC0_CRTC_CRC_CNTL,
+-			  CRTC_CRC_EN, params->continuous_mode ? 1 : 0,
+-			  CRTC_CRC0_SELECT, params->selection,
+-			  CRTC_CRC_EN, 1);
++	switch (params->crc_eng_inst) {
++	case 0:
++		/* Window A x axis start and end. */
++		CRTC_REG_UPDATE_2(CRTC0_CRTC_CRC0_WINDOWA_X_CONTROL,
++				  CRTC_CRC0_WINDOWA_X_START, params->windowa_x_start,
++				  CRTC_CRC0_WINDOWA_X_END, params->windowa_x_end);
++
++		/* Window A y axis start and end. */
++		CRTC_REG_UPDATE_2(CRTC0_CRTC_CRC0_WINDOWA_Y_CONTROL,
++				  CRTC_CRC0_WINDOWA_Y_START, params->windowa_y_start,
++				  CRTC_CRC0_WINDOWA_Y_END, params->windowa_y_end);
++
++		/* Window B x axis start and end. */
++		CRTC_REG_UPDATE_2(CRTC0_CRTC_CRC0_WINDOWB_X_CONTROL,
++				  CRTC_CRC0_WINDOWB_X_START, params->windowb_x_start,
++				  CRTC_CRC0_WINDOWB_X_END, params->windowb_x_end);
++
++		/* Window B y axis start and end. */
++		CRTC_REG_UPDATE_2(CRTC0_CRTC_CRC0_WINDOWB_Y_CONTROL,
++				  CRTC_CRC0_WINDOWB_Y_START, params->windowb_y_start,
++				  CRTC_CRC0_WINDOWB_Y_END, params->windowb_y_end);
++
++		/* Set crc mode and selection, and enable.*/
++		CRTC_REG_UPDATE_3(CRTC0_CRTC_CRC_CNTL,
++				  CRTC_CRC_CONT_EN, params->continuous_mode ? 1 : 0,
++				  CRTC_CRC0_SELECT, params->selection,
++				  CRTC_CRC_EN, 1);
++		break;
++	case 1:
++		/* Window A x axis start and end. */
++		CRTC_REG_UPDATE_2(CRTC0_CRTC_CRC1_WINDOWA_X_CONTROL,
++				  CRTC_CRC1_WINDOWA_X_START, params->windowa_x_start,
++				  CRTC_CRC1_WINDOWA_X_END, params->windowa_x_end);
++
++		/* Window A y axis start and end. */
++		CRTC_REG_UPDATE_2(CRTC0_CRTC_CRC1_WINDOWA_Y_CONTROL,
++				  CRTC_CRC1_WINDOWA_Y_START, params->windowa_y_start,
++				  CRTC_CRC1_WINDOWA_Y_END, params->windowa_y_end);
++
++		/* Window B x axis start and end. */
++		CRTC_REG_UPDATE_2(CRTC0_CRTC_CRC1_WINDOWB_X_CONTROL,
++				  CRTC_CRC1_WINDOWB_X_START, params->windowb_x_start,
++				  CRTC_CRC1_WINDOWB_X_END, params->windowb_x_end);
++
++		/* Window B y axis start and end. */
++		CRTC_REG_UPDATE_2(CRTC0_CRTC_CRC1_WINDOWB_Y_CONTROL,
++				  CRTC_CRC1_WINDOWB_Y_START, params->windowb_y_start,
++				  CRTC_CRC1_WINDOWB_Y_END, params->windowb_y_end);
++
++		/* Set crc mode and selection, and enable */
++		CRTC_REG_UPDATE_3(CRTC0_CRTC_CRC_CNTL,
++				  CRTC_CRC_CONT_EN, params->continuous_mode ? 1 : 0,
++				  CRTC_CRC1_SELECT, params->selection,
++				  CRTC_CRC_EN, 1);
++		break;
++	default:
++		return false;
++	}
+ 
+ 	return true;
+ }
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/timing_generator.h b/drivers/gpu/drm/amd/display/dc/inc/hw/timing_generator.h
+index 4807b9f9f5a5..9885cb3c310f 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/timing_generator.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/timing_generator.h
+@@ -141,6 +141,9 @@ struct crc_params {
+ 
+ 	bool continuous_mode;
+ 	bool enable;
++
++	uint8_t crc_eng_inst;
++	bool reset;
+ };
+ 
+ /**
+diff --git a/drivers/gpu/drm/amd/display/dc/optc/dcn10/dcn10_optc.c b/drivers/gpu/drm/amd/display/dc/optc/dcn10/dcn10_optc.c
+index a296bb89b106..19d5ebc6763c 100644
+--- a/drivers/gpu/drm/amd/display/dc/optc/dcn10/dcn10_optc.c
++++ b/drivers/gpu/drm/amd/display/dc/optc/dcn10/dcn10_optc.c
+@@ -1470,37 +1470,71 @@ bool optc1_configure_crc(struct timing_generator *optc,
+ 	if (!optc1_is_tg_enabled(optc))
+ 		return false;
+ 
+-	REG_WRITE(OTG_CRC_CNTL, 0);
++	if (!params->enable || params->reset)
++		REG_WRITE(OTG_CRC_CNTL, 0);
+ 
+ 	if (!params->enable)
+ 		return true;
+ 
+ 	/* Program frame boundaries */
+-	/* Window A x axis start and end. */
+-	REG_UPDATE_2(OTG_CRC0_WINDOWA_X_CONTROL,
+-			OTG_CRC0_WINDOWA_X_START, params->windowa_x_start,
+-			OTG_CRC0_WINDOWA_X_END, params->windowa_x_end);
+-
+-	/* Window A y axis start and end. */
+-	REG_UPDATE_2(OTG_CRC0_WINDOWA_Y_CONTROL,
+-			OTG_CRC0_WINDOWA_Y_START, params->windowa_y_start,
+-			OTG_CRC0_WINDOWA_Y_END, params->windowa_y_end);
+-
+-	/* Window B x axis start and end. */
+-	REG_UPDATE_2(OTG_CRC0_WINDOWB_X_CONTROL,
+-			OTG_CRC0_WINDOWB_X_START, params->windowb_x_start,
+-			OTG_CRC0_WINDOWB_X_END, params->windowb_x_end);
+-
+-	/* Window B y axis start and end. */
+-	REG_UPDATE_2(OTG_CRC0_WINDOWB_Y_CONTROL,
+-			OTG_CRC0_WINDOWB_Y_START, params->windowb_y_start,
+-			OTG_CRC0_WINDOWB_Y_END, params->windowb_y_end);
+-
+-	/* Set crc mode and selection, and enable. Only using CRC0*/
+-	REG_UPDATE_3(OTG_CRC_CNTL,
+-			OTG_CRC_CONT_EN, params->continuous_mode ? 1 : 0,
+-			OTG_CRC0_SELECT, params->selection,
+-			OTG_CRC_EN, 1);
++	switch (params->crc_eng_inst) {
++	case 0:
++		/* Window A x axis start and end. */
++		REG_UPDATE_2(OTG_CRC0_WINDOWA_X_CONTROL,
++				OTG_CRC0_WINDOWA_X_START, params->windowa_x_start,
++				OTG_CRC0_WINDOWA_X_END, params->windowa_x_end);
++
++		/* Window A y axis start and end. */
++		REG_UPDATE_2(OTG_CRC0_WINDOWA_Y_CONTROL,
++				OTG_CRC0_WINDOWA_Y_START, params->windowa_y_start,
++				OTG_CRC0_WINDOWA_Y_END, params->windowa_y_end);
++
++		/* Window B x axis start and end. */
++		REG_UPDATE_2(OTG_CRC0_WINDOWB_X_CONTROL,
++				OTG_CRC0_WINDOWB_X_START, params->windowb_x_start,
++				OTG_CRC0_WINDOWB_X_END, params->windowb_x_end);
++
++		/* Window B y axis start and end. */
++		REG_UPDATE_2(OTG_CRC0_WINDOWB_Y_CONTROL,
++				OTG_CRC0_WINDOWB_Y_START, params->windowb_y_start,
++				OTG_CRC0_WINDOWB_Y_END, params->windowb_y_end);
++
++		/* Set crc mode and selection, and enable.*/
++		REG_UPDATE_3(OTG_CRC_CNTL,
++				OTG_CRC_CONT_EN, params->continuous_mode ? 1 : 0,
++				OTG_CRC0_SELECT, params->selection,
++				OTG_CRC_EN, 1);
++		break;
++	case 1:
++		/* Window A x axis start and end. */
++		REG_UPDATE_2(OTG_CRC1_WINDOWA_X_CONTROL,
++				OTG_CRC1_WINDOWA_X_START, params->windowa_x_start,
++				OTG_CRC1_WINDOWA_X_END, params->windowa_x_end);
++
++		/* Window A y axis start and end. */
++		REG_UPDATE_2(OTG_CRC1_WINDOWA_Y_CONTROL,
++				OTG_CRC1_WINDOWA_Y_START, params->windowa_y_start,
++				OTG_CRC1_WINDOWA_Y_END, params->windowa_y_end);
++
++		/* Window B x axis start and end. */
++		REG_UPDATE_2(OTG_CRC1_WINDOWB_X_CONTROL,
++				OTG_CRC1_WINDOWB_X_START, params->windowb_x_start,
++				OTG_CRC1_WINDOWB_X_END, params->windowb_x_end);
++
++		/* Window B y axis start and end. */
++		REG_UPDATE_2(OTG_CRC1_WINDOWB_Y_CONTROL,
++				OTG_CRC1_WINDOWB_Y_START, params->windowb_y_start,
++				OTG_CRC1_WINDOWB_Y_END, params->windowb_y_end);
++
++		/* Set crc mode and selection, and enable.*/
++		REG_UPDATE_3(OTG_CRC_CNTL,
++				OTG_CRC_CONT_EN, params->continuous_mode ? 1 : 0,
++				OTG_CRC1_SELECT, params->selection,
++				OTG_CRC_EN, 1);
++		break;
++	default:
++		return false;
++	}
+ 
+ 	return true;
+ }
+diff --git a/drivers/gpu/drm/amd/display/dc/optc/dcn35/dcn35_optc.c b/drivers/gpu/drm/amd/display/dc/optc/dcn35/dcn35_optc.c
+index dfa9364fe5a6..d21e82b927d0 100644
+--- a/drivers/gpu/drm/amd/display/dc/optc/dcn35/dcn35_optc.c
++++ b/drivers/gpu/drm/amd/display/dc/optc/dcn35/dcn35_optc.c
+@@ -183,34 +183,87 @@ static bool optc35_configure_crc(struct timing_generator *optc,
+ {
+ 	struct optc *optc1 = DCN10TG_FROM_TG(optc);
+ 
++	/* Cannot configure crc on a CRTC that is disabled */
+ 	if (!optc1_is_tg_enabled(optc))
+ 		return false;
+-	REG_WRITE(OTG_CRC_CNTL, 0);
++
++	if (!params->enable || params->reset)
++		REG_WRITE(OTG_CRC_CNTL, 0);
++
+ 	if (!params->enable)
+ 		return true;
+-	REG_UPDATE_2(OTG_CRC0_WINDOWA_X_CONTROL,
+-			OTG_CRC0_WINDOWA_X_START, params->windowa_x_start,
+-			OTG_CRC0_WINDOWA_X_END, params->windowa_x_end);
+-	REG_UPDATE_2(OTG_CRC0_WINDOWA_Y_CONTROL,
+-			OTG_CRC0_WINDOWA_Y_START, params->windowa_y_start,
+-			OTG_CRC0_WINDOWA_Y_END, params->windowa_y_end);
+-	REG_UPDATE_2(OTG_CRC0_WINDOWB_X_CONTROL,
+-			OTG_CRC0_WINDOWB_X_START, params->windowb_x_start,
+-			OTG_CRC0_WINDOWB_X_END, params->windowb_x_end);
+-	REG_UPDATE_2(OTG_CRC0_WINDOWB_Y_CONTROL,
+-			OTG_CRC0_WINDOWB_Y_START, params->windowb_y_start,
+-			OTG_CRC0_WINDOWB_Y_END, params->windowb_y_end);
+-	if (optc1->base.ctx->dc->debug.otg_crc_db && optc1->tg_mask->OTG_CRC_WINDOW_DB_EN != 0) {
+-		REG_UPDATE_4(OTG_CRC_CNTL,
+-				OTG_CRC_CONT_EN, params->continuous_mode ? 1 : 0,
+-				OTG_CRC0_SELECT, params->selection,
+-				OTG_CRC_EN, 1,
+-				OTG_CRC_WINDOW_DB_EN, 1);
+-	} else
+-		REG_UPDATE_3(OTG_CRC_CNTL,
+-				OTG_CRC_CONT_EN, params->continuous_mode ? 1 : 0,
+-				OTG_CRC0_SELECT, params->selection,
+-				OTG_CRC_EN, 1);
++
++	/* Program frame boundaries */
++	switch (params->crc_eng_inst) {
++	case 0:
++		/* Window A x axis start and end. */
++		REG_UPDATE_2(OTG_CRC0_WINDOWA_X_CONTROL,
++				OTG_CRC0_WINDOWA_X_START, params->windowa_x_start,
++				OTG_CRC0_WINDOWA_X_END, params->windowa_x_end);
++
++		/* Window A y axis start and end. */
++		REG_UPDATE_2(OTG_CRC0_WINDOWA_Y_CONTROL,
++				OTG_CRC0_WINDOWA_Y_START, params->windowa_y_start,
++				OTG_CRC0_WINDOWA_Y_END, params->windowa_y_end);
++
++		/* Window B x axis start and end. */
++		REG_UPDATE_2(OTG_CRC0_WINDOWB_X_CONTROL,
++				OTG_CRC0_WINDOWB_X_START, params->windowb_x_start,
++				OTG_CRC0_WINDOWB_X_END, params->windowb_x_end);
++
++		/* Window B y axis start and end. */
++		REG_UPDATE_2(OTG_CRC0_WINDOWB_Y_CONTROL,
++				OTG_CRC0_WINDOWB_Y_START, params->windowb_y_start,
++				OTG_CRC0_WINDOWB_Y_END, params->windowb_y_end);
++
++		if (optc1->base.ctx->dc->debug.otg_crc_db && optc1->tg_mask->OTG_CRC_WINDOW_DB_EN != 0)
++			REG_UPDATE_4(OTG_CRC_CNTL,
++					OTG_CRC_CONT_EN, params->continuous_mode ? 1 : 0,
++					OTG_CRC0_SELECT, params->selection,
++					OTG_CRC_EN, 1,
++					OTG_CRC_WINDOW_DB_EN, 1);
++		else
++			REG_UPDATE_3(OTG_CRC_CNTL,
++					OTG_CRC_CONT_EN, params->continuous_mode ? 1 : 0,
++					OTG_CRC0_SELECT, params->selection,
++					OTG_CRC_EN, 1);
++		break;
++	case 1:
++		/* Window A x axis start and end. */
++		REG_UPDATE_2(OTG_CRC1_WINDOWA_X_CONTROL,
++				OTG_CRC1_WINDOWA_X_START, params->windowa_x_start,
++				OTG_CRC1_WINDOWA_X_END, params->windowa_x_end);
++
++		/* Window A y axis start and end. */
++		REG_UPDATE_2(OTG_CRC1_WINDOWA_Y_CONTROL,
++				OTG_CRC1_WINDOWA_Y_START, params->windowa_y_start,
++				OTG_CRC1_WINDOWA_Y_END, params->windowa_y_end);
++
++		/* Window B x axis start and end. */
++		REG_UPDATE_2(OTG_CRC1_WINDOWB_X_CONTROL,
++				OTG_CRC1_WINDOWB_X_START, params->windowb_x_start,
++				OTG_CRC1_WINDOWB_X_END, params->windowb_x_end);
++
++		/* Window B y axis start and end. */
++		REG_UPDATE_2(OTG_CRC1_WINDOWB_Y_CONTROL,
++				OTG_CRC1_WINDOWB_Y_START, params->windowb_y_start,
++				OTG_CRC1_WINDOWB_Y_END, params->windowb_y_end);
++
++		if (optc1->base.ctx->dc->debug.otg_crc_db && optc1->tg_mask->OTG_CRC_WINDOW_DB_EN != 0)
++			REG_UPDATE_4(OTG_CRC_CNTL,
++					OTG_CRC_CONT_EN, params->continuous_mode ? 1 : 0,
++					OTG_CRC1_SELECT, params->selection,
++					OTG_CRC_EN, 1,
++					OTG_CRC_WINDOW_DB_EN, 1);
++		else
++			REG_UPDATE_3(OTG_CRC_CNTL,
++					OTG_CRC_CONT_EN, params->continuous_mode ? 1 : 0,
++					OTG_CRC1_SELECT, params->selection,
++					OTG_CRC_EN, 1);
++		break;
++	default:
++		return false;
++	}
+ 	return true;
+ }
+ 
+-- 
+2.52.0
+
