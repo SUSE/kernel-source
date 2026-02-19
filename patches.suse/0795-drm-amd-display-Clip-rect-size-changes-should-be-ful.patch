@@ -1,0 +1,167 @@
+From ce5057885ff70d0b61f5c332639e685b7ea720e8 Mon Sep 17 00:00:00 2001
+From: Joshua Aberback <joshua.aberback@amd.com>
+Date: Thu, 12 Sep 2024 18:47:22 -0400
+Subject: drm/amd/display: Clip rect size changes should be full updates
+Git-commit: ce5057885ff70d0b61f5c332639e685b7ea720e8
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+[Why]
+In cases where an MPO plane is being dragged around partially off-screen,
+it is possible to get a flip where the only scaling parameters to change
+are the clip rect size and position. Currently, clip rect size changes
+are considered medium updates, which can result in the clip rect being used
+for HW programming being larger than the clip rect that was used for the
+last DML validation. This can lead to mismatches in different parts of the
+pipe and can result in a p-state hang.
+
+[How]
+ - consider clip rect size changes scaling changes, therefore full updates
+ - refactor get_scaling_info_update_type for clarity
+ - remove clip_size_change update flag
+
+Clip rect size changes were previously demoted from full updates as an
+optimization when the MPO + ODM policy changed to always pre-allocate MPO
+pipes, but it created the issue described above. Personally testing this
+use case, the performance feels fine with full update spam, and we expect
+this is a fairly infrequent use case. If the performance needs to be
+optimized in the future, consider reworking the entire update type logic
+to run a DML pass and determine the update type based on what DML says
+will actually change.
+
+Reviewed-by: Dillon Varone <dillon.varone@amd.com>
+Signed-off-by: Joshua Aberback <joshua.aberback@amd.com>
+Signed-off-by: Aurabindo Pillai <aurabindo.pillai@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c      | 45 ++++++++-----------
+ drivers/gpu/drm/amd/display/dc/dc.h           |  1 -
+ .../amd/display/dc/hwss/dcn20/dcn20_hwseq.c   |  2 -
+ 3 files changed, 19 insertions(+), 29 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index cc00d9ee9f2e..22bff6a1786e 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -2515,41 +2515,35 @@ static enum surface_update_type get_scaling_info_update_type(
+ 	if (!u->scaling_info)
+ 		return UPDATE_TYPE_FAST;
+ 
+-	if (u->scaling_info->dst_rect.width != u->surface->dst_rect.width
++	if (u->scaling_info->src_rect.width != u->surface->src_rect.width
++			|| u->scaling_info->src_rect.height != u->surface->src_rect.height
++			|| u->scaling_info->dst_rect.width != u->surface->dst_rect.width
+ 			|| u->scaling_info->dst_rect.height != u->surface->dst_rect.height
++			|| u->scaling_info->clip_rect.width != u->surface->clip_rect.width
++			|| u->scaling_info->clip_rect.height != u->surface->clip_rect.height
+ 			|| u->scaling_info->scaling_quality.integer_scaling !=
+-				u->surface->scaling_quality.integer_scaling
+-			) {
++					u->surface->scaling_quality.integer_scaling) {
+ 		update_flags->bits.scaling_change = 1;
+ 
++		if (u->scaling_info->src_rect.width > u->surface->src_rect.width
++				|| u->scaling_info->src_rect.height > u->surface->src_rect.height)
++			/* Making src rect bigger requires a bandwidth change */
++			update_flags->bits.clock_change = 1;
++
+ 		if ((u->scaling_info->dst_rect.width < u->surface->dst_rect.width
+ 			|| u->scaling_info->dst_rect.height < u->surface->dst_rect.height)
+ 				&& (u->scaling_info->dst_rect.width < u->surface->src_rect.width
+ 					|| u->scaling_info->dst_rect.height < u->surface->src_rect.height))
+ 			/* Making dst rect smaller requires a bandwidth change */
+ 			update_flags->bits.bandwidth_change = 1;
+-	}
+-
+-	if (u->scaling_info->src_rect.width != u->surface->src_rect.width
+-		|| u->scaling_info->src_rect.height != u->surface->src_rect.height) {
+ 
+-		update_flags->bits.scaling_change = 1;
+-		if (u->scaling_info->src_rect.width > u->surface->src_rect.width
+-				|| u->scaling_info->src_rect.height > u->surface->src_rect.height)
+-			/* Making src rect bigger requires a bandwidth change */
+-			update_flags->bits.clock_change = 1;
++		if (u->scaling_info->src_rect.width > dc->caps.max_optimizable_video_width &&
++			(u->scaling_info->clip_rect.width > u->surface->clip_rect.width ||
++			 u->scaling_info->clip_rect.height > u->surface->clip_rect.height))
++			 /* Changing clip size of a large surface may result in MPC slice count change */
++			update_flags->bits.bandwidth_change = 1;
+ 	}
+ 
+-	if (u->scaling_info->src_rect.width > dc->caps.max_optimizable_video_width &&
+-		(u->scaling_info->clip_rect.width > u->surface->clip_rect.width ||
+-		 u->scaling_info->clip_rect.height > u->surface->clip_rect.height))
+-		 /* Changing clip size of a large surface may result in MPC slice count change */
+-		update_flags->bits.bandwidth_change = 1;
+-
+-	if (u->scaling_info->clip_rect.width != u->surface->clip_rect.width ||
+-			u->scaling_info->clip_rect.height != u->surface->clip_rect.height)
+-		update_flags->bits.clip_size_change = 1;
+-
+ 	if (u->scaling_info->src_rect.x != u->surface->src_rect.x
+ 			|| u->scaling_info->src_rect.y != u->surface->src_rect.y
+ 			|| u->scaling_info->clip_rect.x != u->surface->clip_rect.x
+@@ -2558,13 +2552,13 @@ static enum surface_update_type get_scaling_info_update_type(
+ 			|| u->scaling_info->dst_rect.y != u->surface->dst_rect.y)
+ 		update_flags->bits.position_change = 1;
+ 
++	/* process every update flag before returning */
+ 	if (update_flags->bits.clock_change
+ 			|| update_flags->bits.bandwidth_change
+ 			|| update_flags->bits.scaling_change)
+ 		return UPDATE_TYPE_FULL;
+ 
+-	if (update_flags->bits.position_change ||
+-			update_flags->bits.clip_size_change)
++	if (update_flags->bits.position_change)
+ 		return UPDATE_TYPE_MED;
+ 
+ 	return UPDATE_TYPE_FAST;
+@@ -3263,8 +3257,7 @@ static bool update_planes_and_stream_state(struct dc *dc,
+ 
+ 		if (update_type != UPDATE_TYPE_MED)
+ 			continue;
+-		if (surface->update_flags.bits.clip_size_change ||
+-				surface->update_flags.bits.position_change) {
++		if (surface->update_flags.bits.position_change) {
+ 			for (j = 0; j < dc->res_pool->pipe_count; j++) {
+ 				struct pipe_ctx *pipe_ctx = &context->res_ctx.pipe_ctx[j];
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index d3b6a389fece..6d60f7597f88 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -1254,7 +1254,6 @@ union surface_update_flags {
+ 		uint32_t rotation_change:1;
+ 		uint32_t swizzle_change:1;
+ 		uint32_t scaling_change:1;
+-		uint32_t clip_size_change: 1;
+ 		uint32_t position_change:1;
+ 		uint32_t in_transfer_func_change:1;
+ 		uint32_t input_csc_change:1;
+diff --git a/drivers/gpu/drm/amd/display/dc/hwss/dcn20/dcn20_hwseq.c b/drivers/gpu/drm/amd/display/dc/hwss/dcn20/dcn20_hwseq.c
+index b383ed8cb4d4..e89499536c46 100644
+--- a/drivers/gpu/drm/amd/display/dc/hwss/dcn20/dcn20_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/hwss/dcn20/dcn20_hwseq.c
+@@ -1732,7 +1732,6 @@ static void dcn20_update_dchubp_dpp(
+ 	if (pipe_ctx->update_flags.bits.scaler ||
+ 			plane_state->update_flags.bits.scaling_change ||
+ 			plane_state->update_flags.bits.position_change ||
+-			plane_state->update_flags.bits.clip_size_change ||
+ 			plane_state->update_flags.bits.per_pixel_alpha_change ||
+ 			pipe_ctx->stream->update_flags.bits.scaling) {
+ 		pipe_ctx->plane_res.scl_data.lb_params.alpha_en = pipe_ctx->plane_state->per_pixel_alpha;
+@@ -1745,7 +1744,6 @@ static void dcn20_update_dchubp_dpp(
+ 	if (pipe_ctx->update_flags.bits.viewport ||
+ 			(context == dc->current_state && plane_state->update_flags.bits.position_change) ||
+ 			(context == dc->current_state && plane_state->update_flags.bits.scaling_change) ||
+-			(context == dc->current_state && plane_state->update_flags.bits.clip_size_change) ||
+ 			(context == dc->current_state && pipe_ctx->stream->update_flags.bits.scaling)) {
+ 
+ 		hubp->funcs->mem_program_viewport(
+-- 
+2.52.0
+

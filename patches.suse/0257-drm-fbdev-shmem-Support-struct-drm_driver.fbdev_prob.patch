@@ -1,0 +1,142 @@
+From f0f195d1a3aedef126c3ed159712ed57a34daa1c Mon Sep 17 00:00:00 2001
+From: Thomas Zimmermann <tzimmermann@suse.de>
+Date: Tue, 24 Sep 2024 09:12:47 +0200
+Subject: drm/fbdev-shmem: Support struct drm_driver.fbdev_probe
+Git-commit: f0f195d1a3aedef126c3ed159712ed57a34daa1c
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Rework fbdev probing to support fbdev_probe in struct drm_driver
+and reimplement the old fb_probe callback on top of it. Provide an
+initializer macro for struct drm_driver that sets the callback
+according to the kernel configuration.
+
+This change allows the common fbdev client to run on top of SHMEM-
+based DRM drivers.
+
+Signed-off-by: Thomas Zimmermann <tzimmermann@suse.de>
+Reviewed-by: Javier Martinez Canillas <javierm@redhat.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20240924071734.98201-50-tzimmermann@suse.de
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/drm_fbdev_shmem.c | 60 ++++++++++++++++++-------------
+ include/drm/drm_fbdev_shmem.h     | 11 ++++++
+ 2 files changed, 47 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_fbdev_shmem.c b/drivers/gpu/drm/drm_fbdev_shmem.c
+index 0c785007f11b..3bca333917d1 100644
+--- a/drivers/gpu/drm/drm_fbdev_shmem.c
++++ b/drivers/gpu/drm/drm_fbdev_shmem.c
+@@ -107,6 +107,40 @@ static struct page *drm_fbdev_shmem_get_page(struct fb_info *info, unsigned long
+ 
+ static int drm_fbdev_shmem_helper_fb_probe(struct drm_fb_helper *fb_helper,
+ 					   struct drm_fb_helper_surface_size *sizes)
++{
++	return drm_fbdev_shmem_driver_fbdev_probe(fb_helper, sizes);
++}
++
++static int drm_fbdev_shmem_helper_fb_dirty(struct drm_fb_helper *helper,
++					   struct drm_clip_rect *clip)
++{
++	struct drm_device *dev = helper->dev;
++	int ret;
++
++	/* Call damage handlers only if necessary */
++	if (!(clip->x1 < clip->x2 && clip->y1 < clip->y2))
++		return 0;
++
++	if (helper->fb->funcs->dirty) {
++		ret = helper->fb->funcs->dirty(helper->fb, NULL, 0, 0, clip, 1);
++		if (drm_WARN_ONCE(dev, ret, "Dirty helper failed: ret=%d\n", ret))
++			return ret;
++	}
++
++	return 0;
++}
++
++static const struct drm_fb_helper_funcs drm_fbdev_shmem_helper_funcs = {
++	.fb_probe = drm_fbdev_shmem_helper_fb_probe,
++	.fb_dirty = drm_fbdev_shmem_helper_fb_dirty,
++};
++
++/*
++ * struct drm_driver
++ */
++
++int drm_fbdev_shmem_driver_fbdev_probe(struct drm_fb_helper *fb_helper,
++				       struct drm_fb_helper_surface_size *sizes)
+ {
+ 	struct drm_client_dev *client = &fb_helper->client;
+ 	struct drm_device *dev = fb_helper->dev;
+@@ -139,6 +173,7 @@ static int drm_fbdev_shmem_helper_fb_probe(struct drm_fb_helper *fb_helper,
+ 		goto err_drm_client_buffer_delete;
+ 	}
+ 
++	fb_helper->funcs = &drm_fbdev_shmem_helper_funcs;
+ 	fb_helper->buffer = buffer;
+ 	fb_helper->fb = fb;
+ 
+@@ -182,30 +217,7 @@ static int drm_fbdev_shmem_helper_fb_probe(struct drm_fb_helper *fb_helper,
+ 	drm_client_framebuffer_delete(buffer);
+ 	return ret;
+ }
+-
+-static int drm_fbdev_shmem_helper_fb_dirty(struct drm_fb_helper *helper,
+-					   struct drm_clip_rect *clip)
+-{
+-	struct drm_device *dev = helper->dev;
+-	int ret;
+-
+-	/* Call damage handlers only if necessary */
+-	if (!(clip->x1 < clip->x2 && clip->y1 < clip->y2))
+-		return 0;
+-
+-	if (helper->fb->funcs->dirty) {
+-		ret = helper->fb->funcs->dirty(helper->fb, NULL, 0, 0, clip, 1);
+-		if (drm_WARN_ONCE(dev, ret, "Dirty helper failed: ret=%d\n", ret))
+-			return ret;
+-	}
+-
+-	return 0;
+-}
+-
+-static const struct drm_fb_helper_funcs drm_fbdev_shmem_helper_funcs = {
+-	.fb_probe = drm_fbdev_shmem_helper_fb_probe,
+-	.fb_dirty = drm_fbdev_shmem_helper_fb_dirty,
+-};
++EXPORT_SYMBOL(drm_fbdev_shmem_driver_fbdev_probe);
+ 
+ /*
+  * struct drm_client_funcs
+diff --git a/include/drm/drm_fbdev_shmem.h b/include/drm/drm_fbdev_shmem.h
+index fb43cadd1950..3a5d1efa9d55 100644
+--- a/include/drm/drm_fbdev_shmem.h
++++ b/include/drm/drm_fbdev_shmem.h
+@@ -4,12 +4,23 @@
+ #define DRM_FBDEV_SHMEM_H
+ 
+ struct drm_device;
++struct drm_fb_helper;
++struct drm_fb_helper_surface_size;
+ 
+ #ifdef CONFIG_DRM_FBDEV_EMULATION
++int drm_fbdev_shmem_driver_fbdev_probe(struct drm_fb_helper *fb_helper,
++				       struct drm_fb_helper_surface_size *sizes);
++
++#define DRM_FBDEV_SHMEM_DRIVER_OPS \
++	.fbdev_probe = drm_fbdev_shmem_driver_fbdev_probe
++
+ void drm_fbdev_shmem_setup(struct drm_device *dev, unsigned int preferred_bpp);
+ #else
+ static inline void drm_fbdev_shmem_setup(struct drm_device *dev, unsigned int preferred_bpp)
+ { }
++
++#define DRM_FBDEV_SHMEM_DRIVER_OPS \
++	.fbdev_probe = NULL
+ #endif
+ 
+ #endif
+-- 
+2.52.0
+

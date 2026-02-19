@@ -1,0 +1,167 @@
+From ee52489d1210dbb894fda71957e1e9832126efda Mon Sep 17 00:00:00 2001
+From: Lijo Lazar <lijo.lazar@amd.com>
+Date: Fri, 20 Sep 2024 13:14:40 +0530
+Subject: drm/amdgpu: Place NPS mode request on unload
+Git-commit: ee52489d1210dbb894fda71957e1e9832126efda
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+If a user has requested NPS mode switch, place the request through PSP
+during unload of the driver. For devices which are part of a hive, all
+requests are placed together. If one of them fails, revert back to the
+current NPS mode.
+
+Signed-off-by: Lijo Lazar <lijo.lazar@amd.com>
+Signed-off-by: Rajneesh Bhardwaj <rajneesh.bhardwaj@amd.com>
+Reviewed-by: Feifei Xu <Feifei.Xu@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c  |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c  | 47 ++++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h  |  2 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_xgmi.c | 38 +++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_xgmi.h |  4 ++
+ 5 files changed, 92 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+index bb06cb20041c..6ac7d335e28e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+@@ -2434,6 +2434,7 @@ amdgpu_pci_remove(struct pci_dev *pdev)
+ 	struct amdgpu_device *adev = drm_to_adev(dev);
+ 
+ 	amdgpu_xcp_dev_unplug(adev);
++	amdgpu_gmc_prepare_nps_mode_change(adev);
+ 	drm_dev_unplug(dev);
+ 
+ 	if (adev->pm.rpm_mode != AMDGPU_RUNPM_NONE) {
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
+index ddf716d27f3a..4b70123957df 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
+@@ -1333,3 +1333,50 @@ int amdgpu_gmc_request_memory_partition(struct amdgpu_device *adev,
+ 
+ 	return psp_memory_partition(&adev->psp, nps_mode);
+ }
++
++static inline bool amdgpu_gmc_need_nps_switch_req(struct amdgpu_device *adev,
++						  int req_nps_mode,
++						  int cur_nps_mode)
++{
++	return (((BIT(req_nps_mode) & adev->gmc.supported_nps_modes) ==
++			BIT(req_nps_mode)) &&
++		req_nps_mode != cur_nps_mode);
++}
++
++void amdgpu_gmc_prepare_nps_mode_change(struct amdgpu_device *adev)
++{
++	int req_nps_mode, cur_nps_mode, r;
++	struct amdgpu_hive_info *hive;
++
++	if (amdgpu_sriov_vf(adev) || !adev->gmc.supported_nps_modes ||
++	    !adev->gmc.gmc_funcs->request_mem_partition_mode)
++		return;
++
++	cur_nps_mode = adev->gmc.gmc_funcs->query_mem_partition_mode(adev);
++	hive = amdgpu_get_xgmi_hive(adev);
++	if (hive) {
++		req_nps_mode = atomic_read(&hive->requested_nps_mode);
++		if (!amdgpu_gmc_need_nps_switch_req(adev, req_nps_mode,
++						    cur_nps_mode)) {
++			amdgpu_put_xgmi_hive(hive);
++			return;
++		}
++		r = amdgpu_xgmi_request_nps_change(adev, hive, req_nps_mode);
++		amdgpu_put_xgmi_hive(hive);
++		goto out;
++	}
++
++	req_nps_mode = adev->gmc.requested_nps_mode;
++	if (!amdgpu_gmc_need_nps_switch_req(adev, req_nps_mode, cur_nps_mode))
++		return;
++
++	/* even if this fails, we should let driver unload w/o blocking */
++	r = adev->gmc.gmc_funcs->request_mem_partition_mode(adev, req_nps_mode);
++out:
++	if (r)
++		dev_err(adev->dev, "NPS mode change request failed\n");
++	else
++		dev_info(
++			adev->dev,
++			"NPS mode change request done, reload driver to complete the change\n");
++}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h
+index 05c70732a320..b92f41d1b46f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h
+@@ -466,4 +466,6 @@ int amdgpu_gmc_get_nps_memranges(struct amdgpu_device *adev,
+ 
+ int amdgpu_gmc_request_memory_partition(struct amdgpu_device *adev,
+ 					int nps_mode);
++void amdgpu_gmc_prepare_nps_mode_change(struct amdgpu_device *adev);
++
+ #endif
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_xgmi.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_xgmi.c
+index d53789642fc6..63503719303c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_xgmi.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_xgmi.c
+@@ -1564,3 +1564,41 @@ int amdgpu_xgmi_reset_on_init(struct amdgpu_device *adev)
+ 
+ 	return 0;
+ }
++
++int amdgpu_xgmi_request_nps_change(struct amdgpu_device *adev,
++				   struct amdgpu_hive_info *hive,
++				   int req_nps_mode)
++{
++	struct amdgpu_device *tmp_adev;
++	int cur_nps_mode, r;
++
++	/* This is expected to be called only during unload of driver. The
++	 * request needs to be placed only once for all devices in the hive. If
++	 * one of them fail, revert the request for previous successful devices.
++	 * After placing the request, make hive mode as UNKNOWN so that other
++	 * devices don't request anymore.
++	 */
++	mutex_lock(&hive->hive_lock);
++	list_for_each_entry(tmp_adev, &hive->device_list, gmc.xgmi.head) {
++		r = adev->gmc.gmc_funcs->request_mem_partition_mode(
++			tmp_adev, req_nps_mode);
++		if (r)
++			goto err;
++	}
++	/* Set to UNKNOWN so that other devices don't request anymore */
++	atomic_set(&hive->requested_nps_mode, UNKNOWN_MEMORY_PARTITION_MODE);
++
++	mutex_unlock(&hive->hive_lock);
++
++	return 0;
++err:
++	/* Request back current mode if one of the requests failed */
++	cur_nps_mode = adev->gmc.gmc_funcs->query_mem_partition_mode(tmp_adev);
++	list_for_each_entry_continue_reverse(tmp_adev, &hive->device_list,
++					     gmc.xgmi.head)
++		adev->gmc.gmc_funcs->request_mem_partition_mode(tmp_adev,
++								cur_nps_mode);
++	mutex_lock(&hive->hive_lock);
++
++	return r;
++}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_xgmi.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_xgmi.h
+index 67abadb4f298..41d5f97fc77a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_xgmi.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_xgmi.h
+@@ -79,4 +79,8 @@ static inline bool amdgpu_xgmi_same_hive(struct amdgpu_device *adev,
+ int amdgpu_xgmi_ras_sw_init(struct amdgpu_device *adev);
+ int amdgpu_xgmi_reset_on_init(struct amdgpu_device *adev);
+ 
++int amdgpu_xgmi_request_nps_change(struct amdgpu_device *adev,
++				   struct amdgpu_hive_info *hive,
++				   int req_nps_mode);
++
+ #endif
+-- 
+2.52.0
+

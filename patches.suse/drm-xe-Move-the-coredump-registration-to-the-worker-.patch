@@ -1,16 +1,14 @@
-From 1d397722cf3e78ad44b46daaec10e41f9270cba4 Mon Sep 17 00:00:00 2001
+From 5dce85fecb87751ec94526e1ac516dd7871e2e0c Mon Sep 17 00:00:00 2001
 From: John Harrison <John.C.Harrison@Intel.com>
 Date: Thu, 28 Nov 2024 13:08:23 -0800
-Subject: [PATCH] drm/xe: Move the coredump registration to the worker thread
+Subject: drm/xe: Move the coredump registration to the worker thread
 Mime-version: 1.0
 Content-type: text/plain; charset=UTF-8
 Content-transfer-encoding: 8bit
 Git-commit: 5dce85fecb87751ec94526e1ac516dd7871e2e0c
 Patch-mainline: v6.13-rc2
-References: git-fixes
+References: git-fixes jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
 Alt-commit: 90f51a7f4ec1004fc4ddfbc6d1f1068d85ef4771
-
-[ Upstream commit 5dce85fecb87751ec94526e1ac516dd7871e2e0c ]
 
 Adding lockdep checking to the coredump code showed that there was an
 existing violation. The dev_coredumpm_timeout() call is used to
@@ -47,16 +45,17 @@ Link: https://patchwork.freedesktop.org/patch/msgid/20241128210824.3302147-3-Joh
 (cherry picked from commit 90f51a7f4ec1004fc4ddfbc6d1f1068d85ef4771)
 
 Signed-off-by: Thomas Hellström <thomas.hellstrom@linux.intel.com>
-Signed-off-by: Sasha Levin <sashal@kernel.org>
-Acked-by: Takashi Iwai <tiwai@suse.de>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
 
 ---
- drivers/gpu/drm/xe/xe_devcoredump.c |   69 +++++++++++++++++++-----------------
- 1 file changed, 37 insertions(+), 32 deletions(-)
+ drivers/gpu/drm/xe/xe_devcoredump.c | 73 +++++++++++++++--------------
+ 1 file changed, 39 insertions(+), 34 deletions(-)
 
+diff --git a/drivers/gpu/drm/xe/xe_devcoredump.c b/drivers/gpu/drm/xe/xe_devcoredump.c
+index 0b0cd6aa1d9f..f8947e7e917e 100644
 --- a/drivers/gpu/drm/xe/xe_devcoredump.c
 +++ b/drivers/gpu/drm/xe/xe_devcoredump.c
-@@ -144,34 +144,6 @@ static void xe_devcoredump_snapshot_free
+@@ -155,36 +155,6 @@ static void xe_devcoredump_snapshot_free(struct xe_devcoredump_snapshot *ss)
  	ss->vm = NULL;
  }
  
@@ -65,15 +64,17 @@ Acked-by: Takashi Iwai <tiwai@suse.de>
 -	struct xe_devcoredump_snapshot *ss = container_of(work, typeof(*ss), work);
 -	struct xe_devcoredump *coredump = container_of(ss, typeof(*coredump), snapshot);
 -	struct xe_device *xe = coredump_to_xe(coredump);
+-	unsigned int fw_ref;
 -
 -	xe_pm_runtime_get(xe);
 -
 -	/* keep going if fw fails as we still want to save the memory and SW data */
--	if (xe_force_wake_get(gt_to_fw(ss->gt), XE_FORCEWAKE_ALL))
+-	fw_ref = xe_force_wake_get(gt_to_fw(ss->gt), XE_FORCEWAKE_ALL);
+-	if (!xe_force_wake_ref_has_domain(fw_ref, XE_FORCEWAKE_ALL))
 -		xe_gt_info(ss->gt, "failed to get forcewake for coredump capture\n");
 -	xe_vm_snapshot_capture_delayed(ss->vm);
 -	xe_guc_exec_queue_snapshot_capture_delayed(ss->ge);
--	xe_force_wake_put(gt_to_fw(ss->gt), XE_FORCEWAKE_ALL);
+-	xe_force_wake_put(gt_to_fw(ss->gt), fw_ref);
 -
 -	xe_pm_runtime_put(xe);
 -
@@ -91,7 +92,7 @@ Acked-by: Takashi Iwai <tiwai@suse.de>
  static ssize_t xe_devcoredump_read(char *buffer, loff_t offset,
  				   size_t count, void *data, size_t datalen)
  {
-@@ -220,6 +192,43 @@ static void xe_devcoredump_free(void *da
+@@ -234,6 +204,45 @@ static void xe_devcoredump_free(void *data)
  		 "Xe device coredump has been deleted.\n");
  }
  
@@ -100,6 +101,7 @@ Acked-by: Takashi Iwai <tiwai@suse.de>
 +	struct xe_devcoredump_snapshot *ss = container_of(work, typeof(*ss), work);
 +	struct xe_devcoredump *coredump = container_of(ss, typeof(*coredump), snapshot);
 +	struct xe_device *xe = coredump_to_xe(coredump);
++	unsigned int fw_ref;
 +
 +	/*
 +	 * NB: Despite passing a GFP_ flags parameter here, more allocations are done
@@ -113,11 +115,12 @@ Acked-by: Takashi Iwai <tiwai@suse.de>
 +	xe_pm_runtime_get(xe);
 +
 +	/* keep going if fw fails as we still want to save the memory and SW data */
-+	if (xe_force_wake_get(gt_to_fw(ss->gt), XE_FORCEWAKE_ALL))
++	fw_ref = xe_force_wake_get(gt_to_fw(ss->gt), XE_FORCEWAKE_ALL);
++	if (!xe_force_wake_ref_has_domain(fw_ref, XE_FORCEWAKE_ALL))
 +		xe_gt_info(ss->gt, "failed to get forcewake for coredump capture\n");
 +	xe_vm_snapshot_capture_delayed(ss->vm);
 +	xe_guc_exec_queue_snapshot_capture_delayed(ss->ge);
-+	xe_force_wake_put(gt_to_fw(ss->gt), XE_FORCEWAKE_ALL);
++	xe_force_wake_put(gt_to_fw(ss->gt), fw_ref);
 +
 +	xe_pm_runtime_put(xe);
 +
@@ -135,7 +138,7 @@ Acked-by: Takashi Iwai <tiwai@suse.de>
  static void devcoredump_snapshot(struct xe_devcoredump *coredump,
  				 struct xe_sched_job *job)
  {
-@@ -303,10 +312,6 @@ void xe_devcoredump(struct xe_sched_job
+@@ -310,10 +319,6 @@ void xe_devcoredump(struct xe_sched_job *job)
  	drm_info(&xe->drm, "Xe device coredump has been created\n");
  	drm_info(&xe->drm, "Check your /sys/class/drm/card%d/device/devcoredump/data\n",
  		 xe->drm.primary->index);
@@ -146,3 +149,6 @@ Acked-by: Takashi Iwai <tiwai@suse.de>
  }
  
  static void xe_driver_devcoredump_fini(void *arg)
+-- 
+2.52.0
+

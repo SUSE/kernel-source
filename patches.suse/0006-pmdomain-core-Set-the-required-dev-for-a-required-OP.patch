@@ -1,0 +1,131 @@
+From e130ca9d4873f8d01e3e7b8137e0c14196a3cfb4 Mon Sep 17 00:00:00 2001
+From: Ulf Hansson <ulf.hansson@linaro.org>
+Date: Wed, 2 Oct 2024 14:22:27 +0200
+Subject: pmdomain: core: Set the required dev for a required OPP during genpd
+ attach
+Git-commit: e130ca9d4873f8d01e3e7b8137e0c14196a3cfb4
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+In the single PM domain case there is no need for platform code to specify
+the index of the corresponding required OPP in DT, as the index must be
+zero. This allows us to assign a required dev for the required OPP from
+genpd, while attaching a device to its PM domain.
+
+In this way, we can remove some of the genpd specific code in the OPP core
+for the single PM domain case. Although, this cleanup is made from a
+subsequent change.
+
+Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+Acked-by: Viresh Kumar <viresh.kumar@linaro.org>
+Link: https://lore.kernel.org/r/20241002122232.194245-7-ulf.hansson@linaro.org
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/pmdomain/core.c   | 42 ++++++++++++++++++++++++++++++++++++---
+ include/linux/pm_domain.h |  1 +
+ 2 files changed, 40 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/pmdomain/core.c b/drivers/pmdomain/core.c
+index 996f74951385..a6c8b85dd024 100644
+--- a/drivers/pmdomain/core.c
++++ b/drivers/pmdomain/core.c
+@@ -1727,6 +1727,7 @@ static void genpd_free_dev_data(struct device *dev,
+ 
+ 	spin_unlock_irq(&dev->power.lock);
+ 
++	dev_pm_opp_clear_config(gpd_data->opp_token);
+ 	kfree(gpd_data->td);
+ 	kfree(gpd_data);
+ 	dev_pm_put_subsys_data(dev);
+@@ -2903,6 +2904,29 @@ static void genpd_dev_pm_sync(struct device *dev)
+ 	genpd_queue_power_off_work(pd);
+ }
+ 
++static int genpd_set_required_opp_dev(struct device *dev,
++				      struct device *base_dev)
++{
++	struct dev_pm_opp_config config = {
++		.required_dev = dev,
++	};
++	int ret;
++
++	/* Limit support to non-providers for now. */
++	if (of_property_present(base_dev->of_node, "#power-domain-cells"))
++		return 0;
++
++	if (!dev_pm_opp_of_has_required_opp(base_dev))
++		return 0;
++
++	ret = dev_pm_opp_set_config(base_dev, &config);
++	if (ret < 0)
++		return ret;
++
++	dev_gpd_data(dev)->opp_token = ret;
++	return 0;
++}
++
+ static int genpd_set_required_opp(struct device *dev, unsigned int index)
+ {
+ 	int ret, pstate;
+@@ -2927,7 +2951,8 @@ static int genpd_set_required_opp(struct device *dev, unsigned int index)
+ }
+ 
+ static int __genpd_dev_pm_attach(struct device *dev, struct device *base_dev,
+-				 unsigned int index, bool power_on)
++				 unsigned int index, unsigned int num_domains,
++				 bool power_on)
+ {
+ 	struct of_phandle_args pd_args;
+ 	struct generic_pm_domain *pd;
+@@ -2959,6 +2984,17 @@ static int __genpd_dev_pm_attach(struct device *dev, struct device *base_dev,
+ 	dev->pm_domain->detach = genpd_dev_pm_detach;
+ 	dev->pm_domain->sync = genpd_dev_pm_sync;
+ 
++	/*
++	 * For a single PM domain the index of the required OPP must be zero, so
++	 * let's try to assign a required dev in that case. In the multiple PM
++	 * domains case, we need platform code to specify the index.
++	 */
++	if (num_domains == 1) {
++		ret = genpd_set_required_opp_dev(dev, base_dev);
++		if (ret)
++			goto err;
++	}
++
+ 	ret = genpd_set_required_opp(dev, index);
+ 	if (ret)
+ 		goto err;
+@@ -3013,7 +3049,7 @@ int genpd_dev_pm_attach(struct device *dev)
+ 				       "#power-domain-cells") != 1)
+ 		return 0;
+ 
+-	return __genpd_dev_pm_attach(dev, dev, 0, true);
++	return __genpd_dev_pm_attach(dev, dev, 0, 1, true);
+ }
+ EXPORT_SYMBOL_GPL(genpd_dev_pm_attach);
+ 
+@@ -3066,7 +3102,7 @@ struct device *genpd_dev_pm_attach_by_id(struct device *dev,
+ 	}
+ 
+ 	/* Try to attach the device to the PM domain at the specified index. */
+-	ret = __genpd_dev_pm_attach(virt_dev, dev, index, false);
++	ret = __genpd_dev_pm_attach(virt_dev, dev, index, num_domains, false);
+ 	if (ret < 1) {
+ 		device_unregister(virt_dev);
+ 		return ret ? ERR_PTR(ret) : NULL;
+diff --git a/include/linux/pm_domain.h b/include/linux/pm_domain.h
+index f51f11160add..45646bfcaf1a 100644
+--- a/include/linux/pm_domain.h
++++ b/include/linux/pm_domain.h
+@@ -258,6 +258,7 @@ struct generic_pm_domain_data {
+ 	unsigned int performance_state;
+ 	unsigned int default_pstate;
+ 	unsigned int rpm_pstate;
++	unsigned int opp_token;
+ 	bool hw_mode;
+ 	void *data;
+ };
+-- 
+2.52.0
+

@@ -1,0 +1,180 @@
+From 8521e3c5f0585cad3e73e4ba73535dc274e7eba6 Mon Sep 17 00:00:00 2001
+From: Shaoyun Liu <shaoyun.liu@amd.com>
+Date: Wed, 23 Oct 2024 11:12:00 -0400
+Subject: drm/amd/amdgpu: limit single process inside MES
+Git-commit: 8521e3c5f0585cad3e73e4ba73535dc274e7eba6
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+This is for MES to limit only one process for the user queues
+
+Signed-off-by: Shaoyun Liu <shaoyun.liu@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c |  2 ++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_mes.c | 23 +++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_mes.h | 19 +++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/mes_v11_0.c  | 15 +++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/mes_v12_0.c  | 11 +++++++++++
+ 5 files changed, 70 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
+index 76093793839e..f57cc72c43cf 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
+@@ -1598,9 +1598,11 @@ static ssize_t amdgpu_gfx_set_enforce_isolation(struct device *dev,
+ 		if (adev->enforce_isolation[i] && !partition_values[i]) {
+ 			/* Going from enabled to disabled */
+ 			amdgpu_vmid_free_reserved(adev, AMDGPU_GFXHUB(i));
++			amdgpu_mes_set_enforce_isolation(adev, i, false);
+ 		} else if (!adev->enforce_isolation[i] && partition_values[i]) {
+ 			/* Going from disabled to enabled */
+ 			amdgpu_vmid_alloc_reserved(adev, AMDGPU_GFXHUB(i));
++			amdgpu_mes_set_enforce_isolation(adev, i, true);
+ 		}
+ 		adev->enforce_isolation[i] = partition_values[i];
+ 	}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_mes.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_mes.c
+index c9ec5c6cad2e..59ec20b07a6a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_mes.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_mes.c
+@@ -1678,6 +1678,29 @@ bool amdgpu_mes_suspend_resume_all_supported(struct amdgpu_device *adev)
+ 	return is_supported;
+ }
+ 
++/* Fix me -- node_id is used to identify the correct MES instances in the future */
++int amdgpu_mes_set_enforce_isolation(struct amdgpu_device *adev, uint32_t node_id, bool enable)
++{
++	struct mes_misc_op_input op_input = {0};
++	int r;
++
++	op_input.op = MES_MISC_OP_CHANGE_CONFIG;
++	op_input.change_config.option.limit_single_process = enable ? 1 : 0;
++
++	if (!adev->mes.funcs->misc_op) {
++		dev_err(adev->dev, "mes change config is not supported!\n");
++		r = -EINVAL;
++		goto error;
++	}
++
++	r = adev->mes.funcs->misc_op(&adev->mes, &op_input);
++	if (r)
++		dev_err(adev->dev, "failed to change_config.\n");
++
++error:
++	return r;
++}
++
+ #if defined(CONFIG_DEBUG_FS)
+ 
+ static int amdgpu_debugfs_mes_event_log_show(struct seq_file *m, void *unused)
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_mes.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_mes.h
+index 0666ba91be15..c6f93cbd6739 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_mes.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_mes.h
+@@ -309,6 +309,7 @@ enum mes_misc_opcode {
+ 	MES_MISC_OP_WRM_REG_WAIT,
+ 	MES_MISC_OP_WRM_REG_WR_WAIT,
+ 	MES_MISC_OP_SET_SHADER_DEBUGGER,
++	MES_MISC_OP_CHANGE_CONFIG,
+ };
+ 
+ struct mes_misc_op_input {
+@@ -347,6 +348,21 @@ struct mes_misc_op_input {
+ 			uint32_t tcp_watch_cntl[4];
+ 			uint32_t trap_en;
+ 		} set_shader_debugger;
++
++		struct {
++			union {
++				struct {
++					uint32_t limit_single_process : 1;
++					uint32_t enable_hws_logging_buffer : 1;
++					uint32_t reserved : 30;
++				};
++				uint32_t all;
++			} option;
++			struct {
++				uint32_t tdr_level;
++				uint32_t tdr_delay;
++			} tdr_config;
++		} change_config;
+ 	};
+ };
+ 
+@@ -517,4 +533,7 @@ static inline void amdgpu_mes_unlock(struct amdgpu_mes *mes)
+ }
+ 
+ bool amdgpu_mes_suspend_resume_all_supported(struct amdgpu_device *adev);
++
++int amdgpu_mes_set_enforce_isolation(struct amdgpu_device *adev, uint32_t node_id, bool enable);
++
+ #endif /* __AMDGPU_MES_H__ */
+diff --git a/drivers/gpu/drm/amd/amdgpu/mes_v11_0.c b/drivers/gpu/drm/amd/amdgpu/mes_v11_0.c
+index 6f6133496944..9c905b9e9376 100644
+--- a/drivers/gpu/drm/amd/amdgpu/mes_v11_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/mes_v11_0.c
+@@ -644,6 +644,18 @@ static int mes_v11_0_misc_op(struct amdgpu_mes *mes,
+ 				sizeof(misc_pkt.set_shader_debugger.tcp_watch_cntl));
+ 		misc_pkt.set_shader_debugger.trap_en = input->set_shader_debugger.trap_en;
+ 		break;
++	case MES_MISC_OP_CHANGE_CONFIG:
++		if ((mes->adev->mes.sched_version & AMDGPU_MES_VERSION_MASK) < 0x63) {
++			dev_err(mes->adev->dev, "MES FW versoin must be larger than 0x63 to support limit single process feature.\n");
++			return -EINVAL;
++		}
++		misc_pkt.opcode = MESAPI_MISC__CHANGE_CONFIG;
++		misc_pkt.change_config.opcode =
++				MESAPI_MISC__CHANGE_CONFIG_OPTION_LIMIT_SINGLE_PROCESS;
++		misc_pkt.change_config.option.bits.limit_single_process =
++				input->change_config.option.limit_single_process;
++		break;
++
+ 	default:
+ 		DRM_ERROR("unsupported misc op (%d) \n", input->op);
+ 		return -EINVAL;
+@@ -708,6 +720,9 @@ static int mes_v11_0_set_hw_resources(struct amdgpu_mes *mes)
+ 					mes->event_log_gpu_addr;
+ 	}
+ 
++	if (enforce_isolation)
++		mes_set_hw_res_pkt.limit_single_process = 1;
++
+ 	return mes_v11_0_submit_pkt_and_poll_completion(mes,
+ 			&mes_set_hw_res_pkt, sizeof(mes_set_hw_res_pkt),
+ 			offsetof(union MESAPI_SET_HW_RESOURCES, api_status));
+diff --git a/drivers/gpu/drm/amd/amdgpu/mes_v12_0.c b/drivers/gpu/drm/amd/amdgpu/mes_v12_0.c
+index 0c401a5e2fb8..9ecc5d61e49b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/mes_v12_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/mes_v12_0.c
+@@ -531,6 +531,14 @@ static int mes_v12_0_misc_op(struct amdgpu_mes *mes,
+ 				sizeof(misc_pkt.set_shader_debugger.tcp_watch_cntl));
+ 		misc_pkt.set_shader_debugger.trap_en = input->set_shader_debugger.trap_en;
+ 		break;
++	case MES_MISC_OP_CHANGE_CONFIG:
++		misc_pkt.opcode = MESAPI_MISC__CHANGE_CONFIG;
++		misc_pkt.change_config.opcode =
++				MESAPI_MISC__CHANGE_CONFIG_OPTION_LIMIT_SINGLE_PROCESS;
++		misc_pkt.change_config.option.bits.limit_single_process =
++				input->change_config.option.limit_single_process;
++		break;
++
+ 	default:
+ 		DRM_ERROR("unsupported misc op (%d) \n", input->op);
+ 		return -EINVAL;
+@@ -624,6 +632,9 @@ static int mes_v12_0_set_hw_resources(struct amdgpu_mes *mes, int pipe)
+ 		mes_set_hw_res_pkt.event_intr_history_gpu_mc_ptr = mes->event_log_gpu_addr + pipe * AMDGPU_MES_LOG_BUFFER_SIZE;
+ 	}
+ 
++	if (enforce_isolation)
++		mes_set_hw_res_pkt.limit_single_process = 1;
++
+ 	return mes_v12_0_submit_pkt_and_poll_completion(mes, pipe,
+ 			&mes_set_hw_res_pkt, sizeof(mes_set_hw_res_pkt),
+ 			offsetof(union MESAPI_SET_HW_RESOURCES, api_status));
+-- 
+2.52.0
+

@@ -1,0 +1,199 @@
+From a86e0c0e94373aebc39c2efedaefc408f6a49fe3 Mon Sep 17 00:00:00 2001
+From: Lijo Lazar <lijo.lazar@amd.com>
+Date: Fri, 15 Nov 2024 11:08:02 +0530
+Subject: drm/amdgpu: Add init level for post reset reinit
+Git-commit: a86e0c0e94373aebc39c2efedaefc408f6a49fe3
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+When device needs to be reset before initialization, it's not required
+for all IPs to be initialized before a reset. In such cases, it needs to
+identify whether the IP/feature is initialized for the first time or
+whether it's reinitialized after a reset.
+
+Add RESET_RECOVERY init level to identify post reset reinitialization
+phase. This only provides a device level identification, IP/features may
+choose to track their state independently also.
+
+Signed-off-by: Lijo Lazar <lijo.lazar@amd.com>
+Acked-by: Tao Zhou <tao.zhou1@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/aldebaran.c      |  4 ++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h         |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c  | 25 ++++++++++++++++++---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_reset.c   |  5 +++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_reset.h   |  2 ++
+ drivers/gpu/drm/amd/amdgpu/sienna_cichlid.c |  2 ++
+ drivers/gpu/drm/amd/amdgpu/smu_v13_0_10.c   |  2 ++
+ 7 files changed, 38 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/aldebaran.c b/drivers/gpu/drm/amd/amdgpu/aldebaran.c
+index 3a588fecb0c5..f44de9d4b6a1 100644
+--- a/drivers/gpu/drm/amd/amdgpu/aldebaran.c
++++ b/drivers/gpu/drm/amd/amdgpu/aldebaran.c
+@@ -330,6 +330,8 @@ aldebaran_mode2_restore_hwcontext(struct amdgpu_reset_control *reset_ctl,
+ 	}
+ 
+ 	list_for_each_entry(tmp_adev, reset_device_list, reset_list) {
++		amdgpu_set_init_level(tmp_adev,
++				AMDGPU_INIT_LEVEL_RESET_RECOVERY);
+ 		dev_info(tmp_adev->dev,
+ 			 "GPU reset succeeded, trying to resume\n");
+ 		r = aldebaran_mode2_restore_ip(tmp_adev);
+@@ -375,6 +377,8 @@ aldebaran_mode2_restore_hwcontext(struct amdgpu_reset_control *reset_ctl,
+ 							tmp_adev);
+ 
+ 		if (!r) {
++			amdgpu_set_init_level(tmp_adev,
++					      AMDGPU_INIT_LEVEL_DEFAULT);
+ 			amdgpu_irq_gpu_reset_resume_helper(tmp_adev);
+ 
+ 			r = amdgpu_ib_ring_tests(tmp_adev);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index d8bc6da50016..4653a8d2823a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -839,6 +839,7 @@ struct amdgpu_mqd {
+ enum amdgpu_init_lvl_id {
+ 	AMDGPU_INIT_LEVEL_DEFAULT,
+ 	AMDGPU_INIT_LEVEL_MINIMAL_XGMI,
++	AMDGPU_INIT_LEVEL_RESET_RECOVERY,
+ };
+ 
+ struct amdgpu_init_level {
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 0171d240fcb0..5ef95161e632 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -156,6 +156,11 @@ struct amdgpu_init_level amdgpu_init_default = {
+ 	.hwini_ip_block_mask = AMDGPU_IP_BLK_MASK_ALL,
+ };
+ 
++struct amdgpu_init_level amdgpu_init_recovery = {
++	.level = AMDGPU_INIT_LEVEL_RESET_RECOVERY,
++	.hwini_ip_block_mask = AMDGPU_IP_BLK_MASK_ALL,
++};
++
+ /*
+  * Minimal blocks needed to be initialized before a XGMI hive can be reset. This
+  * is used for cases like reset on initialization where the entire hive needs to
+@@ -182,6 +187,9 @@ void amdgpu_set_init_level(struct amdgpu_device *adev,
+ 	case AMDGPU_INIT_LEVEL_MINIMAL_XGMI:
+ 		adev->init_lvl = &amdgpu_init_minimal_xgmi;
+ 		break;
++	case AMDGPU_INIT_LEVEL_RESET_RECOVERY:
++		adev->init_lvl = &amdgpu_init_recovery;
++		break;
+ 	case AMDGPU_INIT_LEVEL_DEFAULT:
+ 		fallthrough;
+ 	default:
+@@ -5419,7 +5427,7 @@ int amdgpu_device_reinit_after_reset(struct amdgpu_reset_context *reset_context)
+ 	struct list_head *device_list_handle;
+ 	bool full_reset, vram_lost = false;
+ 	struct amdgpu_device *tmp_adev;
+-	int r;
++	int r, init_level;
+ 
+ 	device_list_handle = reset_context->reset_device_list;
+ 
+@@ -5428,10 +5436,18 @@ int amdgpu_device_reinit_after_reset(struct amdgpu_reset_context *reset_context)
+ 
+ 	full_reset = test_bit(AMDGPU_NEED_FULL_RESET, &reset_context->flags);
+ 
++	/**
++	 * If it's reset on init, it's default init level, otherwise keep level
++	 * as recovery level.
++	 */
++	if (reset_context->method == AMD_RESET_METHOD_ON_INIT)
++			init_level = AMDGPU_INIT_LEVEL_DEFAULT;
++	else
++			init_level = AMDGPU_INIT_LEVEL_RESET_RECOVERY;
++
+ 	r = 0;
+ 	list_for_each_entry(tmp_adev, device_list_handle, reset_list) {
+-		/* After reset, it's default init level */
+-		amdgpu_set_init_level(tmp_adev, AMDGPU_INIT_LEVEL_DEFAULT);
++		amdgpu_set_init_level(tmp_adev, init_level);
+ 		if (full_reset) {
+ 			/* post card */
+ 			amdgpu_ras_set_fed(tmp_adev, false);
+@@ -5518,6 +5534,9 @@ int amdgpu_device_reinit_after_reset(struct amdgpu_reset_context *reset_context)
+ 
+ out:
+ 		if (!r) {
++			/* IP init is complete now, set level as default */
++			amdgpu_set_init_level(tmp_adev,
++					      AMDGPU_INIT_LEVEL_DEFAULT);
+ 			amdgpu_irq_gpu_reset_resume_helper(tmp_adev);
+ 			r = amdgpu_ib_ring_tests(tmp_adev);
+ 			if (r) {
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_reset.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_reset.c
+index 24dae7cdbe95..a0acb65f4b40 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_reset.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_reset.c
+@@ -342,3 +342,8 @@ void amdgpu_reset_get_desc(struct amdgpu_reset_context *rst_ctxt, char *buf,
+ 		strscpy(buf, "unknown", len);
+ 	}
+ }
++
++bool amdgpu_reset_in_recovery(struct amdgpu_device *adev)
++{
++	return (adev->init_lvl->level == AMDGPU_INIT_LEVEL_RESET_RECOVERY);
++}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_reset.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_reset.h
+index f8628bc898df..4d9b9701139b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_reset.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_reset.h
+@@ -158,4 +158,6 @@ extern struct amdgpu_reset_handler xgmi_reset_on_init_handler;
+ int amdgpu_reset_do_xgmi_reset_on_init(
+ 	struct amdgpu_reset_context *reset_context);
+ 
++bool amdgpu_reset_in_recovery(struct amdgpu_device *adev);
++
+ #endif
+diff --git a/drivers/gpu/drm/amd/amdgpu/sienna_cichlid.c b/drivers/gpu/drm/amd/amdgpu/sienna_cichlid.c
+index 9b01e074af47..2594467bdd87 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sienna_cichlid.c
++++ b/drivers/gpu/drm/amd/amdgpu/sienna_cichlid.c
+@@ -220,6 +220,7 @@ sienna_cichlid_mode2_restore_hwcontext(struct amdgpu_reset_control *reset_ctl,
+ 	int r;
+ 	struct amdgpu_device *tmp_adev = (struct amdgpu_device *)reset_ctl->handle;
+ 
++	amdgpu_set_init_level(tmp_adev, AMDGPU_INIT_LEVEL_RESET_RECOVERY);
+ 	dev_info(tmp_adev->dev,
+ 			"GPU reset succeeded, trying to resume\n");
+ 	r = sienna_cichlid_mode2_restore_ip(tmp_adev);
+@@ -237,6 +238,7 @@ sienna_cichlid_mode2_restore_hwcontext(struct amdgpu_reset_control *reset_ctl,
+ 
+ 	amdgpu_irq_gpu_reset_resume_helper(tmp_adev);
+ 
++	amdgpu_set_init_level(tmp_adev, AMDGPU_INIT_LEVEL_DEFAULT);
+ 	r = amdgpu_ib_ring_tests(tmp_adev);
+ 	if (r) {
+ 		dev_err(tmp_adev->dev,
+diff --git a/drivers/gpu/drm/amd/amdgpu/smu_v13_0_10.c b/drivers/gpu/drm/amd/amdgpu/smu_v13_0_10.c
+index e70ebad3f9fa..70569ea906bc 100644
+--- a/drivers/gpu/drm/amd/amdgpu/smu_v13_0_10.c
++++ b/drivers/gpu/drm/amd/amdgpu/smu_v13_0_10.c
+@@ -221,6 +221,7 @@ smu_v13_0_10_mode2_restore_hwcontext(struct amdgpu_reset_control *reset_ctl,
+ 	int r;
+ 	struct amdgpu_device *tmp_adev = (struct amdgpu_device *)reset_ctl->handle;
+ 
++	amdgpu_set_init_level(tmp_adev, AMDGPU_INIT_LEVEL_RESET_RECOVERY);
+ 	dev_info(tmp_adev->dev,
+ 			"GPU reset succeeded, trying to resume\n");
+ 	r = smu_v13_0_10_mode2_restore_ip(tmp_adev);
+@@ -234,6 +235,7 @@ smu_v13_0_10_mode2_restore_hwcontext(struct amdgpu_reset_control *reset_ctl,
+ 
+ 	amdgpu_irq_gpu_reset_resume_helper(tmp_adev);
+ 
++	amdgpu_set_init_level(tmp_adev, AMDGPU_INIT_LEVEL_DEFAULT);
+ 	r = amdgpu_ib_ring_tests(tmp_adev);
+ 	if (r) {
+ 		dev_err(tmp_adev->dev,
+-- 
+2.52.0
+

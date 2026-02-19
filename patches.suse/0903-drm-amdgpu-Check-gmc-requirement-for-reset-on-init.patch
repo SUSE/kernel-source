@@ -1,0 +1,109 @@
+From ed3dac4bf9588b5a68e1a85ac45cbbe180df6d4b Mon Sep 17 00:00:00 2001
+From: Lijo Lazar <lijo.lazar@amd.com>
+Date: Fri, 20 Sep 2024 14:17:30 +0530
+Subject: drm/amdgpu: Check gmc requirement for reset on init
+Git-commit: ed3dac4bf9588b5a68e1a85ac45cbbe180df6d4b
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Add a callback to check if there is any condition detected by GMC block
+for reset on init. One case is if a pending NPS change request is
+detected. If reset is done because of NPS switch, refresh NPS info from
+discovery table.
+
+Signed-off-by: Lijo Lazar <lijo.lazar@amd.com>
+Reviewed-by: Feifei Xu <Feifei.Xu@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c | 13 ++++++++++++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h |  5 +++++
+ drivers/gpu/drm/amd/amdgpu/soc15.c      |  2 ++
+ 3 files changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
+index 4b70123957df..3a71028e4193 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
+@@ -1249,12 +1249,15 @@ int amdgpu_gmc_get_nps_memranges(struct amdgpu_device *adev,
+ 	struct amdgpu_gmc_memrange *ranges;
+ 	int range_cnt, ret, i, j;
+ 	uint32_t nps_type;
++	bool refresh;
+ 
+ 	if (!mem_ranges)
+ 		return -EINVAL;
+ 
++	refresh = (adev->init_lvl->level != AMDGPU_INIT_LEVEL_MINIMAL_XGMI) &&
++		  (adev->gmc.reset_flags & AMDGPU_GMC_INIT_RESET_NPS);
+ 	ret = amdgpu_discovery_get_nps_info(adev, &nps_type, &ranges,
+-					    &range_cnt, false);
++					    &range_cnt, refresh);
+ 
+ 	if (ret)
+ 		return ret;
+@@ -1380,3 +1383,11 @@ void amdgpu_gmc_prepare_nps_mode_change(struct amdgpu_device *adev)
+ 			adev->dev,
+ 			"NPS mode change request done, reload driver to complete the change\n");
+ }
++
++bool amdgpu_gmc_need_reset_on_init(struct amdgpu_device *adev)
++{
++	if (adev->gmc.gmc_funcs->need_reset_on_init)
++		return adev->gmc.gmc_funcs->need_reset_on_init(adev);
++
++	return false;
++}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h
+index b92f41d1b46f..c66b6dbe9ac6 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h
+@@ -78,6 +78,8 @@ enum amdgpu_memory_partition {
+ 	 BIT(AMDGPU_NPS3_PARTITION_MODE) | BIT(AMDGPU_NPS4_PARTITION_MODE) | \
+ 	 BIT(AMDGPU_NPS6_PARTITION_MODE) | BIT(AMDGPU_NPS8_PARTITION_MODE))
+ 
++#define AMDGPU_GMC_INIT_RESET_NPS  BIT(0)
++
+ /*
+  * GMC page fault information
+  */
+@@ -169,6 +171,7 @@ struct amdgpu_gmc_funcs {
+ 	/* Request NPS mode */
+ 	int (*request_mem_partition_mode)(struct amdgpu_device *adev,
+ 					  int nps_mode);
++	bool (*need_reset_on_init)(struct amdgpu_device *adev);
+ };
+ 
+ struct amdgpu_xgmi_ras {
+@@ -314,6 +317,7 @@ struct amdgpu_gmc {
+ 	const struct amdgpu_gmc_funcs	*gmc_funcs;
+ 	enum amdgpu_memory_partition	requested_nps_mode;
+ 	uint32_t supported_nps_modes;
++	uint32_t reset_flags;
+ 
+ 	struct amdgpu_xgmi xgmi;
+ 	struct amdgpu_irq_src	ecc_irq;
+@@ -467,5 +471,6 @@ int amdgpu_gmc_get_nps_memranges(struct amdgpu_device *adev,
+ int amdgpu_gmc_request_memory_partition(struct amdgpu_device *adev,
+ 					int nps_mode);
+ void amdgpu_gmc_prepare_nps_mode_change(struct amdgpu_device *adev);
++bool amdgpu_gmc_need_reset_on_init(struct amdgpu_device *adev);
+ 
+ #endif
+diff --git a/drivers/gpu/drm/amd/amdgpu/soc15.c b/drivers/gpu/drm/amd/amdgpu/soc15.c
+index 0f545a096962..143a8f77e348 100644
+--- a/drivers/gpu/drm/amd/amdgpu/soc15.c
++++ b/drivers/gpu/drm/amd/amdgpu/soc15.c
+@@ -831,6 +831,8 @@ static bool soc15_need_reset_on_init(struct amdgpu_device *adev)
+ 	if (adev->asic_type == CHIP_RENOIR)
+ 		return true;
+ 
++	if (amdgpu_gmc_need_reset_on_init(adev))
++		return true;
+ 	if (amdgpu_psp_tos_reload_needed(adev))
+ 		return true;
+ 	/* Just return false for soc15 GPUs.  Reset does not seem to
+-- 
+2.52.0
+

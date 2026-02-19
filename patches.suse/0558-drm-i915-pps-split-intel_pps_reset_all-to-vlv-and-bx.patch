@@ -1,0 +1,151 @@
+From 39bc6d24f01f4a62b098f6531533dc72d1ecc99c Mon Sep 17 00:00:00 2001
+From: Jani Nikula <jani.nikula@intel.com>
+Date: Thu, 19 Sep 2024 12:04:27 +0300
+Subject: drm/i915/pps: split intel_pps_reset_all() to vlv and bxt variants
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 39bc6d24f01f4a62b098f6531533dc72d1ecc99c
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+The intel_pps_reset_all() function does similar but not quite the same
+things for VLV/CHV and BXT/GLK. Observe that it's called from platform
+specific code only, and a split to two functions vlv_pps_reset_all() and
+bxt_pps_reset_all() is natural.
+
+Remove the platform checks and warnings from the functions. We don't
+usually have them, unless we're unsure. To make this easier to reason
+about for BXT/GLK, change the condition on caller side from "!PCH" to
+"BXT || GLK".
+
+Suggested-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20240919090427.1859032-1-jani.nikula@intel.com
+Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../i915/display/intel_display_power_well.c   | 11 +++---
+ drivers/gpu/drm/i915/display/intel_pps.c      | 34 +++++++++++--------
+ drivers/gpu/drm/i915/display/intel_pps.h      |  3 +-
+ 3 files changed, 27 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display_power_well.c b/drivers/gpu/drm/i915/display/intel_display_power_well.c
+index 1898aff50ac4..adaf7cf3a33b 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_power_well.c
++++ b/drivers/gpu/drm/i915/display/intel_display_power_well.c
+@@ -879,12 +879,11 @@ void bxt_enable_dc9(struct intel_display *display)
+ 
+ 	drm_dbg_kms(display->drm, "Enabling DC9\n");
+ 	/*
+-	 * Power sequencer reset is not needed on
+-	 * platforms with South Display Engine on PCH,
+-	 * because PPS registers are always on.
++	 * Power sequencer reset is needed on BXT/GLK, because the PPS registers
++	 * aren't always on, unlike with South Display Engine on PCH.
+ 	 */
+-	if (!HAS_PCH_SPLIT(dev_priv))
+-		intel_pps_reset_all(display);
++	if (IS_BROXTON(dev_priv) || IS_GEMINILAKE(dev_priv))
++		bxt_pps_reset_all(display);
+ 	gen9_set_dc_state(display, DC_STATE_EN_DC9);
+ }
+ 
+@@ -1270,7 +1269,7 @@ static void vlv_display_power_well_deinit(struct drm_i915_private *dev_priv)
+ 	/* make sure we're done processing display irqs */
+ 	intel_synchronize_irq(dev_priv);
+ 
+-	intel_pps_reset_all(display);
++	vlv_pps_reset_all(display);
+ 
+ 	/* Prevent us from re-enabling polling on accident in late suspend */
+ 	if (!dev_priv->drm.dev->power.is_suspended)
+diff --git a/drivers/gpu/drm/i915/display/intel_pps.c b/drivers/gpu/drm/i915/display/intel_pps.c
+index 819b2843946f..88abc4c7cda1 100644
+--- a/drivers/gpu/drm/i915/display/intel_pps.c
++++ b/drivers/gpu/drm/i915/display/intel_pps.c
+@@ -70,7 +70,7 @@ intel_wakeref_t intel_pps_lock(struct intel_dp *intel_dp)
+ 	intel_wakeref_t wakeref;
+ 
+ 	/*
+-	 * See intel_pps_reset_all() why we need a power domain reference here.
++	 * See vlv_pps_reset_all() why we need a power domain reference here.
+ 	 */
+ 	wakeref = intel_display_power_get(dev_priv, POWER_DOMAIN_DISPLAY_CORE);
+ 	mutex_lock(&display->pps.mutex);
+@@ -448,14 +448,10 @@ pps_initial_setup(struct intel_dp *intel_dp)
+ 	return intel_pps_is_valid(intel_dp);
+ }
+ 
+-void intel_pps_reset_all(struct intel_display *display)
++void vlv_pps_reset_all(struct intel_display *display)
+ {
+-	struct drm_i915_private *dev_priv = to_i915(display->drm);
+ 	struct intel_encoder *encoder;
+ 
+-	if (drm_WARN_ON(display->drm, !IS_LP(dev_priv)))
+-		return;
+-
+ 	if (!HAS_DISPLAY(display))
+ 		return;
+ 
+@@ -472,16 +468,26 @@ void intel_pps_reset_all(struct intel_display *display)
+ 	for_each_intel_dp(display->drm, encoder) {
+ 		struct intel_dp *intel_dp = enc_to_intel_dp(encoder);
+ 
+-		if (IS_VALLEYVIEW(dev_priv) || IS_CHERRYVIEW(dev_priv))
+-			drm_WARN_ON(display->drm,
+-				    intel_dp->pps.vlv_active_pipe != INVALID_PIPE);
+-
+-		if (encoder->type != INTEL_OUTPUT_EDP)
+-			continue;
++		drm_WARN_ON(display->drm, intel_dp->pps.vlv_active_pipe != INVALID_PIPE);
+ 
+-		if (IS_VALLEYVIEW(dev_priv) || IS_CHERRYVIEW(dev_priv))
++		if (encoder->type == INTEL_OUTPUT_EDP)
+ 			intel_dp->pps.vlv_pps_pipe = INVALID_PIPE;
+-		else
++	}
++}
++
++void bxt_pps_reset_all(struct intel_display *display)
++{
++	struct intel_encoder *encoder;
++
++	if (!HAS_DISPLAY(display))
++		return;
++
++	/* See vlv_pps_reset_all() for why we can't grab pps_mutex here. */
++
++	for_each_intel_dp(display->drm, encoder) {
++		struct intel_dp *intel_dp = enc_to_intel_dp(encoder);
++
++		if (encoder->type == INTEL_OUTPUT_EDP)
+ 			intel_dp->pps.bxt_pps_reset = true;
+ 	}
+ }
+diff --git a/drivers/gpu/drm/i915/display/intel_pps.h b/drivers/gpu/drm/i915/display/intel_pps.h
+index a5339a65485d..bc5046d53626 100644
+--- a/drivers/gpu/drm/i915/display/intel_pps.h
++++ b/drivers/gpu/drm/i915/display/intel_pps.h
+@@ -43,7 +43,6 @@ void intel_pps_wait_power_cycle(struct intel_dp *intel_dp);
+ bool intel_pps_init(struct intel_dp *intel_dp);
+ void intel_pps_init_late(struct intel_dp *intel_dp);
+ void intel_pps_encoder_reset(struct intel_dp *intel_dp);
+-void intel_pps_reset_all(struct intel_display *display);
+ 
+ void vlv_pps_pipe_init(struct intel_dp *intel_dp);
+ void vlv_pps_pipe_reset(struct intel_dp *intel_dp);
+@@ -52,6 +51,8 @@ void vlv_pps_port_enable_unlocked(struct intel_encoder *encoder,
+ 				  const struct intel_crtc_state *crtc_state);
+ void vlv_pps_port_disable(struct intel_encoder *encoder,
+ 			  const struct intel_crtc_state *crtc_state);
++void vlv_pps_reset_all(struct intel_display *display);
++void bxt_pps_reset_all(struct intel_display *display);
+ 
+ void intel_pps_unlock_regs_wa(struct intel_display *display);
+ void intel_pps_setup(struct intel_display *display);
+-- 
+2.52.0
+

@@ -1,0 +1,123 @@
+From d42b0435254f0965ab5484c69cd45b4097f2f47d Mon Sep 17 00:00:00 2001
+From: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Date: Thu, 19 Sep 2024 19:15:28 +0200
+Subject: drm/xe/pf: Allow to save and restore VF config blob from debugfs
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: d42b0435254f0965ab5484c69cd45b4097f2f47d
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+For feature enabling and testing purposes, allow to capture and
+replace full VF configuration using debugfs blob file, but only
+under strict debug config.
+
+Signed-off-by: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Reviewed-by: Michał Winiarski <michal.winiarski@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20240919171528.1451-6-michal.wajdeczko@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/xe/xe_gt_sriov_pf_debugfs.c | 78 +++++++++++++++++++++
+ 1 file changed, 78 insertions(+)
+
+diff --git a/drivers/gpu/drm/xe/xe_gt_sriov_pf_debugfs.c b/drivers/gpu/drm/xe/xe_gt_sriov_pf_debugfs.c
+index ccbcf6e572d0..91fc42e386d8 100644
+--- a/drivers/gpu/drm/xe/xe_gt_sriov_pf_debugfs.c
++++ b/drivers/gpu/drm/xe/xe_gt_sriov_pf_debugfs.c
+@@ -417,6 +417,81 @@ static const struct file_operations guc_state_ops = {
+ 	.llseek		= default_llseek,
+ };
+ 
++/*
++ *      /sys/kernel/debug/dri/0/
++ *      ├── gt0
++ *      │   ├── vf1
++ *      │   │   ├── config_blob
++ */
++static ssize_t config_blob_read(struct file *file, char __user *buf,
++				size_t count, loff_t *pos)
++{
++	struct dentry *dent = file_dentry(file);
++	struct dentry *parent = dent->d_parent;
++	struct xe_gt *gt = extract_gt(parent);
++	unsigned int vfid = extract_vfid(parent);
++	ssize_t ret;
++	void *tmp;
++
++	ret = xe_gt_sriov_pf_config_save(gt, vfid, NULL, 0);
++	if (!ret)
++		return -ENODATA;
++	if (ret < 0)
++		return ret;
++
++	tmp = kzalloc(ret, GFP_KERNEL);
++	if (!tmp)
++		return -ENOMEM;
++
++	ret = xe_gt_sriov_pf_config_save(gt, vfid, tmp, ret);
++	if (ret > 0)
++		ret = simple_read_from_buffer(buf, count, pos, tmp, ret);
++
++	kfree(tmp);
++	return ret;
++}
++
++static ssize_t config_blob_write(struct file *file, const char __user *buf,
++				 size_t count, loff_t *pos)
++{
++	struct dentry *dent = file_dentry(file);
++	struct dentry *parent = dent->d_parent;
++	struct xe_gt *gt = extract_gt(parent);
++	unsigned int vfid = extract_vfid(parent);
++	ssize_t ret;
++	void *tmp;
++
++	if (*pos)
++		return -EINVAL;
++
++	if (!count)
++		return -ENODATA;
++
++	if (count > SZ_4K)
++		return -EINVAL;
++
++	tmp = kzalloc(count, GFP_KERNEL);
++	if (!tmp)
++		return -ENOMEM;
++
++	if (copy_from_user(tmp, buf, count)) {
++		ret = -EFAULT;
++	} else {
++		ret = xe_gt_sriov_pf_config_restore(gt, vfid, tmp, count);
++		if (!ret)
++			ret = count;
++	}
++	kfree(tmp);
++	return ret;
++}
++
++static const struct file_operations config_blob_ops = {
++	.owner		= THIS_MODULE,
++	.read		= config_blob_read,
++	.write		= config_blob_write,
++	.llseek		= default_llseek,
++};
++
+ /**
+  * xe_gt_sriov_pf_debugfs_register - Register SR-IOV PF specific entries in GT debugfs.
+  * @gt: the &xe_gt to register
+@@ -471,6 +546,9 @@ void xe_gt_sriov_pf_debugfs_register(struct xe_gt *gt, struct dentry *root)
+ 			debugfs_create_file("guc_state",
+ 					    IS_ENABLED(CONFIG_DRM_XE_DEBUG_SRIOV) ? 0600 : 0400,
+ 					    vfdentry, NULL, &guc_state_ops);
++			debugfs_create_file("config_blob",
++					    IS_ENABLED(CONFIG_DRM_XE_DEBUG_SRIOV) ? 0600 : 0400,
++					    vfdentry, NULL, &config_blob_ops);
+ 		}
+ 	}
+ }
+-- 
+2.52.0
+

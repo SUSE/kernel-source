@@ -1,0 +1,104 @@
+From e2f5812ebf6af7e67ac50f0abb11249f6171b8a2 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Tue, 1 Oct 2024 22:58:03 +0300
+Subject: drm/i915: Apply the i915gm/i945gm irq C-state w/a to CRC interrupts
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: e2f5812ebf6af7e67ac50f0abb11249f6171b8a2
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Turns out CRC interrupts also fail to wake up i915gm/i945gm from
+C2+. I suppose this is a generic problem, but for most other
+interrupts the system will be busy enough already prior to
+the irq being issued. But CRC interrupts are like vblank interrupts
+and only fire once per frame, so plenty of time to fall asleep
+in between them.
+
+Apply the same core clock gating trick to CRC interrupts
+that we use for vblank interrupts.
+
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241001195803.3371-5-ville.syrjala@linux.intel.com
+Reviewed-by: Jani Nikula <jani.nikula@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/intel_display_irq.c | 16 ++++++++++++++--
+ drivers/gpu/drm/i915/display/intel_display_irq.h |  2 ++
+ drivers/gpu/drm/i915/display/intel_pipe_crc.c    |  4 ++++
+ 3 files changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display_irq.c b/drivers/gpu/drm/i915/display/intel_display_irq.c
+index feeb3a29972a..a09909c3c6cd 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_irq.c
++++ b/drivers/gpu/drm/i915/display/intel_display_irq.c
+@@ -1264,10 +1264,10 @@ static void i915gm_irq_cstate_wa_enable(struct drm_i915_private *i915)
+ 	lockdep_assert_held(&i915->drm.vblank_time_lock);
+ 
+ 	/*
+-	 * Vblank interrupts fail to wake the device up from C2+.
++	 * Vblank/CRC interrupts fail to wake the device up from C2+.
+ 	 * Disabling render clock gating during C-states avoids
+ 	 * the problem. There is a small power cost so we do this
+-	 * only when vblank interrupts are actually enabled.
++	 * only when vblank/CRC interrupts are actually enabled.
+ 	 */
+ 	if (i915->display.irq.vblank_enabled++ == 0)
+ 		intel_uncore_write(&i915->uncore, SCPD0, _MASKED_BIT_ENABLE(CSTATE_RENDER_CLOCK_GATE_DISABLE));
+@@ -1281,6 +1281,18 @@ static void i915gm_irq_cstate_wa_disable(struct drm_i915_private *i915)
+ 		intel_uncore_write(&i915->uncore, SCPD0, _MASKED_BIT_DISABLE(CSTATE_RENDER_CLOCK_GATE_DISABLE));
+ }
+ 
++void i915gm_irq_cstate_wa(struct drm_i915_private *i915, bool enable)
++{
++	spin_lock_irq(&i915->drm.vblank_time_lock);
++
++	if (enable)
++		i915gm_irq_cstate_wa_enable(i915);
++	else
++		i915gm_irq_cstate_wa_disable(i915);
++
++	spin_unlock_irq(&i915->drm.vblank_time_lock);
++}
++
+ int i8xx_enable_vblank(struct drm_crtc *crtc)
+ {
+ 	struct drm_i915_private *dev_priv = to_i915(crtc->dev);
+diff --git a/drivers/gpu/drm/i915/display/intel_display_irq.h b/drivers/gpu/drm/i915/display/intel_display_irq.h
+index bf9d269d0e3f..4b493cff7b8e 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_irq.h
++++ b/drivers/gpu/drm/i915/display/intel_display_irq.h
+@@ -78,4 +78,6 @@ void valleyview_pipestat_irq_handler(struct drm_i915_private *i915, u32 pipe_sta
+ 
+ void intel_display_irq_init(struct drm_i915_private *i915);
+ 
++void i915gm_irq_cstate_wa(struct drm_i915_private *i915, bool enable);
++
+ #endif /* __INTEL_DISPLAY_IRQ_H__ */
+diff --git a/drivers/gpu/drm/i915/display/intel_pipe_crc.c b/drivers/gpu/drm/i915/display/intel_pipe_crc.c
+index 82ceede0b2b1..304da826dee1 100644
+--- a/drivers/gpu/drm/i915/display/intel_pipe_crc.c
++++ b/drivers/gpu/drm/i915/display/intel_pipe_crc.c
+@@ -32,6 +32,7 @@
+ #include "i915_reg.h"
+ #include "intel_atomic.h"
+ #include "intel_de.h"
++#include "intel_display_irq.h"
+ #include "intel_display_types.h"
+ #include "intel_pipe_crc.h"
+ #include "intel_pipe_crc_regs.h"
+@@ -285,6 +286,9 @@ intel_crtc_crc_setup_workarounds(struct intel_crtc *crtc, bool enable)
+ 	struct drm_modeset_acquire_ctx ctx;
+ 	int ret;
+ 
++	if (IS_I945GM(dev_priv) || IS_I915GM(dev_priv))
++		i915gm_irq_cstate_wa(dev_priv, enable);
++
+ 	drm_modeset_acquire_init(&ctx, 0);
+ 
+ 	state = drm_atomic_state_alloc(&dev_priv->drm);
+-- 
+2.52.0
+

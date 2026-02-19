@@ -1,0 +1,172 @@
+From facde55b6fca80fc6c8d051e932085bd3e7c6d04 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jouni=20H=C3=B6gander?= <jouni.hogander@intel.com>
+Date: Tue, 29 Oct 2024 14:24:15 +0200
+Subject: drm/i915/psr: WA for panels stating bad link status after PSR is
+ enabled
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: facde55b6fca80fc6c8d051e932085bd3e7c6d04
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+We are currently seeing unexpected link trainings with several different
+eDP panels. These are caused by these panels stating bad link status in
+their dpcd registers. This can be observed by doing following test:
+
+1. Boot up without Xe module loaded
+
+2. Load Xe module with PSR disabled:
+    $ modprobe xe  enable_psr=0
+
+3. Read panel link status register
+    $ dpcd_reg read --offset 0x200e --count=1
+    0x200e:  00
+
+4. Enable PSR, sleep for 2 seconds and disable PSR again:
+
+    $ echo 0x1 > /sys/kernel/debug/dri/0/i915_edp_psr_debug
+    $ echo "-1" > /sys/kernel/debug/dri/0000:00:02.0/xe_params/enable_psr
+    $ echo 0x0 > /sys/kernel/debug/dri/0/i915_edp_psr_debug
+    $ sleep 2
+    $ cat /sys/kernel/debug/dri/0/i915_edp_psr_status | grep status
+    $ echo 0x1 > /sys/kernel/debug/dri/0/i915_edp_psr_debug
+    Source PSR/PanelReplay status: DEEP_SLEEP [0x80310030]
+
+5. Now read panel link status registers again:
+    $ dpcd_reg read --offset 0x200e --count=1
+    0x200e:  80
+
+Workaround this by not trusting link status registers after PSR is enabled
+until first short pulse interrupt is received.
+
+V2: - clear link_ok flag on pipe disable
+  - remove useless comment
+  - modify intel_dp_needs_link_retrain return statement
+
+Signed-off-by: Jouni Högander <jouni.hogander@intel.com>
+Reviewed-by: Imre Deak <imre.deak@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241029122415.1789528-1-jouni.hogander@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../drm/i915/display/intel_display_types.h    |  2 +
+ drivers/gpu/drm/i915/display/intel_dp.c       |  3 +-
+ drivers/gpu/drm/i915/display/intel_psr.c      | 40 +++++++++++++++++++
+ drivers/gpu/drm/i915/display/intel_psr.h      |  1 +
+ 4 files changed, 45 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display_types.h b/drivers/gpu/drm/i915/display/intel_display_types.h
+index d2b68505f088..ff6eb93337e0 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_types.h
++++ b/drivers/gpu/drm/i915/display/intel_display_types.h
+@@ -1618,6 +1618,8 @@ struct intel_psr {
+ 	u32 dc3co_exit_delay;
+ 	struct delayed_work dc3co_work;
+ 	u8 entry_setup_frames;
++
++	bool link_ok;
+ };
+ 
+ struct intel_dp {
+diff --git a/drivers/gpu/drm/i915/display/intel_dp.c b/drivers/gpu/drm/i915/display/intel_dp.c
+index 5fbb33bd6bb1..ff5ba7b3035f 100644
+--- a/drivers/gpu/drm/i915/display/intel_dp.c
++++ b/drivers/gpu/drm/i915/display/intel_dp.c
+@@ -5038,7 +5038,8 @@ intel_dp_needs_link_retrain(struct intel_dp *intel_dp)
+ 		return true;
+ 
+ 	/* Retrain if link not ok */
+-	return !intel_dp_link_ok(intel_dp, link_status);
++	return !intel_dp_link_ok(intel_dp, link_status) &&
++		!intel_psr_link_ok(intel_dp);
+ }
+ 
+ bool intel_dp_has_connector(struct intel_dp *intel_dp,
+diff --git a/drivers/gpu/drm/i915/display/intel_psr.c b/drivers/gpu/drm/i915/display/intel_psr.c
+index 0c8da1701c3a..a784c0b81556 100644
+--- a/drivers/gpu/drm/i915/display/intel_psr.c
++++ b/drivers/gpu/drm/i915/display/intel_psr.c
+@@ -2013,6 +2013,15 @@ static void intel_psr_enable_locked(struct intel_dp *intel_dp,
+ 	intel_dp->psr.enabled = true;
+ 	intel_dp->psr.paused = false;
+ 
++	/*
++	 * Link_ok is sticky and set here on PSR enable. We can assume link
++	 * training is complete as we never continue to PSR enable with
++	 * untrained link. Link_ok is kept as set until first short pulse
++	 * interrupt. This is targeted to workaround panels stating bad link
++	 * after PSR is enabled.
++	 */
++	intel_dp->psr.link_ok = true;
++
+ 	intel_psr_activate(intel_dp);
+ }
+ 
+@@ -2172,6 +2181,8 @@ void intel_psr_disable(struct intel_dp *intel_dp,
+ 
+ 	intel_psr_disable_locked(intel_dp);
+ 
++	intel_dp->psr.link_ok = false;
++
+ 	mutex_unlock(&intel_dp->psr.lock);
+ 	cancel_work_sync(&intel_dp->psr.work);
+ 	cancel_delayed_work_sync(&intel_dp->psr.dc3co_work);
+@@ -3462,6 +3473,8 @@ void intel_psr_short_pulse(struct intel_dp *intel_dp)
+ 
+ 	mutex_lock(&psr->lock);
+ 
++	psr->link_ok = false;
++
+ 	if (!psr->enabled)
+ 		goto exit;
+ 
+@@ -3521,6 +3534,33 @@ bool intel_psr_enabled(struct intel_dp *intel_dp)
+ 	return ret;
+ }
+ 
++/**
++ * intel_psr_link_ok - return psr->link_ok
++ * @intel_dp: struct intel_dp
++ *
++ * We are seeing unexpected link re-trainings with some panels. This is caused
++ * by panel stating bad link status after PSR is enabled. Code checking link
++ * status can call this to ensure it can ignore bad link status stated by the
++ * panel I.e. if panel is stating bad link and intel_psr_link_ok is stating link
++ * is ok caller should rely on latter.
++ *
++ * Return value of link_ok
++ */
++bool intel_psr_link_ok(struct intel_dp *intel_dp)
++{
++	bool ret;
++
++	if ((!CAN_PSR(intel_dp) && !CAN_PANEL_REPLAY(intel_dp)) ||
++	    !intel_dp_is_edp(intel_dp))
++		return false;
++
++	mutex_lock(&intel_dp->psr.lock);
++	ret = intel_dp->psr.link_ok;
++	mutex_unlock(&intel_dp->psr.lock);
++
++	return ret;
++}
++
+ /**
+  * intel_psr_lock - grab PSR lock
+  * @crtc_state: the crtc state
+diff --git a/drivers/gpu/drm/i915/display/intel_psr.h b/drivers/gpu/drm/i915/display/intel_psr.h
+index 5f26f61f82aa..956be263c09e 100644
+--- a/drivers/gpu/drm/i915/display/intel_psr.h
++++ b/drivers/gpu/drm/i915/display/intel_psr.h
+@@ -59,6 +59,7 @@ void intel_psr2_program_trans_man_trk_ctl(const struct intel_crtc_state *crtc_st
+ void intel_psr_pause(struct intel_dp *intel_dp);
+ void intel_psr_resume(struct intel_dp *intel_dp);
+ bool intel_psr_needs_block_dc_vblank(const struct intel_crtc_state *crtc_state);
++bool intel_psr_link_ok(struct intel_dp *intel_dp);
+ 
+ void intel_psr_lock(const struct intel_crtc_state *crtc_state);
+ void intel_psr_unlock(const struct intel_crtc_state *crtc_state);
+-- 
+2.52.0
+

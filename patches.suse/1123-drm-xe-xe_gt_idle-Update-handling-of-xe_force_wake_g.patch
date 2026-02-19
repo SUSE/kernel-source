@@ -1,0 +1,140 @@
+From a66c19895396e66e578e28d9b598959a5406a6cb Mon Sep 17 00:00:00 2001
+From: Himal Prasad Ghimiray <himal.prasad.ghimiray@intel.com>
+Date: Mon, 14 Oct 2024 13:25:45 +0530
+Subject: drm/xe/xe_gt_idle: Update handling of xe_force_wake_get return
+Git-commit: a66c19895396e66e578e28d9b598959a5406a6cb
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+xe_force_wake_get() now returns the reference count-incremented domain
+mask. If it fails for individual domains, the return value will always
+be 0. However, for XE_FORCEWAKE_ALL, it may return a non-zero value even
+in the event of failure. Update the return handling of xe_force_wake_get()
+to reflect this behavior, and ensure that the return value is passed as
+input to xe_force_wake_put().
+
+v3
+- return xe_wakeref_t instead of int in xe_force_wake_get()
+- xe_force_wake_put() error doesn't need to be checked. It internally
+WARNS on domain ack failure.
+
+v4
+- Rebase fix
+
+v5
+- return unsigned int for xe_force_wake_get()
+- Remove reudandant WARN calls.
+
+v7
+- Fix commit message
+
+Cc: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Cc: Lucas De Marchi <lucas.demarchi@intel.com>
+Signed-off-by: Himal Prasad Ghimiray <himal.prasad.ghimiray@intel.com>
+Reviewed-by: Badal Nilawar <badal.nilawar@intel.com>
+Reviewed-by: Nirmoy Das <nirmoy.das@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241014075601.2324382-11-himal.prasad.ghimiray@intel.com
+Signed-off-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/xe/xe_gt_idle.c | 26 +++++++++++++++-----------
+ 1 file changed, 15 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_gt_idle.c b/drivers/gpu/drm/xe/xe_gt_idle.c
+index 746812aee8ff..fd80afeef56a 100644
+--- a/drivers/gpu/drm/xe/xe_gt_idle.c
++++ b/drivers/gpu/drm/xe/xe_gt_idle.c
+@@ -101,6 +101,7 @@ void xe_gt_idle_enable_pg(struct xe_gt *gt)
+ 	struct xe_gt_idle *gtidle = &gt->gtidle;
+ 	struct xe_mmio *mmio = &gt->mmio;
+ 	u32 vcs_mask, vecs_mask;
++	unsigned int fw_ref;
+ 	int i, j;
+ 
+ 	if (IS_SRIOV_VF(xe))
+@@ -127,7 +128,7 @@ void xe_gt_idle_enable_pg(struct xe_gt *gt)
+ 						     VDN_MFXVDENC_POWERGATE_ENABLE(j));
+ 	}
+ 
+-	XE_WARN_ON(xe_force_wake_get(gt_to_fw(gt), XE_FW_GT));
++	fw_ref = xe_force_wake_get(gt_to_fw(gt), XE_FW_GT);
+ 	if (xe->info.skip_guc_pc) {
+ 		/*
+ 		 * GuC sets the hysteresis value when GuC PC is enabled
+@@ -138,12 +139,13 @@ void xe_gt_idle_enable_pg(struct xe_gt *gt)
+ 	}
+ 
+ 	xe_mmio_write32(mmio, POWERGATE_ENABLE, gtidle->powergate_enable);
+-	XE_WARN_ON(xe_force_wake_put(gt_to_fw(gt), XE_FW_GT));
++	xe_force_wake_put(gt_to_fw(gt), fw_ref);
+ }
+ 
+ void xe_gt_idle_disable_pg(struct xe_gt *gt)
+ {
+ 	struct xe_gt_idle *gtidle = &gt->gtidle;
++	unsigned int fw_ref;
+ 
+ 	if (IS_SRIOV_VF(gt_to_xe(gt)))
+ 		return;
+@@ -151,9 +153,9 @@ void xe_gt_idle_disable_pg(struct xe_gt *gt)
+ 	xe_device_assert_mem_access(gt_to_xe(gt));
+ 	gtidle->powergate_enable = 0;
+ 
+-	XE_WARN_ON(xe_force_wake_get(gt_to_fw(gt), XE_FW_GT));
++	fw_ref = xe_force_wake_get(gt_to_fw(gt), XE_FW_GT);
+ 	xe_mmio_write32(&gt->mmio, POWERGATE_ENABLE, gtidle->powergate_enable);
+-	XE_WARN_ON(xe_force_wake_put(gt_to_fw(gt), XE_FW_GT));
++	xe_force_wake_put(gt_to_fw(gt), fw_ref);
+ }
+ 
+ /**
+@@ -172,7 +174,8 @@ int xe_gt_idle_pg_print(struct xe_gt *gt, struct drm_printer *p)
+ 	enum xe_gt_idle_state state;
+ 	u32 pg_enabled, pg_status = 0;
+ 	u32 vcs_mask, vecs_mask;
+-	int err, n;
++	unsigned int fw_ref;
++	int n;
+ 	/*
+ 	 * Media Slices
+ 	 *
+@@ -208,14 +211,14 @@ int xe_gt_idle_pg_print(struct xe_gt *gt, struct drm_printer *p)
+ 
+ 	/* Do not wake the GT to read powergating status */
+ 	if (state != GT_IDLE_C6) {
+-		err = xe_force_wake_get(gt_to_fw(gt), XE_FW_GT);
+-		if (err)
+-			return err;
++		fw_ref = xe_force_wake_get(gt_to_fw(gt), XE_FW_GT);
++		if (!fw_ref)
++			return -ETIMEDOUT;
+ 
+ 		pg_enabled = xe_mmio_read32(&gt->mmio, POWERGATE_ENABLE);
+ 		pg_status = xe_mmio_read32(&gt->mmio, POWERGATE_DOMAIN_STATUS);
+ 
+-		XE_WARN_ON(xe_force_wake_put(gt_to_fw(gt), XE_FW_GT));
++		xe_force_wake_put(gt_to_fw(gt), fw_ref);
+ 	}
+ 
+ 	if (gt->info.engine_mask & XE_HW_ENGINE_RCS_MASK) {
+@@ -298,13 +301,14 @@ static void gt_idle_fini(void *arg)
+ {
+ 	struct kobject *kobj = arg;
+ 	struct xe_gt *gt = kobj_to_gt(kobj->parent);
++	unsigned int fw_ref;
+ 
+ 	xe_gt_idle_disable_pg(gt);
+ 
+ 	if (gt_to_xe(gt)->info.skip_guc_pc) {
+-		XE_WARN_ON(xe_force_wake_get(gt_to_fw(gt), XE_FW_GT));
++		fw_ref = xe_force_wake_get(gt_to_fw(gt), XE_FW_GT);
+ 		xe_gt_idle_disable_c6(gt);
+-		xe_force_wake_put(gt_to_fw(gt), XE_FW_GT);
++		xe_force_wake_put(gt_to_fw(gt), fw_ref);
+ 	}
+ 
+ 	sysfs_remove_files(kobj, gt_idle_attrs);
+-- 
+2.52.0
+

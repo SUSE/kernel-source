@@ -1,0 +1,134 @@
+From b17f87329d49860130a524ab424ecefd3332600f Mon Sep 17 00:00:00 2001
+From: Lijo Lazar <lijo.lazar@amd.com>
+Date: Fri, 30 Aug 2024 11:21:43 +0530
+Subject: drm/amdgpu: Add helper to initialize badpage info
+Git-commit: b17f87329d49860130a524ab424ecefd3332600f
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Add a separate function to read badpage data during initialization.
+Reading bad pages will need hardware access and cannot be done during
+reset. Hence in cases where device needs a full reset during
+init itself, attempting to read will cause a deadlock.
+
+Signed-off-by: Lijo Lazar <lijo.lazar@amd.com>
+Reviewed-by: Feifei Xu <Feifei.Xu@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Rajneesh Bhardwaj <rajneesh.bhardwaj@amd.com>
+Tested-by: Rajneesh Bhardwaj <rajneesh.bhardwaj@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c    | 56 +++++++++++++++-------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ras.h    |  4 +-
+ 3 files changed, 41 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index b393f4b8edc5..a32fe1a8ffbd 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -2954,7 +2954,7 @@ static int amdgpu_device_ip_init(struct amdgpu_device *adev)
+ 	 * Note: theoretically, this should be called before all vram allocations
+ 	 * to protect retired page from abusing
+ 	 */
+-	r = amdgpu_ras_recovery_init(adev);
++	r = amdgpu_ras_recovery_init(adev, true);
+ 	if (r)
+ 		goto init_failed;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
+index 6665d9abb27b..7e63fc05e18b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
+@@ -3146,7 +3146,42 @@ static int amdgpu_ras_page_retirement_thread(void *param)
+ 	return 0;
+ }
+ 
+-int amdgpu_ras_recovery_init(struct amdgpu_device *adev)
++int amdgpu_ras_init_badpage_info(struct amdgpu_device *adev)
++{
++	struct amdgpu_ras *con = amdgpu_ras_get_context(adev);
++	int ret;
++
++	if (!con || amdgpu_sriov_vf(adev))
++		return 0;
++
++	ret = amdgpu_ras_eeprom_init(&con->eeprom_control);
++
++	if (ret)
++		return ret;
++
++	/* HW not usable */
++	if (amdgpu_ras_is_rma(adev))
++		return -EHWPOISON;
++
++	if (con->eeprom_control.ras_num_recs) {
++		ret = amdgpu_ras_load_bad_pages(adev);
++		if (ret)
++			return ret;
++
++		amdgpu_dpm_send_hbm_bad_pages_num(
++			adev, con->eeprom_control.ras_num_recs);
++
++		if (con->update_channel_flag == true) {
++			amdgpu_dpm_send_hbm_bad_channel_flag(
++				adev, con->eeprom_control.bad_channel_bitmap);
++			con->update_channel_flag = false;
++		}
++	}
++
++	return ret;
++}
++
++int amdgpu_ras_recovery_init(struct amdgpu_device *adev, bool init_bp_info)
+ {
+ 	struct amdgpu_ras *con = amdgpu_ras_get_context(adev);
+ 	struct ras_err_handler_data **data;
+@@ -3187,25 +3222,10 @@ int amdgpu_ras_recovery_init(struct amdgpu_device *adev)
+ 	 */
+ 	if (adev->init_lvl->level == AMDGPU_INIT_LEVEL_MINIMAL_XGMI)
+ 		return 0;
+-	ret = amdgpu_ras_eeprom_init(&con->eeprom_control);
+-	/*
+-	 * This calling fails when is_rma is true or
+-	 * ret != 0.
+-	 */
+-	if (amdgpu_ras_is_rma(adev) || ret)
+-		goto free;
+-
+-	if (con->eeprom_control.ras_num_recs) {
+-		ret = amdgpu_ras_load_bad_pages(adev);
++	if (init_bp_info) {
++		ret = amdgpu_ras_init_badpage_info(adev);
+ 		if (ret)
+ 			goto free;
+-
+-		amdgpu_dpm_send_hbm_bad_pages_num(adev, con->eeprom_control.ras_num_recs);
+-
+-		if (con->update_channel_flag == true) {
+-			amdgpu_dpm_send_hbm_bad_channel_flag(adev, con->eeprom_control.bad_channel_bitmap);
+-			con->update_channel_flag = false;
+-		}
+ 	}
+ 
+ 	mutex_init(&con->page_rsv_lock);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.h
+index 669720a9c60a..871b2d6278e0 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.h
+@@ -736,8 +736,8 @@ struct amdgpu_ras_block_hw_ops {
+  * 8: feature disable
+  */
+ 
+-
+-int amdgpu_ras_recovery_init(struct amdgpu_device *adev);
++int amdgpu_ras_init_badpage_info(struct amdgpu_device *adev);
++int amdgpu_ras_recovery_init(struct amdgpu_device *adev, bool init_bp_info);
+ 
+ void amdgpu_ras_resume(struct amdgpu_device *adev);
+ void amdgpu_ras_suspend(struct amdgpu_device *adev);
+-- 
+2.52.0
+

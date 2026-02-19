@@ -1,0 +1,171 @@
+From 6fa86e7ad46e3a779e41868e1f082152cc24a6ca Mon Sep 17 00:00:00 2001
+From: Ilia Levi <ilia.levi@intel.com>
+Date: Wed, 18 Sep 2024 08:39:39 +0300
+Subject: drm/xe: Introduce xe_device_uses_memirq()
+Git-commit: 6fa86e7ad46e3a779e41868e1f082152cc24a6ca
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Simplify some memirq usage scenarios and asserts in memirq infrastructure.
+
+Signed-off-by: Ilia Levi <ilia.levi@intel.com>
+Reviewed-by: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Signed-off-by: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20240918053942.1331811-3-illevi@habana.ai
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/xe/xe_device.c |  8 +++-----
+ drivers/gpu/drm/xe/xe_device.h |  6 ++++++
+ drivers/gpu/drm/xe/xe_irq.c    |  2 +-
+ drivers/gpu/drm/xe/xe_lrc.c    |  2 +-
+ drivers/gpu/drm/xe/xe_memirq.c | 22 +++++++---------------
+ 5 files changed, 18 insertions(+), 22 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_device.c b/drivers/gpu/drm/xe/xe_device.c
+index 9eb21bcd774f..e2e7346eef47 100644
+--- a/drivers/gpu/drm/xe/xe_device.c
++++ b/drivers/gpu/drm/xe/xe_device.c
+@@ -669,11 +669,9 @@ int xe_device_probe(struct xe_device *xe)
+ 		err = xe_ggtt_init_early(tile->mem.ggtt);
+ 		if (err)
+ 			return err;
+-		if (IS_SRIOV_VF(xe)) {
+-			err = xe_memirq_init(&tile->sriov.vf.memirq);
+-			if (err)
+-				return err;
+-		}
++		err = xe_memirq_init(&tile->sriov.vf.memirq);
++		if (err)
++			return err;
+ 	}
+ 
+ 	for_each_gt(gt, xe, id) {
+diff --git a/drivers/gpu/drm/xe/xe_device.h b/drivers/gpu/drm/xe/xe_device.h
+index 5dad24fc487c..480195bedf0d 100644
+--- a/drivers/gpu/drm/xe/xe_device.h
++++ b/drivers/gpu/drm/xe/xe_device.h
+@@ -10,6 +10,7 @@
+ 
+ #include "xe_device_types.h"
+ #include "xe_gt_types.h"
++#include "xe_sriov.h"
+ 
+ static inline struct xe_device *to_xe_device(const struct drm_device *dev)
+ {
+@@ -159,6 +160,11 @@ static inline bool xe_device_has_memirq(struct xe_device *xe)
+ 	return GRAPHICS_VERx100(xe) >= 1250;
+ }
+ 
++static inline bool xe_device_uses_memirq(struct xe_device *xe)
++{
++	return xe_device_has_memirq(xe) && IS_SRIOV_VF(xe);
++}
++
+ u32 xe_device_ccs_bytes(struct xe_device *xe, u64 size);
+ 
+ void xe_device_snapshot_print(struct xe_device *xe, struct drm_printer *p);
+diff --git a/drivers/gpu/drm/xe/xe_irq.c b/drivers/gpu/drm/xe/xe_irq.c
+index e501002e8a04..250036abec52 100644
+--- a/drivers/gpu/drm/xe/xe_irq.c
++++ b/drivers/gpu/drm/xe/xe_irq.c
+@@ -135,7 +135,7 @@ void xe_irq_enable_hwe(struct xe_gt *gt)
+ 	u32 gsc_mask = 0;
+ 	u32 heci_mask = 0;
+ 
+-	if (IS_SRIOV_VF(xe) && xe_device_has_memirq(xe))
++	if (xe_device_uses_memirq(xe))
+ 		return;
+ 
+ 	if (xe_device_uc_enabled(xe)) {
+diff --git a/drivers/gpu/drm/xe/xe_lrc.c b/drivers/gpu/drm/xe/xe_lrc.c
+index aec7db39c061..50d9521ba9f5 100644
+--- a/drivers/gpu/drm/xe/xe_lrc.c
++++ b/drivers/gpu/drm/xe/xe_lrc.c
+@@ -602,7 +602,7 @@ static void set_memory_based_intr(u32 *regs, struct xe_hw_engine *hwe)
+ 	struct xe_memirq *memirq = &gt_to_tile(hwe->gt)->sriov.vf.memirq;
+ 	struct xe_device *xe = gt_to_xe(hwe->gt);
+ 
+-	if (!IS_SRIOV_VF(xe) || !xe_device_has_memirq(xe))
++	if (!xe_device_uses_memirq(xe))
+ 		return;
+ 
+ 	regs[CTX_LRM_INT_MASK_ENABLE] = MI_LOAD_REGISTER_MEM |
+diff --git a/drivers/gpu/drm/xe/xe_memirq.c b/drivers/gpu/drm/xe/xe_memirq.c
+index ecb4870c3356..b48be52bf684 100644
+--- a/drivers/gpu/drm/xe/xe_memirq.c
++++ b/drivers/gpu/drm/xe/xe_memirq.c
+@@ -200,9 +200,7 @@ int xe_memirq_init(struct xe_memirq *memirq)
+ 	struct xe_device *xe = memirq_to_xe(memirq);
+ 	int err;
+ 
+-	memirq_assert(memirq, IS_SRIOV_VF(xe));
+-
+-	if (!xe_device_has_memirq(xe))
++	if (!xe_device_uses_memirq(xe))
+ 		return 0;
+ 
+ 	err = memirq_alloc_pages(memirq);
+@@ -226,8 +224,7 @@ int xe_memirq_init(struct xe_memirq *memirq)
+  */
+ u32 xe_memirq_source_ptr(struct xe_memirq *memirq)
+ {
+-	memirq_assert(memirq, IS_SRIOV_VF(memirq_to_xe(memirq)));
+-	memirq_assert(memirq, xe_device_has_memirq(memirq_to_xe(memirq)));
++	memirq_assert(memirq, xe_device_uses_memirq(memirq_to_xe(memirq)));
+ 	memirq_assert(memirq, memirq->bo);
+ 
+ 	return xe_bo_ggtt_addr(memirq->bo) + XE_MEMIRQ_SOURCE_OFFSET;
+@@ -244,8 +241,7 @@ u32 xe_memirq_source_ptr(struct xe_memirq *memirq)
+  */
+ u32 xe_memirq_status_ptr(struct xe_memirq *memirq)
+ {
+-	memirq_assert(memirq, IS_SRIOV_VF(memirq_to_xe(memirq)));
+-	memirq_assert(memirq, xe_device_has_memirq(memirq_to_xe(memirq)));
++	memirq_assert(memirq, xe_device_uses_memirq(memirq_to_xe(memirq)));
+ 	memirq_assert(memirq, memirq->bo);
+ 
+ 	return xe_bo_ggtt_addr(memirq->bo) + XE_MEMIRQ_STATUS_OFFSET;
+@@ -262,8 +258,7 @@ u32 xe_memirq_status_ptr(struct xe_memirq *memirq)
+  */
+ u32 xe_memirq_enable_ptr(struct xe_memirq *memirq)
+ {
+-	memirq_assert(memirq, IS_SRIOV_VF(memirq_to_xe(memirq)));
+-	memirq_assert(memirq, xe_device_has_memirq(memirq_to_xe(memirq)));
++	memirq_assert(memirq, xe_device_uses_memirq(memirq_to_xe(memirq)));
+ 	memirq_assert(memirq, memirq->bo);
+ 
+ 	return xe_bo_ggtt_addr(memirq->bo) + XE_MEMIRQ_ENABLE_OFFSET;
+@@ -289,8 +284,7 @@ int xe_memirq_init_guc(struct xe_memirq *memirq, struct xe_guc *guc)
+ 	u32 source, status;
+ 	int err;
+ 
+-	memirq_assert(memirq, IS_SRIOV_VF(memirq_to_xe(memirq)));
+-	memirq_assert(memirq, xe_device_has_memirq(memirq_to_xe(memirq)));
++	memirq_assert(memirq, xe_device_uses_memirq(memirq_to_xe(memirq)));
+ 	memirq_assert(memirq, memirq->bo);
+ 
+ 	source = xe_memirq_source_ptr(memirq) + offset;
+@@ -325,8 +319,7 @@ int xe_memirq_init_guc(struct xe_memirq *memirq, struct xe_guc *guc)
+  */
+ void xe_memirq_reset(struct xe_memirq *memirq)
+ {
+-	memirq_assert(memirq, IS_SRIOV_VF(memirq_to_xe(memirq)));
+-	memirq_assert(memirq, xe_device_has_memirq(memirq_to_xe(memirq)));
++	memirq_assert(memirq, xe_device_uses_memirq(memirq_to_xe(memirq)));
+ 
+ 	if (memirq->bo)
+ 		memirq_set_enable(memirq, false);
+@@ -343,8 +336,7 @@ void xe_memirq_reset(struct xe_memirq *memirq)
+  */
+ void xe_memirq_postinstall(struct xe_memirq *memirq)
+ {
+-	memirq_assert(memirq, IS_SRIOV_VF(memirq_to_xe(memirq)));
+-	memirq_assert(memirq, xe_device_has_memirq(memirq_to_xe(memirq)));
++	memirq_assert(memirq, xe_device_uses_memirq(memirq_to_xe(memirq)));
+ 
+ 	if (memirq->bo)
+ 		memirq_set_enable(memirq, true);
+-- 
+2.52.0
+

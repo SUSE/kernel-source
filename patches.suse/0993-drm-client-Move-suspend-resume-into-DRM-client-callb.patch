@@ -1,0 +1,289 @@
+From bf17766f108309027aac2bfe184df6088dfd7384 Mon Sep 17 00:00:00 2001
+From: Thomas Zimmermann <tzimmermann@suse.de>
+Date: Mon, 14 Oct 2024 10:55:21 +0200
+Subject: drm/client: Move suspend/resume into DRM client callbacks
+Git-commit: bf17766f108309027aac2bfe184df6088dfd7384
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Suspend and resume is still tied to fbdev emulation. Modeset helpers
+and several drivers call drm_fb_helper_set_suspend_unlocked() to inform
+the fbdev client about suspend/resume events.
+
+To make it work with arbitrary clients, add per-client callback
+functions for suspend and resume. Implement them for fbdev emulation
+with the existing drm_fb_helper_set_suspend_unlocked(). Then update
+DRM's modeset helpers to call the new interface.
+
+Clients that are not fbdev can now implement suspend/resume to their
+requirements.
+
+The callback parameter holds_console_lock is a workaround for i915,
+radeon and xe, which possibly call the interface while having the
+console lock acquired. Even though the commit doesn't modify these
+drivers, it already adds the flag to avoid churn later on. New code
+should not hold the console lock.
+
+V4: 
+- clarify holds_console_lock in commit description (Jonathan)
+
+Signed-off-by: Thomas Zimmermann <tzimmermann@suse.de>
+Reviewed-by: Jonathan Cavitt <jonathan.cavitt@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241014085740.582287-8-tzimmermann@suse.de
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/drm_client_event.c   | 60 ++++++++++++++++++++++++++++
+ drivers/gpu/drm/drm_fbdev_client.c   | 30 +++++++++++++-
+ drivers/gpu/drm/drm_modeset_helper.c | 14 ++++---
+ include/drm/drm_client.h             | 35 ++++++++++++++++
+ include/drm/drm_client_event.h       |  2 +
+ 5 files changed, 133 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_client_event.c b/drivers/gpu/drm/drm_client_event.c
+index d13d44320c5c..c52e93643672 100644
+--- a/drivers/gpu/drm/drm_client_event.c
++++ b/drivers/gpu/drm/drm_client_event.c
+@@ -107,6 +107,66 @@ void drm_client_dev_restore(struct drm_device *dev)
+ 	mutex_unlock(&dev->clientlist_mutex);
+ }
+ 
++static int drm_client_suspend(struct drm_client_dev *client, bool holds_console_lock)
++{
++	struct drm_device *dev = client->dev;
++	int ret = 0;
++
++	if (drm_WARN_ON_ONCE(dev, client->suspended))
++		return 0;
++
++	if (client->funcs && client->funcs->suspend)
++		ret = client->funcs->suspend(client, holds_console_lock);
++	drm_dbg_kms(dev, "%s: ret=%d\n", client->name, ret);
++
++	client->suspended = true;
++
++	return ret;
++}
++
++void drm_client_dev_suspend(struct drm_device *dev, bool holds_console_lock)
++{
++	struct drm_client_dev *client;
++
++	mutex_lock(&dev->clientlist_mutex);
++	list_for_each_entry(client, &dev->clientlist, list) {
++		if (!client->suspended)
++			drm_client_suspend(client, holds_console_lock);
++	}
++	mutex_unlock(&dev->clientlist_mutex);
++}
++EXPORT_SYMBOL(drm_client_dev_suspend);
++
++static int drm_client_resume(struct drm_client_dev *client, bool holds_console_lock)
++{
++	struct drm_device *dev = client->dev;
++	int ret = 0;
++
++	if (drm_WARN_ON_ONCE(dev, !client->suspended))
++		return 0;
++
++	if (client->funcs && client->funcs->resume)
++		ret = client->funcs->resume(client, holds_console_lock);
++	drm_dbg_kms(dev, "%s: ret=%d\n", client->name, ret);
++
++	client->suspended = false;
++
++	return ret;
++}
++
++void drm_client_dev_resume(struct drm_device *dev, bool holds_console_lock)
++{
++	struct drm_client_dev *client;
++
++	mutex_lock(&dev->clientlist_mutex);
++	list_for_each_entry(client, &dev->clientlist, list) {
++		if  (client->suspended)
++			drm_client_resume(client, holds_console_lock);
++	}
++	mutex_unlock(&dev->clientlist_mutex);
++}
++EXPORT_SYMBOL(drm_client_dev_resume);
++
+ #ifdef CONFIG_DEBUG_FS
+ static int drm_client_debugfs_internal_clients(struct seq_file *m, void *data)
+ {
+diff --git a/drivers/gpu/drm/drm_fbdev_client.c b/drivers/gpu/drm/drm_fbdev_client.c
+index a09382afe2fb..246fb63ab250 100644
+--- a/drivers/gpu/drm/drm_fbdev_client.c
++++ b/drivers/gpu/drm/drm_fbdev_client.c
+@@ -61,11 +61,37 @@ static int drm_fbdev_client_hotplug(struct drm_client_dev *client)
+ 	return ret;
+ }
+ 
++static int drm_fbdev_client_suspend(struct drm_client_dev *client, bool holds_console_lock)
++{
++	struct drm_fb_helper *fb_helper = drm_fb_helper_from_client(client);
++
++	if (holds_console_lock)
++		drm_fb_helper_set_suspend(fb_helper, true);
++	else
++		drm_fb_helper_set_suspend_unlocked(fb_helper, true);
++
++	return 0;
++}
++
++static int drm_fbdev_client_resume(struct drm_client_dev *client, bool holds_console_lock)
++{
++	struct drm_fb_helper *fb_helper = drm_fb_helper_from_client(client);
++
++	if (holds_console_lock)
++		drm_fb_helper_set_suspend(fb_helper, false);
++	else
++		drm_fb_helper_set_suspend_unlocked(fb_helper, false);
++
++	return 0;
++}
++
+ static const struct drm_client_funcs drm_fbdev_client_funcs = {
+ 	.owner		= THIS_MODULE,
+ 	.unregister	= drm_fbdev_client_unregister,
+ 	.restore	= drm_fbdev_client_restore,
+ 	.hotplug	= drm_fbdev_client_hotplug,
++	.suspend	= drm_fbdev_client_suspend,
++	.resume		= drm_fbdev_client_resume,
+ };
+ 
+ /**
+@@ -76,8 +102,8 @@ static const struct drm_client_funcs drm_fbdev_client_funcs = {
+  *
+  * This function sets up fbdev emulation. Restore, hotplug events and
+  * teardown are all taken care of. Drivers that do suspend/resume need
+- * to call drm_fb_helper_set_suspend_unlocked() themselves. Simple
+- * drivers might use drm_mode_config_helper_suspend().
++ * to call drm_client_dev_suspend() and drm_client_dev_resume() by
++ * themselves. Simple drivers might use drm_mode_config_helper_suspend().
+  *
+  * This function is safe to call even when there are no connectors present.
+  * Setup will be retried on the next hotplug event.
+diff --git a/drivers/gpu/drm/drm_modeset_helper.c b/drivers/gpu/drm/drm_modeset_helper.c
+index 2c582020cb42..5565464c1734 100644
+--- a/drivers/gpu/drm/drm_modeset_helper.c
++++ b/drivers/gpu/drm/drm_modeset_helper.c
+@@ -21,7 +21,7 @@
+  */
+ 
+ #include <drm/drm_atomic_helper.h>
+-#include <drm/drm_fb_helper.h>
++#include <drm/drm_client_event.h>
+ #include <drm/drm_fourcc.h>
+ #include <drm/drm_framebuffer.h>
+ #include <drm/drm_modeset_helper.h>
+@@ -185,7 +185,7 @@ EXPORT_SYMBOL(drm_crtc_init);
+  * Zero on success, negative error code on error.
+  *
+  * See also:
+- * drm_kms_helper_poll_disable() and drm_fb_helper_set_suspend_unlocked().
++ * drm_kms_helper_poll_disable() and drm_client_dev_suspend().
+  */
+ int drm_mode_config_helper_suspend(struct drm_device *dev)
+ {
+@@ -199,10 +199,11 @@ int drm_mode_config_helper_suspend(struct drm_device *dev)
+ 	if (dev->mode_config.poll_enabled)
+ 		drm_kms_helper_poll_disable(dev);
+ 
+-	drm_fb_helper_set_suspend_unlocked(dev->fb_helper, 1);
++	drm_client_dev_suspend(dev, false);
+ 	state = drm_atomic_helper_suspend(dev);
+ 	if (IS_ERR(state)) {
+-		drm_fb_helper_set_suspend_unlocked(dev->fb_helper, 0);
++		drm_client_dev_resume(dev, false);
++
+ 		/*
+ 		 * Don't enable polling if it was never initialized
+ 		 */
+@@ -230,7 +231,7 @@ EXPORT_SYMBOL(drm_mode_config_helper_suspend);
+  * Zero on success, negative error code on error.
+  *
+  * See also:
+- * drm_fb_helper_set_suspend_unlocked() and drm_kms_helper_poll_enable().
++ * drm_client_dev_resume() and drm_kms_helper_poll_enable().
+  */
+ int drm_mode_config_helper_resume(struct drm_device *dev)
+ {
+@@ -247,7 +248,8 @@ int drm_mode_config_helper_resume(struct drm_device *dev)
+ 		DRM_ERROR("Failed to resume (%d)\n", ret);
+ 	dev->mode_config.suspend_state = NULL;
+ 
+-	drm_fb_helper_set_suspend_unlocked(dev->fb_helper, 0);
++	drm_client_dev_resume(dev, false);
++
+ 	/*
+ 	 * Don't enable polling if it is not initialized
+ 	 */
+diff --git a/include/drm/drm_client.h b/include/drm/drm_client.h
+index dfd5afcc9463..c03c4b0f3e94 100644
+--- a/include/drm/drm_client.h
++++ b/include/drm/drm_client.h
+@@ -63,6 +63,34 @@ struct drm_client_funcs {
+ 	 * This callback is optional.
+ 	 */
+ 	int (*hotplug)(struct drm_client_dev *client);
++
++	/**
++	 * @suspend:
++	 *
++	 * Called when suspending the device.
++	 *
++	 * This callback is optional.
++	 *
++	 * FIXME: Some callers hold the console lock when invoking this
++	 *        function. This interferes with fbdev emulation, which
++	 *        also tries to acquire the lock. Push the console lock
++	 *        into the callback and remove 'holds_console_lock'.
++	 */
++	int (*suspend)(struct drm_client_dev *client, bool holds_console_lock);
++
++	/**
++	 * @resume:
++	 *
++	 * Called when resuming the device from suspend.
++	 *
++	 * This callback is optional.
++	 *
++	 * FIXME: Some callers hold the console lock when invoking this
++	 *        function. This interferes with fbdev emulation, which
++	 *        also tries to acquire the lock. Push the console lock
++	 *        into the callback and remove 'holds_console_lock'.
++	 */
++	int (*resume)(struct drm_client_dev *client, bool holds_console_lock);
+ };
+ 
+ /**
+@@ -107,6 +135,13 @@ struct drm_client_dev {
+ 	 */
+ 	struct drm_mode_set *modesets;
+ 
++	/**
++	 * @suspended:
++	 *
++	 * The client has been suspended.
++	 */
++	bool suspended;
++
+ 	/**
+ 	 * @hotplug_failed:
+ 	 *
+diff --git a/include/drm/drm_client_event.h b/include/drm/drm_client_event.h
+index 2c8915241120..72c97d111169 100644
+--- a/include/drm/drm_client_event.h
++++ b/include/drm/drm_client_event.h
+@@ -8,5 +8,7 @@ struct drm_device;
+ void drm_client_dev_unregister(struct drm_device *dev);
+ void drm_client_dev_hotplug(struct drm_device *dev);
+ void drm_client_dev_restore(struct drm_device *dev);
++void drm_client_dev_suspend(struct drm_device *dev, bool holds_console_lock);
++void drm_client_dev_resume(struct drm_device *dev, bool holds_console_lock);
+ 
+ #endif
+-- 
+2.52.0
+

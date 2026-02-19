@@ -1,0 +1,95 @@
+From 059c2a79b0b2bfcc8e65e25ab7444eb8062e1621 Mon Sep 17 00:00:00 2001
+From: Matthew Brost <matthew.brost@intel.com>
+Date: Mon, 21 Oct 2024 10:35:12 -0700
+Subject: drm/xe: Take ref to job's fence in arm
+Git-commit: 059c2a79b0b2bfcc8e65e25ab7444eb8062e1621
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Take ref to job's fence in arm rather than run job. This ref is owned by
+the drm scheduler so it makes sense to take the ref before handing over
+the job to the scheduler. Also removes an atomic from the run job path.
+
+Suggested-by: Matthew Auld <matthew.auld@intel.com>
+Signed-off-by: Matthew Brost <matthew.brost@intel.com>
+Reviewed-by: Matthew Auld <matthew.auld@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241021173512.1584248-1-matthew.brost@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/xe/xe_execlist.c        | 2 +-
+ drivers/gpu/drm/xe/xe_guc_submit.c      | 9 +++++----
+ drivers/gpu/drm/xe/xe_sched_job.c       | 2 +-
+ drivers/gpu/drm/xe/xe_sched_job_types.h | 1 -
+ 4 files changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_execlist.c b/drivers/gpu/drm/xe/xe_execlist.c
+index f3b71fe7a96d..a8c416a48812 100644
+--- a/drivers/gpu/drm/xe/xe_execlist.c
++++ b/drivers/gpu/drm/xe/xe_execlist.c
+@@ -313,7 +313,7 @@ execlist_run_job(struct drm_sched_job *drm_job)
+ 	q->ring_ops->emit_job(job);
+ 	xe_execlist_make_active(exl);
+ 
+-	return dma_fence_get(job->fence);
++	return job->fence;
+ }
+ 
+ static void execlist_job_free(struct drm_sched_job *drm_job)
+diff --git a/drivers/gpu/drm/xe/xe_guc_submit.c b/drivers/gpu/drm/xe/xe_guc_submit.c
+index ae1b5665b654..9a8564ea06b5 100644
+--- a/drivers/gpu/drm/xe/xe_guc_submit.c
++++ b/drivers/gpu/drm/xe/xe_guc_submit.c
+@@ -717,6 +717,7 @@ guc_exec_queue_run_job(struct drm_sched_job *drm_job)
+ 	struct xe_exec_queue *q = job->q;
+ 	struct xe_guc *guc = exec_queue_to_guc(q);
+ 	struct xe_device *xe = guc_to_xe(guc);
++	struct dma_fence *fence = NULL;
+ 	bool lr = xe_exec_queue_is_lr(q);
+ 
+ 	xe_assert(xe, !(exec_queue_destroyed(q) || exec_queue_pending_disable(q)) ||
+@@ -734,12 +735,12 @@ guc_exec_queue_run_job(struct drm_sched_job *drm_job)
+ 
+ 	if (lr) {
+ 		xe_sched_job_set_error(job, -EOPNOTSUPP);
+-		return NULL;
+-	} else if (test_and_set_bit(JOB_FLAG_SUBMIT, &job->fence->flags)) {
+-		return job->fence;
++		dma_fence_put(job->fence);	/* Drop ref from xe_sched_job_arm */
+ 	} else {
+-		return dma_fence_get(job->fence);
++		fence = job->fence;
+ 	}
++
++	return fence;
+ }
+ 
+ static void guc_exec_queue_free_job(struct drm_sched_job *drm_job)
+diff --git a/drivers/gpu/drm/xe/xe_sched_job.c b/drivers/gpu/drm/xe/xe_sched_job.c
+index eeccc1c318ae..1905ca590965 100644
+--- a/drivers/gpu/drm/xe/xe_sched_job.c
++++ b/drivers/gpu/drm/xe/xe_sched_job.c
+@@ -280,7 +280,7 @@ void xe_sched_job_arm(struct xe_sched_job *job)
+ 		fence = &chain->base;
+ 	}
+ 
+-	job->fence = fence;
++	job->fence = dma_fence_get(fence);	/* Pairs with put in scheduler */
+ 	drm_sched_job_arm(&job->drm);
+ }
+ 
+diff --git a/drivers/gpu/drm/xe/xe_sched_job_types.h b/drivers/gpu/drm/xe/xe_sched_job_types.h
+index 426d261d7359..f13f333f00be 100644
+--- a/drivers/gpu/drm/xe/xe_sched_job_types.h
++++ b/drivers/gpu/drm/xe/xe_sched_job_types.h
+@@ -40,7 +40,6 @@ struct xe_sched_job {
+ 	 * @fence: dma fence to indicate completion. 1 way relationship - job
+ 	 * can safely reference fence, fence cannot safely reference job.
+ 	 */
+-#define JOB_FLAG_SUBMIT		DMA_FENCE_FLAG_USER_BITS
+ 	struct dma_fence *fence;
+ 	/** @user_fence: write back value when BB is complete */
+ 	struct {
+-- 
+2.52.0
+

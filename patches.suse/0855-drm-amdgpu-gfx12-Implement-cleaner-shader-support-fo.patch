@@ -1,0 +1,121 @@
+From e7cee5459517e49a540240b03d207d0f81625109 Mon Sep 17 00:00:00 2001
+From: Srinivasan Shanmugam <srinivasan.shanmugam@amd.com>
+Date: Wed, 2 Oct 2024 09:58:15 +0530
+Subject: drm/amdgpu/gfx12: Implement cleaner shader support for GFX12 hardware
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: e7cee5459517e49a540240b03d207d0f81625109
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+This patch adds support for the PACKET3_RUN_CLEANER_SHADER packet in the
+gfx_v12_0 module. This packet is used to emit the cleaner shader, which
+is used to clear GPU memory before it's reused, helping to prevent data
+leakage between different processes.
+
+Finally, the patch updates the ring function structures to include the
+new gfx_v12_0_ring_emit_cleaner_shader function. This allows the
+cleaner shader to be emitted as part of the ring's operations.
+
+Cc: Christian König <christian.koenig@amd.com>
+Cc: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Srinivasan Shanmugam <srinivasan.shanmugam@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/gfx_v12_0.c | 27 ++++++++++++++++++++++++--
+ 1 file changed, 25 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v12_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v12_0.c
+index dc25fcb89b13..7c23f95ae186 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v12_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v12_0.c
+@@ -1346,6 +1346,12 @@ static int gfx_v12_0_sw_init(struct amdgpu_ip_block *ip_block)
+ 		break;
+ 	}
+ 
++	switch (amdgpu_ip_version(adev, GC_HWIP, 0)) {
++	default:
++		adev->gfx.enable_cleaner_shader = false;
++		break;
++	}
++
+ 	/* recalculate compute rings to use based on hardware configuration */
+ 	num_compute_rings = (adev->gfx.mec.num_pipe_per_mec *
+ 			     adev->gfx.mec.num_queue_per_pipe) / 2;
+@@ -1460,6 +1466,10 @@ static int gfx_v12_0_sw_init(struct amdgpu_ip_block *ip_block)
+ 
+ 	gfx_v12_0_alloc_ip_dump(adev);
+ 
++	r = amdgpu_gfx_sysfs_isolation_shader_init(adev);
++	if (r)
++		return r;
++
+ 	return 0;
+ }
+ 
+@@ -1519,6 +1529,8 @@ static int gfx_v12_0_sw_fini(struct amdgpu_ip_block *ip_block)
+ 
+ 	gfx_v12_0_free_microcode(adev);
+ 
++	amdgpu_gfx_sysfs_isolation_shader_fini(adev);
++
+ 	kfree(adev->gfx.ip_dump_core);
+ 	kfree(adev->gfx.ip_dump_compute_queues);
+ 	kfree(adev->gfx.ip_dump_gfx_queues);
+@@ -5038,6 +5050,13 @@ static void gfx_v12_ring_insert_nop(struct amdgpu_ring *ring, uint32_t num_nop)
+ 		amdgpu_ring_write(ring, ring->funcs->nop);
+ }
+ 
++static void gfx_v12_0_ring_emit_cleaner_shader(struct amdgpu_ring *ring)
++{
++	/* Emit the cleaner shader */
++	amdgpu_ring_write(ring, PACKET3(PACKET3_RUN_CLEANER_SHADER, 0));
++	amdgpu_ring_write(ring, 0);  /* RESERVED field, programmed to zero */
++}
++
+ static void gfx_v12_ip_print(struct amdgpu_ip_block *ip_block, struct drm_printer *p)
+ {
+ 	struct amdgpu_device *adev = ip_block->adev;
+@@ -5297,7 +5316,8 @@ static const struct amdgpu_ring_funcs gfx_v12_0_ring_funcs_gfx = {
+ 		3 + /* CNTX_CTRL */
+ 		5 + /* HDP_INVL */
+ 		8 + 8 + /* FENCE x2 */
+-		8, /* gfx_v12_0_emit_mem_sync */
++		8 + /* gfx_v12_0_emit_mem_sync */
++		2, /* gfx_v12_0_ring_emit_cleaner_shader */
+ 	.emit_ib_size =	4, /* gfx_v12_0_ring_emit_ib_gfx */
+ 	.emit_ib = gfx_v12_0_ring_emit_ib_gfx,
+ 	.emit_fence = gfx_v12_0_ring_emit_fence,
+@@ -5318,6 +5338,7 @@ static const struct amdgpu_ring_funcs gfx_v12_0_ring_funcs_gfx = {
+ 	.soft_recovery = gfx_v12_0_ring_soft_recovery,
+ 	.emit_mem_sync = gfx_v12_0_emit_mem_sync,
+ 	.reset = gfx_v12_0_reset_kgq,
++	.emit_cleaner_shader = gfx_v12_0_ring_emit_cleaner_shader,
+ };
+ 
+ static const struct amdgpu_ring_funcs gfx_v12_0_ring_funcs_compute = {
+@@ -5336,7 +5357,8 @@ static const struct amdgpu_ring_funcs gfx_v12_0_ring_funcs_compute = {
+ 		SOC15_FLUSH_GPU_TLB_NUM_REG_WAIT * 7 +
+ 		2 + /* gfx_v12_0_ring_emit_vm_flush */
+ 		8 + 8 + 8 + /* gfx_v12_0_ring_emit_fence x3 for user fence, vm fence */
+-		8, /* gfx_v12_0_emit_mem_sync */
++		8 + /* gfx_v12_0_emit_mem_sync */
++		2, /* gfx_v12_0_ring_emit_cleaner_shader */
+ 	.emit_ib_size =	7, /* gfx_v12_0_ring_emit_ib_compute */
+ 	.emit_ib = gfx_v12_0_ring_emit_ib_compute,
+ 	.emit_fence = gfx_v12_0_ring_emit_fence,
+@@ -5353,6 +5375,7 @@ static const struct amdgpu_ring_funcs gfx_v12_0_ring_funcs_compute = {
+ 	.soft_recovery = gfx_v12_0_ring_soft_recovery,
+ 	.emit_mem_sync = gfx_v12_0_emit_mem_sync,
+ 	.reset = gfx_v12_0_reset_kcq,
++	.emit_cleaner_shader = gfx_v12_0_ring_emit_cleaner_shader,
+ };
+ 
+ static const struct amdgpu_ring_funcs gfx_v12_0_ring_funcs_kiq = {
+-- 
+2.52.0
+

@@ -1,0 +1,94 @@
+From f0bbcc258e81288212c2092c587ae06428196598 Mon Sep 17 00:00:00 2001
+From: Huan Yang <link@vivo.com>
+Date: Wed, 18 Sep 2024 10:52:24 +0800
+Subject: udmabuf: pre-fault when first page fault
+Git-commit: f0bbcc258e81288212c2092c587ae06428196598
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+The current udmabuf mmap only fills the physical memory to the
+corresponding virtual address when the user actually accesses the
+virtual address.
+
+However, the current udmabuf has already obtained and pinned the folio
+upon completion of the creation.This means that the physical memory has
+already been acquired, rather than being accessed dynamically.
+
+As a result, the page fault has lost its purpose as a demanding
+page. Due to the fact that page fault requires trapping into kernel mode
+and filling in when accessing the corresponding virtual address in mmap,
+when creating a large size udmabuf, this represents a considerable
+overhead.
+
+This patch fill the pfn into page table, and then pre-fault each pfn
+into vma, when first access.
+
+Notice, if anything wrong , we do not return an error during this
+pre-fault step. However, an error will be returned if the failure occurs
+when the addr is truly accessed
+
+Suggested-by: Vivek Kasireddy <vivek.kasireddy@intel.com>
+Signed-off-by: Huan Yang <link@vivo.com>
+Acked-by: Vivek Kasireddy <vivek.kasireddy@intel.com>
+Signed-off-by: Vivek Kasireddy <vivek.kasireddy@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20240918025238.2957823-2-link@vivo.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/dma-buf/udmabuf.c | 33 +++++++++++++++++++++++++++++++--
+ 1 file changed, 31 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/dma-buf/udmabuf.c b/drivers/dma-buf/udmabuf.c
+index 047c3cd2ceff..2170d975cc76 100644
+--- a/drivers/dma-buf/udmabuf.c
++++ b/drivers/dma-buf/udmabuf.c
+@@ -43,7 +43,8 @@ static vm_fault_t udmabuf_vm_fault(struct vm_fault *vmf)
+ 	struct vm_area_struct *vma = vmf->vma;
+ 	struct udmabuf *ubuf = vma->vm_private_data;
+ 	pgoff_t pgoff = vmf->pgoff;
+-	unsigned long pfn;
++	unsigned long addr, pfn;
++	vm_fault_t ret;
+ 
+ 	if (pgoff >= ubuf->pagecount)
+ 		return VM_FAULT_SIGBUS;
+@@ -51,7 +52,35 @@ static vm_fault_t udmabuf_vm_fault(struct vm_fault *vmf)
+ 	pfn = folio_pfn(ubuf->folios[pgoff]);
+ 	pfn += ubuf->offsets[pgoff] >> PAGE_SHIFT;
+ 
+-	return vmf_insert_pfn(vma, vmf->address, pfn);
++	ret = vmf_insert_pfn(vma, vmf->address, pfn);
++	if (ret & VM_FAULT_ERROR)
++		return ret;
++
++	/* pre fault */
++	pgoff = vma->vm_pgoff;
++	addr = vma->vm_start;
++
++	for (; addr < vma->vm_end; pgoff++, addr += PAGE_SIZE) {
++		if (addr == vmf->address)
++			continue;
++
++		if (WARN_ON(pgoff >= ubuf->pagecount))
++			break;
++
++		pfn = folio_pfn(ubuf->folios[pgoff]);
++		pfn += ubuf->offsets[pgoff] >> PAGE_SHIFT;
++
++		/**
++		 * If the below vmf_insert_pfn() fails, we do not return an
++		 * error here during this pre-fault step. However, an error
++		 * will be returned if the failure occurs when the addr is
++		 * truly accessed.
++		 */
++		if (vmf_insert_pfn(vma, addr, pfn) & VM_FAULT_ERROR)
++			break;
++	}
++
++	return ret;
+ }
+ 
+ static const struct vm_operations_struct udmabuf_vm_ops = {
+-- 
+2.52.0
+

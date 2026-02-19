@@ -1,0 +1,240 @@
+From 56c594d8df64e726e803652ee9f4ab08659d4574 Mon Sep 17 00:00:00 2001
+From: Pierre-Eric Pelloux-Prayer <pierre-eric.pelloux-prayer@amd.com>
+Date: Thu, 3 Oct 2024 14:43:09 +0200
+Subject: drm: add DRM_SET_CLIENT_NAME ioctl
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 56c594d8df64e726e803652ee9f4ab08659d4574
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Giving the opportunity to userspace to associate a free-form
+name with a drm_file struct is helpful for tracking and debugging.
+
+This is similar to the existing DMA_BUF_SET_NAME ioctl.
+
+Access to client_name is protected by a mutex, and the 'clients' debugfs
+file has been updated to print it.
+
+Userspace MR to use this ioctl:
+   https://gitlab.freedesktop.org/virgl/virglrenderer/-/merge_requests/1428
+
+If the string passed by userspace contains chars that would mess up output
+when it's going to be printed (in dmesg, fdinfo, etc), -EINVAL is returned.
+
+A 0-length string is a valid use, and clears the existing name.
+
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@igalia.com>
+Reviewed-by: Dmitry Osipenko <dmitry.osipenko@collabora.com>
+Signed-off-by: Pierre-Eric Pelloux-Prayer <pierre-eric.pelloux-prayer@amd.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241003124506.470931-2-pierre-eric.pelloux-prayer@amd.com
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/drm_debugfs.c | 14 +++++++---
+ drivers/gpu/drm/drm_file.c    |  5 ++++
+ drivers/gpu/drm/drm_ioctl.c   | 51 +++++++++++++++++++++++++++++++++++
+ include/drm/drm_file.h        |  9 +++++++
+ include/uapi/drm/drm.h        | 17 ++++++++++++
+ 5 files changed, 92 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_debugfs.c b/drivers/gpu/drm/drm_debugfs.c
+index 9d3e6dd68810..52783eac078e 100644
+--- a/drivers/gpu/drm/drm_debugfs.c
++++ b/drivers/gpu/drm/drm_debugfs.c
+@@ -78,12 +78,14 @@ static int drm_clients_info(struct seq_file *m, void *data)
+ 	kuid_t uid;
+ 
+ 	seq_printf(m,
+-		   "%20s %5s %3s master a %5s %10s\n",
++		   "%20s %5s %3s master a %5s %10s %*s\n",
+ 		   "command",
+ 		   "tgid",
+ 		   "dev",
+ 		   "uid",
+-		   "magic");
++		   "magic",
++		   DRM_CLIENT_NAME_MAX_LEN,
++		   "name");
+ 
+ 	/* dev->filelist is sorted youngest first, but we want to present
+ 	 * oldest first (i.e. kernel, servers, clients), so walk backwardss.
+@@ -94,19 +96,23 @@ static int drm_clients_info(struct seq_file *m, void *data)
+ 		struct task_struct *task;
+ 		struct pid *pid;
+ 
++		mutex_lock(&priv->client_name_lock);
+ 		rcu_read_lock(); /* Locks priv->pid and pid_task()->comm! */
+ 		pid = rcu_dereference(priv->pid);
+ 		task = pid_task(pid, PIDTYPE_TGID);
+ 		uid = task ? __task_cred(task)->euid : GLOBAL_ROOT_UID;
+-		seq_printf(m, "%20s %5d %3d   %c    %c %5d %10u\n",
++		seq_printf(m, "%20s %5d %3d   %c    %c %5d %10u %*s\n",
+ 			   task ? task->comm : "<unknown>",
+ 			   pid_vnr(pid),
+ 			   priv->minor->index,
+ 			   is_current_master ? 'y' : 'n',
+ 			   priv->authenticated ? 'y' : 'n',
+ 			   from_kuid_munged(seq_user_ns(m), uid),
+-			   priv->magic);
++			   priv->magic,
++			   DRM_CLIENT_NAME_MAX_LEN,
++			   priv->client_name ? priv->client_name : "<unset>");
+ 		rcu_read_unlock();
++		mutex_unlock(&priv->client_name_lock);
+ 	}
+ 	mutex_unlock(&dev->filelist_mutex);
+ 	return 0;
+diff --git a/drivers/gpu/drm/drm_file.c b/drivers/gpu/drm/drm_file.c
+index ad1dc638c83b..65c40ce3d61c 100644
+--- a/drivers/gpu/drm/drm_file.c
++++ b/drivers/gpu/drm/drm_file.c
+@@ -157,6 +157,7 @@ struct drm_file *drm_file_alloc(struct drm_minor *minor)
+ 
+ 	spin_lock_init(&file->master_lookup_lock);
+ 	mutex_init(&file->event_read_lock);
++	mutex_init(&file->client_name_lock);
+ 
+ 	if (drm_core_check_feature(dev, DRIVER_GEM))
+ 		drm_gem_open(dev, file);
+@@ -258,6 +259,10 @@ void drm_file_free(struct drm_file *file)
+ 	WARN_ON(!list_empty(&file->event_list));
+ 
+ 	put_pid(rcu_access_pointer(file->pid));
++
++	mutex_destroy(&file->client_name_lock);
++	kfree(file->client_name);
++
+ 	kfree(file);
+ }
+ 
+diff --git a/drivers/gpu/drm/drm_ioctl.c b/drivers/gpu/drm/drm_ioctl.c
+index 51f39912866f..f593dc569d31 100644
+--- a/drivers/gpu/drm/drm_ioctl.c
++++ b/drivers/gpu/drm/drm_ioctl.c
+@@ -540,6 +540,55 @@ int drm_version(struct drm_device *dev, void *data,
+ 	return err;
+ }
+ 
++/*
++ * Check if the passed string contains control char or spaces or
++ * anything that would mess up a formatted output.
++ */
++static int drm_validate_value_string(const char *value, size_t len)
++{
++	int i;
++
++	for (i = 0; i < len; i++) {
++		if (!isascii(value[i]) || !isgraph(value[i]))
++			return -EINVAL;
++	}
++	return 0;
++}
++
++static int drm_set_client_name(struct drm_device *dev, void *data,
++			       struct drm_file *file_priv)
++{
++	struct drm_set_client_name *name = data;
++	size_t len = name->name_len;
++	void __user *user_ptr;
++	char *new_name;
++
++	if (len > DRM_CLIENT_NAME_MAX_LEN) {
++		return -EINVAL;
++	} else if (len) {
++		user_ptr = u64_to_user_ptr(name->name);
++
++		new_name = memdup_user_nul(user_ptr, len);
++		if (IS_ERR(new_name))
++			return PTR_ERR(new_name);
++
++		if (strlen(new_name) != len ||
++		    drm_validate_value_string(new_name, len) < 0) {
++			kfree(new_name);
++			return -EINVAL;
++		}
++	} else {
++		new_name = NULL;
++	}
++
++	mutex_lock(&file_priv->client_name_lock);
++	kfree(file_priv->client_name);
++	file_priv->client_name = new_name;
++	mutex_unlock(&file_priv->client_name_lock);
++
++	return 0;
++}
++
+ static int drm_ioctl_permit(u32 flags, struct drm_file *file_priv)
+ {
+ 	/* ROOT_ONLY is only for CAP_SYS_ADMIN */
+@@ -610,6 +659,8 @@ static const struct drm_ioctl_desc drm_ioctls[] = {
+ 	DRM_IOCTL_DEF(DRM_IOCTL_PRIME_HANDLE_TO_FD, drm_prime_handle_to_fd_ioctl, DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF(DRM_IOCTL_PRIME_FD_TO_HANDLE, drm_prime_fd_to_handle_ioctl, DRM_RENDER_ALLOW),
+ 
++	DRM_IOCTL_DEF(DRM_IOCTL_SET_CLIENT_NAME, drm_set_client_name, DRM_RENDER_ALLOW),
++
+ 	DRM_IOCTL_DEF(DRM_IOCTL_MODE_GETPLANERESOURCES, drm_mode_getplane_res, 0),
+ 	DRM_IOCTL_DEF(DRM_IOCTL_MODE_GETCRTC, drm_mode_getcrtc, 0),
+ 	DRM_IOCTL_DEF(DRM_IOCTL_MODE_SETCRTC, drm_mode_setcrtc, DRM_MASTER),
+diff --git a/include/drm/drm_file.h b/include/drm/drm_file.h
+index 8c0030c77308..d4f1c115ea0f 100644
+--- a/include/drm/drm_file.h
++++ b/include/drm/drm_file.h
+@@ -388,6 +388,15 @@ struct drm_file {
+ 	 * Per-file buffer caches used by the PRIME buffer sharing code.
+ 	 */
+ 	struct drm_prime_file_private prime;
++
++	/**
++	 * @client_name:
++	 *
++	 * Userspace-provided name; useful for accounting and debugging.
++	 */
++	const char *client_name;
++	/** @name_lock: Protects @client_name. */
++	struct mutex client_name_lock;
+ };
+ 
+ /**
+diff --git a/include/uapi/drm/drm.h b/include/uapi/drm/drm.h
+index 16122819edfe..7fba37b94401 100644
+--- a/include/uapi/drm/drm.h
++++ b/include/uapi/drm/drm.h
+@@ -1024,6 +1024,13 @@ struct drm_crtc_queue_sequence {
+ 	__u64 user_data;	/* user data passed to event */
+ };
+ 
++#define DRM_CLIENT_NAME_MAX_LEN		64
++struct drm_set_client_name {
++	__u64 name_len;
++	__u64 name;
++};
++
++
+ #if defined(__cplusplus)
+ }
+ #endif
+@@ -1288,6 +1295,16 @@ extern "C" {
+  */
+ #define DRM_IOCTL_MODE_CLOSEFB		DRM_IOWR(0xD0, struct drm_mode_closefb)
+ 
++/**
++ * DRM_IOCTL_SET_CLIENT_NAME - Attach a name to a drm_file
++ *
++ * Having a name allows for easier tracking and debugging.
++ * The length of the name (without null ending char) must be
++ * <= DRM_CLIENT_NAME_MAX_LEN.
++ * The call will fail if the name contains whitespaces or non-printable chars.
++ */
++#define DRM_IOCTL_SET_CLIENT_NAME	DRM_IOWR(0xD1, struct drm_set_client_name)
++
+ /*
+  * Device specific ioctls should only be in their respective headers
+  * The device specific ioctl range is from 0x40 to 0x9f.
+-- 
+2.52.0
+

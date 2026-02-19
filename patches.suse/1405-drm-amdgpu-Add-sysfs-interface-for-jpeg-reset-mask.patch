@@ -1,0 +1,205 @@
+From 96f0b56c34d257e4e7532eb99a071ca6c8497467 Mon Sep 17 00:00:00 2001
+From: "Jesse.zhang@amd.com" <Jesse.zhang@amd.com>
+Date: Tue, 29 Oct 2024 14:36:35 +0800
+Subject: drm/amdgpu: Add sysfs interface for jpeg reset mask
+Git-commit: 96f0b56c34d257e4e7532eb99a071ca6c8497467
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Add the sysfs interface for jpeg:
+jpeg_reset_mask
+
+The interface is read-only and show the resets supported by the IP.
+For example, full adapter reset (mode1/mode2/BACO/etc),
+soft reset, queue reset, and pipe reset.
+
+V2: the sysfs node returns a text string instead of some flags (Christian)
+V3: add a generic helper which takes the ring as parameter
+    and print the strings in the order they are applied (Christian)
+
+    check amdgpu_gpu_recovery  before creating sysfs file itself,
+    and initialize supported_reset_types in IP version files (Lijo)
+
+Signed-off-by: Jesse Zhang <Jesse.Zhang@amd.com>
+Suggested-by: Alex Deucher <alexander.deucher@amd.com>
+Reviewed-by: Tim Huang <tim.huang@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_jpeg.c | 35 ++++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_jpeg.h |  3 ++
+ drivers/gpu/drm/amd/amdgpu/jpeg_v4_0.c   |  7 +++++
+ drivers/gpu/drm/amd/amdgpu/jpeg_v4_0_3.c |  8 ++++++
+ drivers/gpu/drm/amd/amdgpu/jpeg_v4_0_5.c |  8 ++++++
+ drivers/gpu/drm/amd/amdgpu/jpeg_v5_0_0.c |  7 +++++
+ 6 files changed, 68 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_jpeg.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_jpeg.c
+index 95e2796919fc..f971ffdffce9 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_jpeg.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_jpeg.c
+@@ -415,3 +415,38 @@ void amdgpu_debugfs_jpeg_sched_mask_init(struct amdgpu_device *adev)
+ 			    &amdgpu_debugfs_jpeg_sched_mask_fops);
+ #endif
+ }
++
++static ssize_t amdgpu_get_jpeg_reset_mask(struct device *dev,
++						struct device_attribute *attr,
++						char *buf)
++{
++	struct drm_device *ddev = dev_get_drvdata(dev);
++	struct amdgpu_device *adev = drm_to_adev(ddev);
++
++	if (!adev)
++		return -ENODEV;
++
++	return amdgpu_show_reset_mask(buf, adev->jpeg.supported_reset);
++}
++
++static DEVICE_ATTR(jpeg_reset_mask, 0444,
++		   amdgpu_get_jpeg_reset_mask, NULL);
++
++int amdgpu_jpeg_sysfs_reset_mask_init(struct amdgpu_device *adev)
++{
++	int r = 0;
++
++	if (adev->jpeg.num_jpeg_inst) {
++		r = device_create_file(adev->dev, &dev_attr_jpeg_reset_mask);
++		if (r)
++			return r;
++	}
++
++	return r;
++}
++
++void amdgpu_jpeg_sysfs_reset_mask_fini(struct amdgpu_device *adev)
++{
++	if (adev->jpeg.num_jpeg_inst)
++		device_remove_file(adev->dev, &dev_attr_jpeg_reset_mask);
++}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_jpeg.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_jpeg.h
+index 819dc7a0af99..3eb4a4653fce 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_jpeg.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_jpeg.h
+@@ -128,6 +128,7 @@ struct amdgpu_jpeg {
+ 	uint16_t inst_mask;
+ 	uint8_t num_inst_per_aid;
+ 	bool	indirect_sram;
++	uint32_t supported_reset;
+ };
+ 
+ int amdgpu_jpeg_sw_init(struct amdgpu_device *adev);
+@@ -150,5 +151,7 @@ int amdgpu_jpeg_ras_sw_init(struct amdgpu_device *adev);
+ int amdgpu_jpeg_psp_update_sram(struct amdgpu_device *adev, int inst_idx,
+ 			       enum AMDGPU_UCODE_ID ucode_id);
+ void amdgpu_debugfs_jpeg_sched_mask_init(struct amdgpu_device *adev);
++int amdgpu_jpeg_sysfs_reset_mask_init(struct amdgpu_device *adev);
++void amdgpu_jpeg_sysfs_reset_mask_fini(struct amdgpu_device *adev);
+ 
+ #endif /*__AMDGPU_JPEG_H__*/
+diff --git a/drivers/gpu/drm/amd/amdgpu/jpeg_v4_0.c b/drivers/gpu/drm/amd/amdgpu/jpeg_v4_0.c
+index 89953c0f5f1f..193dfac5dc76 100644
+--- a/drivers/gpu/drm/amd/amdgpu/jpeg_v4_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/jpeg_v4_0.c
+@@ -121,6 +121,12 @@ static int jpeg_v4_0_sw_init(struct amdgpu_ip_block *ip_block)
+ 	adev->jpeg.inst->external.jpeg_pitch[0] = SOC15_REG_OFFSET(JPEG, 0, regUVD_JPEG_PITCH);
+ 
+ 	r = amdgpu_jpeg_ras_sw_init(adev);
++	if (r)
++		return r;
++	/* TODO: Add queue reset mask when FW fully supports it */
++	adev->jpeg.supported_reset =
++		amdgpu_get_soft_full_reset_mask(&adev->jpeg.inst[0].ring_dec[0]);
++	r = amdgpu_jpeg_sysfs_reset_mask_init(adev);
+ 	if (r)
+ 		return r;
+ 
+@@ -143,6 +149,7 @@ static int jpeg_v4_0_sw_fini(struct amdgpu_ip_block *ip_block)
+ 	if (r)
+ 		return r;
+ 
++	amdgpu_jpeg_sysfs_reset_mask_fini(adev);
+ 	r = amdgpu_jpeg_sw_fini(adev);
+ 
+ 	return r;
+diff --git a/drivers/gpu/drm/amd/amdgpu/jpeg_v4_0_3.c b/drivers/gpu/drm/amd/amdgpu/jpeg_v4_0_3.c
+index 6917e4a8e96a..67b51bcbacd1 100644
+--- a/drivers/gpu/drm/amd/amdgpu/jpeg_v4_0_3.c
++++ b/drivers/gpu/drm/amd/amdgpu/jpeg_v4_0_3.c
+@@ -159,6 +159,13 @@ static int jpeg_v4_0_3_sw_init(struct amdgpu_ip_block *ip_block)
+ 		}
+ 	}
+ 
++	/* TODO: Add queue reset mask when FW fully supports it */
++	adev->jpeg.supported_reset =
++		amdgpu_get_soft_full_reset_mask(&adev->jpeg.inst[0].ring_dec[0]);
++	r = amdgpu_jpeg_sysfs_reset_mask_init(adev);
++	if (r)
++		return r;
++
+ 	return 0;
+ }
+ 
+@@ -178,6 +185,7 @@ static int jpeg_v4_0_3_sw_fini(struct amdgpu_ip_block *ip_block)
+ 	if (r)
+ 		return r;
+ 
++	amdgpu_jpeg_sysfs_reset_mask_fini(adev);
+ 	r = amdgpu_jpeg_sw_fini(adev);
+ 
+ 	return r;
+diff --git a/drivers/gpu/drm/amd/amdgpu/jpeg_v4_0_5.c b/drivers/gpu/drm/amd/amdgpu/jpeg_v4_0_5.c
+index f3cce523f3cb..b48e2412e6cc 100644
+--- a/drivers/gpu/drm/amd/amdgpu/jpeg_v4_0_5.c
++++ b/drivers/gpu/drm/amd/amdgpu/jpeg_v4_0_5.c
+@@ -153,6 +153,13 @@ static int jpeg_v4_0_5_sw_init(struct amdgpu_ip_block *ip_block)
+ 		adev->jpeg.inst[i].external.jpeg_pitch[0] = SOC15_REG_OFFSET(JPEG, i, regUVD_JPEG_PITCH);
+ 	}
+ 
++	/* TODO: Add queue reset mask when FW fully supports it */
++	adev->jpeg.supported_reset =
++		amdgpu_get_soft_full_reset_mask(&adev->jpeg.inst[0].ring_dec[0]);
++	r = amdgpu_jpeg_sysfs_reset_mask_init(adev);
++	if (r)
++		return r;
++
+ 	return 0;
+ }
+ 
+@@ -172,6 +179,7 @@ static int jpeg_v4_0_5_sw_fini(struct amdgpu_ip_block *ip_block)
+ 	if (r)
+ 		return r;
+ 
++	amdgpu_jpeg_sysfs_reset_mask_fini(adev);
+ 	r = amdgpu_jpeg_sw_fini(adev);
+ 
+ 	return r;
+diff --git a/drivers/gpu/drm/amd/amdgpu/jpeg_v5_0_0.c b/drivers/gpu/drm/amd/amdgpu/jpeg_v5_0_0.c
+index 06840d1dae79..686f9605239d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/jpeg_v5_0_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/jpeg_v5_0_0.c
+@@ -100,6 +100,12 @@ static int jpeg_v5_0_0_sw_init(struct amdgpu_ip_block *ip_block)
+ 	adev->jpeg.internal.jpeg_pitch[0] = regUVD_JPEG_PITCH_INTERNAL_OFFSET;
+ 	adev->jpeg.inst->external.jpeg_pitch[0] = SOC15_REG_OFFSET(JPEG, 0, regUVD_JPEG_PITCH);
+ 
++	/* TODO: Add queue reset mask when FW fully supports it */
++	adev->jpeg.supported_reset =
++		amdgpu_get_soft_full_reset_mask(&adev->jpeg.inst[0].ring_dec[0]);
++	r = amdgpu_jpeg_sysfs_reset_mask_init(adev);
++	if (r)
++		return r;
+ 	return 0;
+ }
+ 
+@@ -119,6 +125,7 @@ static int jpeg_v5_0_0_sw_fini(struct amdgpu_ip_block *ip_block)
+ 	if (r)
+ 		return r;
+ 
++	amdgpu_jpeg_sysfs_reset_mask_fini(adev);
+ 	r = amdgpu_jpeg_sw_fini(adev);
+ 
+ 	return r;
+-- 
+2.52.0
+

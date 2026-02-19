@@ -1,0 +1,136 @@
+From aa4e216827553f487c121264579807c35b5571c8 Mon Sep 17 00:00:00 2001
+From: Ilia Levi <ilia.levi@intel.com>
+Date: Wed, 18 Sep 2024 08:39:42 +0300
+Subject: drm/xe: memirq handler changes
+Git-commit: aa4e216827553f487c121264579807c35b5571c8
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Expose an interrupt processing handler for a single hw engine.
+Refactor code to use this handler from the VF.
+This handler also caters for the MSI-X mode, where the hardware engines
+report interrupt source and status to the offset of engine instance zero
+(this usage will be introduced in upcoming MSI-X enabling series).
+
+Signed-off-by: Ilia Levi <ilia.levi@intel.com>
+Reviewed-by: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Signed-off-by: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20240918053942.1331811-6-illevi@habana.ai
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/xe/xe_hw_engine.c | 28 +++++++++++++++++++++++++++-
+ drivers/gpu/drm/xe/xe_memirq.c    | 31 ++++++++++++++++++++++++-------
+ drivers/gpu/drm/xe/xe_memirq.h    |  1 +
+ 3 files changed, 52 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_hw_engine.c b/drivers/gpu/drm/xe/xe_hw_engine.c
+index a7abc4b67e67..d7408d06ee20 100644
+--- a/drivers/gpu/drm/xe/xe_hw_engine.c
++++ b/drivers/gpu/drm/xe/xe_hw_engine.c
+@@ -460,6 +460,30 @@ hw_engine_setup_default_state(struct xe_hw_engine *hwe)
+ 	xe_rtp_process_to_sr(&ctx, engine_entries, &hwe->reg_sr);
+ }
+ 
++static const struct engine_info *find_engine_info(enum xe_engine_class class, int instance)
++{
++	const struct engine_info *info;
++	enum xe_hw_engine_id id;
++
++	for (id = 0; id < XE_NUM_HW_ENGINES; ++id) {
++		info = &engine_infos[id];
++		if (info->class == class && info->instance == instance)
++			return info;
++	}
++
++	return NULL;
++}
++
++static u16 get_msix_irq_offset(struct xe_gt *gt, enum xe_engine_class class)
++{
++	/* For MSI-X, hw engines report to offset of engine instance zero */
++	const struct engine_info *info = find_engine_info(class, 0);
++
++	xe_gt_assert(gt, info);
++
++	return info ? info->irq_offset : 0;
++}
++
+ static void hw_engine_init_early(struct xe_gt *gt, struct xe_hw_engine *hwe,
+ 				 enum xe_hw_engine_id id)
+ {
+@@ -479,7 +503,9 @@ static void hw_engine_init_early(struct xe_gt *gt, struct xe_hw_engine *hwe,
+ 	hwe->class = info->class;
+ 	hwe->instance = info->instance;
+ 	hwe->mmio_base = info->mmio_base;
+-	hwe->irq_offset = info->irq_offset;
++	hwe->irq_offset = xe_device_has_msix(gt_to_xe(gt)) ?
++		get_msix_irq_offset(gt, info->class) :
++		info->irq_offset;
+ 	hwe->domain = info->domain;
+ 	hwe->name = info->name;
+ 	hwe->fence_irq = &gt->fence_irq[info->class];
+diff --git a/drivers/gpu/drm/xe/xe_memirq.c b/drivers/gpu/drm/xe/xe_memirq.c
+index ae4279a7f947..3f8d4ca64302 100644
+--- a/drivers/gpu/drm/xe/xe_memirq.c
++++ b/drivers/gpu/drm/xe/xe_memirq.c
+@@ -437,6 +437,28 @@ static void memirq_dispatch_guc(struct xe_memirq *memirq, struct iosys_map *stat
+ 		xe_guc_irq_handler(guc, GUC_INTR_GUC2HOST);
+ }
+ 
++/**
++ * xe_memirq_hwe_handler - Check and process interrupts for a specific HW engine.
++ * @memirq: the &xe_memirq
++ * @hwe: the hw engine to process
++ *
++ * This function reads and dispatches `Memory Based Interrupts` for the provided HW engine.
++ */
++void xe_memirq_hwe_handler(struct xe_memirq *memirq, struct xe_hw_engine *hwe)
++{
++	u16 offset = hwe->irq_offset;
++	u16 instance = hw_reports_to_instance_zero(memirq) ? hwe->instance : 0;
++	struct iosys_map src_offset = IOSYS_MAP_INIT_OFFSET(&memirq->bo->vmap,
++							    XE_MEMIRQ_SOURCE_OFFSET(instance));
++
++	if (memirq_received(memirq, &src_offset, offset, "SRC")) {
++		struct iosys_map status_offset =
++			IOSYS_MAP_INIT_OFFSET(&memirq->bo->vmap,
++					      XE_MEMIRQ_STATUS_OFFSET(instance) + offset * SZ_16);
++		memirq_dispatch_engine(memirq, &status_offset, hwe);
++	}
++}
++
+ /**
+  * xe_memirq_handler - The `Memory Based Interrupts`_ Handler.
+  * @memirq: the &xe_memirq
+@@ -464,13 +486,8 @@ void xe_memirq_handler(struct xe_memirq *memirq)
+ 		if (gt->tile != tile)
+ 			continue;
+ 
+-		for_each_hw_engine(hwe, gt, id) {
+-			if (memirq_received(memirq, &memirq->source, hwe->irq_offset, "SRC")) {
+-				map = IOSYS_MAP_INIT_OFFSET(&memirq->status,
+-							    hwe->irq_offset * SZ_16);
+-				memirq_dispatch_engine(memirq, &map, hwe);
+-			}
+-		}
++		for_each_hw_engine(hwe, gt, id)
++			xe_memirq_hwe_handler(memirq, hwe);
+ 	}
+ 
+ 	/* GuC and media GuC (if present) must be checked separately */
+diff --git a/drivers/gpu/drm/xe/xe_memirq.h b/drivers/gpu/drm/xe/xe_memirq.h
+index 15efae2a7a55..06130650e9d6 100644
+--- a/drivers/gpu/drm/xe/xe_memirq.h
++++ b/drivers/gpu/drm/xe/xe_memirq.h
+@@ -20,6 +20,7 @@ u32 xe_memirq_enable_ptr(struct xe_memirq *memirq);
+ 
+ void xe_memirq_reset(struct xe_memirq *memirq);
+ void xe_memirq_postinstall(struct xe_memirq *memirq);
++void xe_memirq_hwe_handler(struct xe_memirq *memirq, struct xe_hw_engine *hwe);
+ void xe_memirq_handler(struct xe_memirq *memirq);
+ 
+ int xe_memirq_init_guc(struct xe_memirq *memirq, struct xe_guc *guc);
+-- 
+2.52.0
+

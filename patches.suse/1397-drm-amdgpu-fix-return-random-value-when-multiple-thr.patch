@@ -1,0 +1,123 @@
+From f4a3246a2c7a595161f1ba11db53639b7f580104 Mon Sep 17 00:00:00 2001
+From: chongli2 <chongli2@amd.com>
+Date: Wed, 6 Nov 2024 11:43:09 +0800
+Subject: drm/amdgpu: fix return random value when multiple threads read
+ registers via mes.
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: f4a3246a2c7a595161f1ba11db53639b7f580104
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+The currect code use the address "adev->mes.read_val_ptr" to
+store the value read from register via mes.
+So when multiple threads read register,
+multiple threads have to share the one address,
+and overwrite the value each other.
+
+Assign an address by "amdgpu_device_wb_get" to store register value.
+each thread will has an address to store register value.
+
+Signed-off-by: chongli2 <chongli2@amd.com>
+Reviewed-by: Emily Deng <Emily.Deng@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_mes.c | 30 +++++++++++--------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_mes.h |  3 ---
+ 2 files changed, 13 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_mes.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_mes.c
+index b10383f83d73..f702b8b9c318 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_mes.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_mes.c
+@@ -192,17 +192,6 @@ int amdgpu_mes_init(struct amdgpu_device *adev)
+ 			(uint64_t *)&adev->wb.wb[adev->mes.query_status_fence_offs[i]];
+ 	}
+ 
+-	r = amdgpu_device_wb_get(adev, &adev->mes.read_val_offs);
+-	if (r) {
+-		dev_err(adev->dev,
+-			"(%d) read_val_offs alloc failed\n", r);
+-		goto error;
+-	}
+-	adev->mes.read_val_gpu_addr =
+-		adev->wb.gpu_addr + (adev->mes.read_val_offs * 4);
+-	adev->mes.read_val_ptr =
+-		(uint32_t *)&adev->wb.wb[adev->mes.read_val_offs];
+-
+ 	r = amdgpu_mes_doorbell_init(adev);
+ 	if (r)
+ 		goto error;
+@@ -223,8 +212,6 @@ int amdgpu_mes_init(struct amdgpu_device *adev)
+ 			amdgpu_device_wb_free(adev,
+ 				      adev->mes.query_status_fence_offs[i]);
+ 	}
+-	if (adev->mes.read_val_ptr)
+-		amdgpu_device_wb_free(adev, adev->mes.read_val_offs);
+ 
+ 	idr_destroy(&adev->mes.pasid_idr);
+ 	idr_destroy(&adev->mes.gang_id_idr);
+@@ -249,8 +236,6 @@ void amdgpu_mes_fini(struct amdgpu_device *adev)
+ 			amdgpu_device_wb_free(adev,
+ 				      adev->mes.query_status_fence_offs[i]);
+ 	}
+-	if (adev->mes.read_val_ptr)
+-		amdgpu_device_wb_free(adev, adev->mes.read_val_offs);
+ 
+ 	amdgpu_mes_doorbell_free(adev);
+ 
+@@ -921,10 +906,19 @@ uint32_t amdgpu_mes_rreg(struct amdgpu_device *adev, uint32_t reg)
+ {
+ 	struct mes_misc_op_input op_input;
+ 	int r, val = 0;
++	uint32_t addr_offset = 0;
++	uint64_t read_val_gpu_addr;
++	uint32_t *read_val_ptr;
+ 
++	if (amdgpu_device_wb_get(adev, &addr_offset)) {
++		DRM_ERROR("critical bug! too many mes readers\n");
++		goto error;
++	}
++	read_val_gpu_addr = adev->wb.gpu_addr + (addr_offset * 4);
++	read_val_ptr = (uint32_t *)&adev->wb.wb[addr_offset];
+ 	op_input.op = MES_MISC_OP_READ_REG;
+ 	op_input.read_reg.reg_offset = reg;
+-	op_input.read_reg.buffer_addr = adev->mes.read_val_gpu_addr;
++	op_input.read_reg.buffer_addr = read_val_gpu_addr;
+ 
+ 	if (!adev->mes.funcs->misc_op) {
+ 		DRM_ERROR("mes rreg is not supported!\n");
+@@ -935,9 +929,11 @@ uint32_t amdgpu_mes_rreg(struct amdgpu_device *adev, uint32_t reg)
+ 	if (r)
+ 		DRM_ERROR("failed to read reg (0x%x)\n", reg);
+ 	else
+-		val = *(adev->mes.read_val_ptr);
++		val = *(read_val_ptr);
+ 
+ error:
++	if (addr_offset)
++		amdgpu_device_wb_free(adev, addr_offset);
+ 	return val;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_mes.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_mes.h
+index 0684e482a204..129b8d1cacef 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_mes.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_mes.h
+@@ -120,9 +120,6 @@ struct amdgpu_mes {
+ 	uint32_t			query_status_fence_offs[AMDGPU_MAX_MES_PIPES];
+ 	uint64_t			query_status_fence_gpu_addr[AMDGPU_MAX_MES_PIPES];
+ 	uint64_t			*query_status_fence_ptr[AMDGPU_MAX_MES_PIPES];
+-	uint32_t                        read_val_offs;
+-	uint64_t			read_val_gpu_addr;
+-	uint32_t			*read_val_ptr;
+ 
+ 	uint32_t			saved_flags;
+ 
+-- 
+2.52.0
+

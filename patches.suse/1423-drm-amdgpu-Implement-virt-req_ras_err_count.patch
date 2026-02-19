@@ -1,0 +1,451 @@
+From 84a2947ecc85c67f433f2cc2186e54cdb9047b61 Mon Sep 17 00:00:00 2001
+From: Victor Skvortsov <victor.skvortsov@amd.com>
+Date: Wed, 30 Oct 2024 10:18:00 -0400
+Subject: drm/amdgpu: Implement virt req_ras_err_count
+Git-commit: 84a2947ecc85c67f433f2cc2186e54cdb9047b61
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Enable RAS late init  if VF RAS Telemetry is supported.
+
+When enabled, the VF can use this interface to query total
+RAS error counts from the host.
+
+The VF FB access may abruptly end due to a fatal error,
+therefore the VF must cache and sanitize the input.
+
+The Host allows 15 Telemetry messages every 60 seconds, afterwhich
+the host will ignore any more in-coming telemetry messages. The VF will
+rate limit its msg calling to once every 5 seconds (12 times in 60 seconds).
+While the VF is rate limited, it will continue to report the last
+good cached data.
+
+V2: Flip generate report & update statistics order for VF
+
+Signed-off-by: Victor Skvortsov <victor.skvortsov@amd.com>
+Acked-by: Tao Zhou <tao.zhou1@amd.com>
+Reviewed-by: Zhigang Luo <zhigang.luo@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c |   6 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c    |   3 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c    |  72 +++++++++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ras.h    |   1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_umc.c    |   3 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_virt.c   | 136 +++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_virt.h   |  15 +++
+ 7 files changed, 229 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index a72c90da3d1d..0171d240fcb0 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -4236,7 +4236,10 @@ int amdgpu_device_init(struct amdgpu_device *adev,
+ 	 * for throttling interrupt) = 60 seconds.
+ 	 */
+ 	ratelimit_state_init(&adev->throttling_logging_rs, (60 - 1) * HZ, 1);
++	ratelimit_state_init(&adev->virt.ras_telemetry_rs, 5 * HZ, 1);
++
+ 	ratelimit_set_flags(&adev->throttling_logging_rs, RATELIMIT_MSG_ON_RELEASE);
++	ratelimit_set_flags(&adev->virt.ras_telemetry_rs, RATELIMIT_MSG_ON_RELEASE);
+ 
+ 	/* Registers mapping */
+ 	/* TODO: block userspace mapping of io register */
+@@ -5186,6 +5189,9 @@ static int amdgpu_device_reset_sriov(struct amdgpu_device *adev,
+ 	    amdgpu_ip_version(adev, GC_HWIP, 0) == IP_VERSION(9, 4, 4) ||
+ 	    amdgpu_ip_version(adev, GC_HWIP, 0) == IP_VERSION(11, 0, 3))
+ 		amdgpu_ras_resume(adev);
++
++	amdgpu_virt_ras_telemetry_post_reset(adev);
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
+index 826a41bd10df..76093793839e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
+@@ -904,6 +904,9 @@ int amdgpu_gfx_ras_late_init(struct amdgpu_device *adev, struct ras_common_if *r
+ 		if (r)
+ 			return r;
+ 
++		if (amdgpu_sriov_vf(adev))
++			return r;
++
+ 		if (adev->gfx.cp_ecc_error_irq.funcs) {
+ 			r = amdgpu_irq_get(adev, &adev->gfx.cp_ecc_error_irq, 0);
+ 			if (r)
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
+index ffc4a1ced672..1bc95b0cdbb8 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
+@@ -1214,6 +1214,42 @@ static void amdgpu_ras_error_generate_report(struct amdgpu_device *adev,
+ 	}
+ }
+ 
++static void amdgpu_ras_virt_error_generate_report(struct amdgpu_device *adev,
++						  struct ras_query_if *query_if,
++						  struct ras_err_data *err_data,
++						  struct ras_query_context *qctx)
++{
++	unsigned long new_ue, new_ce, new_de;
++	struct ras_manager *obj = amdgpu_ras_find_obj(adev, &query_if->head);
++	const char *blk_name = get_ras_block_str(&query_if->head);
++	u64 event_id = qctx->evid.event_id;
++
++	new_ce = err_data->ce_count - obj->err_data.ce_count;
++	new_ue = err_data->ue_count - obj->err_data.ue_count;
++	new_de = err_data->de_count - obj->err_data.de_count;
++
++	if (new_ce) {
++		RAS_EVENT_LOG(adev, event_id, "%lu correctable hardware errors "
++			      "detected in %s block\n",
++			      new_ce,
++			      blk_name);
++	}
++
++	if (new_ue) {
++		RAS_EVENT_LOG(adev, event_id, "%lu uncorrectable hardware errors "
++			      "detected in %s block\n",
++			      new_ue,
++			      blk_name);
++	}
++
++	if (new_de) {
++		RAS_EVENT_LOG(adev, event_id, "%lu deferred hardware errors "
++			      "detected in %s block\n",
++			      new_de,
++			      blk_name);
++	}
++}
++
+ static void amdgpu_rasmgr_error_data_statistic_update(struct ras_manager *obj, struct ras_err_data *err_data)
+ {
+ 	struct ras_err_node *err_node;
+@@ -1237,6 +1273,15 @@ static void amdgpu_rasmgr_error_data_statistic_update(struct ras_manager *obj, s
+ 	}
+ }
+ 
++static void amdgpu_ras_mgr_virt_error_data_statistics_update(struct ras_manager *obj,
++							     struct ras_err_data *err_data)
++{
++	/* Host reports absolute counts */
++	obj->err_data.ue_count = err_data->ue_count;
++	obj->err_data.ce_count = err_data->ce_count;
++	obj->err_data.de_count = err_data->de_count;
++}
++
+ static struct ras_manager *get_ras_manager(struct amdgpu_device *adev, enum amdgpu_ras_block blk)
+ {
+ 	struct ras_common_if head;
+@@ -1323,7 +1368,9 @@ static int amdgpu_ras_query_error_status_helper(struct amdgpu_device *adev,
+ 	if (error_query_mode == AMDGPU_RAS_INVALID_ERROR_QUERY)
+ 		return -EINVAL;
+ 
+-	if (error_query_mode == AMDGPU_RAS_DIRECT_ERROR_QUERY) {
++	if (error_query_mode == AMDGPU_RAS_VIRT_ERROR_COUNT_QUERY) {
++		return amdgpu_virt_req_ras_err_count(adev, blk, err_data);
++	} else if (error_query_mode == AMDGPU_RAS_DIRECT_ERROR_QUERY) {
+ 		if (info->head.block == AMDGPU_RAS_BLOCK__UMC) {
+ 			amdgpu_ras_get_ecc_info(adev, err_data);
+ 		} else {
+@@ -1405,14 +1452,22 @@ static int amdgpu_ras_query_error_status_with_event(struct amdgpu_device *adev,
+ 	if (ret)
+ 		goto out_fini_err_data;
+ 
+-	amdgpu_rasmgr_error_data_statistic_update(obj, &err_data);
++	if (error_query_mode != AMDGPU_RAS_VIRT_ERROR_COUNT_QUERY) {
++		amdgpu_rasmgr_error_data_statistic_update(obj, &err_data);
++		amdgpu_ras_error_generate_report(adev, info, &err_data, &qctx);
++	} else {
++		/* Host provides absolute error counts. First generate the report
++		 * using the previous VF internal count against new host count.
++		 * Then Update VF internal count.
++		 */
++		amdgpu_ras_virt_error_generate_report(adev, info, &err_data, &qctx);
++		amdgpu_ras_mgr_virt_error_data_statistics_update(obj, &err_data);
++	}
+ 
+ 	info->ue_count = obj->err_data.ue_count;
+ 	info->ce_count = obj->err_data.ce_count;
+ 	info->de_count = obj->err_data.de_count;
+ 
+-	amdgpu_ras_error_generate_report(adev, info, &err_data, &qctx);
+-
+ out_fini_err_data:
+ 	amdgpu_ras_error_data_fini(&err_data);
+ 
+@@ -3930,7 +3985,7 @@ int amdgpu_ras_late_init(struct amdgpu_device *adev)
+ 	}
+ 
+ 	/* Guest side doesn't need init ras feature */
+-	if (amdgpu_sriov_vf(adev))
++	if (amdgpu_sriov_vf(adev) && !amdgpu_sriov_ras_telemetry_en(adev))
+ 		return 0;
+ 
+ 	list_for_each_entry_safe(node, tmp, &adev->ras_list, node) {
+@@ -4397,11 +4452,14 @@ bool amdgpu_ras_get_error_query_mode(struct amdgpu_device *adev,
+ 		return false;
+ 	}
+ 
+-	if ((smu_funcs && smu_funcs->set_debug_mode) || (mca_funcs && mca_funcs->mca_set_debug_mode))
++	if (amdgpu_sriov_vf(adev)) {
++		*error_query_mode = AMDGPU_RAS_VIRT_ERROR_COUNT_QUERY;
++	} else if ((smu_funcs && smu_funcs->set_debug_mode) || (mca_funcs && mca_funcs->mca_set_debug_mode)) {
+ 		*error_query_mode =
+ 			(con->is_aca_debug_mode) ? AMDGPU_RAS_DIRECT_ERROR_QUERY : AMDGPU_RAS_FIRMWARE_ERROR_QUERY;
+-	else
++	} else {
+ 		*error_query_mode = AMDGPU_RAS_DIRECT_ERROR_QUERY;
++	}
+ 
+ 	return true;
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.h
+index 871b2d6278e0..6db772ecfee4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.h
+@@ -365,6 +365,7 @@ enum amdgpu_ras_error_query_mode {
+ 	AMDGPU_RAS_INVALID_ERROR_QUERY		= 0,
+ 	AMDGPU_RAS_DIRECT_ERROR_QUERY		= 1,
+ 	AMDGPU_RAS_FIRMWARE_ERROR_QUERY		= 2,
++	AMDGPU_RAS_VIRT_ERROR_COUNT_QUERY	= 3,
+ };
+ 
+ /* ras error status reisger fields */
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_umc.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_umc.c
+index bb7b9b2eaac1..896f3609b0ee 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_umc.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_umc.c
+@@ -318,6 +318,9 @@ int amdgpu_umc_ras_late_init(struct amdgpu_device *adev, struct ras_common_if *r
+ 	if (r)
+ 		return r;
+ 
++	if (amdgpu_sriov_vf(adev))
++		return r;
++
+ 	if (amdgpu_ras_is_supported(adev, ras_block->block)) {
+ 		r = amdgpu_irq_get(adev, &adev->gmc.ecc_irq, 0);
+ 		if (r)
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_virt.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_virt.c
+index 53297c40f09c..c704e9803e11 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_virt.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_virt.c
+@@ -524,6 +524,8 @@ static int amdgpu_virt_read_pf2vf_data(struct amdgpu_device *adev)
+ 		adev->unique_id =
+ 			((struct amd_sriov_msg_pf2vf_info *)pf2vf_info)->uuid;
+ 		adev->virt.ras_en_caps.all = ((struct amd_sriov_msg_pf2vf_info *)pf2vf_info)->ras_en_caps.all;
++		adev->virt.ras_telemetry_en_caps.all =
++			((struct amd_sriov_msg_pf2vf_info *)pf2vf_info)->ras_telemetry_en_caps.all;
+ 		break;
+ 	default:
+ 		dev_err(adev->dev, "invalid pf2vf version: 0x%x\n", pf2vf_info->version);
+@@ -704,6 +706,8 @@ void amdgpu_virt_exchange_data(struct amdgpu_device *adev)
+ 			adev->virt.fw_reserve.p_vf2pf =
+ 				(struct amd_sriov_msg_vf2pf_info_header *)
+ 				(adev->mman.fw_vram_usage_va + (AMD_SRIOV_MSG_VF2PF_OFFSET_KB << 10));
++			adev->virt.fw_reserve.ras_telemetry =
++				(adev->mman.fw_vram_usage_va + (AMD_SRIOV_MSG_RAS_TELEMETRY_OFFSET_KB << 10));
+ 		} else if (adev->mman.drv_vram_usage_va) {
+ 			adev->virt.fw_reserve.p_pf2vf =
+ 				(struct amd_sriov_msg_pf2vf_info_header *)
+@@ -711,6 +715,8 @@ void amdgpu_virt_exchange_data(struct amdgpu_device *adev)
+ 			adev->virt.fw_reserve.p_vf2pf =
+ 				(struct amd_sriov_msg_vf2pf_info_header *)
+ 				(adev->mman.drv_vram_usage_va + (AMD_SRIOV_MSG_VF2PF_OFFSET_KB << 10));
++			adev->virt.fw_reserve.ras_telemetry =
++				(adev->mman.drv_vram_usage_va + (AMD_SRIOV_MSG_RAS_TELEMETRY_OFFSET_KB << 10));
+ 		}
+ 
+ 		amdgpu_virt_read_pf2vf_data(adev);
+@@ -1197,3 +1203,133 @@ bool amdgpu_virt_get_ras_capability(struct amdgpu_device *adev)
+ 
+ 	return true;
+ }
++
++static inline enum amd_sriov_ras_telemetry_gpu_block
++amdgpu_ras_block_to_sriov(struct amdgpu_device *adev, enum amdgpu_ras_block block) {
++	switch (block) {
++	case AMDGPU_RAS_BLOCK__UMC:
++		return RAS_TELEMETRY_GPU_BLOCK_UMC;
++	case AMDGPU_RAS_BLOCK__SDMA:
++		return RAS_TELEMETRY_GPU_BLOCK_SDMA;
++	case AMDGPU_RAS_BLOCK__GFX:
++		return RAS_TELEMETRY_GPU_BLOCK_GFX;
++	case AMDGPU_RAS_BLOCK__MMHUB:
++		return RAS_TELEMETRY_GPU_BLOCK_MMHUB;
++	case AMDGPU_RAS_BLOCK__ATHUB:
++		return RAS_TELEMETRY_GPU_BLOCK_ATHUB;
++	case AMDGPU_RAS_BLOCK__PCIE_BIF:
++		return RAS_TELEMETRY_GPU_BLOCK_PCIE_BIF;
++	case AMDGPU_RAS_BLOCK__HDP:
++		return RAS_TELEMETRY_GPU_BLOCK_HDP;
++	case AMDGPU_RAS_BLOCK__XGMI_WAFL:
++		return RAS_TELEMETRY_GPU_BLOCK_XGMI_WAFL;
++	case AMDGPU_RAS_BLOCK__DF:
++		return RAS_TELEMETRY_GPU_BLOCK_DF;
++	case AMDGPU_RAS_BLOCK__SMN:
++		return RAS_TELEMETRY_GPU_BLOCK_SMN;
++	case AMDGPU_RAS_BLOCK__SEM:
++		return RAS_TELEMETRY_GPU_BLOCK_SEM;
++	case AMDGPU_RAS_BLOCK__MP0:
++		return RAS_TELEMETRY_GPU_BLOCK_MP0;
++	case AMDGPU_RAS_BLOCK__MP1:
++		return RAS_TELEMETRY_GPU_BLOCK_MP1;
++	case AMDGPU_RAS_BLOCK__FUSE:
++		return RAS_TELEMETRY_GPU_BLOCK_FUSE;
++	case AMDGPU_RAS_BLOCK__MCA:
++		return RAS_TELEMETRY_GPU_BLOCK_MCA;
++	case AMDGPU_RAS_BLOCK__VCN:
++		return RAS_TELEMETRY_GPU_BLOCK_VCN;
++	case AMDGPU_RAS_BLOCK__JPEG:
++		return RAS_TELEMETRY_GPU_BLOCK_JPEG;
++	case AMDGPU_RAS_BLOCK__IH:
++		return RAS_TELEMETRY_GPU_BLOCK_IH;
++	case AMDGPU_RAS_BLOCK__MPIO:
++		return RAS_TELEMETRY_GPU_BLOCK_MPIO;
++	default:
++		dev_err(adev->dev, "Unsupported SRIOV RAS telemetry block 0x%x\n", block);
++		return RAS_TELEMETRY_GPU_BLOCK_COUNT;
++	}
++}
++
++static int amdgpu_virt_cache_host_error_counts(struct amdgpu_device *adev,
++					       struct amdsriov_ras_telemetry *host_telemetry)
++{
++	struct amd_sriov_ras_telemetry_error_count *tmp = NULL;
++	uint32_t checksum, used_size;
++
++	checksum = host_telemetry->header.checksum;
++	used_size = host_telemetry->header.used_size;
++
++	if (used_size > (AMD_SRIOV_RAS_TELEMETRY_SIZE_KB << 10))
++		return 0;
++
++	tmp = kmalloc(used_size, GFP_KERNEL);
++	if (!tmp)
++		return -ENOMEM;
++
++	memcpy(tmp, &host_telemetry->body.error_count, used_size);
++
++	if (checksum != amd_sriov_msg_checksum(tmp, used_size, 0, 0))
++		goto out;
++
++	memcpy(&adev->virt.count_cache, tmp,
++	       min(used_size, sizeof(adev->virt.count_cache)));
++out:
++	kfree(tmp);
++
++	return 0;
++}
++
++static int amdgpu_virt_req_ras_err_count_internal(struct amdgpu_device *adev, bool force_update)
++{
++	struct amdgpu_virt *virt = &adev->virt;
++
++	/* Host allows 15 ras telemetry requests per 60 seconds. Afterwhich, the Host
++	 * will ignore incoming guest messages. Ratelimit the guest messages to
++	 * prevent guest self DOS.
++	 */
++	if (__ratelimit(&adev->virt.ras_telemetry_rs) || force_update) {
++		if (!virt->ops->req_ras_err_count(adev))
++			amdgpu_virt_cache_host_error_counts(adev,
++				adev->virt.fw_reserve.ras_telemetry);
++	}
++
++	return 0;
++}
++
++/* Bypass ACA interface and query ECC counts directly from host */
++int amdgpu_virt_req_ras_err_count(struct amdgpu_device *adev, enum amdgpu_ras_block block,
++				  struct ras_err_data *err_data)
++{
++	enum amd_sriov_ras_telemetry_gpu_block sriov_block;
++
++	sriov_block = amdgpu_ras_block_to_sriov(adev, block);
++
++	if (sriov_block >= RAS_TELEMETRY_GPU_BLOCK_COUNT ||
++	    !amdgpu_sriov_ras_telemetry_block_en(adev, sriov_block))
++		return -EOPNOTSUPP;
++
++	/* Host Access may be lost during reset, just return last cached data. */
++	if (down_read_trylock(&adev->reset_domain->sem)) {
++		amdgpu_virt_req_ras_err_count_internal(adev, false);
++		up_read(&adev->reset_domain->sem);
++	}
++
++	err_data->ue_count = adev->virt.count_cache.block[sriov_block].ue_count;
++	err_data->ce_count = adev->virt.count_cache.block[sriov_block].ce_count;
++	err_data->de_count = adev->virt.count_cache.block[sriov_block].de_count;
++
++	return 0;
++}
++
++int amdgpu_virt_ras_telemetry_post_reset(struct amdgpu_device *adev)
++{
++	unsigned long ue_count, ce_count;
++
++	if (amdgpu_sriov_ras_telemetry_en(adev)) {
++		amdgpu_virt_req_ras_err_count_internal(adev, true);
++		amdgpu_ras_query_error_count(adev, &ce_count, &ue_count, NULL);
++	}
++
++	return 0;
++}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_virt.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_virt.h
+index f0ff84add692..5381b8d596e6 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_virt.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_virt.h
+@@ -104,6 +104,7 @@ struct amdgpu_virt_ops {
+ struct amdgpu_virt_fw_reserve {
+ 	struct amd_sriov_msg_pf2vf_info_header *p_pf2vf;
+ 	struct amd_sriov_msg_vf2pf_info_header *p_vf2pf;
++	void *ras_telemetry;
+ 	unsigned int checksum_key;
+ };
+ 
+@@ -138,6 +139,7 @@ enum AMDGIM_FEATURE_FLAG {
+ 	/* MES info */
+ 	AMDGIM_FEATURE_MES_INFO_ENABLE = (1 << 8),
+ 	AMDGIM_FEATURE_RAS_CAPS = (1 << 9),
++	AMDGIM_FEATURE_RAS_TELEMETRY = (1 << 10),
+ };
+ 
+ enum AMDGIM_REG_ACCESS_FLAG {
+@@ -280,6 +282,10 @@ struct amdgpu_virt {
+ 	struct mutex rlcg_reg_lock;
+ 
+ 	union amd_sriov_ras_caps ras_en_caps;
++	union amd_sriov_ras_caps ras_telemetry_en_caps;
++
++	struct ratelimit_state ras_telemetry_rs;
++	struct amd_sriov_ras_telemetry_error_count count_cache;
+ };
+ 
+ struct amdgpu_video_codec_info;
+@@ -327,6 +333,12 @@ struct amdgpu_video_codec_info;
+ #define amdgpu_sriov_ras_caps_en(adev) \
+ ((adev)->virt.gim_feature & AMDGIM_FEATURE_RAS_CAPS)
+ 
++#define amdgpu_sriov_ras_telemetry_en(adev) \
++(((adev)->virt.gim_feature & AMDGIM_FEATURE_RAS_TELEMETRY) && (adev)->virt.fw_reserve.ras_telemetry)
++
++#define amdgpu_sriov_ras_telemetry_block_en(adev, sriov_blk) \
++(amdgpu_sriov_ras_telemetry_en((adev)) && (adev)->virt.ras_telemetry_en_caps.all & BIT(sriov_blk))
++
+ static inline bool is_virtual_machine(void)
+ {
+ #if defined(CONFIG_X86)
+@@ -391,4 +403,7 @@ bool amdgpu_virt_get_rlcg_reg_access_flag(struct amdgpu_device *adev,
+ 					  bool write, u32 *rlcg_flag);
+ u32 amdgpu_virt_rlcg_reg_rw(struct amdgpu_device *adev, u32 offset, u32 v, u32 flag, u32 xcc_id);
+ bool amdgpu_virt_get_ras_capability(struct amdgpu_device *adev);
++int amdgpu_virt_req_ras_err_count(struct amdgpu_device *adev, enum amdgpu_ras_block block,
++				  struct ras_err_data *err_data);
++int amdgpu_virt_ras_telemetry_post_reset(struct amdgpu_device *adev);
+ #endif
+-- 
+2.52.0
+

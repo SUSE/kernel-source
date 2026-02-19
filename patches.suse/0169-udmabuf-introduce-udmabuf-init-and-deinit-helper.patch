@@ -1,0 +1,129 @@
+From 5d8157961fd183ce2a9be1f4fd9c775ae9e94536 Mon Sep 17 00:00:00 2001
+From: Huan Yang <link@vivo.com>
+Date: Wed, 18 Sep 2024 10:52:28 +0800
+Subject: udmabuf: introduce udmabuf init and deinit helper
+Git-commit: 5d8157961fd183ce2a9be1f4fd9c775ae9e94536
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+After udmabuf is allocated, its resources need to be initialized,
+including various array structures. The current array structure has
+already been greatly expanded.
+
+Also, before udmabuf needs to be kfree, the occupied resources need to
+be released.
+
+This part is repetitive and maybe overlooked.
+
+This patch give a helper function when init and deinit, by this,
+reduce duplicate code.
+
+Signed-off-by: Huan Yang <link@vivo.com>
+Acked-by: Vivek Kasireddy <vivek.kasireddy@intel.com>
+Signed-off-by: Vivek Kasireddy <vivek.kasireddy@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20240918025238.2957823-6-link@vivo.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/dma-buf/udmabuf.c | 52 +++++++++++++++++++++++----------------
+ 1 file changed, 31 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/dma-buf/udmabuf.c b/drivers/dma-buf/udmabuf.c
+index 9d58c045b8eb..40ebff2c77f4 100644
+--- a/drivers/dma-buf/udmabuf.c
++++ b/drivers/dma-buf/udmabuf.c
+@@ -224,6 +224,28 @@ static int add_to_unpin_list(struct list_head *unpin_list,
+ 	return 0;
+ }
+ 
++static __always_inline int init_udmabuf(struct udmabuf *ubuf, pgoff_t pgcnt)
++{
++	INIT_LIST_HEAD(&ubuf->unpin_list);
++
++	ubuf->folios = kvmalloc_array(pgcnt, sizeof(*ubuf->folios), GFP_KERNEL);
++	if (!ubuf->folios)
++		return -ENOMEM;
++
++	ubuf->offsets = kvcalloc(pgcnt, sizeof(*ubuf->offsets), GFP_KERNEL);
++	if (!ubuf->offsets)
++		return -ENOMEM;
++
++	return 0;
++}
++
++static __always_inline void deinit_udmabuf(struct udmabuf *ubuf)
++{
++	unpin_all_folios(&ubuf->unpin_list);
++	kvfree(ubuf->offsets);
++	kvfree(ubuf->folios);
++}
++
+ static void release_udmabuf(struct dma_buf *buf)
+ {
+ 	struct udmabuf *ubuf = buf->priv;
+@@ -232,9 +254,7 @@ static void release_udmabuf(struct dma_buf *buf)
+ 	if (ubuf->sg)
+ 		put_sg_table(dev, ubuf->sg, DMA_BIDIRECTIONAL);
+ 
+-	unpin_all_folios(&ubuf->unpin_list);
+-	kvfree(ubuf->offsets);
+-	kvfree(ubuf->folios);
++	deinit_udmabuf(ubuf);
+ 	kfree(ubuf);
+ }
+ 
+@@ -392,33 +412,24 @@ static long udmabuf_create(struct miscdevice *device,
+ 	if (!ubuf)
+ 		return -ENOMEM;
+ 
+-	INIT_LIST_HEAD(&ubuf->unpin_list);
+ 	pglimit = (size_limit_mb * 1024 * 1024) >> PAGE_SHIFT;
+ 	for (i = 0; i < head->count; i++) {
+ 		if (!PAGE_ALIGNED(list[i].offset))
+-			goto err;
++			goto err_noinit;
+ 		if (!PAGE_ALIGNED(list[i].size))
+-			goto err;
++			goto err_noinit;
+ 
+ 		pgcnt += list[i].size >> PAGE_SHIFT;
+ 		if (pgcnt > pglimit)
+-			goto err;
++			goto err_noinit;
+ 	}
+ 
+ 	if (!pgcnt)
+-		goto err;
++		goto err_noinit;
+ 
+-	ubuf->folios = kvmalloc_array(pgcnt, sizeof(*ubuf->folios), GFP_KERNEL);
+-	if (!ubuf->folios) {
+-		ret = -ENOMEM;
++	ret = init_udmabuf(ubuf, pgcnt);
++	if (ret)
+ 		goto err;
+-	}
+-
+-	ubuf->offsets = kvcalloc(pgcnt, sizeof(*ubuf->offsets), GFP_KERNEL);
+-	if (!ubuf->offsets) {
+-		ret = -ENOMEM;
+-		goto err;
+-	}
+ 
+ 	for (i = 0; i < head->count; i++) {
+ 		struct file *memfd = fget(list[i].memfd);
+@@ -449,9 +460,8 @@ static long udmabuf_create(struct miscdevice *device,
+ 	return ret;
+ 
+ err:
+-	unpin_all_folios(&ubuf->unpin_list);
+-	kvfree(ubuf->offsets);
+-	kvfree(ubuf->folios);
++	deinit_udmabuf(ubuf);
++err_noinit:
+ 	kfree(ubuf);
+ 	return ret;
+ }
+-- 
+2.52.0
+

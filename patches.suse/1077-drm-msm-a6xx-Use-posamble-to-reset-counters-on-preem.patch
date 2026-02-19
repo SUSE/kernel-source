@@ -1,0 +1,191 @@
+From 50117cad0c50410cff0d43a1141a562b1347e7c5 Mon Sep 17 00:00:00 2001
+From: Antonino Maniscalco <antomani103@gmail.com>
+Date: Thu, 3 Oct 2024 18:12:57 +0200
+Subject: drm/msm/a6xx: Use posamble to reset counters on preemption
+Git-commit: 50117cad0c50410cff0d43a1141a562b1347e7c5
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Use the postamble to reset perf counters when switching between rings,
+except when sysprof is enabled, analogously to how they are reset
+between submissions when switching pagetables.
+
+Reviewed-by: Akhil P Oommen <quic_akhilpo@quicinc.com>
+Tested-by: Rob Clark <robdclark@gmail.com>
+Tested-by: Neil Armstrong <neil.armstrong@linaro.org> # on SM8650-QRD
+Tested-by: Neil Armstrong <neil.armstrong@linaro.org> # on SM8550-QRD
+Tested-by: Neil Armstrong <neil.armstrong@linaro.org> # on SM8450-HDK
+Signed-off-by: Antonino Maniscalco <antomani103@gmail.com>
+Patchwork: https://patchwork.freedesktop.org/patch/618024/
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/msm/adreno/a6xx_gpu.c     | 12 +++++
+ drivers/gpu/drm/msm/adreno/a6xx_gpu.h     |  6 +++
+ drivers/gpu/drm/msm/adreno/a6xx_preempt.c | 58 +++++++++++++++++++++++
+ drivers/gpu/drm/msm/adreno/adreno_gpu.h   |  7 ++-
+ 4 files changed, 81 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
+index 9748e1fe19af..fa55320d63b5 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
+@@ -290,6 +290,8 @@ static void a6xx_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit)
+ static void a6xx_emit_set_pseudo_reg(struct msm_ringbuffer *ring,
+ 		struct a6xx_gpu *a6xx_gpu, struct msm_gpu_submitqueue *queue)
+ {
++	u64 preempt_postamble;
++
+ 	OUT_PKT7(ring, CP_SET_PSEUDO_REG, 12);
+ 
+ 	OUT_RING(ring, SMMU_INFO);
+@@ -313,6 +315,16 @@ static void a6xx_emit_set_pseudo_reg(struct msm_ringbuffer *ring,
+ 	/* seems OK to set to 0 to disable it */
+ 	OUT_RING(ring, 0);
+ 	OUT_RING(ring, 0);
++
++	/* Emit postamble to clear perfcounters */
++	preempt_postamble = a6xx_gpu->preempt_postamble_iova;
++
++	OUT_PKT7(ring, CP_SET_AMBLE, 3);
++	OUT_RING(ring, lower_32_bits(preempt_postamble));
++	OUT_RING(ring, upper_32_bits(preempt_postamble));
++	OUT_RING(ring, CP_SET_AMBLE_2_DWORDS(
++				 a6xx_gpu->preempt_postamble_len) |
++			 CP_SET_AMBLE_2_TYPE(KMD_AMBLE_TYPE));
+ }
+ 
+ static void a7xx_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit)
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gpu.h b/drivers/gpu/drm/msm/adreno/a6xx_gpu.h
+index 66181d163a61..4aceffb6aae8 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gpu.h
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gpu.h
+@@ -71,6 +71,12 @@ struct a6xx_gpu {
+ 	bool uses_gmem;
+ 	bool skip_save_restore;
+ 
++	struct drm_gem_object *preempt_postamble_bo;
++	void *preempt_postamble_ptr;
++	uint64_t preempt_postamble_iova;
++	uint64_t preempt_postamble_len;
++	bool postamble_enabled;
++
+ 	struct a6xx_gmu gmu;
+ 
+ 	struct drm_gem_object *shadow_bo;
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_preempt.c b/drivers/gpu/drm/msm/adreno/a6xx_preempt.c
+index fd2a90360740..21e333cb6342 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_preempt.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_preempt.c
+@@ -97,6 +97,43 @@ static void a6xx_preempt_timer(struct timer_list *t)
+ 	kthread_queue_work(gpu->worker, &gpu->recover_work);
+ }
+ 
++static void preempt_prepare_postamble(struct a6xx_gpu *a6xx_gpu)
++{
++	u32 *postamble = a6xx_gpu->preempt_postamble_ptr;
++	u32 count = 0;
++
++	postamble[count++] = PKT7(CP_REG_RMW, 3);
++	postamble[count++] = REG_A6XX_RBBM_PERFCTR_SRAM_INIT_CMD;
++	postamble[count++] = 0;
++	postamble[count++] = 1;
++
++	postamble[count++] = PKT7(CP_WAIT_REG_MEM, 6);
++	postamble[count++] = CP_WAIT_REG_MEM_0_FUNCTION(WRITE_EQ);
++	postamble[count++] = CP_WAIT_REG_MEM_1_POLL_ADDR_LO(
++				REG_A6XX_RBBM_PERFCTR_SRAM_INIT_STATUS);
++	postamble[count++] = CP_WAIT_REG_MEM_2_POLL_ADDR_HI(0);
++	postamble[count++] = CP_WAIT_REG_MEM_3_REF(0x1);
++	postamble[count++] = CP_WAIT_REG_MEM_4_MASK(0x1);
++	postamble[count++] = CP_WAIT_REG_MEM_5_DELAY_LOOP_CYCLES(0);
++
++	a6xx_gpu->preempt_postamble_len = count;
++
++	a6xx_gpu->postamble_enabled = true;
++}
++
++static void preempt_disable_postamble(struct a6xx_gpu *a6xx_gpu)
++{
++	u32 *postamble = a6xx_gpu->preempt_postamble_ptr;
++
++	/*
++	 * Disable the postamble by replacing the first packet header with a NOP
++	 * that covers the whole buffer.
++	 */
++	*postamble = PKT7(CP_NOP, (a6xx_gpu->preempt_postamble_len - 1));
++
++	a6xx_gpu->postamble_enabled = false;
++}
++
+ void a6xx_preempt_irq(struct msm_gpu *gpu)
+ {
+ 	uint32_t status;
+@@ -187,6 +224,7 @@ void a6xx_preempt_trigger(struct msm_gpu *gpu)
+ 	unsigned long flags;
+ 	struct msm_ringbuffer *ring;
+ 	unsigned int cntl;
++	bool sysprof;
+ 
+ 	if (gpu->nr_rings == 1)
+ 		return;
+@@ -271,6 +309,15 @@ void a6xx_preempt_trigger(struct msm_gpu *gpu)
+ 	/* Start a timer to catch a stuck preemption */
+ 	mod_timer(&a6xx_gpu->preempt_timer, jiffies + msecs_to_jiffies(10000));
+ 
++	/* Enable or disable postamble as needed */
++	sysprof = refcount_read(&a6xx_gpu->base.base.sysprof_active) > 1;
++
++	if (!sysprof && !a6xx_gpu->postamble_enabled)
++		preempt_prepare_postamble(a6xx_gpu);
++
++	if (sysprof && a6xx_gpu->postamble_enabled)
++		preempt_disable_postamble(a6xx_gpu);
++
+ 	/* Set the preemption state to triggered */
+ 	set_preempt_state(a6xx_gpu, PREEMPT_TRIGGERED);
+ 
+@@ -375,6 +422,17 @@ void a6xx_preempt_init(struct msm_gpu *gpu)
+ 	a6xx_gpu->uses_gmem = 1;
+ 	a6xx_gpu->skip_save_restore = 1;
+ 
++	a6xx_gpu->preempt_postamble_ptr  = msm_gem_kernel_new(gpu->dev,
++			PAGE_SIZE,
++			MSM_BO_WC | MSM_BO_MAP_PRIV | MSM_BO_GPU_READONLY,
++			gpu->aspace, &a6xx_gpu->preempt_postamble_bo,
++			&a6xx_gpu->preempt_postamble_iova);
++
++	preempt_prepare_postamble(a6xx_gpu);
++
++	if (IS_ERR(a6xx_gpu->preempt_postamble_ptr))
++		goto fail;
++
+ 	timer_setup(&a6xx_gpu->preempt_timer, a6xx_preempt_timer, 0);
+ 
+ 	return;
+diff --git a/drivers/gpu/drm/msm/adreno/adreno_gpu.h b/drivers/gpu/drm/msm/adreno/adreno_gpu.h
+index ca8812c88a6b..0f79d2ad515e 100644
+--- a/drivers/gpu/drm/msm/adreno/adreno_gpu.h
++++ b/drivers/gpu/drm/msm/adreno/adreno_gpu.h
+@@ -670,12 +670,15 @@ OUT_PKT4(struct msm_ringbuffer *ring, uint16_t regindx, uint16_t cnt)
+ 	OUT_RING(ring, PKT4(regindx, cnt));
+ }
+ 
++#define PKT7(opcode, cnt) \
++	(CP_TYPE7_PKT | (cnt << 0) | (PM4_PARITY(cnt) << 15) | \
++		((opcode & 0x7F) << 16) | (PM4_PARITY(opcode) << 23))
++
+ static inline void
+ OUT_PKT7(struct msm_ringbuffer *ring, uint8_t opcode, uint16_t cnt)
+ {
+ 	adreno_wait_ring(ring, cnt + 1);
+-	OUT_RING(ring, CP_TYPE7_PKT | (cnt << 0) | (PM4_PARITY(cnt) << 15) |
+-		((opcode & 0x7F) << 16) | (PM4_PARITY(opcode) << 23));
++	OUT_RING(ring, PKT7(opcode, cnt));
+ }
+ 
+ struct msm_gpu *a2xx_gpu_init(struct drm_device *dev);
+-- 
+2.52.0
+

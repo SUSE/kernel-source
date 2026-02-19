@@ -1,0 +1,213 @@
+From 1e4acf4d93cdc3ffae1b835e304a3f491e4d363e Mon Sep 17 00:00:00 2001
+From: Lijo Lazar <lijo.lazar@amd.com>
+Date: Wed, 21 Aug 2024 11:40:16 +0530
+Subject: drm/amdgpu: Add reset on init handler for XGMI
+Git-commit: 1e4acf4d93cdc3ffae1b835e304a3f491e4d363e
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+In some cases, device needs to be reset before first use. Add handlers
+for doing device reset during driver init sequence.
+
+Signed-off-by: Lijo Lazar <lijo.lazar@amd.com>
+Reviewed-by: Feifei Xu <feifxu@amd.com>
+Acked-by: Rajneesh Bhardwaj <rajneesh.bhardwaj@amd.com>
+Tested-by: Rajneesh Bhardwaj <rajneesh.bhardwaj@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h       |   1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_reset.c | 149 ++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_reset.h |   5 +
+ 3 files changed, 155 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index ad1112ec033d..dd5539911af2 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -566,6 +566,7 @@ enum amd_reset_method {
+ 	AMD_RESET_METHOD_MODE2,
+ 	AMD_RESET_METHOD_BACO,
+ 	AMD_RESET_METHOD_PCI,
++	AMD_RESET_METHOD_ON_INIT,
+ };
+ 
+ struct amdgpu_video_codec_info {
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_reset.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_reset.c
+index 66c1a868c0e1..f35fcb46861e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_reset.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_reset.c
+@@ -26,6 +26,155 @@
+ #include "sienna_cichlid.h"
+ #include "smu_v13_0_10.h"
+ 
++static int amdgpu_reset_xgmi_reset_on_init_suspend(struct amdgpu_device *adev)
++{
++	int i, r;
++
++	for (i = adev->num_ip_blocks - 1; i >= 0; i--) {
++		if (!adev->ip_blocks[i].status.valid)
++			continue;
++		if (!adev->ip_blocks[i].status.hw)
++			continue;
++		/* displays are handled in phase1 */
++		if (adev->ip_blocks[i].version->type == AMD_IP_BLOCK_TYPE_DCE)
++			continue;
++
++		/* XXX handle errors */
++		r = adev->ip_blocks[i].version->funcs->suspend(adev);
++		/* XXX handle errors */
++		if (r) {
++			dev_err(adev->dev, "suspend of IP block <%s> failed %d",
++				adev->ip_blocks[i].version->funcs->name, r);
++		}
++		adev->ip_blocks[i].status.hw = false;
++	}
++
++	return 0;
++}
++
++static int amdgpu_reset_xgmi_reset_on_init_prep_hwctxt(
++	struct amdgpu_reset_control *reset_ctl,
++	struct amdgpu_reset_context *reset_context)
++{
++	struct list_head *reset_device_list = reset_context->reset_device_list;
++	struct amdgpu_device *tmp_adev;
++	int r;
++
++	list_for_each_entry(tmp_adev, reset_device_list, reset_list) {
++		amdgpu_unregister_gpu_instance(tmp_adev);
++		r = amdgpu_reset_xgmi_reset_on_init_suspend(tmp_adev);
++		if (r) {
++			dev_err(tmp_adev->dev,
++				"xgmi reset on init: prepare for reset failed");
++			return r;
++		}
++	}
++
++	return r;
++}
++
++static int amdgpu_reset_xgmi_reset_on_init_restore_hwctxt(
++	struct amdgpu_reset_control *reset_ctl,
++	struct amdgpu_reset_context *reset_context)
++{
++	struct list_head *reset_device_list = reset_context->reset_device_list;
++	struct amdgpu_device *tmp_adev = NULL;
++	int r;
++
++	r = amdgpu_device_reinit_after_reset(reset_context);
++	if (r)
++		return r;
++	list_for_each_entry(tmp_adev, reset_device_list, reset_list) {
++		if (!tmp_adev->kfd.init_complete) {
++			kgd2kfd_init_zone_device(tmp_adev);
++			amdgpu_amdkfd_device_init(tmp_adev);
++			amdgpu_amdkfd_drm_client_create(tmp_adev);
++		}
++	}
++
++	return r;
++}
++
++static int amdgpu_reset_xgmi_reset_on_init_perform_reset(
++	struct amdgpu_reset_control *reset_ctl,
++	struct amdgpu_reset_context *reset_context)
++{
++	struct amdgpu_device *adev = (struct amdgpu_device *)reset_ctl->handle;
++	struct list_head *reset_device_list = reset_context->reset_device_list;
++	struct amdgpu_device *tmp_adev = NULL;
++	int r;
++
++	dev_dbg(adev->dev, "xgmi roi - hw reset\n");
++
++	list_for_each_entry(tmp_adev, reset_device_list, reset_list) {
++		mutex_lock(&tmp_adev->reset_cntl->reset_lock);
++		tmp_adev->reset_cntl->active_reset =
++			amdgpu_asic_reset_method(adev);
++	}
++	r = 0;
++	/* Mode1 reset needs to be triggered on all devices together */
++	list_for_each_entry(tmp_adev, reset_device_list, reset_list) {
++		/* For XGMI run all resets in parallel to speed up the process */
++		if (!queue_work(system_unbound_wq, &tmp_adev->xgmi_reset_work))
++			r = -EALREADY;
++		if (r) {
++			dev_err(tmp_adev->dev,
++				"xgmi reset on init: reset failed with error, %d",
++				r);
++			break;
++		}
++	}
++
++	/* For XGMI wait for all resets to complete before proceed */
++	if (!r) {
++		list_for_each_entry(tmp_adev, reset_device_list, reset_list) {
++			flush_work(&tmp_adev->xgmi_reset_work);
++			r = tmp_adev->asic_reset_res;
++			if (r)
++				break;
++		}
++	}
++
++	list_for_each_entry(tmp_adev, reset_device_list, reset_list) {
++		mutex_unlock(&tmp_adev->reset_cntl->reset_lock);
++		tmp_adev->reset_cntl->active_reset = AMD_RESET_METHOD_NONE;
++	}
++
++	return r;
++}
++
++int amdgpu_reset_do_xgmi_reset_on_init(
++	struct amdgpu_reset_context *reset_context)
++{
++	struct list_head *reset_device_list = reset_context->reset_device_list;
++	struct amdgpu_device *adev;
++	int r;
++
++	if (!reset_device_list || list_empty(reset_device_list) ||
++	    list_is_singular(reset_device_list))
++		return -EINVAL;
++
++	adev = list_first_entry(reset_device_list, struct amdgpu_device,
++				reset_list);
++	r = amdgpu_reset_prepare_hwcontext(adev, reset_context);
++	if (r)
++		return r;
++
++	r = amdgpu_reset_perform_reset(adev, reset_context);
++
++	return r;
++}
++
++struct amdgpu_reset_handler xgmi_reset_on_init_handler = {
++	.reset_method = AMD_RESET_METHOD_ON_INIT,
++	.prepare_env = NULL,
++	.prepare_hwcontext = amdgpu_reset_xgmi_reset_on_init_prep_hwctxt,
++	.perform_reset = amdgpu_reset_xgmi_reset_on_init_perform_reset,
++	.restore_hwcontext = amdgpu_reset_xgmi_reset_on_init_restore_hwctxt,
++	.restore_env = NULL,
++	.do_reset = NULL,
++};
++
+ int amdgpu_reset_init(struct amdgpu_device *adev)
+ {
+ 	int ret = 0;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_reset.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_reset.h
+index 1cb920abc2fe..f8628bc898df 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_reset.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_reset.h
+@@ -153,4 +153,9 @@ void amdgpu_reset_get_desc(struct amdgpu_reset_context *rst_ctxt, char *buf,
+ 	for (i = 0; (i < AMDGPU_RESET_MAX_HANDLERS) &&           \
+ 		    (handler = (*reset_ctl->reset_handlers)[i]); \
+ 	     ++i)
++
++extern struct amdgpu_reset_handler xgmi_reset_on_init_handler;
++int amdgpu_reset_do_xgmi_reset_on_init(
++	struct amdgpu_reset_context *reset_context);
++
+ #endif
+-- 
+2.52.0
+

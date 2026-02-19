@@ -1,0 +1,95 @@
+From 9d5a05f86d2f4f81abcac6abc856c0d511a8607b Mon Sep 17 00:00:00 2001
+From: Suraj Kandpal <suraj.kandpal@intel.com>
+Date: Fri, 27 Sep 2024 11:34:37 +0530
+Subject: drm/i915/hdcp: Retry first read and writes to downstream
+Git-commit: 9d5a05f86d2f4f81abcac6abc856c0d511a8607b
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Retry the first read and write to downstream at least 10 times
+with a 50ms delay if not hdcp2 capable(dock decides to stop advertising
+hdcp2 capability for some reason). The reason being that
+during suspend resume Dock usually keep the HDCP2 registers inaccesible
+causing AUX error. This wouldn't be a big problem if the userspace
+just kept retrying with some delay while it continues to play low
+values content but most userpace applications end up throwing an error
+when it receives one from KMD. This makes sure we give the dock
+and the sink devices to complete its power cycle and then try HDCP
+authentication.
+
+--v2
+-Add more details in comment [Jani]
+-fix looping condition [Jani]
+-optimize loop exit condition [Jani]
+
+--v3
+-Add comment explaining why the loop was added [Ankit]
+
+Signed-off-by: Suraj Kandpal <suraj.kandpal@intel.com>
+Reviewed-by: Ankit Nautiyal <ankit.k.nautiyal@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20240927060437.1422942-2-suraj.kandpal@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/intel_hdcp.c | 37 ++++++++++++++++++-----
+ 1 file changed, 30 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_hdcp.c b/drivers/gpu/drm/i915/display/intel_hdcp.c
+index cad309602617..ed6aa87403e2 100644
+--- a/drivers/gpu/drm/i915/display/intel_hdcp.c
++++ b/drivers/gpu/drm/i915/display/intel_hdcp.c
+@@ -1513,7 +1513,7 @@ static int hdcp2_authentication_key_exchange(struct intel_connector *connector)
+ 	} msgs;
+ 	const struct intel_hdcp_shim *shim = hdcp->shim;
+ 	size_t size;
+-	int ret;
++	int ret, i;
+ 
+ 	/* Init for seq_num */
+ 	hdcp->seq_num_v = 0;
+@@ -1523,13 +1523,36 @@ static int hdcp2_authentication_key_exchange(struct intel_connector *connector)
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	ret = shim->write_2_2_msg(connector, &msgs.ake_init,
+-				  sizeof(msgs.ake_init));
+-	if (ret < 0)
+-		return ret;
++	/*
++	 * Retry the first read and write to downstream at least 10 times
++	 * with a 50ms delay if not hdcp2 capable(dock decides to stop advertising
++	 * hdcp2 capability for some reason). The reason being that
++	 * during suspend resume dock usually keeps the HDCP2 registers inaccesible
++	 * causing AUX error. This wouldn't be a big problem if the userspace
++	 * just kept retrying with some delay while it continues to play low
++	 * value content but most userpace applications end up throwing an error
++	 * when it receives one from KMD. This makes sure we give the dock
++	 * and the sink devices to complete its power cycle and then try HDCP
++	 * authentication. The values of 10 and delay of 50ms was decided based
++	 * on multiple trial and errors.
++	 */
++	for (i = 0; i < 10; i++) {
++		if (!intel_hdcp2_get_capability(connector)) {
++			msleep(50);
++			continue;
++		}
++
++		ret = shim->write_2_2_msg(connector, &msgs.ake_init,
++					  sizeof(msgs.ake_init));
++		if (ret < 0)
++			continue;
++
++		ret = shim->read_2_2_msg(connector, HDCP_2_2_AKE_SEND_CERT,
++					 &msgs.send_cert, sizeof(msgs.send_cert));
++		if (ret > 0)
++			break;
++	}
+ 
+-	ret = shim->read_2_2_msg(connector, HDCP_2_2_AKE_SEND_CERT,
+-				 &msgs.send_cert, sizeof(msgs.send_cert));
+ 	if (ret < 0)
+ 		return ret;
+ 
+-- 
+2.52.0
+

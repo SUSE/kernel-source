@@ -1,0 +1,212 @@
+From 70ec2e8be72c8cb71eb6a18f223484d2a39b708f Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Wed, 20 Nov 2024 18:41:20 +0200
+Subject: drm/i915/dsb: Don't use indexed register writes needlessly
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 70ec2e8be72c8cb71eb6a18f223484d2a39b708f
+Patch-mainline: v6.13-rc3
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Turns out the DSB indexed register write command has
+rather significant initial overhead compared to the normal
+MMIO write command. Based on some quick experiments on TGL
+you have to write the register at least ~5 times for the
+indexed write command to come out ahead. If you write the
+register less times than that the MMIO write is faster.
+
+So it seems my automagic indexed write logic was a bit
+misguided. Go back to the original approach only use
+indexed writes for the cases we know will benefit from
+it (indexed LUT register updates).
+
+Currently we shouldn't have any cases where this truly
+matters (just some rare double writes to the precision
+LUT index registers), but we will need to switch the
+legacy LUT updates to write each LUT register twice (to
+avoid some palette anti-collision logic troubles).
+This would be close to the worst case for using indexed
+writes (two writes per register, and 256 separate registers).
+Using the MMIO write command should shave off around 30%
+of the execution time compared to using the indexed write
+command.
+
+Cc: stable@vger.kernel.org
+Fixes: 34d8311f4a1c ("drm/i915/dsb: Re-instate DSB for LUT updates")
+Fixes: 25ea3411bd23 ("drm/i915/dsb: Use non-posted register writes for legacy LUT")
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241120164123.12706-2-ville.syrjala@linux.intel.com
+Reviewed-by: Uma Shankar <uma.shankar@intel.com>
+(cherry picked from commit ecba559a88ab8399a41893d7828caf4dccbeab6c)
+
+Signed-off-by: Tvrtko Ursulin <tursulin@ursulin.net>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/intel_color.c | 51 +++++++++++++---------
+ drivers/gpu/drm/i915/display/intel_dsb.c   | 19 ++++++--
+ drivers/gpu/drm/i915/display/intel_dsb.h   |  2 +
+ 3 files changed, 49 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_color.c b/drivers/gpu/drm/i915/display/intel_color.c
+index 174753625bca..6ea3d5c58cb1 100644
+--- a/drivers/gpu/drm/i915/display/intel_color.c
++++ b/drivers/gpu/drm/i915/display/intel_color.c
+@@ -1343,6 +1343,17 @@ static void ilk_lut_write(const struct intel_crtc_state *crtc_state,
+ 		intel_de_write_fw(display, reg, val);
+ }
+ 
++static void ilk_lut_write_indexed(const struct intel_crtc_state *crtc_state,
++				  i915_reg_t reg, u32 val)
++{
++	struct intel_display *display = to_intel_display(crtc_state);
++
++	if (crtc_state->dsb_color_vblank)
++		intel_dsb_reg_write_indexed(crtc_state->dsb_color_vblank, reg, val);
++	else
++		intel_de_write_fw(display, reg, val);
++}
++
+ static void ilk_load_lut_8(const struct intel_crtc_state *crtc_state,
+ 			   const struct drm_property_blob *blob)
+ {
+@@ -1458,8 +1469,8 @@ static void bdw_load_lut_10(const struct intel_crtc_state *crtc_state,
+ 		      prec_index);
+ 
+ 	for (i = 0; i < lut_size; i++)
+-		ilk_lut_write(crtc_state, PREC_PAL_DATA(pipe),
+-			      ilk_lut_10(&lut[i]));
++		ilk_lut_write_indexed(crtc_state, PREC_PAL_DATA(pipe),
++				      ilk_lut_10(&lut[i]));
+ 
+ 	/*
+ 	 * Reset the index, otherwise it prevents the legacy palette to be
+@@ -1612,16 +1623,16 @@ static void glk_load_degamma_lut(const struct intel_crtc_state *crtc_state,
+ 		 * ToDo: Extend to max 7.0. Enable 32 bit input value
+ 		 * as compared to just 16 to achieve this.
+ 		 */
+-		ilk_lut_write(crtc_state, PRE_CSC_GAMC_DATA(pipe),
+-			      DISPLAY_VER(display) >= 14 ?
+-			      mtl_degamma_lut(&lut[i]) : glk_degamma_lut(&lut[i]));
++		ilk_lut_write_indexed(crtc_state, PRE_CSC_GAMC_DATA(pipe),
++				      DISPLAY_VER(display) >= 14 ?
++				      mtl_degamma_lut(&lut[i]) : glk_degamma_lut(&lut[i]));
+ 	}
+ 
+ 	/* Clamp values > 1.0. */
+ 	while (i++ < glk_degamma_lut_size(display))
+-		ilk_lut_write(crtc_state, PRE_CSC_GAMC_DATA(pipe),
+-			      DISPLAY_VER(display) >= 14 ?
+-			      1 << 24 : 1 << 16);
++		ilk_lut_write_indexed(crtc_state, PRE_CSC_GAMC_DATA(pipe),
++				      DISPLAY_VER(display) >= 14 ?
++				      1 << 24 : 1 << 16);
+ 
+ 	ilk_lut_write(crtc_state, PRE_CSC_GAMC_INDEX(pipe), 0);
+ }
+@@ -1687,10 +1698,10 @@ icl_program_gamma_superfine_segment(const struct intel_crtc_state *crtc_state)
+ 	for (i = 0; i < 9; i++) {
+ 		const struct drm_color_lut *entry = &lut[i];
+ 
+-		ilk_lut_write(crtc_state, PREC_PAL_MULTI_SEG_DATA(pipe),
+-			      ilk_lut_12p4_ldw(entry));
+-		ilk_lut_write(crtc_state, PREC_PAL_MULTI_SEG_DATA(pipe),
+-			      ilk_lut_12p4_udw(entry));
++		ilk_lut_write_indexed(crtc_state, PREC_PAL_MULTI_SEG_DATA(pipe),
++				      ilk_lut_12p4_ldw(entry));
++		ilk_lut_write_indexed(crtc_state, PREC_PAL_MULTI_SEG_DATA(pipe),
++				      ilk_lut_12p4_udw(entry));
+ 	}
+ 
+ 	ilk_lut_write(crtc_state, PREC_PAL_MULTI_SEG_INDEX(pipe),
+@@ -1726,10 +1737,10 @@ icl_program_gamma_multi_segment(const struct intel_crtc_state *crtc_state)
+ 	for (i = 1; i < 257; i++) {
+ 		entry = &lut[i * 8];
+ 
+-		ilk_lut_write(crtc_state, PREC_PAL_DATA(pipe),
+-			      ilk_lut_12p4_ldw(entry));
+-		ilk_lut_write(crtc_state, PREC_PAL_DATA(pipe),
+-			      ilk_lut_12p4_udw(entry));
++		ilk_lut_write_indexed(crtc_state, PREC_PAL_DATA(pipe),
++				      ilk_lut_12p4_ldw(entry));
++		ilk_lut_write_indexed(crtc_state, PREC_PAL_DATA(pipe),
++				      ilk_lut_12p4_udw(entry));
+ 	}
+ 
+ 	/*
+@@ -1747,10 +1758,10 @@ icl_program_gamma_multi_segment(const struct intel_crtc_state *crtc_state)
+ 	for (i = 0; i < 256; i++) {
+ 		entry = &lut[i * 8 * 128];
+ 
+-		ilk_lut_write(crtc_state, PREC_PAL_DATA(pipe),
+-			      ilk_lut_12p4_ldw(entry));
+-		ilk_lut_write(crtc_state, PREC_PAL_DATA(pipe),
+-			      ilk_lut_12p4_udw(entry));
++		ilk_lut_write_indexed(crtc_state, PREC_PAL_DATA(pipe),
++				      ilk_lut_12p4_ldw(entry));
++		ilk_lut_write_indexed(crtc_state, PREC_PAL_DATA(pipe),
++				      ilk_lut_12p4_udw(entry));
+ 	}
+ 
+ 	ilk_lut_write(crtc_state, PREC_PAL_INDEX(pipe),
+diff --git a/drivers/gpu/drm/i915/display/intel_dsb.c b/drivers/gpu/drm/i915/display/intel_dsb.c
+index b7b44399adaa..4d3785f5cb52 100644
+--- a/drivers/gpu/drm/i915/display/intel_dsb.c
++++ b/drivers/gpu/drm/i915/display/intel_dsb.c
+@@ -273,16 +273,20 @@ static bool intel_dsb_prev_ins_is_indexed_write(struct intel_dsb *dsb, i915_reg_
+ }
+ 
+ /**
+- * intel_dsb_reg_write() - Emit register wriite to the DSB context
++ * intel_dsb_reg_write_indexed() - Emit register wriite to the DSB context
+  * @dsb: DSB context
+  * @reg: register address.
+  * @val: value.
+  *
+  * This function is used for writing register-value pair in command
+  * buffer of DSB.
++ *
++ * Note that indexed writes are slower than normal MMIO writes
++ * for a small number (less than 5 or so) of writes to the same
++ * register.
+  */
+-void intel_dsb_reg_write(struct intel_dsb *dsb,
+-			 i915_reg_t reg, u32 val)
++void intel_dsb_reg_write_indexed(struct intel_dsb *dsb,
++				 i915_reg_t reg, u32 val)
+ {
+ 	/*
+ 	 * For example the buffer will look like below for 3 dwords for auto
+@@ -340,6 +344,15 @@ void intel_dsb_reg_write(struct intel_dsb *dsb,
+ 	}
+ }
+ 
++void intel_dsb_reg_write(struct intel_dsb *dsb,
++			 i915_reg_t reg, u32 val)
++{
++	intel_dsb_emit(dsb, val,
++		       (DSB_OPCODE_MMIO_WRITE << DSB_OPCODE_SHIFT) |
++		       (DSB_BYTE_EN << DSB_BYTE_EN_SHIFT) |
++		       i915_mmio_reg_offset(reg));
++}
++
+ static u32 intel_dsb_mask_to_byte_en(u32 mask)
+ {
+ 	return (!!(mask & 0xff000000) << 3 |
+diff --git a/drivers/gpu/drm/i915/display/intel_dsb.h b/drivers/gpu/drm/i915/display/intel_dsb.h
+index 33e0fc2ab380..da6df07a3c83 100644
+--- a/drivers/gpu/drm/i915/display/intel_dsb.h
++++ b/drivers/gpu/drm/i915/display/intel_dsb.h
+@@ -34,6 +34,8 @@ void intel_dsb_finish(struct intel_dsb *dsb);
+ void intel_dsb_cleanup(struct intel_dsb *dsb);
+ void intel_dsb_reg_write(struct intel_dsb *dsb,
+ 			 i915_reg_t reg, u32 val);
++void intel_dsb_reg_write_indexed(struct intel_dsb *dsb,
++				 i915_reg_t reg, u32 val);
+ void intel_dsb_reg_write_masked(struct intel_dsb *dsb,
+ 				i915_reg_t reg, u32 mask, u32 val);
+ void intel_dsb_noop(struct intel_dsb *dsb, int count);
+-- 
+2.52.0
+

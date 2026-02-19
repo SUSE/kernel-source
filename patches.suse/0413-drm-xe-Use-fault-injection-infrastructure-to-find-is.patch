@@ -1,0 +1,358 @@
+From 91b2c42c214f570efaff80a666e30b8f6ce4f12b Mon Sep 17 00:00:00 2001
+From: Francois Dugast <francois.dugast@intel.com>
+Date: Fri, 27 Sep 2024 17:12:06 +0200
+Subject: drm/xe: Use fault injection infrastructure to find issues at probe
+ time
+Git-commit: 91b2c42c214f570efaff80a666e30b8f6ce4f12b
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+The kernel fault injection infrastructure is used to test proper error
+handling during probe. The return code of the functions using
+ALLOW_ERROR_INJECTION() can be conditionnally modified at runtime by
+tuning some debugfs entries. This requires CONFIG_FUNCTION_ERROR_INJECTION
+(among others).
+
+One way to use fault injection at probe time by making each of those
+functions fail one at a time is:
+
+    FAILTYPE=fail_function
+    DEVICE="0000:00:08.0" # depends on the system
+    ERRNO=-12 # -ENOMEM, can depend on the function
+
+    echo N > /sys/kernel/debug/$FAILTYPE/task-filter
+    echo 100 > /sys/kernel/debug/$FAILTYPE/probability
+    echo 0 > /sys/kernel/debug/$FAILTYPE/interval
+    echo -1 > /sys/kernel/debug/$FAILTYPE/times
+    echo 0 > /sys/kernel/debug/$FAILTYPE/space
+    echo 1 > /sys/kernel/debug/$FAILTYPE/verbose
+
+    modprobe xe
+    echo $DEVICE > /sys/bus/pci/drivers/xe/unbind
+
+    grep -oP "^.* \[xe\]" /sys/kernel/debug/$FAILTYPE/injectable | \
+    cut -d ' ' -f 1 | while read -r FUNCTION ; do
+        echo "Injecting fault in $FUNCTION"
+        echo "" > /sys/kernel/debug/$FAILTYPE/inject
+        echo $FUNCTION > /sys/kernel/debug/$FAILTYPE/inject
+        printf %#x $ERRNO > /sys/kernel/debug/$FAILTYPE/$FUNCTION/retval
+        echo $DEVICE > /sys/bus/pci/drivers/xe/bind
+    done
+
+    rmmod xe
+
+It will also be integrated into IGT for systematic execution by CI.
+
+V2: Wrappers are not needed in the cases covered by this patch, so
+    remove them and use ALLOW_ERROR_INJECTION() directly.
+
+V3: Document the use of fault injection at probe time in xe_pci_probe
+    and refer to it where ALLOW_ERROR_INJECTION() is used.
+
+Signed-off-by: Francois Dugast <francois.dugast@intel.com>
+Cc: Lucas De Marchi <lucas.demarchi@intel.com>
+Cc: Matthew Brost <matthew.brost@intel.com>
+Cc: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Cc: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Cc: Jani Nikula <jani.nikula@intel.com>
+Reviewed-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20240927151207.399354-1-francois.dugast@intel.com
+Signed-off-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/xe/xe_device.c    |  3 +++
+ drivers/gpu/drm/xe/xe_ggtt.c      |  2 ++
+ drivers/gpu/drm/xe/xe_guc_ads.c   |  3 +++
+ drivers/gpu/drm/xe/xe_guc_ct.c    |  2 ++
+ drivers/gpu/drm/xe/xe_guc_log.c   |  3 +++
+ drivers/gpu/drm/xe/xe_guc_relay.c |  2 ++
+ drivers/gpu/drm/xe/xe_pci.c       | 19 +++++++++++++++++++
+ drivers/gpu/drm/xe/xe_pm.c        |  2 ++
+ drivers/gpu/drm/xe/xe_sriov.c     |  3 +++
+ drivers/gpu/drm/xe/xe_tile.c      |  3 +++
+ drivers/gpu/drm/xe/xe_uc_fw.c     |  2 ++
+ drivers/gpu/drm/xe/xe_wa.c        |  2 ++
+ drivers/gpu/drm/xe/xe_wopcm.c     |  3 +++
+ 13 files changed, 49 insertions(+)
+
+diff --git a/drivers/gpu/drm/xe/xe_device.c b/drivers/gpu/drm/xe/xe_device.c
+index 0d96b4b7c90a..0bdbe4720c3d 100644
+--- a/drivers/gpu/drm/xe/xe_device.c
++++ b/drivers/gpu/drm/xe/xe_device.c
+@@ -6,6 +6,7 @@
+ #include "xe_device.h"
+ 
+ #include <linux/delay.h>
++#include <linux/fault-inject.h>
+ #include <linux/units.h>
+ 
+ #include <drm/drm_aperture.h>
+@@ -373,6 +374,7 @@ struct xe_device *xe_device_create(struct pci_dev *pdev,
+ err:
+ 	return ERR_PTR(err);
+ }
++ALLOW_ERROR_INJECTION(xe_device_create, ERRNO); /* See xe_pci_probe() */
+ 
+ static bool xe_driver_flr_disabled(struct xe_device *xe)
+ {
+@@ -541,6 +543,7 @@ static int wait_for_lmem_ready(struct xe_device *xe)
+ 
+ 	return 0;
+ }
++ALLOW_ERROR_INJECTION(wait_for_lmem_ready, ERRNO); /* See xe_pci_probe() */
+ 
+ static void update_device_info(struct xe_device *xe)
+ {
+diff --git a/drivers/gpu/drm/xe/xe_ggtt.c b/drivers/gpu/drm/xe/xe_ggtt.c
+index e7cdbe3ce1f0..1041187803ca 100644
+--- a/drivers/gpu/drm/xe/xe_ggtt.c
++++ b/drivers/gpu/drm/xe/xe_ggtt.c
+@@ -5,6 +5,7 @@
+ 
+ #include "xe_ggtt.h"
+ 
++#include <linux/fault-inject.h>
+ #include <linux/io-64-nonatomic-lo-hi.h>
+ #include <linux/sizes.h>
+ 
+@@ -264,6 +265,7 @@ int xe_ggtt_init_early(struct xe_ggtt *ggtt)
+ 
+ 	return 0;
+ }
++ALLOW_ERROR_INJECTION(xe_ggtt_init_early, ERRNO); /* See xe_pci_probe() */
+ 
+ static void xe_ggtt_invalidate(struct xe_ggtt *ggtt);
+ 
+diff --git a/drivers/gpu/drm/xe/xe_guc_ads.c b/drivers/gpu/drm/xe/xe_guc_ads.c
+index 66d4e5e95abd..04485461aa20 100644
+--- a/drivers/gpu/drm/xe/xe_guc_ads.c
++++ b/drivers/gpu/drm/xe/xe_guc_ads.c
+@@ -5,6 +5,8 @@
+ 
+ #include "xe_guc_ads.h"
+ 
++#include <linux/fault-inject.h>
++
+ #include <drm/drm_managed.h>
+ 
+ #include <generated/xe_wa_oob.h>
+@@ -418,6 +420,7 @@ int xe_guc_ads_init(struct xe_guc_ads *ads)
+ 
+ 	return 0;
+ }
++ALLOW_ERROR_INJECTION(xe_guc_ads_init, ERRNO); /* See xe_pci_probe() */
+ 
+ /**
+  * xe_guc_ads_init_post_hwconfig - initialize ADS post hwconfig load
+diff --git a/drivers/gpu/drm/xe/xe_guc_ct.c b/drivers/gpu/drm/xe/xe_guc_ct.c
+index 87288205b3e2..a91c8f65558f 100644
+--- a/drivers/gpu/drm/xe/xe_guc_ct.c
++++ b/drivers/gpu/drm/xe/xe_guc_ct.c
+@@ -8,6 +8,7 @@
+ #include <linux/bitfield.h>
+ #include <linux/circ_buf.h>
+ #include <linux/delay.h>
++#include <linux/fault-inject.h>
+ 
+ #include <kunit/static_stub.h>
+ 
+@@ -209,6 +210,7 @@ int xe_guc_ct_init(struct xe_guc_ct *ct)
+ 	ct->state = XE_GUC_CT_STATE_DISABLED;
+ 	return 0;
+ }
++ALLOW_ERROR_INJECTION(xe_guc_ct_init, ERRNO); /* See xe_pci_probe() */
+ 
+ #define desc_read(xe_, guc_ctb__, field_)			\
+ 	xe_map_rd_field(xe_, &guc_ctb__->desc, 0,		\
+diff --git a/drivers/gpu/drm/xe/xe_guc_log.c b/drivers/gpu/drm/xe/xe_guc_log.c
+index a37ee3419428..651543721ce5 100644
+--- a/drivers/gpu/drm/xe/xe_guc_log.c
++++ b/drivers/gpu/drm/xe/xe_guc_log.c
+@@ -5,6 +5,8 @@
+ 
+ #include "xe_guc_log.h"
+ 
++#include <linux/fault-inject.h>
++
+ #include <drm/drm_managed.h>
+ 
+ #include "xe_bo.h"
+@@ -96,3 +98,4 @@ int xe_guc_log_init(struct xe_guc_log *log)
+ 
+ 	return 0;
+ }
++ALLOW_ERROR_INJECTION(xe_guc_log_init, ERRNO); /* See xe_pci_probe() */
+diff --git a/drivers/gpu/drm/xe/xe_guc_relay.c b/drivers/gpu/drm/xe/xe_guc_relay.c
+index ade6162dc259..8f62de026724 100644
+--- a/drivers/gpu/drm/xe/xe_guc_relay.c
++++ b/drivers/gpu/drm/xe/xe_guc_relay.c
+@@ -5,6 +5,7 @@
+ 
+ #include <linux/bitfield.h>
+ #include <linux/delay.h>
++#include <linux/fault-inject.h>
+ 
+ #include <drm/drm_managed.h>
+ 
+@@ -355,6 +356,7 @@ int xe_guc_relay_init(struct xe_guc_relay *relay)
+ 
+ 	return drmm_add_action_or_reset(&xe->drm, __fini_relay, relay);
+ }
++ALLOW_ERROR_INJECTION(xe_guc_relay_init, ERRNO); /* See xe_pci_probe() */
+ 
+ static u32 to_relay_error(int err)
+ {
+diff --git a/drivers/gpu/drm/xe/xe_pci.c b/drivers/gpu/drm/xe/xe_pci.c
+index edaeefd2d648..af7b2f2ff13a 100644
+--- a/drivers/gpu/drm/xe/xe_pci.c
++++ b/drivers/gpu/drm/xe/xe_pci.c
+@@ -765,6 +765,25 @@ static void xe_pci_remove(struct pci_dev *pdev)
+ 	pci_set_drvdata(pdev, NULL);
+ }
+ 
++/*
++ * Probe the PCI device, initialize various parts of the driver.
++ *
++ * Fault injection is used to test the error paths of some initialization
++ * functions called either directly from xe_pci_probe() or indirectly for
++ * example through xe_device_probe(). Those functions use the kernel fault
++ * injection capabilities infrastructure, see
++ * Documentation/fault-injection/fault-injection.rst for details. The macro
++ * ALLOW_ERROR_INJECTION() is used to conditionally skip function execution
++ * at runtime and use a provided return value. The first requirement for
++ * error injectable functions is proper handling of the error code by the
++ * caller for recovery, which is always the case here. The second
++ * requirement is that no state is changed before the first error return.
++ * It is not strictly fullfilled for all initialization functions using the
++ * ALLOW_ERROR_INJECTION() macro but this is acceptable because for those
++ * error cases at probe time, the error code is simply propagated up by the
++ * caller. Therefore there is no consequence on those specific callers when
++ * function error injection skips the whole function.
++ */
+ static int xe_pci_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+ {
+ 	const struct xe_device_desc *desc = (const void *)ent->driver_data;
+diff --git a/drivers/gpu/drm/xe/xe_pm.c b/drivers/gpu/drm/xe/xe_pm.c
+index 33eb039053e4..40f7c844ed44 100644
+--- a/drivers/gpu/drm/xe/xe_pm.c
++++ b/drivers/gpu/drm/xe/xe_pm.c
+@@ -5,6 +5,7 @@
+ 
+ #include "xe_pm.h"
+ 
++#include <linux/fault-inject.h>
+ #include <linux/pm_runtime.h>
+ 
+ #include <drm/drm_managed.h>
+@@ -263,6 +264,7 @@ int xe_pm_init_early(struct xe_device *xe)
+ 
+ 	return 0;
+ }
++ALLOW_ERROR_INJECTION(xe_pm_init_early, ERRNO); /* See xe_pci_probe() */
+ 
+ /**
+  * xe_pm_init - Initialize Xe Power Management
+diff --git a/drivers/gpu/drm/xe/xe_sriov.c b/drivers/gpu/drm/xe/xe_sriov.c
+index 69a066ef20c0..ef10782af656 100644
+--- a/drivers/gpu/drm/xe/xe_sriov.c
++++ b/drivers/gpu/drm/xe/xe_sriov.c
+@@ -3,6 +3,8 @@
+  * Copyright © 2023 Intel Corporation
+  */
+ 
++#include <linux/fault-inject.h>
++
+ #include <drm/drm_managed.h>
+ 
+ #include "regs/xe_regs.h"
+@@ -119,6 +121,7 @@ int xe_sriov_init(struct xe_device *xe)
+ 
+ 	return drmm_add_action_or_reset(&xe->drm, fini_sriov, xe);
+ }
++ALLOW_ERROR_INJECTION(xe_sriov_init, ERRNO); /* See xe_pci_probe() */
+ 
+ /**
+  * xe_sriov_print_info - Print basic SR-IOV information.
+diff --git a/drivers/gpu/drm/xe/xe_tile.c b/drivers/gpu/drm/xe/xe_tile.c
+index dda5268507d8..07cf7cfe4abd 100644
+--- a/drivers/gpu/drm/xe/xe_tile.c
++++ b/drivers/gpu/drm/xe/xe_tile.c
+@@ -3,6 +3,8 @@
+  * Copyright © 2023 Intel Corporation
+  */
+ 
++#include <linux/fault-inject.h>
++
+ #include <drm/drm_managed.h>
+ 
+ #include "xe_device.h"
+@@ -129,6 +131,7 @@ int xe_tile_init_early(struct xe_tile *tile, struct xe_device *xe, u8 id)
+ 
+ 	return 0;
+ }
++ALLOW_ERROR_INJECTION(xe_tile_init_early, ERRNO); /* See xe_pci_probe() */
+ 
+ static int tile_ttm_mgr_init(struct xe_tile *tile)
+ {
+diff --git a/drivers/gpu/drm/xe/xe_uc_fw.c b/drivers/gpu/drm/xe/xe_uc_fw.c
+index d339f636f4d5..fb0eda3d5682 100644
+--- a/drivers/gpu/drm/xe/xe_uc_fw.c
++++ b/drivers/gpu/drm/xe/xe_uc_fw.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include <linux/bitfield.h>
++#include <linux/fault-inject.h>
+ #include <linux/firmware.h>
+ 
+ #include <drm/drm_managed.h>
+@@ -796,6 +797,7 @@ int xe_uc_fw_init(struct xe_uc_fw *uc_fw)
+ 
+ 	return err;
+ }
++ALLOW_ERROR_INJECTION(xe_uc_fw_init, ERRNO); /* See xe_pci_probe() */
+ 
+ static u32 uc_fw_ggtt_offset(struct xe_uc_fw *uc_fw)
+ {
+diff --git a/drivers/gpu/drm/xe/xe_wa.c b/drivers/gpu/drm/xe/xe_wa.c
+index 2f9cde4b7d45..df2abdfae2b2 100644
+--- a/drivers/gpu/drm/xe/xe_wa.c
++++ b/drivers/gpu/drm/xe/xe_wa.c
+@@ -8,6 +8,7 @@
+ #include <drm/drm_managed.h>
+ #include <kunit/visibility.h>
+ #include <linux/compiler_types.h>
++#include <linux/fault-inject.h>
+ 
+ #include <generated/xe_wa_oob.h>
+ 
+@@ -854,6 +855,7 @@ int xe_wa_init(struct xe_gt *gt)
+ 
+ 	return 0;
+ }
++ALLOW_ERROR_INJECTION(xe_wa_init, ERRNO); /* See xe_pci_probe() */
+ 
+ void xe_wa_dump(struct xe_gt *gt, struct drm_printer *p)
+ {
+diff --git a/drivers/gpu/drm/xe/xe_wopcm.c b/drivers/gpu/drm/xe/xe_wopcm.c
+index 93c82825d896..ada0d0aa6b74 100644
+--- a/drivers/gpu/drm/xe/xe_wopcm.c
++++ b/drivers/gpu/drm/xe/xe_wopcm.c
+@@ -5,6 +5,8 @@
+ 
+ #include "xe_wopcm.h"
+ 
++#include <linux/fault-inject.h>
++
+ #include "regs/xe_guc_regs.h"
+ #include "xe_device.h"
+ #include "xe_force_wake.h"
+@@ -268,3 +270,4 @@ int xe_wopcm_init(struct xe_wopcm *wopcm)
+ 
+ 	return ret;
+ }
++ALLOW_ERROR_INJECTION(xe_wopcm_init, ERRNO); /* See xe_pci_probe() */
+-- 
+2.52.0
+

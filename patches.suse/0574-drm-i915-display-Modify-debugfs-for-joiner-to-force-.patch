@@ -1,0 +1,143 @@
+From a47df3335a223c096b946b7934db12f9ac9948a4 Mon Sep 17 00:00:00 2001
+From: Ankit Nautiyal <ankit.k.nautiyal@intel.com>
+Date: Thu, 26 Sep 2024 19:13:21 +0530
+Subject: drm/i915/display: Modify debugfs for joiner to force n pipes
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: a47df3335a223c096b946b7934db12f9ac9948a4
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+At the moment, the debugfs for joiner allows only to force enable/disable
+pipe joiner for 2 pipes. Modify it to force join 'n' number of pipes,
+where n is a valid pipe joiner configuration.
+This will help in case of ultra joiner where 4 pipes are joined.
+
+V2: 
+-Fix commit message to state that only valid joiner config can be
+forced. (Suraj)
+-Rename the identifiers to have INTEL_BIG/NONE_JOINER_PIPES. (Suraj)
+V3: 
+-Avoid enum for joiner pipe counts, use bare numbers for better
+readability. (Ville)
+-Remove redundant prints from debugfs. (Ville)
+V4: Return -EINVAL if joiner forced to an invalid value.
+V5: Remove extra debug message. (Ville)
+V6: Minor fix in switch case. (Ville)
+
+Signed-off-by: Ankit Nautiyal <ankit.k.nautiyal@intel.com>
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20240926134322.3728021-4-ankit.k.nautiyal@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../drm/i915/display/intel_display_debugfs.c  | 57 ++++++++++++++++++-
+ .../drm/i915/display/intel_display_types.h    |  2 +-
+ drivers/gpu/drm/i915/display/intel_dp.c       |  2 +-
+ 3 files changed, 57 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display_debugfs.c b/drivers/gpu/drm/i915/display/intel_display_debugfs.c
+index c38023b43682..ae3715f0f1d8 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_debugfs.c
++++ b/drivers/gpu/drm/i915/display/intel_display_debugfs.c
+@@ -1316,6 +1316,59 @@ static int intel_crtc_pipe_show(struct seq_file *m, void *unused)
+ }
+ DEFINE_SHOW_ATTRIBUTE(intel_crtc_pipe);
+ 
++static int i915_joiner_show(struct seq_file *m, void *data)
++{
++	struct intel_connector *connector = m->private;
++
++	seq_printf(m, "%d\n", connector->force_joined_pipes);
++
++	return 0;
++}
++
++static ssize_t i915_joiner_write(struct file *file,
++				 const char __user *ubuf,
++				 size_t len, loff_t *offp)
++{
++	struct seq_file *m = file->private_data;
++	struct intel_connector *connector = m->private;
++	int force_joined_pipes = 0;
++	int ret;
++
++	if (len == 0)
++		return 0;
++
++	ret = kstrtoint_from_user(ubuf, len, 0, &force_joined_pipes);
++	if (ret < 0)
++		return ret;
++
++	switch (force_joined_pipes) {
++	case 0:
++	case 2:
++		connector->force_joined_pipes = force_joined_pipes;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	*offp += len;
++
++	return len;
++}
++
++static int i915_joiner_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, i915_joiner_show, inode->i_private);
++}
++
++static const struct file_operations i915_joiner_fops = {
++	.owner = THIS_MODULE,
++	.open = i915_joiner_open,
++	.read = seq_read,
++	.llseek = seq_lseek,
++	.release = single_release,
++	.write = i915_joiner_write
++};
++
+ /**
+  * intel_connector_debugfs_add - add i915 specific connector debugfs files
+  * @connector: pointer to a registered intel_connector
+@@ -1365,8 +1418,8 @@ void intel_connector_debugfs_add(struct intel_connector *connector)
+ 	if ((connector_type == DRM_MODE_CONNECTOR_DisplayPort ||
+ 	     connector_type == DRM_MODE_CONNECTOR_eDP) &&
+ 	    intel_dp_has_joiner(intel_attached_dp(connector))) {
+-		debugfs_create_bool("i915_bigjoiner_force_enable", 0644, root,
+-				    &connector->force_bigjoiner_enable);
++		debugfs_create_file("i915_joiner_force_enable", 0644, root,
++				    connector, &i915_joiner_fops);
+ 	}
+ 
+ 	if (connector_type == DRM_MODE_CONNECTOR_DSI ||
+diff --git a/drivers/gpu/drm/i915/display/intel_display_types.h b/drivers/gpu/drm/i915/display/intel_display_types.h
+index 7ff97e5b83dd..7fb3eeb0e0f2 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_types.h
++++ b/drivers/gpu/drm/i915/display/intel_display_types.h
+@@ -524,7 +524,7 @@ struct intel_connector {
+ 
+ 	struct intel_dp *mst_port;
+ 
+-	bool force_bigjoiner_enable;
++	int force_joined_pipes;
+ 
+ 	struct {
+ 		struct drm_dp_aux *dsc_decompression_aux;
+diff --git a/drivers/gpu/drm/i915/display/intel_dp.c b/drivers/gpu/drm/i915/display/intel_dp.c
+index 16dc1d26d2a2..a1a64758d30d 100644
+--- a/drivers/gpu/drm/i915/display/intel_dp.c
++++ b/drivers/gpu/drm/i915/display/intel_dp.c
+@@ -1274,7 +1274,7 @@ bool intel_dp_need_joiner(struct intel_dp *intel_dp,
+ 		return false;
+ 
+ 	return clock > i915->display.cdclk.max_dotclk_freq || hdisplay > 5120 ||
+-	       connector->force_bigjoiner_enable;
++	       connector->force_joined_pipes == 2;
+ }
+ 
+ bool intel_dp_has_dsc(const struct intel_connector *connector)
+-- 
+2.52.0
+

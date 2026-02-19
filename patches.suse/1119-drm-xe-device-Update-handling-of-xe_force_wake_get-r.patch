@@ -1,0 +1,137 @@
+From 3b41f8882e4b25908043139eb4ea98d031543136 Mon Sep 17 00:00:00 2001
+From: Himal Prasad Ghimiray <himal.prasad.ghimiray@intel.com>
+Date: Mon, 14 Oct 2024 13:25:41 +0530
+Subject: drm/xe/device: Update handling of xe_force_wake_get return
+Git-commit: 3b41f8882e4b25908043139eb4ea98d031543136
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+xe_force_wake_get() now returns the reference count-incremented domain
+mask. If it fails for individual domains, the return value will always
+be 0. However, for XE_FORCEWAKE_ALL, it may return a non-zero value even
+in the event of failure. Update the return handling of xe_force_wake_get()
+to reflect this behavior, and ensure that the return value is passed as
+input to xe_force_wake_put().
+
+v3
+- return xe_wakeref_t instead of int in xe_force_wake_get()
+- xe_force_wake_put() error doesn't need to be escalated/considered as
+probing error. It internally WARNS on domain ack failure.
+
+v5
+- return unsigned int xe_force_wake_get()
+
+v7
+- Fix commit message(Badal)
+
+v9
+- s/uint/unsigned int (Nikula)
+
+Cc: Jani Nikula <jani.nikula@intel.com>
+Cc: Badal Nilawar <badal.nilawar@intel.com>
+Cc: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Signed-off-by: Himal Prasad Ghimiray <himal.prasad.ghimiray@intel.com>
+Reviewed-by: Nirmoy Das <nirmoy.das@intel.com>
+Reviewed-by: Badal Nilawar <badal.nilawar@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241014075601.2324382-7-himal.prasad.ghimiray@intel.com
+Signed-off-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/xe/xe_device.c | 25 ++++++++++++++-----------
+ 1 file changed, 14 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_device.c b/drivers/gpu/drm/xe/xe_device.c
+index 87ea48180d50..0e2dd691bdae 100644
+--- a/drivers/gpu/drm/xe/xe_device.c
++++ b/drivers/gpu/drm/xe/xe_device.c
+@@ -594,8 +594,8 @@ int xe_device_probe_early(struct xe_device *xe)
+ static int probe_has_flat_ccs(struct xe_device *xe)
+ {
+ 	struct xe_gt *gt;
++	unsigned int fw_ref;
+ 	u32 reg;
+-	int err;
+ 
+ 	/* Always enabled/disabled, no runtime check to do */
+ 	if (GRAPHICS_VER(xe) < 20 || !xe->info.has_flat_ccs)
+@@ -603,9 +603,9 @@ static int probe_has_flat_ccs(struct xe_device *xe)
+ 
+ 	gt = xe_root_mmio_gt(xe);
+ 
+-	err = xe_force_wake_get(gt_to_fw(gt), XE_FW_GT);
+-	if (err)
+-		return err;
++	fw_ref = xe_force_wake_get(gt_to_fw(gt), XE_FW_GT);
++	if (!fw_ref)
++		return -ETIMEDOUT;
+ 
+ 	reg = xe_gt_mcr_unicast_read_any(gt, XE2_FLAT_CCS_BASE_RANGE_LOWER);
+ 	xe->info.has_flat_ccs = (reg & XE2_FLAT_CCS_ENABLE);
+@@ -614,7 +614,8 @@ static int probe_has_flat_ccs(struct xe_device *xe)
+ 		drm_dbg(&xe->drm,
+ 			"Flat CCS has been disabled in bios, May lead to performance impact");
+ 
+-	return xe_force_wake_put(gt_to_fw(gt), XE_FW_GT);
++	xe_force_wake_put(gt_to_fw(gt), fw_ref);
++	return 0;
+ }
+ 
+ int xe_device_probe(struct xe_device *xe)
+@@ -865,6 +866,7 @@ void xe_device_wmb(struct xe_device *xe)
+ void xe_device_td_flush(struct xe_device *xe)
+ {
+ 	struct xe_gt *gt;
++	unsigned int fw_ref;
+ 	u8 id;
+ 
+ 	if (!IS_DGFX(xe) || GRAPHICS_VER(xe) < 20)
+@@ -879,7 +881,8 @@ void xe_device_td_flush(struct xe_device *xe)
+ 		if (xe_gt_is_media_type(gt))
+ 			continue;
+ 
+-		if (xe_force_wake_get(gt_to_fw(gt), XE_FW_GT))
++		fw_ref = xe_force_wake_get(gt_to_fw(gt), XE_FW_GT);
++		if (!fw_ref)
+ 			return;
+ 
+ 		xe_mmio_write32(&gt->mmio, XE2_TDF_CTRL, TRANSIENT_FLUSH_REQUEST);
+@@ -894,22 +897,22 @@ void xe_device_td_flush(struct xe_device *xe)
+ 				   150, NULL, false))
+ 			xe_gt_err_once(gt, "TD flush timeout\n");
+ 
+-		xe_force_wake_put(gt_to_fw(gt), XE_FW_GT);
++		xe_force_wake_put(gt_to_fw(gt), fw_ref);
+ 	}
+ }
+ 
+ void xe_device_l2_flush(struct xe_device *xe)
+ {
+ 	struct xe_gt *gt;
+-	int err;
++	unsigned int fw_ref;
+ 
+ 	gt = xe_root_mmio_gt(xe);
+ 
+ 	if (!XE_WA(gt, 16023588340))
+ 		return;
+ 
+-	err = xe_force_wake_get(gt_to_fw(gt), XE_FW_GT);
+-	if (err)
++	fw_ref = xe_force_wake_get(gt_to_fw(gt), XE_FW_GT);
++	if (!fw_ref)
+ 		return;
+ 
+ 	spin_lock(&gt->global_invl_lock);
+@@ -919,7 +922,7 @@ void xe_device_l2_flush(struct xe_device *xe)
+ 		xe_gt_err_once(gt, "Global invalidation timeout\n");
+ 	spin_unlock(&gt->global_invl_lock);
+ 
+-	xe_force_wake_put(gt_to_fw(gt), XE_FW_GT);
++	xe_force_wake_put(gt_to_fw(gt), fw_ref);
+ }
+ 
+ u32 xe_device_ccs_bytes(struct xe_device *xe, u64 size)
+-- 
+2.52.0
+

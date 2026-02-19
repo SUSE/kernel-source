@@ -1,0 +1,143 @@
+From a7d5eeaa57d7a0d3d6a1da82b350d9661c8559a1 Mon Sep 17 00:00:00 2001
+From: Sean Anderson <sean.anderson@linux.dev>
+Date: Fri, 9 Aug 2024 15:35:54 -0400
+Subject: drm: zynqmp_dp: Add locking
+Git-commit: a7d5eeaa57d7a0d3d6a1da82b350d9661c8559a1
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Add some locking to prevent the IRQ/workers/bridge API calls from stepping
+on each other's toes. This lock protects:
+
+- Non-atomic registers configuring the link. That is, everything but the
+  IRQ registers (since these are accessed in an atomic fashion), and the DP
+  AUX registers (since these don't affect the link). We also access AUX
+  while holding this lock, so it would be very tricky to support.
+- Link configuration. This is effectively everything in zynqmp_dp which
+  isn't read-only after probe time. So from next_bridge onward.
+
+This lock is designed to protect configuration changes so we don't have to
+do anything tricky. Configuration should never be in the hot path, so I'm
+not worried about performance.
+
+Signed-off-by: Sean Anderson <sean.anderson@linux.dev>
+Signed-off-by: Tomi Valkeinen <tomi.valkeinen@ideasonboard.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20240809193600.3360015-3-sean.anderson@linux.dev
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/xlnx/zynqmp_dp.c | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/drivers/gpu/drm/xlnx/zynqmp_dp.c b/drivers/gpu/drm/xlnx/zynqmp_dp.c
+index 129beac4c073..abfccd8bb5a7 100644
+--- a/drivers/gpu/drm/xlnx/zynqmp_dp.c
++++ b/drivers/gpu/drm/xlnx/zynqmp_dp.c
+@@ -280,6 +280,7 @@ struct zynqmp_dp_config {
+  * @dpsub: Display subsystem
+  * @iomem: device I/O memory for register access
+  * @reset: reset controller
++ * @lock: Mutex protecting this struct and register access (but not AUX)
+  * @irq: irq
+  * @bridge: DRM bridge for the DP encoder
+  * @next_bridge: The downstream bridge
+@@ -294,11 +295,16 @@ struct zynqmp_dp_config {
+  * @link_config: common link configuration between IP core and sink device
+  * @mode: current mode between IP core and sink device
+  * @train_set: set of training data
++ *
++ * @lock covers the link configuration in this struct and the device's
++ * registers. It does not cover @aux. It is not strictly required for any of
++ * the members which are only modified at probe/remove time (e.g. @dev).
+  */
+ struct zynqmp_dp {
+ 	struct drm_dp_aux aux;
+ 	struct drm_bridge bridge;
+ 	struct work_struct hpd_work;
++	struct mutex lock;
+ 
+ 	struct drm_bridge *next_bridge;
+ 	struct device *dev;
+@@ -1386,8 +1392,10 @@ zynqmp_dp_bridge_mode_valid(struct drm_bridge *bridge,
+ 	}
+ 
+ 	/* Check with link rate and lane count */
++	mutex_lock(&dp->lock);
+ 	rate = zynqmp_dp_max_rate(dp->link_config.max_rate,
+ 				  dp->link_config.max_lanes, dp->config.bpp);
++	mutex_unlock(&dp->lock);
+ 	if (mode->clock > rate) {
+ 		dev_dbg(dp->dev, "filtered mode %s for high pixel rate\n",
+ 			mode->name);
+@@ -1414,6 +1422,7 @@ static void zynqmp_dp_bridge_atomic_enable(struct drm_bridge *bridge,
+ 
+ 	pm_runtime_get_sync(dp->dev);
+ 
++	mutex_lock(&dp->lock);
+ 	zynqmp_dp_disp_enable(dp, old_bridge_state);
+ 
+ 	/*
+@@ -1474,6 +1483,7 @@ static void zynqmp_dp_bridge_atomic_enable(struct drm_bridge *bridge,
+ 	zynqmp_dp_write(dp, ZYNQMP_DP_SOFTWARE_RESET,
+ 			ZYNQMP_DP_SOFTWARE_RESET_ALL);
+ 	zynqmp_dp_write(dp, ZYNQMP_DP_MAIN_STREAM_ENABLE, 1);
++	mutex_unlock(&dp->lock);
+ }
+ 
+ static void zynqmp_dp_bridge_atomic_disable(struct drm_bridge *bridge,
+@@ -1481,6 +1491,7 @@ static void zynqmp_dp_bridge_atomic_disable(struct drm_bridge *bridge,
+ {
+ 	struct zynqmp_dp *dp = bridge_to_dp(bridge);
+ 
++	mutex_lock(&dp->lock);
+ 	dp->enabled = false;
+ 	cancel_work(&dp->hpd_work);
+ 	zynqmp_dp_write(dp, ZYNQMP_DP_MAIN_STREAM_ENABLE, 0);
+@@ -1491,6 +1502,7 @@ static void zynqmp_dp_bridge_atomic_disable(struct drm_bridge *bridge,
+ 		zynqmp_dp_write(dp, ZYNQMP_DP_TX_AUDIO_CONTROL, 0);
+ 
+ 	zynqmp_dp_disp_disable(dp, old_bridge_state);
++	mutex_unlock(&dp->lock);
+ 
+ 	pm_runtime_put_sync(dp->dev);
+ }
+@@ -1533,6 +1545,8 @@ static enum drm_connector_status zynqmp_dp_bridge_detect(struct drm_bridge *brid
+ 	u32 state, i;
+ 	int ret;
+ 
++	mutex_lock(&dp->lock);
++
+ 	/*
+ 	 * This is from heuristic. It takes some delay (ex, 100 ~ 500 msec) to
+ 	 * get the HPD signal with some monitors.
+@@ -1560,11 +1574,13 @@ static enum drm_connector_status zynqmp_dp_bridge_detect(struct drm_bridge *brid
+ 					       dp->num_lanes);
+ 
+ 		dp->status = connector_status_connected;
++		mutex_unlock(&dp->lock);
+ 		return connector_status_connected;
+ 	}
+ 
+ disconnected:
+ 	dp->status = connector_status_disconnected;
++	mutex_unlock(&dp->lock);
+ 	return connector_status_disconnected;
+ }
+ 
+@@ -1725,6 +1741,7 @@ int zynqmp_dp_probe(struct zynqmp_dpsub *dpsub)
+ 	dp->dev = &pdev->dev;
+ 	dp->dpsub = dpsub;
+ 	dp->status = connector_status_disconnected;
++	mutex_init(&dp->lock);
+ 
+ 	INIT_WORK(&dp->hpd_work, zynqmp_dp_hpd_work_func);
+ 
+@@ -1838,4 +1855,5 @@ void zynqmp_dp_remove(struct zynqmp_dpsub *dpsub)
+ 
+ 	zynqmp_dp_phy_exit(dp);
+ 	zynqmp_dp_reset(dp, true);
++	mutex_destroy(&dp->lock);
+ }
+-- 
+2.52.0
+

@@ -1,0 +1,234 @@
+From 5208989d59f989762578b497aecb1e2b1b0780fd Mon Sep 17 00:00:00 2001
+From: Thomas Zimmermann <tzimmermann@suse.de>
+Date: Tue, 24 Sep 2024 09:13:16 +0200
+Subject: drm/tegra: Run DRM default client setup
+Git-commit: 5208989d59f989762578b497aecb1e2b1b0780fd
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Rework fbdev probing to support fbdev_probe in struct drm_driver
+and remove the old fb_probe callback. Provide an initializer macro
+for struct drm_driver that sets the callback according to the kernel
+configuration.
+
+Call drm_client_setup() to run the kernel's default client setup
+for DRM. Set fbdev_probe in struct drm_driver, so that the client
+setup can start the common fbdev client.
+
+The tegra driver specifies a preferred color mode of 32. As this
+is the default if no format has been given, leave it out entirely.
+
+V5: 
+- select DRM_CLIENT_SELECTION
+
+Signed-off-by: Thomas Zimmermann <tzimmermann@suse.de>
+Cc: Thierry Reding <thierry.reding@gmail.com>
+Cc: Mikko Perttunen <mperttunen@nvidia.com>
+Cc: Jonathan Hunter <jonathanh@nvidia.com>
+Acked-by: Javier Martinez Canillas <javierm@redhat.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20240924071734.98201-79-tzimmermann@suse.de
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/tegra/Kconfig |  1 +
+ drivers/gpu/drm/tegra/drm.c   |  5 +-
+ drivers/gpu/drm/tegra/drm.h   | 12 +++--
+ drivers/gpu/drm/tegra/fbdev.c | 98 +++--------------------------------
+ 4 files changed, 20 insertions(+), 96 deletions(-)
+
+diff --git a/drivers/gpu/drm/tegra/Kconfig b/drivers/gpu/drm/tegra/Kconfig
+index e688d8104652..8a3b16aac5d6 100644
+--- a/drivers/gpu/drm/tegra/Kconfig
++++ b/drivers/gpu/drm/tegra/Kconfig
+@@ -5,6 +5,7 @@ config DRM_TEGRA
+ 	depends on COMMON_CLK
+ 	depends on DRM
+ 	depends on OF
++	select DRM_CLIENT_SELECTION
+ 	select DRM_DISPLAY_DP_HELPER
+ 	select DRM_DISPLAY_HDMI_HELPER
+ 	select DRM_DISPLAY_HELPER
+diff --git a/drivers/gpu/drm/tegra/drm.c b/drivers/gpu/drm/tegra/drm.c
+index 34d22ba210b0..722d04c18410 100644
+--- a/drivers/gpu/drm/tegra/drm.c
++++ b/drivers/gpu/drm/tegra/drm.c
+@@ -15,6 +15,7 @@
+ #include <drm/drm_aperture.h>
+ #include <drm/drm_atomic.h>
+ #include <drm/drm_atomic_helper.h>
++#include <drm/drm_client_setup.h>
+ #include <drm/drm_debugfs.h>
+ #include <drm/drm_drv.h>
+ #include <drm/drm_fourcc.h>
+@@ -892,6 +893,8 @@ static const struct drm_driver tegra_drm_driver = {
+ 
+ 	.dumb_create = tegra_bo_dumb_create,
+ 
++	TEGRA_FBDEV_DRIVER_OPS,
++
+ 	.ioctls = tegra_drm_ioctls,
+ 	.num_ioctls = ARRAY_SIZE(tegra_drm_ioctls),
+ 	.fops = &tegra_drm_fops,
+@@ -1270,7 +1273,7 @@ static int host1x_drm_probe(struct host1x_device *dev)
+ 	if (err < 0)
+ 		goto hub;
+ 
+-	tegra_fbdev_setup(drm);
++	drm_client_setup(drm, NULL);
+ 
+ 	return 0;
+ 
+diff --git a/drivers/gpu/drm/tegra/drm.h b/drivers/gpu/drm/tegra/drm.h
+index 2f3781e04b0a..0b65e69f3a8a 100644
+--- a/drivers/gpu/drm/tegra/drm.h
++++ b/drivers/gpu/drm/tegra/drm.h
+@@ -25,6 +25,9 @@
+ /* XXX move to include/uapi/drm/drm_fourcc.h? */
+ #define DRM_FORMAT_MOD_NVIDIA_SECTOR_LAYOUT BIT_ULL(22)
+ 
++struct drm_fb_helper;
++struct drm_fb_helper_surface_size;
++
+ struct edid;
+ struct reset_control;
+ 
+@@ -190,10 +193,13 @@ struct drm_framebuffer *tegra_fb_create(struct drm_device *drm,
+ 					const struct drm_mode_fb_cmd2 *cmd);
+ 
+ #ifdef CONFIG_DRM_FBDEV_EMULATION
+-void tegra_fbdev_setup(struct drm_device *drm);
++int tegra_fbdev_driver_fbdev_probe(struct drm_fb_helper *helper,
++				   struct drm_fb_helper_surface_size *sizes);
++#define TEGRA_FBDEV_DRIVER_OPS \
++	.fbdev_probe = tegra_fbdev_driver_fbdev_probe
+ #else
+-static inline void tegra_fbdev_setup(struct drm_device *drm)
+-{ }
++#define TEGRA_FBDEV_DRIVER_OPS \
++	.fbdev_probe = NULL
+ #endif
+ 
+ extern struct platform_driver tegra_display_hub_driver;
+diff --git a/drivers/gpu/drm/tegra/fbdev.c b/drivers/gpu/drm/tegra/fbdev.c
+index db6eaac3d30e..cd9d798f8870 100644
+--- a/drivers/gpu/drm/tegra/fbdev.c
++++ b/drivers/gpu/drm/tegra/fbdev.c
+@@ -66,8 +66,11 @@ static const struct fb_ops tegra_fb_ops = {
+ 	.fb_destroy = tegra_fbdev_fb_destroy,
+ };
+ 
+-static int tegra_fbdev_probe(struct drm_fb_helper *helper,
+-			     struct drm_fb_helper_surface_size *sizes)
++static const struct drm_fb_helper_funcs tegra_fbdev_helper_funcs = {
++};
++
++int tegra_fbdev_driver_fbdev_probe(struct drm_fb_helper *helper,
++				   struct drm_fb_helper_surface_size *sizes)
+ {
+ 	struct tegra_drm *tegra = helper->dev->dev_private;
+ 	struct drm_device *drm = helper->dev;
+@@ -112,6 +115,7 @@ static int tegra_fbdev_probe(struct drm_fb_helper *helper,
+ 		return PTR_ERR(fb);
+ 	}
+ 
++	helper->funcs = &tegra_fbdev_helper_funcs;
+ 	helper->fb = fb;
+ 	helper->info = info;
+ 
+@@ -144,93 +148,3 @@ static int tegra_fbdev_probe(struct drm_fb_helper *helper,
+ 	drm_framebuffer_remove(fb);
+ 	return err;
+ }
+-
+-static const struct drm_fb_helper_funcs tegra_fb_helper_funcs = {
+-	.fb_probe = tegra_fbdev_probe,
+-};
+-
+-/*
+- * struct drm_client
+- */
+-
+-static void tegra_fbdev_client_unregister(struct drm_client_dev *client)
+-{
+-	struct drm_fb_helper *fb_helper = drm_fb_helper_from_client(client);
+-
+-	if (fb_helper->info) {
+-		drm_fb_helper_unregister_info(fb_helper);
+-	} else {
+-		drm_client_release(&fb_helper->client);
+-		drm_fb_helper_unprepare(fb_helper);
+-		kfree(fb_helper);
+-	}
+-}
+-
+-static int tegra_fbdev_client_restore(struct drm_client_dev *client)
+-{
+-	drm_fb_helper_lastclose(client->dev);
+-
+-	return 0;
+-}
+-
+-static int tegra_fbdev_client_hotplug(struct drm_client_dev *client)
+-{
+-	struct drm_fb_helper *fb_helper = drm_fb_helper_from_client(client);
+-	struct drm_device *dev = client->dev;
+-	int ret;
+-
+-	if (dev->fb_helper)
+-		return drm_fb_helper_hotplug_event(dev->fb_helper);
+-
+-	ret = drm_fb_helper_init(dev, fb_helper);
+-	if (ret)
+-		goto err_drm_err;
+-
+-	if (!drm_drv_uses_atomic_modeset(dev))
+-		drm_helper_disable_unused_functions(dev);
+-
+-	ret = drm_fb_helper_initial_config(fb_helper);
+-	if (ret)
+-		goto err_drm_fb_helper_fini;
+-
+-	return 0;
+-
+-err_drm_fb_helper_fini:
+-	drm_fb_helper_fini(fb_helper);
+-err_drm_err:
+-	drm_err(dev, "Failed to setup fbdev emulation (ret=%d)\n", ret);
+-	return ret;
+-}
+-
+-static const struct drm_client_funcs tegra_fbdev_client_funcs = {
+-	.owner		= THIS_MODULE,
+-	.unregister	= tegra_fbdev_client_unregister,
+-	.restore	= tegra_fbdev_client_restore,
+-	.hotplug	= tegra_fbdev_client_hotplug,
+-};
+-
+-void tegra_fbdev_setup(struct drm_device *dev)
+-{
+-	struct drm_fb_helper *helper;
+-	int ret;
+-
+-	drm_WARN(dev, !dev->registered, "Device has not been registered.\n");
+-	drm_WARN(dev, dev->fb_helper, "fb_helper is already set!\n");
+-
+-	helper = kzalloc(sizeof(*helper), GFP_KERNEL);
+-	if (!helper)
+-		return;
+-	drm_fb_helper_prepare(dev, helper, 32, &tegra_fb_helper_funcs);
+-
+-	ret = drm_client_init(dev, &helper->client, "fbdev", &tegra_fbdev_client_funcs);
+-	if (ret)
+-		goto err_drm_client_init;
+-
+-	drm_client_register(&helper->client);
+-
+-	return;
+-
+-err_drm_client_init:
+-	drm_fb_helper_unprepare(helper);
+-	kfree(helper);
+-}
+-- 
+2.52.0
+

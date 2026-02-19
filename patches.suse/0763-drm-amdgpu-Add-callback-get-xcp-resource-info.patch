@@ -1,0 +1,158 @@
+From f501057aff3357d6973a09036fc78fd6efb1b1ae Mon Sep 17 00:00:00 2001
+From: Lijo Lazar <lijo.lazar@amd.com>
+Date: Mon, 9 Sep 2024 17:38:24 +0530
+Subject: drm/amdgpu: Add callback get xcp resource info
+Git-commit: f501057aff3357d6973a09036fc78fd6efb1b1ae
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Add a callback interface to get the resource information of a partition
+mode. Presently the information has number of resources and number of
+entities sharing the resource.
+
+Add the implementation for aquavanjaram SOCs.
+
+Signed-off-by: Lijo Lazar <lijo.lazar@amd.com>
+Signed-off-by: Asad Kamal <asad.kamal@amd.com>
+Reviewed-by: Hawking Zhang <Hawking.Zhang@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_xcp.h    | 26 +++++++++-
+ drivers/gpu/drm/amd/amdgpu/aqua_vanjaram.c | 59 +++++++++++++++++++++-
+ 2 files changed, 83 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_xcp.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_xcp.h
+index 2c54c05f2c16..648237f27d1c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_xcp.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_xcp.h
+@@ -56,6 +56,27 @@ enum AMDGPU_XCP_STATE {
+ 	AMDGPU_XCP_RESUME,
+ };
+ 
++enum amdgpu_xcp_res_id {
++	AMDGPU_XCP_RES_XCC,
++	AMDGPU_XCP_RES_DMA,
++	AMDGPU_XCP_RES_DEC,
++	AMDGPU_XCP_RES_JPEG,
++	AMDGPU_XCP_RES_MAX,
++};
++
++struct amdgpu_xcp_res_details {
++	enum amdgpu_xcp_res_id id;
++	u8 num_inst;
++	u8 num_shared;
++};
++
++struct amdgpu_xcp_cfg {
++	u8 mode;
++	struct amdgpu_xcp_res_details xcp_res[AMDGPU_XCP_RES_MAX];
++	u8 num_res;
++	struct amdgpu_xcp_mgr *xcp_mgr;
++};
++
+ struct amdgpu_xcp_ip_funcs {
+ 	int (*prepare_suspend)(void *handle, uint32_t inst_mask);
+ 	int (*suspend)(void *handle, uint32_t inst_mask);
+@@ -97,6 +118,7 @@ struct amdgpu_xcp_mgr {
+ 
+ 	 /* Used to determine KFD memory size limits per XCP */
+ 	unsigned int num_xcp_per_mem_partition;
++	struct amdgpu_xcp_cfg *xcp_cfg;
+ 	uint32_t supp_xcp_modes;
+ 	uint32_t avail_xcp_modes;
+ };
+@@ -110,7 +132,9 @@ struct amdgpu_xcp_mgr_funcs {
+ 			      struct amdgpu_xcp_ip *ip);
+ 	int (*get_xcp_mem_id)(struct amdgpu_xcp_mgr *xcp_mgr,
+ 			      struct amdgpu_xcp *xcp, uint8_t *mem_id);
+-
++	int (*get_xcp_res_info)(struct amdgpu_xcp_mgr *xcp_mgr,
++				int mode,
++				struct amdgpu_xcp_cfg *xcp_cfg);
+ 	int (*prepare_suspend)(struct amdgpu_xcp_mgr *xcp_mgr, int xcp_id);
+ 	int (*suspend)(struct amdgpu_xcp_mgr *xcp_mgr, int xcp_id);
+ 	int (*prepare_resume)(struct amdgpu_xcp_mgr *xcp_mgr, int xcp_id);
+diff --git a/drivers/gpu/drm/amd/amdgpu/aqua_vanjaram.c b/drivers/gpu/drm/amd/amdgpu/aqua_vanjaram.c
+index c1eb06c08bee..e88949a3eb2a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/aqua_vanjaram.c
++++ b/drivers/gpu/drm/amd/amdgpu/aqua_vanjaram.c
+@@ -447,6 +447,61 @@ static int __aqua_vanjaram_get_xcp_ip_info(struct amdgpu_xcp_mgr *xcp_mgr, int x
+ 	return 0;
+ }
+ 
++static int aqua_vanjaram_get_xcp_res_info(struct amdgpu_xcp_mgr *xcp_mgr,
++					  int mode,
++					  struct amdgpu_xcp_cfg *xcp_cfg)
++{
++	struct amdgpu_device *adev = xcp_mgr->adev;
++	int max_res[AMDGPU_XCP_RES_MAX] = {};
++	bool res_lt_xcp;
++	int num_xcp, i;
++
++	if (!(xcp_mgr->supp_xcp_modes & BIT(mode)))
++		return -EINVAL;
++
++	max_res[AMDGPU_XCP_RES_XCC] = NUM_XCC(adev->gfx.xcc_mask);
++	max_res[AMDGPU_XCP_RES_DMA] = adev->sdma.num_instances;
++	max_res[AMDGPU_XCP_RES_DEC] = adev->vcn.num_vcn_inst;
++	max_res[AMDGPU_XCP_RES_JPEG] = adev->jpeg.num_jpeg_inst;
++
++	switch (mode) {
++	case AMDGPU_SPX_PARTITION_MODE:
++		num_xcp = 1;
++		break;
++	case AMDGPU_DPX_PARTITION_MODE:
++		num_xcp = 2;
++		break;
++	case AMDGPU_TPX_PARTITION_MODE:
++		num_xcp = 3;
++		break;
++	case AMDGPU_QPX_PARTITION_MODE:
++		num_xcp = 4;
++		break;
++	case AMDGPU_CPX_PARTITION_MODE:
++		num_xcp = NUM_XCC(adev->gfx.xcc_mask);
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	xcp_cfg->num_res = ARRAY_SIZE(max_res);
++
++	for (i = 0; i < xcp_cfg->num_res; i++) {
++		res_lt_xcp = max_res[i] < num_xcp;
++		xcp_cfg->xcp_res[i].id = i;
++		xcp_cfg->xcp_res[i].num_inst =
++			res_lt_xcp ? 1 : max_res[i] / num_xcp;
++		xcp_cfg->xcp_res[i].num_inst =
++			i == AMDGPU_XCP_RES_JPEG ?
++			xcp_cfg->xcp_res[i].num_inst *
++			adev->jpeg.num_jpeg_rings : xcp_cfg->xcp_res[i].num_inst;
++		xcp_cfg->xcp_res[i].num_shared =
++			res_lt_xcp ? num_xcp / max_res[i] : 1;
++	}
++
++	return 0;
++}
++
+ static enum amdgpu_gfx_partition
+ __aqua_vanjaram_get_auto_mode(struct amdgpu_xcp_mgr *xcp_mgr)
+ {
+@@ -709,9 +764,11 @@ struct amdgpu_xcp_mgr_funcs aqua_vanjaram_xcp_funcs = {
+ 	.switch_partition_mode = &aqua_vanjaram_switch_partition_mode,
+ 	.query_partition_mode = &aqua_vanjaram_query_partition_mode,
+ 	.get_ip_details = &aqua_vanjaram_get_xcp_ip_details,
++	.get_xcp_res_info = &aqua_vanjaram_get_xcp_res_info,
+ 	.get_xcp_mem_id = &aqua_vanjaram_get_xcp_mem_id,
+ 	.select_scheds = &aqua_vanjaram_select_scheds,
+-	.update_partition_sched_list = &aqua_vanjaram_update_partition_sched_list
++	.update_partition_sched_list =
++		&aqua_vanjaram_update_partition_sched_list
+ };
+ 
+ static int aqua_vanjaram_xcp_mgr_init(struct amdgpu_device *adev)
+-- 
+2.52.0
+

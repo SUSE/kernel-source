@@ -1,0 +1,211 @@
+From 0e719a40bf5234e66bbd0f1537e30709ab112b5f Mon Sep 17 00:00:00 2001
+From: Austin Zheng <Austin.Zheng@amd.com>
+Date: Tue, 10 Sep 2024 13:46:50 -0400
+Subject: drm/amd/display: Set Pipe Unlock Order Outside of HWSEQ
+Git-commit: 0e719a40bf5234e66bbd0f1537e30709ab112b5f
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+[Why]
+Current pipe unlock order set within dcn401_interdependent_update_lock.
+Separate the logic from the functionality to allow for unit testing
+and make it easier to debug.
+
+[How]
+Add a flag to indicate if a pipe unlock order should be set.
+Create function to determine unlock order.
+Indicate which pipes should be unlocked first using
+array stored in dc scratch memory.
+Pipes indicated in array can be unlocked in any order.
+
+Reviewed-by: Alvin Lee <alvin.lee2@amd.com>
+Signed-off-by: Austin Zheng <Austin.Zheng@amd.com>
+Signed-off-by: Aurabindo Pillai <aurabindo.pillai@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c      | 42 +++++++++++++++++++
+ drivers/gpu/drm/amd/display/dc/dc.h           |  2 +
+ .../amd/display/dc/hwss/dcn401/dcn401_hwseq.c | 32 ++++++--------
+ .../dc/resource/dcn401/dcn401_resource.c      |  1 +
+ 4 files changed, 57 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index 93092995e7df..ec2e2eb0c090 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -1876,6 +1876,41 @@ void dc_z10_save_init(struct dc *dc)
+ 		dc->hwss.z10_save_init(dc);
+ }
+ 
++/* Set a pipe unlock order based on the change in DET allocation and stores it in dc scratch memory
++ * Prevents over allocation of DET during unlock process
++ * e.g. 2 pipe config with different streams with a max of 20 DET segments
++ *	Before:								After:
++ *		- Pipe0: 10 DET segments			- Pipe0: 12 DET segments
++ *		- Pipe1: 10 DET segments			- Pipe1: 8 DET segments
++ * If Pipe0 gets updated first, 22 DET segments will be allocated
++ */
++static void determine_pipe_unlock_order(struct dc *dc, struct dc_state *context)
++{
++	unsigned int i = 0;
++	struct pipe_ctx *pipe = NULL;
++	struct timing_generator *tg = NULL;
++
++	if (!dc->config.set_pipe_unlock_order)
++		return;
++
++	memset(dc->scratch.pipes_to_unlock_first, 0, sizeof(dc->scratch.pipes_to_unlock_first));
++	for (i = 0; i < dc->res_pool->pipe_count; i++) {
++		pipe = &context->res_ctx.pipe_ctx[i];
++		tg = pipe->stream_res.tg;
++
++		if (!resource_is_pipe_type(pipe, OTG_MASTER) ||
++				!tg->funcs->is_tg_enabled(tg) ||
++				dc_state_get_pipe_subvp_type(context, pipe) == SUBVP_PHANTOM) {
++			continue;
++		}
++
++		if (resource_calculate_det_for_stream(context, pipe) <
++				resource_calculate_det_for_stream(dc->current_state, &dc->current_state->res_ctx.pipe_ctx[i])) {
++			dc->scratch.pipes_to_unlock_first[i] = true;
++		}
++	}
++}
++
+ /**
+  * dc_commit_state_no_check - Apply context to the hardware
+  *
+@@ -1974,6 +2009,7 @@ static enum dc_status dc_commit_state_no_check(struct dc *dc, struct dc_state *c
+ 		context->streams[i]->update_flags.bits.dsc_changed = prev_dsc_changed;
+ 	}
+ 
++	determine_pipe_unlock_order(dc, context);
+ 	/* Program all planes within new context*/
+ 	if (dc->res_pool->funcs->prepare_mcache_programming)
+ 		dc->res_pool->funcs->prepare_mcache_programming(dc, context);
+@@ -3625,6 +3661,10 @@ static void commit_planes_for_stream_fast(struct dc *dc,
+ 	struct pipe_ctx *top_pipe_to_program = NULL;
+ 	struct dc_stream_status *stream_status = NULL;
+ 	bool should_offload_fams2_flip = false;
++	bool should_lock_all_pipes = (update_type != UPDATE_TYPE_FAST);
++
++	if (should_lock_all_pipes)
++		determine_pipe_unlock_order(dc, context);
+ 
+ 	if (dc->debug.fams2_config.bits.enable &&
+ 			dc->debug.fams2_config.bits.enable_offload_flip &&
+@@ -3743,6 +3783,8 @@ static void commit_planes_for_stream(struct dc *dc,
+ 	bool subvp_curr_use = false;
+ 	uint8_t current_stream_mask = 0;
+ 
++	if (should_lock_all_pipes)
++		determine_pipe_unlock_order(dc, context);
+ 	// Once we apply the new subvp context to hardware it won't be in the
+ 	// dc->current_state anymore, so we have to cache it before we apply
+ 	// the new SubVP context
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index 7b164e8fa104..d3b6a389fece 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -463,6 +463,7 @@ struct dc_config {
+ 	unsigned int enable_fpo_flicker_detection;
+ 	bool disable_hbr_audio_dp2;
+ 	bool consolidated_dpia_dp_lt;
++	bool set_pipe_unlock_order;
+ };
+ 
+ enum visual_confirm {
+@@ -1461,6 +1462,7 @@ struct dc {
+ 		struct dc_scratch_space current_state;
+ 		struct dc_scratch_space new_state;
+ 		struct dc_stream_state temp_stream; // Used so we don't need to allocate stream on the stack
++		bool pipes_to_unlock_first[MAX_PIPES]; /* Any of the pipes indicated here should be unlocked first */
+ 	} scratch;
+ 
+ 	struct dml2_configuration_options dml2_options;
+diff --git a/drivers/gpu/drm/amd/display/dc/hwss/dcn401/dcn401_hwseq.c b/drivers/gpu/drm/amd/display/dc/hwss/dcn401/dcn401_hwseq.c
+index 0b743669f23b..29fcb4ed6646 100644
+--- a/drivers/gpu/drm/amd/display/dc/hwss/dcn401/dcn401_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/hwss/dcn401/dcn401_hwseq.c
+@@ -1705,7 +1705,6 @@ void dcn401_interdependent_update_lock(struct dc *dc,
+ 	unsigned int i = 0;
+ 	struct pipe_ctx *pipe = NULL;
+ 	struct timing_generator *tg = NULL;
+-	bool pipe_unlocked[MAX_PIPES] = {0};
+ 
+ 	if (lock) {
+ 		for (i = 0; i < dc->res_pool->pipe_count; i++) {
+@@ -1719,43 +1718,36 @@ void dcn401_interdependent_update_lock(struct dc *dc,
+ 			dc->hwss.pipe_control_lock(dc, pipe, true);
+ 		}
+ 	} else {
+-		/* Unlock pipes based on the change in DET allocation instead of pipe index
+-		 * Prevents over allocation of DET during unlock process
+-		 * e.g. 2 pipe config with different streams with a max of 20 DET segments
+-		 *	Before:								After:
+-		 *		- Pipe0: 10 DET segments			- Pipe0: 12 DET segments
+-		 *		- Pipe1: 10 DET segments			- Pipe1: 8 DET segments
+-		 * If Pipe0 gets updated first, 22 DET segments will be allocated
+-		 */
++		/* Need to free DET being used first and have pipe update, then unlock the remaining pipes*/
+ 		for (i = 0; i < dc->res_pool->pipe_count; i++) {
+ 			pipe = &context->res_ctx.pipe_ctx[i];
+ 			tg = pipe->stream_res.tg;
+-			int current_pipe_idx = i;
+ 
+ 			if (!resource_is_pipe_type(pipe, OTG_MASTER) ||
+ 					!tg->funcs->is_tg_enabled(tg) ||
+ 					dc_state_get_pipe_subvp_type(context, pipe) == SUBVP_PHANTOM) {
+-				pipe_unlocked[i] = true;
+ 				continue;
+ 			}
+ 
+-			// If the same stream exists in old context, ensure the OTG_MASTER pipes for the same stream get compared
+-			struct pipe_ctx *old_otg_master = resource_get_otg_master_for_stream(&dc->current_state->res_ctx, pipe->stream);
+-
+-			if (old_otg_master)
+-				current_pipe_idx = old_otg_master->pipe_idx;
+-			if (resource_calculate_det_for_stream(context, pipe) <
+-					resource_calculate_det_for_stream(dc->current_state, &dc->current_state->res_ctx.pipe_ctx[current_pipe_idx])) {
++			if (dc->scratch.pipes_to_unlock_first[i]) {
+ 				dc->hwss.pipe_control_lock(dc, pipe, false);
+-				pipe_unlocked[i] = true;
+ 				dcn401_wait_for_det_buffer_update(dc, context, pipe);
+ 			}
+ 		}
+ 
++		/* Unlocking the rest of the pipes */
+ 		for (i = 0; i < dc->res_pool->pipe_count; i++) {
+-			if (pipe_unlocked[i])
++			if (dc->scratch.pipes_to_unlock_first[i])
+ 				continue;
++
+ 			pipe = &context->res_ctx.pipe_ctx[i];
++			tg = pipe->stream_res.tg;
++			if (!resource_is_pipe_type(pipe, OTG_MASTER) ||
++					!tg->funcs->is_tg_enabled(tg) ||
++					dc_state_get_pipe_subvp_type(context, pipe) == SUBVP_PHANTOM) {
++				continue;
++			}
++
+ 			dc->hwss.pipe_control_lock(dc, pipe, false);
+ 		}
+ 	}
+diff --git a/drivers/gpu/drm/amd/display/dc/resource/dcn401/dcn401_resource.c b/drivers/gpu/drm/amd/display/dc/resource/dcn401/dcn401_resource.c
+index 9d56fbdcd06a..f2653a86d3e7 100644
+--- a/drivers/gpu/drm/amd/display/dc/resource/dcn401/dcn401_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/resource/dcn401/dcn401_resource.c
+@@ -1867,6 +1867,7 @@ static bool dcn401_resource_construct(
+ 	dc->config.prefer_easf = true;
+ 	dc->config.dc_mode_clk_limit_support = true;
+ 	dc->config.enable_windowed_mpo_odm = true;
++	dc->config.set_pipe_unlock_order = true; /* Need to ensure DET gets freed before allocating */
+ 	/* read VBIOS LTTPR caps */
+ 	{
+ 		if (ctx->dc_bios->funcs->get_lttpr_caps) {
+-- 
+2.52.0
+
