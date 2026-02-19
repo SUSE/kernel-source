@@ -1,0 +1,366 @@
+From 44063dbcdbd8abf172b8cc30e18d7e2948e9d699 Mon Sep 17 00:00:00 2001
+From: Peichen Huang <PeiChen.Huang@amd.com>
+Date: Wed, 4 Dec 2024 15:20:10 +0800
+Subject: drm/amd/display: have pretrain for dpia
+Git-commit: 44063dbcdbd8abf172b8cc30e18d7e2948e9d699
+Patch-mainline: v6.14-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+[WHY]
+We like to have pretrain for dpia link so that dp and dp tunneling
+have aligned behavior. The Main difficult for dpia pretrain is that
+encoder can not get corresponded dpia port when link detection
+in current implementation.
+
+[HOW]
+1. create enable/disable dpia output functions for dcn35 encoder
+and have dpia_id and other necessary info as inputs.
+2. dcn35 dpia use the new functions to enable/disable output.
+3. have a option to enable/disable the change.
+
+Reviewed-by: Wenjing Liu <wenjing.liu@amd.com>
+Reviewed-by: Meenakshikumar Somasundaram <meenakshikumar.somasundaram@amd.com>
+Signed-off-by: Peichen Huang <PeiChen.Huang@amd.com>
+Signed-off-by: Roman Li <roman.li@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/display/dc/dc.h           |  4 +-
+ .../dc/dio/dcn35/dcn35_dio_link_encoder.c     | 80 +++++++++++++++++++
+ .../dc/dio/dcn35/dcn35_dio_link_encoder.h     | 18 +++++
+ .../drm/amd/display/dc/inc/hw/link_encoder.h  |  8 ++
+ .../amd/display/dc/link/hwss/link_hwss_dio.c  |  4 +-
+ .../amd/display/dc/link/hwss/link_hwss_dpia.c | 61 +++++++++++++-
+ .../amd/display/dc/link/hwss/link_hwss_dpia.h |  3 +
+ .../drm/amd/display/dc/link/link_detection.c  |  3 +-
+ .../gpu/drm/amd/display/dc/link/link_dpms.c   |  3 +-
+ .../dc/link/protocols/link_dp_irq_handler.c   |  3 +-
+ 10 files changed, 180 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index eb66d67abd9e..9db51b359de0 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -472,6 +472,7 @@ struct dc_config {
+ 	bool disable_hbr_audio_dp2;
+ 	bool consolidated_dpia_dp_lt;
+ 	bool set_pipe_unlock_order;
++	bool enable_dpia_pre_training;
+ };
+ 
+ enum visual_confirm {
+@@ -775,7 +776,8 @@ union dpia_debug_options {
+ 		uint32_t enable_force_tbt3_work_around:1; /* bit 4 */
+ 		uint32_t disable_usb4_pm_support:1; /* bit 5 */
+ 		uint32_t enable_consolidated_dpia_dp_lt:1; /* bit 6 */
+-		uint32_t reserved:25;
++		uint32_t enable_dpia_pre_training:1; /* bit 7 */
++		uint32_t reserved:24;
+ 	} bits;
+ 	uint32_t raw;
+ };
+diff --git a/drivers/gpu/drm/amd/display/dc/dio/dcn35/dcn35_dio_link_encoder.c b/drivers/gpu/drm/amd/display/dc/dio/dcn35/dcn35_dio_link_encoder.c
+index d4a3e811aa39..ea0c9a9d0bd6 100644
+--- a/drivers/gpu/drm/amd/display/dc/dio/dcn35/dcn35_dio_link_encoder.c
++++ b/drivers/gpu/drm/amd/display/dc/dio/dcn35/dcn35_dio_link_encoder.c
+@@ -28,6 +28,7 @@
+ #include "link_encoder.h"
+ #include "dcn31/dcn31_dio_link_encoder.h"
+ #include "dcn35_dio_link_encoder.h"
++#include "dc_dmub_srv.h"
+ #define CTX \
+ 	enc10->base.ctx
+ #define DC_LOGGER \
+@@ -159,6 +160,8 @@ static const struct link_encoder_funcs dcn35_link_enc_funcs = {
+ 	.is_in_alt_mode = dcn31_link_encoder_is_in_alt_mode,
+ 	.get_max_link_cap = dcn31_link_encoder_get_max_link_cap,
+ 	.set_dio_phy_mux = dcn31_link_encoder_set_dio_phy_mux,
++	.enable_dpia_output = dcn35_link_encoder_enable_dpia_output,
++	.disable_dpia_output = dcn35_link_encoder_disable_dpia_output,
+ };
+ 
+ void dcn35_link_encoder_construct(
+@@ -265,3 +268,80 @@ void dcn35_link_encoder_construct(
+ 		enc10->base.features.flags.bits.HDMI_6GB_EN = 0;
+ 
+ }
++
++/* DPIA equivalent of link_transmitter_control. */
++static bool link_dpia_control(struct dc_context *dc_ctx,
++	struct dmub_cmd_dig_dpia_control_data *dpia_control)
++{
++	union dmub_rb_cmd cmd;
++
++	memset(&cmd, 0, sizeof(cmd));
++
++	cmd.dig1_dpia_control.header.type = DMUB_CMD__DPIA;
++	cmd.dig1_dpia_control.header.sub_type =
++			DMUB_CMD__DPIA_DIG1_DPIA_CONTROL;
++	cmd.dig1_dpia_control.header.payload_bytes =
++		sizeof(cmd.dig1_dpia_control) -
++		sizeof(cmd.dig1_dpia_control.header);
++
++	cmd.dig1_dpia_control.dpia_control = *dpia_control;
++
++	dc_wake_and_execute_dmub_cmd(dc_ctx, &cmd, DM_DMUB_WAIT_TYPE_WAIT);
++
++	return true;
++}
++
++static void link_encoder_disable(struct dcn10_link_encoder *enc10)
++{
++	/* reset training complete */
++	REG_UPDATE(DP_LINK_CNTL, DP_LINK_TRAINING_COMPLETE, 0);
++}
++
++void dcn35_link_encoder_enable_dpia_output(
++	struct link_encoder *enc,
++	const struct dc_link_settings *link_settings,
++	uint8_t dpia_id,
++	uint8_t digmode,
++	uint8_t fec_rdy)
++{
++	struct dcn10_link_encoder *enc10 = TO_DCN10_LINK_ENC(enc);
++	struct dmub_cmd_dig_dpia_control_data dpia_control = { 0 };
++
++	enc1_configure_encoder(enc10, link_settings);
++
++	dpia_control.action = (uint8_t)TRANSMITTER_CONTROL_ENABLE;
++	dpia_control.enc_id = enc->preferred_engine;
++	dpia_control.mode_laneset.digmode = digmode;
++	dpia_control.lanenum = (uint8_t)link_settings->lane_count;
++	dpia_control.symclk_10khz = link_settings->link_rate *
++			LINK_RATE_REF_FREQ_IN_KHZ / 10;
++	/* DIG_BE_CNTL.DIG_HPD_SELECT set to 5 (hpdsel - 1) to indicate HPD pin unused by DPIA. */
++	dpia_control.hpdsel = 6;
++	dpia_control.dpia_id = dpia_id;
++	dpia_control.fec_rdy = fec_rdy;
++
++	DC_LOG_DEBUG("%s: DPIA(%d) - enc_id(%d)\n", __func__, dpia_control.dpia_id, dpia_control.enc_id);
++	link_dpia_control(enc->ctx, &dpia_control);
++}
++
++void dcn35_link_encoder_disable_dpia_output(
++	struct link_encoder *enc,
++	uint8_t dpia_id,
++	uint8_t digmode)
++{
++	struct dcn10_link_encoder *enc10 = TO_DCN10_LINK_ENC(enc);
++	struct dmub_cmd_dig_dpia_control_data dpia_control = { 0 };
++
++	if (enc->funcs->is_dig_enabled && !enc->funcs->is_dig_enabled(enc))
++		return;
++
++	dpia_control.action = (uint8_t)TRANSMITTER_CONTROL_DISABLE;
++	dpia_control.enc_id = enc->preferred_engine;
++	dpia_control.mode_laneset.digmode = digmode;
++	dpia_control.dpia_id = dpia_id;
++
++	DC_LOG_DEBUG("%s: DPIA(%d) - enc_id(%d)\n", __func__, dpia_control.dpia_id, dpia_control.enc_id);
++	link_dpia_control(enc->ctx, &dpia_control);
++
++	link_encoder_disable(enc10);
++}
+diff --git a/drivers/gpu/drm/amd/display/dc/dio/dcn35/dcn35_dio_link_encoder.h b/drivers/gpu/drm/amd/display/dc/dio/dcn35/dcn35_dio_link_encoder.h
+index d546a3676304..f9d4221f4b43 100644
+--- a/drivers/gpu/drm/amd/display/dc/dio/dcn35/dcn35_dio_link_encoder.h
++++ b/drivers/gpu/drm/amd/display/dc/dio/dcn35/dcn35_dio_link_encoder.h
+@@ -144,4 +144,22 @@ bool dcn35_is_dig_enabled(struct link_encoder *enc);
+ enum signal_type dcn35_get_dig_mode(struct link_encoder *enc);
+ void dcn35_link_encoder_setup(struct link_encoder *enc, enum signal_type signal);
+ 
++/*
++ * Enable DP transmitter and its encoder for dpia port.
++ */
++void dcn35_link_encoder_enable_dpia_output(
++	struct link_encoder *enc,
++	const struct dc_link_settings *link_settings,
++	uint8_t dpia_id,
++	uint8_t digmode,
++	uint8_t fec_rdy);
++
++/*
++ * Disable transmitter and its encoder for dpia port.
++ */
++void dcn35_link_encoder_disable_dpia_output(
++	struct link_encoder *enc,
++	uint8_t dpia_id,
++	uint8_t digmode);
++
+ #endif /* __DC_LINK_ENCODER__DCN35_H__ */
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/link_encoder.h b/drivers/gpu/drm/amd/display/dc/inc/hw/link_encoder.h
+index af9183f5d69b..08c16ba52a51 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/link_encoder.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/link_encoder.h
+@@ -168,6 +168,14 @@ struct link_encoder_funcs {
+ 		struct link_encoder *enc,
+ 		enum encoder_type_select sel,
+ 		uint32_t hpo_inst);
++	void (*enable_dpia_output)(struct link_encoder *enc,
++		const struct dc_link_settings *link_settings,
++		uint8_t dpia_id,
++		uint8_t digmode,
++		uint8_t fec_rdy);
++	void (*disable_dpia_output)(struct link_encoder *link_enc,
++		uint8_t dpia_id,
++		uint8_t digmode);
+ };
+ 
+ /*
+diff --git a/drivers/gpu/drm/amd/display/dc/link/hwss/link_hwss_dio.c b/drivers/gpu/drm/amd/display/dc/link/hwss/link_hwss_dio.c
+index 3e47a6735912..06faa461067b 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/hwss/link_hwss_dio.c
++++ b/drivers/gpu/drm/amd/display/dc/link/hwss/link_hwss_dio.c
+@@ -164,7 +164,9 @@ void disable_dio_link_output(struct dc_link *link,
+ {
+ 	struct link_encoder *link_enc = link_enc_cfg_get_link_enc(link);
+ 
+-	link_enc->funcs->disable_output(link_enc, signal);
++	if (link_enc != NULL)
++		link_enc->funcs->disable_output(link_enc, signal);
++
+ 	link->dc->link_srv->dp_trace_source_sequence(link,
+ 			DPCD_SOURCE_SEQ_AFTER_DISABLE_LINK_PHY);
+ }
+diff --git a/drivers/gpu/drm/amd/display/dc/link/hwss/link_hwss_dpia.c b/drivers/gpu/drm/amd/display/dc/link/hwss/link_hwss_dpia.c
+index 6499807af72a..36adf95744fe 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/hwss/link_hwss_dpia.c
++++ b/drivers/gpu/drm/amd/display/dc/link/hwss/link_hwss_dpia.c
+@@ -77,17 +77,74 @@ static void set_dio_dpia_lane_settings(struct dc_link *link,
+ {
+ }
+ 
++static void enable_dpia_link_output(struct dc_link *link,
++		const struct link_resource *link_res,
++		enum signal_type signal,
++		enum clock_source_id clock_source,
++		const struct dc_link_settings *link_settings)
++{
++	struct link_encoder *link_enc = link_enc_cfg_get_link_enc(link);
++
++	if (link_enc != NULL) {
++		if (link->dc->config.enable_dpia_pre_training && link_enc->funcs->enable_dpia_output) {
++			uint8_t fec_rdy = link->dc->link_srv->dp_should_enable_fec(link);
++			uint8_t digmode = dc_is_dp_sst_signal(signal) ? DIG_SST_MODE : DIG_MST_MODE;
++
++			link_enc->funcs->enable_dpia_output(
++					link_enc,
++					link_settings,
++					link->ddc_hw_inst,
++					digmode,
++					fec_rdy);
++		} else {
++			if (dc_is_dp_sst_signal(signal))
++				link_enc->funcs->enable_dp_output(
++						link_enc,
++						link_settings,
++						clock_source);
++			else
++				link_enc->funcs->enable_dp_mst_output(
++						link_enc,
++						link_settings,
++						clock_source);
++		}
++
++	}
++
++	link->dc->link_srv->dp_trace_source_sequence(link,
++			DPCD_SOURCE_SEQ_AFTER_ENABLE_LINK_PHY);
++}
++
++static void disable_dpia_link_output(struct dc_link *link,
++		const struct link_resource *link_res,
++		enum signal_type signal)
++{
++	struct link_encoder *link_enc = link_enc_cfg_get_link_enc(link);
++
++	if (link_enc != NULL) {
++		if (link->dc->config.enable_dpia_pre_training && link_enc->funcs->disable_dpia_output) {
++			uint8_t digmode = dc_is_dp_sst_signal(signal) ? DIG_SST_MODE : DIG_MST_MODE;
++
++			link_enc->funcs->disable_dpia_output(link_enc, link->ddc_hw_inst, digmode);
++		} else
++			link_enc->funcs->disable_output(link_enc, signal);
++	}
++
++	link->dc->link_srv->dp_trace_source_sequence(link,
++			DPCD_SOURCE_SEQ_AFTER_DISABLE_LINK_PHY);
++}
++
+ static const struct link_hwss dpia_link_hwss = {
+ 	.setup_stream_encoder = setup_dio_stream_encoder,
+ 	.reset_stream_encoder = reset_dio_stream_encoder,
+ 	.setup_stream_attribute = setup_dio_stream_attribute,
+-	.disable_link_output = disable_dio_link_output,
++	.disable_link_output = disable_dpia_link_output,
+ 	.setup_audio_output = setup_dio_audio_output,
+ 	.enable_audio_packet = enable_dio_audio_packet,
+ 	.disable_audio_packet = disable_dio_audio_packet,
+ 	.ext = {
+ 		.set_throttled_vcp_size = set_dio_throttled_vcp_size,
+-		.enable_dp_link_output = enable_dio_dp_link_output,
++		.enable_dp_link_output = enable_dpia_link_output,
+ 		.set_dp_link_test_pattern = set_dio_dpia_link_test_pattern,
+ 		.set_dp_lane_settings = set_dio_dpia_lane_settings,
+ 		.update_stream_allocation_table = update_dpia_stream_allocation_table,
+diff --git a/drivers/gpu/drm/amd/display/dc/link/hwss/link_hwss_dpia.h b/drivers/gpu/drm/amd/display/dc/link/hwss/link_hwss_dpia.h
+index ad16ec5d9bb7..259e0f4775e1 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/hwss/link_hwss_dpia.h
++++ b/drivers/gpu/drm/amd/display/dc/link/hwss/link_hwss_dpia.h
+@@ -27,6 +27,9 @@
+ 
+ #include "link_hwss.h"
+ 
++#define DIG_SST_MODE    0
++#define DIG_MST_MODE    5
++
+ const struct link_hwss *get_dpia_link_hwss(void);
+ bool can_use_dpia_link_hwss(const struct dc_link *link,
+ 		const struct link_resource *link_res);
+diff --git a/drivers/gpu/drm/amd/display/dc/link/link_detection.c b/drivers/gpu/drm/amd/display/dc/link/link_detection.c
+index e026c728042a..550e1a098fa2 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/link_detection.c
++++ b/drivers/gpu/drm/amd/display/dc/link/link_detection.c
+@@ -829,7 +829,8 @@ static bool should_verify_link_capability_destructively(struct dc_link *link,
+ 
+ 		if (link->dc->debug.skip_detection_link_training ||
+ 				dc_is_embedded_signal(link->local_sink->sink_signal) ||
+-				link->ep_type == DISPLAY_ENDPOINT_USB4_DPIA) {
++				(link->ep_type == DISPLAY_ENDPOINT_USB4_DPIA &&
++				!link->dc->config.enable_dpia_pre_training)) {
+ 			destrictive = false;
+ 		} else if (link_dp_get_encoding_format(&max_link_cap) ==
+ 				DP_8b_10b_ENCODING) {
+diff --git a/drivers/gpu/drm/amd/display/dc/link/link_dpms.c b/drivers/gpu/drm/amd/display/dc/link/link_dpms.c
+index 60e64e0138a3..6f3e7e182145 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/link_dpms.c
++++ b/drivers/gpu/drm/amd/display/dc/link/link_dpms.c
+@@ -2043,7 +2043,8 @@ static enum dc_status enable_link_dp(struct dc_state *state,
+ 	/* Train with fallback when enabling DPIA link. Conventional links are
+ 	 * trained with fallback during sink detection.
+ 	 */
+-	if (link->ep_type == DISPLAY_ENDPOINT_USB4_DPIA)
++	if (link->ep_type == DISPLAY_ENDPOINT_USB4_DPIA &&
++			!link->dc->config.enable_dpia_pre_training)
+ 		do_fallback = true;
+ 
+ 	/*
+diff --git a/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_irq_handler.c b/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_irq_handler.c
+index 017fbc476d51..ae47bb5975af 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_irq_handler.c
++++ b/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_irq_handler.c
+@@ -410,7 +410,8 @@ bool dp_handle_hpd_rx_irq(struct dc_link *link,
+ 
+ 	if (hpd_irq_dpcd_data.bytes.device_service_irq.bits.AUTOMATED_TEST) {
+ 		// Workaround for DP 1.4a LL Compliance CTS as USB4 has to share encoders unlike DP and USBC
+-		if (link->ep_type == DISPLAY_ENDPOINT_USB4_DPIA)
++		if (link->ep_type == DISPLAY_ENDPOINT_USB4_DPIA &&
++				!link->dc->config.enable_dpia_pre_training)
+ 			link->skip_fallback_on_link_loss = true;
+ 
+ 		device_service_clear.bits.AUTOMATED_TEST = 1;
+-- 
+2.52.0
+
