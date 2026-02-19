@@ -1,0 +1,128 @@
+From e79cba63de318faa80804701563e58d880c2c492 Mon Sep 17 00:00:00 2001
+From: George Shen <george.shen@amd.com>
+Date: Wed, 4 Dec 2024 18:10:18 -0500
+Subject: drm/amd/display: Parse RECEIVE_PORT0_CAP capabilities from DPCD
+Git-commit: e79cba63de318faa80804701563e58d880c2c492
+Patch-mainline: v6.14-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+[Why]
+DPCD register RECEIVE_PORT0_CAP contains HBlank expansion/reduction
+capabilities of a DP device. These capabilities are required to enable
+HBlank expansion/reduction logic.
+
+[How]
+Read raw RECEIVE_PORT0_CAP register values and store parsed fields.
+
+Reviewed-by: Wenjing Liu <wenjing.liu@amd.com>
+Signed-off-by: George Shen <george.shen@amd.com>
+Signed-off-by: Roman Li <roman.li@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/display/dc/dc.h              |  8 ++++++++
+ drivers/gpu/drm/amd/display/dc/dc_dp_types.h     | 16 ++++++++++++++++
+ drivers/gpu/drm/amd/display/dc/dc_types.h        |  8 ++++++++
+ .../dc/link/protocols/link_dp_capability.c       |  5 +++++
+ 4 files changed, 37 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index c92232c14c50..2b1fb1de43c5 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -2383,6 +2383,13 @@ struct dc_sink_dsc_caps {
+ 	struct dsc_dec_dpcd_caps dsc_dec_caps;
+ };
+ 
++struct dc_sink_hblank_expansion_caps {
++	// 'true' if these are virtual DPCD's HBlank expansion caps (immediately upstream of sink in MST topology),
++	// 'false' if they are sink's HBlank expansion caps
++	bool is_virtual_dpcd_hblank_expansion;
++	struct hblank_expansion_dpcd_caps dpcd_caps;
++};
++
+ struct dc_sink_fec_caps {
+ 	bool is_rx_fec_supported;
+ 	bool is_topology_fec_supported;
+@@ -2409,6 +2416,7 @@ struct dc_sink {
+ 	struct scdc_caps scdc_caps;
+ 	struct dc_sink_dsc_caps dsc_caps;
+ 	struct dc_sink_fec_caps fec_caps;
++	struct dc_sink_hblank_expansion_caps hblank_expansion_caps;
+ 
+ 	bool is_vsc_sdp_colorimetry_supported;
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_dp_types.h b/drivers/gpu/drm/amd/display/dc/dc_dp_types.h
+index 8dd6eb044829..94ce8fe74481 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_dp_types.h
++++ b/drivers/gpu/drm/amd/display/dc/dc_dp_types.h
+@@ -969,6 +969,21 @@ union dp_sink_video_fallback_formats {
+ 	uint8_t raw;
+ };
+ 
++union dp_receive_port0_cap {
++	struct {
++		uint8_t RESERVED					:1;
++		uint8_t LOCAL_EDID_PRESENT			:1;
++		uint8_t ASSOCIATED_TO_PRECEDING_PORT:1;
++		uint8_t HBLANK_EXPANSION_CAPABLE	:1;
++		uint8_t BUFFER_SIZE_UNIT			:1;
++		uint8_t BUFFER_SIZE_PER_PORT		:1;
++		uint8_t HBLANK_REDUCTION_CAPABLE	:1;
++		uint8_t RESERVED2:1;
++		uint8_t BUFFER_SIZE:8;
++	} bits;
++	uint8_t raw[2];
++};
++
+ union dpcd_max_uncompressed_pixel_rate_cap {
+ 	struct {
+ 		uint16_t max_uncompressed_pixel_rate_cap	:15;
+@@ -1193,6 +1208,7 @@ struct dpcd_caps {
+ 
+ 	struct replay_info pr_info;
+ 	uint16_t edp_oled_emission_rate;
++	union dp_receive_port0_cap receive_port0_cap;
+ };
+ 
+ union dpcd_sink_ext_caps {
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_types.h b/drivers/gpu/drm/amd/display/dc/dc_types.h
+index 9466b63644d5..0243d1b675d8 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_types.h
++++ b/drivers/gpu/drm/amd/display/dc/dc_types.h
+@@ -874,6 +874,14 @@ struct dsc_dec_dpcd_caps {
+ 	bool is_dp; /* Decoded format */
+ };
+ 
++struct hblank_expansion_dpcd_caps {
++	bool expansion_supported;
++	bool reduction_supported;
++	bool buffer_unit_bytes; /* True: buffer size in bytes. False: buffer size in pixels*/
++	bool buffer_per_port; /* True: buffer size per port. False: buffer size per lane*/
++	uint32_t buffer_size; /* Add 1 to value and multiply by 32 */
++};
++
+ struct dc_golden_table {
+ 	uint16_t dc_golden_table_ver;
+ 	uint32_t aux_dphy_rx_control0_val;
+diff --git a/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_capability.c b/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_capability.c
+index ce9d799d2386..d1d869cc85c7 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_capability.c
++++ b/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_capability.c
+@@ -1779,6 +1779,11 @@ static bool retrieve_link_cap(struct dc_link *link)
+ 	link->test_pattern_enabled = false;
+ 	link->compliance_test_state.raw = 0;
+ 
++	link->dpcd_caps.receive_port0_cap.raw[0] =
++			dpcd_data[DP_RECEIVE_PORT_0_CAP_0 - DP_DPCD_REV];
++	link->dpcd_caps.receive_port0_cap.raw[1] =
++			dpcd_data[DP_RECEIVE_PORT_0_BUFFER_SIZE - DP_DPCD_REV];
++
+ 	/* read sink count */
+ 	core_link_read_dpcd(link,
+ 			DP_SINK_COUNT,
+-- 
+2.52.0
+
