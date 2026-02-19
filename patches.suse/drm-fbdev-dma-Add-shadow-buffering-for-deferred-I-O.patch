@@ -1,13 +1,13 @@
-From 0d251bd7da586f3fcd3b442c0fcdd8141f6ea82c Mon Sep 17 00:00:00 2001
+From 3603996432997f7c88da37a97062a46cda01ac9d Mon Sep 17 00:00:00 2001
 From: Thomas Zimmermann <tzimmermann@suse.de>
 Date: Wed, 11 Dec 2024 10:06:28 +0100
 Subject: drm/fbdev-dma: Add shadow buffering for deferred I/O
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
 Git-commit: 3603996432997f7c88da37a97062a46cda01ac9d
 Patch-mainline: v6.14-rc5
-References: bsc#1240174 CVE-2024-58091
+References: bsc#1240174 CVE-2024-58091 jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
 
 DMA areas are not necessarily backed by struct page, so we cannot
 rely on it for deferred I/O. Allocate a shadow buffer for drivers
@@ -29,7 +29,7 @@ page in the allocated DMA-backed buffer object.
 
 Signed-off-by: Thomas Zimmermann <tzimmermann@suse.de>
 Reported-by: Nuno Gonçalves <nunojpg@gmail.com>
-CLoses: https://lore.kernel.org/dri-devel/CAEXMXLR55DziAMbv_+2hmLeH-jP96pmit6nhs6siB22cpQFr9w@mail.gmail.com/
+Closes: https://lore.kernel.org/dri-devel/CAEXMXLR55DziAMbv_+2hmLeH-jP96pmit6nhs6siB22cpQFr9w@mail.gmail.com/
 Tested-by: Nuno Gonçalves <nunojpg@gmail.com>
 Fixes: 5ab91447aa13 ("drm/tiny/ili9225: Use fbdev-dma")
 Cc: Thomas Zimmermann <tzimmermann@suse.de>
@@ -37,13 +37,14 @@ Cc: <stable@vger.kernel.org> # v6.11+
 Reviewed-by: Simona Vetter <simona.vetter@ffwll.ch>
 Reviewed-by: Javier Martinez Canillas <javierm@redhat.com>
 Link: https://patchwork.freedesktop.org/patch/msgid/20241211090643.74250-1-tzimmermann@suse.de
-Acked-by: Thomas Zimmermann <tzimmermann@suse.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
 ---
- drivers/gpu/drm/drm_fbdev_dma.c | 257 ++++++++++++++++++++++----------
- 1 file changed, 175 insertions(+), 82 deletions(-)
+ drivers/gpu/drm/drm_fbdev_dma.c | 217 +++++++++++++++++++++++---------
+ 1 file changed, 155 insertions(+), 62 deletions(-)
 
 diff --git a/drivers/gpu/drm/drm_fbdev_dma.c b/drivers/gpu/drm/drm_fbdev_dma.c
-index 51c2d742d1998..1631f7cba3c4b 100644
+index b14b581c059d..02a516e77192 100644
 --- a/drivers/gpu/drm/drm_fbdev_dma.c
 +++ b/drivers/gpu/drm/drm_fbdev_dma.c
 @@ -1,6 +1,7 @@
@@ -52,9 +53,9 @@ index 51c2d742d1998..1631f7cba3c4b 100644
  #include <linux/fb.h>
 +#include <linux/vmalloc.h>
  
- #include <drm/drm_crtc_helper.h>
  #include <drm/drm_drv.h>
-@@ -72,45 +73,199 @@ static const struct fb_ops drm_fbdev_dma_fb_ops = {
+ #include <drm/drm_fbdev_dma.h>
+@@ -70,37 +71,102 @@ static const struct fb_ops drm_fbdev_dma_fb_ops = {
  	.fb_destroy = drm_fbdev_dma_fb_destroy,
  };
  
@@ -70,18 +71,18 @@ index 51c2d742d1998..1631f7cba3c4b 100644
 -	struct drm_framebuffer *fb = fb_helper->fb;
 -	struct drm_gem_dma_object *dma = drm_fb_dma_get_gem_obj(fb, 0);
 +	void *shadow = info->screen_buffer;
- 
--	if (!dma->map_noncoherent)
--		vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
++
 +	if (!fb_helper->dev)
 +		return;
  
--	return fb_deferred_io_mmap(info, vma);
+-	if (!dma->map_noncoherent)
+-		vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
 +	if (info->fbdefio)
 +		fb_deferred_io_cleanup(info);
 +	drm_fb_helper_fini(fb_helper);
 +	vfree(shadow);
-+
+ 
+-	return fb_deferred_io_mmap(info, vma);
 +	drm_client_buffer_vunmap(fb_helper->buffer);
 +	drm_client_framebuffer_delete(fb_helper->buffer);
 +	drm_client_release(&fb_helper->client);
@@ -166,29 +167,24 @@ index 51c2d742d1998..1631f7cba3c4b 100644
 +
 +	return 0;
 +}
-+static int drm_fbdev_dma_helper_fb_dirty(struct drm_fb_helper *helper,
-+					 struct drm_clip_rect *clip)
-+{
-+	struct drm_device *dev = helper->dev;
-+	int ret;
-+
-+	/* Call damage handlers only if necessary */
-+	if (!(clip->x1 < clip->x2 && clip->y1 < clip->y2))
-+		return 0;
-+
-+	if (helper->fb->funcs->dirty) {
+ static int drm_fbdev_dma_helper_fb_dirty(struct drm_fb_helper *helper,
+ 					 struct drm_clip_rect *clip)
+ {
+@@ -112,6 +178,10 @@ static int drm_fbdev_dma_helper_fb_dirty(struct drm_fb_helper *helper,
+ 		return 0;
+ 
+ 	if (helper->fb->funcs->dirty) {
 +		ret = drm_fbdev_dma_damage_blit(helper, clip);
 +		if (drm_WARN_ONCE(dev, ret, "Damage blitter failed: ret=%d\n", ret))
 +			return ret;
 +
-+		ret = helper->fb->funcs->dirty(helper->fb, NULL, 0, 0, clip, 1);
-+		if (drm_WARN_ONCE(dev, ret, "Dirty helper failed: ret=%d\n", ret))
-+			return ret;
-+	}
-+
-+	return 0;
-+}
-+
+ 		ret = helper->fb->funcs->dirty(helper->fb, NULL, 0, 0, clip, 1);
+ 		if (drm_WARN_ONCE(dev, ret, "Dirty helper failed: ret=%d\n", ret))
+ 			return ret;
+@@ -128,14 +198,80 @@ static const struct drm_fb_helper_funcs drm_fbdev_dma_helper_funcs = {
+  * struct drm_fb_helper
+  */
+ 
 +static int drm_fbdev_dma_driver_fbdev_probe_tail(struct drm_fb_helper *fb_helper,
 +						 struct drm_fb_helper_surface_size *sizes)
 +{
@@ -257,8 +253,8 @@ index 51c2d742d1998..1631f7cba3c4b 100644
 +	return ret;
 +}
 +
- static int drm_fbdev_dma_helper_fb_probe(struct drm_fb_helper *fb_helper,
- 					 struct drm_fb_helper_surface_size *sizes)
+ int drm_fbdev_dma_driver_fbdev_probe(struct drm_fb_helper *fb_helper,
+ 				     struct drm_fb_helper_surface_size *sizes)
  {
  	struct drm_client_dev *client = &fb_helper->client;
  	struct drm_device *dev = fb_helper->dev;
@@ -268,7 +264,7 @@ index 51c2d742d1998..1631f7cba3c4b 100644
  	struct drm_framebuffer *fb;
  	struct fb_info *info;
  	u32 format;
-@@ -127,19 +282,9 @@ static int drm_fbdev_dma_helper_fb_probe(struct drm_fb_helper *fb_helper,
+@@ -152,19 +288,9 @@ int drm_fbdev_dma_driver_fbdev_probe(struct drm_fb_helper *fb_helper,
  					       sizes->surface_height, format);
  	if (IS_ERR(buffer))
  		return PTR_ERR(buffer);
@@ -288,7 +284,7 @@ index 51c2d742d1998..1631f7cba3c4b 100644
  	ret = drm_client_buffer_vmap(buffer, &map);
  	if (ret) {
  		goto err_drm_client_buffer_delete;
-@@ -159,45 +304,12 @@ static int drm_fbdev_dma_helper_fb_probe(struct drm_fb_helper *fb_helper,
+@@ -185,45 +311,12 @@ int drm_fbdev_dma_driver_fbdev_probe(struct drm_fb_helper *fb_helper,
  
  	drm_fb_helper_fill_info(info, fb_helper, sizes);
  
@@ -339,36 +335,6 @@ index 51c2d742d1998..1631f7cba3c4b 100644
  
  	return 0;
  
-@@ -212,28 +324,9 @@ static int drm_fbdev_dma_helper_fb_probe(struct drm_fb_helper *fb_helper,
- 	return ret;
- }
- 
--static int drm_fbdev_dma_helper_fb_dirty(struct drm_fb_helper *helper,
--					 struct drm_clip_rect *clip)
--{
--	struct drm_device *dev = helper->dev;
--	int ret;
--
--	/* Call damage handlers only if necessary */
--	if (!(clip->x1 < clip->x2 && clip->y1 < clip->y2))
--		return 0;
--
--	if (helper->fb->funcs->dirty) {
--		ret = helper->fb->funcs->dirty(helper->fb, NULL, 0, 0, clip, 1);
--		if (drm_WARN_ONCE(dev, ret, "Dirty helper failed: ret=%d\n", ret))
--			return ret;
--	}
--
--	return 0;
--}
--
- static const struct drm_fb_helper_funcs drm_fbdev_dma_helper_funcs = {
--	.fb_probe = drm_fbdev_dma_helper_fb_probe,
- 	.fb_dirty = drm_fbdev_dma_helper_fb_dirty,
-+	.fb_probe = drm_fbdev_dma_helper_fb_probe,
- };
- 
- /*
 -- 
-2.49.0
+2.52.0
 
