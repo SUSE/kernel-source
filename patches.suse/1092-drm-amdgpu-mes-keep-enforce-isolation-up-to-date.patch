@@ -1,0 +1,144 @@
+From 748a1f51bb74453f1fe22d3ca68a717cb31f02e5 Mon Sep 17 00:00:00 2001
+From: Alex Deucher <alexander.deucher@amd.com>
+Date: Fri, 14 Feb 2025 12:32:30 -0500
+Subject: drm/amdgpu/mes: keep enforce isolation up to date
+Git-commit: 748a1f51bb74453f1fe22d3ca68a717cb31f02e5
+Patch-mainline: v6.14-rc5
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Re-send the mes message on resume to make sure the
+mes state is up to date.
+
+Fixes: 8521e3c5f058 ("drm/amd/amdgpu: limit single process inside MES")
+Acked-by: Srinivasan Shanmugam <srinivasan.shanmugam@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Cc: Shaoyun Liu <shaoyun.liu@amd.com>
+Cc: Srinivasan Shanmugam <srinivasan.shanmugam@amd.com>
+(cherry picked from commit 27b791514789844e80da990c456c2465325e0851)
+
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c | 13 ++++---------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_mes.c | 20 +++++++++++++++++++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_mes.h |  2 +-
+ drivers/gpu/drm/amd/amdgpu/mes_v11_0.c  |  4 ++++
+ drivers/gpu/drm/amd/amdgpu/mes_v12_0.c  |  4 ++++
+ 5 files changed, 32 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
+index c6aff3ddb42d..c1f35ded684e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
+@@ -1638,24 +1638,19 @@ static ssize_t amdgpu_gfx_set_enforce_isolation(struct device *dev,
+ 	}
+ 
+ 	mutex_lock(&adev->enforce_isolation_mutex);
+-
+ 	for (i = 0; i < num_partitions; i++) {
+-		if (adev->enforce_isolation[i] && !partition_values[i]) {
++		if (adev->enforce_isolation[i] && !partition_values[i])
+ 			/* Going from enabled to disabled */
+ 			amdgpu_vmid_free_reserved(adev, AMDGPU_GFXHUB(i));
+-			if (adev->enable_mes && adev->gfx.enable_cleaner_shader)
+-				amdgpu_mes_set_enforce_isolation(adev, i, false);
+-		} else if (!adev->enforce_isolation[i] && partition_values[i]) {
++		else if (!adev->enforce_isolation[i] && partition_values[i])
+ 			/* Going from disabled to enabled */
+ 			amdgpu_vmid_alloc_reserved(adev, AMDGPU_GFXHUB(i));
+-			if (adev->enable_mes && adev->gfx.enable_cleaner_shader)
+-				amdgpu_mes_set_enforce_isolation(adev, i, true);
+-		}
+ 		adev->enforce_isolation[i] = partition_values[i];
+ 	}
+-
+ 	mutex_unlock(&adev->enforce_isolation_mutex);
+ 
++	amdgpu_mes_update_enforce_isolation(adev);
++
+ 	return count;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_mes.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_mes.c
+index 32b27a1658e7..709c11cbeabd 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_mes.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_mes.c
+@@ -1681,7 +1681,8 @@ bool amdgpu_mes_suspend_resume_all_supported(struct amdgpu_device *adev)
+ }
+ 
+ /* Fix me -- node_id is used to identify the correct MES instances in the future */
+-int amdgpu_mes_set_enforce_isolation(struct amdgpu_device *adev, uint32_t node_id, bool enable)
++static int amdgpu_mes_set_enforce_isolation(struct amdgpu_device *adev,
++					    uint32_t node_id, bool enable)
+ {
+ 	struct mes_misc_op_input op_input = {0};
+ 	int r;
+@@ -1703,6 +1704,23 @@ int amdgpu_mes_set_enforce_isolation(struct amdgpu_device *adev, uint32_t node_i
+ 	return r;
+ }
+ 
++int amdgpu_mes_update_enforce_isolation(struct amdgpu_device *adev)
++{
++	int i, r = 0;
++
++	if (adev->enable_mes && adev->gfx.enable_cleaner_shader) {
++		mutex_lock(&adev->enforce_isolation_mutex);
++		for (i = 0; i < (adev->xcp_mgr ? adev->xcp_mgr->num_xcps : 1); i++) {
++			if (adev->enforce_isolation[i])
++				r |= amdgpu_mes_set_enforce_isolation(adev, i, true);
++			else
++				r |= amdgpu_mes_set_enforce_isolation(adev, i, false);
++		}
++		mutex_unlock(&adev->enforce_isolation_mutex);
++	}
++	return r;
++}
++
+ #if defined(CONFIG_DEBUG_FS)
+ 
+ static int amdgpu_debugfs_mes_event_log_show(struct seq_file *m, void *unused)
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_mes.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_mes.h
+index 2df2444ee892..e98ea7ede1ba 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_mes.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_mes.h
+@@ -534,6 +534,6 @@ static inline void amdgpu_mes_unlock(struct amdgpu_mes *mes)
+ 
+ bool amdgpu_mes_suspend_resume_all_supported(struct amdgpu_device *adev);
+ 
+-int amdgpu_mes_set_enforce_isolation(struct amdgpu_device *adev, uint32_t node_id, bool enable);
++int amdgpu_mes_update_enforce_isolation(struct amdgpu_device *adev);
+ 
+ #endif /* __AMDGPU_MES_H__ */
+diff --git a/drivers/gpu/drm/amd/amdgpu/mes_v11_0.c b/drivers/gpu/drm/amd/amdgpu/mes_v11_0.c
+index 65f389eb65e5..f9a4d08eef92 100644
+--- a/drivers/gpu/drm/amd/amdgpu/mes_v11_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/mes_v11_0.c
+@@ -1633,6 +1633,10 @@ static int mes_v11_0_hw_init(struct amdgpu_ip_block *ip_block)
+ 		goto failure;
+ 	}
+ 
++	r = amdgpu_mes_update_enforce_isolation(adev);
++	if (r)
++		goto failure;
++
+ out:
+ 	/*
+ 	 * Disable KIQ ring usage from the driver once MES is enabled.
+diff --git a/drivers/gpu/drm/amd/amdgpu/mes_v12_0.c b/drivers/gpu/drm/amd/amdgpu/mes_v12_0.c
+index 901e924e69ad..0fd0fa6ed518 100644
+--- a/drivers/gpu/drm/amd/amdgpu/mes_v12_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/mes_v12_0.c
+@@ -1743,6 +1743,10 @@ static int mes_v12_0_hw_init(struct amdgpu_ip_block *ip_block)
+ 		goto failure;
+ 	}
+ 
++	r = amdgpu_mes_update_enforce_isolation(adev);
++	if (r)
++		goto failure;
++
+ out:
+ 	/*
+ 	 * Disable KIQ ring usage from the driver once MES is enabled.
+-- 
+2.52.0
+
