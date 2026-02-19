@@ -1,0 +1,120 @@
+From: Jane Chu <jane.chu@oracle.com>
+Date: Mon, 15 Sep 2025 18:45:20 -0600
+Subject: [PATCH] mm/hugetlb: fix copy_hugetlb_page_range() to use
+ ->pt_share_count
+References: bsc#1234429
+Patch-mainline: 6.12.74
+Git-commit: 14967a9c7d247841b0312c48dcf8cd29e55a4cc8
+
+commit 14967a9c7d247841b0312c48dcf8cd29e55a4cc8 upstream.
+
+commit 59d9094df3d79 ("mm: hugetlb: independent PMD page table shared
+count") introduced ->pt_share_count dedicated to hugetlb PMD share count
+tracking, but omitted fixing copy_hugetlb_page_range(), leaving the
+function relying on page_count() for tracking that no longer works.
+
+When lazy page table copy for hugetlb is disabled, that is, revert commit
+bcd51a3c679d ("hugetlb: lazy page table copies in fork()") fork()'ing with
+hugetlb PMD sharing quickly lockup -
+
+[  239.446559] watchdog: BUG: soft lockup - CPU#75 stuck for 27s!
+[  239.446611] RIP: 0010:native_queued_spin_lock_slowpath+0x7e/0x2e0
+[  239.446631] Call Trace:
+[  239.446633]  <TASK>
+[  239.446636]  _raw_spin_lock+0x3f/0x60
+[  239.446639]  copy_hugetlb_page_range+0x258/0xb50
+[  239.446645]  copy_page_range+0x22b/0x2c0
+[  239.446651]  dup_mmap+0x3e2/0x770
+[  239.446654]  dup_mm.constprop.0+0x5e/0x230
+[  239.446657]  copy_process+0xd17/0x1760
+[  239.446660]  kernel_clone+0xc0/0x3e0
+[  239.446661]  __do_sys_clone+0x65/0xa0
+[  239.446664]  do_syscall_64+0x82/0x930
+[  239.446668]  ? count_memcg_events+0xd2/0x190
+[  239.446671]  ? syscall_trace_enter+0x14e/0x1f0
+[  239.446676]  ? syscall_exit_work+0x118/0x150
+[  239.446677]  ? arch_exit_to_user_mode_prepare.constprop.0+0x9/0xb0
+[  239.446681]  ? clear_bhb_loop+0x30/0x80
+[  239.446684]  ? clear_bhb_loop+0x30/0x80
+[  239.446686]  entry_SYSCALL_64_after_hwframe+0x76/0x7e
+
+There are two options to resolve the potential latent issue:
+  1. warn against PMD sharing in copy_hugetlb_page_range(),
+  2. fix it.
+This patch opts for the second option.
+While at it, simplify the comment, the details are not actually relevant
+anymore.
+
+Link: https://lkml.kernel.org/r/20250916004520.1604530-1-jane.chu@oracle.com
+Fixes: 59d9094df3d7 ("mm: hugetlb: independent PMD page table shared count")
+Signed-off-by: Jane Chu <jane.chu@oracle.com>
+Reviewed-by: Harry Yoo <harry.yoo@oracle.com>
+Acked-by: Oscar Salvador <osalvador@suse.de>
+Acked-by: David Hildenbrand <david@redhat.com>
+Cc: Jann Horn <jannh@google.com>
+Cc: Liu Shixin <liushixin2@huawei.com>
+Cc: Muchun Song <muchun.song@linux.dev>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: David Hildenbrand (Arm) <david@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ include/linux/mm_types.h |  5 +++++
+ mm/hugetlb.c             | 15 +++++----------
+ 2 files changed, 10 insertions(+), 10 deletions(-)
+
+diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
+index 6894de506b36..23602259259d 100644
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -540,6 +540,11 @@ static inline int ptdesc_pmd_pts_count(struct ptdesc *ptdesc)
+ {
+ 	return atomic_read(&ptdesc->pt_share_count);
+ }
++
++static inline bool ptdesc_pmd_is_shared(struct ptdesc *ptdesc)
++{
++	return !!ptdesc_pmd_pts_count(ptdesc);
++}
+ #else
+ static inline void ptdesc_pmd_pts_init(struct ptdesc *ptdesc)
+ {
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index d404532ae41e..7014e622980d 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -5258,18 +5258,13 @@ int copy_hugetlb_page_range(struct mm_struct *dst, struct mm_struct *src,
+ 			break;
+ 		}
+ 
+-		/*
+-		 * If the pagetables are shared don't copy or take references.
+-		 *
+-		 * dst_pte == src_pte is the common case of src/dest sharing.
+-		 * However, src could have 'unshared' and dst shares with
+-		 * another vma. So page_count of ptep page is checked instead
+-		 * to reliably determine whether pte is shared.
+-		 */
+-		if (page_count(virt_to_page(dst_pte)) > 1) {
++#ifdef CONFIG_HUGETLB_PMD_PAGE_TABLE_SHARING
++		/* If the pagetables are shared, there is nothing to do */
++		if (ptdesc_pmd_is_shared(virt_to_ptdesc(dst_pte))) {
+ 			addr |= last_addr_mask;
+ 			continue;
+ 		}
++#endif
+ 
+ 		dst_ptl = huge_pte_lock(h, dst, dst_pte);
+ 		src_ptl = huge_pte_lockptr(h, src, src_pte);
+@@ -7270,7 +7265,7 @@ int huge_pmd_unshare(struct mm_struct *mm, struct vm_area_struct *vma,
+ 	hugetlb_vma_assert_locked(vma);
+ 	if (sz != PMD_SIZE)
+ 		return 0;
+-	if (!ptdesc_pmd_pts_count(virt_to_ptdesc(ptep)))
++	if (!ptdesc_pmd_is_shared(virt_to_ptdesc(ptep)))
+ 		return 0;
+ 
+ 	pud_clear(pud);
+-- 
+2.51.0
+
