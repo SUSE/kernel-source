@@ -1,0 +1,102 @@
+From ef0a0757bbeac9aedff66464c6fba2d896cfe343 Mon Sep 17 00:00:00 2001
+From: Jani Nikula <jani.nikula@intel.com>
+Date: Fri, 3 Jan 2025 15:52:39 +0200
+Subject: drm/i915/dp: compute config for 128b/132b SST w/o DSC
+Git-commit: ef0a0757bbeac9aedff66464c6fba2d896cfe343
+Patch-mainline: v6.14-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Enable basic 128b/132b SST functionality without compression. Reuse
+intel_dp_mtp_tu_compute_config() to figure out the TU after we've
+determined we need to use an UHBR rate.
+
+It's slightly complicated as the M/N computation is done in different
+places in MST and SST paths, so we need to avoid trashing the values
+later for UHBR.
+
+If uncompressed UHBR fails, we drop to compressed non-UHBR, which is
+quite likely to fail as well. We still lack 128b/132b SST+DSC.
+
+We need mst_master_transcoder also for 128b/132b SST. Use cpu_transcoder
+directly. Enhanced framing is "don't care" for 128b/132b link.
+
+V2: mst_master_transcoder, enhanced framing (Imre)
+
+Reviewed-by: Imre Deak <imre.deak@intel.com>
+Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/084e4e05bf25a5dd396dd391014943d42b11c88d.1735912293.git.jani.nikula@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/intel_dp.c | 34 +++++++++++++++++--------
+ 1 file changed, 24 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_dp.c b/drivers/gpu/drm/i915/display/intel_dp.c
+index 4fa0e0b675b0..f1f3b1bb1e89 100644
+--- a/drivers/gpu/drm/i915/display/intel_dp.c
++++ b/drivers/gpu/drm/i915/display/intel_dp.c
+@@ -2519,8 +2519,8 @@ intel_dp_compute_config_limits(struct intel_dp *intel_dp,
+ 	limits->min_rate = intel_dp_min_link_rate(intel_dp);
+ 	limits->max_rate = intel_dp_max_link_rate(intel_dp);
+ 
+-	/* FIXME 128b/132b SST support missing */
+-	if (!is_mst)
++	/* FIXME 128b/132b SST+DSC support missing */
++	if (!is_mst && dsc)
+ 		limits->max_rate = min(limits->max_rate, 810000);
+ 	limits->min_rate = min(limits->min_rate, limits->max_rate);
+ 
+@@ -2638,6 +2638,13 @@ intel_dp_compute_link_config(struct intel_encoder *encoder,
+ 		 */
+ 		ret = intel_dp_compute_link_config_wide(intel_dp, pipe_config,
+ 							conn_state, &limits);
++		if (!ret && intel_dp_is_uhbr(pipe_config))
++			ret = intel_dp_mtp_tu_compute_config(intel_dp,
++							     pipe_config,
++							     pipe_config->pipe_bpp,
++							     pipe_config->pipe_bpp,
++							     conn_state,
++							     0, false);
+ 		if (ret)
+ 			dsc_needed = true;
+ 	}
+@@ -3151,8 +3158,13 @@ intel_dp_compute_config(struct intel_encoder *encoder,
+ 	pipe_config->limited_color_range =
+ 		intel_dp_limited_color_range(pipe_config, conn_state);
+ 
+-	pipe_config->enhanced_framing =
+-		drm_dp_enhanced_frame_cap(intel_dp->dpcd);
++	if (intel_dp_is_uhbr(pipe_config)) {
++		/* 128b/132b SST also needs this */
++		pipe_config->mst_master_transcoder = pipe_config->cpu_transcoder;
++	} else {
++		pipe_config->enhanced_framing =
++			drm_dp_enhanced_frame_cap(intel_dp->dpcd);
++	}
+ 
+ 	if (pipe_config->dsc.compression_enable)
+ 		link_bpp_x16 = pipe_config->dsc.compressed_bpp_x16;
+@@ -3183,12 +3195,14 @@ intel_dp_compute_config(struct intel_encoder *encoder,
+ 
+ 	intel_dp_audio_compute_config(encoder, pipe_config, conn_state);
+ 
+-	intel_link_compute_m_n(link_bpp_x16,
+-			       pipe_config->lane_count,
+-			       adjusted_mode->crtc_clock,
+-			       pipe_config->port_clock,
+-			       intel_dp_bw_fec_overhead(pipe_config->fec_enable),
+-			       &pipe_config->dp_m_n);
++	if (!intel_dp_is_uhbr(pipe_config)) {
++		intel_link_compute_m_n(link_bpp_x16,
++				       pipe_config->lane_count,
++				       adjusted_mode->crtc_clock,
++				       pipe_config->port_clock,
++				       intel_dp_bw_fec_overhead(pipe_config->fec_enable),
++				       &pipe_config->dp_m_n);
++	}
+ 
+ 	/* FIXME: abstract this better */
+ 	if (pipe_config->splitter.enable)
+-- 
+2.52.0
+
