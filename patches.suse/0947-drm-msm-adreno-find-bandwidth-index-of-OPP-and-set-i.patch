@@ -1,0 +1,182 @@
+From 7047e655a5679250fce9d8afac3f87c0bb4af621 Mon Sep 17 00:00:00 2001
+From: Neil Armstrong <neil.armstrong@linaro.org>
+Date: Tue, 17 Dec 2024 15:51:17 +0100
+Subject: drm/msm: adreno: find bandwidth index of OPP and set it along freq
+ index
+Git-commit: 7047e655a5679250fce9d8afac3f87c0bb4af621
+Patch-mainline: v6.14-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+The Adreno GPU Management Unit (GMU) can also scale the DDR Bandwidth
+along the Frequency and Power Domain level, until now we left the OPP
+core scale the OPP bandwidth via the interconnect path.
+
+In order to enable bandwidth voting via the GPU Management
+Unit (GMU), when an opp is set by devfreq we also look for
+the corresponding bandwidth index in the previously generated
+bw_table and pass this value along the frequency index to the GMU.
+
+The GMU also takes another vote called AB which is a 16bit quantized
+value of the floor bandwidth against the maximum supported bandwidth.
+
+The AB is calculated with a default 25% of the bandwidth like the
+downstream implementation too inform the GMU firmware the minimal
+quantity of bandwidth we require for this OPP. Only pass the AB
+vote starting from A750 GPUs.
+
+Since we now vote for all resources via the GMU, setting the OPP
+is no more needed, so we can completely skip calling
+dev_pm_opp_set_opp() in this situation.
+
+Reviewed-by: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Reviewed-by: Akhil P Oommen <quic_akhilpo@quicinc.com>
+Signed-off-by: Neil Armstrong <neil.armstrong@linaro.org>
+Reviewed-by: Konrad Dybcio <konrad.dybcio@oss.qualcomm.com>
+Patchwork: https://patchwork.freedesktop.org/patch/629397/
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/msm/adreno/a6xx_gmu.c   | 39 +++++++++++++++++++++++--
+ drivers/gpu/drm/msm/adreno/a6xx_gmu.h   |  2 +-
+ drivers/gpu/drm/msm/adreno/a6xx_hfi.c   |  6 ++--
+ drivers/gpu/drm/msm/adreno/a6xx_hfi.h   |  5 ++++
+ drivers/gpu/drm/msm/adreno/adreno_gpu.h |  5 ++++
+ 5 files changed, 51 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+index 72eb9f18ea6e..65d38b25c070 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+@@ -110,9 +110,11 @@ void a6xx_gmu_set_freq(struct msm_gpu *gpu, struct dev_pm_opp *opp,
+ 		       bool suspended)
+ {
+ 	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
++	const struct a6xx_info *info = adreno_gpu->info->a6xx;
+ 	struct a6xx_gpu *a6xx_gpu = to_a6xx_gpu(adreno_gpu);
+ 	struct a6xx_gmu *gmu = &a6xx_gpu->gmu;
+ 	u32 perf_index;
++	u32 bw_index = 0;
+ 	unsigned long gpu_freq;
+ 	int ret = 0;
+ 
+@@ -125,6 +127,37 @@ void a6xx_gmu_set_freq(struct msm_gpu *gpu, struct dev_pm_opp *opp,
+ 		if (gpu_freq == gmu->gpu_freqs[perf_index])
+ 			break;
+ 
++	/* If enabled, find the corresponding DDR bandwidth index */
++	if (info->bcms && gmu->nr_gpu_bws > 1) {
++		unsigned int bw = dev_pm_opp_get_bw(opp, true, 0);
++
++		for (bw_index = 0; bw_index < gmu->nr_gpu_bws - 1; bw_index++) {
++			if (bw == gmu->gpu_bw_table[bw_index])
++				break;
++		}
++
++		/* Vote AB as a fraction of the max bandwidth, starting from A750 */
++		if (bw && adreno_is_a750_family(adreno_gpu)) {
++			u64 tmp;
++
++			/* For now, vote for 25% of the bandwidth */
++			tmp = bw * 25;
++			do_div(tmp, 100);
++
++			/*
++			 * The AB vote consists of a 16 bit wide quantized level
++			 * against the maximum supported bandwidth.
++			 * Quantization can be calculated as below:
++			 * vote = (bandwidth * 2^16) / max bandwidth
++			 */
++			tmp *= MAX_AB_VOTE;
++			do_div(tmp, gmu->gpu_bw_table[gmu->nr_gpu_bws - 1]);
++
++			bw_index |= AB_VOTE(clamp(tmp, 1, MAX_AB_VOTE));
++			bw_index |= AB_VOTE_ENABLE;
++		}
++	}
++
+ 	gmu->current_perf_index = perf_index;
+ 	gmu->freq = gmu->gpu_freqs[perf_index];
+ 
+@@ -140,8 +173,10 @@ void a6xx_gmu_set_freq(struct msm_gpu *gpu, struct dev_pm_opp *opp,
+ 		return;
+ 
+ 	if (!gmu->legacy) {
+-		a6xx_hfi_set_freq(gmu, perf_index);
+-		dev_pm_opp_set_opp(&gpu->pdev->dev, opp);
++		a6xx_hfi_set_freq(gmu, perf_index, bw_index);
++		/* With Bandwidth voting, we now vote for all resources, so skip OPP set */
++		if (!bw_index)
++			dev_pm_opp_set_opp(&gpu->pdev->dev, opp);
+ 		return;
+ 	}
+ 
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gmu.h b/drivers/gpu/drm/msm/adreno/a6xx_gmu.h
+index 2062a2be2247..0c888b326cfb 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gmu.h
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.h
+@@ -209,7 +209,7 @@ void a6xx_hfi_init(struct a6xx_gmu *gmu);
+ int a6xx_hfi_start(struct a6xx_gmu *gmu, int boot_state);
+ void a6xx_hfi_stop(struct a6xx_gmu *gmu);
+ int a6xx_hfi_send_prep_slumber(struct a6xx_gmu *gmu);
+-int a6xx_hfi_set_freq(struct a6xx_gmu *gmu, int index);
++int a6xx_hfi_set_freq(struct a6xx_gmu *gmu, u32 perf_index, u32 bw_index);
+ 
+ bool a6xx_gmu_gx_is_on(struct a6xx_gmu *gmu);
+ bool a6xx_gmu_sptprac_is_on(struct a6xx_gmu *gmu);
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_hfi.c b/drivers/gpu/drm/msm/adreno/a6xx_hfi.c
+index 995526620d67..0989aee3dd2c 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_hfi.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_hfi.c
+@@ -772,13 +772,13 @@ static int a6xx_hfi_send_core_fw_start(struct a6xx_gmu *gmu)
+ 		sizeof(msg), NULL, 0);
+ }
+ 
+-int a6xx_hfi_set_freq(struct a6xx_gmu *gmu, int index)
++int a6xx_hfi_set_freq(struct a6xx_gmu *gmu, u32 freq_index, u32 bw_index)
+ {
+ 	struct a6xx_hfi_gx_bw_perf_vote_cmd msg = { 0 };
+ 
+ 	msg.ack_type = 1; /* blocking */
+-	msg.freq = index;
+-	msg.bw = 0; /* TODO: bus scaling */
++	msg.freq = freq_index;
++	msg.bw = bw_index;
+ 
+ 	return a6xx_hfi_send_msg(gmu, HFI_H2F_MSG_GX_BW_PERF_VOTE, &msg,
+ 		sizeof(msg), NULL, 0);
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_hfi.h b/drivers/gpu/drm/msm/adreno/a6xx_hfi.h
+index 528110169398..52ba4a07d7b9 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_hfi.h
++++ b/drivers/gpu/drm/msm/adreno/a6xx_hfi.h
+@@ -173,6 +173,11 @@ struct a6xx_hfi_gx_bw_perf_vote_cmd {
+ 	u32 bw;
+ };
+ 
++#define AB_VOTE_MASK		GENMASK(31, 16)
++#define MAX_AB_VOTE		(FIELD_MAX(AB_VOTE_MASK) - 1)
++#define AB_VOTE(vote)		FIELD_PREP(AB_VOTE_MASK, (vote))
++#define AB_VOTE_ENABLE		BIT(8)
++
+ #define HFI_H2F_MSG_PREPARE_SLUMBER 33
+ 
+ struct a6xx_hfi_prep_slumber_cmd {
+diff --git a/drivers/gpu/drm/msm/adreno/adreno_gpu.h b/drivers/gpu/drm/msm/adreno/adreno_gpu.h
+index e71f420f8b3a..f5d6087376f5 100644
+--- a/drivers/gpu/drm/msm/adreno/adreno_gpu.h
++++ b/drivers/gpu/drm/msm/adreno/adreno_gpu.h
+@@ -559,6 +559,11 @@ static inline int adreno_is_a740_family(struct adreno_gpu *gpu)
+ 	       gpu->info->family == ADRENO_7XX_GEN3;
+ }
+ 
++static inline int adreno_is_a750_family(struct adreno_gpu *gpu)
++{
++	return gpu->info->family == ADRENO_7XX_GEN3;
++}
++
+ static inline int adreno_is_a7xx(struct adreno_gpu *gpu)
+ {
+ 	/* Update with non-fake (i.e. non-A702) Gen 7 GPUs */
+-- 
+2.52.0
+
