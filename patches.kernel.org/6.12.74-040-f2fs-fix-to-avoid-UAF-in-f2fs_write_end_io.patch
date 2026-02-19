@@ -1,0 +1,83 @@
+From: Chao Yu <chao@kernel.org>
+Date: Tue, 17 Feb 2026 10:19:55 -0500
+Subject: [PATCH] f2fs: fix to avoid UAF in f2fs_write_end_io()
+References: bsc#1234429
+Patch-mainline: 6.12.74
+Git-commit: ce2739e482bce8d2c014d76c4531c877f382aa54
+
+[ Upstream commit ce2739e482bce8d2c014d76c4531c877f382aa54 ]
+
+As syzbot reported an use-after-free issue in f2fs_write_end_io().
+
+It is caused by below race condition:
+
+loop device				umount
+- worker_thread
+ - loop_process_work
+  - do_req_filebacked
+   - lo_rw_aio
+    - lo_rw_aio_complete
+     - blk_mq_end_request
+      - blk_update_request
+       - f2fs_write_end_io
+        - dec_page_count
+        - folio_end_writeback
+					- kill_f2fs_super
+					 - kill_block_super
+					  - f2fs_put_super
+					 : free(sbi)
+       : get_pages(, F2FS_WB_CP_DATA)
+         accessed sbi which is freed
+
+In kill_f2fs_super(), we will drop all page caches of f2fs inodes before
+call free(sbi), it guarantee that all folios should end its writeback, so
+it should be safe to access sbi before last folio_end_writeback().
+
+Let's relocate ckpt thread wakeup flow before folio_end_writeback() to
+resolve this issue.
+
+Cc: stable@kernel.org
+Fixes: e234088758fc ("f2fs: avoid wait if IO end up when do_checkpoint for better performance")
+Reported-by: syzbot+b4444e3c972a7a124187@syzkaller.appspotmail.com
+Closes: https://syzkaller.appspot.com/bug?extid=b4444e3c972a7a124187
+Signed-off-by: Chao Yu <chao@kernel.org>
+Signed-off-by: Jaegeuk Kim <jaegeuk@kernel.org>
+[ folio => page ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ fs/f2fs/data.c | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/fs/f2fs/data.c b/fs/f2fs/data.c
+index 0c4c8a357742..7bd6f9f108ec 100644
+--- a/fs/f2fs/data.c
++++ b/fs/f2fs/data.c
+@@ -357,14 +357,20 @@ static void f2fs_write_end_io(struct bio *bio)
+ 				page_folio(page)->index != nid_of_node(page));
+ 
+ 		dec_page_count(sbi, type);
++
++		/*
++		 * we should access sbi before end_page_writeback() to
++		 * avoid racing w/ kill_f2fs_super()
++		 */
++		if (type == F2FS_WB_CP_DATA && !get_pages(sbi, type) &&
++				wq_has_sleeper(&sbi->cp_wait))
++			wake_up(&sbi->cp_wait);
++
+ 		if (f2fs_in_warm_node_list(sbi, page))
+ 			f2fs_del_fsync_node_entry(sbi, page);
+ 		clear_page_private_gcing(page);
+ 		end_page_writeback(page);
+ 	}
+-	if (!get_pages(sbi, F2FS_WB_CP_DATA) &&
+-				wq_has_sleeper(&sbi->cp_wait))
+-		wake_up(&sbi->cp_wait);
+ 
+ 	bio_put(bio);
+ }
+-- 
+2.51.0
+
