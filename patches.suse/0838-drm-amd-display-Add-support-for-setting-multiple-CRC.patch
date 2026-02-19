@@ -1,0 +1,139 @@
+From a2b5668bdb3c4100c2cbd4af046eacc6dafa30c3 Mon Sep 17 00:00:00 2001
+From: Wayne Lin <Wayne.Lin@amd.com>
+Date: Fri, 19 Jul 2024 15:57:33 +0800
+Subject: drm/amd/display: Add support for setting multiple CRC windows in dc
+Git-commit: a2b5668bdb3c4100c2cbd4af046eacc6dafa30c3
+Patch-mainline: v6.14-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+[Why & How]
+Have to support multiple CRC windows setting to dmub. Add new dmub forward
+functions for supporting/forwarding multiple crc windows setting to dmub.
+
+Reviewed-by: HaoPing Liu <haoping.liu@amd.com>
+Signed-off-by: Wayne Lin <Wayne.Lin@amd.com>
+Signed-off-by: Roman Li <roman.li@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c   | 62 ++++++++++++++++++++++
+ drivers/gpu/drm/amd/display/dc/dc_stream.h |  5 ++
+ drivers/gpu/drm/amd/display/dc/dc_types.h  |  7 +++
+ 3 files changed, 74 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index 91a4c52289ac..97b3237772f9 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -615,6 +615,68 @@ dc_stream_forward_crc_window(struct dc_stream_state *stream,
+ 
+ 	return true;
+ }
++
++static void
++dc_stream_forward_dmub_multiple_crc_window(struct dc_dmub_srv *dmub_srv,
++		struct crc_window *window, struct otg_phy_mux *mux_mapping, bool stop)
++{
++	int i;
++	union dmub_rb_cmd cmd = {0};
++
++	cmd.secure_display.mul_roi_ctl.phy_id = mux_mapping->phy_output_num;
++	cmd.secure_display.mul_roi_ctl.otg_id = mux_mapping->otg_output_num;
++
++	cmd.secure_display.header.type = DMUB_CMD__SECURE_DISPLAY;
++
++	if (stop) {
++		cmd.secure_display.header.sub_type = DMUB_CMD__SECURE_DISPLAY_MULTIPLE_CRC_STOP_UPDATE;
++	} else {
++		cmd.secure_display.header.sub_type = DMUB_CMD__SECURE_DISPLAY_MULTIPLE_CRC_WIN_NOTIFY;
++		for (i = 0; i < MAX_CRC_WINDOW_NUM; i++) {
++			cmd.secure_display.mul_roi_ctl.roi_ctl[i].x_start = window[i].rect.x;
++			cmd.secure_display.mul_roi_ctl.roi_ctl[i].y_start = window[i].rect.y;
++			cmd.secure_display.mul_roi_ctl.roi_ctl[i].x_end = window[i].rect.x + window[i].rect.width;
++			cmd.secure_display.mul_roi_ctl.roi_ctl[i].y_end = window[i].rect.y + window[i].rect.height;
++			cmd.secure_display.mul_roi_ctl.roi_ctl[i].enable = window[i].enable;
++		}
++	}
++
++	dc_wake_and_execute_dmub_cmd(dmub_srv->ctx, &cmd, DM_DMUB_WAIT_TYPE_NO_WAIT);
++}
++
++bool
++dc_stream_forward_multiple_crc_window(struct dc_stream_state *stream,
++		struct crc_window *window, uint8_t phy_id, bool stop)
++{
++	struct dc_dmub_srv *dmub_srv;
++	struct otg_phy_mux mux_mapping;
++	struct pipe_ctx *pipe;
++	int i;
++	struct dc *dc = stream->ctx->dc;
++
++	for (i = 0; i < MAX_PIPES; i++) {
++		pipe = &dc->current_state->res_ctx.pipe_ctx[i];
++		if (pipe->stream == stream && !pipe->top_pipe && !pipe->prev_odm_pipe)
++			break;
++	}
++
++	/* Stream not found */
++	if (i == MAX_PIPES)
++		return false;
++
++	mux_mapping.phy_output_num = phy_id;
++	mux_mapping.otg_output_num = pipe->stream_res.tg->inst;
++
++	dmub_srv = dc->ctx->dmub_srv;
++
++	/* forward to dmub only. no dmcu support*/
++	if (dmub_srv)
++		dc_stream_forward_dmub_multiple_crc_window(dmub_srv, window, &mux_mapping, stop);
++	else
++		return false;
++
++	return true;
++}
+ #endif /* CONFIG_DRM_AMD_SECURE_DISPLAY */
+ 
+ /**
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_stream.h b/drivers/gpu/drm/amd/display/dc/dc_stream.h
+index 7ccdeb681918..50cbf0661f2e 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_stream.h
++++ b/drivers/gpu/drm/amd/display/dc/dc_stream.h
+@@ -539,6 +539,11 @@ bool dc_stream_forward_crc_window(struct dc_stream_state *stream,
+ 		struct rect *rect,
+ 		uint8_t phy_id,
+ 		bool is_stop);
++
++bool dc_stream_forward_multiple_crc_window(struct dc_stream_state *stream,
++		struct crc_window *window,
++		uint8_t phy_id,
++		bool stop);
+ #endif
+ 
+ bool dc_stream_configure_crc(struct dc *dc,
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_types.h b/drivers/gpu/drm/amd/display/dc/dc_types.h
+index 0243d1b675d8..778627ddc746 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_types.h
++++ b/drivers/gpu/drm/amd/display/dc/dc_types.h
+@@ -939,10 +939,17 @@ enum backlight_control_type {
+ };
+ 
+ #if defined(CONFIG_DRM_AMD_SECURE_DISPLAY)
++#define MAX_CRC_WINDOW_NUM	2
++
+ struct otg_phy_mux {
+ 	uint8_t phy_output_num;
+ 	uint8_t otg_output_num;
+ };
++
++struct crc_window {
++	struct rect rect;
++	bool enable;
++};
+ #endif
+ 
+ enum dc_detect_reason {
+-- 
+2.52.0
+
