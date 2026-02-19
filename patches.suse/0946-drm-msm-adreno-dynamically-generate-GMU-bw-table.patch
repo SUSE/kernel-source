@@ -1,0 +1,116 @@
+From 8c1b9451d96b972d0c3b5a5df777dc21bf191b36 Mon Sep 17 00:00:00 2001
+From: Neil Armstrong <neil.armstrong@linaro.org>
+Date: Tue, 17 Dec 2024 15:51:16 +0100
+Subject: drm/msm: adreno: dynamically generate GMU bw table
+Git-commit: 8c1b9451d96b972d0c3b5a5df777dc21bf191b36
+Patch-mainline: v6.14-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+The Adreno GPU Management Unit (GMU) can also scale the ddr
+bandwidth along the frequency and power domain level, but for
+now we statically fill the bw_table with values from the
+downstream driver.
+
+Only the first entry is used, which is a disable vote, so we
+currently rely on scaling via the linux interconnect paths.
+
+Let's dynamically generate the bw_table with the vote values
+previously calculated from the OPPs.
+
+Those entries will then be used by the GMU when passing the
+appropriate bandwidth level while voting for a gpu frequency.
+
+Signed-off-by: Neil Armstrong <neil.armstrong@linaro.org>
+Reviewed-by: Akhil P Oommen <quic_akhilpo@quicinc.com>
+Reviewed-by: Konrad Dybcio <konrad.dybcio@oss.qualcomm.com>
+Patchwork: https://patchwork.freedesktop.org/patch/629396/
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/msm/adreno/a6xx_hfi.c | 48 ++++++++++++++++++++++++++-
+ 1 file changed, 47 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_hfi.c b/drivers/gpu/drm/msm/adreno/a6xx_hfi.c
+index cb8844ed46b2..995526620d67 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_hfi.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_hfi.c
+@@ -6,6 +6,7 @@
+ #include <linux/list.h>
+ 
+ #include <soc/qcom/cmd-db.h>
++#include <soc/qcom/tcs.h>
+ 
+ #include "a6xx_gmu.h"
+ #include "a6xx_gmu.xml.h"
+@@ -259,6 +260,48 @@ static int a6xx_hfi_send_perf_table(struct a6xx_gmu *gmu)
+ 		NULL, 0);
+ }
+ 
++static void a6xx_generate_bw_table(const struct a6xx_info *info, struct a6xx_gmu *gmu,
++				   struct a6xx_hfi_msg_bw_table *msg)
++{
++	unsigned int i, j;
++
++	for (i = 0; i < GMU_MAX_BCMS; i++) {
++		if (!info->bcms[i].name)
++			break;
++		msg->ddr_cmds_addrs[i] = cmd_db_read_addr(info->bcms[i].name);
++	}
++	msg->ddr_cmds_num = i;
++
++	for (i = 0; i < gmu->nr_gpu_bws; ++i)
++		for (j = 0; j < msg->ddr_cmds_num; j++)
++			msg->ddr_cmds_data[i][j] = gmu->gpu_ib_votes[i][j];
++	msg->bw_level_num = gmu->nr_gpu_bws;
++
++	/* Compute the wait bitmask with each BCM having the commit bit */
++	msg->ddr_wait_bitmask = 0;
++	for (j = 0; j < msg->ddr_cmds_num; j++)
++		if (msg->ddr_cmds_data[0][j] & BCM_TCS_CMD_COMMIT_MASK)
++			msg->ddr_wait_bitmask |= BIT(j);
++
++	/*
++	 * These are the CX (CNOC) votes - these are used by the GMU
++	 * The 'CN0' BCM is used on all targets, and votes are basically
++	 * 'off' and 'on' states with first bit to enable the path.
++	 */
++
++	msg->cnoc_cmds_addrs[0] = cmd_db_read_addr("CN0");
++	msg->cnoc_cmds_num = 1;
++
++	msg->cnoc_cmds_data[0][0] = BCM_TCS_CMD(true, false, 0, 0);
++	msg->cnoc_cmds_data[1][0] = BCM_TCS_CMD(true, true, 0, BIT(0));
++
++	/* Compute the wait bitmask with each BCM having the commit bit */
++	msg->cnoc_wait_bitmask = 0;
++	for (j = 0; j < msg->cnoc_cmds_num; j++)
++		if (msg->cnoc_cmds_data[0][j] & BCM_TCS_CMD_COMMIT_MASK)
++			msg->cnoc_wait_bitmask |= BIT(j);
++}
++
+ static void a618_build_bw_table(struct a6xx_hfi_msg_bw_table *msg)
+ {
+ 	/* Send a single "off" entry since the 618 GMU doesn't do bus scaling */
+@@ -664,6 +707,7 @@ static int a6xx_hfi_send_bw_table(struct a6xx_gmu *gmu)
+ 	struct a6xx_hfi_msg_bw_table *msg;
+ 	struct a6xx_gpu *a6xx_gpu = container_of(gmu, struct a6xx_gpu, gmu);
+ 	struct adreno_gpu *adreno_gpu = &a6xx_gpu->base;
++	const struct a6xx_info *info = adreno_gpu->info->a6xx;
+ 
+ 	if (gmu->bw_table)
+ 		goto send;
+@@ -672,7 +716,9 @@ static int a6xx_hfi_send_bw_table(struct a6xx_gmu *gmu)
+ 	if (!msg)
+ 		return -ENOMEM;
+ 
+-	if (adreno_is_a618(adreno_gpu))
++	if (info->bcms && gmu->nr_gpu_bws > 1)
++		a6xx_generate_bw_table(info, gmu, msg);
++	else if (adreno_is_a618(adreno_gpu))
+ 		a618_build_bw_table(msg);
+ 	else if (adreno_is_a619(adreno_gpu))
+ 		a619_build_bw_table(msg);
+-- 
+2.52.0
+
