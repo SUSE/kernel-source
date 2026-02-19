@@ -1,0 +1,138 @@
+From 64546cf46e370c89cc4b0434b00ba05cdef02d86 Mon Sep 17 00:00:00 2001
+From: Mika Kahola <mika.kahola@intel.com>
+Date: Tue, 17 Dec 2024 16:34:40 +0200
+Subject: drm/i915/display: UHBR rates for Thunderbolt
+Git-commit: 64546cf46e370c89cc4b0434b00ba05cdef02d86
+Patch-mainline: v6.14-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+tbt-alt mode is missing uhbr rates 10G and 20G. This requires
+requires pll clock rates 312.5 MHz and 625 MHz to be added,
+respectively. The uhbr rates are supported only form PTL+
+platforms.
+
+V2: Add drm_WARN_ON() to check if port clock is not supported by
+    the platform (Imre)
+    Combine forward ungate with mask parameter (Imre)
+    Rename XE3LPDP_* to XE3D_* (Imre)
+
+Signed-off-by: Mika Kahola <mika.kahola@intel.com>
+Reviewed-by: Imre Deak <imre.deak@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241217143440.572308-1-mika.kahola@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/intel_cx0_phy.c  | 39 +++++++++++++++++--
+ .../gpu/drm/i915/display/intel_cx0_phy_regs.h |  4 ++
+ 2 files changed, 39 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_cx0_phy.c b/drivers/gpu/drm/i915/display/intel_cx0_phy.c
+index a0ede622a847..41cab2f15f31 100644
+--- a/drivers/gpu/drm/i915/display/intel_cx0_phy.c
++++ b/drivers/gpu/drm/i915/display/intel_cx0_phy.c
+@@ -3066,7 +3066,10 @@ int intel_mtl_tbt_calc_port_clock(struct intel_encoder *encoder)
+ 
+ 	val = intel_de_read(display, XELPDP_PORT_CLOCK_CTL(display, encoder->port));
+ 
+-	clock = REG_FIELD_GET(XELPDP_DDI_CLOCK_SELECT_MASK, val);
++	if (DISPLAY_VER(display) >= 30)
++		clock = REG_FIELD_GET(XE3_DDI_CLOCK_SELECT_MASK, val);
++	else
++		clock = REG_FIELD_GET(XELPDP_DDI_CLOCK_SELECT_MASK, val);
+ 
+ 	drm_WARN_ON(display->drm, !(val & XELPDP_FORWARD_CLOCK_UNGATE));
+ 	drm_WARN_ON(display->drm, !(val & XELPDP_TBT_CLOCK_REQUEST));
+@@ -3081,13 +3084,18 @@ int intel_mtl_tbt_calc_port_clock(struct intel_encoder *encoder)
+ 		return 540000;
+ 	case XELPDP_DDI_CLOCK_SELECT_TBT_810:
+ 		return 810000;
++	case XELPDP_DDI_CLOCK_SELECT_TBT_312_5:
++		return 1000000;
++	case XELPDP_DDI_CLOCK_SELECT_TBT_625:
++		return 2000000;
+ 	default:
+ 		MISSING_CASE(clock);
+ 		return 162000;
+ 	}
+ }
+ 
+-static int intel_mtl_tbt_clock_select(int clock)
++static int intel_mtl_tbt_clock_select(struct intel_display *display,
++				      int clock)
+ {
+ 	switch (clock) {
+ 	case 162000:
+@@ -3098,6 +3106,18 @@ static int intel_mtl_tbt_clock_select(int clock)
+ 		return XELPDP_DDI_CLOCK_SELECT_TBT_540;
+ 	case 810000:
+ 		return XELPDP_DDI_CLOCK_SELECT_TBT_810;
++	case 1000000:
++		if (DISPLAY_VER(display) < 30) {
++			drm_WARN_ON(display->drm, "UHBR10 not supported for the platform\n");
++			return XELPDP_DDI_CLOCK_SELECT_TBT_162;
++		}
++		return XELPDP_DDI_CLOCK_SELECT_TBT_312_5;
++	case 2000000:
++		if (DISPLAY_VER(display) < 30) {
++			drm_WARN_ON(display->drm, "UHBR20 not supported for the platform\n");
++			return XELPDP_DDI_CLOCK_SELECT_TBT_162;
++		}
++		return XELPDP_DDI_CLOCK_SELECT_TBT_625;
+ 	default:
+ 		MISSING_CASE(clock);
+ 		return XELPDP_DDI_CLOCK_SELECT_TBT_162;
+@@ -3110,15 +3130,26 @@ static void intel_mtl_tbt_pll_enable(struct intel_encoder *encoder,
+ 	struct intel_display *display = to_intel_display(encoder);
+ 	enum phy phy = intel_encoder_to_phy(encoder);
+ 	u32 val = 0;
++	u32 mask;
+ 
+ 	/*
+ 	 * 1. Program PORT_CLOCK_CTL REGISTER to configure
+ 	 * clock muxes, gating and SSC
+ 	 */
+-	val |= XELPDP_DDI_CLOCK_SELECT(intel_mtl_tbt_clock_select(crtc_state->port_clock));
++
++	if (DISPLAY_VER(display) >= 30) {
++		mask = XE3_DDI_CLOCK_SELECT_MASK;
++		val |= XE3_DDI_CLOCK_SELECT(intel_mtl_tbt_clock_select(display, crtc_state->port_clock));
++	} else {
++		mask = XELPDP_DDI_CLOCK_SELECT_MASK;
++		val |= XELPDP_DDI_CLOCK_SELECT(intel_mtl_tbt_clock_select(display, crtc_state->port_clock));
++	}
++
++	mask |= XELPDP_FORWARD_CLOCK_UNGATE;
+ 	val |= XELPDP_FORWARD_CLOCK_UNGATE;
++
+ 	intel_de_rmw(display, XELPDP_PORT_CLOCK_CTL(display, encoder->port),
+-		     XELPDP_DDI_CLOCK_SELECT_MASK | XELPDP_FORWARD_CLOCK_UNGATE, val);
++		     mask, val);
+ 
+ 	/* 2. Read back PORT_CLOCK_CTL REGISTER */
+ 	val = intel_de_read(display, XELPDP_PORT_CLOCK_CTL(display, encoder->port));
+diff --git a/drivers/gpu/drm/i915/display/intel_cx0_phy_regs.h b/drivers/gpu/drm/i915/display/intel_cx0_phy_regs.h
+index c685479c9756..59002fe651ef 100644
+--- a/drivers/gpu/drm/i915/display/intel_cx0_phy_regs.h
++++ b/drivers/gpu/drm/i915/display/intel_cx0_phy_regs.h
+@@ -187,7 +187,9 @@
+ #define   XELPDP_TBT_CLOCK_REQUEST			REG_BIT(19)
+ #define   XELPDP_TBT_CLOCK_ACK				REG_BIT(18)
+ #define   XELPDP_DDI_CLOCK_SELECT_MASK			REG_GENMASK(15, 12)
++#define   XE3_DDI_CLOCK_SELECT_MASK			REG_GENMASK(16, 12)
+ #define   XELPDP_DDI_CLOCK_SELECT(val)			REG_FIELD_PREP(XELPDP_DDI_CLOCK_SELECT_MASK, val)
++#define   XE3_DDI_CLOCK_SELECT(val)			REG_FIELD_PREP(XE3_DDI_CLOCK_SELECT_MASK, val)
+ #define   XELPDP_DDI_CLOCK_SELECT_NONE			0x0
+ #define   XELPDP_DDI_CLOCK_SELECT_MAXPCLK		0x8
+ #define   XELPDP_DDI_CLOCK_SELECT_DIV18CLK		0x9
+@@ -195,6 +197,8 @@
+ #define   XELPDP_DDI_CLOCK_SELECT_TBT_270		0xd
+ #define   XELPDP_DDI_CLOCK_SELECT_TBT_540		0xe
+ #define   XELPDP_DDI_CLOCK_SELECT_TBT_810		0xf
++#define   XELPDP_DDI_CLOCK_SELECT_TBT_312_5		0x18
++#define   XELPDP_DDI_CLOCK_SELECT_TBT_625		0x19
+ #define   XELPDP_FORWARD_CLOCK_UNGATE			REG_BIT(10)
+ #define   XELPDP_LANE1_PHY_CLOCK_SELECT			REG_BIT(8)
+ #define   XELPDP_SSC_ENABLE_PLLA			REG_BIT(1)
+-- 
+2.52.0
+
