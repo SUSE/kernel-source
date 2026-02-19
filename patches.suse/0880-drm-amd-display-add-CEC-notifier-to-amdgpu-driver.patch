@@ -1,0 +1,327 @@
+From 7594874227e1b046e08799bd4d965494c861a573 Mon Sep 17 00:00:00 2001
+From: Kun Liu <Kun.Liu2@amd.com>
+Date: Wed, 8 Jan 2025 17:18:49 +0800
+Subject: drm/amd/display: add CEC notifier to amdgpu driver
+Git-commit: 7594874227e1b046e08799bd4d965494c861a573
+Patch-mainline: v6.14-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+This patch adds the cec_notifier feature to amdgpu driver.
+The changes will allow amdgpu driver code to notify EDID
+and HPD changes to an eventual CEC adapter.
+
+Signed-off-by: Kun Liu <Kun.Liu2@amd.com>
+Reviewed-by: Mario Limonciello <mario.limonciello@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/display/Kconfig           |  2 +
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 76 +++++++++++++++++++
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h |  6 ++
+ .../amd/display/amdgpu_dm/amdgpu_dm_debugfs.c | 66 +++++++++++++++-
+ drivers/gpu/drm/amd/include/amd_shared.h      |  5 ++
+ 5 files changed, 154 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/display/Kconfig b/drivers/gpu/drm/amd/display/Kconfig
+index 11e3f2f3b174..abd3b6564373 100644
+--- a/drivers/gpu/drm/amd/display/Kconfig
++++ b/drivers/gpu/drm/amd/display/Kconfig
+@@ -8,6 +8,8 @@ config DRM_AMD_DC
+ 	bool "AMD DC - Enable new display engine"
+ 	default y
+ 	depends on BROKEN || !CC_IS_CLANG || ARM64 || LOONGARCH || RISCV || SPARC64 || X86_64
++	select CEC_CORE
++	select CEC_NOTIFIER
+ 	select SND_HDA_COMPONENT if SND_HDA_CORE
+ 	# !CC_IS_CLANG: https://github.com/ClangBuiltLinux/linux/issues/1752
+ 	select DRM_AMD_DC_FP if ARCH_HAS_KERNEL_FPU_SUPPORT && !(CC_IS_CLANG && (ARM64 || LOONGARCH || RISCV))
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 7b59ab3fe310..0ec178ca7434 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -98,6 +98,7 @@
+ #include <drm/drm_audio_component.h>
+ #include <drm/drm_gem_atomic_helper.h>
+ 
++#include <media/cec-notifier.h>
+ #include <acpi/video.h>
+ 
+ #include "ivsrcid/dcn/irqsrcs_dcn_1_0.h"
+@@ -2754,6 +2755,48 @@ static void resume_mst_branch_status(struct drm_dp_mst_topology_mgr *mgr)
+ 	mutex_unlock(&mgr->lock);
+ }
+ 
++void hdmi_cec_unset_edid(struct amdgpu_dm_connector *aconnector)
++{
++	struct cec_notifier *n = aconnector->notifier;
++
++	if (!n)
++		return;
++
++	cec_notifier_phys_addr_invalidate(n);
++}
++
++void hdmi_cec_set_edid(struct amdgpu_dm_connector *aconnector)
++{
++	struct drm_connector *connector = &aconnector->base;
++	struct cec_notifier *n = aconnector->notifier;
++
++	if (!n)
++		return;
++
++	cec_notifier_set_phys_addr(n,
++				   connector->display_info.source_physical_address);
++}
++
++static void s3_handle_hdmi_cec(struct drm_device *ddev, bool suspend)
++{
++	struct amdgpu_dm_connector *aconnector;
++	struct drm_connector *connector;
++	struct drm_connector_list_iter conn_iter;
++
++	drm_connector_list_iter_begin(ddev, &conn_iter);
++	drm_for_each_connector_iter(connector, &conn_iter) {
++		if (connector->connector_type == DRM_MODE_CONNECTOR_WRITEBACK)
++			continue;
++
++		aconnector = to_amdgpu_dm_connector(connector);
++		if (suspend)
++			hdmi_cec_unset_edid(aconnector);
++		else
++			hdmi_cec_set_edid(aconnector);
++	}
++	drm_connector_list_iter_end(&conn_iter);
++}
++
+ static void s3_handle_mst(struct drm_device *dev, bool suspend)
+ {
+ 	struct amdgpu_dm_connector *aconnector;
+@@ -3025,6 +3068,8 @@ static int dm_suspend(struct amdgpu_ip_block *ip_block)
+ 	if (IS_ERR(adev->dm.cached_state))
+ 		return PTR_ERR(adev->dm.cached_state);
+ 
++	s3_handle_hdmi_cec(adev_to_drm(adev), true);
++
+ 	s3_handle_mst(adev_to_drm(adev), true);
+ 
+ 	amdgpu_dm_irq_suspend(adev);
+@@ -3297,6 +3342,8 @@ static int dm_resume(struct amdgpu_ip_block *ip_block)
+ 	 */
+ 	amdgpu_dm_irq_resume_early(adev);
+ 
++	s3_handle_hdmi_cec(ddev, false);
++
+ 	/* On resume we need to rewrite the MSTM control bits to enable MST*/
+ 	s3_handle_mst(ddev, false);
+ 
+@@ -3611,6 +3658,7 @@ void amdgpu_dm_update_connector_after_detect(
+ 		dc_sink_retain(aconnector->dc_sink);
+ 		if (sink->dc_edid.length == 0) {
+ 			aconnector->drm_edid = NULL;
++			hdmi_cec_unset_edid(aconnector);
+ 			if (aconnector->dc_link->aux_mode) {
+ 				drm_dp_cec_unset_edid(&aconnector->dm_dp_aux.aux);
+ 			}
+@@ -3620,6 +3668,7 @@ void amdgpu_dm_update_connector_after_detect(
+ 			aconnector->drm_edid = drm_edid_alloc(edid, sink->dc_edid.length);
+ 			drm_edid_connector_update(connector, aconnector->drm_edid);
+ 
++			hdmi_cec_set_edid(aconnector);
+ 			if (aconnector->dc_link->aux_mode)
+ 				drm_dp_cec_attach(&aconnector->dm_dp_aux.aux,
+ 						  connector->display_info.source_physical_address);
+@@ -3636,6 +3685,7 @@ void amdgpu_dm_update_connector_after_detect(
+ 		amdgpu_dm_update_freesync_caps(connector, aconnector->drm_edid);
+ 		update_connector_ext_caps(aconnector);
+ 	} else {
++		hdmi_cec_unset_edid(aconnector);
+ 		drm_dp_cec_unset_edid(&aconnector->dm_dp_aux.aux);
+ 		amdgpu_dm_update_freesync_caps(connector, NULL);
+ 		aconnector->num_modes = 0;
+@@ -7052,6 +7102,7 @@ static void amdgpu_dm_connector_unregister(struct drm_connector *connector)
+ 	if (amdgpu_dm_should_create_sysfs(amdgpu_dm_connector))
+ 		sysfs_remove_group(&connector->kdev->kobj, &amdgpu_group);
+ 
++	cec_notifier_conn_unregister(amdgpu_dm_connector->notifier);
+ 	drm_dp_aux_unregister(&amdgpu_dm_connector->dm_dp_aux.aux);
+ }
+ 
+@@ -8288,6 +8339,27 @@ create_i2c(struct ddc_service *ddc_service,
+ 	return i2c;
+ }
+ 
++int amdgpu_dm_initialize_hdmi_connector(struct amdgpu_dm_connector *aconnector)
++{
++	struct cec_connector_info conn_info;
++	struct drm_device *ddev = aconnector->base.dev;
++	struct device *hdmi_dev = ddev->dev;
++
++	if (amdgpu_dc_debug_mask & DC_DISABLE_HDMI_CEC) {
++		drm_info(ddev, "HDMI-CEC feature masked\n");
++		return -EINVAL;
++	}
++
++	cec_fill_conn_info_from_drm(&conn_info, &aconnector->base);
++	aconnector->notifier =
++		cec_notifier_conn_register(hdmi_dev, NULL, &conn_info);
++	if (!aconnector->notifier) {
++		drm_err(ddev, "Failed to create cec notifier\n");
++		return -ENOMEM;
++	}
++
++	return 0;
++}
+ 
+ /*
+  * Note: this function assumes that dc_link_detect() was called for the
+@@ -8351,6 +8423,10 @@ static int amdgpu_dm_connector_init(struct amdgpu_display_manager *dm,
+ 	drm_connector_attach_encoder(
+ 		&aconnector->base, &aencoder->base);
+ 
++	if (connector_type == DRM_MODE_CONNECTOR_HDMIA ||
++	    connector_type == DRM_MODE_CONNECTOR_HDMIB)
++		amdgpu_dm_initialize_hdmi_connector(aconnector);
++
+ 	if (connector_type == DRM_MODE_CONNECTOR_DisplayPort
+ 		|| connector_type == DRM_MODE_CONNECTOR_eDP)
+ 		amdgpu_dm_initialize_dp_connector(dm, aconnector, link->link_index);
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+index e7963158a147..d2703ca7dff3 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+@@ -671,6 +671,8 @@ struct amdgpu_dm_connector {
+ 	uint32_t connector_id;
+ 	int bl_idx;
+ 
++	struct cec_notifier *notifier;
++
+ 	/* we need to mind the EDID between detect
+ 	   and get modes due to analog/digital/tvencoder */
+ 	const struct drm_edid *drm_edid;
+@@ -1012,4 +1014,8 @@ void dm_free_gpu_mem(struct amdgpu_device *adev,
+ 
+ bool amdgpu_dm_is_headless(struct amdgpu_device *adev);
+ 
++void hdmi_cec_set_edid(struct amdgpu_dm_connector *aconnector);
++void hdmi_cec_unset_edid(struct amdgpu_dm_connector *aconnector);
++int amdgpu_dm_initialize_hdmi_connector(struct amdgpu_dm_connector *aconnector);
++
+ #endif /* __AMDGPU_DM_H__ */
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_debugfs.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_debugfs.c
+index 6d372835d416..049046c60462 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_debugfs.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_debugfs.c
+@@ -25,6 +25,7 @@
+ 
+ #include <linux/string_helpers.h>
+ #include <linux/uaccess.h>
++#include <media/cec-notifier.h>
+ 
+ #include "dc.h"
+ #include "amdgpu.h"
+@@ -2848,6 +2849,67 @@ static int is_dpia_link_show(struct seq_file *m, void *data)
+ 	return 0;
+ }
+ 
++/**
++ * hdmi_cec_state_show - Read out the HDMI-CEC feature status
++ * @m: sequence file.
++ * @data: unused.
++ *
++ * Return 0 on success
++ */
++static int hdmi_cec_state_show(struct seq_file *m, void *data)
++{
++	struct drm_connector *connector = m->private;
++	struct amdgpu_dm_connector *aconnector = to_amdgpu_dm_connector(connector);
++
++	seq_printf(m, "%s:%d\n", connector->name, connector->base.id);
++	seq_printf(m, "HDMI-CEC status: %d\n", aconnector->notifier ? 1 : 0);
++
++	return 0;
++}
++
++/**
++ * hdmi_cec_state_write - Enable/Disable HDMI-CEC feature from driver side
++ * @f: file structure.
++ * @buf: userspace buffer. set to '1' to enable; '0' to disable cec feature.
++ * @size: size of buffer from userpsace.
++ * @pos: unused.
++ *
++ * Return size on success, error code on failure
++ */
++static ssize_t hdmi_cec_state_write(struct file *f, const char __user *buf,
++				    size_t size, loff_t *pos)
++{
++	int ret;
++	bool enable;
++	struct amdgpu_dm_connector *aconnector = file_inode(f)->i_private;
++	struct drm_device *ddev = aconnector->base.dev;
++
++	if (size == 0)
++		return -EINVAL;
++
++	ret = kstrtobool_from_user(buf, size, &enable);
++	if (ret) {
++		drm_dbg_driver(ddev, "invalid user data !\n");
++		return ret;
++	}
++
++	if (enable) {
++		if (aconnector->notifier)
++			return -EINVAL;
++		ret = amdgpu_dm_initialize_hdmi_connector(aconnector);
++		if (ret)
++			return ret;
++		hdmi_cec_set_edid(aconnector);
++	} else {
++		if (!aconnector->notifier)
++			return -EINVAL;
++		cec_notifier_conn_unregister(aconnector->notifier);
++		aconnector->notifier = NULL;
++	}
++
++	return size;
++}
++
+ DEFINE_SHOW_ATTRIBUTE(dp_dsc_fec_support);
+ DEFINE_SHOW_ATTRIBUTE(dmub_fw_state);
+ DEFINE_SHOW_ATTRIBUTE(dmub_tracebuffer);
+@@ -2860,6 +2922,7 @@ DEFINE_SHOW_ATTRIBUTE(psr_capability);
+ DEFINE_SHOW_ATTRIBUTE(dp_is_mst_connector);
+ DEFINE_SHOW_ATTRIBUTE(dp_mst_progress_status);
+ DEFINE_SHOW_ATTRIBUTE(is_dpia_link);
++DEFINE_SHOW_STORE_ATTRIBUTE(hdmi_cec_state);
+ 
+ static const struct file_operations dp_dsc_clock_en_debugfs_fops = {
+ 	.owner = THIS_MODULE,
+@@ -2995,7 +3058,8 @@ static const struct {
+ 	char *name;
+ 	const struct file_operations *fops;
+ } hdmi_debugfs_entries[] = {
+-		{"hdcp_sink_capability", &hdcp_sink_capability_fops}
++		{"hdcp_sink_capability", &hdcp_sink_capability_fops},
++		{"hdmi_cec_state", &hdmi_cec_state_fops}
+ };
+ 
+ /*
+diff --git a/drivers/gpu/drm/amd/include/amd_shared.h b/drivers/gpu/drm/amd/include/amd_shared.h
+index 98d9e840b0e2..05bdb4e020ae 100644
+--- a/drivers/gpu/drm/amd/include/amd_shared.h
++++ b/drivers/gpu/drm/amd/include/amd_shared.h
+@@ -344,6 +344,11 @@ enum DC_DEBUG_MASK {
+ 	 * eDP display from ACPI _DDC method.
+ 	 */
+ 	DC_DISABLE_ACPI_EDID = 0x8000,
++
++	/*
++	 * @DC_DISABLE_HDMI_CEC: If set, disable HDMI-CEC feature in amdgpu driver.
++	 */
++	DC_DISABLE_HDMI_CEC = 0x10000,
+ };
+ 
+ enum amd_dpm_forced_level;
+-- 
+2.52.0
+
