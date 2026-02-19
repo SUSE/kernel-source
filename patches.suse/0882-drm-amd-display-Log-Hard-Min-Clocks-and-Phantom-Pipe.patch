@@ -1,0 +1,120 @@
+From 59fb2d0697de0fa9e48b98414420f5a59ca5583c Mon Sep 17 00:00:00 2001
+From: Sung Lee <Sung.Lee@amd.com>
+Date: Wed, 11 Dec 2024 16:27:42 -0500
+Subject: drm/amd/display: Log Hard Min Clocks and Phantom Pipe Status
+Git-commit: 59fb2d0697de0fa9e48b98414420f5a59ca5583c
+Patch-mainline: v6.14-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+[WHY]
+On entering/exiting idle power, certain parameters would be
+very useful to know for power profiling purposes.
+
+[HOW]
+This commit adds certain hard min clocks and pipe types
+to log output on idle optimization enter/exit.
+
+Reviewed-by: Alvin Lee <alvin.lee2@amd.com>
+Signed-off-by: Sung Lee <Sung.Lee@amd.com>
+Signed-off-by: Tom Chung <chiahsuan.chung@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../dc/clk_mgr/dcn401/dcn401_clk_mgr.c        | 16 ++++++++++++++
+ drivers/gpu/drm/amd/display/dc/core/dc.c      | 22 +++++++++++++++++++
+ .../gpu/drm/amd/display/dc/inc/hw/clk_mgr.h   |  3 +++
+ 3 files changed, 41 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn401/dcn401_clk_mgr.c b/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn401/dcn401_clk_mgr.c
+index e4360cd6b373..204ebdd99415 100644
+--- a/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn401/dcn401_clk_mgr.c
++++ b/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn401/dcn401_clk_mgr.c
+@@ -1345,6 +1345,20 @@ static void dcn401_set_hard_min_memclk(struct clk_mgr *clk_mgr_base, bool curren
+ 	dcn401_execute_block_sequence(clk_mgr_base,	num_steps);
+ }
+ 
++static int dcn401_get_hard_min_memclk(struct clk_mgr *clk_mgr_base)
++{
++	struct clk_mgr_internal *clk_mgr = TO_CLK_MGR_INTERNAL(clk_mgr_base);
++
++	return clk_mgr->base.ctx->dc->current_state->bw_ctx.bw.dcn.clk.dramclk_khz;
++}
++
++static int dcn401_get_hard_min_fclk(struct clk_mgr *clk_mgr_base)
++{
++	struct clk_mgr_internal *clk_mgr = TO_CLK_MGR_INTERNAL(clk_mgr_base);
++
++	return clk_mgr->base.ctx->dc->current_state->bw_ctx.bw.dcn.clk.fclk_khz;
++}
++
+ /* Get current memclk states, update bounding box */
+ static void dcn401_get_memclk_states_from_smu(struct clk_mgr *clk_mgr_base)
+ {
+@@ -1478,6 +1492,8 @@ static struct clk_mgr_funcs dcn401_funcs = {
+ 		.enable_pme_wa = dcn401_enable_pme_wa,
+ 		.is_smu_present = dcn401_is_smu_present,
+ 		.get_dispclk_from_dentist = dcn401_get_dispclk_from_dentist,
++		.get_hard_min_memclk = dcn401_get_hard_min_memclk,
++		.get_hard_min_fclk = dcn401_get_hard_min_fclk,
+ };
+ 
+ struct clk_mgr_internal *dcn401_clk_mgr_construct(
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index 76c36374de67..cb6293d8ba77 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -5507,6 +5507,11 @@ bool dc_set_ips_disable(struct dc *dc, unsigned int disable_ips)
+ 
+ void dc_allow_idle_optimizations_internal(struct dc *dc, bool allow, char const *caller_name)
+ {
++	int idle_fclk_khz = 0, idle_dramclk_khz = 0, i = 0;
++	enum mall_stream_type subvp_pipe_type[MAX_PIPES] = {0};
++	struct pipe_ctx *pipe = NULL;
++	struct dc_state *context = dc->current_state;
++
+ 	if (dc->debug.disable_idle_power_optimizations) {
+ 		DC_LOG_DEBUG("%s: disabled\n", __func__);
+ 		return;
+@@ -5531,6 +5536,23 @@ void dc_allow_idle_optimizations_internal(struct dc *dc, bool allow, char const
+ 		dc->idle_optimizations_allowed = allow;
+ 		DC_LOG_DEBUG("%s: %s\n", __func__, allow ? "enabled" : "disabled");
+ 	}
++
++	// log idle clocks and sub vp pipe types at idle optimization time
++	if (dc->clk_mgr != NULL && dc->clk_mgr->funcs->get_hard_min_fclk)
++		idle_fclk_khz = dc->clk_mgr->funcs->get_hard_min_fclk(dc->clk_mgr);
++
++	if (dc->clk_mgr != NULL && dc->clk_mgr->funcs->get_hard_min_memclk)
++		idle_dramclk_khz = dc->clk_mgr->funcs->get_hard_min_memclk(dc->clk_mgr);
++
++	for (i = 0; i < dc->res_pool->pipe_count; i++) {
++		pipe = &context->res_ctx.pipe_ctx[i];
++		subvp_pipe_type[i] = dc_state_get_pipe_subvp_type(context, pipe);
++	}
++
++	DC_LOG_DC("%s: allow_idle=%d\n HardMinUClk_Khz=%d HardMinDramclk_Khz=%d\n Pipe_0=%d Pipe_1=%d Pipe_2=%d Pipe_3=%d Pipe_4=%d Pipe_5=%d (caller=%s)\n",
++			__func__, allow, idle_fclk_khz, idle_dramclk_khz, subvp_pipe_type[0], subvp_pipe_type[1], subvp_pipe_type[2],
++			subvp_pipe_type[3], subvp_pipe_type[4], subvp_pipe_type[5], caller_name);
++
+ }
+ 
+ void dc_exit_ips_for_hw_access_internal(struct dc *dc, const char *caller_name)
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/clk_mgr.h b/drivers/gpu/drm/amd/display/dc/inc/hw/clk_mgr.h
+index 2d06067ff36d..c14d64687a3d 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/clk_mgr.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/clk_mgr.h
+@@ -306,6 +306,9 @@ struct clk_mgr_funcs {
+ 	 */
+ 	void (*set_hard_min_memclk)(struct clk_mgr *clk_mgr, bool current_mode);
+ 
++	int (*get_hard_min_memclk)(struct clk_mgr *clk_mgr);
++	int (*get_hard_min_fclk)(struct clk_mgr *clk_mgr);
++
+ 	/* Send message to PMFW to set hard max memclk frequency to highest DPM */
+ 	void (*set_hard_max_memclk)(struct clk_mgr *clk_mgr);
+ 
+-- 
+2.52.0
+
