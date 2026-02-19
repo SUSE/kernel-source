@@ -1,0 +1,209 @@
+From 3ea943991d09a8d5cdddec5356d2694bd8060f69 Mon Sep 17 00:00:00 2001
+From: Dillon Varone <dillon.varone@amd.com>
+Date: Thu, 12 Dec 2024 17:01:34 -0500
+Subject: drm/amd/display: Add SMU interface to get UMC count for dcn401
+Git-commit: 3ea943991d09a8d5cdddec5356d2694bd8060f69
+Patch-mainline: v6.14-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+[WHY&HOW]
+BIOS table will not always contain accurate UMC channel info when
+harvesting is enabled, so get the correct info from SMU.
+
+Reviewed-by: Alvin Lee <alvin.lee2@amd.com>
+Signed-off-by: Dillon Varone <dillon.varone@amd.com>
+Signed-off-by: Tom Chung <chiahsuan.chung@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../amd/display/dc/clk_mgr/dcn401/dalsmc.h    |  4 +-
+ .../dc/clk_mgr/dcn401/dcn401_clk_mgr.c        |  9 ++++
+ .../clk_mgr/dcn401/dcn401_clk_mgr_smu_msg.c   | 14 +++++
+ .../clk_mgr/dcn401/dcn401_clk_mgr_smu_msg.h   |  1 +
+ .../dc/dml2/dml21/dml21_translation_helper.c  |  9 +++-
+ .../dc/resource/dcn401/dcn401_resource.c      | 54 +++++++++++--------
+ 6 files changed, 65 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn401/dalsmc.h b/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn401/dalsmc.h
+index dbfdd3487da5..2e0d34fd7512 100644
+--- a/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn401/dalsmc.h
++++ b/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn401/dalsmc.h
+@@ -43,7 +43,9 @@
+ #define DALSMC_MSG_ActiveUclkFclk                 0x18
+ #define DALSMC_MSG_IdleUclkFclk                   0x19
+ #define DALSMC_MSG_SetUclkPstateAllow             0x1A
+-#define DALSMC_Message_Count                      0x1B
++#define DALSMC_MSG_SubvpUclkFclk                  0x1B
++#define DALSMC_MSG_GetNumUmcChannels              0x1C
++#define DALSMC_Message_Count                      0x1D
+ 
+ typedef enum {
+   FCLK_SWITCH_DISALLOW,
+diff --git a/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn401/dcn401_clk_mgr.c b/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn401/dcn401_clk_mgr.c
+index 204ebdd99415..8082bb877611 100644
+--- a/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn401/dcn401_clk_mgr.c
++++ b/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn401/dcn401_clk_mgr.c
+@@ -1403,6 +1403,15 @@ static void dcn401_get_memclk_states_from_smu(struct clk_mgr *clk_mgr_base)
+ 	if (clk_mgr->dpm_present && !num_levels)
+ 		clk_mgr->dpm_present = false;
+ 
++	clk_mgr_base->bw_params->num_channels = dcn401_smu_get_num_of_umc_channels(clk_mgr);
++	if (clk_mgr_base->ctx->dc_bios) {
++		/* use BIOS values if none provided by PMFW */
++		if (clk_mgr_base->bw_params->num_channels == 0) {
++			clk_mgr_base->bw_params->num_channels = clk_mgr_base->ctx->dc_bios->vram_info.num_chans;
++		}
++		clk_mgr_base->bw_params->dram_channel_width_bytes = clk_mgr_base->ctx->dc_bios->vram_info.dram_channel_width_bytes;
++	}
++
+ 	/* Refresh bounding box */
+ 	clk_mgr_base->ctx->dc->res_pool->funcs->update_bw_bounding_box(
+ 			clk_mgr->base.ctx->dc, clk_mgr_base->bw_params);
+diff --git a/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn401/dcn401_clk_mgr_smu_msg.c b/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn401/dcn401_clk_mgr_smu_msg.c
+index b02a41179b41..21c35528f61f 100644
+--- a/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn401/dcn401_clk_mgr_smu_msg.c
++++ b/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn401/dcn401_clk_mgr_smu_msg.c
+@@ -25,6 +25,9 @@
+ #ifndef DALSMC_MSG_SubvpUclkFclk
+ #define DALSMC_MSG_SubvpUclkFclk 0x1B
+ #endif
++#ifndef DALSMC_MSG_GetNumUmcChannels
++#define DALSMC_MSG_GetNumUmcChannels 0x1C
++#endif
+ 
+ /*
+  * Function to be used instead of REG_WAIT macro because the wait ends when
+@@ -334,3 +337,14 @@ void dcn401_smu_set_num_of_displays(struct clk_mgr_internal *clk_mgr, uint32_t n
+ 	dcn401_smu_send_msg_with_param(clk_mgr,
+ 			DALSMC_MSG_NumOfDisplays, num_displays, NULL);
+ }
++
++unsigned int dcn401_smu_get_num_of_umc_channels(struct clk_mgr_internal *clk_mgr)
++{
++	unsigned int response = 0;
++
++	dcn401_smu_send_msg_with_param(clk_mgr, DALSMC_MSG_GetNumUmcChannels, 0, &response);
++
++	smu_print("SMU Get Num UMC Channels: num_umc_channels = %d\n", response);
++
++	return response;
++}
+diff --git a/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn401/dcn401_clk_mgr_smu_msg.h b/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn401/dcn401_clk_mgr_smu_msg.h
+index 42cf7885a7cb..e02eb1294b37 100644
+--- a/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn401/dcn401_clk_mgr_smu_msg.h
++++ b/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn401/dcn401_clk_mgr_smu_msg.h
+@@ -28,5 +28,6 @@ bool dcn401_smu_set_subvp_uclk_fclk_hardmin(struct clk_mgr_internal *clk_mgr,
+ 		uint16_t fclk_freq_mhz);
+ void dcn401_smu_set_min_deep_sleep_dcef_clk(struct clk_mgr_internal *clk_mgr, uint32_t freq_mhz);
+ void dcn401_smu_set_num_of_displays(struct clk_mgr_internal *clk_mgr, uint32_t num_displays);
++unsigned int dcn401_smu_get_num_of_umc_channels(struct clk_mgr_internal *clk_mgr);
+ 
+ #endif /* __DCN401_CLK_MGR_SMU_MSG_H_ */
+diff --git a/drivers/gpu/drm/amd/display/dc/dml2/dml21/dml21_translation_helper.c b/drivers/gpu/drm/amd/display/dc/dml2/dml21/dml21_translation_helper.c
+index 5d46f4e24f6b..b9c6b45f6872 100644
+--- a/drivers/gpu/drm/amd/display/dc/dml2/dml21/dml21_translation_helper.c
++++ b/drivers/gpu/drm/amd/display/dc/dml2/dml21/dml21_translation_helper.c
+@@ -294,12 +294,17 @@ void dml21_apply_soc_bb_overrides(struct dml2_initialize_instance_in_out *dml_in
+ 		dml_soc_bb->power_management_parameters.stutter_exit_latency_us =
+ 			(in_dc->ctx->dc_bios->bb_info.dram_sr_exit_latency_100ns + 9) / 10;
+ 
+-	if (in_dc->ctx->dc_bios->vram_info.num_chans) {
++	if (dc_bw_params->num_channels) {
++		dml_clk_table->dram_config.channel_count = dc_bw_params->num_channels;
++		dml_soc_bb->mall_allocated_for_dcn_mbytes = in_dc->caps.mall_size_total / 1048576;
++	} else if (in_dc->ctx->dc_bios->vram_info.num_chans) {
+ 		dml_clk_table->dram_config.channel_count = in_dc->ctx->dc_bios->vram_info.num_chans;
+ 		dml_soc_bb->mall_allocated_for_dcn_mbytes = in_dc->caps.mall_size_total / 1048576;
+ 	}
+ 
+-	if (in_dc->ctx->dc_bios->vram_info.dram_channel_width_bytes) {
++	if (dc_bw_params->dram_channel_width_bytes) {
++		dml_clk_table->dram_config.channel_width_bytes = dc_bw_params->dram_channel_width_bytes;
++	} else if (in_dc->ctx->dc_bios->vram_info.dram_channel_width_bytes) {
+ 		dml_clk_table->dram_config.channel_width_bytes = in_dc->ctx->dc_bios->vram_info.dram_channel_width_bytes;
+ 	}
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/resource/dcn401/dcn401_resource.c b/drivers/gpu/drm/amd/display/dc/resource/dcn401/dcn401_resource.c
+index 0767adaa6389..c1ebc6b1c937 100644
+--- a/drivers/gpu/drm/amd/display/dc/resource/dcn401/dcn401_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/resource/dcn401/dcn401_resource.c
+@@ -1297,6 +1297,29 @@ static struct hpo_dp_link_encoder *dcn401_hpo_dp_link_encoder_create(
+ 	return &hpo_dp_enc31->base;
+ }
+ 
++static unsigned int dcn401_calc_num_avail_chans_for_mall(struct dc *dc, unsigned int num_chans)
++{
++	unsigned int num_available_chans = 1;
++
++	/* channels for MALL must be a power of 2 */
++	while (num_chans > 1) {
++		num_available_chans = (num_available_chans << 1);
++		num_chans = (num_chans >> 1);
++	}
++
++	/* cannot be odd */
++	num_available_chans &= ~1;
++
++	/* clamp to max available channels for MALL per ASIC */
++	if (ASICREV_IS_GC_12_0_0_A0(dc->ctx->asic_id.hw_internal_rev)) {
++		num_available_chans = num_available_chans > 16 ? 16 : num_available_chans;
++	} else if (ASICREV_IS_GC_12_0_1_A0(dc->ctx->asic_id.hw_internal_rev)) {
++		num_available_chans = num_available_chans > 8 ? 8 : num_available_chans;
++	}
++
++	return num_available_chans;
++}
++
+ static struct dce_hwseq *dcn401_hwseq_create(
+ 	struct dc_context *ctx)
+ {
+@@ -1592,6 +1615,14 @@ static void dcn401_update_bw_bounding_box(struct dc *dc, struct clk_bw_params *b
+ 
+ 	memcpy(dml2_opt, &dc->dml2_options, sizeof(dc->dml2_options));
+ 
++	/* re-calculate the available MALL size if required */
++	if (bw_params->num_channels > 0) {
++		dc->caps.max_cab_allocation_bytes = dcn401_calc_num_avail_chans_for_mall(
++			dc, bw_params->num_channels) *
++			dc->caps.mall_size_per_mem_channel * 1024 * 1024;
++		dc->caps.mall_size_total = dc->caps.max_cab_allocation_bytes;
++	}
++
+ 	DC_FP_START();
+ 
+ 	dcn401_update_bw_bounding_box_fpu(dc, bw_params);
+@@ -1714,29 +1745,6 @@ static unsigned int dcn401_get_vstartup_for_pipe(struct pipe_ctx *pipe_ctx)
+ 	return pipe_ctx->global_sync.dcn4x.vstartup_lines;
+ }
+ 
+-static unsigned int dcn401_calc_num_avail_chans_for_mall(struct dc *dc, unsigned int num_chans)
+-{
+-	unsigned int num_available_chans = 1;
+-
+-	/* channels for MALL must be a power of 2 */
+-	while (num_chans > 1) {
+-		num_available_chans = (num_available_chans << 1);
+-		num_chans = (num_chans >> 1);
+-	}
+-
+-	/* cannot be odd */
+-	num_available_chans &= ~1;
+-
+-	/* clamp to max available channels for MALL per ASIC */
+-	if (ASICREV_IS_GC_12_0_0_A0(dc->ctx->asic_id.hw_internal_rev)) {
+-		num_available_chans = num_available_chans > 16 ? 16 : num_available_chans;
+-	} else if (ASICREV_IS_GC_12_0_1_A0(dc->ctx->asic_id.hw_internal_rev)) {
+-		num_available_chans = num_available_chans > 8 ? 8 : num_available_chans;
+-	}
+-
+-	return num_available_chans;
+-}
+-
+ static struct resource_funcs dcn401_res_pool_funcs = {
+ 	.destroy = dcn401_destroy_resource_pool,
+ 	.link_enc_create = dcn401_link_encoder_create,
+-- 
+2.52.0
+
