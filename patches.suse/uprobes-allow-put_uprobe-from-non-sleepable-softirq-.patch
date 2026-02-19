@@ -1,0 +1,81 @@
+From: Andrii Nakryiko <andrii@kernel.org>
+Date: Wed, 23 Oct 2024 21:41:58 -0700
+Subject: uprobes: allow put_uprobe() from non-sleepable softirq context
+Patch-mainline: v6.13-rc1
+Git-commit: 2bf8e5aceff899f5117f14c73e869a61c44d8a69
+References: jsc#PED-14653
+
+Currently put_uprobe() might trigger mutex_lock()/mutex_unlock(), which
+makes it unsuitable to be called from more restricted context like softirq.
+
+Let's make put_uprobe() agnostic to the context in which it is called,
+and use work queue to defer the mutex-protected clean up steps.
+
+RB tree removal step is also moved into work-deferred callback to avoid
+potential deadlock between softirq-based timer callback, added in the
+next patch, and the rest of uprobe code.
+
+We can rework locking altogher as a follow up, but that's significantly
+more tricky, so warrants its own patch set. For now, we need to make
+sure that changes in the next patch that add timer thread work correctly
+with existing approach, while concentrating on SRCU + timeout logic.
+
+Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lore.kernel.org/r/20241024044159.3156646-2-andrii@kernel.org
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ kernel/events/uprobes.c |   20 ++++++++++++++++----
+ 1 file changed, 16 insertions(+), 4 deletions(-)
+
+--- a/kernel/events/uprobes.c
++++ b/kernel/events/uprobes.c
+@@ -27,6 +27,7 @@
+ #include <linux/shmem_fs.h>
+ #include <linux/khugepaged.h>
+ #include <linux/rcupdate_trace.h>
++#include <linux/workqueue.h>
+ 
+ #include <linux/uprobes.h>
+ 
+@@ -61,7 +62,10 @@ struct uprobe {
+ 	struct list_head	pending_list;
+ 	struct list_head	consumers;
+ 	struct inode		*inode;		/* Also hold a ref to inode */
+-	struct rcu_head		rcu;
++	union {
++		struct rcu_head		rcu;
++		struct work_struct	work;
++	};
+ 	loff_t			offset;
+ 	loff_t			ref_ctr_offset;
+ 	unsigned long		flags;		/* "unsigned long" so bitops work */
+@@ -625,10 +629,9 @@ static void uprobe_free_rcu(struct rcu_h
+ 	kfree(uprobe);
+ }
+ 
+-static void put_uprobe(struct uprobe *uprobe)
++static void uprobe_free_deferred(struct work_struct *work)
+ {
+-	if (!refcount_dec_and_test(&uprobe->ref))
+-		return;
++	struct uprobe *uprobe = container_of(work, struct uprobe, work);
+ 
+ 	write_lock(&uprobes_treelock);
+ 
+@@ -652,6 +655,15 @@ static void put_uprobe(struct uprobe *up
+ 	call_rcu_tasks_trace(&uprobe->rcu, uprobe_free_rcu);
+ }
+ 
++static void put_uprobe(struct uprobe *uprobe)
++{
++	if (!refcount_dec_and_test(&uprobe->ref))
++		return;
++
++	INIT_WORK(&uprobe->work, uprobe_free_deferred);
++	schedule_work(&uprobe->work);
++}
++
+ static __always_inline
+ int uprobe_cmp(const struct inode *l_inode, const loff_t l_offset,
+ 	       const struct uprobe *r)
