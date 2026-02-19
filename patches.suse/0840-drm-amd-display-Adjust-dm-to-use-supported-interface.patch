@@ -1,0 +1,497 @@
+From 9a45ad15a1e26477fb870afb2b4d674c635cd57c Mon Sep 17 00:00:00 2001
+From: Wayne Lin <Wayne.Lin@amd.com>
+Date: Mon, 22 Jul 2024 18:29:25 +0800
+Subject: drm/amd/display: Adjust dm to use supported interfaces for setting
+ multiple crc windows
+Git-commit: 9a45ad15a1e26477fb870afb2b4d674c635cd57c
+Patch-mainline: v6.14-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+[Why & How]
+We actually have the capability to calculate independent CRC for 2 crc window
+at the same time. Extend dm with the capability by having array to
+configure/maintain multiple crc windows. Add the flexibility but use 1st CRC
+instance only for now. Can change to use the 2nd CRC instance if needed.
+
+Reviewed-by: HaoPing Liu <haoping.liu@amd.com>
+Signed-off-by: Wayne Lin <Wayne.Lin@amd.com>
+Signed-off-by: Roman Li <roman.li@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c |  23 ++-
+ .../drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c | 176 +++++++++++++-----
+ .../drm/amd/display/amdgpu_dm/amdgpu_dm_crc.h |  23 ++-
+ .../amd/display/amdgpu_dm/amdgpu_dm_debugfs.c |  31 +--
+ .../display/amdgpu_dm/amdgpu_dm_irq_params.h  |   4 +-
+ 5 files changed, 185 insertions(+), 72 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 6065c336364e..7b59ab3fe310 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -2158,6 +2158,10 @@ static int amdgpu_dm_init(struct amdgpu_device *adev)
+ 	amdgpu_dm_crtc_secure_display_create_contexts(adev);
+ 	if (!adev->dm.secure_display_ctx.crtc_ctx)
+ 		DRM_ERROR("amdgpu: failed to initialize secure display contexts.\n");
++
++	if (amdgpu_ip_version(adev, DCE_HWIP, 0) >= IP_VERSION(4, 0, 1))
++		adev->dm.secure_display_ctx.support_mul_roi = true;
++
+ #endif
+ 
+ 	DRM_DEBUG_DRIVER("KMS initialized.\n");
+@@ -10037,14 +10041,19 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
+ 			if (amdgpu_dm_is_valid_crc_source(cur_crc_src)) {
+ #if defined(CONFIG_DRM_AMD_SECURE_DISPLAY)
+ 				if (amdgpu_dm_crc_window_is_activated(crtc)) {
++					uint8_t cnt;
+ 					spin_lock_irqsave(&adev_to_drm(adev)->event_lock, flags);
+-					acrtc->dm_irq_params.window_param.update_win = true;
+-
+-					/**
+-					 * It takes 2 frames for HW to stably generate CRC when
+-					 * resuming from suspend, so we set skip_frame_cnt 2.
+-					 */
+-					acrtc->dm_irq_params.window_param.skip_frame_cnt = 2;
++					for (cnt = 0; cnt < MAX_CRC_WINDOW_NUM; cnt++) {
++						if (acrtc->dm_irq_params.window_param[cnt].enable) {
++							acrtc->dm_irq_params.window_param[cnt].update_win = true;
++
++							/**
++							 * It takes 2 frames for HW to stably generate CRC when
++							 * resuming from suspend, so we set skip_frame_cnt 2.
++							 */
++							acrtc->dm_irq_params.window_param[cnt].skip_frame_cnt = 2;
++						}
++					}
+ 					spin_unlock_irqrestore(&adev_to_drm(adev)->event_lock, flags);
+ 				}
+ #endif
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c
+index 26a8209c22f5..74ba6860c24a 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c
+@@ -296,33 +296,41 @@ static void amdgpu_dm_set_crc_window_default(struct drm_crtc *crtc, struct dc_st
+ 	struct drm_device *drm_dev = crtc->dev;
+ 	struct amdgpu_display_manager *dm = &drm_to_adev(drm_dev)->dm;
+ 	struct amdgpu_crtc *acrtc = to_amdgpu_crtc(crtc);
+-	bool was_activated;
+ 	struct amdgpu_dm_connector *aconnector;
++	bool was_activated;
+ 	uint8_t phy_id;
++	unsigned long flags;
++	int i;
+ 
+-	spin_lock_irq(&drm_dev->event_lock);
+-	was_activated = acrtc->dm_irq_params.window_param.activated;
+-	acrtc->dm_irq_params.window_param.x_start = 0;
+-	acrtc->dm_irq_params.window_param.y_start = 0;
+-	acrtc->dm_irq_params.window_param.x_end = 0;
+-	acrtc->dm_irq_params.window_param.y_end = 0;
+-	acrtc->dm_irq_params.window_param.activated = false;
+-	acrtc->dm_irq_params.window_param.update_win = false;
+-	acrtc->dm_irq_params.window_param.skip_frame_cnt = 0;
+-	spin_unlock_irq(&drm_dev->event_lock);
++	spin_lock_irqsave(&drm_dev->event_lock, flags);
++	was_activated = acrtc->dm_irq_params.crc_window_activated;
++	for (i = 0; i < MAX_CRC_WINDOW_NUM; i++) {
++		acrtc->dm_irq_params.window_param[i].x_start = 0;
++		acrtc->dm_irq_params.window_param[i].y_start = 0;
++		acrtc->dm_irq_params.window_param[i].x_end = 0;
++		acrtc->dm_irq_params.window_param[i].y_end = 0;
++		acrtc->dm_irq_params.window_param[i].enable = false;
++		acrtc->dm_irq_params.window_param[i].update_win = false;
++		acrtc->dm_irq_params.window_param[i].skip_frame_cnt = 0;
++	}
++	acrtc->dm_irq_params.crc_window_activated = false;
++	spin_unlock_irqrestore(&drm_dev->event_lock, flags);
+ 
+ 	/* Disable secure_display if it was enabled */
+ 	if (was_activated) {
+ 		/* stop ROI update on this crtc */
+ 		flush_work(&dm->secure_display_ctx.crtc_ctx[crtc->index].notify_ta_work);
+ 		flush_work(&dm->secure_display_ctx.crtc_ctx[crtc->index].forward_roi_work);
+-
+ 		aconnector = (struct amdgpu_dm_connector *)stream->dm_stream_context;
+ 
+-		if (aconnector && get_phy_id(dm, aconnector, &phy_id))
+-			dc_stream_forward_crc_window(stream, NULL, phy_id, true);
+-		else
++		if (aconnector && get_phy_id(dm, aconnector, &phy_id)) {
++			if (dm->secure_display_ctx.support_mul_roi)
++				dc_stream_forward_multiple_crc_window(stream, NULL, phy_id, true);
++			else
++				dc_stream_forward_crc_window(stream, NULL, phy_id, true);
++		} else {
+ 			DRM_DEBUG_DRIVER("%s Can't find matching phy id", __func__);
++		}
+ 	}
+ }
+ 
+@@ -394,6 +402,8 @@ amdgpu_dm_forward_crc_window(struct work_struct *work)
+ 	struct drm_crtc *crtc;
+ 	struct dc_stream_state *stream;
+ 	struct amdgpu_dm_connector *aconnector;
++	struct crc_window roi_cpy[MAX_CRC_WINDOW_NUM];
++	unsigned long flags;
+ 	uint8_t phy_id;
+ 
+ 	crtc_ctx = container_of(work, struct secure_display_crtc_context, forward_roi_work);
+@@ -417,9 +427,17 @@ amdgpu_dm_forward_crc_window(struct work_struct *work)
+ 	}
+ 	mutex_unlock(&crtc->dev->mode_config.mutex);
+ 
++	spin_lock_irqsave(&crtc->dev->event_lock, flags);
++	memcpy(roi_cpy, crtc_ctx->roi, sizeof(struct crc_window) * MAX_CRC_WINDOW_NUM);
++	spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
++
+ 	mutex_lock(&dm->dc_lock);
+-	dc_stream_forward_crc_window(stream, &crtc_ctx->rect,
+-		phy_id, false);
++	if (dm->secure_display_ctx.support_mul_roi)
++		dc_stream_forward_multiple_crc_window(stream, roi_cpy,
++			phy_id, false);
++	else
++		dc_stream_forward_crc_window(stream, &roi_cpy[0].rect,
++			phy_id, false);
+ 	mutex_unlock(&dm->dc_lock);
+ }
+ 
+@@ -430,7 +448,7 @@ bool amdgpu_dm_crc_window_is_activated(struct drm_crtc *crtc)
+ 	bool ret = false;
+ 
+ 	spin_lock_irq(&drm_dev->event_lock);
+-	ret = acrtc->dm_irq_params.window_param.activated;
++	ret = acrtc->dm_irq_params.crc_window_activated;
+ 	spin_unlock_irq(&drm_dev->event_lock);
+ 
+ 	return ret;
+@@ -733,7 +751,15 @@ void amdgpu_dm_crtc_handle_crc_window_irq(struct drm_crtc *crtc)
+ 	struct amdgpu_crtc *acrtc = NULL;
+ 	struct amdgpu_device *adev = NULL;
+ 	struct secure_display_crtc_context *crtc_ctx = NULL;
++	bool reset_crc_frame_count[MAX_CRC_WINDOW_NUM] = {false};
++	uint32_t crc_r[MAX_CRC_WINDOW_NUM] = {0};
++	uint32_t crc_g[MAX_CRC_WINDOW_NUM] = {0};
++	uint32_t crc_b[MAX_CRC_WINDOW_NUM] = {0};
+ 	unsigned long flags1;
++	bool forward_roi_change = false;
++	bool notify_ta = false;
++	bool all_crc_ready = true;
++	int i;
+ 
+ 	if (crtc == NULL)
+ 		return;
+@@ -747,15 +773,14 @@ void amdgpu_dm_crtc_handle_crc_window_irq(struct drm_crtc *crtc)
+ 
+ 	/* Early return if CRC capture is not enabled. */
+ 	if (!amdgpu_dm_is_valid_crc_source(cur_crc_src) ||
+-		!dm_is_crc_source_crtc(cur_crc_src))
+-		goto cleanup;
+-
+-	if (!acrtc->dm_irq_params.window_param.activated)
+-		goto cleanup;
++	    !dm_is_crc_source_crtc(cur_crc_src)) {
++		spin_unlock_irqrestore(&drm_dev->event_lock, flags1);
++		return;
++	}
+ 
+-	if (acrtc->dm_irq_params.window_param.skip_frame_cnt) {
+-		acrtc->dm_irq_params.window_param.skip_frame_cnt -= 1;
+-		goto cleanup;
++	if (!acrtc->dm_irq_params.crc_window_activated) {
++		spin_unlock_irqrestore(&drm_dev->event_lock, flags1);
++		return;
+ 	}
+ 
+ 	crtc_ctx = &adev->dm.secure_display_ctx.crtc_ctx[acrtc->crtc_id];
+@@ -766,32 +791,90 @@ void amdgpu_dm_crtc_handle_crc_window_irq(struct drm_crtc *crtc)
+ 		crtc_ctx->crtc = crtc;
+ 	}
+ 
+-	if (acrtc->dm_irq_params.window_param.update_win) {
+-		/* prepare work for dmub to update ROI */
+-		crtc_ctx->rect.x = acrtc->dm_irq_params.window_param.x_start;
+-		crtc_ctx->rect.y = acrtc->dm_irq_params.window_param.y_start;
+-		crtc_ctx->rect.width = acrtc->dm_irq_params.window_param.x_end -
+-								acrtc->dm_irq_params.window_param.x_start;
+-		crtc_ctx->rect.height = acrtc->dm_irq_params.window_param.y_end -
+-								acrtc->dm_irq_params.window_param.y_start;
+-		schedule_work(&crtc_ctx->forward_roi_work);
++	for (i = 0; i < MAX_CRC_WINDOW_NUM; i++) {
++		crtc_ctx->roi[i].enable = acrtc->dm_irq_params.window_param[i].enable;
+ 
+-		acrtc->dm_irq_params.window_param.update_win = false;
++		if (!acrtc->dm_irq_params.window_param[i].enable) {
++			crtc_ctx->crc_info.crc[i].crc_ready = false;
++			continue;
++		}
+ 
+-		/* Statically skip 1 frame, because we may need to wait below things
+-		 * before sending ROI to dmub:
+-		 * 1. We defer the work by using system workqueue.
+-		 * 2. We may need to wait for dc_lock before accessing dmub.
+-		 */
+-		acrtc->dm_irq_params.window_param.skip_frame_cnt = 1;
++		if (acrtc->dm_irq_params.window_param[i].skip_frame_cnt) {
++			acrtc->dm_irq_params.window_param[i].skip_frame_cnt -= 1;
++			crtc_ctx->crc_info.crc[i].crc_ready = false;
++			continue;
++		}
+ 
+-	} else {
+-		/* prepare work for psp to read ROI/CRC and send to I2C */
+-		schedule_work(&crtc_ctx->notify_ta_work);
++		if (acrtc->dm_irq_params.window_param[i].update_win) {
++			/* prepare work for dmub to update ROI */
++			crtc_ctx->roi[i].rect.x = acrtc->dm_irq_params.window_param[i].x_start;
++			crtc_ctx->roi[i].rect.y = acrtc->dm_irq_params.window_param[i].y_start;
++			crtc_ctx->roi[i].rect.width = acrtc->dm_irq_params.window_param[i].x_end -
++						acrtc->dm_irq_params.window_param[i].x_start;
++			crtc_ctx->roi[i].rect.height = acrtc->dm_irq_params.window_param[i].y_end -
++						acrtc->dm_irq_params.window_param[i].y_start;
++
++			forward_roi_change = true;
++
++			reset_crc_frame_count[i] = true;
++
++			acrtc->dm_irq_params.window_param[i].update_win = false;
++
++			/* Statically skip 1 frame, because we may need to wait below things
++			 * before sending ROI to dmub:
++			 * 1. We defer the work by using system workqueue.
++			 * 2. We may need to wait for dc_lock before accessing dmub.
++			 */
++			acrtc->dm_irq_params.window_param[i].skip_frame_cnt = 1;
++			crtc_ctx->crc_info.crc[i].crc_ready = false;
++		} else {
++			struct dc_stream_state *stream_state = to_dm_crtc_state(crtc->state)->stream;
++
++			if (!dc_stream_get_crc(stream_state->ctx->dc, stream_state, i,
++						&crc_r[i], &crc_g[i], &crc_b[i]))
++				DRM_ERROR("Secure Display: fail to get crc from engine %d\n", i);
++
++			/* prepare work for psp to read ROI/CRC and send to I2C */
++			notify_ta = true;
++			/* crc ready for psp to read out */
++			crtc_ctx->crc_info.crc[i].crc_ready = true;
++		}
+ 	}
+ 
+-cleanup:
+ 	spin_unlock_irqrestore(&drm_dev->event_lock, flags1);
++
++	if (forward_roi_change)
++		schedule_work(&crtc_ctx->forward_roi_work);
++
++	if (notify_ta)
++		schedule_work(&crtc_ctx->notify_ta_work);
++
++	spin_lock_irqsave(&crtc_ctx->crc_info.lock, flags1);
++	for (i = 0; i < MAX_CRC_WINDOW_NUM; i++) {
++		crtc_ctx->crc_info.crc[i].crc_R = crc_r[i];
++		crtc_ctx->crc_info.crc[i].crc_G = crc_g[i];
++		crtc_ctx->crc_info.crc[i].crc_B = crc_b[i];
++
++		if (!crtc_ctx->roi[i].enable) {
++			crtc_ctx->crc_info.crc[i].frame_count = 0;
++			continue;
++		}
++
++		if (!crtc_ctx->crc_info.crc[i].crc_ready)
++			all_crc_ready = false;
++
++		if (reset_crc_frame_count[i] || crtc_ctx->crc_info.crc[i].frame_count == UINT_MAX)
++			/* Reset the reference frame count after user update the ROI
++			 * or it reaches the maximum value.
++			 */
++			crtc_ctx->crc_info.crc[i].frame_count = 0;
++		else
++			crtc_ctx->crc_info.crc[i].frame_count += 1;
++	}
++	spin_unlock_irqrestore(&crtc_ctx->crc_info.lock, flags1);
++
++	if (all_crc_ready)
++		complete_all(&crtc_ctx->crc_info.completion);
+ }
+ 
+ void amdgpu_dm_crtc_secure_display_create_contexts(struct amdgpu_device *adev)
+@@ -812,6 +895,7 @@ void amdgpu_dm_crtc_secure_display_create_contexts(struct amdgpu_device *adev)
+ 		INIT_WORK(&crtc_ctx[i].forward_roi_work, amdgpu_dm_forward_crc_window);
+ 		INIT_WORK(&crtc_ctx[i].notify_ta_work, amdgpu_dm_crtc_notify_ta_to_read);
+ 		crtc_ctx[i].crtc = &adev->mode_info.crtcs[i]->base;
++		spin_lock_init(&crtc_ctx[i].crc_info.lock);
+ 	}
+ 
+ 	adev->dm.secure_display_ctx.crtc_ctx = crtc_ctx;
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.h
+index 4ec2510bc312..0c96f2db1352 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.h
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.h
+@@ -51,13 +51,27 @@ struct phy_id_mapping {
+ 	u8 rad[8];
+ };
+ 
++struct crc_data {
++	uint32_t crc_R;
++	uint32_t crc_G;
++	uint32_t crc_B;
++	uint32_t frame_count;
++	bool crc_ready;
++};
++
++struct crc_info {
++	struct crc_data crc[MAX_CRC_WINDOW_NUM];
++	struct completion completion;
++	spinlock_t lock;
++};
++
+ struct crc_window_param {
+ 	uint16_t x_start;
+ 	uint16_t y_start;
+ 	uint16_t x_end;
+ 	uint16_t y_end;
+ 	/* CRC window is activated or not*/
+-	bool activated;
++	bool enable;
+ 	/* Update crc window during vertical blank or not */
+ 	bool update_win;
+ 	/* skip reading/writing for few frames */
+@@ -74,13 +88,16 @@ struct secure_display_crtc_context {
+ 	struct drm_crtc *crtc;
+ 
+ 	/* Region of Interest (ROI) */
+-	struct rect rect;
++	struct crc_window roi[MAX_CRC_WINDOW_NUM];
++
++	struct crc_info crc_info;
+ };
+ 
+ struct secure_display_context {
+ 
+ 	struct secure_display_crtc_context *crtc_ctx;
+-
++    /* Whether dmub support multiple ROI setting */
++	bool support_mul_roi;
+ 	bool phy_mapping_updated;
+ 	int phy_id_mapping_cnt;
+ 	struct phy_id_mapping phy_id_mapping[MAX_CRTC];
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_debugfs.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_debugfs.c
+index 8b9fc8f8cc43..6d372835d416 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_debugfs.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_debugfs.c
+@@ -3480,8 +3480,8 @@ static int crc_win_x_start_set(void *data, u64 val)
+ 	struct amdgpu_crtc *acrtc = to_amdgpu_crtc(crtc);
+ 
+ 	spin_lock_irq(&drm_dev->event_lock);
+-	acrtc->dm_irq_params.window_param.x_start = (uint16_t) val;
+-	acrtc->dm_irq_params.window_param.update_win = false;
++	acrtc->dm_irq_params.window_param[0].x_start = (uint16_t) val;
++	acrtc->dm_irq_params.window_param[0].update_win = false;
+ 	spin_unlock_irq(&drm_dev->event_lock);
+ 
+ 	return 0;
+@@ -3497,7 +3497,7 @@ static int crc_win_x_start_get(void *data, u64 *val)
+ 	struct amdgpu_crtc *acrtc = to_amdgpu_crtc(crtc);
+ 
+ 	spin_lock_irq(&drm_dev->event_lock);
+-	*val = acrtc->dm_irq_params.window_param.x_start;
++	*val = acrtc->dm_irq_params.window_param[0].x_start;
+ 	spin_unlock_irq(&drm_dev->event_lock);
+ 
+ 	return 0;
+@@ -3517,8 +3517,8 @@ static int crc_win_y_start_set(void *data, u64 val)
+ 	struct amdgpu_crtc *acrtc = to_amdgpu_crtc(crtc);
+ 
+ 	spin_lock_irq(&drm_dev->event_lock);
+-	acrtc->dm_irq_params.window_param.y_start = (uint16_t) val;
+-	acrtc->dm_irq_params.window_param.update_win = false;
++	acrtc->dm_irq_params.window_param[0].y_start = (uint16_t) val;
++	acrtc->dm_irq_params.window_param[0].update_win = false;
+ 	spin_unlock_irq(&drm_dev->event_lock);
+ 
+ 	return 0;
+@@ -3534,7 +3534,7 @@ static int crc_win_y_start_get(void *data, u64 *val)
+ 	struct amdgpu_crtc *acrtc = to_amdgpu_crtc(crtc);
+ 
+ 	spin_lock_irq(&drm_dev->event_lock);
+-	*val = acrtc->dm_irq_params.window_param.y_start;
++	*val = acrtc->dm_irq_params.window_param[0].y_start;
+ 	spin_unlock_irq(&drm_dev->event_lock);
+ 
+ 	return 0;
+@@ -3553,8 +3553,8 @@ static int crc_win_x_end_set(void *data, u64 val)
+ 	struct amdgpu_crtc *acrtc = to_amdgpu_crtc(crtc);
+ 
+ 	spin_lock_irq(&drm_dev->event_lock);
+-	acrtc->dm_irq_params.window_param.x_end = (uint16_t) val;
+-	acrtc->dm_irq_params.window_param.update_win = false;
++	acrtc->dm_irq_params.window_param[0].x_end = (uint16_t) val;
++	acrtc->dm_irq_params.window_param[0].update_win = false;
+ 	spin_unlock_irq(&drm_dev->event_lock);
+ 
+ 	return 0;
+@@ -3570,7 +3570,7 @@ static int crc_win_x_end_get(void *data, u64 *val)
+ 	struct amdgpu_crtc *acrtc = to_amdgpu_crtc(crtc);
+ 
+ 	spin_lock_irq(&drm_dev->event_lock);
+-	*val = acrtc->dm_irq_params.window_param.x_end;
++	*val = acrtc->dm_irq_params.window_param[0].x_end;
+ 	spin_unlock_irq(&drm_dev->event_lock);
+ 
+ 	return 0;
+@@ -3589,8 +3589,8 @@ static int crc_win_y_end_set(void *data, u64 val)
+ 	struct amdgpu_crtc *acrtc = to_amdgpu_crtc(crtc);
+ 
+ 	spin_lock_irq(&drm_dev->event_lock);
+-	acrtc->dm_irq_params.window_param.y_end = (uint16_t) val;
+-	acrtc->dm_irq_params.window_param.update_win = false;
++	acrtc->dm_irq_params.window_param[0].y_end = (uint16_t) val;
++	acrtc->dm_irq_params.window_param[0].update_win = false;
+ 	spin_unlock_irq(&drm_dev->event_lock);
+ 
+ 	return 0;
+@@ -3606,7 +3606,7 @@ static int crc_win_y_end_get(void *data, u64 *val)
+ 	struct amdgpu_crtc *acrtc = to_amdgpu_crtc(crtc);
+ 
+ 	spin_lock_irq(&drm_dev->event_lock);
+-	*val = acrtc->dm_irq_params.window_param.y_end;
++	*val = acrtc->dm_irq_params.window_param[0].y_end;
+ 	spin_unlock_irq(&drm_dev->event_lock);
+ 
+ 	return 0;
+@@ -3633,9 +3633,10 @@ static int crc_win_update_set(void *data, u64 val)
+ 
+ 		spin_lock_irq(&adev_to_drm(adev)->event_lock);
+ 
+-		acrtc->dm_irq_params.window_param.activated = true;
+-		acrtc->dm_irq_params.window_param.update_win = true;
+-		acrtc->dm_irq_params.window_param.skip_frame_cnt = 0;
++		acrtc->dm_irq_params.window_param[0].enable = true;
++		acrtc->dm_irq_params.window_param[0].update_win = true;
++		acrtc->dm_irq_params.window_param[0].skip_frame_cnt = 0;
++		acrtc->dm_irq_params.crc_window_activated = true;
+ 
+ 		spin_unlock_irq(&adev_to_drm(adev)->event_lock);
+ 		mutex_unlock(&adev->dm.dc_lock);
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_irq_params.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_irq_params.h
+index 6a7ecc1e4602..6c9de834455b 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_irq_params.h
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_irq_params.h
+@@ -39,7 +39,9 @@ struct dm_irq_params {
+ #ifdef CONFIG_DEBUG_FS
+ 	enum amdgpu_dm_pipe_crc_source crc_src;
+ #ifdef CONFIG_DRM_AMD_SECURE_DISPLAY
+-	struct crc_window_param window_param;
++	struct crc_window_param window_param[MAX_CRC_WINDOW_NUM];
++	/* At least one CRC window is activated or not*/
++	bool crc_window_activated;
+ #endif
+ #endif
+ };
+-- 
+2.52.0
+
