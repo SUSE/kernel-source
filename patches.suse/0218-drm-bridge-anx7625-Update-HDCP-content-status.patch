@@ -1,0 +1,153 @@
+From a253b0b1292b4db0fec5733acceffc87bad4ffaf Mon Sep 17 00:00:00 2001
+From: Xin Ji <xji@analogixsemi.com>
+Date: Thu, 19 Dec 2024 15:03:29 +0800
+Subject: drm/bridge:anx7625: Update HDCP content status
+Git-commit: a253b0b1292b4db0fec5733acceffc87bad4ffaf
+Patch-mainline: v6.14-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+When user enabled HDCP feature, userspace will set HDCP content
+to DRM_MODE_CONTENT_PROTECTION_DESIRED. Next, anx7625 will update
+HDCP content to DRM_MODE_CONTENT_PROTECTION_ENABLED if down stream
+support HDCP feature.
+
+As anx7625 bridge IC will be power down after call .atomic_disable(),
+then all HDCP status will be lost on chip. So we should reestablish
+HDCP again in .atomic_enable(), and update hdcp content to DESIRE if
+current HDCP content is ENABLE in .atomic_disable().
+
+V4: - Change HDCP content value to DESIRED if HDCP status is ENABLE in bridge
+interface .atomic_enable().
+
+V3: - Move hdcp content value checking from bridge interface
+.atomic_check() to .atomic_enable()
+
+V2: - Add more details in commit message
+
+Signed-off-by: Xin Ji <xji@analogixsemi.com>
+Tested-by: Pin-yen Lin <treapking@chromium.org>
+Reviewed-by: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Link: https://lore.kernel.org/r/20241219070330.224996-1-xji@analogixsemi.com
+Signed-off-by: Neil Armstrong <neil.armstrong@linaro.org>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241219070330.224996-1-xji@analogixsemi.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/bridge/analogix/anx7625.c | 73 +++++++++--------------
+ 1 file changed, 29 insertions(+), 44 deletions(-)
+
+diff --git a/drivers/gpu/drm/bridge/analogix/anx7625.c b/drivers/gpu/drm/bridge/analogix/anx7625.c
+index 6238eabd2328..6c409f4f1778 100644
+--- a/drivers/gpu/drm/bridge/analogix/anx7625.c
++++ b/drivers/gpu/drm/bridge/analogix/anx7625.c
+@@ -2139,49 +2139,6 @@ static void hdcp_check_work_func(struct work_struct *work)
+ 	drm_modeset_unlock(&drm_dev->mode_config.connection_mutex);
+ }
+ 
+-static int anx7625_connector_atomic_check(struct anx7625_data *ctx,
+-					  struct drm_connector_state *state)
+-{
+-	struct device *dev = ctx->dev;
+-	int cp;
+-
+-	dev_dbg(dev, "hdcp state check\n");
+-	cp = state->content_protection;
+-
+-	if (cp == ctx->hdcp_cp)
+-		return 0;
+-
+-	if (cp == DRM_MODE_CONTENT_PROTECTION_DESIRED) {
+-		if (ctx->dp_en) {
+-			dev_dbg(dev, "enable HDCP\n");
+-			anx7625_hdcp_enable(ctx);
+-
+-			queue_delayed_work(ctx->hdcp_workqueue,
+-					   &ctx->hdcp_work,
+-					   msecs_to_jiffies(2000));
+-		}
+-	}
+-
+-	if (cp == DRM_MODE_CONTENT_PROTECTION_UNDESIRED) {
+-		if (ctx->hdcp_cp != DRM_MODE_CONTENT_PROTECTION_ENABLED) {
+-			dev_err(dev, "current CP is not ENABLED\n");
+-			return -EINVAL;
+-		}
+-		anx7625_hdcp_disable(ctx);
+-		ctx->hdcp_cp = DRM_MODE_CONTENT_PROTECTION_UNDESIRED;
+-		drm_hdcp_update_content_protection(ctx->connector,
+-						   ctx->hdcp_cp);
+-		dev_dbg(dev, "update CP to UNDESIRE\n");
+-	}
+-
+-	if (cp == DRM_MODE_CONTENT_PROTECTION_ENABLED) {
+-		dev_err(dev, "Userspace illegal set to PROTECTION ENABLE\n");
+-		return -EINVAL;
+-	}
+-
+-	return 0;
+-}
+-
+ static int anx7625_bridge_attach(struct drm_bridge *bridge,
+ 				 enum drm_bridge_attach_flags flags)
+ {
+@@ -2418,7 +2375,7 @@ static int anx7625_bridge_atomic_check(struct drm_bridge *bridge,
+ 	anx7625_bridge_mode_fixup(bridge, &crtc_state->mode,
+ 				  &crtc_state->adjusted_mode);
+ 
+-	return anx7625_connector_atomic_check(ctx, conn_state);
++	return 0;
+ }
+ 
+ static void anx7625_bridge_atomic_enable(struct drm_bridge *bridge,
+@@ -2427,6 +2384,7 @@ static void anx7625_bridge_atomic_enable(struct drm_bridge *bridge,
+ 	struct anx7625_data *ctx = bridge_to_anx7625(bridge);
+ 	struct device *dev = ctx->dev;
+ 	struct drm_connector *connector;
++	struct drm_connector_state *conn_state;
+ 
+ 	dev_dbg(dev, "drm atomic enable\n");
+ 
+@@ -2441,6 +2399,22 @@ static void anx7625_bridge_atomic_enable(struct drm_bridge *bridge,
+ 	_anx7625_hpd_polling(ctx, 5000 * 100);
+ 
+ 	anx7625_dp_start(ctx);
++
++	conn_state = drm_atomic_get_new_connector_state(state->base.state, connector);
++
++	if (WARN_ON(!conn_state))
++		return;
++
++	if (conn_state->content_protection == DRM_MODE_CONTENT_PROTECTION_DESIRED) {
++		if (ctx->dp_en) {
++			dev_dbg(dev, "enable HDCP\n");
++			anx7625_hdcp_enable(ctx);
++
++			queue_delayed_work(ctx->hdcp_workqueue,
++					   &ctx->hdcp_work,
++					   msecs_to_jiffies(2000));
++		}
++	}
+ }
+ 
+ static void anx7625_bridge_atomic_disable(struct drm_bridge *bridge,
+@@ -2451,6 +2425,17 @@ static void anx7625_bridge_atomic_disable(struct drm_bridge *bridge,
+ 
+ 	dev_dbg(dev, "drm atomic disable\n");
+ 
++	flush_workqueue(ctx->hdcp_workqueue);
++
++	if (ctx->connector &&
++	    ctx->hdcp_cp == DRM_MODE_CONTENT_PROTECTION_ENABLED) {
++		anx7625_hdcp_disable(ctx);
++		ctx->hdcp_cp = DRM_MODE_CONTENT_PROTECTION_DESIRED;
++		drm_hdcp_update_content_protection(ctx->connector,
++						   ctx->hdcp_cp);
++		dev_dbg(dev, "update CP to DESIRE\n");
++	}
++
+ 	ctx->connector = NULL;
+ 	anx7625_dp_stop(ctx);
+ 
+-- 
+2.52.0
+
