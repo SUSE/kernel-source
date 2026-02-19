@@ -1,0 +1,674 @@
+From 74ef9527bd87ead62deabe749a6d867af748d448 Mon Sep 17 00:00:00 2001
+From: Yunxiang Li <Yunxiang.Li@amd.com>
+Date: Thu, 19 Dec 2024 10:14:11 -0500
+Subject: drm/amdgpu: track bo memory stats at runtime
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 74ef9527bd87ead62deabe749a6d867af748d448
+Patch-mainline: v6.14-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Before, every time fdinfo is queried we try to lock all the BOs in the
+VM and calculate memory usage from scratch. This works okay if the
+fdinfo is rarely read and the VMs don't have a ton of BOs. If either of
+these conditions is not true, we get a massive performance hit.
+
+In this new revision, we track the BOs as they change states. This way
+when the fdinfo is queried we only need to take the status lock and copy
+out the usage stats with minimal impact to the runtime performance. With
+this new approach however, we would no longer be able to track active
+buffers.
+
+Signed-off-by: Yunxiang Li <Yunxiang.Li@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241219151411.1150-6-Yunxiang.Li@amd.com
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c |   3 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_fdinfo.c  |  18 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c     |   3 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_object.c  | 110 ++++-------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_object.h  |   4 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h     |   4 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c      | 205 +++++++++++++++-----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h      |  23 ++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm_pt.c   |   1 +
+ 9 files changed, 232 insertions(+), 139 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c
+index b14440490225..9f627caedc3f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c
+@@ -36,6 +36,7 @@
+ #include "amdgpu_gem.h"
+ #include "amdgpu_dma_buf.h"
+ #include "amdgpu_xgmi.h"
++#include "amdgpu_vm.h"
+ #include <drm/amdgpu_drm.h>
+ #include <drm/ttm/ttm_tt.h>
+ #include <linux/dma-buf.h>
+@@ -60,6 +61,8 @@ static int amdgpu_dma_buf_attach(struct dma_buf *dmabuf,
+ 	if (pci_p2pdma_distance(adev->pdev, attach->dev, false) < 0)
+ 		attach->peer2peer = false;
+ 
++	amdgpu_vm_bo_update_shared(bo);
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_fdinfo.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_fdinfo.c
+index 7717e3e4f05b..91d638098889 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_fdinfo.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_fdinfo.c
+@@ -60,7 +60,7 @@ void amdgpu_show_fdinfo(struct drm_printer *p, struct drm_file *file)
+ 	struct amdgpu_fpriv *fpriv = file->driver_priv;
+ 	struct amdgpu_vm *vm = &fpriv->vm;
+ 
+-	struct amdgpu_mem_stats stats[__AMDGPU_PL_LAST + 1] = { };
++	struct amdgpu_mem_stats stats[__AMDGPU_PL_NUM];
+ 	ktime_t usage[AMDGPU_HW_IP_NUM];
+ 	const char *pl_name[] = {
+ 		[TTM_PL_VRAM] = "vram",
+@@ -72,15 +72,8 @@ void amdgpu_show_fdinfo(struct drm_printer *p, struct drm_file *file)
+ 		[AMDGPU_PL_DOORBELL] = "doorbell",
+ 	};
+ 	unsigned int hw_ip, i;
+-	int ret;
+-
+-	ret = amdgpu_bo_reserve(vm->root.bo, false);
+-	if (ret)
+-		return;
+-
+-	amdgpu_vm_get_memory(vm, stats, ARRAY_SIZE(stats));
+-	amdgpu_bo_unreserve(vm->root.bo);
+ 
++	amdgpu_vm_get_memory(vm, stats);
+ 	amdgpu_ctx_mgr_usage(&fpriv->ctx_mgr, usage);
+ 
+ 	/*
+@@ -97,7 +90,6 @@ void amdgpu_show_fdinfo(struct drm_printer *p, struct drm_file *file)
+ 
+ 		drm_print_memory_stats(p,
+ 				       &stats[i].drm,
+-				       DRM_GEM_OBJECT_ACTIVE |
+ 				       DRM_GEM_OBJECT_RESIDENT |
+ 				       DRM_GEM_OBJECT_PURGEABLE,
+ 				       pl_name[i]);
+@@ -115,9 +107,11 @@ void amdgpu_show_fdinfo(struct drm_printer *p, struct drm_file *file)
+ 	drm_printf(p, "amd-evicted-vram:\t%llu KiB\n",
+ 		   stats[TTM_PL_VRAM].evicted/1024UL);
+ 	drm_printf(p, "amd-requested-vram:\t%llu KiB\n",
+-		   stats[TTM_PL_VRAM].requested/1024UL);
++		   (stats[TTM_PL_VRAM].drm.shared +
++		    stats[TTM_PL_VRAM].drm.private) / 1024UL);
+ 	drm_printf(p, "amd-requested-gtt:\t%llu KiB\n",
+-		   stats[TTM_PL_TT].requested/1024UL);
++		   (stats[TTM_PL_TT].drm.shared +
++		    stats[TTM_PL_TT].drm.private) / 1024UL);
+ 
+ 	for (hw_ip = 0; hw_ip < AMDGPU_HW_IP_NUM; ++hw_ip) {
+ 		if (!usage[hw_ip])
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+index bc1ad6cdf036..103513b1d23f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+@@ -42,6 +42,7 @@
+ #include "amdgpu_dma_buf.h"
+ #include "amdgpu_hmm.h"
+ #include "amdgpu_xgmi.h"
++#include "amdgpu_vm.h"
+ 
+ static vm_fault_t amdgpu_gem_fault(struct vm_fault *vmf)
+ {
+@@ -179,6 +180,7 @@ static int amdgpu_gem_object_open(struct drm_gem_object *obj,
+ 	if (r)
+ 		return r;
+ 
++	amdgpu_vm_bo_update_shared(abo);
+ 	bo_va = amdgpu_vm_bo_find(vm, abo);
+ 	if (!bo_va)
+ 		bo_va = amdgpu_vm_bo_add(adev, vm, abo);
+@@ -252,6 +254,7 @@ static void amdgpu_gem_object_close(struct drm_gem_object *obj,
+ 		goto out_unlock;
+ 
+ 	amdgpu_vm_bo_del(adev, bo_va);
++	amdgpu_vm_bo_update_shared(bo);
+ 	if (!amdgpu_vm_ready(vm))
+ 		goto out_unlock;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+index a9aaf8f7cb4f..fc94b8b9b86d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+@@ -1157,7 +1157,7 @@ void amdgpu_bo_move_notify(struct ttm_buffer_object *bo,
+ 		return;
+ 
+ 	abo = ttm_to_amdgpu_bo(bo);
+-	amdgpu_vm_bo_invalidate(abo, evict);
++	amdgpu_vm_bo_move(abo, new_mem, evict);
+ 
+ 	amdgpu_bo_kunmap(abo);
+ 
+@@ -1170,75 +1170,6 @@ void amdgpu_bo_move_notify(struct ttm_buffer_object *bo,
+ 			     old_mem ? old_mem->mem_type : -1);
+ }
+ 
+-void amdgpu_bo_get_memory(struct amdgpu_bo *bo,
+-			  struct amdgpu_mem_stats *stats,
+-			  unsigned int sz)
+-{
+-	const unsigned int domain_to_pl[] = {
+-		[ilog2(AMDGPU_GEM_DOMAIN_CPU)]	    = TTM_PL_SYSTEM,
+-		[ilog2(AMDGPU_GEM_DOMAIN_GTT)]	    = TTM_PL_TT,
+-		[ilog2(AMDGPU_GEM_DOMAIN_VRAM)]	    = TTM_PL_VRAM,
+-		[ilog2(AMDGPU_GEM_DOMAIN_GDS)]	    = AMDGPU_PL_GDS,
+-		[ilog2(AMDGPU_GEM_DOMAIN_GWS)]	    = AMDGPU_PL_GWS,
+-		[ilog2(AMDGPU_GEM_DOMAIN_OA)]	    = AMDGPU_PL_OA,
+-		[ilog2(AMDGPU_GEM_DOMAIN_DOORBELL)] = AMDGPU_PL_DOORBELL,
+-	};
+-	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
+-	struct ttm_resource *res = bo->tbo.resource;
+-	struct drm_gem_object *obj = &bo->tbo.base;
+-	uint64_t size = amdgpu_bo_size(bo);
+-	unsigned int type;
+-
+-	if (!res) {
+-		/*
+-		 * If no backing store use one of the preferred domain for basic
+-		 * stats. We take the MSB since that should give a reasonable
+-		 * view.
+-		 */
+-		BUILD_BUG_ON(TTM_PL_VRAM < TTM_PL_TT ||
+-			     TTM_PL_VRAM < TTM_PL_SYSTEM);
+-		type = fls(bo->preferred_domains & AMDGPU_GEM_DOMAIN_MASK);
+-		if (!type)
+-			return;
+-		type--;
+-		if (drm_WARN_ON_ONCE(&adev->ddev,
+-				     type >= ARRAY_SIZE(domain_to_pl)))
+-			return;
+-		type = domain_to_pl[type];
+-	} else {
+-		type = res->mem_type;
+-	}
+-
+-	if (drm_WARN_ON_ONCE(&adev->ddev, type >= sz))
+-		return;
+-
+-	/* DRM stats common fields: */
+-
+-	if (drm_gem_object_is_shared_for_memory_stats(obj))
+-		stats[type].drm.shared += size;
+-	else
+-		stats[type].drm.private += size;
+-
+-	if (res) {
+-		stats[type].drm.resident += size;
+-
+-		if (!dma_resv_test_signaled(obj->resv, DMA_RESV_USAGE_BOOKKEEP))
+-			stats[type].drm.active += size;
+-		else if (bo->flags & AMDGPU_GEM_CREATE_DISCARDABLE)
+-			stats[type].drm.purgeable += size;
+-	}
+-
+-	/* amdgpu specific stats: */
+-
+-	if (bo->preferred_domains & AMDGPU_GEM_DOMAIN_VRAM) {
+-		stats[TTM_PL_VRAM].requested += size;
+-		if (type != TTM_PL_VRAM)
+-			stats[TTM_PL_VRAM].evicted += size;
+-	} else if (bo->preferred_domains & AMDGPU_GEM_DOMAIN_GTT) {
+-		stats[TTM_PL_TT].requested += size;
+-	}
+-}
+-
+ /**
+  * amdgpu_bo_release_notify - notification about a BO being released
+  * @bo: pointer to a buffer object
+@@ -1453,6 +1384,45 @@ u64 amdgpu_bo_gpu_offset_no_check(struct amdgpu_bo *bo)
+ 	return amdgpu_gmc_sign_extend(offset);
+ }
+ 
++/**
++ * amdgpu_bo_mem_stats_placement - bo placement for memory accounting
++ * @bo:	the buffer object we should look at
++ *
++ * BO can have multiple preferred placements, to avoid double counting we want
++ * to file it under a single placement for memory stats.
++ * Luckily, if we take the highest set bit in preferred_domains the result is
++ * quite sensible.
++ *
++ * Returns:
++ * Which of the placements should the BO be accounted under.
++ */
++uint32_t amdgpu_bo_mem_stats_placement(struct amdgpu_bo *bo)
++{
++	uint32_t domain = bo->preferred_domains & AMDGPU_GEM_DOMAIN_MASK;
++
++	if (!domain)
++		return TTM_PL_SYSTEM;
++
++	switch (rounddown_pow_of_two(domain)) {
++	case AMDGPU_GEM_DOMAIN_CPU:
++		return TTM_PL_SYSTEM;
++	case AMDGPU_GEM_DOMAIN_GTT:
++		return TTM_PL_TT;
++	case AMDGPU_GEM_DOMAIN_VRAM:
++		return TTM_PL_VRAM;
++	case AMDGPU_GEM_DOMAIN_GDS:
++		return AMDGPU_PL_GDS;
++	case AMDGPU_GEM_DOMAIN_GWS:
++		return AMDGPU_PL_GWS;
++	case AMDGPU_GEM_DOMAIN_OA:
++		return AMDGPU_PL_OA;
++	case AMDGPU_GEM_DOMAIN_DOORBELL:
++		return AMDGPU_PL_DOORBELL;
++	default:
++		return TTM_PL_SYSTEM;
++	}
++}
++
+ /**
+  * amdgpu_bo_get_preferred_domain - get preferred domain
+  * @adev: amdgpu device object
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
+index be6769852ece..23d2c6ab9d62 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
+@@ -300,9 +300,7 @@ int amdgpu_bo_sync_wait_resv(struct amdgpu_device *adev, struct dma_resv *resv,
+ int amdgpu_bo_sync_wait(struct amdgpu_bo *bo, void *owner, bool intr);
+ u64 amdgpu_bo_gpu_offset(struct amdgpu_bo *bo);
+ u64 amdgpu_bo_gpu_offset_no_check(struct amdgpu_bo *bo);
+-void amdgpu_bo_get_memory(struct amdgpu_bo *bo,
+-			  struct amdgpu_mem_stats *stats,
+-			  unsigned int size);
++uint32_t amdgpu_bo_mem_stats_placement(struct amdgpu_bo *bo);
+ uint32_t amdgpu_bo_get_preferred_domain(struct amdgpu_device *adev,
+ 					    uint32_t domain);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
+index 2852a6064c9a..461fb8090ae0 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
+@@ -26,15 +26,15 @@
+ 
+ #include <linux/dma-direction.h>
+ #include <drm/gpu_scheduler.h>
++#include <drm/ttm/ttm_placement.h>
+ #include "amdgpu_vram_mgr.h"
+-#include "amdgpu.h"
+ 
+ #define AMDGPU_PL_GDS		(TTM_PL_PRIV + 0)
+ #define AMDGPU_PL_GWS		(TTM_PL_PRIV + 1)
+ #define AMDGPU_PL_OA		(TTM_PL_PRIV + 2)
+ #define AMDGPU_PL_PREEMPT	(TTM_PL_PRIV + 3)
+ #define AMDGPU_PL_DOORBELL	(TTM_PL_PRIV + 4)
+-#define __AMDGPU_PL_LAST	(TTM_PL_PRIV + 4)
++#define __AMDGPU_PL_NUM	(TTM_PL_PRIV + 5)
+ 
+ #define AMDGPU_GTT_MAX_TRANSFER_SIZE	512
+ #define AMDGPU_GTT_NUM_TRANSFER_WINDOWS	2
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index 7def92dd091d..5c07777d3239 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -36,6 +36,7 @@
+ #include <drm/ttm/ttm_tt.h>
+ #include <drm/drm_exec.h>
+ #include "amdgpu.h"
++#include "amdgpu_vm.h"
+ #include "amdgpu_trace.h"
+ #include "amdgpu_amdkfd.h"
+ #include "amdgpu_gmc.h"
+@@ -310,6 +311,111 @@ static void amdgpu_vm_bo_reset_state_machine(struct amdgpu_vm *vm)
+ 	spin_unlock(&vm->status_lock);
+ }
+ 
++/**
++ * amdgpu_vm_update_shared - helper to update shared memory stat
++ * @base: base structure for tracking BO usage in a VM
++ *
++ * Takes the vm status_lock and updates the shared memory stat. If the basic
++ * stat changed (e.g. buffer was moved) amdgpu_vm_update_stats need to be called
++ * as well.
++ */
++static void amdgpu_vm_update_shared(struct amdgpu_vm_bo_base *base)
++{
++	struct amdgpu_vm *vm = base->vm;
++	struct amdgpu_bo *bo = base->bo;
++	uint64_t size = amdgpu_bo_size(bo);
++	uint32_t bo_memtype = amdgpu_bo_mem_stats_placement(bo);
++	bool shared;
++
++	spin_lock(&vm->status_lock);
++	shared = drm_gem_object_is_shared_for_memory_stats(&bo->tbo.base);
++	if (base->shared != shared) {
++		base->shared = shared;
++		if (shared) {
++			vm->stats[bo_memtype].drm.shared += size;
++			vm->stats[bo_memtype].drm.private -= size;
++		} else {
++			vm->stats[bo_memtype].drm.shared -= size;
++			vm->stats[bo_memtype].drm.private += size;
++		}
++	}
++	spin_unlock(&vm->status_lock);
++}
++
++/**
++ * amdgpu_vm_bo_update_shared - callback when bo gets shared/unshared
++ * @bo: amdgpu buffer object
++ *
++ * Update the per VM stats for all the vm if needed from private to shared or
++ * vice versa.
++ */
++void amdgpu_vm_bo_update_shared(struct amdgpu_bo *bo)
++{
++	struct amdgpu_vm_bo_base *base;
++
++	for (base = bo->vm_bo; base; base = base->next)
++		amdgpu_vm_update_shared(base);
++}
++
++/**
++ * amdgpu_vm_update_stats_locked - helper to update normal memory stat
++ * @base: base structure for tracking BO usage in a VM
++ * @res:  the ttm_resource to use for the purpose of accounting, may or may not
++ *        be bo->tbo.resource
++ * @sign: if we should add (+1) or subtract (-1) from the stat
++ *
++ * Caller need to have the vm status_lock held. Useful for when multiple update
++ * need to happen at the same time.
++ */
++static void amdgpu_vm_update_stats_locked(struct amdgpu_vm_bo_base *base,
++			    struct ttm_resource *res, int sign)
++{
++	struct amdgpu_vm *vm = base->vm;
++	struct amdgpu_bo *bo = base->bo;
++	int64_t size = sign * amdgpu_bo_size(bo);
++	uint32_t bo_memtype = amdgpu_bo_mem_stats_placement(bo);
++
++	/* For drm-total- and drm-shared-, BO are accounted by their preferred
++	 * placement, see also amdgpu_bo_mem_stats_placement.
++	 */
++	if (base->shared)
++		vm->stats[bo_memtype].drm.shared += size;
++	else
++		vm->stats[bo_memtype].drm.private += size;
++
++	if (res && res->mem_type < __AMDGPU_PL_NUM) {
++		uint32_t res_memtype = res->mem_type;
++
++		vm->stats[res_memtype].drm.resident += size;
++		/* BO only count as purgeable if it is resident,
++		 * since otherwise there's nothing to purge.
++		 */
++		if (bo->flags & AMDGPU_GEM_CREATE_DISCARDABLE)
++			vm->stats[res_memtype].drm.purgeable += size;
++		if (!(bo->preferred_domains & amdgpu_mem_type_to_domain(res_memtype)))
++			vm->stats[bo_memtype].evicted += size;
++	}
++}
++
++/**
++ * amdgpu_vm_update_stats - helper to update normal memory stat
++ * @base: base structure for tracking BO usage in a VM
++ * @res:  the ttm_resource to use for the purpose of accounting, may or may not
++ *        be bo->tbo.resource
++ * @sign: if we should add (+1) or subtract (-1) from the stat
++ *
++ * Updates the basic memory stat when bo is added/deleted/moved.
++ */
++void amdgpu_vm_update_stats(struct amdgpu_vm_bo_base *base,
++			    struct ttm_resource *res, int sign)
++{
++	struct amdgpu_vm *vm = base->vm;
++
++	spin_lock(&vm->status_lock);
++	amdgpu_vm_update_stats_locked(base, res, sign);
++	spin_unlock(&vm->status_lock);
++}
++
+ /**
+  * amdgpu_vm_bo_base_init - Adds bo to the list of bos associated with the vm
+  *
+@@ -333,6 +439,11 @@ void amdgpu_vm_bo_base_init(struct amdgpu_vm_bo_base *base,
+ 	base->next = bo->vm_bo;
+ 	bo->vm_bo = base;
+ 
++	spin_lock(&vm->status_lock);
++	base->shared = drm_gem_object_is_shared_for_memory_stats(&bo->tbo.base);
++	amdgpu_vm_update_stats_locked(base, bo->tbo.resource, +1);
++	spin_unlock(&vm->status_lock);
++
+ 	if (!amdgpu_vm_is_bo_always_valid(vm, bo))
+ 		return;
+ 
+@@ -1083,53 +1194,11 @@ int amdgpu_vm_update_range(struct amdgpu_device *adev, struct amdgpu_vm *vm,
+ 	return r;
+ }
+ 
+-static void amdgpu_vm_bo_get_memory(struct amdgpu_bo_va *bo_va,
+-				    struct amdgpu_mem_stats *stats,
+-				    unsigned int size)
+-{
+-	struct amdgpu_vm *vm = bo_va->base.vm;
+-	struct amdgpu_bo *bo = bo_va->base.bo;
+-
+-	if (!bo)
+-		return;
+-
+-	/*
+-	 * For now ignore BOs which are currently locked and potentially
+-	 * changing their location.
+-	 */
+-	if (!amdgpu_vm_is_bo_always_valid(vm, bo) &&
+-	    !dma_resv_trylock(bo->tbo.base.resv))
+-		return;
+-
+-	amdgpu_bo_get_memory(bo, stats, size);
+-	if (!amdgpu_vm_is_bo_always_valid(vm, bo))
+-		dma_resv_unlock(bo->tbo.base.resv);
+-}
+-
+ void amdgpu_vm_get_memory(struct amdgpu_vm *vm,
+-			  struct amdgpu_mem_stats *stats,
+-			  unsigned int size)
++			  struct amdgpu_mem_stats stats[__AMDGPU_PL_NUM])
+ {
+-	struct amdgpu_bo_va *bo_va, *tmp;
+-
+ 	spin_lock(&vm->status_lock);
+-	list_for_each_entry_safe(bo_va, tmp, &vm->idle, base.vm_status)
+-		amdgpu_vm_bo_get_memory(bo_va, stats, size);
+-
+-	list_for_each_entry_safe(bo_va, tmp, &vm->evicted, base.vm_status)
+-		amdgpu_vm_bo_get_memory(bo_va, stats, size);
+-
+-	list_for_each_entry_safe(bo_va, tmp, &vm->relocated, base.vm_status)
+-		amdgpu_vm_bo_get_memory(bo_va, stats, size);
+-
+-	list_for_each_entry_safe(bo_va, tmp, &vm->moved, base.vm_status)
+-		amdgpu_vm_bo_get_memory(bo_va, stats, size);
+-
+-	list_for_each_entry_safe(bo_va, tmp, &vm->invalidated, base.vm_status)
+-		amdgpu_vm_bo_get_memory(bo_va, stats, size);
+-
+-	list_for_each_entry_safe(bo_va, tmp, &vm->done, base.vm_status)
+-		amdgpu_vm_bo_get_memory(bo_va, stats, size);
++	memcpy(stats, vm->stats, sizeof(*stats) * __AMDGPU_PL_NUM);
+ 	spin_unlock(&vm->status_lock);
+ }
+ 
+@@ -2075,6 +2144,7 @@ void amdgpu_vm_bo_del(struct amdgpu_device *adev,
+ 			if (*base != &bo_va->base)
+ 				continue;
+ 
++			amdgpu_vm_update_stats(*base, bo->tbo.resource, -1);
+ 			*base = bo_va->base.next;
+ 			break;
+ 		}
+@@ -2173,6 +2243,32 @@ void amdgpu_vm_bo_invalidate(struct amdgpu_bo *bo, bool evicted)
+ 	}
+ }
+ 
++/**
++ * amdgpu_vm_bo_move - handle BO move
++ *
++ * @bo: amdgpu buffer object
++ * @new_mem: the new placement of the BO move
++ * @evicted: is the BO evicted
++ *
++ * Update the memory stats for the new placement and mark @bo as invalid.
++ */
++void amdgpu_vm_bo_move(struct amdgpu_bo *bo, struct ttm_resource *new_mem,
++		       bool evicted)
++{
++	struct amdgpu_vm_bo_base *bo_base;
++
++	for (bo_base = bo->vm_bo; bo_base; bo_base = bo_base->next) {
++		struct amdgpu_vm *vm = bo_base->vm;
++
++		spin_lock(&vm->status_lock);
++		amdgpu_vm_update_stats_locked(bo_base, bo->tbo.resource, -1);
++		amdgpu_vm_update_stats_locked(bo_base, new_mem, +1);
++		spin_unlock(&vm->status_lock);
++	}
++
++	amdgpu_vm_bo_invalidate(bo, evicted);
++}
++
+ /**
+  * amdgpu_vm_get_block_size - calculate VM page table size as power of two
+  *
+@@ -2592,6 +2688,16 @@ void amdgpu_vm_release_compute(struct amdgpu_device *adev, struct amdgpu_vm *vm)
+ 	vm->is_compute_context = false;
+ }
+ 
++static int amdgpu_vm_stats_is_zero(struct amdgpu_vm *vm)
++{
++	for (int i = 0; i < __AMDGPU_PL_NUM; ++i) {
++		if (!(drm_memory_stats_is_zero(&vm->stats[i].drm) &&
++		      vm->stats[i].evicted == 0))
++			return false;
++	}
++	return true;
++}
++
+ /**
+  * amdgpu_vm_fini - tear down a vm instance
+  *
+@@ -2615,7 +2721,6 @@ void amdgpu_vm_fini(struct amdgpu_device *adev, struct amdgpu_vm *vm)
+ 
+ 	root = amdgpu_bo_ref(vm->root.bo);
+ 	amdgpu_bo_reserve(root, true);
+-	amdgpu_vm_put_task_info(vm->task_info);
+ 	amdgpu_vm_set_pasid(adev, vm, 0);
+ 	dma_fence_wait(vm->last_unlocked, false);
+ 	dma_fence_put(vm->last_unlocked);
+@@ -2664,6 +2769,16 @@ void amdgpu_vm_fini(struct amdgpu_device *adev, struct amdgpu_vm *vm)
+ 	}
+ 
+ 	ttm_lru_bulk_move_fini(&adev->mman.bdev, &vm->lru_bulk_move);
++
++	if (!amdgpu_vm_stats_is_zero(vm)) {
++		struct amdgpu_task_info *ti = vm->task_info;
++
++		dev_warn(adev->dev,
++			 "VM memory stats for proc %s(%d) task %s(%d) is non-zero when fini\n",
++			 ti->process_name, ti->pid, ti->task_name, ti->tgid);
++	}
++
++	amdgpu_vm_put_task_info(vm->task_info);
+ }
+ 
+ /**
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
+index 6a1b344e15e1..a3e128e373bc 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
+@@ -35,6 +35,7 @@
+ #include "amdgpu_sync.h"
+ #include "amdgpu_ring.h"
+ #include "amdgpu_ids.h"
++#include "amdgpu_ttm.h"
+ 
+ struct drm_exec;
+ 
+@@ -202,9 +203,13 @@ struct amdgpu_vm_bo_base {
+ 	/* protected by bo being reserved */
+ 	struct amdgpu_vm_bo_base	*next;
+ 
+-	/* protected by spinlock */
++	/* protected by vm status_lock */
+ 	struct list_head		vm_status;
+ 
++	/* if the bo is counted as shared in mem stats
++	 * protected by vm status_lock */
++	bool				shared;
++
+ 	/* protected by the BO being reserved */
+ 	bool				moved;
+ };
+@@ -324,10 +329,7 @@ struct amdgpu_vm_fault_info {
+ struct amdgpu_mem_stats {
+ 	struct drm_memory_stats drm;
+ 
+-	/* buffers that requested this placement */
+-	uint64_t requested;
+-	/* buffers that requested this placement
+-	 * but are currently evicted */
++	/* buffers that requested this placement but are currently evicted */
+ 	uint64_t evicted;
+ };
+ 
+@@ -345,6 +347,9 @@ struct amdgpu_vm {
+ 	/* Lock to protect vm_bo add/del/move on all lists of vm */
+ 	spinlock_t		status_lock;
+ 
++	/* Memory statistics for this vm, protected by status_lock */
++	struct amdgpu_mem_stats stats[__AMDGPU_PL_NUM];
++
+ 	/* Per-VM and PT BOs who needs a validation */
+ 	struct list_head	evicted;
+ 
+@@ -525,6 +530,11 @@ int amdgpu_vm_bo_update(struct amdgpu_device *adev,
+ 			bool clear);
+ bool amdgpu_vm_evictable(struct amdgpu_bo *bo);
+ void amdgpu_vm_bo_invalidate(struct amdgpu_bo *bo, bool evicted);
++void amdgpu_vm_update_stats(struct amdgpu_vm_bo_base *base,
++			    struct ttm_resource *new_res, int sign);
++void amdgpu_vm_bo_update_shared(struct amdgpu_bo *bo);
++void amdgpu_vm_bo_move(struct amdgpu_bo *bo, struct ttm_resource *new_mem,
++		       bool evicted);
+ uint64_t amdgpu_vm_map_gart(const dma_addr_t *pages_addr, uint64_t addr);
+ struct amdgpu_bo_va *amdgpu_vm_bo_find(struct amdgpu_vm *vm,
+ 				       struct amdgpu_bo *bo);
+@@ -575,8 +585,7 @@ void amdgpu_vm_set_task_info(struct amdgpu_vm *vm);
+ void amdgpu_vm_move_to_lru_tail(struct amdgpu_device *adev,
+ 				struct amdgpu_vm *vm);
+ void amdgpu_vm_get_memory(struct amdgpu_vm *vm,
+-			  struct amdgpu_mem_stats *stats,
+-			  unsigned int size);
++			  struct amdgpu_mem_stats stats[__AMDGPU_PL_NUM]);
+ 
+ int amdgpu_vm_pt_clear(struct amdgpu_device *adev, struct amdgpu_vm *vm,
+ 		       struct amdgpu_bo_vm *vmbo, bool immediate);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm_pt.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm_pt.c
+index f78a0434a48f..b0bf21682115 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm_pt.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm_pt.c
+@@ -537,6 +537,7 @@ static void amdgpu_vm_pt_free(struct amdgpu_vm_bo_base *entry)
+ 	if (!entry->bo)
+ 		return;
+ 
++	amdgpu_vm_update_stats(entry, entry->bo->tbo.resource, -1);
+ 	entry->bo->vm_bo = NULL;
+ 	ttm_bo_set_bulk_move(&entry->bo->tbo, NULL);
+ 
+-- 
+2.52.0
+
