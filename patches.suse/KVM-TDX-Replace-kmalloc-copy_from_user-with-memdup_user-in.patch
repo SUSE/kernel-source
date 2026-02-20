@@ -1,0 +1,81 @@
+From: Thorsten Blum <thorsten.blum@linux.dev>
+Date: Tue, 16 Sep 2025 23:31:29 +0200
+Subject: KVM: TDX: Replace kmalloc + copy_from_user with memdup_user in
+ tdx_td_init()
+Git-commit: 0bd0a4a1428baaf4447e95f0832492d9e3d64961
+Patch-mainline: v6.19-rc1
+References: git-fixes
+
+Use get_user() to retrieve the number of entries instead of allocating
+memory for 'init_vm' with the maximum size, copying 'cmd->data' to it,
+only to then read the actual entry count 'cpuid.nent' from the copy.
+
+Use memdup_user() to allocate just enough memory to fit all entries and
+to copy 'cmd->data' from userspace. Use struct_size() instead of
+manually calculating the number of bytes to allocate and copy.
+
+No functional changes intended.
+
+Signed-off-by: Thorsten Blum <thorsten.blum@linux.dev>
+Link: https://lore.kernel.org/r/20250916213129.2535597-2-thorsten.blum@linux.dev
+[sean: s/user_init_vm/user_data]
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Acked-by: Nikolay Borisov <nik.borisov@suse.com>
+---
+ arch/x86/kvm/vmx/tdx.c | 30 ++++++++++--------------------
+ 1 file changed, 10 insertions(+), 20 deletions(-)
+
+diff --git a/arch/x86/kvm/vmx/tdx.c b/arch/x86/kvm/vmx/tdx.c
+index 0a49c863c811..326db9b9c567 100644
+--- a/arch/x86/kvm/vmx/tdx.c
++++ b/arch/x86/kvm/vmx/tdx.c
+@@ -2749,9 +2749,11 @@ static int tdx_read_cpuid(struct kvm_vcpu *vcpu, u32 leaf, u32 sub_leaf,
+ 
+ static int tdx_td_init(struct kvm *kvm, struct kvm_tdx_cmd *cmd)
+ {
++	struct kvm_tdx_init_vm __user *user_data = u64_to_user_ptr(cmd->data);
+ 	struct kvm_tdx *kvm_tdx = to_kvm_tdx(kvm);
+ 	struct kvm_tdx_init_vm *init_vm;
+ 	struct td_params *td_params = NULL;
++	u32 nr_user_entries;
+ 	int ret;
+ 
+ 	BUILD_BUG_ON(sizeof(*init_vm) != 256 + sizeof_field(struct kvm_tdx_init_vm, cpuid));
+@@ -2763,28 +2765,16 @@ static int tdx_td_init(struct kvm *kvm, struct kvm_tdx_cmd *cmd)
+ 	if (cmd->flags)
+ 		return -EINVAL;
+ 
+-	init_vm = kmalloc(sizeof(*init_vm) +
+-			  sizeof(init_vm->cpuid.entries[0]) * KVM_MAX_CPUID_ENTRIES,
+-			  GFP_KERNEL);
+-	if (!init_vm)
+-		return -ENOMEM;
++	if (get_user(nr_user_entries, &user_data->cpuid.nent))
++		return -EFAULT;
+ 
+-	if (copy_from_user(init_vm, u64_to_user_ptr(cmd->data), sizeof(*init_vm))) {
+-		ret = -EFAULT;
+-		goto out;
+-	}
++	if (nr_user_entries > KVM_MAX_CPUID_ENTRIES)
++		return -E2BIG;
+ 
+-	if (init_vm->cpuid.nent > KVM_MAX_CPUID_ENTRIES) {
+-		ret = -E2BIG;
+-		goto out;
+-	}
+-
+-	if (copy_from_user(init_vm->cpuid.entries,
+-			   u64_to_user_ptr(cmd->data) + sizeof(*init_vm),
+-			   flex_array_size(init_vm, cpuid.entries, init_vm->cpuid.nent))) {
+-		ret = -EFAULT;
+-		goto out;
+-	}
++	init_vm = memdup_user(user_data,
++			      struct_size(user_data, cpuid.entries, nr_user_entries));
++	if (IS_ERR(init_vm))
++		return PTR_ERR(init_vm);
+ 
+ 	if (memchr_inv(init_vm->reserved, 0, sizeof(init_vm->reserved))) {
+ 		ret = -EINVAL;
+

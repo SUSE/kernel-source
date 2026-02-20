@@ -1,0 +1,118 @@
+From: Yan Zhao <yan.y.zhao@intel.com>
+Date: Thu, 30 Oct 2025 13:09:51 -0700
+Subject: KVM: TDX: Fix list_add corruption during vcpu_load()
+Git-commit: 1e3a825c9ec90f91ef61dc9cbda610d9ec887db8
+Patch-mainline: v6.19-rc1
+References: git-fixes
+
+During vCPU creation, a vCPU may be destroyed immediately after
+kvm_arch_vcpu_create() (e.g., due to vCPU id confiliction). However, the
+vcpu_load() inside kvm_arch_vcpu_create() may have associate the vCPU to
+pCPU via "list_add(&tdx->cpu_list, &per_cpu(associated_tdvcpus, cpu))"
+before invoking tdx_vcpu_free().
+
+Though there's no need to invoke tdh_vp_flush() on the vCPU, failing to
+dissociate the vCPU from pCPU (i.e., "list_del(&to_tdx(vcpu)->cpu_list)")
+will cause list corruption of the per-pCPU list associated_tdvcpus.
+
+Then, a later list_add() during vcpu_load() would detect list corruption
+and print calltrace as shown below.
+
+Dissociate a vCPU from its associated pCPU in tdx_vcpu_free() for the vCPUs
+destroyed immediately after creation which must be in
+VCPU_TD_STATE_UNINITIALIZED state.
+
+kernel BUG at lib/list_debug.c:29!
+Oops: invalid opcode: 0000 [#2] SMP NOPTI
+RIP: 0010:__list_add_valid_or_report+0x82/0xd0
+
+Call Trace:
+ <TASK>
+ tdx_vcpu_load+0xa8/0x120
+ vt_vcpu_load+0x25/0x30
+ kvm_arch_vcpu_load+0x81/0x300
+ vcpu_load+0x55/0x90
+ kvm_arch_vcpu_create+0x24f/0x330
+ kvm_vm_ioctl_create_vcpu+0x1b1/0x53
+ kvm_vm_ioctl+0xc2/0xa60
+  __x64_sys_ioctl+0x9a/0xf0
+ x64_sys_call+0x10ee/0x20d0
+ do_syscall_64+0xc3/0x470
+ entry_SYSCALL_64_after_hwframe+0x77/0x7f
+
+Fixes: d789fa6efac9 ("KVM: TDX: Handle vCPU dissociation")
+Signed-off-by: Yan Zhao <yan.y.zhao@intel.com>
+Reviewed-by: Kai Huang <kai.huang@intel.com>
+Reviewed-by: Yan Zhao <yan.y.zhao@intel.com>
+Tested-by: Yan Zhao <yan.y.zhao@intel.com>
+Tested-by: Kai Huang <kai.huang@intel.com>
+Link: https://patch.msgid.link/20251030200951.3402865-29-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Acked-by: Nikolay Borisov <nik.borisov@suse.com>
+---
+ arch/x86/kvm/vmx/tdx.c | 43 ++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 38 insertions(+), 5 deletions(-)
+
+diff --git a/arch/x86/kvm/vmx/tdx.c b/arch/x86/kvm/vmx/tdx.c
+index 977cc41c96b4..865d18b34988 100644
+--- a/arch/x86/kvm/vmx/tdx.c
++++ b/arch/x86/kvm/vmx/tdx.c
+@@ -843,19 +843,52 @@ void tdx_vcpu_put(struct kvm_vcpu *vcpu)
+ 	tdx_prepare_switch_to_host(vcpu);
+ }
+ 
++/*
++ * Life cycles for a TD and a vCPU:
++ * 1. KVM_CREATE_VM ioctl.
++ *    TD state is TD_STATE_UNINITIALIZED.
++ *    hkid is not assigned at this stage.
++ * 2. KVM_TDX_INIT_VM ioctl.
++ *    TD transitions to TD_STATE_INITIALIZED.
++ *    hkid is assigned after this stage.
++ * 3. KVM_CREATE_VCPU ioctl. (only when TD is TD_STATE_INITIALIZED).
++ *    3.1 tdx_vcpu_create() transitions vCPU state to VCPU_TD_STATE_UNINITIALIZED.
++ *    3.2 vcpu_load() and vcpu_put() in kvm_arch_vcpu_create().
++ *    3.3 (conditional) if any error encountered after kvm_arch_vcpu_create()
++ *        kvm_arch_vcpu_destroy() --> tdx_vcpu_free().
++ * 4. KVM_TDX_INIT_VCPU ioctl.
++ *    tdx_vcpu_init() transitions vCPU state to VCPU_TD_STATE_INITIALIZED.
++ *    vCPU control structures are allocated at this stage.
++ * 5. kvm_destroy_vm().
++ *    5.1 tdx_mmu_release_hkid(): (1) tdh_vp_flush(), disassociates all vCPUs.
++ *                                (2) puts hkid to !assigned state.
++ *    5.2 kvm_destroy_vcpus() --> tdx_vcpu_free():
++ *        transitions vCPU to VCPU_TD_STATE_UNINITIALIZED state.
++ *    5.3 tdx_vm_destroy()
++ *        transitions TD to TD_STATE_UNINITIALIZED state.
++ *
++ * tdx_vcpu_free() can be invoked only at 3.3 or 5.2.
++ * - If at 3.3, hkid is still assigned, but the vCPU must be in
++ *   VCPU_TD_STATE_UNINITIALIZED state.
++ * - if at 5.2, hkid must be !assigned and all vCPUs must be in
++ *   VCPU_TD_STATE_INITIALIZED state and have been dissociated.
++ */
+ void tdx_vcpu_free(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_tdx *kvm_tdx = to_kvm_tdx(vcpu->kvm);
+ 	struct vcpu_tdx *tdx = to_tdx(vcpu);
+ 	int i;
+ 
++	if (vcpu->cpu != -1) {
++		KVM_BUG_ON(tdx->state == VCPU_TD_STATE_INITIALIZED, vcpu->kvm);
++		tdx_flush_vp_on_cpu(vcpu);
++		return;
++	}
++
+ 	/*
+ 	 * It is not possible to reclaim pages while hkid is assigned. It might
+-	 * be assigned if:
+-	 * 1. the TD VM is being destroyed but freeing hkid failed, in which
+-	 * case the pages are leaked
+-	 * 2. TD VCPU creation failed and this on the error path, in which case
+-	 * there is nothing to do anyway
++	 * be assigned if the TD VM is being destroyed but freeing hkid failed,
++	 * in which case the pages are leaked.
+ 	 */
+ 	if (is_hkid_assigned(kvm_tdx))
+ 		return;
+
