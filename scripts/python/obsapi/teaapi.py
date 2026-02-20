@@ -191,6 +191,12 @@ class TeaAPI(api.API):
             json['old_ref_name'] = ref
         return self.check_post(self.repo_path(org, repo) + '/branches', json=json)
 
+    def update_branch(self, org, repo, branch, commit, old_commit=None, force=False):
+        json = { 'new_commit_id': commit }
+        if force: json['force'] = True
+        if old_commit: json['old_commit_id'] = old_commit
+        return self.check_put(self.repo_path(org, repo) + '/branches/' + branch, json=json)
+
     def update_gitattr(self, org, repo, branch):
         self.update_file_lines(org, repo, branch, '.gitattributes', [
                 '*.tar.bz2 filter=lfs diff=lfs merge=lfs -text',
