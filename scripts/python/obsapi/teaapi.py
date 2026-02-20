@@ -169,6 +169,16 @@ class TeaAPI(api.API):
             else:
                 raise api.APIError("Branch reset requested but no reference is provided.")
             if current_commit != ref_commit:
+                sys.stderr.write('Resetting branch %s (commit mismatch %s %s)\n' %
+                                 (branch, current_commit, ref_commit))
+                try:
+                    self.update_branch(org, repo, branch, ref_commit, old_commit=current_commit, force=1)
+                except api.APIError as e:
+                    if e.status == 405:
+                        sys.stderr.write('%s\n' % (e,))
+                        None # UpdateBranch not supported
+                    else:
+                        raise
                 sys.stderr.write('Deleting branch %s (commit mismatch %s %s)\n' %
                                  (branch, current_commit, ref_commit))
             else:
