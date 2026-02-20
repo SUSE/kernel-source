@@ -38,7 +38,17 @@ def _get_encoding(r):  # another case for walrus
     return ct
 setattr(http.client.HTTPResponse, 'encoding', property(_get_encoding))
 
-setattr(http.client.HTTPResponse, 'status_message_pretty', property(lambda r: '%s %s %i %s' % (r.url, r.method, r.status, r.reason)))
+def _content_pretty(r):
+    try:
+        return r.json()
+    except:
+        try:
+            return r.text
+        except:
+            return r.content
+setattr(http.client.HTTPResponse, 'content_pretty', property(_content_pretty))
+
+setattr(http.client.HTTPResponse, 'status_message_pretty', property(lambda r: '%s %s %i %s\n%s' % (r.url, r.method, r.status, r.reason, r.content_pretty) if r.content_pretty else '%s %s %i %s' % (r.url, r.method, r.status, r.reason)))
 def _raise_for_status(r):
     if not r.ok:
         raise APIError(r.status_message_pretty, status=r.status)
