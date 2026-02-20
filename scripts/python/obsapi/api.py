@@ -13,7 +13,9 @@ import ssl
 import sys
 
 class APIError(RuntimeError):
-    pass
+    def __init__(self, *args, status=None, **kwargs):
+        self.status = status
+        super().__init__(*args, **kwargs)
 
 setattr(http.client.HTTPResponse, 'ok', property(lambda r: r.status < 300 and r.status >= 200))
 
@@ -39,7 +41,7 @@ setattr(http.client.HTTPResponse, 'encoding', property(_get_encoding))
 setattr(http.client.HTTPResponse, 'status_message_pretty', property(lambda r: '%s %s %i %s' % (r.url, r.method, r.status, r.reason)))
 def _raise_for_status(r):
     if not r.ok:
-        raise APIError(r.status_message_pretty)
+        raise APIError(r.status_message_pretty, status=r.status)
 http.client.HTTPResponse.raise_for_status = _raise_for_status
 
 def _dic_update(self, dic):
