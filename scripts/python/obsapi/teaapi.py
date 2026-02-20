@@ -161,22 +161,18 @@ class TeaAPI(api.API):
         if branch in branches:
             if not reset:
                 return
-            if not commit and not ref_branch:
-                raise api.APIError("Branch reset requested but no reference is provided.")
             current_commit = branches[branch]['commit']['id']
             if commit:
-                if current_commit != commit:
-                    sys.stderr.write('Deleting branch %s (commit mismatch %s %s)\n' %
-                                     (branch, current_commit, commit))
-                else:
-                    return
+                ref_commit = commit
             elif ref_branch:
                 ref_commit = branches[ref_branch]['commit']['id']
-                if current_commit != ref_commit:
-                    sys.stderr.write('Deleting branch %s (commit mismatch %s %s)\n' %
-                                     (branch, current_commit, ref_commit))
-                else:
-                    return
+            else:
+                raise api.APIError("Branch reset requested but no reference is provided.")
+            if current_commit != ref_commit:
+                sys.stderr.write('Deleting branch %s (commit mismatch %s %s)\n' %
+                                 (branch, current_commit, ref_commit))
+            else:
+                return
             self.delete_branch(org, repo, branch)  # no branch update feature
         ref = None
         if commit:
