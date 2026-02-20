@@ -147,12 +147,12 @@ class TeaAPI(api.API):
 
     def merge_upstream_branch(self, org, repo, branch):
         if not branch in self.repo_branches(org, repo):
-            self.create_branch(org, repo, branch, None, None)
+            self.create_branch(org, repo, branch, None)
         return self.post(self.repo_path(org, repo) + '/merge-upstream', json = {
             'branch': branch,
             })
 
-    def create_branch(self, org, repo, branch, ref_branch, commit, reset=False):
+    def create_or_reset_branch(self, org, repo, branch, ref_branch, commit, reset=False):
         branches = self.repo_branches(org, repo)
         if commit and not self.repo_commit_exists(org, repo, commit):
             commit = None
@@ -183,6 +183,9 @@ class TeaAPI(api.API):
             ref = commit
         elif ref_branch:
             ref = ref_branch
+        return self.create_branch(org, repo, branch, ref)
+
+    def create_branch(self, org, repo, branch, ref):
         json = { 'new_branch_name' : branch }
         if ref:
             json['old_ref_name'] = ref
