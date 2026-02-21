@@ -147,12 +147,12 @@ class TeaAPI(api.API):
 
     def merge_upstream_branch(self, org, repo, branch):
         if not branch in self.repo_branches(org, repo):
-            self.create_branch(org, repo, branch, None, None)
+            self.create_branch(org, repo, branch, None)
         return self.post(self.repo_path(org, repo) + '/merge-upstream', json = {
             'branch': branch,
             })
 
-    def create_branch(self, org, repo, branch, ref_branch, commit, reset=False):
+    def create_or_reset_branch(self, org, repo, branch, ref_branch, commit, reset=False):
         branches = self.repo_branches(org, repo)
         if commit and not self.repo_commit_exists(org, repo, commit):
             commit = None
@@ -161,32 +161,47 @@ class TeaAPI(api.API):
         if branch in branches:
             if not reset:
                 return
-            if not commit and not ref_branch:
-                raise api.APIError("Branch reset requested but no reference is provided.")
             current_commit = branches[branch]['commit']['id']
             if commit:
-                if current_commit != commit:
-                    sys.stderr.write('Deleting branch %s (commit mismatch %s %s)\n' %
-                                     (branch, current_commit, commit))
-                else:
-                    return
+                ref_commit = commit
             elif ref_branch:
                 ref_commit = branches[ref_branch]['commit']['id']
-                if current_commit != ref_commit:
-                    sys.stderr.write('Deleting branch %s (commit mismatch %s %s)\n' %
-                                     (branch, current_commit, ref_commit))
-                else:
-                    return
+            else:
+                raise api.APIError("Branch reset requested but no reference is provided.")
+            if current_commit != ref_commit:
+                sys.stderr.write('Resetting branch %s (commit mismatch %s %s)\n' %
+                                 (branch, current_commit, ref_commit))
+                try:
+                    self.update_branch(org, repo, branch, ref_commit, old_commit=current_commit, force=1)
+                except api.APIError as e:
+                    if e.status == 405:
+                        sys.stderr.write('%s\n' % (e,))
+                        None # UpdateBranch not supported
+                    else:
+                        raise
+                sys.stderr.write('Deleting branch %s (commit mismatch %s %s)\n' %
+                                 (branch, current_commit, ref_commit))
+            else:
+                return
             self.delete_branch(org, repo, branch)  # no branch update feature
         ref = None
         if commit:
             ref = commit
         elif ref_branch:
             ref = ref_branch
+        return self.create_branch(org, repo, branch, ref)
+
+    def create_branch(self, org, repo, branch, ref):
         json = { 'new_branch_name' : branch }
         if ref:
             json['old_ref_name'] = ref
         return self.check_post(self.repo_path(org, repo) + '/branches', json=json)
+
+    def update_branch(self, org, repo, branch, commit, old_commit=None, force=False):
+        json = { 'new_commit_id': commit }
+        if force: json['force'] = True
+        if old_commit: json['old_commit_id'] = old_commit
+        return self.check_put(self.repo_path(org, repo) + '/branches/' + branch, json=json)
 
     def update_gitattr(self, org, repo, branch):
         self.update_file_lines(org, repo, branch, '.gitattributes', [
