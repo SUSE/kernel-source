@@ -356,7 +356,7 @@ Constraint: hardware:disk:size unit=G %i
                 self.log_progress('Resetting branch %s.\n' % (self.user_branch,))
             else:
                 self.log_progress('Creating branch %s.\n' % (self.user_branch,))
-            self.tea.create_branch(self.user, upstream_repo.repo, self.user_branch, upstream_repo.branch, upstream_repo.commit, reset_branch)
+            self.tea.create_or_reset_branch(self.user, upstream_repo.repo, self.user_branch, upstream_repo.branch, upstream_repo.commit, reset_branch)
 
 
 class Uploader(UploaderBase):
