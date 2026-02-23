@@ -1,0 +1,119 @@
+From: Martin KaFai Lau <martin.lau@kernel.org>
+Date: Wed, 23 Oct 2024 16:47:52 -0700
+Subject: bpf: Postpone bpf_obj_free_fields to the rcu callback
+Patch-mainline: v6.13-rc1
+Git-commit: 9bac675e6368b96f448289010caba4ee3320ab24
+References: jsc#PED-14653
+
+A later patch will enable the uptr usage in the task_local_storage map.
+This will require the unpin_user_page() to be done after the rcu
+task trace gp for the cases that the uptr may still be used by
+a bpf prog. The bpf_obj_free_fields() will be the one doing
+unpin_user_page(), so this patch is to postpone calling
+bpf_obj_free_fields() to the rcu callback.
+
+The bpf_obj_free_fields() is only required to be done in
+the rcu callback when bpf->bpf_ma==true and reuse_now==false.
+
+bpf->bpf_ma==true case is because uptr will only be enabled
+in task storage which has already been moved to bpf_mem_alloc.
+The bpf->bpf_ma==false case can be supported in the future
+also if there is a need.
+
+reuse_now==false when the selem (aka storage) is deleted
+by bpf prog (bpf_task_storage_delete) or by syscall delete_elem().
+In both cases, bpf_obj_free_fields() needs to wait for
+rcu gp.
+
+A few words on reuse_now==true. reuse_now==true when the
+storage's owner (i.e. the task_struct) is destructing or the map
+itself is doing map_free(). In both cases, no bpf prog should
+have a hold on the selem and its uptrs, so there is no need to
+postpone bpf_obj_free_fields(). reuse_now==true should be the
+common case for local storage usage where the storage exists
+throughout the lifetime of its owner (task_struct).
+
+The bpf_obj_free_fields() needs to use the map->record. Doing
+bpf_obj_free_fields() in a rcu callback will require the
+bpf_local_storage_map_free() to wait for rcu_barrier. An optimization
+could be only waiting for rcu_barrier when the map has uptr in
+its map_value. This will require either yet another rcu callback
+function or adding a bool in the selem to flag if the SDATA(selem)->smap
+is still valid. This patch chooses to keep it simple and wait for
+rcu_barrier for maps that use bpf_mem_alloc.
+
+Signed-off-by: Martin KaFai Lau <martin.lau@kernel.org>
+Link: https://lore.kernel.org/r/20241023234759.860539-6-martin.lau@linux.dev
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ kernel/bpf/bpf_local_storage.c |   29 ++++++++++++++++++++++++-----
+ 1 file changed, 24 insertions(+), 5 deletions(-)
+
+--- a/kernel/bpf/bpf_local_storage.c
++++ b/kernel/bpf/bpf_local_storage.c
+@@ -209,8 +209,12 @@ static void __bpf_selem_free(struct bpf_
+ static void bpf_selem_free_rcu(struct rcu_head *rcu)
+ {
+ 	struct bpf_local_storage_elem *selem;
++	struct bpf_local_storage_map *smap;
+ 
+ 	selem = container_of(rcu, struct bpf_local_storage_elem, rcu);
++	/* The bpf_local_storage_map_free will wait for rcu_barrier */
++	smap = rcu_dereference_check(SDATA(selem)->smap, 1);
++	bpf_obj_free_fields(smap->map.record, SDATA(selem)->data);
+ 	bpf_mem_cache_raw_free(selem);
+ }
+ 
+@@ -226,16 +230,25 @@ void bpf_selem_free(struct bpf_local_sto
+ 		    struct bpf_local_storage_map *smap,
+ 		    bool reuse_now)
+ {
+-	bpf_obj_free_fields(smap->map.record, SDATA(selem)->data);
+-
+ 	if (!smap->bpf_ma) {
++		/* Only task storage has uptrs and task storage
++		 * has moved to bpf_mem_alloc. Meaning smap->bpf_ma == true
++		 * for task storage, so this bpf_obj_free_fields() won't unpin
++		 * any uptr.
++		 */
++		bpf_obj_free_fields(smap->map.record, SDATA(selem)->data);
+ 		__bpf_selem_free(selem, reuse_now);
+ 		return;
+ 	}
+ 
+-	if (!reuse_now) {
+-		call_rcu_tasks_trace(&selem->rcu, bpf_selem_free_trace_rcu);
+-	} else {
++	if (reuse_now) {
++		/* reuse_now == true only happens when the storage owner
++		 * (e.g. task_struct) is being destructed or the map itself
++		 * is being destructed (ie map_free). In both cases,
++		 * no bpf prog can have a hold on the selem. It is
++		 * safe to unpin the uptrs and free the selem now.
++		 */
++		bpf_obj_free_fields(smap->map.record, SDATA(selem)->data);
+ 		/* Instead of using the vanilla call_rcu(),
+ 		 * bpf_mem_cache_free will be able to reuse selem
+ 		 * immediately.
+@@ -243,7 +256,10 @@ void bpf_selem_free(struct bpf_local_sto
+ 		migrate_disable();
+ 		bpf_mem_cache_free(&smap->selem_ma, selem);
+ 		migrate_enable();
++		return;
+ 	}
++
++	call_rcu_tasks_trace(&selem->rcu, bpf_selem_free_trace_rcu);
+ }
+ 
+ static void bpf_selem_free_list(struct hlist_head *list, bool reuse_now)
+@@ -908,6 +924,9 @@ void bpf_local_storage_map_free(struct b
+ 	synchronize_rcu();
+ 
+ 	if (smap->bpf_ma) {
++		rcu_barrier_tasks_trace();
++		if (!rcu_trace_implies_rcu_gp())
++			rcu_barrier();
+ 		bpf_mem_alloc_destroy(&smap->selem_ma);
+ 		bpf_mem_alloc_destroy(&smap->storage_ma);
+ 	}

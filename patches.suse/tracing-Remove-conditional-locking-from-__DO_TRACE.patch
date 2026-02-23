@@ -1,0 +1,136 @@
+From: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Date: Sat, 23 Nov 2024 10:30:30 -0500
+Subject: tracing: Remove conditional locking from __DO_TRACE()
+Patch-mainline: v6.13-rc1
+Git-commit: 98bf0fbb65226809a8df4d1948c5b6cf0c91590f
+References: jsc#PED-14653
+
+Remove conditional locking by moving the __DO_TRACE() code into
+trace_##name().
+
+When the faultable syscall tracepoints were implemented, __DO_TRACE()
+had a rcuidle argument which selected between SRCU and preempt disable.
+Therefore, the RCU tasks trace protection for faultable syscall
+tracepoints was introduced using the same pattern.
+
+At that point, it did not appear obvious that this feedback from Linus [1]
+applied here as well, because the __DO_TRACE() modification was
+extending a pre-existing pattern.
+
+Shortly before pulling the faultable syscall tracepoints modifications,
+Steven removed the rcuidle argument and SRCU protection scheme entirely
+from tracepoint.h:
+
+commit 48bcda684823 ("tracing: Remove definition of trace_*_rcuidle()")
+
+This required a rebase of the faultable syscall tracepoints series,
+which missed a perfect opportunity to integrate the prior recommendation
+from Linus.
+
+In response to the pull request, Linus pointed out [2] that he was not
+pleased by the implementation, expecting this to be fixed in a follow up
+patch series.
+
+Move __DO_TRACE() code into trace_##name() within each of
+__DECLARE_TRACE() and __DECLARE_TRACE_SYSCALL(). Use a scoped guard
+to guard the preempt disable notrace and RCU tasks trace critical
+sections.
+
+Link: https://lore.kernel.org/all/CAHk-=wggDLDeTKbhb5hh--x=-DQd69v41137M72m6NOTmbD-cw@mail.gmail.com/ [1]
+Link: https://lore.kernel.org/lkml/CAHk-=witPrLcu22dZ93VCyRQonS7+-dFYhQbna=KBa-TAhayMw@mail.gmail.com/ [2]
+
+Fixes: a363d27cdbc2 ("tracing: Allow system call tracepoints to handle page faults")
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Michael Jeanson <mjeanson@efficios.com>
+Cc: Masami Hiramatsu <mhiramat@kernel.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Alexei Starovoitov <ast@kernel.org>
+Cc: Yonghong Song <yhs@fb.com>
+Cc: Paul E. McKenney <paulmck@kernel.org>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Arnaldo Carvalho de Melo <acme@kernel.org>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Cc: Namhyung Kim <namhyung@kernel.org>
+Cc: Andrii Nakryiko <andrii.nakryiko@gmail.com>
+Cc: bpf@vger.kernel.org
+Cc: Joel Fernandes <joel@joelfernandes.org>
+Cc: Jordan Rife <jrife@google.com>
+Cc: linux-trace-kernel@vger.kernel.org
+Link: https://lore.kernel.org/20241123153031.2884933-5-mathieu.desnoyers@efficios.com
+Signed-off-by: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Signed-off-by: Steven Rostedt (Google) <rostedt@goodmis.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ include/linux/tracepoint.h |   45 ++++++++++++---------------------------------
+ 1 file changed, 12 insertions(+), 33 deletions(-)
+
+--- a/include/linux/tracepoint.h
++++ b/include/linux/tracepoint.h
+@@ -210,31 +210,6 @@ static inline struct tracepoint *tracepo
+ #endif /* CONFIG_HAVE_STATIC_CALL */
+ 
+ /*
+- * With @syscall=0, the tracepoint callback array dereference is
+- * protected by disabling preemption.
+- * With @syscall=1, the tracepoint callback array dereference is
+- * protected by Tasks Trace RCU, which allows probes to handle page
+- * faults.
+- */
+-#define __DO_TRACE(name, args, cond, syscall)				\
+-	do {								\
+-		if (!(cond))						\
+-			return;						\
+-									\
+-		if (syscall)						\
+-			rcu_read_lock_trace();				\
+-		else							\
+-			preempt_disable_notrace();			\
+-									\
+-		__DO_TRACE_CALL(name, TP_ARGS(args));			\
+-									\
+-		if (syscall)						\
+-			rcu_read_unlock_trace();			\
+-		else							\
+-			preempt_enable_notrace();			\
+-	} while (0)
+-
+-/*
+  * Make sure the alignment of the structure in the __tracepoints section will
+  * not add unwanted padding between the beginning of the section and the
+  * structure. Force alignment to the same alignment as the section start.
+@@ -282,10 +257,12 @@ static inline struct tracepoint *tracepo
+ 	__DECLARE_TRACE_COMMON(name, PARAMS(proto), PARAMS(args), cond, PARAMS(data_proto)) \
+ 	static inline void trace_##name(proto)				\
+ 	{								\
+-		if (static_branch_unlikely(&__tracepoint_##name.key))	\
+-			__DO_TRACE(name,				\
+-				TP_ARGS(args),				\
+-				TP_CONDITION(cond), 0);			\
++		if (static_branch_unlikely(&__tracepoint_##name.key)) { \
++			if (cond) {					\
++				scoped_guard(preempt_notrace)		\
++					__DO_TRACE_CALL(name, TP_ARGS(args)); \
++			}						\
++		}							\
+ 		if (IS_ENABLED(CONFIG_LOCKDEP) && (cond)) {		\
+ 			WARN_ONCE(!rcu_is_watching(),			\
+ 				  "RCU not watching for tracepoint");	\
+@@ -297,10 +274,12 @@ static inline struct tracepoint *tracepo
+ 	static inline void trace_##name(proto)				\
+ 	{								\
+ 		might_fault();						\
+-		if (static_branch_unlikely(&__tracepoint_##name.key))	\
+-			__DO_TRACE(name,				\
+-				TP_ARGS(args),				\
+-				TP_CONDITION(cond), 1);			\
++		if (static_branch_unlikely(&__tracepoint_##name.key)) {	\
++			if (cond) {					\
++				scoped_guard(rcu_tasks_trace)		\
++					__DO_TRACE_CALL(name, TP_ARGS(args)); \
++			}						\
++		}							\
+ 		if (IS_ENABLED(CONFIG_LOCKDEP) && (cond)) {		\
+ 			WARN_ONCE(!rcu_is_watching(),			\
+ 				  "RCU not watching for tracepoint");	\

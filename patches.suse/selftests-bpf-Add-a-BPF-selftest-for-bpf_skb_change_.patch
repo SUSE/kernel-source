@@ -1,0 +1,140 @@
+From: Cong Wang <cong.wang@bytedance.com>
+Date: Thu, 12 Dec 2024 19:40:55 -0800
+Subject: selftests/bpf: Add a BPF selftest for bpf_skb_change_tail()
+Patch-mainline: v6.13-rc4
+Git-commit: 9ee0c7b8654346d60c823babe4b3747357a30477
+References: jsc#PED-14653
+
+As requested by Daniel, we need to add a selftest to cover
+bpf_skb_change_tail() cases in skb_verdict. Here we test trimming,
+growing and error cases, and validate its expected return values and the
+expected sizes of the payload.
+
+Signed-off-by: Cong Wang <cong.wang@bytedance.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: John Fastabend <john.fastabend@gmail.com>
+Link: https://lore.kernel.org/bpf/20241213034057.246437-3-xiyou.wangcong@gmail.com
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ tools/testing/selftests/bpf/prog_tests/sockmap_basic.c       |   51 +++++++++++
+ tools/testing/selftests/bpf/progs/test_sockmap_change_tail.c |   40 ++++++++
+ 2 files changed, 91 insertions(+)
+ create mode 100644 tools/testing/selftests/bpf/progs/test_sockmap_change_tail.c
+
+--- a/tools/testing/selftests/bpf/prog_tests/sockmap_basic.c
++++ b/tools/testing/selftests/bpf/prog_tests/sockmap_basic.c
+@@ -12,6 +12,7 @@
+ #include "test_sockmap_progs_query.skel.h"
+ #include "test_sockmap_pass_prog.skel.h"
+ #include "test_sockmap_drop_prog.skel.h"
++#include "test_sockmap_change_tail.skel.h"
+ #include "bpf_iter_sockmap.skel.h"
+ 
+ #include "sockmap_helpers.h"
+@@ -643,6 +644,54 @@ out:
+ 		test_sockmap_drop_prog__destroy(drop);
+ }
+ 
++static void test_sockmap_skb_verdict_change_tail(void)
++{
++	struct test_sockmap_change_tail *skel;
++	int err, map, verdict;
++	int c1, p1, sent, recvd;
++	int zero = 0;
++	char buf[2];
++
++	skel = test_sockmap_change_tail__open_and_load();
++	if (!ASSERT_OK_PTR(skel, "open_and_load"))
++		return;
++	verdict = bpf_program__fd(skel->progs.prog_skb_verdict);
++	map = bpf_map__fd(skel->maps.sock_map_rx);
++
++	err = bpf_prog_attach(verdict, map, BPF_SK_SKB_STREAM_VERDICT, 0);
++	if (!ASSERT_OK(err, "bpf_prog_attach"))
++		goto out;
++	err = create_pair(AF_INET, SOCK_STREAM, &c1, &p1);
++	if (!ASSERT_OK(err, "create_pair()"))
++		goto out;
++	err = bpf_map_update_elem(map, &zero, &c1, BPF_NOEXIST);
++	if (!ASSERT_OK(err, "bpf_map_update_elem(c1)"))
++		goto out_close;
++	sent = xsend(p1, "Tr", 2, 0);
++	ASSERT_EQ(sent, 2, "xsend(p1)");
++	recvd = recv(c1, buf, 2, 0);
++	ASSERT_EQ(recvd, 1, "recv(c1)");
++	ASSERT_EQ(skel->data->change_tail_ret, 0, "change_tail_ret");
++
++	sent = xsend(p1, "G", 1, 0);
++	ASSERT_EQ(sent, 1, "xsend(p1)");
++	recvd = recv(c1, buf, 2, 0);
++	ASSERT_EQ(recvd, 2, "recv(c1)");
++	ASSERT_EQ(skel->data->change_tail_ret, 0, "change_tail_ret");
++
++	sent = xsend(p1, "E", 1, 0);
++	ASSERT_EQ(sent, 1, "xsend(p1)");
++	recvd = recv(c1, buf, 1, 0);
++	ASSERT_EQ(recvd, 1, "recv(c1)");
++	ASSERT_EQ(skel->data->change_tail_ret, -EINVAL, "change_tail_ret");
++
++out_close:
++	close(c1);
++	close(p1);
++out:
++	test_sockmap_change_tail__destroy(skel);
++}
++
+ static void test_sockmap_skb_verdict_peek_helper(int map)
+ {
+ 	int err, c1, p1, zero = 0, sent, recvd, avail;
+@@ -1058,6 +1107,8 @@ void test_sockmap_basic(void)
+ 		test_sockmap_skb_verdict_fionread(true);
+ 	if (test__start_subtest("sockmap skb_verdict fionread on drop"))
+ 		test_sockmap_skb_verdict_fionread(false);
++	if (test__start_subtest("sockmap skb_verdict change tail"))
++		test_sockmap_skb_verdict_change_tail();
+ 	if (test__start_subtest("sockmap skb_verdict msg_f_peek"))
+ 		test_sockmap_skb_verdict_peek();
+ 	if (test__start_subtest("sockmap skb_verdict msg_f_peek with link"))
+--- /dev/null
++++ b/tools/testing/selftests/bpf/progs/test_sockmap_change_tail.c
+@@ -0,0 +1,40 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2024 ByteDance */
++#include <linux/bpf.h>
++#include <bpf/bpf_helpers.h>
++
++struct {
++	__uint(type, BPF_MAP_TYPE_SOCKMAP);
++	__uint(max_entries, 1);
++	__type(key, int);
++	__type(value, int);
++} sock_map_rx SEC(".maps");
++
++long change_tail_ret = 1;
++
++SEC("sk_skb")
++int prog_skb_verdict(struct __sk_buff *skb)
++{
++	char *data, *data_end;
++
++	bpf_skb_pull_data(skb, 1);
++	data = (char *)(unsigned long)skb->data;
++	data_end = (char *)(unsigned long)skb->data_end;
++
++	if (data + 1 > data_end)
++		return SK_PASS;
++
++	if (data[0] == 'T') { /* Trim the packet */
++		change_tail_ret = bpf_skb_change_tail(skb, skb->len - 1, 0);
++		return SK_PASS;
++	} else if (data[0] == 'G') { /* Grow the packet */
++		change_tail_ret = bpf_skb_change_tail(skb, skb->len + 1, 0);
++		return SK_PASS;
++	} else if (data[0] == 'E') { /* Error */
++		change_tail_ret = bpf_skb_change_tail(skb, 65535, 0);
++		return SK_PASS;
++	}
++	return SK_PASS;
++}
++
++char _license[] SEC("license") = "GPL";

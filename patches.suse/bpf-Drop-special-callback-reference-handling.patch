@@ -1,0 +1,145 @@
+From: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Date: Sat, 9 Nov 2024 15:14:30 -0800
+Subject: bpf: Drop special callback reference handling
+Patch-mainline: v6.13-rc1
+Git-commit: ae6e3a273f590a2b64f14a9fab3546c3a8f44ed4
+References: jsc#PED-14653
+
+Logic to prevent callbacks from acquiring new references for the program
+(i.e. leaving acquired references), and releasing caller references
+(i.e. those acquired in parent frames) was introduced in commit
+9d9d00ac29d0 ("bpf: Fix reference state management for synchronous callbacks").
+
+This was necessary because back then, the verifier simulated each
+callback once (that could potentially be executed N times, where N can
+be zero). This meant that callbacks that left lingering resources or
+cleared caller resources could do it more than once, operating on
+undefined state or leaking memory.
+
+With the fixes to callback verification in commit
+ab5cfac139ab ("bpf: verify callbacks as if they are called unknown number of times"),
+all of this extra logic is no longer necessary. Hence, drop it as part
+of this commit.
+
+Cc: Eduard Zingerman <eddyz87@gmail.com>
+Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Link: https://lore.kernel.org/r/20241109231430.2475236-3-memxor@gmail.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ include/linux/bpf_verifier.h                     |   21 +++----------------
+ kernel/bpf/verifier.c                            |   25 ++++-------------------
+ tools/testing/selftests/bpf/prog_tests/cb_refs.c |    4 +--
+ 3 files changed, 11 insertions(+), 39 deletions(-)
+
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@ -265,23 +265,10 @@ struct bpf_reference_state {
+ 	 * is used purely to inform the user of a reference leak.
+ 	 */
+ 	int insn_idx;
+-	union {
+-		/* There can be a case like:
+-		 * main (frame 0)
+-		 *  cb (frame 1)
+-		 *   func (frame 3)
+-		 *    cb (frame 4)
+-		 * Hence for frame 4, if callback_ref just stored boolean, it would be
+-		 * impossible to distinguish nested callback refs. Hence store the
+-		 * frameno and compare that to callback_ref in check_reference_leak when
+-		 * exiting a callback function.
+-		 */
+-		int callback_ref;
+-		/* Use to keep track of the source object of a lock, to ensure
+-		 * it matches on unlock.
+-		 */
+-		void *ptr;
+-	};
++	/* Use to keep track of the source object of a lock, to ensure
++	 * it matches on unlock.
++	 */
++	void *ptr;
+ };
+ 
+ struct bpf_retval_range {
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -1358,7 +1358,6 @@ static int acquire_reference_state(struc
+ 	state->refs[new_ofs].type = REF_TYPE_PTR;
+ 	state->refs[new_ofs].id = id;
+ 	state->refs[new_ofs].insn_idx = insn_idx;
+-	state->refs[new_ofs].callback_ref = state->in_callback_fn ? state->frameno : 0;
+ 
+ 	return id;
+ }
+@@ -1392,9 +1391,6 @@ static int release_reference_state(struc
+ 		if (state->refs[i].type != REF_TYPE_PTR)
+ 			continue;
+ 		if (state->refs[i].id == ptr_id) {
+-			/* Cannot release caller references in callbacks */
+-			if (state->in_callback_fn && state->refs[i].callback_ref != state->frameno)
+-				return -EINVAL;
+ 			if (last_idx && i != last_idx)
+ 				memcpy(&state->refs[i], &state->refs[last_idx],
+ 				       sizeof(*state->refs));
+@@ -10257,17 +10253,10 @@ static int prepare_func_exit(struct bpf_
+ 		caller->regs[BPF_REG_0] = *r0;
+ 	}
+ 
+-	/* callback_fn frame should have released its own additions to parent's
+-	 * reference state at this point, or check_reference_leak would
+-	 * complain, hence it must be the same as the caller. There is no need
+-	 * to copy it back.
+-	 */
+-	if (!callee->in_callback_fn) {
+-		/* Transfer references to the caller */
+-		err = copy_reference_state(caller, callee);
+-		if (err)
+-			return err;
+-	}
++	/* Transfer references to the caller */
++	err = copy_reference_state(caller, callee);
++	if (err)
++		return err;
+ 
+ 	/* for callbacks like bpf_loop or bpf_for_each_map_elem go back to callsite,
+ 	 * there function call logic would reschedule callback visit. If iteration
+@@ -10437,14 +10426,12 @@ static int check_reference_leak(struct b
+ 	bool refs_lingering = false;
+ 	int i;
+ 
+-	if (!exception_exit && state->frameno && !state->in_callback_fn)
++	if (!exception_exit && state->frameno)
+ 		return 0;
+ 
+ 	for (i = 0; i < state->acquired_refs; i++) {
+ 		if (state->refs[i].type != REF_TYPE_PTR)
+ 			continue;
+-		if (!exception_exit && state->in_callback_fn && state->refs[i].callback_ref != state->frameno)
+-			continue;
+ 		verbose(env, "Unreleased reference id=%d alloc_insn=%d\n",
+ 			state->refs[i].id, state->refs[i].insn_idx);
+ 		refs_lingering = true;
+@@ -17697,8 +17684,6 @@ static bool refsafe(struct bpf_func_stat
+ 			return false;
+ 		switch (old->refs[i].type) {
+ 		case REF_TYPE_PTR:
+-			if (old->refs[i].callback_ref != cur->refs[i].callback_ref)
+-				return false;
+ 			break;
+ 		case REF_TYPE_LOCK:
+ 			if (old->refs[i].ptr != cur->refs[i].ptr)
+--- a/tools/testing/selftests/bpf/prog_tests/cb_refs.c
++++ b/tools/testing/selftests/bpf/prog_tests/cb_refs.c
+@@ -11,8 +11,8 @@ struct {
+ 	const char *prog_name;
+ 	const char *err_msg;
+ } cb_refs_tests[] = {
+-	{ "underflow_prog", "reference has not been acquired before" },
+-	{ "leak_prog", "Unreleased reference" },
++	{ "underflow_prog", "must point to scalar, or struct with scalar" },
++	{ "leak_prog", "Possibly NULL pointer passed to helper arg2" },
+ 	{ "nested_cb", "Unreleased reference id=4 alloc_insn=2" }, /* alloc_insn=2{4,5} */
+ 	{ "non_cb_transfer_ref", "Unreleased reference id=4 alloc_insn=1" }, /* alloc_insn=1{1,2} */
+ };

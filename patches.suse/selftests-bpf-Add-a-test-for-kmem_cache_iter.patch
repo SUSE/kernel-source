@@ -1,0 +1,262 @@
+From: Namhyung Kim <namhyung@kernel.org>
+Date: Thu, 10 Oct 2024 16:25:05 -0700
+Subject: selftests/bpf: Add a test for kmem_cache_iter
+Patch-mainline: v6.13-rc1
+Git-commit: a496d0cdc84d81fbfd2026ef41c8ae9385d01fbb
+References: jsc#PED-14653
+
+The test traverses all slab caches using the kmem_cache_iter and save
+the data into slab_result array map.  And check if current task's
+pointer is from "task_struct" slab cache using bpf_get_kmem_cache().
+
+Also compare the result array with /proc/slabinfo if available (when
+CONFIG_SLUB_DEBUG is on).  Note that many of the fields in the slabinfo
+are transient, so it only compares the name and objsize fields.
+
+Signed-off-by: Namhyung Kim <namhyung@kernel.org>
+Link: https://lore.kernel.org/r/20241010232505.1339892-4-namhyung@kernel.org
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ tools/testing/selftests/bpf/prog_tests/kmem_cache_iter.c |  115 +++++++++++++++
+ tools/testing/selftests/bpf/progs/bpf_iter.h             |    7 
+ tools/testing/selftests/bpf/progs/kmem_cache_iter.c      |   87 +++++++++++
+ 3 files changed, 209 insertions(+)
+ create mode 100644 tools/testing/selftests/bpf/prog_tests/kmem_cache_iter.c
+ create mode 100644 tools/testing/selftests/bpf/progs/kmem_cache_iter.c
+
+--- /dev/null
++++ b/tools/testing/selftests/bpf/prog_tests/kmem_cache_iter.c
+@@ -0,0 +1,115 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2024 Google */
++
++#include <test_progs.h>
++#include <bpf/libbpf.h>
++#include <bpf/btf.h>
++#include "kmem_cache_iter.skel.h"
++
++#define SLAB_NAME_MAX  32
++
++struct kmem_cache_result {
++	char name[SLAB_NAME_MAX];
++	long obj_size;
++};
++
++static void subtest_kmem_cache_iter_check_task_struct(struct kmem_cache_iter *skel)
++{
++	LIBBPF_OPTS(bpf_test_run_opts, opts,
++		.flags = 0,  /* Run it with the current task */
++	);
++	int prog_fd = bpf_program__fd(skel->progs.check_task_struct);
++
++	/* Get task_struct and check it if's from a slab cache */
++	ASSERT_OK(bpf_prog_test_run_opts(prog_fd, &opts), "prog_test_run");
++
++	/* The BPF program should set 'found' variable */
++	ASSERT_EQ(skel->bss->task_struct_found, 1, "task_struct_found");
++}
++
++static void subtest_kmem_cache_iter_check_slabinfo(struct kmem_cache_iter *skel)
++{
++	FILE *fp;
++	int map_fd;
++	char name[SLAB_NAME_MAX];
++	unsigned long objsize;
++	char rest_of_line[1000];
++	struct kmem_cache_result r;
++	int seen = 0;
++
++	fp = fopen("/proc/slabinfo", "r");
++	if (fp == NULL) {
++		/* CONFIG_SLUB_DEBUG is not enabled */
++		return;
++	}
++
++	map_fd = bpf_map__fd(skel->maps.slab_result);
++
++	/* Ignore first two lines for header */
++	fscanf(fp, "slabinfo - version: %*d.%*d\n");
++	fscanf(fp, "# %*s %*s %*s %*s %*s %*s : %[^\n]\n", rest_of_line);
++
++	/* Compare name and objsize only - others can be changes frequently */
++	while (fscanf(fp, "%s %*u %*u %lu %*u %*u : %[^\n]\n",
++		      name, &objsize, rest_of_line) == 3) {
++		int ret = bpf_map_lookup_elem(map_fd, &seen, &r);
++
++		if (!ASSERT_OK(ret, "kmem_cache_lookup"))
++			break;
++
++		ASSERT_STREQ(r.name, name, "kmem_cache_name");
++		ASSERT_EQ(r.obj_size, objsize, "kmem_cache_objsize");
++
++		seen++;
++	}
++
++	ASSERT_EQ(skel->bss->kmem_cache_seen, seen, "kmem_cache_seen_eq");
++
++	fclose(fp);
++}
++
++void test_kmem_cache_iter(void)
++{
++	DECLARE_LIBBPF_OPTS(bpf_iter_attach_opts, opts);
++	struct kmem_cache_iter *skel = NULL;
++	union bpf_iter_link_info linfo = {};
++	struct bpf_link *link;
++	char buf[256];
++	int iter_fd;
++
++	skel = kmem_cache_iter__open_and_load();
++	if (!ASSERT_OK_PTR(skel, "kmem_cache_iter__open_and_load"))
++		return;
++
++	opts.link_info = &linfo;
++	opts.link_info_len = sizeof(linfo);
++
++	link = bpf_program__attach_iter(skel->progs.slab_info_collector, &opts);
++	if (!ASSERT_OK_PTR(link, "attach_iter"))
++		goto destroy;
++
++	iter_fd = bpf_iter_create(bpf_link__fd(link));
++	if (!ASSERT_GE(iter_fd, 0, "iter_create"))
++		goto free_link;
++
++	memset(buf, 0, sizeof(buf));
++	while (read(iter_fd, buf, sizeof(buf) > 0)) {
++		/* Read out all contents */
++		printf("%s", buf);
++	}
++
++	/* Next reads should return 0 */
++	ASSERT_EQ(read(iter_fd, buf, sizeof(buf)), 0, "read");
++
++	if (test__start_subtest("check_task_struct"))
++		subtest_kmem_cache_iter_check_task_struct(skel);
++	if (test__start_subtest("check_slabinfo"))
++		subtest_kmem_cache_iter_check_slabinfo(skel);
++
++	close(iter_fd);
++
++free_link:
++	bpf_link__destroy(link);
++destroy:
++	kmem_cache_iter__destroy(skel);
++}
+--- a/tools/testing/selftests/bpf/progs/bpf_iter.h
++++ b/tools/testing/selftests/bpf/progs/bpf_iter.h
+@@ -24,6 +24,7 @@
+ #define BTF_F_PTR_RAW BTF_F_PTR_RAW___not_used
+ #define BTF_F_ZERO BTF_F_ZERO___not_used
+ #define bpf_iter__ksym bpf_iter__ksym___not_used
++#define bpf_iter__kmem_cache bpf_iter__kmem_cache___not_used
+ #include "vmlinux.h"
+ #undef bpf_iter_meta
+ #undef bpf_iter__bpf_map
+@@ -48,6 +49,7 @@
+ #undef BTF_F_PTR_RAW
+ #undef BTF_F_ZERO
+ #undef bpf_iter__ksym
++#undef bpf_iter__kmem_cache
+ 
+ struct bpf_iter_meta {
+ 	struct seq_file *seq;
+@@ -165,3 +167,8 @@ struct bpf_iter__ksym {
+ 	struct bpf_iter_meta *meta;
+ 	struct kallsym_iter *ksym;
+ };
++
++struct bpf_iter__kmem_cache {
++	struct bpf_iter_meta *meta;
++	struct kmem_cache *s;
++} __attribute__((preserve_access_index));
+--- /dev/null
++++ b/tools/testing/selftests/bpf/progs/kmem_cache_iter.c
+@@ -0,0 +1,87 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2024 Google */
++
++#include "bpf_iter.h"
++#include <bpf/bpf_helpers.h>
++#include <bpf/bpf_tracing.h>
++
++char _license[] SEC("license") = "GPL";
++
++#define SLAB_NAME_MAX  32
++
++struct kmem_cache_result {
++	char name[SLAB_NAME_MAX];
++	long obj_size;
++};
++
++struct {
++	__uint(type, BPF_MAP_TYPE_HASH);
++	__uint(key_size, sizeof(void *));
++	__uint(value_size, SLAB_NAME_MAX);
++	__uint(max_entries, 1);
++} slab_hash SEC(".maps");
++
++struct {
++	__uint(type, BPF_MAP_TYPE_ARRAY);
++	__uint(key_size, sizeof(int));
++	__uint(value_size, sizeof(struct kmem_cache_result));
++	__uint(max_entries, 1024);
++} slab_result SEC(".maps");
++
++extern struct kmem_cache *bpf_get_kmem_cache(u64 addr) __ksym;
++
++/* Result, will be checked by userspace */
++int task_struct_found;
++int kmem_cache_seen;
++
++SEC("iter/kmem_cache")
++int slab_info_collector(struct bpf_iter__kmem_cache *ctx)
++{
++	struct seq_file *seq = ctx->meta->seq;
++	struct kmem_cache *s = ctx->s;
++	struct kmem_cache_result *r;
++	int idx;
++
++	if (s) {
++		/* To make sure if the slab_iter implements the seq interface
++		 * properly and it's also useful for debugging.
++		 */
++		BPF_SEQ_PRINTF(seq, "%s: %u\n", s->name, s->size);
++
++		idx = kmem_cache_seen;
++		r = bpf_map_lookup_elem(&slab_result, &idx);
++		if (r == NULL)
++			return 0;
++
++		kmem_cache_seen++;
++
++		/* Save name and size to match /proc/slabinfo */
++		bpf_probe_read_kernel_str(r->name, sizeof(r->name), s->name);
++		r->obj_size = s->size;
++
++		if (!bpf_strncmp(r->name, 11, "task_struct"))
++			bpf_map_update_elem(&slab_hash, &s, r->name, BPF_NOEXIST);
++	}
++
++	return 0;
++}
++
++SEC("raw_tp/bpf_test_finish")
++int BPF_PROG(check_task_struct)
++{
++	u64 curr = bpf_get_current_task();
++	struct kmem_cache *s;
++	char *name;
++
++	s = bpf_get_kmem_cache(curr);
++	if (s == NULL) {
++		task_struct_found = -1;
++		return 0;
++	}
++	name = bpf_map_lookup_elem(&slab_hash, &s);
++	if (name && !bpf_strncmp(name, 11, "task_struct"))
++		task_struct_found = 1;
++	else
++		task_struct_found = -2;
++	return 0;
++}

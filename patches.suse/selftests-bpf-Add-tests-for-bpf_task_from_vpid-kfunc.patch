@@ -1,0 +1,223 @@
+From: Juntong Deng <juntong.deng@outlook.com>
+Date: Mon, 14 Oct 2024 10:25:53 +0100
+Subject: selftests/bpf: Add tests for bpf_task_from_vpid() kfunc
+Patch-mainline: v6.13-rc1
+Git-commit: f987a640e853e96c85f8193d0c2f79744622e3d8
+References: jsc#PED-14653
+
+This patch adds test cases for bpf_task_from_vpid() kfunc.
+
+task_kfunc_from_vpid_no_null_check is used to test the case where
+the return value is not checked for NULL pointer.
+
+test_task_from_vpid_current is used to test obtaining the
+struct task_struct of the process in the pid namespace based on vpid.
+
+test_task_from_vpid_invalid is used to test the case of invalid vpid.
+
+test_task_from_vpid_current and test_task_from_vpid_invalid will run
+in the new namespace.
+
+Signed-off-by: Juntong Deng <juntong.deng@outlook.com>
+Link: https://lore.kernel.org/r/AM6PR03MB5848F13435CD650AC4B7BD7099442@AM6PR03MB5848.eurprd03.prod.outlook.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ tools/testing/selftests/bpf/prog_tests/task_kfunc.c    |   80 +++++++++++++++++
+ tools/testing/selftests/bpf/progs/task_kfunc_common.h  |    1 
+ tools/testing/selftests/bpf/progs/task_kfunc_failure.c |   14 ++
+ tools/testing/selftests/bpf/progs/task_kfunc_success.c |   51 ++++++++++
+ 4 files changed, 146 insertions(+)
+
+--- a/tools/testing/selftests/bpf/prog_tests/task_kfunc.c
++++ b/tools/testing/selftests/bpf/prog_tests/task_kfunc.c
+@@ -68,6 +68,74 @@ cleanup:
+ 	task_kfunc_success__destroy(skel);
+ }
+ 
++static int run_vpid_test(void *prog_name)
++{
++	struct task_kfunc_success *skel;
++	struct bpf_program *prog;
++	int prog_fd, err = 0;
++
++	if (getpid() != 1)
++		return 1;
++
++	skel = open_load_task_kfunc_skel();
++	if (!skel)
++		return 2;
++
++	if (skel->bss->err) {
++		err = 3;
++		goto cleanup;
++	}
++
++	prog = bpf_object__find_program_by_name(skel->obj, prog_name);
++	if (!prog) {
++		err = 4;
++		goto cleanup;
++	}
++
++	prog_fd = bpf_program__fd(prog);
++	if (prog_fd < 0) {
++		err = 5;
++		goto cleanup;
++	}
++
++	if (bpf_prog_test_run_opts(prog_fd, NULL)) {
++		err = 6;
++		goto cleanup;
++	}
++
++	if (skel->bss->err)
++		err = 7 + skel->bss->err;
++cleanup:
++	task_kfunc_success__destroy(skel);
++	return err;
++}
++
++static void run_vpid_success_test(const char *prog_name)
++{
++	const int stack_size = 1024 * 1024;
++	int child_pid, wstatus;
++	char *stack;
++
++	stack = (char *)malloc(stack_size);
++	if (!ASSERT_OK_PTR(stack, "clone_stack"))
++		return;
++
++	child_pid = clone(run_vpid_test, stack + stack_size,
++			  CLONE_NEWPID | SIGCHLD, (void *)prog_name);
++	if (!ASSERT_GT(child_pid, -1, "child_pid"))
++		goto cleanup;
++
++	if (!ASSERT_GT(waitpid(child_pid, &wstatus, 0), -1, "waitpid"))
++		goto cleanup;
++
++	if (WEXITSTATUS(wstatus) > 7)
++		ASSERT_OK(WEXITSTATUS(wstatus) - 7, "vpid_test_failure");
++	else
++		ASSERT_OK(WEXITSTATUS(wstatus), "run_vpid_test_err");
++cleanup:
++	free(stack);
++}
++
+ static const char * const success_tests[] = {
+ 	"test_task_acquire_release_argument",
+ 	"test_task_acquire_release_current",
+@@ -83,6 +151,11 @@ static const char * const success_tests[
+ 	"test_task_kfunc_flavor_relo_not_found",
+ };
+ 
++static const char * const vpid_success_tests[] = {
++	"test_task_from_vpid_current",
++	"test_task_from_vpid_invalid",
++};
++
+ void test_task_kfunc(void)
+ {
+ 	int i;
+@@ -94,5 +167,12 @@ void test_task_kfunc(void)
+ 		run_success_test(success_tests[i]);
+ 	}
+ 
++	for (i = 0; i < ARRAY_SIZE(vpid_success_tests); i++) {
++		if (!test__start_subtest(vpid_success_tests[i]))
++			continue;
++
++		run_vpid_success_test(vpid_success_tests[i]);
++	}
++
+ 	RUN_TESTS(task_kfunc_failure);
+ }
+--- a/tools/testing/selftests/bpf/progs/task_kfunc_common.h
++++ b/tools/testing/selftests/bpf/progs/task_kfunc_common.h
+@@ -23,6 +23,7 @@ struct {
+ struct task_struct *bpf_task_acquire(struct task_struct *p) __ksym;
+ void bpf_task_release(struct task_struct *p) __ksym;
+ struct task_struct *bpf_task_from_pid(s32 pid) __ksym;
++struct task_struct *bpf_task_from_vpid(s32 vpid) __ksym;
+ void bpf_rcu_read_lock(void) __ksym;
+ void bpf_rcu_read_unlock(void) __ksym;
+ 
+--- a/tools/testing/selftests/bpf/progs/task_kfunc_failure.c
++++ b/tools/testing/selftests/bpf/progs/task_kfunc_failure.c
+@@ -247,6 +247,20 @@ int BPF_PROG(task_kfunc_from_pid_no_null
+ 	return 0;
+ }
+ 
++SEC("tp_btf/task_newtask")
++__failure __msg("Possibly NULL pointer passed to trusted arg0")
++int BPF_PROG(task_kfunc_from_vpid_no_null_check, struct task_struct *task, u64 clone_flags)
++{
++	struct task_struct *acquired;
++
++	acquired = bpf_task_from_vpid(task->pid);
++
++	/* Releasing bpf_task_from_vpid() lookup without a NULL check. */
++	bpf_task_release(acquired);
++
++	return 0;
++}
++
+ SEC("lsm/task_free")
+ __failure __msg("R1 must be a rcu pointer")
+ int BPF_PROG(task_kfunc_from_lsm_task_free, struct task_struct *task)
+--- a/tools/testing/selftests/bpf/progs/task_kfunc_success.c
++++ b/tools/testing/selftests/bpf/progs/task_kfunc_success.c
+@@ -366,3 +366,54 @@ int BPF_PROG(task_kfunc_acquire_trusted_
+ 
+ 	return 0;
+ }
++
++SEC("syscall")
++int test_task_from_vpid_current(const void *ctx)
++{
++	struct task_struct *current, *v_task;
++
++	v_task = bpf_task_from_vpid(1);
++	if (!v_task) {
++		err = 1;
++		return 0;
++	}
++
++	current = bpf_get_current_task_btf();
++
++	/* The current process should be the init process (pid 1) in the new pid namespace. */
++	if (current != v_task)
++		err = 2;
++
++	bpf_task_release(v_task);
++	return 0;
++}
++
++SEC("syscall")
++int test_task_from_vpid_invalid(const void *ctx)
++{
++	struct task_struct *v_task;
++
++	v_task = bpf_task_from_vpid(-1);
++	if (v_task) {
++		err = 1;
++		goto err;
++	}
++
++	/* There should be only one process (current process) in the new pid namespace. */
++	v_task = bpf_task_from_vpid(2);
++	if (v_task) {
++		err = 2;
++		goto err;
++	}
++
++	v_task = bpf_task_from_vpid(9999);
++	if (v_task) {
++		err = 3;
++		goto err;
++	}
++
++	return 0;
++err:
++	bpf_task_release(v_task);
++	return 0;
++}

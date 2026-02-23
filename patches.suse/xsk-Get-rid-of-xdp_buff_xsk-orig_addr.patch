@@ -1,0 +1,96 @@
+From: Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+Date: Mon, 7 Oct 2024 14:24:55 +0200
+Subject: xsk: Get rid of xdp_buff_xsk::orig_addr
+Patch-mainline: v6.13-rc1
+Git-commit: bea14124bacbe5c9366381e62635eed28ac892ae
+References: jsc#PED-14653
+
+Continue the process of dieting xdp_buff_xsk by removing orig_addr
+member. It can be calculated from xdp->data_hard_start where it was
+previously used, so it is not anything that has to be carried around in
+struct used widely in hot path.
+
+This has been used for initializing xdp_buff_xsk::frame_dma during pool
+setup and as a shortcut in xp_get_handle() to retrieve address provided
+to xsk Rx queue.
+
+Signed-off-by: Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Magnus Karlsson <magnus.karlsson@intel.com>
+Link: https://lore.kernel.org/bpf/20241007122458.282590-4-maciej.fijalkowski@intel.com
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ include/net/xsk_buff_pool.h |   19 +++++++++++--------
+ net/xdp/xsk.c               |    2 +-
+ net/xdp/xsk_buff_pool.c     |    4 +++-
+ 3 files changed, 15 insertions(+), 10 deletions(-)
+
+--- a/include/net/xsk_buff_pool.h
++++ b/include/net/xsk_buff_pool.h
+@@ -28,7 +28,6 @@ struct xdp_buff_xsk {
+ 	dma_addr_t dma;
+ 	dma_addr_t frame_dma;
+ 	struct xsk_buff_pool *pool;
+-	u64 orig_addr;
+ 	struct list_head list_node;
+ };
+ 
+@@ -119,7 +118,6 @@ void xp_free(struct xdp_buff_xsk *xskb);
+ static inline void xp_init_xskb_addr(struct xdp_buff_xsk *xskb, struct xsk_buff_pool *pool,
+ 				     u64 addr)
+ {
+-	xskb->orig_addr = addr;
+ 	xskb->xdp.data_hard_start = pool->addrs + addr + pool->headroom;
+ }
+ 
+@@ -221,14 +219,19 @@ static inline void xp_release(struct xdp
+ 		xskb->pool->free_heads[xskb->pool->free_heads_cnt++] = xskb;
+ }
+ 
+-static inline u64 xp_get_handle(struct xdp_buff_xsk *xskb)
++static inline u64 xp_get_handle(struct xdp_buff_xsk *xskb,
++				struct xsk_buff_pool *pool)
+ {
+-	u64 offset = xskb->xdp.data - xskb->xdp.data_hard_start;
++	u64 orig_addr = xskb->xdp.data - pool->addrs;
++	u64 offset;
+ 
+-	offset += xskb->pool->headroom;
+-	if (!xskb->pool->unaligned)
+-		return xskb->orig_addr + offset;
+-	return xskb->orig_addr + (offset << XSK_UNALIGNED_BUF_OFFSET_SHIFT);
++	if (!pool->unaligned)
++		return orig_addr;
++
++	offset = xskb->xdp.data - xskb->xdp.data_hard_start;
++	orig_addr -= offset;
++	offset += pool->headroom;
++	return orig_addr + (offset << XSK_UNALIGNED_BUF_OFFSET_SHIFT);
+ }
+ 
+ static inline bool xp_tx_metadata_enabled(const struct xsk_buff_pool *pool)
+--- a/net/xdp/xsk.c
++++ b/net/xdp/xsk.c
+@@ -141,7 +141,7 @@ static int __xsk_rcv_zc(struct xdp_sock
+ 	u64 addr;
+ 	int err;
+ 
+-	addr = xp_get_handle(xskb);
++	addr = xp_get_handle(xskb, xskb->pool);
+ 	err = xskq_prod_reserve_desc(xs->rx, addr, len, flags);
+ 	if (err) {
+ 		xs->rx_queue_full++;
+--- a/net/xdp/xsk_buff_pool.c
++++ b/net/xdp/xsk_buff_pool.c
+@@ -416,8 +416,10 @@ static int xp_init_dma_info(struct xsk_b
+ 
+ 		for (i = 0; i < pool->heads_cnt; i++) {
+ 			struct xdp_buff_xsk *xskb = &pool->heads[i];
++			u64 orig_addr;
+ 
+-			xp_init_xskb_dma(xskb, pool, dma_map->dma_pages, xskb->orig_addr);
++			orig_addr = xskb->xdp.data_hard_start - pool->addrs - pool->headroom;
++			xp_init_xskb_dma(xskb, pool, dma_map->dma_pages, orig_addr);
+ 		}
+ 	}
+ 

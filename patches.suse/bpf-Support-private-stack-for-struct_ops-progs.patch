@@ -1,0 +1,105 @@
+From: Yonghong Song <yonghong.song@linux.dev>
+Date: Tue, 12 Nov 2024 08:39:33 -0800
+Subject: bpf: Support private stack for struct_ops progs
+Patch-mainline: v6.13-rc1
+Git-commit: 5bd36da1e37e7a78e8b38efd287de6e1394b7d6e
+References: jsc#PED-14653
+
+For struct_ops progs, whether a particular prog uses private stack
+depends on prog->aux->priv_stack_requested setting before actual
+insn-level verification for that prog. One particular implementation
+is to piggyback on struct_ops->check_member(). The next patch has
+an example for this. The struct_ops->check_member() sets
+prog->aux->priv_stack_requested to be true which enables private stack
+usage.
+
+The struct_ops prog follows the same rule as kprobe/tracing progs after
+function bpf_enable_priv_stack(). For example, even a struct_ops prog
+requests private stack, it could still use normal kernel stack if
+the stack size is small (< 64 bytes).
+
+Similar to tracing progs, nested same cpu same prog run will be skipped.
+A field (recursion_detected()) is added to bpf_prog_aux structure.
+If bpf_prog->aux->recursion_detected is implemented by the struct_ops
+subsystem and nested same cpu/prog happens, the function will be
+triggered to report an error, collect related info, etc.
+
+Acked-by: Tejun Heo <tj@kernel.org>
+Signed-off-by: Yonghong Song <yonghong.song@linux.dev>
+Link: https://lore.kernel.org/r/20241112163933.2224962-1-yonghong.song@linux.dev
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ include/linux/bpf.h          |    2 ++
+ include/linux/bpf_verifier.h |    1 +
+ kernel/bpf/trampoline.c      |    4 ++++
+ kernel/bpf/verifier.c        |    7 ++++++-
+ 4 files changed, 13 insertions(+), 1 deletion(-)
+
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -1525,9 +1525,11 @@ struct bpf_prog_aux {
+ 	bool exception_boundary;
+ 	bool is_extended; /* true if extended by freplace program */
+ 	bool jits_use_priv_stack;
++	bool priv_stack_requested;
+ 	u64 prog_array_member_cnt; /* counts how many times as member of prog_array */
+ 	struct mutex ext_mutex; /* mutex for is_extended and prog_array_member_cnt */
+ 	struct bpf_arena *arena;
++	void (*recursion_detected)(struct bpf_prog *prog); /* callback if recursion is detected */
+ 	/* BTF_KIND_FUNC_PROTO for valid attach_btf_id */
+ 	const struct btf_type *attach_func_proto;
+ 	/* function name for valid attach_btf_id */
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@ -879,6 +879,7 @@ static inline bool bpf_prog_check_recur(
+ 	case BPF_PROG_TYPE_TRACING:
+ 		return prog->expected_attach_type != BPF_TRACE_ITER;
+ 	case BPF_PROG_TYPE_STRUCT_OPS:
++		return prog->aux->jits_use_priv_stack;
+ 	case BPF_PROG_TYPE_LSM:
+ 		return false;
+ 	default:
+--- a/kernel/bpf/trampoline.c
++++ b/kernel/bpf/trampoline.c
+@@ -899,6 +899,8 @@ static u64 notrace __bpf_prog_enter_recu
+ 
+ 	if (unlikely(this_cpu_inc_return(*(prog->active)) != 1)) {
+ 		bpf_prog_inc_misses_counter(prog);
++		if (prog->aux->recursion_detected)
++			prog->aux->recursion_detected(prog);
+ 		return 0;
+ 	}
+ 	return bpf_prog_start_time();
+@@ -975,6 +977,8 @@ u64 notrace __bpf_prog_enter_sleepable_r
+ 
+ 	if (unlikely(this_cpu_inc_return(*(prog->active)) != 1)) {
+ 		bpf_prog_inc_misses_counter(prog);
++		if (prog->aux->recursion_detected)
++			prog->aux->recursion_detected(prog);
+ 		return 0;
+ 	}
+ 	return bpf_prog_start_time();
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -6110,7 +6110,7 @@ static enum priv_stack_mode bpf_enable_p
+ 	case BPF_PROG_TYPE_TRACING:
+ 	case BPF_PROG_TYPE_LSM:
+ 	case BPF_PROG_TYPE_STRUCT_OPS:
+-		if (bpf_prog_check_recur(prog))
++		if (prog->aux->priv_stack_requested || bpf_prog_check_recur(prog))
+ 			return PRIV_STACK_ADAPTIVE;
+ 		fallthrough;
+ 	default:
+@@ -22046,6 +22046,11 @@ static int check_struct_ops_btf_id(struc
+ 		}
+ 	}
+ 
++	if (prog->aux->priv_stack_requested && !bpf_jit_supports_private_stack()) {
++		verbose(env, "Private stack not supported by jit\n");
++		return -EACCES;
++	}
++
+ 	/* btf_ctx_access() used this to provide argument type info */
+ 	prog->aux->ctx_arg_info =
+ 		st_ops_desc->arg_info[member_idx].info;

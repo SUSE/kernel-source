@@ -1,0 +1,117 @@
+From: Mahe Tardy <mahe.tardy@gmail.com>
+Date: Mon, 7 Oct 2024 09:59:58 +0000
+Subject: selftests/bpf: add tcx netns cookie tests
+Patch-mainline: v6.13-rc1
+Git-commit: 693fe954d61d4696aa06f631fd0bce0b3b3e8027
+References: jsc#PED-14653
+
+Add netns cookie test that verifies the helper is now supported and work
+in the context of tc programs.
+
+Signed-off-by: Mahe Tardy <mahe.tardy@gmail.com>
+Link: https://lore.kernel.org/r/20241007095958.97442-2-mahe.tardy@gmail.com
+Signed-off-by: Martin KaFai Lau <martin.lau@kernel.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ tools/testing/selftests/bpf/prog_tests/netns_cookie.c |   29 +++++++++++++-----
+ tools/testing/selftests/bpf/progs/netns_cookie_prog.c |   10 ++++++
+ 2 files changed, 32 insertions(+), 7 deletions(-)
+
+--- a/tools/testing/selftests/bpf/prog_tests/netns_cookie.c
++++ b/tools/testing/selftests/bpf/prog_tests/netns_cookie.c
+@@ -8,12 +8,16 @@
+ #define SO_NETNS_COOKIE 71
+ #endif
+ 
++#define loopback 1
++
+ static int duration;
+ 
+ void test_netns_cookie(void)
+ {
++	LIBBPF_OPTS(bpf_prog_attach_opts, opta);
++	LIBBPF_OPTS(bpf_prog_detach_opts, optd);
+ 	int server_fd = -1, client_fd = -1, cgroup_fd = -1;
+-	int err, val, ret, map, verdict;
++	int err, val, ret, map, verdict, tc_fd;
+ 	struct netns_cookie_prog *skel;
+ 	uint64_t cookie_expected_value;
+ 	socklen_t vallen = sizeof(cookie_expected_value);
+@@ -38,36 +42,47 @@ void test_netns_cookie(void)
+ 	if (!ASSERT_OK(err, "prog_attach"))
+ 		goto done;
+ 
++	tc_fd = bpf_program__fd(skel->progs.get_netns_cookie_tcx);
++	err = bpf_prog_attach_opts(tc_fd, loopback, BPF_TCX_INGRESS, &opta);
++	if (!ASSERT_OK(err, "prog_attach"))
++		goto done;
++
+ 	server_fd = start_server(AF_INET6, SOCK_STREAM, "::1", 0, 0);
+ 	if (CHECK(server_fd < 0, "start_server", "errno %d\n", errno))
+-		goto done;
++		goto cleanup_tc;
+ 
+ 	client_fd = connect_to_fd(server_fd, 0);
+ 	if (CHECK(client_fd < 0, "connect_to_fd", "errno %d\n", errno))
+-		goto done;
++		goto cleanup_tc;
+ 
+ 	ret = send(client_fd, send_msg, sizeof(send_msg), 0);
+ 	if (CHECK(ret != sizeof(send_msg), "send(msg)", "ret:%d\n", ret))
+-		goto done;
++		goto cleanup_tc;
+ 
+ 	err = bpf_map_lookup_elem(bpf_map__fd(skel->maps.sockops_netns_cookies),
+ 				  &client_fd, &val);
+ 	if (!ASSERT_OK(err, "map_lookup(sockops_netns_cookies)"))
+-		goto done;
++		goto cleanup_tc;
+ 
+ 	err = getsockopt(client_fd, SOL_SOCKET, SO_NETNS_COOKIE,
+ 			 &cookie_expected_value, &vallen);
+ 	if (!ASSERT_OK(err, "getsockopt"))
+-		goto done;
++		goto cleanup_tc;
+ 
+ 	ASSERT_EQ(val, cookie_expected_value, "cookie_value");
+ 
+ 	err = bpf_map_lookup_elem(bpf_map__fd(skel->maps.sk_msg_netns_cookies),
+ 				  &client_fd, &val);
+ 	if (!ASSERT_OK(err, "map_lookup(sk_msg_netns_cookies)"))
+-		goto done;
++		goto cleanup_tc;
+ 
+ 	ASSERT_EQ(val, cookie_expected_value, "cookie_value");
++	ASSERT_EQ(skel->bss->tcx_init_netns_cookie, cookie_expected_value, "cookie_value");
++	ASSERT_EQ(skel->bss->tcx_netns_cookie, cookie_expected_value, "cookie_value");
++
++cleanup_tc:
++	err = bpf_prog_detach_opts(tc_fd, loopback, BPF_TCX_INGRESS, &optd);
++	ASSERT_OK(err, "prog_detach");
+ 
+ done:
+ 	if (server_fd != -1)
+--- a/tools/testing/selftests/bpf/progs/netns_cookie_prog.c
++++ b/tools/testing/selftests/bpf/progs/netns_cookie_prog.c
+@@ -27,6 +27,8 @@ struct {
+ 	__type(value, __u64);
+ } sock_map SEC(".maps");
+ 
++int tcx_init_netns_cookie, tcx_netns_cookie;
++
+ SEC("sockops")
+ int get_netns_cookie_sockops(struct bpf_sock_ops *ctx)
+ {
+@@ -81,4 +83,12 @@ int get_netns_cookie_sk_msg(struct sk_ms
+ 	return 1;
+ }
+ 
++SEC("tcx/ingress")
++int get_netns_cookie_tcx(struct __sk_buff *skb)
++{
++	tcx_init_netns_cookie = bpf_get_netns_cookie(NULL);
++	tcx_netns_cookie = bpf_get_netns_cookie(skb);
++	return TCX_PASS;
++}
++
+ char _license[] SEC("license") = "GPL";

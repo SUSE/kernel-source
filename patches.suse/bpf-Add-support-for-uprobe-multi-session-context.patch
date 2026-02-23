@@ -1,0 +1,124 @@
+From: Jiri Olsa <jolsa@kernel.org>
+Date: Fri, 8 Nov 2024 14:45:35 +0100
+Subject: bpf: Add support for uprobe multi session context
+Patch-mainline: v6.13-rc1
+Git-commit: 99b403d2060d3e2604958a0ec3a7f37b18256d6b
+References: jsc#PED-14653
+
+Placing bpf_session_run_ctx layer in between bpf_run_ctx and
+bpf_uprobe_multi_run_ctx, so the session data can be retrieved
+from uprobe_multi link.
+
+Plus granting session kfuncs access to uprobe session programs.
+
+Signed-off-by: Jiri Olsa <jolsa@kernel.org>
+Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+Acked-by: Andrii Nakryiko <andrii@kernel.org>
+Link: https://lore.kernel.org/bpf/20241108134544.480660-5-jolsa@kernel.org
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ kernel/trace/bpf_trace.c |   28 ++++++++++++++++++----------
+ 1 file changed, 18 insertions(+), 10 deletions(-)
+
+--- a/kernel/trace/bpf_trace.c
++++ b/kernel/trace/bpf_trace.c
+@@ -3120,7 +3120,7 @@ struct bpf_uprobe_multi_link {
+ };
+ 
+ struct bpf_uprobe_multi_run_ctx {
+-	struct bpf_run_ctx run_ctx;
++	struct bpf_session_run_ctx session_ctx;
+ 	unsigned long entry_ip;
+ 	struct bpf_uprobe *uprobe;
+ };
+@@ -3231,16 +3231,22 @@ static const struct bpf_link_ops bpf_upr
+ 
+ static int uprobe_prog_run(struct bpf_uprobe *uprobe,
+ 			   unsigned long entry_ip,
+-			   struct pt_regs *regs)
++			   struct pt_regs *regs,
++			   bool is_return, void *data)
+ {
+ 	struct bpf_uprobe_multi_link *link = uprobe->link;
+ 	struct bpf_uprobe_multi_run_ctx run_ctx = {
++		.session_ctx = {
++			.is_return = is_return,
++			.data = data,
++		},
+ 		.entry_ip = entry_ip,
+ 		.uprobe = uprobe,
+ 	};
+ 	struct bpf_prog *prog = link->link.prog;
+ 	bool sleepable = prog->sleepable;
+ 	struct bpf_run_ctx *old_run_ctx;
++	int err;
+ 
+ 	if (link->task && !same_thread_group(current, link->task))
+ 		return 0;
+@@ -3252,8 +3258,8 @@ static int uprobe_prog_run(struct bpf_up
+ 
+ 	migrate_disable();
+ 
+-	old_run_ctx = bpf_set_run_ctx(&run_ctx.run_ctx);
+-	bpf_prog_run(link->link.prog, regs);
++	old_run_ctx = bpf_set_run_ctx(&run_ctx.session_ctx.run_ctx);
++	err = bpf_prog_run(link->link.prog, regs);
+ 	bpf_reset_run_ctx(old_run_ctx);
+ 
+ 	migrate_enable();
+@@ -3262,7 +3268,7 @@ static int uprobe_prog_run(struct bpf_up
+ 		rcu_read_unlock_trace();
+ 	else
+ 		rcu_read_unlock();
+-	return 0;
++	return err;
+ }
+ 
+ static bool
+@@ -3282,7 +3288,7 @@ uprobe_multi_link_handler(struct uprobe_
+ 	int ret;
+ 
+ 	uprobe = container_of(con, struct bpf_uprobe, consumer);
+-	ret = uprobe_prog_run(uprobe, instruction_pointer(regs), regs);
++	ret = uprobe_prog_run(uprobe, instruction_pointer(regs), regs, false, data);
+ 	if (uprobe->session)
+ 		return ret ? UPROBE_HANDLER_IGNORE : 0;
+ 	return 0;
+@@ -3295,7 +3301,7 @@ uprobe_multi_link_ret_handler(struct upr
+ 	struct bpf_uprobe *uprobe;
+ 
+ 	uprobe = container_of(con, struct bpf_uprobe, consumer);
+-	uprobe_prog_run(uprobe, func, regs);
++	uprobe_prog_run(uprobe, func, regs, true, data);
+ 	return 0;
+ }
+ 
+@@ -3303,7 +3309,8 @@ static u64 bpf_uprobe_multi_entry_ip(str
+ {
+ 	struct bpf_uprobe_multi_run_ctx *run_ctx;
+ 
+-	run_ctx = container_of(current->bpf_ctx, struct bpf_uprobe_multi_run_ctx, run_ctx);
++	run_ctx = container_of(current->bpf_ctx, struct bpf_uprobe_multi_run_ctx,
++			       session_ctx.run_ctx);
+ 	return run_ctx->entry_ip;
+ }
+ 
+@@ -3311,7 +3318,8 @@ static u64 bpf_uprobe_multi_cookie(struc
+ {
+ 	struct bpf_uprobe_multi_run_ctx *run_ctx;
+ 
+-	run_ctx = container_of(current->bpf_ctx, struct bpf_uprobe_multi_run_ctx, run_ctx);
++	run_ctx = container_of(current->bpf_ctx, struct bpf_uprobe_multi_run_ctx,
++			       session_ctx.run_ctx);
+ 	return run_ctx->uprobe->cookie;
+ }
+ 
+@@ -3505,7 +3513,7 @@ static int bpf_kprobe_multi_filter(const
+ 	if (!btf_id_set8_contains(&kprobe_multi_kfunc_set_ids, kfunc_id))
+ 		return 0;
+ 
+-	if (!is_kprobe_session(prog))
++	if (!is_kprobe_session(prog) && !is_uprobe_session(prog))
+ 		return -EACCES;
+ 
+ 	return 0;

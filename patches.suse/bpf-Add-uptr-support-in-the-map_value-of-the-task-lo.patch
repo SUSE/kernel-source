@@ -1,0 +1,295 @@
+From: Martin KaFai Lau <martin.lau@kernel.org>
+Date: Wed, 23 Oct 2024 16:47:53 -0700
+Subject: bpf: Add uptr support in the map_value of the task local storage.
+Patch-mainline: v6.13-rc1
+Git-commit: ba512b00e5efbf7e19cfb7fa9f66ce82669b7077
+References: jsc#PED-14653
+
+This patch adds uptr support in the map_value of the task local storage.
+
+struct map_value {
+	struct user_data __uptr *uptr;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__type(key, int);
+	__type(value, struct value_type);
+} datamap SEC(".maps");
+
+A new bpf_obj_pin_uptrs() is added to pin the user page and
+also stores the kernel address back to the uptr for the
+bpf prog to use later. It currently does not support
+the uptr pointing to a user struct across two pages.
+It also excludes PageHighMem support to keep it simple.
+As of now, the 32bit bpf jit is missing other more crucial bpf
+features. For example, many important bpf features depend on
+bpf kfunc now but so far only one arch (x86-32) supports it
+which was added by me as an example when kfunc was first
+introduced to bpf.
+
+The uptr can only be stored to the task local storage by the
+syscall update_elem. Meaning the uptr will not be considered
+if it is provided by the bpf prog through
+bpf_task_storage_get(BPF_LOCAL_STORAGE_GET_F_CREATE).
+This is enforced by only calling
+bpf_local_storage_update(swap_uptrs==true) in
+bpf_pid_task_storage_update_elem. Everywhere else will
+have swap_uptrs==false.
+
+This will pump down to bpf_selem_alloc(swap_uptrs==true). It is
+the only case that bpf_selem_alloc() will take the uptr value when
+updating the newly allocated selem. bpf_obj_swap_uptrs() is added
+to swap the uptr between the SDATA(selem)->data and the user provided
+map_value in "void *value". bpf_obj_swap_uptrs() makes the
+SDATA(selem)->data takes the ownership of the uptr and the user space
+provided map_value will have NULL in the uptr.
+
+The bpf_obj_unpin_uptrs() is called after map->ops->map_update_elem()
+returning error. If the map->ops->map_update_elem has reached
+a state that the local storage has taken the uptr ownership,
+the bpf_obj_unpin_uptrs() will be a no op because the uptr
+is NULL. A "__"bpf_obj_unpin_uptrs is added to make this
+error path unpin easier such that it does not have to check
+the map->record is NULL or not.
+
+BPF_F_LOCK is not supported when the map_value has uptr.
+This can be revisited later if there is a use case. A similar
+swap_uptrs idea can be considered.
+
+The final bit is to do unpin_user_page in the bpf_obj_free_fields().
+The earlier patch has ensured that the bpf_obj_free_fields() has
+gone through the rcu gp when needed.
+
+Cc: linux-mm@kvack.org
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Signed-off-by: Martin KaFai Lau <martin.lau@kernel.org>
+Acked-by: Shakeel Butt <shakeel.butt@linux.dev>
+Link: https://lore.kernel.org/r/20241023234759.860539-7-martin.lau@linux.dev
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ include/linux/bpf.h            |   20 +++++++
+ kernel/bpf/bpf_local_storage.c |    7 +-
+ kernel/bpf/bpf_task_storage.c  |    5 +
+ kernel/bpf/syscall.c           |  106 +++++++++++++++++++++++++++++++++++++++--
+ 4 files changed, 131 insertions(+), 7 deletions(-)
+
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -424,6 +424,7 @@ static inline void bpf_obj_init_field(co
+ 	case BPF_KPTR_UNREF:
+ 	case BPF_KPTR_REF:
+ 	case BPF_KPTR_PERCPU:
++	case BPF_UPTR:
+ 		break;
+ 	default:
+ 		WARN_ON_ONCE(1);
+@@ -512,6 +513,25 @@ static inline void copy_map_value_long(s
+ 	bpf_obj_memcpy(map->record, dst, src, map->value_size, true);
+ }
+ 
++static inline void bpf_obj_swap_uptrs(const struct btf_record *rec, void *dst, void *src)
++{
++	unsigned long *src_uptr, *dst_uptr;
++	const struct btf_field *field;
++	int i;
++
++	if (!btf_record_has_field(rec, BPF_UPTR))
++		return;
++
++	for (i = 0, field = rec->fields; i < rec->cnt; i++, field++) {
++		if (field->type != BPF_UPTR)
++			continue;
++
++		src_uptr = src + field->offset;
++		dst_uptr = dst + field->offset;
++		swap(*src_uptr, *dst_uptr);
++	}
++}
++
+ static inline void bpf_obj_memzero(struct btf_record *rec, void *dst, u32 size)
+ {
+ 	u32 curr_off = 0;
+--- a/kernel/bpf/bpf_local_storage.c
++++ b/kernel/bpf/bpf_local_storage.c
+@@ -99,9 +99,12 @@ bpf_selem_alloc(struct bpf_local_storage
+ 	}
+ 
+ 	if (selem) {
+-		if (value)
++		if (value) {
++			/* No need to call check_and_init_map_value as memory is zero init */
+ 			copy_map_value(&smap->map, SDATA(selem)->data, value);
+-		/* No need to call check_and_init_map_value as memory is zero init */
++			if (swap_uptrs)
++				bpf_obj_swap_uptrs(smap->map.record, SDATA(selem)->data, value);
++		}
+ 		return selem;
+ 	}
+ 
+--- a/kernel/bpf/bpf_task_storage.c
++++ b/kernel/bpf/bpf_task_storage.c
+@@ -128,6 +128,9 @@ static long bpf_pid_task_storage_update_
+ 	struct pid *pid;
+ 	int fd, err;
+ 
++	if ((map_flags & BPF_F_LOCK) && btf_record_has_field(map->record, BPF_UPTR))
++		return -EOPNOTSUPP;
++
+ 	fd = *(int *)key;
+ 	pid = pidfd_get_pid(fd, &f_flags);
+ 	if (IS_ERR(pid))
+@@ -146,7 +149,7 @@ static long bpf_pid_task_storage_update_
+ 	bpf_task_storage_lock();
+ 	sdata = bpf_local_storage_update(
+ 		task, (struct bpf_local_storage_map *)map, value, map_flags,
+-		false, GFP_ATOMIC);
++		true, GFP_ATOMIC);
+ 	bpf_task_storage_unlock();
+ 
+ 	err = PTR_ERR_OR_ZERO(sdata);
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -155,6 +155,89 @@ static void maybe_wait_bpf_programs(stru
+ 		synchronize_rcu();
+ }
+ 
++static void unpin_uptr_kaddr(void *kaddr)
++{
++	if (kaddr)
++		unpin_user_page(virt_to_page(kaddr));
++}
++
++static void __bpf_obj_unpin_uptrs(struct btf_record *rec, u32 cnt, void *obj)
++{
++	const struct btf_field *field;
++	void **uptr_addr;
++	int i;
++
++	for (i = 0, field = rec->fields; i < cnt; i++, field++) {
++		if (field->type != BPF_UPTR)
++			continue;
++
++		uptr_addr = obj + field->offset;
++		unpin_uptr_kaddr(*uptr_addr);
++	}
++}
++
++static void bpf_obj_unpin_uptrs(struct btf_record *rec, void *obj)
++{
++	if (!btf_record_has_field(rec, BPF_UPTR))
++		return;
++
++	__bpf_obj_unpin_uptrs(rec, rec->cnt, obj);
++}
++
++static int bpf_obj_pin_uptrs(struct btf_record *rec, void *obj)
++{
++	const struct btf_field *field;
++	const struct btf_type *t;
++	unsigned long start, end;
++	struct page *page;
++	void **uptr_addr;
++	int i, err;
++
++	if (!btf_record_has_field(rec, BPF_UPTR))
++		return 0;
++
++	for (i = 0, field = rec->fields; i < rec->cnt; i++, field++) {
++		if (field->type != BPF_UPTR)
++			continue;
++
++		uptr_addr = obj + field->offset;
++		start = *(unsigned long *)uptr_addr;
++		if (!start)
++			continue;
++
++		t = btf_type_by_id(field->kptr.btf, field->kptr.btf_id);
++		/* t->size was checked for zero before */
++		if (check_add_overflow(start, t->size - 1, &end)) {
++			err = -EFAULT;
++			goto unpin_all;
++		}
++
++		/* The uptr's struct cannot span across two pages */
++		if ((start & PAGE_MASK) != (end & PAGE_MASK)) {
++			err = -EOPNOTSUPP;
++			goto unpin_all;
++		}
++
++		err = pin_user_pages_fast(start, 1, FOLL_LONGTERM | FOLL_WRITE, &page);
++		if (err != 1)
++			goto unpin_all;
++
++		if (PageHighMem(page)) {
++			err = -EOPNOTSUPP;
++			unpin_user_page(page);
++			goto unpin_all;
++		}
++
++		*uptr_addr = page_address(page) + offset_in_page(start);
++	}
++
++	return 0;
++
++unpin_all:
++	__bpf_obj_unpin_uptrs(rec, i, obj);
++	return err;
++}
++
+ static int bpf_map_update_value(struct bpf_map *map, struct file *map_file,
+ 				void *key, void *value, __u64 flags)
+ {
+@@ -199,9 +282,14 @@ static int bpf_map_update_value(struct b
+ 		   map->map_type == BPF_MAP_TYPE_BLOOM_FILTER) {
+ 		err = map->ops->map_push_elem(map, value, flags);
+ 	} else {
+-		rcu_read_lock();
+-		err = map->ops->map_update_elem(map, key, value, flags);
+-		rcu_read_unlock();
++		err = bpf_obj_pin_uptrs(map->record, value);
++		if (!err) {
++			rcu_read_lock();
++			err = map->ops->map_update_elem(map, key, value, flags);
++			rcu_read_unlock();
++			if (err)
++				bpf_obj_unpin_uptrs(map->record, value);
++		}
+ 	}
+ 	bpf_enable_instrumentation();
+ 
+@@ -716,6 +804,10 @@ void bpf_obj_free_fields(const struct bt
+ 				field->kptr.dtor(xchgd_field);
+ 			}
+ 			break;
++		case BPF_UPTR:
++			/* The caller ensured that no one is using the uptr */
++			unpin_uptr_kaddr(*(void **)field_ptr);
++			break;
+ 		case BPF_LIST_HEAD:
+ 			if (WARN_ON_ONCE(rec->spin_lock_off < 0))
+ 				continue;
+@@ -1107,7 +1199,7 @@ static int map_check_btf(struct bpf_map
+ 
+ 	map->record = btf_parse_fields(btf, value_type,
+ 				       BPF_SPIN_LOCK | BPF_TIMER | BPF_KPTR | BPF_LIST_HEAD |
+-				       BPF_RB_ROOT | BPF_REFCOUNT | BPF_WORKQUEUE,
++				       BPF_RB_ROOT | BPF_REFCOUNT | BPF_WORKQUEUE | BPF_UPTR,
+ 				       map->value_size);
+ 	if (!IS_ERR_OR_NULL(map->record)) {
+ 		int i;
+@@ -1162,6 +1254,12 @@ static int map_check_btf(struct bpf_map
+ 					ret = -EOPNOTSUPP;
+ 					goto free_map_tab;
+ 				}
++				break;
++			case BPF_UPTR:
++				if (map->map_type != BPF_MAP_TYPE_TASK_STORAGE) {
++					ret = -EOPNOTSUPP;
++					goto free_map_tab;
++				}
+ 				break;
+ 			case BPF_LIST_HEAD:
+ 			case BPF_RB_ROOT:

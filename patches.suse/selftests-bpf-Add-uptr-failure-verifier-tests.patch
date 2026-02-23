@@ -1,0 +1,143 @@
+From: Martin KaFai Lau <martin.lau@kernel.org>
+Date: Wed, 23 Oct 2024 16:47:58 -0700
+Subject: selftests/bpf: Add uptr failure verifier tests
+Patch-mainline: v6.13-rc1
+Git-commit: 898cbca4a7579bea3ab746cd8dc33027bff80dac
+References: jsc#PED-14653
+
+Add verifier tests to ensure invalid uptr usages are rejected.
+
+Signed-off-by: Martin KaFai Lau <martin.lau@kernel.org>
+Link: https://lore.kernel.org/r/20241023234759.860539-12-martin.lau@linux.dev
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ tools/testing/selftests/bpf/prog_tests/task_local_storage.c |    2 
+ tools/testing/selftests/bpf/progs/uptr_failure.c            |  105 ++++++++++++
+ 2 files changed, 107 insertions(+)
+ create mode 100644 tools/testing/selftests/bpf/progs/uptr_failure.c
+
+--- a/tools/testing/selftests/bpf/prog_tests/task_local_storage.c
++++ b/tools/testing/selftests/bpf/prog_tests/task_local_storage.c
+@@ -18,6 +18,7 @@
+ #include "uptr_test_common.h"
+ #include "task_ls_uptr.skel.h"
+ #include "uptr_update_failure.skel.h"
++#include "uptr_failure.skel.h"
+ 
+ static void test_sys_enter_exit(void)
+ {
+@@ -467,4 +468,5 @@ void test_task_local_storage(void)
+ 		test_uptr_across_pages();
+ 	if (test__start_subtest("uptr_update_failure"))
+ 		test_uptr_update_failure();
++	RUN_TESTS(uptr_failure);
+ }
+--- /dev/null
++++ b/tools/testing/selftests/bpf/progs/uptr_failure.c
+@@ -0,0 +1,105 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2024 Meta Platforms, Inc. and affiliates. */
++
++#include <vmlinux.h>
++#include <bpf/bpf_helpers.h>
++#include "bpf_experimental.h"
++#include "bpf_misc.h"
++#include "uptr_test_common.h"
++
++struct {
++	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
++	__uint(map_flags, BPF_F_NO_PREALLOC);
++	__type(key, int);
++	__type(value, struct value_type);
++} datamap SEC(".maps");
++
++SEC("?syscall")
++__failure __msg("store to uptr disallowed")
++int uptr_write(const void *ctx)
++{
++	struct task_struct *task;
++	struct value_type *v;
++
++	task = bpf_get_current_task_btf();
++	v = bpf_task_storage_get(&datamap, task, 0,
++				 BPF_LOCAL_STORAGE_GET_F_CREATE);
++	if (!v)
++		return 0;
++
++	v->udata = NULL;
++	return 0;
++}
++
++SEC("?syscall")
++__failure __msg("store to uptr disallowed")
++int uptr_write_nested(const void *ctx)
++{
++	struct task_struct *task;
++	struct value_type *v;
++
++	task = bpf_get_current_task_btf();
++	v = bpf_task_storage_get(&datamap, task, 0,
++				 BPF_LOCAL_STORAGE_GET_F_CREATE);
++	if (!v)
++		return 0;
++
++	v->nested.udata = NULL;
++	return 0;
++}
++
++SEC("?syscall")
++__failure __msg("R1 invalid mem access 'mem_or_null'")
++int uptr_no_null_check(const void *ctx)
++{
++	struct task_struct *task;
++	struct value_type *v;
++
++	task = bpf_get_current_task_btf();
++	v = bpf_task_storage_get(&datamap, task, 0,
++				 BPF_LOCAL_STORAGE_GET_F_CREATE);
++	if (!v)
++		return 0;
++
++	v->udata->result = 0;
++
++	return 0;
++}
++
++SEC("?syscall")
++__failure __msg("doesn't point to kptr")
++int uptr_kptr_xchg(const void *ctx)
++{
++	struct task_struct *task;
++	struct value_type *v;
++
++	task = bpf_get_current_task_btf();
++	v = bpf_task_storage_get(&datamap, task, 0,
++				 BPF_LOCAL_STORAGE_GET_F_CREATE);
++	if (!v)
++		return 0;
++
++	bpf_kptr_xchg(&v->udata, NULL);
++
++	return 0;
++}
++
++SEC("?syscall")
++__failure __msg("invalid mem access 'scalar'")
++int uptr_obj_new(const void *ctx)
++{
++	struct value_type *v;
++
++	v = bpf_obj_new(typeof(*v));
++	if (!v)
++		return 0;
++
++	if (v->udata)
++		v->udata->result = 0;
++
++	bpf_obj_drop(v);
++
++	return 0;
++}
++
++char _license[] SEC("license") = "GPL";

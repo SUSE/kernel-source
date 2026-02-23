@@ -1,0 +1,83 @@
+From: Mykyta Yatsenko <yatsenko@meta.com>
+Date: Wed, 23 Oct 2024 16:53:14 +0100
+Subject: selftests/bpf: Increase verifier log limit in veristat
+Patch-mainline: v6.13-rc1
+Git-commit: 1f7c33630724dfe47f99748bd2a9a56ec8bd337f
+References: jsc#PED-14653
+
+The current default buffer size of 16MB allocated by veristat is no
+longer sufficient to hold the verifier logs of some production BPF
+programs. To address this issue, we need to increase the verifier log
+limit.
+Commit 7a9f5c65abcc ("bpf: increase verifier log limit") has already
+increased the supported buffer size by the kernel, but veristat users
+need to explicitly pass a log size argument to use the bigger log.
+
+This patch adds a function to detect the maximum verifier log size
+supported by the kernel and uses that by default in veristat.
+This ensures that veristat can handle larger verifier logs without
+requiring users to manually specify the log size.
+
+Signed-off-by: Mykyta Yatsenko <yatsenko@meta.com>
+Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+Link: https://lore.kernel.org/bpf/20241023155314.126255-1-mykyta.yatsenko5@gmail.com
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ tools/testing/selftests/bpf/veristat.c |   32 +++++++++++++++++++++++++++++++-
+ 1 file changed, 31 insertions(+), 1 deletion(-)
+
+--- a/tools/testing/selftests/bpf/veristat.c
++++ b/tools/testing/selftests/bpf/veristat.c
+@@ -16,6 +16,7 @@
+ #include <sys/stat.h>
+ #include <bpf/libbpf.h>
+ #include <bpf/btf.h>
++#include <bpf/bpf.h>
+ #include <libelf.h>
+ #include <gelf.h>
+ #include <float.h>
+@@ -1109,6 +1110,35 @@ skip_freplace_fixup:
+ 	return;
+ }
+ 
++static int max_verifier_log_size(void)
++{
++	const int SMALL_LOG_SIZE = UINT_MAX >> 8;
++	const int BIG_LOG_SIZE = UINT_MAX >> 2;
++	struct bpf_insn insns[] = {
++		{ .code = BPF_ALU | BPF_MOV | BPF_X, .dst_reg = BPF_REG_0, },
++		{ .code  = BPF_JMP | BPF_EXIT, },
++	};
++	LIBBPF_OPTS(bpf_prog_load_opts, opts,
++		    .log_size = BIG_LOG_SIZE,
++		    .log_buf = (void *)-1,
++		    .log_level = 4
++	);
++	int ret, insn_cnt = ARRAY_SIZE(insns);
++	static int log_size;
++
++	if (log_size != 0)
++		return log_size;
++
++	ret = bpf_prog_load(BPF_PROG_TYPE_TRACEPOINT, NULL, "GPL", insns, insn_cnt, &opts);
++
++	if (ret == -EFAULT)
++		log_size = BIG_LOG_SIZE;
++	else /* ret == -EINVAL, big log size is not supported by the verifier */
++		log_size = SMALL_LOG_SIZE;
++
++	return log_size;
++}
++
+ static int process_prog(const char *filename, struct bpf_object *obj, struct bpf_program *prog)
+ {
+ 	const char *base_filename = basename(strdupa(filename));
+@@ -1132,7 +1162,7 @@ static int process_prog(const char *file
+ 	memset(stats, 0, sizeof(*stats));
+ 
+ 	if (env.verbose || env.top_src_lines > 0) {
+-		buf_sz = env.log_size ? env.log_size : 16 * 1024 * 1024;
++		buf_sz = env.log_size ? env.log_size : max_verifier_log_size();
+ 		buf = malloc(buf_sz);
+ 		if (!buf)
+ 			return -ENOMEM;

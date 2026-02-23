@@ -1,0 +1,235 @@
+From: Linus Torvalds <torvalds@linux-foundation.org>
+Date: Mon, 25 Nov 2024 09:21:21 -0800
+Subject: Revert "HID: bpf: allow write access to quirks field in struct
+ hid_device"
+Patch-mainline: v6.13-rc1
+Git-commit: 919464deeca24e5bf13b6c8efd0b1d25cc43866f
+References: jsc#PED-14653
+
+This reverts commit 6fd47effe92b, and the related self-test update
+commit e14e0eaeb040 ("selftests/hid: add test for assigning a given
+device to hid-generic").
+
+It results in things like the scroll wheel on Logitech mice not working
+after a reboot due to the kernel being confused about the state of the
+high-resolution mode.
+
+Quoting Benjamin Tissoires:
+ "The idea of 6fd47effe92b was to be able to call hid_bpf_rdesc_fixup()
+  once per reprobe of the device.
+
+  However, because the bpf filter can now change the quirk value, the
+  call had to be moved before the driver gets bound (which was
+  previously ensuring the unicity of the call).
+
+  The net effect is that now, in the case hid-generic gets loaded first
+  and then the specific driver gets loaded once the disk is available,
+  the value of ->quirks is not reset, but kept to the value that was set
+  by hid-generic (HID_QUIRK_INPUT_PER_APP).
+
+  Once hid-logitech-hidpp kicks in, that quirk is now set, which creates
+  two inputs for the single mouse: one keyboard for fancy shortcuts, and
+  one mouse node.
+
+  However, hid-logitech-hidpp expects only one input node to be attached
+  (it stores it into hidpp->input), and when a wheel event is received,
+  because there is some processing with high-resolution wheel events,
+  the wheel event is injected into hidpp->input.
+
+  And of course, when HID_QUIRK_INPUT_PER_APP is set, hidpp->input gets
+  the keyboard node, which doesn't have wheel event type, and the events
+  are ignored"
+
+Reported-and-bisected-by: Mike Galbraith <efault@gmx.de>
+Link: https://lore.kernel.org/all/CAHk-=wiUkQM3uheit2cNM0Y0OOY5qqspJgC8LkmOkJ2p2LDxcw@mail.gmail.com/
+Acked-by: Benjamin Tissoires <bentiss@kernel.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ drivers/hid/bpf/hid_bpf_struct_ops.c                |    1 
+ drivers/hid/hid-core.c                              |   11 --
+ tools/testing/selftests/hid/hid_bpf.c               |   80 --------------------
+ tools/testing/selftests/hid/progs/hid.c             |   12 ---
+ tools/testing/selftests/hid/progs/hid_bpf_helpers.h |    6 -
+ 5 files changed, 4 insertions(+), 106 deletions(-)
+
+--- a/drivers/hid/bpf/hid_bpf_struct_ops.c
++++ b/drivers/hid/bpf/hid_bpf_struct_ops.c
+@@ -79,7 +79,6 @@ static int hid_bpf_ops_btf_struct_access
+ 		WRITE_RANGE(hid_device, name, true),
+ 		WRITE_RANGE(hid_device, uniq, true),
+ 		WRITE_RANGE(hid_device, phys, true),
+-		WRITE_RANGE(hid_device, quirks, false),
+ 	};
+ #undef WRITE_RANGE
+ 	const struct btf_type *state = NULL;
+--- a/drivers/hid/hid-core.c
++++ b/drivers/hid/hid-core.c
+@@ -2703,12 +2703,6 @@ static int __hid_device_probe(struct hid
+ 	int ret;
+ 
+ 	if (!hdev->bpf_rsize) {
+-		unsigned int quirks;
+-
+-		/* reset the quirks that has been previously set */
+-		quirks = hid_lookup_quirk(hdev);
+-		hdev->quirks = quirks;
+-
+ 		/* in case a bpf program gets detached, we need to free the old one */
+ 		hid_free_bpf_rdesc(hdev);
+ 
+@@ -2718,9 +2712,6 @@ static int __hid_device_probe(struct hid
+ 		/* call_hid_bpf_rdesc_fixup will always return a valid pointer */
+ 		hdev->bpf_rdesc = call_hid_bpf_rdesc_fixup(hdev, hdev->dev_rdesc,
+ 							   &hdev->bpf_rsize);
+-		if (quirks ^ hdev->quirks)
+-			hid_info(hdev, "HID-BPF toggled quirks on the device: %04x",
+-				 quirks ^ hdev->quirks);
+ 	}
+ 
+ 	if (!hid_check_device_match(hdev, hdrv, &id))
+@@ -2730,6 +2721,8 @@ static int __hid_device_probe(struct hid
+ 	if (!hdev->devres_group_id)
+ 		return -ENOMEM;
+ 
++	/* reset the quirks that has been previously set */
++	hdev->quirks = hid_lookup_quirk(hdev);
+ 	hdev->driver = hdrv;
+ 
+ 	if (hdrv->probe) {
+--- a/tools/testing/selftests/hid/hid_bpf.c
++++ b/tools/testing/selftests/hid/hid_bpf.c
+@@ -54,41 +54,11 @@ FIXTURE_TEARDOWN(hid_bpf) {
+ 	hid_bpf_teardown(_metadata, self, variant); \
+ } while (0)
+ 
+-struct specific_device {
+-	const char test_name[64];
+-	__u16 bus;
+-	__u32 vid;
+-	__u32 pid;
+-};
+-
+ FIXTURE_SETUP(hid_bpf)
+ {
+-	const struct specific_device *match = NULL;
+ 	int err;
+ 
+-	const struct specific_device devices[] = {
+-	{
+-		.test_name = "test_hid_driver_probe",
+-		.bus = BUS_BLUETOOTH,
+-		.vid = 0x05ac,  /* USB_VENDOR_ID_APPLE */
+-		.pid = 0x022c,  /* USB_DEVICE_ID_APPLE_ALU_WIRELESS_ANSI */
+-	}, {
+-		.test_name = "*",
+-		.bus = BUS_USB,
+-		.vid = 0x0001,
+-		.pid = 0x0a36,
+-	}};
+-
+-	for (int i = 0; i < ARRAY_SIZE(devices); i++) {
+-		match = &devices[i];
+-		if (!strncmp(_metadata->name, devices[i].test_name, sizeof(devices[i].test_name)))
+-			break;
+-	}
+-
+-	ASSERT_OK_PTR(match);
+-
+-	err = setup_uhid(_metadata, &self->hid, match->bus, match->vid, match->pid,
+-			 rdesc, sizeof(rdesc));
++	err = setup_uhid(_metadata, &self->hid, BUS_USB, 0x0001, 0x0a36, rdesc, sizeof(rdesc));
+ 	ASSERT_OK(err);
+ }
+ 
+@@ -885,54 +855,6 @@ TEST_F(hid_bpf, test_hid_attach_flags)
+ 	ASSERT_EQ(buf[3], 3);
+ }
+ 
+-static bool is_using_driver(struct __test_metadata *_metadata, struct uhid_device *hid,
+-			    const char *driver)
+-{
+-	char driver_line[512];
+-	char uevent[1024];
+-	char temp[512];
+-	int fd, nread;
+-	bool found = false;
+-
+-	sprintf(uevent, "/sys/bus/hid/devices/%04X:%04X:%04X.%04X/uevent",
+-		hid->bus, hid->vid, hid->pid, hid->hid_id);
+-
+-	fd = open(uevent, O_RDONLY | O_NONBLOCK);
+-	if (fd < 0) {
+-		TH_LOG("couldn't open '%s': %d, %d", uevent, fd, errno);
+-		return false;
+-	}
+-
+-	sprintf(driver_line, "DRIVER=%s", driver);
+-
+-	nread = read(fd, temp, ARRAY_SIZE(temp));
+-	if (nread > 0 && (strstr(temp, driver_line)) != NULL)
+-		found = true;
+-
+-	close(fd);
+-
+-	return found;
+-}
+-
+-/*
+- * Attach hid_driver_probe to the given uhid device,
+- * check that the device is now using hid-generic.
+- */
+-TEST_F(hid_bpf, test_hid_driver_probe)
+-{
+-	const struct test_program progs[] = {
+-		{
+-			.name = "hid_test_driver_probe",
+-		},
+-	};
+-
+-	ASSERT_TRUE(is_using_driver(_metadata, &self->hid, "apple"));
+-
+-	LOAD_PROGRAMS(progs);
+-
+-	ASSERT_TRUE(is_using_driver(_metadata, &self->hid, "hid-generic"));
+-}
+-
+ /*
+  * Attach hid_rdesc_fixup to the given uhid device,
+  * retrieve and open the matching hidraw node,
+--- a/tools/testing/selftests/hid/progs/hid.c
++++ b/tools/testing/selftests/hid/progs/hid.c
+@@ -598,15 +598,3 @@ SEC(".struct_ops.link")
+ struct hid_bpf_ops test_infinite_loop_input_report = {
+ 	.hid_device_event = (void *)hid_test_infinite_loop_input_report,
+ };
+-
+-SEC("?struct_ops.s/hid_rdesc_fixup")
+-int BPF_PROG(hid_test_driver_probe, struct hid_bpf_ctx *hid_ctx)
+-{
+-	hid_ctx->hid->quirks |= HID_QUIRK_IGNORE_SPECIAL_DRIVER;
+-	return 0;
+-}
+-
+-SEC(".struct_ops.link")
+-struct hid_bpf_ops test_driver_probe = {
+-	.hid_rdesc_fixup = (void *)hid_test_driver_probe,
+-};
+--- a/tools/testing/selftests/hid/progs/hid_bpf_helpers.h
++++ b/tools/testing/selftests/hid/progs/hid_bpf_helpers.h
+@@ -84,14 +84,10 @@ struct hid_bpf_ops {
+ 	struct hid_device *hdev;
+ };
+ 
+-#define BIT(n) (1U << n)
+-
+ #ifndef BPF_F_BEFORE
+-#define BPF_F_BEFORE BIT(3)
++#define BPF_F_BEFORE (1U << 3)
+ #endif
+ 
+-#define HID_QUIRK_IGNORE_SPECIAL_DRIVER		BIT(22)
+-
+ /* following are kfuncs exported by HID for HID-BPF */
+ extern __u8 *hid_bpf_get_data(struct hid_bpf_ctx *ctx,
+ 			      unsigned int offset,

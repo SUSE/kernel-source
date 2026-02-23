@@ -1,0 +1,75 @@
+From: Oleg Nesterov <oleg@redhat.com>
+Date: Sun, 29 Sep 2024 16:42:39 +0200
+Subject: uprobes: kill the unnecessary put_uprobe/xol_free_insn_slot in
+ uprobe_free_utask()
+Patch-mainline: v6.13-rc1
+Git-commit: 430af825ba991730f8acc3c804a4aef82e9f7ff6
+References: jsc#PED-14653
+
+If pre_ssout() succeeds and sets utask->active_uprobe and utask->xol_vaddr
+the task must not exit until it calls handle_singlestep() which does the
+necessary put_uprobe() and xol_free_insn_slot().
+
+Remove put_uprobe() and xol_free_insn_slot() from uprobe_free_utask(). With
+this change xol_free_insn_slot() can't hit xol_area/utask/xol_vaddr == NULL,
+we can kill the unnecessary checks checks and simplify this function more.
+
+Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lore.kernel.org/r/20240929144239.GA9475@redhat.com
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ kernel/events/uprobes.c |   24 +++++-------------------
+ 1 file changed, 5 insertions(+), 19 deletions(-)
+
+--- a/kernel/events/uprobes.c
++++ b/kernel/events/uprobes.c
+@@ -1673,28 +1673,16 @@ static unsigned long xol_get_insn_slot(s
+ }
+ 
+ /*
+- * xol_free_insn_slot - If slot was earlier allocated by
+- * @xol_get_insn_slot(), make the slot available for
+- * subsequent requests.
++ * xol_free_insn_slot - free the slot allocated by xol_get_insn_slot()
+  */
+ static void xol_free_insn_slot(struct task_struct *tsk)
+ {
+-	struct xol_area *area;
+-	unsigned long slot_addr;
+-	unsigned long offset;
+-
+-	if (!tsk->mm || !tsk->mm->uprobes_state.xol_area || !tsk->utask)
+-		return;
+-
+-	slot_addr = tsk->utask->xol_vaddr;
+-	if (unlikely(!slot_addr))
+-		return;
++	struct xol_area *area = tsk->mm->uprobes_state.xol_area;
++	unsigned long offset = tsk->utask->xol_vaddr - area->vaddr;
+ 
+ 	tsk->utask->xol_vaddr = 0;
+-	area = tsk->mm->uprobes_state.xol_area;
+-	offset = slot_addr - area->vaddr;
+ 	/*
+-	 * slot_addr must fit into [area->vaddr, area->vaddr + PAGE_SIZE).
++	 * xol_vaddr must fit into [area->vaddr, area->vaddr + PAGE_SIZE).
+ 	 * This check can only fail if the "[uprobes]" vma was mremap'ed.
+ 	 */
+ 	if (offset < PAGE_SIZE) {
+@@ -1764,14 +1752,12 @@ void uprobe_free_utask(struct task_struc
+ 	if (!utask)
+ 		return;
+ 
+-	if (utask->active_uprobe)
+-		put_uprobe(utask->active_uprobe);
++	WARN_ON_ONCE(utask->active_uprobe || utask->xol_vaddr);
+ 
+ 	ri = utask->return_instances;
+ 	while (ri)
+ 		ri = free_ret_instance(ri);
+ 
+-	xol_free_insn_slot(t);
+ 	kfree(utask);
+ 	t->utask = NULL;
+ }

@@ -1,0 +1,183 @@
+From: Geliang Tang <tanggeliang@kylinos.cn>
+Date: Thu, 26 Sep 2024 19:30:23 +0200
+Subject: selftests/bpf: Add getsockopt to inspect mptcp subflow
+Patch-mainline: v6.13-rc1
+Git-commit: cd19b885106e0a24c28ef72fccc4c020782e6e7e
+References: jsc#PED-14653
+
+This patch adds a "cgroup/getsockopt" way to inspect the subflows of an
+MPTCP socket, and verify the modifications done by the same BPF program
+in the previous commit: a different mark per subflow, and a different
+TCP CC set on the second one. This new hook will be used by the next
+commit to verify the socket options set on each subflow.
+
+This extra "cgroup/getsockopt" prog walks the msk->conn_list and use
+bpf_core_cast to cast a pointer for readonly. It allows to inspect all
+the fields of a structure.
+
+Note that on the kernel side, the MPTCP socket stores a list of subflows
+under 'msk->conn_list'. They can be iterated using the generic 'list'
+helpers. They have been imported here, with a small difference:
+list_for_each_entry() uses 'can_loop' to limit the number of iterations,
+and ease its use. Because only data need to be read here, it is enough
+to use this technique. It is planned to use bpf_iter, when BPF programs
+will be used to modify data from the different subflows.
+mptcp_subflow_tcp_sock() and mptcp_for_each_stubflow() helpers have also
+be imported.
+
+Suggested-by: Martin KaFai Lau <martin.lau@kernel.org>
+Signed-off-by: Geliang Tang <tanggeliang@kylinos.cn>
+Reviewed-by: Matthieu Baerts (NGI0) <matttbe@kernel.org>
+Signed-off-by: Matthieu Baerts (NGI0) <matttbe@kernel.org>
+Link: https://lore.kernel.org/r/20240926-upstream-bpf-next-20240506-mptcp-subflow-test-v7-2-d26029e15cdd@kernel.org
+Signed-off-by: Martin KaFai Lau <martin.lau@kernel.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ MAINTAINERS                                       |    2 
+ tools/testing/selftests/bpf/progs/mptcp_bpf.h     |   42 +++++++++++++
+ tools/testing/selftests/bpf/progs/mptcp_subflow.c |   69 ++++++++++++++++++++++
+ 3 files changed, 112 insertions(+), 1 deletion(-)
+ create mode 100644 tools/testing/selftests/bpf/progs/mptcp_bpf.h
+
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -16247,7 +16247,7 @@ F:	include/net/mptcp.h
+ F:	include/trace/events/mptcp.h
+ F:	include/uapi/linux/mptcp*.h
+ F:	net/mptcp/
+-F:	tools/testing/selftests/bpf/*/*mptcp*.c
++F:	tools/testing/selftests/bpf/*/*mptcp*.[ch]
+ F:	tools/testing/selftests/net/mptcp/
+ 
+ NETWORKING [TCP]
+--- /dev/null
++++ b/tools/testing/selftests/bpf/progs/mptcp_bpf.h
+@@ -0,0 +1,42 @@
++/* SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause) */
++#ifndef __MPTCP_BPF_H__
++#define __MPTCP_BPF_H__
++
++#include "bpf_experimental.h"
++
++/* list helpers from include/linux/list.h */
++static inline int list_is_head(const struct list_head *list,
++			       const struct list_head *head)
++{
++	return list == head;
++}
++
++#define list_entry(ptr, type, member)					\
++	container_of(ptr, type, member)
++
++#define list_first_entry(ptr, type, member)				\
++	list_entry((ptr)->next, type, member)
++
++#define list_next_entry(pos, member)					\
++	list_entry((pos)->member.next, typeof(*(pos)), member)
++
++#define list_entry_is_head(pos, head, member)				\
++	list_is_head(&pos->member, (head))
++
++/* small difference: 'can_loop' has been added in the conditions */
++#define list_for_each_entry(pos, head, member)				\
++	for (pos = list_first_entry(head, typeof(*pos), member);	\
++	     !list_entry_is_head(pos, head, member) && can_loop;	\
++	     pos = list_next_entry(pos, member))
++
++/* mptcp helpers from protocol.h */
++#define mptcp_for_each_subflow(__msk, __subflow)			\
++	list_for_each_entry(__subflow, &((__msk)->conn_list), node)
++
++static __always_inline struct sock *
++mptcp_subflow_tcp_sock(const struct mptcp_subflow_context *subflow)
++{
++	return subflow->tcp_sock;
++}
++
++#endif
+--- a/tools/testing/selftests/bpf/progs/mptcp_subflow.c
++++ b/tools/testing/selftests/bpf/progs/mptcp_subflow.c
+@@ -4,10 +4,12 @@
+ 
+ /* vmlinux.h, bpf_helpers.h and other 'define' */
+ #include "bpf_tracing_net.h"
++#include "mptcp_bpf.h"
+ 
+ char _license[] SEC("license") = "GPL";
+ 
+ char cc[TCP_CA_NAME_MAX] = "reno";
++int pid;
+ 
+ /* Associate a subflow counter to each token */
+ struct {
+@@ -57,3 +59,70 @@ int mptcp_subflow(struct bpf_sock_ops *s
+ 
+ 	return 1;
+ }
++
++static int _check_getsockopt_subflow_mark(struct mptcp_sock *msk, struct bpf_sockopt *ctx)
++{
++	struct mptcp_subflow_context *subflow;
++	int i = 0;
++
++	mptcp_for_each_subflow(msk, subflow) {
++		struct sock *ssk;
++
++		ssk = mptcp_subflow_tcp_sock(bpf_core_cast(subflow,
++							   struct mptcp_subflow_context));
++
++		if (ssk->sk_mark != ++i) {
++			ctx->retval = -2;
++			break;
++		}
++	}
++
++	return 1;
++}
++
++static int _check_getsockopt_subflow_cc(struct mptcp_sock *msk, struct bpf_sockopt *ctx)
++{
++	struct mptcp_subflow_context *subflow;
++
++	mptcp_for_each_subflow(msk, subflow) {
++		struct inet_connection_sock *icsk;
++		struct sock *ssk;
++
++		ssk = mptcp_subflow_tcp_sock(bpf_core_cast(subflow,
++							   struct mptcp_subflow_context));
++		icsk = bpf_core_cast(ssk, struct inet_connection_sock);
++
++		if (ssk->sk_mark == 2 &&
++		    __builtin_memcmp(icsk->icsk_ca_ops->name, cc, TCP_CA_NAME_MAX)) {
++			ctx->retval = -2;
++			break;
++		}
++	}
++
++	return 1;
++}
++
++SEC("cgroup/getsockopt")
++int _getsockopt_subflow(struct bpf_sockopt *ctx)
++{
++	struct bpf_sock *sk = ctx->sk;
++	struct mptcp_sock *msk;
++
++	if (bpf_get_current_pid_tgid() >> 32 != pid)
++		return 1;
++
++	if (!sk || sk->protocol != IPPROTO_MPTCP ||
++	    (!(ctx->level == SOL_SOCKET && ctx->optname == SO_MARK) &&
++	     !(ctx->level == SOL_TCP && ctx->optname == TCP_CONGESTION)))
++		return 1;
++
++	msk = bpf_core_cast(sk, struct mptcp_sock);
++	if (msk->pm.subflows != 1) {
++		ctx->retval = -1;
++		return 1;
++	}
++
++	if (ctx->optname == SO_MARK)
++		return _check_getsockopt_subflow_mark(msk, ctx);
++	return _check_getsockopt_subflow_cc(msk, ctx);
++}

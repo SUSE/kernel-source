@@ -1,0 +1,118 @@
+From: Nicolas Rybowski <nicolas.rybowski@tessares.net>
+Date: Thu, 26 Sep 2024 19:30:22 +0200
+Subject: selftests/bpf: Add mptcp subflow example
+Patch-mainline: v6.13-rc1
+Git-commit: 83752e12896a72b24845c94f000e4c51b2bc5b50
+References: jsc#PED-14653
+
+Move Nicolas' patch into bpf selftests directory. This example adds a
+different mark (SO_MARK) on each subflow, and changes the TCP CC only on
+the first subflow.
+
+From the userspace, an application can do a setsockopt() on an MPTCP
+socket, and typically the same value will be propagated to all subflows
+(paths). If someone wants to have different values per subflow, the
+recommended way is to use BPF. So it is good to add such example here,
+and make sure there is no regressions.
+
+This example shows how it is possible to:
+
+    Identify the parent msk of an MPTCP subflow.
+    Put different sockopt for each subflow of a same MPTCP connection.
+
+Here especially, two different behaviours are implemented:
+
+    A socket mark (SOL_SOCKET SO_MARK) is put on each subflow of a same
+    MPTCP connection. The order of creation of the current subflow defines
+    its mark. The TCP CC algorithm of the very first subflow of an MPTCP
+    connection is set to "reno".
+
+This is just to show it is possible to identify an MPTCP connection, and
+set socket options, from different SOL levels, per subflow. "reno" has
+been picked because it is built-in and usually not set as default one.
+It is easy to verify with 'ss' that these modifications have been
+applied correctly. That's what the next patch is going to do.
+
+Nicolas' code comes from:
+
+    commit 4d120186e4d6 ("bpf:examples: update mptcp_set_mark_kern.c")
+
+from the MPTCP repo https://github.com/multipath-tcp/mptcp_net-next (the
+"scripts" branch), and it has been adapted by Geliang.
+
+Closes: https://github.com/multipath-tcp/mptcp_net-next/issues/76
+Co-developed-by: Geliang Tang <tanggeliang@kylinos.cn>
+Signed-off-by: Geliang Tang <tanggeliang@kylinos.cn>
+Signed-off-by: Nicolas Rybowski <nicolas.rybowski@tessares.net>
+Reviewed-by: Mat Martineau <martineau@kernel.org>
+Signed-off-by: Matthieu Baerts (NGI0) <matttbe@kernel.org>
+Link: https://lore.kernel.org/r/20240926-upstream-bpf-next-20240506-mptcp-subflow-test-v7-1-d26029e15cdd@kernel.org
+Signed-off-by: Martin KaFai Lau <martin.lau@kernel.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ tools/testing/selftests/bpf/progs/mptcp_subflow.c |   59 ++++++++++++++++++++++
+ 1 file changed, 59 insertions(+)
+ create mode 100644 tools/testing/selftests/bpf/progs/mptcp_subflow.c
+
+--- /dev/null
++++ b/tools/testing/selftests/bpf/progs/mptcp_subflow.c
+@@ -0,0 +1,59 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2020, Tessares SA. */
++/* Copyright (c) 2024, Kylin Software */
++
++/* vmlinux.h, bpf_helpers.h and other 'define' */
++#include "bpf_tracing_net.h"
++
++char _license[] SEC("license") = "GPL";
++
++char cc[TCP_CA_NAME_MAX] = "reno";
++
++/* Associate a subflow counter to each token */
++struct {
++	__uint(type, BPF_MAP_TYPE_HASH);
++	__uint(key_size, sizeof(__u32));
++	__uint(value_size, sizeof(__u32));
++	__uint(max_entries, 100);
++} mptcp_sf SEC(".maps");
++
++SEC("sockops")
++int mptcp_subflow(struct bpf_sock_ops *skops)
++{
++	__u32 init = 1, key, mark, *cnt;
++	struct mptcp_sock *msk;
++	struct bpf_sock *sk;
++	int err;
++
++	if (skops->op != BPF_SOCK_OPS_TCP_CONNECT_CB)
++		return 1;
++
++	sk = skops->sk;
++	if (!sk)
++		return 1;
++
++	msk = bpf_skc_to_mptcp_sock(sk);
++	if (!msk)
++		return 1;
++
++	key = msk->token;
++	cnt = bpf_map_lookup_elem(&mptcp_sf, &key);
++	if (cnt) {
++		/* A new subflow is added to an existing MPTCP connection */
++		__sync_fetch_and_add(cnt, 1);
++		mark = *cnt;
++	} else {
++		/* A new MPTCP connection is just initiated and this is its primary subflow */
++		bpf_map_update_elem(&mptcp_sf, &key, &init, BPF_ANY);
++		mark = init;
++	}
++
++	/* Set the mark of the subflow's socket based on appearance order */
++	err = bpf_setsockopt(skops, SOL_SOCKET, SO_MARK, &mark, sizeof(mark));
++	if (err < 0)
++		return 1;
++	if (mark == 2)
++		err = bpf_setsockopt(skops, SOL_TCP, TCP_CONGESTION, cc, TCP_CA_NAME_MAX);
++
++	return 1;
++}

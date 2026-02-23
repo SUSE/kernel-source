@@ -1,0 +1,230 @@
+From: Benjamin Tissoires <bentiss@kernel.org>
+Date: Tue, 1 Oct 2024 16:30:05 +0200
+Subject: HID: bpf: move HID-BPF report descriptor fixup earlier
+Patch-mainline: v6.13-rc1
+Git-commit: 8b7fd6a15f8c32760c2026a62dcf55219b4da15b
+References: jsc#PED-14653
+
+Currently, hid_bpf_rdesc_fixup() is called once the match between the
+HID device and the driver is done. This can be problematic in case
+the driver selected by the kernel would change the report descriptor
+after the fact.
+
+To give a chance for hid_bpf_rdesc_fixup() to provide hints on to how
+to select a dedicated driver or not, move the call to that BPF hook
+earlier in the .probe() process, when we get the first match.
+
+However, this means that we might get called more than once (typically
+once for hid-generic, and once for hid-vendor-specific). So we store the
+result of HID-BPF fixup in struct hid_device. Basically, this means that
+->bpf_rdesc can replace ->dev_rdesc when it was used in the code.
+
+In order to not grow struct hid_device, some fields are re-ordered. This
+was the output of pahole for the first 128 bytes:
+struct hid_device {
+	__u8 *                     dev_rdesc;            /*     0     8 */
+	unsigned int               dev_rsize;            /*     8     4 */
+
+	/* XXX 4 bytes hole, try to pack */
+
+	__u8 *                     rdesc;                /*    16     8 */
+	unsigned int               rsize;                /*    24     4 */
+
+	/* XXX 4 bytes hole, try to pack */
+
+	struct hid_collection *    collection;           /*    32     8 */
+	unsigned int               collection_size;      /*    40     4 */
+	unsigned int               maxcollection;        /*    44     4 */
+	unsigned int               maxapplication;       /*    48     4 */
+	__u16                      bus;                  /*    52     2 */
+	__u16                      group;                /*    54     2 */
+	__u32                      vendor;               /*    56     4 */
+	__u32                      product;              /*    60     4 */
+	/* --- cacheline 1 boundary (64 bytes) --- */
+	__u32                      version;              /*    64     4 */
+	enum hid_type              type;                 /*    68     4 */
+	unsigned int               country;              /*    72     4 */
+
+	/* XXX 4 bytes hole, try to pack */
+
+	struct hid_report_enum     report_enum[3];       /*    80  6216 */
+
+Basically, we got three holes of 4 bytes. We can reorder things a little
+and makes those 3 holes a continuous 12 bytes hole, which can be replaced
+by the new pointer and the new unsigned int we need.
+
+In terms of code allocation, when not using HID-BPF, we are back to kernel
+v6.2 in hid_open_report(). These multiple kmemdup() calls will be fixed
+in a later commit.
+
+Link: https://patch.msgid.link/20241001-hid-bpf-hid-generic-v3-1-2ef1019468df@kernel.org
+Signed-off-by: Benjamin Tissoires <bentiss@kernel.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ drivers/hid/bpf/hid_bpf_dispatch.c |    9 ++++++---
+ drivers/hid/hid-core.c             |   30 ++++++++++++++++++++++++++----
+ include/linux/hid.h                |   18 ++++++++++--------
+ include/linux/hid_bpf.h            |   11 +++--------
+ 4 files changed, 45 insertions(+), 23 deletions(-)
+
+--- a/drivers/hid/bpf/hid_bpf_dispatch.c
++++ b/drivers/hid/bpf/hid_bpf_dispatch.c
+@@ -148,7 +148,7 @@ out:
+ }
+ EXPORT_SYMBOL_GPL(dispatch_hid_bpf_output_report);
+ 
+-u8 *call_hid_bpf_rdesc_fixup(struct hid_device *hdev, const u8 *rdesc, unsigned int *size)
++const u8 *call_hid_bpf_rdesc_fixup(struct hid_device *hdev, const u8 *rdesc, unsigned int *size)
+ {
+ 	int ret;
+ 	struct hid_bpf_ctx_kern ctx_kern = {
+@@ -183,7 +183,7 @@ u8 *call_hid_bpf_rdesc_fixup(struct hid_
+ 
+  ignore_bpf:
+ 	kfree(ctx_kern.data);
+-	return kmemdup(rdesc, *size, GFP_KERNEL);
++	return rdesc;
+ }
+ EXPORT_SYMBOL_GPL(call_hid_bpf_rdesc_fixup);
+ 
+@@ -260,8 +260,11 @@ int hid_bpf_allocate_event_data(struct h
+ 
+ int hid_bpf_reconnect(struct hid_device *hdev)
+ {
+-	if (!test_and_set_bit(ffs(HID_STAT_REPROBED), &hdev->status))
++	if (!test_and_set_bit(ffs(HID_STAT_REPROBED), &hdev->status)) {
++		/* trigger call to call_hid_bpf_rdesc_fixup() during the next probe */
++		hdev->bpf_rsize = 0;
+ 		return device_reprobe(&hdev->dev);
++	}
+ 
+ 	return 0;
+ }
+--- a/drivers/hid/hid-core.c
++++ b/drivers/hid/hid-core.c
+@@ -698,6 +698,14 @@ static void hid_close_report(struct hid_
+ 	device->status &= ~HID_STAT_PARSED;
+ }
+ 
++static inline void hid_free_bpf_rdesc(struct hid_device *hdev)
++{
++	/* bpf_rdesc is either equal to dev_rdesc or allocated by call_hid_bpf_rdesc_fixup() */
++	if (hdev->bpf_rdesc != hdev->dev_rdesc)
++		kfree(hdev->bpf_rdesc);
++	hdev->bpf_rdesc = NULL;
++}
++
+ /*
+  * Free a device structure, all reports, and all fields.
+  */
+@@ -707,6 +715,7 @@ void hiddev_free(struct kref *ref)
+ 	struct hid_device *hid = container_of(ref, struct hid_device, ref);
+ 
+ 	hid_close_report(hid);
++	hid_free_bpf_rdesc(hid);
+ 	kfree(hid->dev_rdesc);
+ 	kfree(hid);
+ }
+@@ -1221,13 +1230,12 @@ int hid_open_report(struct hid_device *d
+ 	if (WARN_ON(device->status & HID_STAT_PARSED))
+ 		return -EBUSY;
+ 
+-	start = device->dev_rdesc;
++	start = device->bpf_rdesc;
+ 	if (WARN_ON(!start))
+ 		return -ENODEV;
+-	size = device->dev_rsize;
++	size = device->bpf_rsize;
+ 
+-	/* call_hid_bpf_rdesc_fixup() ensures we work on a copy of rdesc */
+-	buf = call_hid_bpf_rdesc_fixup(device, start, &size);
++	buf = kmemdup(start, size, GFP_KERNEL);
+ 	if (buf == NULL)
+ 		return -ENOMEM;
+ 
+@@ -2677,6 +2685,18 @@ static int __hid_device_probe(struct hid
+ 	const struct hid_device_id *id;
+ 	int ret;
+ 
++	if (!hdev->bpf_rsize) {
++		/* in case a bpf program gets detached, we need to free the old one */
++		hid_free_bpf_rdesc(hdev);
++
++		/* keep this around so we know we called it once */
++		hdev->bpf_rsize = hdev->dev_rsize;
++
++		/* call_hid_bpf_rdesc_fixup will always return a valid pointer */
++		hdev->bpf_rdesc = call_hid_bpf_rdesc_fixup(hdev, hdev->dev_rdesc,
++							   &hdev->bpf_rsize);
++	}
++
+ 	if (!hid_check_device_match(hdev, hdrv, &id))
+ 		return -ENODEV;
+ 
+@@ -2933,9 +2953,11 @@ static void hid_remove_device(struct hid
+ 		hid_debug_unregister(hdev);
+ 		hdev->status &= ~HID_STAT_ADDED;
+ 	}
++	hid_free_bpf_rdesc(hdev);
+ 	kfree(hdev->dev_rdesc);
+ 	hdev->dev_rdesc = NULL;
+ 	hdev->dev_rsize = 0;
++	hdev->bpf_rsize = 0;
+ }
+ 
+ /**
+--- a/include/linux/hid.h
++++ b/include/linux/hid.h
+@@ -599,15 +599,17 @@ enum hid_battery_status {
+ struct hid_driver;
+ struct hid_ll_driver;
+ 
+-struct hid_device {							/* device report descriptor */
+-	const __u8 *dev_rdesc;
+-	unsigned dev_rsize;
+-	const __u8 *rdesc;
+-	unsigned rsize;
++struct hid_device {
++	const __u8 *dev_rdesc;						/* device report descriptor */
++	const __u8 *bpf_rdesc;						/* bpf modified report descriptor, if any */
++	const __u8 *rdesc;						/* currently used report descriptor */
++	unsigned int dev_rsize;
++	unsigned int bpf_rsize;
++	unsigned int rsize;
++	unsigned int collection_size;					/* Number of allocated hid_collections */
+ 	struct hid_collection *collection;				/* List of HID collections */
+-	unsigned collection_size;					/* Number of allocated hid_collections */
+-	unsigned maxcollection;						/* Number of parsed collections */
+-	unsigned maxapplication;					/* Number of applications */
++	unsigned int maxcollection;						/* Number of parsed collections */
++	unsigned int maxapplication;					/* Number of applications */
+ 	__u16 bus;							/* BUS ID */
+ 	__u16 group;							/* Report group */
+ 	__u32 vendor;							/* Vendor ID */
+--- a/include/linux/hid_bpf.h
++++ b/include/linux/hid_bpf.h
+@@ -212,7 +212,7 @@ int hid_bpf_connect_device(struct hid_de
+ void hid_bpf_disconnect_device(struct hid_device *hdev);
+ void hid_bpf_destroy_device(struct hid_device *hid);
+ int hid_bpf_device_init(struct hid_device *hid);
+-u8 *call_hid_bpf_rdesc_fixup(struct hid_device *hdev, const u8 *rdesc, unsigned int *size);
++const u8 *call_hid_bpf_rdesc_fixup(struct hid_device *hdev, const u8 *rdesc, unsigned int *size);
+ #else /* CONFIG_HID_BPF */
+ static inline u8 *dispatch_hid_bpf_device_event(struct hid_device *hid, enum hid_report_type type,
+ 						u8 *data, u32 *size, int interrupt,
+@@ -228,13 +228,8 @@ static inline int hid_bpf_connect_device
+ static inline void hid_bpf_disconnect_device(struct hid_device *hdev) {}
+ static inline void hid_bpf_destroy_device(struct hid_device *hid) {}
+ static inline int hid_bpf_device_init(struct hid_device *hid) { return 0; }
+-/*
+- * This specialized allocator has to be a macro for its allocations to be
+- * accounted separately (to have a separate alloc_tag). The typecast is
+- * intentional to enforce typesafety.
+- */
+-#define call_hid_bpf_rdesc_fixup(_hdev, _rdesc, _size)	\
+-		((u8 *)kmemdup(_rdesc, *(_size), GFP_KERNEL))
++static inline const u8 *call_hid_bpf_rdesc_fixup(struct hid_device *hdev, const u8 *rdesc,
++						 unsigned int *size) { return rdesc; }
+ 
+ #endif /* CONFIG_HID_BPF */
+ 

@@ -1,0 +1,102 @@
+From: Eduard Zingerman <eddyz87@gmail.com>
+Date: Tue, 12 Nov 2024 03:09:05 -0800
+Subject: selftests/bpf: allow send_signal test to timeout
+Patch-mainline: v6.13-rc1
+Git-commit: 3209139d00e594e30abc2429ea54c36bfbb9528a
+References: jsc#PED-14653
+
+The following invocation:
+
+  $ t1=send_signal/send_signal_perf_thread_remote \
+    t2=send_signal/send_signal_nmi_thread_remote  \
+    ./test_progs -t $t1,$t2
+
+Leads to send_signal_nmi_thread_remote to be stuck
+on a line 180:
+
+  /* wait for result */
+  err = read(pipe_c2p[0], buf, 1);
+
+In this test case:
+- perf event PERF_COUNT_HW_CPU_CYCLES is created for parent process;
+- BPF program is attached to perf event, and sends a signal to child
+  process when event occurs;
+- parent program burns some CPU in busy loop and calls read() to get
+  notification from child that it received a signal.
+
+The perf event is declared with .sample_period = 1.
+This forces perf to throttle events, and under some unclear conditions
+the event does not always occur while parent is in busy loop.
+After parent enters read() system call CPU cycles event won't be
+generated for parent anymore. Thus, if perf event had not occurred
+already the test is stuck.
+
+This commit updates the parent to wait for notification with a timeout,
+doing several iterations of busy loop + read_with_timeout().
+
+Signed-off-by: Eduard Zingerman <eddyz87@gmail.com>
+Link: https://lore.kernel.org/r/20241112110906.3045278-4-eddyz87@gmail.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ tools/testing/selftests/bpf/prog_tests/send_signal.c |   34 +++++++++++--------
+ 1 file changed, 20 insertions(+), 14 deletions(-)
+
+--- a/tools/testing/selftests/bpf/prog_tests/send_signal.c
++++ b/tools/testing/selftests/bpf/prog_tests/send_signal.c
+@@ -3,6 +3,7 @@
+ #include <sys/time.h>
+ #include <sys/resource.h>
+ #include "test_send_signal_kern.skel.h"
++#include "io_helpers.h"
+ 
+ static int sigusr1_received;
+ 
+@@ -24,6 +25,7 @@ static void test_send_signal_common(stru
+ 	int pipe_c2p[2], pipe_p2c[2];
+ 	int err = -1, pmu_fd = -1;
+ 	volatile int j = 0;
++	int retry_count;
+ 	char buf[256];
+ 	pid_t pid;
+ 	int old_prio;
+@@ -163,21 +165,25 @@ static void test_send_signal_common(stru
+ 	/* notify child that bpf program can send_signal now */
+ 	ASSERT_EQ(write(pipe_p2c[1], buf, 1), 1, "pipe_write");
+ 
+-	/* For the remote test, the BPF program is triggered from this
+-	 * process but the other process/thread is signaled.
+-	 */
+-	if (remote) {
+-		if (!attr) {
+-			for (int i = 0; i < 10; i++)
+-				usleep(1);
+-		} else {
+-			for (int i = 0; i < 100000000; i++)
+-				j /= i + 1;
+-		}
++	for (retry_count = 0;;) {
++		/* For the remote test, the BPF program is triggered from this
++		 * process but the other process/thread is signaled.
++		 */
++		if (remote) {
++			if (!attr) {
++				for (int i = 0; i < 10; i++)
++					usleep(1);
++			} else {
++				for (int i = 0; i < 100000000; i++)
++					j /= i + 1;
++			}
++		}
++		/* wait for result */
++		err = read_with_timeout(pipe_c2p[0], buf, 1, 100);
++		if (err == -EAGAIN && retry_count++ < 10000)
++			continue;
++		break;
+ 	}
+-
+-	/* wait for result */
+-	err = read(pipe_c2p[0], buf, 1);
+ 	if (!ASSERT_GE(err, 0, "reading pipe"))
+ 		goto disable_pmu;
+ 	if (!ASSERT_GT(err, 0, "reading pipe error: size 0")) {

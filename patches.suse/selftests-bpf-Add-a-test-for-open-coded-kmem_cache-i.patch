@@ -1,0 +1,154 @@
+From: Namhyung Kim <namhyung@kernel.org>
+Date: Wed, 30 Oct 2024 15:28:19 -0700
+Subject: selftests/bpf: Add a test for open coded kmem_cache iter
+Patch-mainline: v6.13-rc1
+Git-commit: e5e4799e2ac3619a10a9e6db7d2a51d7cc6a69ef
+References: jsc#PED-14653
+
+The new subtest runs with bpf_prog_test_run_opts() as a syscall prog.
+It iterates the kmem_cache using bpf_for_each loop and count the number
+of entries.  Finally it checks it with the number of entries from the
+regular iterator.
+
+  $ ./vmtest.sh -- ./test_progs -t kmem_cache_iter
+  ...
+  #130/1   kmem_cache_iter/check_task_struct:OK
+  #130/2   kmem_cache_iter/check_slabinfo:OK
+  #130/3   kmem_cache_iter/open_coded_iter:OK
+  #130     kmem_cache_iter:OK
+  Summary: 1/3 PASSED, 0 SKIPPED, 0 FAILED
+
+Also simplify the code by using attach routine of the skeleton.
+
+Signed-off-by: Namhyung Kim <namhyung@kernel.org>
+Link: https://lore.kernel.org/r/20241030222819.1800667-2-namhyung@kernel.org
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ tools/testing/selftests/bpf/bpf_experimental.h           |    6 ++
+ tools/testing/selftests/bpf/prog_tests/kmem_cache_iter.c |   35 +++++++++------
+ tools/testing/selftests/bpf/progs/kmem_cache_iter.c      |   22 +++++++++
+ 3 files changed, 51 insertions(+), 12 deletions(-)
+
+--- a/tools/testing/selftests/bpf/bpf_experimental.h
++++ b/tools/testing/selftests/bpf/bpf_experimental.h
+@@ -582,4 +582,10 @@ extern int bpf_wq_set_callback_impl(stru
+ 		unsigned int flags__k, void *aux__ign) __ksym;
+ #define bpf_wq_set_callback(timer, cb, flags) \
+ 	bpf_wq_set_callback_impl(timer, cb, flags, NULL)
++
++struct bpf_iter_kmem_cache;
++extern int bpf_iter_kmem_cache_new(struct bpf_iter_kmem_cache *it) __weak __ksym;
++extern struct kmem_cache *bpf_iter_kmem_cache_next(struct bpf_iter_kmem_cache *it) __weak __ksym;
++extern void bpf_iter_kmem_cache_destroy(struct bpf_iter_kmem_cache *it) __weak __ksym;
++
+ #endif
+--- a/tools/testing/selftests/bpf/prog_tests/kmem_cache_iter.c
++++ b/tools/testing/selftests/bpf/prog_tests/kmem_cache_iter.c
+@@ -68,12 +68,27 @@ static void subtest_kmem_cache_iter_chec
+ 	fclose(fp);
+ }
+ 
++static void subtest_kmem_cache_iter_open_coded(struct kmem_cache_iter *skel)
++{
++	LIBBPF_OPTS(bpf_test_run_opts, topts);
++	int err, fd;
++
++	/* No need to attach it, just run it directly */
++	fd = bpf_program__fd(skel->progs.open_coded_iter);
++
++	err = bpf_prog_test_run_opts(fd, &topts);
++	if (!ASSERT_OK(err, "test_run_opts err"))
++		return;
++	if (!ASSERT_OK(topts.retval, "test_run_opts retval"))
++		return;
++
++	/* It should be same as we've seen from the explicit iterator */
++	ASSERT_EQ(skel->bss->open_coded_seen, skel->bss->kmem_cache_seen, "open_code_seen_eq");
++}
++
+ void test_kmem_cache_iter(void)
+ {
+-	DECLARE_LIBBPF_OPTS(bpf_iter_attach_opts, opts);
+ 	struct kmem_cache_iter *skel = NULL;
+-	union bpf_iter_link_info linfo = {};
+-	struct bpf_link *link;
+ 	char buf[256];
+ 	int iter_fd;
+ 
+@@ -81,16 +96,12 @@ void test_kmem_cache_iter(void)
+ 	if (!ASSERT_OK_PTR(skel, "kmem_cache_iter__open_and_load"))
+ 		return;
+ 
+-	opts.link_info = &linfo;
+-	opts.link_info_len = sizeof(linfo);
+-
+-	link = bpf_program__attach_iter(skel->progs.slab_info_collector, &opts);
+-	if (!ASSERT_OK_PTR(link, "attach_iter"))
++	if (!ASSERT_OK(kmem_cache_iter__attach(skel), "skel_attach"))
+ 		goto destroy;
+ 
+-	iter_fd = bpf_iter_create(bpf_link__fd(link));
++	iter_fd = bpf_iter_create(bpf_link__fd(skel->links.slab_info_collector));
+ 	if (!ASSERT_GE(iter_fd, 0, "iter_create"))
+-		goto free_link;
++		goto destroy;
+ 
+ 	memset(buf, 0, sizeof(buf));
+ 	while (read(iter_fd, buf, sizeof(buf) > 0)) {
+@@ -105,11 +116,11 @@ void test_kmem_cache_iter(void)
+ 		subtest_kmem_cache_iter_check_task_struct(skel);
+ 	if (test__start_subtest("check_slabinfo"))
+ 		subtest_kmem_cache_iter_check_slabinfo(skel);
++	if (test__start_subtest("open_coded_iter"))
++		subtest_kmem_cache_iter_open_coded(skel);
+ 
+ 	close(iter_fd);
+ 
+-free_link:
+-	bpf_link__destroy(link);
+ destroy:
+ 	kmem_cache_iter__destroy(skel);
+ }
+--- a/tools/testing/selftests/bpf/progs/kmem_cache_iter.c
++++ b/tools/testing/selftests/bpf/progs/kmem_cache_iter.c
+@@ -3,6 +3,7 @@
+ #include <vmlinux.h>
+ #include <bpf/bpf_helpers.h>
+ #include <bpf/bpf_tracing.h>
++#include "bpf_experimental.h"
+ 
+ char _license[] SEC("license") = "GPL";
+ 
+@@ -32,6 +33,7 @@ extern struct kmem_cache *bpf_get_kmem_c
+ /* Result, will be checked by userspace */
+ int task_struct_found;
+ int kmem_cache_seen;
++int open_coded_seen;
+ 
+ SEC("iter/kmem_cache")
+ int slab_info_collector(struct bpf_iter__kmem_cache *ctx)
+@@ -84,3 +86,23 @@ int BPF_PROG(check_task_struct)
+ 		task_struct_found = -2;
+ 	return 0;
+ }
++
++SEC("syscall")
++int open_coded_iter(const void *ctx)
++{
++	struct kmem_cache *s;
++
++	bpf_for_each(kmem_cache, s) {
++		struct kmem_cache_result *r;
++
++		r = bpf_map_lookup_elem(&slab_result, &open_coded_seen);
++		if (!r)
++			break;
++
++		if (r->obj_size != s->size)
++			break;
++
++		open_coded_seen++;
++	}
++	return 0;
++}
