@@ -1,0 +1,105 @@
+From: Sean Christopherson <seanjc@google.com>
+Date: Tue, 10 Jun 2025 15:57:35 -0700
+Subject: KVM: SVM: Add a helper to allocate and initialize permissions bitmaps
+Patch-mainline: v6.17-rc1
+Git-commit: 73be81b3bb7cd7951046eedee6efb00e4afc5e02
+References: jsc#PED-15123
+
+Add a helper to allocate and initialize an MSR or I/O permissions map, as
+the logic is identical between the two map types, the only difference is
+the size of the bitmap.  Opportunistically add a comment to explain why
+the bitmaps are initialized with 0xff, e.g. instead of the more common
+zero-initialized behavior, which is the main motivation for deduplicating
+the code.
+
+No functional change intended.
+
+Link: https://lore.kernel.org/r/20250610225737.156318-31-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Acked-by: Carlos López <clopez@suse.de>
+---
+ arch/x86/kvm/svm/svm.c |   32 +++++++++++++++-----------------
+ arch/x86/kvm/svm/svm.h |    8 +++++++-
+ 2 files changed, 22 insertions(+), 18 deletions(-)
+
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -723,19 +723,23 @@ void svm_enable_intercept_for_msr(struct
+ 	svm->nested.force_msr_bitmap_recalc = true;
+ }
+ 
+-void *svm_vcpu_alloc_msrpm(void)
++void *svm_alloc_permissions_map(unsigned long size, gfp_t gfp_mask)
+ {
+-	unsigned int order = get_order(MSRPM_SIZE);
+-	struct page *pages = alloc_pages(GFP_KERNEL_ACCOUNT, order);
+-	void *msrpm;
++	unsigned int order = get_order(size);
++	struct page *pages = alloc_pages(gfp_mask, order);
++	void *pm;
+ 
+ 	if (!pages)
+ 		return NULL;
+ 
+-	msrpm = page_address(pages);
+-	memset(msrpm, 0xff, PAGE_SIZE * (1 << order));
++	/*
++	 * Set all bits in the permissions map so that all MSR and I/O accesses
++	 * are intercepted by default.
++	 */
++	pm = page_address(pages);
++	memset(pm, 0xff, PAGE_SIZE * (1 << order));
+ 
+-	return msrpm;
++	return pm;
+ }
+ 
+ static void svm_recalc_lbr_msr_intercepts(struct kvm_vcpu *vcpu)
+@@ -5242,11 +5246,8 @@ static __init void svm_set_cpu_caps(void
+ 
+ static __init int svm_hardware_setup(void)
+ {
+-	int cpu;
+-	struct page *iopm_pages;
+ 	void *iopm_va;
+-	int r;
+-	unsigned int order = get_order(IOPM_SIZE);
++	int cpu, r;
+ 
+ 	/*
+ 	 * NX is required for shadow paging and for NPT if the NX huge pages
+@@ -5258,14 +5259,11 @@ static __init int svm_hardware_setup(voi
+ 	}
+ 	kvm_enable_efer_bits(EFER_NX);
+ 
+-	iopm_pages = alloc_pages(GFP_KERNEL, order);
+-
+-	if (!iopm_pages)
++	iopm_va = svm_alloc_permissions_map(IOPM_SIZE, GFP_KERNEL);
++	if (!iopm_va)
+ 		return -ENOMEM;
+ 
+-	iopm_va = page_address(iopm_pages);
+-	memset(iopm_va, 0xff, PAGE_SIZE * (1 << order));
+-	iopm_base = __sme_page_pa(iopm_pages);
++	iopm_base = __sme_set(__pa(iopm_va));
+ 
+ 	kvm_caps.supported_xcr0 &= ~(XFEATURE_MASK_BNDREGS |
+ 				     XFEATURE_MASK_BNDCSR);
+--- a/arch/x86/kvm/svm/svm.h
++++ b/arch/x86/kvm/svm/svm.h
+@@ -639,7 +639,13 @@ BUILD_SVM_MSR_BITMAP_HELPERS(void, set,
+ /* svm.c */
+ extern bool dump_invalid_vmcb;
+ 
+-void *svm_vcpu_alloc_msrpm(void);
++void *svm_alloc_permissions_map(unsigned long size, gfp_t gfp_mask);
++
++static inline void *svm_vcpu_alloc_msrpm(void)
++{
++	return svm_alloc_permissions_map(MSRPM_SIZE, GFP_KERNEL_ACCOUNT);
++}
++
+ void svm_vcpu_free_msrpm(void *msrpm);
+ void svm_copy_lbrs(struct vmcb *to_vmcb, struct vmcb *from_vmcb);
+ void svm_enable_lbrv(struct kvm_vcpu *vcpu);
