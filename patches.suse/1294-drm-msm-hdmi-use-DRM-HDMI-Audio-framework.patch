@@ -1,0 +1,322 @@
+From ea54cfac0f8c3b452de67371920ba16a322a6555 Mon Sep 17 00:00:00 2001
+From: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Date: Wed, 26 Feb 2025 10:59:30 +0200
+Subject: drm/msm/hdmi: use DRM HDMI Audio framework
+Git-commit: ea54cfac0f8c3b452de67371920ba16a322a6555
+Patch-mainline: v6.15-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+In order to simplify the driver even further and to remove the
+boilerplate code, rewrite the audio interface to use the DRM HDMI Audio
+framework.
+
+Audio InfoFames are controlled centrally via the DRM HDMI framework.
+Correct InfoFrame data is programmed at the atomic_pre_enable() time (if
+it was set before, drm_atomic_helper_connector_hdmi_update_infoframes()
+takes care of writing all InfoFrames, including the Audio one.) or
+during msm_hdmi_bridge_audio_prepare() when the new stream is started.
+
+All audio data frame management is deferred to
+msm_hdmi_bridge_audio_prepare() and msm_hdmi_bridge_audio_shutdown().
+
+Reviewed-by: Maxime Ripard <mripard@kernel.org>
+Reviewed-by: Abhinav Kumar <quic_abhinavk@quicinc.com>
+Signed-off-by: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Patchwork: https://patchwork.freedesktop.org/patch/639663/
+Link: https://lore.kernel.org/r/20250226-bridge-hdmi-connector-v8-7-340af24b35cc@linaro.org
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/msm/hdmi/hdmi.c        | 91 --------------------------
+ drivers/gpu/drm/msm/hdmi/hdmi.h        | 18 +++--
+ drivers/gpu/drm/msm/hdmi/hdmi_audio.c  | 68 ++++++++++++++++---
+ drivers/gpu/drm/msm/hdmi/hdmi_bridge.c |  5 ++
+ 4 files changed, 71 insertions(+), 111 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/hdmi/hdmi.c b/drivers/gpu/drm/msm/hdmi/hdmi.c
+index 509aa3580ce7..a8d072ad4a11 100644
+--- a/drivers/gpu/drm/msm/hdmi/hdmi.c
++++ b/drivers/gpu/drm/msm/hdmi/hdmi.c
+@@ -14,7 +14,6 @@
+ #include <drm/drm_of.h>
+ #include <drm/display/drm_hdmi_state_helper.h>
+ 
+-#include <sound/hdmi-codec.h>
+ #include "hdmi.h"
+ 
+ void msm_hdmi_set_mode(struct hdmi *hdmi, bool power_on)
+@@ -245,87 +244,6 @@ static const struct hdmi_platform_config hdmi_tx_8974_config = {
+ 		.hpd_freq      = hpd_clk_freq_8x74,
+ };
+ 
+-/*
+- * HDMI audio codec callbacks
+- */
+-static int msm_hdmi_audio_hw_params(struct device *dev, void *data,
+-				    struct hdmi_codec_daifmt *daifmt,
+-				    struct hdmi_codec_params *params)
+-{
+-	struct hdmi *hdmi = dev_get_drvdata(dev);
+-	unsigned int rate;
+-	int ret;
+-
+-	DRM_DEV_DEBUG(dev, "%u Hz, %d bit, %d channels\n", params->sample_rate,
+-		 params->sample_width, params->cea.channels);
+-
+-	switch (params->sample_rate) {
+-	case 32000:
+-		rate = HDMI_SAMPLE_RATE_32KHZ;
+-		break;
+-	case 44100:
+-		rate = HDMI_SAMPLE_RATE_44_1KHZ;
+-		break;
+-	case 48000:
+-		rate = HDMI_SAMPLE_RATE_48KHZ;
+-		break;
+-	case 88200:
+-		rate = HDMI_SAMPLE_RATE_88_2KHZ;
+-		break;
+-	case 96000:
+-		rate = HDMI_SAMPLE_RATE_96KHZ;
+-		break;
+-	case 176400:
+-		rate = HDMI_SAMPLE_RATE_176_4KHZ;
+-		break;
+-	case 192000:
+-		rate = HDMI_SAMPLE_RATE_192KHZ;
+-		break;
+-	default:
+-		DRM_DEV_ERROR(dev, "rate[%d] not supported!\n",
+-			params->sample_rate);
+-		return -EINVAL;
+-	}
+-
+-	ret = drm_atomic_helper_connector_hdmi_update_audio_infoframe(hdmi->connector,
+-								      &params->cea);
+-	if (ret)
+-		return ret;
+-
+-	msm_hdmi_audio_info_setup(hdmi, rate, params->cea.channels);
+-
+-	return 0;
+-}
+-
+-static void msm_hdmi_audio_shutdown(struct device *dev, void *data)
+-{
+-	struct hdmi *hdmi = dev_get_drvdata(dev);
+-
+-	drm_atomic_helper_connector_hdmi_clear_audio_infoframe(hdmi->connector);
+-	msm_hdmi_audio_disable(hdmi);
+-}
+-
+-static const struct hdmi_codec_ops msm_hdmi_audio_codec_ops = {
+-	.hw_params = msm_hdmi_audio_hw_params,
+-	.audio_shutdown = msm_hdmi_audio_shutdown,
+-};
+-
+-static struct hdmi_codec_pdata codec_data = {
+-	.ops = &msm_hdmi_audio_codec_ops,
+-	.max_i2s_channels = 8,
+-	.i2s = 1,
+-};
+-
+-static int msm_hdmi_register_audio_driver(struct hdmi *hdmi, struct device *dev)
+-{
+-	hdmi->audio_pdev = platform_device_register_data(dev,
+-							 HDMI_CODEC_DRV_NAME,
+-							 PLATFORM_DEVID_AUTO,
+-							 &codec_data,
+-							 sizeof(codec_data));
+-	return PTR_ERR_OR_ZERO(hdmi->audio_pdev);
+-}
+-
+ static int msm_hdmi_bind(struct device *dev, struct device *master, void *data)
+ {
+ 	struct msm_drm_private *priv = dev_get_drvdata(master);
+@@ -337,12 +255,6 @@ static int msm_hdmi_bind(struct device *dev, struct device *master, void *data)
+ 		return err;
+ 	priv->hdmi = hdmi;
+ 
+-	err = msm_hdmi_register_audio_driver(hdmi, dev);
+-	if (err) {
+-		DRM_ERROR("Failed to attach an audio codec %d\n", err);
+-		hdmi->audio_pdev = NULL;
+-	}
+-
+ 	return 0;
+ }
+ 
+@@ -352,9 +264,6 @@ static void msm_hdmi_unbind(struct device *dev, struct device *master,
+ 	struct msm_drm_private *priv = dev_get_drvdata(master);
+ 
+ 	if (priv->hdmi) {
+-		if (priv->hdmi->audio_pdev)
+-			platform_device_unregister(priv->hdmi->audio_pdev);
+-
+ 		if (priv->hdmi->bridge)
+ 			msm_hdmi_hpd_disable(priv->hdmi);
+ 
+diff --git a/drivers/gpu/drm/msm/hdmi/hdmi.h b/drivers/gpu/drm/msm/hdmi/hdmi.h
+index cdd3bd4f3783..a5f481c39277 100644
+--- a/drivers/gpu/drm/msm/hdmi/hdmi.h
++++ b/drivers/gpu/drm/msm/hdmi/hdmi.h
+@@ -33,7 +33,6 @@ struct hdmi_hdcp_ctrl;
+ struct hdmi {
+ 	struct drm_device *dev;
+ 	struct platform_device *pdev;
+-	struct platform_device *audio_pdev;
+ 
+ 	const struct hdmi_platform_config *config;
+ 
+@@ -205,17 +204,16 @@ static inline int msm_hdmi_pll_8998_init(struct platform_device *pdev)
+ /*
+  * audio:
+  */
+-#define	HDMI_SAMPLE_RATE_32KHZ		0
+-#define	HDMI_SAMPLE_RATE_44_1KHZ	1
+-#define	HDMI_SAMPLE_RATE_48KHZ		2
+-#define	HDMI_SAMPLE_RATE_88_2KHZ	3
+-#define	HDMI_SAMPLE_RATE_96KHZ		4
+-#define	HDMI_SAMPLE_RATE_176_4KHZ	5
+-#define	HDMI_SAMPLE_RATE_192KHZ		6
++struct hdmi_codec_daifmt;
++struct hdmi_codec_params;
+ 
+ int msm_hdmi_audio_update(struct hdmi *hdmi);
+-int msm_hdmi_audio_info_setup(struct hdmi *hdmi, int rate, int channels);
+-int msm_hdmi_audio_disable(struct hdmi *hdmi);
++int msm_hdmi_bridge_audio_prepare(struct drm_connector *connector,
++				  struct drm_bridge *bridge,
++				  struct hdmi_codec_daifmt *daifmt,
++				  struct hdmi_codec_params *params);
++void msm_hdmi_bridge_audio_shutdown(struct drm_connector *connector,
++				    struct drm_bridge *bridge);
+ 
+ /*
+  * hdmi bridge:
+diff --git a/drivers/gpu/drm/msm/hdmi/hdmi_audio.c b/drivers/gpu/drm/msm/hdmi/hdmi_audio.c
+index 0b91ed5eabd2..8bb975e82c17 100644
+--- a/drivers/gpu/drm/msm/hdmi/hdmi_audio.c
++++ b/drivers/gpu/drm/msm/hdmi/hdmi_audio.c
+@@ -4,7 +4,12 @@
+  * Author: Rob Clark <robdclark@gmail.com>
+  */
+ 
++#include <drm/display/drm_hdmi_state_helper.h>
++
+ #include <linux/hdmi.h>
++
++#include <sound/hdmi-codec.h>
++
+ #include "hdmi.h"
+ 
+ /* Supported HDMI Audio sample rates */
+@@ -192,29 +197,72 @@ int msm_hdmi_audio_update(struct hdmi *hdmi)
+ 	return 0;
+ }
+ 
+-int msm_hdmi_audio_info_setup(struct hdmi *hdmi, int rate, int channels)
++int msm_hdmi_bridge_audio_prepare(struct drm_connector *connector,
++				  struct drm_bridge *bridge,
++				  struct hdmi_codec_daifmt *daifmt,
++				  struct hdmi_codec_params *params)
+ {
+-	if (!hdmi)
+-		return -ENXIO;
+-
+-	if ((rate < 0) || (rate >= MSM_HDMI_SAMPLE_RATE_MAX))
++	struct hdmi_bridge *hdmi_bridge = to_hdmi_bridge(bridge);
++	struct hdmi *hdmi = hdmi_bridge->hdmi;
++	unsigned int rate;
++	int ret;
++
++	drm_dbg_driver(bridge->dev, "%u Hz, %d bit, %d channels\n",
++		       params->sample_rate,
++		       params->sample_width,
++		       params->cea.channels);
++
++	switch (params->sample_rate) {
++	case 32000:
++		rate = MSM_HDMI_SAMPLE_RATE_32KHZ;
++		break;
++	case 44100:
++		rate = MSM_HDMI_SAMPLE_RATE_44_1KHZ;
++		break;
++	case 48000:
++		rate = MSM_HDMI_SAMPLE_RATE_48KHZ;
++		break;
++	case 88200:
++		rate = MSM_HDMI_SAMPLE_RATE_88_2KHZ;
++		break;
++	case 96000:
++		rate = MSM_HDMI_SAMPLE_RATE_96KHZ;
++		break;
++	case 176400:
++		rate = MSM_HDMI_SAMPLE_RATE_176_4KHZ;
++		break;
++	case 192000:
++		rate = MSM_HDMI_SAMPLE_RATE_192KHZ;
++		break;
++	default:
++		drm_err(bridge->dev, "rate[%d] not supported!\n",
++			params->sample_rate);
+ 		return -EINVAL;
++	}
++
++	ret = drm_atomic_helper_connector_hdmi_update_audio_infoframe(connector,
++								      &params->cea);
++	if (ret)
++		return ret;
+ 
+ 	hdmi->audio.rate = rate;
+-	hdmi->audio.channels = channels;
++	hdmi->audio.channels = params->cea.channels;
+ 	hdmi->audio.enabled = true;
+ 
+ 	return msm_hdmi_audio_update(hdmi);
+ }
+ 
+-int msm_hdmi_audio_disable(struct hdmi *hdmi)
++void msm_hdmi_bridge_audio_shutdown(struct drm_connector *connector,
++				    struct drm_bridge *bridge)
+ {
+-	if (!hdmi)
+-		return -ENXIO;
++	struct hdmi_bridge *hdmi_bridge = to_hdmi_bridge(bridge);
++	struct hdmi *hdmi = hdmi_bridge->hdmi;
++
++	drm_atomic_helper_connector_hdmi_clear_audio_infoframe(connector);
+ 
+ 	hdmi->audio.rate = 0;
+ 	hdmi->audio.channels = 2;
+ 	hdmi->audio.enabled = false;
+ 
+-	return msm_hdmi_audio_update(hdmi);
++	msm_hdmi_audio_update(hdmi);
+ }
+diff --git a/drivers/gpu/drm/msm/hdmi/hdmi_bridge.c b/drivers/gpu/drm/msm/hdmi/hdmi_bridge.c
+index 9399613662ee..1456354c8af4 100644
+--- a/drivers/gpu/drm/msm/hdmi/hdmi_bridge.c
++++ b/drivers/gpu/drm/msm/hdmi/hdmi_bridge.c
+@@ -477,6 +477,8 @@ static const struct drm_bridge_funcs msm_hdmi_bridge_funcs = {
+ 	.hdmi_tmds_char_rate_valid = msm_hdmi_bridge_tmds_char_rate_valid,
+ 	.hdmi_clear_infoframe = msm_hdmi_bridge_clear_infoframe,
+ 	.hdmi_write_infoframe = msm_hdmi_bridge_write_infoframe,
++	.hdmi_audio_prepare = msm_hdmi_bridge_audio_prepare,
++	.hdmi_audio_shutdown = msm_hdmi_bridge_audio_shutdown,
+ };
+ 
+ static void
+@@ -514,6 +516,9 @@ int msm_hdmi_bridge_init(struct hdmi *hdmi)
+ 		DRM_BRIDGE_OP_DETECT |
+ 		DRM_BRIDGE_OP_HDMI |
+ 		DRM_BRIDGE_OP_EDID;
++	bridge->hdmi_audio_max_i2s_playback_channels = 8;
++	bridge->hdmi_audio_dev = &hdmi->pdev->dev;
++	bridge->hdmi_audio_dai_port = -1;
+ 
+ 	ret = devm_drm_bridge_add(hdmi->dev->dev, bridge);
+ 	if (ret)
+-- 
+2.52.0
+
