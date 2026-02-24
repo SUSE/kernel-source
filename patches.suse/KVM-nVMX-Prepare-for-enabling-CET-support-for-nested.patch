@@ -1,0 +1,238 @@
+From: Yang Weijiang <weijiang.yang@intel.com>
+Date: Fri, 19 Sep 2025 15:32:38 -0700
+Subject: KVM: nVMX: Prepare for enabling CET support for nested guest
+Patch-mainline: v6.18-rc1
+Git-commit: 625884996bff1b25a39834fa4935d695d71ef1b1
+References: jsc#PED-15123
+
+Set up CET MSRs, related VM_ENTRY/EXIT control bits and fixed CR4 setting
+to enable CET for nested VM.
+
+vmcs12 and vmcs02 needs to be synced when L2 exits to L1 or when L1 wants
+to resume L2, that way correct CET states can be observed by one another.
+
+Please note that consistency checks regarding CET state during VM-Entry
+will be added later to prevent this patch from becoming too large.
+Advertising the new CET VM_ENTRY/EXIT control bits are also be deferred
+until after the consistency checks are added.
+
+Signed-off-by: Yang Weijiang <weijiang.yang@intel.com>
+Tested-by: Mathias Krause <minipli@grsecurity.net>
+Tested-by: John Allen <john.allen@amd.com>
+Tested-by: Rick Edgecombe <rick.p.edgecombe@intel.com>
+Signed-off-by: Chao Gao <chao.gao@intel.com>
+Reviewed-by: Xin Li (Intel) <xin@zytor.com>
+Tested-by: Xin Li (Intel) <xin@zytor.com>
+Link: https://lore.kernel.org/r/20250919223258.1604852-32-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Acked-by: Carlos López <clopez@suse.de>
+---
+ arch/x86/kvm/vmx/nested.c |   77 ++++++++++++++++++++++++++++++++++++++++++++++
+ arch/x86/kvm/vmx/vmcs12.c |    6 +++
+ arch/x86/kvm/vmx/vmcs12.h |   14 +++++++-
+ arch/x86/kvm/vmx/vmx.c    |    2 +
+ arch/x86/kvm/vmx/vmx.h    |    3 +
+ 5 files changed, 101 insertions(+), 1 deletion(-)
+
+--- a/arch/x86/kvm/vmx/nested.c
++++ b/arch/x86/kvm/vmx/nested.c
+@@ -714,6 +714,24 @@ static inline bool nested_vmx_prepare_ms
+ 	nested_vmx_set_intercept_for_msr(vmx, msr_bitmap_l1, msr_bitmap_l0,
+ 					 MSR_IA32_FLUSH_CMD, MSR_TYPE_W);
+ 
++	nested_vmx_set_intercept_for_msr(vmx, msr_bitmap_l1, msr_bitmap_l0,
++					 MSR_IA32_U_CET, MSR_TYPE_RW);
++
++	nested_vmx_set_intercept_for_msr(vmx, msr_bitmap_l1, msr_bitmap_l0,
++					 MSR_IA32_S_CET, MSR_TYPE_RW);
++
++	nested_vmx_set_intercept_for_msr(vmx, msr_bitmap_l1, msr_bitmap_l0,
++					 MSR_IA32_PL0_SSP, MSR_TYPE_RW);
++
++	nested_vmx_set_intercept_for_msr(vmx, msr_bitmap_l1, msr_bitmap_l0,
++					 MSR_IA32_PL1_SSP, MSR_TYPE_RW);
++
++	nested_vmx_set_intercept_for_msr(vmx, msr_bitmap_l1, msr_bitmap_l0,
++					 MSR_IA32_PL2_SSP, MSR_TYPE_RW);
++
++	nested_vmx_set_intercept_for_msr(vmx, msr_bitmap_l1, msr_bitmap_l0,
++					 MSR_IA32_PL3_SSP, MSR_TYPE_RW);
++
+ 	kvm_vcpu_unmap(vcpu, &map);
+ 
+ 	vmx->nested.force_msr_bitmap_recalc = false;
+@@ -2505,6 +2523,32 @@ static void prepare_vmcs02_early(struct
+ 	}
+ }
+ 
++static void vmcs_read_cet_state(struct kvm_vcpu *vcpu, u64 *s_cet,
++				u64 *ssp, u64 *ssp_tbl)
++{
++	if (guest_cpu_cap_has(vcpu, X86_FEATURE_IBT) ||
++	    guest_cpu_cap_has(vcpu, X86_FEATURE_SHSTK))
++		*s_cet = vmcs_readl(GUEST_S_CET);
++
++	if (guest_cpu_cap_has(vcpu, X86_FEATURE_SHSTK)) {
++		*ssp = vmcs_readl(GUEST_SSP);
++		*ssp_tbl = vmcs_readl(GUEST_INTR_SSP_TABLE);
++	}
++}
++
++static void vmcs_write_cet_state(struct kvm_vcpu *vcpu, u64 s_cet,
++				 u64 ssp, u64 ssp_tbl)
++{
++	if (guest_cpu_cap_has(vcpu, X86_FEATURE_IBT) ||
++	    guest_cpu_cap_has(vcpu, X86_FEATURE_SHSTK))
++		vmcs_writel(GUEST_S_CET, s_cet);
++
++	if (guest_cpu_cap_has(vcpu, X86_FEATURE_SHSTK)) {
++		vmcs_writel(GUEST_SSP, ssp);
++		vmcs_writel(GUEST_INTR_SSP_TABLE, ssp_tbl);
++	}
++}
++
+ static void prepare_vmcs02_rare(struct vcpu_vmx *vmx, struct vmcs12 *vmcs12)
+ {
+ 	struct hv_enlightened_vmcs *hv_evmcs = nested_vmx_evmcs(vmx);
+@@ -2621,6 +2665,10 @@ static void prepare_vmcs02_rare(struct v
+ 	vmcs_write32(VM_EXIT_MSR_LOAD_COUNT, vmx->msr_autoload.host.nr);
+ 	vmcs_write32(VM_ENTRY_MSR_LOAD_COUNT, vmx->msr_autoload.guest.nr);
+ 
++	if (vmcs12->vm_entry_controls & VM_ENTRY_LOAD_CET_STATE)
++		vmcs_write_cet_state(&vmx->vcpu, vmcs12->guest_s_cet,
++				     vmcs12->guest_ssp, vmcs12->guest_ssp_tbl);
++
+ 	set_cr4_guest_host_mask(vmx);
+ }
+ 
+@@ -2660,6 +2708,13 @@ static int prepare_vmcs02(struct kvm_vcp
+ 		kvm_set_dr(vcpu, 7, vcpu->arch.dr7);
+ 		vmx_guest_debugctl_write(vcpu, vmx->nested.pre_vmenter_debugctl);
+ 	}
++
++	if (!vmx->nested.nested_run_pending ||
++	    !(vmcs12->vm_entry_controls & VM_ENTRY_LOAD_CET_STATE))
++		vmcs_write_cet_state(vcpu, vmx->nested.pre_vmenter_s_cet,
++				     vmx->nested.pre_vmenter_ssp,
++				     vmx->nested.pre_vmenter_ssp_tbl);
++
+ 	if (kvm_mpx_supported() && (!vmx->nested.nested_run_pending ||
+ 	    !(vmcs12->vm_entry_controls & VM_ENTRY_LOAD_BNDCFGS)))
+ 		vmcs_write64(GUEST_BNDCFGS, vmx->nested.pre_vmenter_bndcfgs);
+@@ -3535,6 +3590,12 @@ enum nvmx_vmentry_status nested_vmx_ente
+ 	     !(vmcs12->vm_entry_controls & VM_ENTRY_LOAD_BNDCFGS)))
+ 		vmx->nested.pre_vmenter_bndcfgs = vmcs_read64(GUEST_BNDCFGS);
+ 
++	if (!vmx->nested.nested_run_pending ||
++	    !(vmcs12->vm_entry_controls & VM_ENTRY_LOAD_CET_STATE))
++		vmcs_read_cet_state(vcpu, &vmx->nested.pre_vmenter_s_cet,
++				    &vmx->nested.pre_vmenter_ssp,
++				    &vmx->nested.pre_vmenter_ssp_tbl);
++
+ 	/*
+ 	 * Overwrite vmcs01.GUEST_CR3 with L1's CR3 if EPT is disabled *and*
+ 	 * nested early checks are disabled.  In the event of a "late" VM-Fail,
+@@ -4618,6 +4679,10 @@ static void sync_vmcs02_to_vmcs12(struct
+ 
+ 	if (vmcs12->vm_exit_controls & VM_EXIT_SAVE_IA32_EFER)
+ 		vmcs12->guest_ia32_efer = vcpu->arch.efer;
++
++	vmcs_read_cet_state(&vmx->vcpu, &vmcs12->guest_s_cet,
++			    &vmcs12->guest_ssp,
++			    &vmcs12->guest_ssp_tbl);
+ }
+ 
+ /*
+@@ -4743,6 +4808,18 @@ static void load_vmcs12_host_state(struc
+ 	if (vmcs12->vm_exit_controls & VM_EXIT_CLEAR_BNDCFGS)
+ 		vmcs_write64(GUEST_BNDCFGS, 0);
+ 
++	/*
++	 * Load CET state from host state if VM_EXIT_LOAD_CET_STATE is set.
++	 * otherwise CET state should be retained across VM-exit, i.e.,
++	 * guest values should be propagated from vmcs12 to vmcs01.
++	 */
++	if (vmcs12->vm_exit_controls & VM_EXIT_LOAD_CET_STATE)
++		vmcs_write_cet_state(vcpu, vmcs12->host_s_cet, vmcs12->host_ssp,
++				     vmcs12->host_ssp_tbl);
++	else
++		vmcs_write_cet_state(vcpu, vmcs12->guest_s_cet, vmcs12->guest_ssp,
++				     vmcs12->guest_ssp_tbl);
++
+ 	if (vmcs12->vm_exit_controls & VM_EXIT_LOAD_IA32_PAT) {
+ 		vmcs_write64(GUEST_IA32_PAT, vmcs12->host_ia32_pat);
+ 		vcpu->arch.pat = vmcs12->host_ia32_pat;
+--- a/arch/x86/kvm/vmx/vmcs12.c
++++ b/arch/x86/kvm/vmx/vmcs12.c
+@@ -139,6 +139,9 @@ const unsigned short vmcs12_field_offset
+ 	FIELD(GUEST_PENDING_DBG_EXCEPTIONS, guest_pending_dbg_exceptions),
+ 	FIELD(GUEST_SYSENTER_ESP, guest_sysenter_esp),
+ 	FIELD(GUEST_SYSENTER_EIP, guest_sysenter_eip),
++	FIELD(GUEST_S_CET, guest_s_cet),
++	FIELD(GUEST_SSP, guest_ssp),
++	FIELD(GUEST_INTR_SSP_TABLE, guest_ssp_tbl),
+ 	FIELD(HOST_CR0, host_cr0),
+ 	FIELD(HOST_CR3, host_cr3),
+ 	FIELD(HOST_CR4, host_cr4),
+@@ -151,5 +154,8 @@ const unsigned short vmcs12_field_offset
+ 	FIELD(HOST_IA32_SYSENTER_EIP, host_ia32_sysenter_eip),
+ 	FIELD(HOST_RSP, host_rsp),
+ 	FIELD(HOST_RIP, host_rip),
++	FIELD(HOST_S_CET, host_s_cet),
++	FIELD(HOST_SSP, host_ssp),
++	FIELD(HOST_INTR_SSP_TABLE, host_ssp_tbl),
+ };
+ const unsigned int nr_vmcs12_fields = ARRAY_SIZE(vmcs12_field_offsets);
+--- a/arch/x86/kvm/vmx/vmcs12.h
++++ b/arch/x86/kvm/vmx/vmcs12.h
+@@ -117,7 +117,13 @@ struct __packed vmcs12 {
+ 	natural_width host_ia32_sysenter_eip;
+ 	natural_width host_rsp;
+ 	natural_width host_rip;
+-	natural_width paddingl[8]; /* room for future expansion */
++	natural_width host_s_cet;
++	natural_width host_ssp;
++	natural_width host_ssp_tbl;
++	natural_width guest_s_cet;
++	natural_width guest_ssp;
++	natural_width guest_ssp_tbl;
++	natural_width paddingl[2]; /* room for future expansion */
+ 	u32 pin_based_vm_exec_control;
+ 	u32 cpu_based_vm_exec_control;
+ 	u32 exception_bitmap;
+@@ -294,6 +300,12 @@ static inline void vmx_check_vmcs12_offs
+ 	CHECK_OFFSET(host_ia32_sysenter_eip, 656);
+ 	CHECK_OFFSET(host_rsp, 664);
+ 	CHECK_OFFSET(host_rip, 672);
++	CHECK_OFFSET(host_s_cet, 680);
++	CHECK_OFFSET(host_ssp, 688);
++	CHECK_OFFSET(host_ssp_tbl, 696);
++	CHECK_OFFSET(guest_s_cet, 704);
++	CHECK_OFFSET(guest_ssp, 712);
++	CHECK_OFFSET(guest_ssp_tbl, 720);
+ 	CHECK_OFFSET(pin_based_vm_exec_control, 744);
+ 	CHECK_OFFSET(cpu_based_vm_exec_control, 748);
+ 	CHECK_OFFSET(exception_bitmap, 752);
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -7686,6 +7686,8 @@ static void nested_vmx_cr_fixed1_bits_up
+ 	cr4_fixed1_update(X86_CR4_PKE,        ecx, feature_bit(PKU));
+ 	cr4_fixed1_update(X86_CR4_UMIP,       ecx, feature_bit(UMIP));
+ 	cr4_fixed1_update(X86_CR4_LA57,       ecx, feature_bit(LA57));
++	cr4_fixed1_update(X86_CR4_CET,	      ecx, feature_bit(SHSTK));
++	cr4_fixed1_update(X86_CR4_CET,	      edx, feature_bit(IBT));
+ 
+ 	entry = kvm_find_cpuid_entry_index(vcpu, 0x7, 1);
+ 	cr4_fixed1_update(X86_CR4_LAM_SUP,    eax, feature_bit(LAM));
+--- a/arch/x86/kvm/vmx/vmx.h
++++ b/arch/x86/kvm/vmx/vmx.h
+@@ -181,6 +181,9 @@ struct nested_vmx {
+ 	 */
+ 	u64 pre_vmenter_debugctl;
+ 	u64 pre_vmenter_bndcfgs;
++	u64 pre_vmenter_s_cet;
++	u64 pre_vmenter_ssp;
++	u64 pre_vmenter_ssp_tbl;
+ 
+ 	/* to migrate it to L1 if L2 writes to L1's CR8 directly */
+ 	int l1_tpr_threshold;
