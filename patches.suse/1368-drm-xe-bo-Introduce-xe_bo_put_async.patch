@@ -1,0 +1,144 @@
+From 5473f4d4e29dea06155e884459b4b9744b2330a8 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Thomas=20Hellstr=C3=B6m?= <thomas.hellstrom@linux.intel.com>
+Date: Wed, 5 Mar 2025 17:26:30 -0800
+Subject: drm/xe/bo: Introduce xe_bo_put_async
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 5473f4d4e29dea06155e884459b4b9744b2330a8
+Patch-mainline: v6.15-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Introduce xe_bo_put_async to put a bo where the context is such that
+the bo destructor can't run due to lockdep problems or atomic context.
+
+If the put is the final put, freeing will be done from a work item.
+
+V5: - Kerenl doc for xe_bo_put_async (Thomas)
+V7: - Fix kernel doc (CI)
+
+Signed-off-by: Matthew Brost <matthew.brost@intel.com>
+Signed-off-by: Thomas Hellström <thomas.hellstrom@linux.intel.com>
+Reviewed-by: Matthew Brost <matthew.brost@intel.com>
+Reviewed-by: Himal Prasad Ghimiray <himal.prasad.ghimiray@intel.com>
+Tested-by: Gwan-gyeong Mun <gwan-gyeong.mun@intel.com>
+Reviewed-by: Gwan-gyeong Mun <gwan-gyeong.mun@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250306012657.3505757-6-matthew.brost@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/xe/xe_bo.c           | 25 +++++++++++++++++++++++++
+ drivers/gpu/drm/xe/xe_bo.h           | 19 +++++++++++++++++++
+ drivers/gpu/drm/xe/xe_device.c       |  3 +++
+ drivers/gpu/drm/xe/xe_device_types.h |  8 ++++++++
+ 4 files changed, 55 insertions(+)
+
+diff --git a/drivers/gpu/drm/xe/xe_bo.c b/drivers/gpu/drm/xe/xe_bo.c
+index d6f44540820d..0305e4bdb18c 100644
+--- a/drivers/gpu/drm/xe/xe_bo.c
++++ b/drivers/gpu/drm/xe/xe_bo.c
+@@ -2828,6 +2828,31 @@ void xe_bo_put_commit(struct llist_head *deferred)
+ 		drm_gem_object_free(&bo->ttm.base.refcount);
+ }
+ 
++static void xe_bo_dev_work_func(struct work_struct *work)
++{
++	struct xe_bo_dev *bo_dev = container_of(work, typeof(*bo_dev), async_free);
++
++	xe_bo_put_commit(&bo_dev->async_list);
++}
++
++/**
++ * xe_bo_dev_init() - Initialize BO dev to manage async BO freeing
++ * @bo_dev: The BO dev structure
++ */
++void xe_bo_dev_init(struct xe_bo_dev *bo_dev)
++{
++	INIT_WORK(&bo_dev->async_free, xe_bo_dev_work_func);
++}
++
++/**
++ * xe_bo_dev_fini() - Finalize BO dev managing async BO freeing
++ * @bo_dev: The BO dev structure
++ */
++void xe_bo_dev_fini(struct xe_bo_dev *bo_dev)
++{
++	flush_work(&bo_dev->async_free);
++}
++
+ void xe_bo_put(struct xe_bo *bo)
+ {
+ 	struct xe_tile *tile;
+diff --git a/drivers/gpu/drm/xe/xe_bo.h b/drivers/gpu/drm/xe/xe_bo.h
+index ce49002802c2..ce3ad9007e8a 100644
+--- a/drivers/gpu/drm/xe/xe_bo.h
++++ b/drivers/gpu/drm/xe/xe_bo.h
+@@ -345,6 +345,25 @@ xe_bo_put_deferred(struct xe_bo *bo, struct llist_head *deferred)
+ 
+ void xe_bo_put_commit(struct llist_head *deferred);
+ 
++/**
++ * xe_bo_put_async() - Put BO async
++ * @bo: The bo to put.
++ *
++ * Put BO async, the final put is deferred to a worker to exit an IRQ context.
++ */
++static inline void
++xe_bo_put_async(struct xe_bo *bo)
++{
++	struct xe_bo_dev *bo_device = &xe_bo_device(bo)->bo_device;
++
++	if (xe_bo_put_deferred(bo, &bo_device->async_list))
++		schedule_work(&bo_device->async_free);
++}
++
++void xe_bo_dev_init(struct xe_bo_dev *bo_device);
++
++void xe_bo_dev_fini(struct xe_bo_dev *bo_device);
++
+ struct sg_table *xe_bo_sg(struct xe_bo *bo);
+ 
+ /*
+diff --git a/drivers/gpu/drm/xe/xe_device.c b/drivers/gpu/drm/xe/xe_device.c
+index 539da525aa14..5d79b439dd62 100644
+--- a/drivers/gpu/drm/xe/xe_device.c
++++ b/drivers/gpu/drm/xe/xe_device.c
+@@ -388,6 +388,8 @@ static void xe_device_destroy(struct drm_device *dev, void *dummy)
+ {
+ 	struct xe_device *xe = to_xe_device(dev);
+ 
++	xe_bo_dev_fini(&xe->bo_device);
++
+ 	if (xe->preempt_fence_wq)
+ 		destroy_workqueue(xe->preempt_fence_wq);
+ 
+@@ -428,6 +430,7 @@ struct xe_device *xe_device_create(struct pci_dev *pdev,
+ 	if (WARN_ON(err))
+ 		goto err;
+ 
++	xe_bo_dev_init(&xe->bo_device);
+ 	err = drmm_add_action_or_reset(&xe->drm, xe_device_destroy, NULL);
+ 	if (err)
+ 		goto err;
+diff --git a/drivers/gpu/drm/xe/xe_device_types.h b/drivers/gpu/drm/xe/xe_device_types.h
+index 604a69c494e5..2f2a51fd9516 100644
+--- a/drivers/gpu/drm/xe/xe_device_types.h
++++ b/drivers/gpu/drm/xe/xe_device_types.h
+@@ -527,6 +527,14 @@ struct xe_device {
+ 		int mode;
+ 	} wedged;
+ 
++	/** @bo_device: Struct to control async free of BOs */
++	struct xe_bo_dev {
++		/** @bo_device.async_free: Free worker */
++		struct work_struct async_free;
++		/** @bo_device.async_list: List of BOs to be freed */
++		struct llist_head async_list;
++	} bo_device;
++
+ 	/** @pmu: performance monitoring unit */
+ 	struct xe_pmu pmu;
+ 
+-- 
+2.52.0
+
