@@ -1,0 +1,97 @@
+From df8c37810b5a4a5c8bff1f880f59163c800a4985 Mon Sep 17 00:00:00 2001
+From: Matthew Brost <matthew.brost@intel.com>
+Date: Mon, 12 May 2025 06:54:57 -0700
+Subject: drm/gpusvm: Add timeslicing support to GPU SVM
+Git-commit: df8c37810b5a4a5c8bff1f880f59163c800a4985
+Patch-mainline: v6.15-rc7
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Add timeslicing support to GPU SVM which will guarantee the GPU a
+minimum execution time on piece of physical memory before migration back
+to CPU. Intended to implement strict migration policies which require
+memory to be in a certain placement for correct execution.
+
+Required for shared CPU and GPU atomics on certain devices.
+
+Fixes: 99624bdff867 ("drm/gpusvm: Add support for GPU Shared Virtual Memory")
+Cc: stable@vger.kernel.org
+Signed-off-by: Matthew Brost <matthew.brost@intel.com>
+Reviewed-by: Himal Prasad Ghimiray <himal.prasad.ghimiray@intel.com>
+Link: https://lore.kernel.org/r/20250512135500.1405019-4-matthew.brost@intel.com
+(cherry picked from commit 8dc1812b5b3a42311d28eb385eed88e2053ad3cb)
+
+Signed-off-by: Lucas De Marchi <lucas.demarchi@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/drm_gpusvm.c | 9 +++++++++
+ include/drm/drm_gpusvm.h     | 5 +++++
+ 2 files changed, 14 insertions(+)
+
+diff --git a/drivers/gpu/drm/drm_gpusvm.c b/drivers/gpu/drm/drm_gpusvm.c
+index 41f6616bcf76..4b2f32889f00 100644
+--- a/drivers/gpu/drm/drm_gpusvm.c
++++ b/drivers/gpu/drm/drm_gpusvm.c
+@@ -1783,6 +1783,8 @@ int drm_gpusvm_migrate_to_devmem(struct drm_gpusvm *gpusvm,
+ 		goto err_finalize;
+ 
+ 	/* Upon success bind devmem allocation to range and zdd */
++	devmem_allocation->timeslice_expiration = get_jiffies_64() +
++		msecs_to_jiffies(ctx->timeslice_ms);
+ 	zdd->devmem_allocation = devmem_allocation;	/* Owns ref */
+ 
+ err_finalize:
+@@ -2003,6 +2005,13 @@ static int __drm_gpusvm_migrate_to_ram(struct vm_area_struct *vas,
+ 	void *buf;
+ 	int i, err = 0;
+ 
++	if (page) {
++		zdd = page->zone_device_data;
++		if (time_before64(get_jiffies_64(),
++				  zdd->devmem_allocation->timeslice_expiration))
++			return 0;
++	}
++
+ 	start = ALIGN_DOWN(fault_addr, size);
+ 	end = ALIGN(fault_addr + 1, size);
+ 
+diff --git a/include/drm/drm_gpusvm.h b/include/drm/drm_gpusvm.h
+index 653d48dbe1c1..eaf704d3d05e 100644
+--- a/include/drm/drm_gpusvm.h
++++ b/include/drm/drm_gpusvm.h
+@@ -89,6 +89,7 @@ struct drm_gpusvm_devmem_ops {
+  * @ops: Pointer to the operations structure for GPU SVM device memory
+  * @dpagemap: The struct drm_pagemap of the pages this allocation belongs to.
+  * @size: Size of device memory allocation
++ * @timeslice_expiration: Timeslice expiration in jiffies
+  */
+ struct drm_gpusvm_devmem {
+ 	struct device *dev;
+@@ -97,6 +98,7 @@ struct drm_gpusvm_devmem {
+ 	const struct drm_gpusvm_devmem_ops *ops;
+ 	struct drm_pagemap *dpagemap;
+ 	size_t size;
++	u64 timeslice_expiration;
+ };
+ 
+ /**
+@@ -295,6 +297,8 @@ struct drm_gpusvm {
+  * @check_pages_threshold: Check CPU pages for present if chunk is less than or
+  *                         equal to threshold. If not present, reduce chunk
+  *                         size.
++ * @timeslice_ms: The timeslice MS which in minimum time a piece of memory
++ *		  remains with either exclusive GPU or CPU access.
+  * @in_notifier: entering from a MMU notifier
+  * @read_only: operating on read-only memory
+  * @devmem_possible: possible to use device memory
+@@ -304,6 +308,7 @@ struct drm_gpusvm {
+  */
+ struct drm_gpusvm_ctx {
+ 	unsigned long check_pages_threshold;
++	unsigned long timeslice_ms;
+ 	unsigned int in_notifier :1;
+ 	unsigned int read_only :1;
+ 	unsigned int devmem_possible :1;
+-- 
+2.52.0
+
