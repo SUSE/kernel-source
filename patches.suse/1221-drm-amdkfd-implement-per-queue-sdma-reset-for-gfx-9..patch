@@ -1,0 +1,432 @@
+From bac38ca8c4755452fcd7e9f2603dea944bcfe76e Mon Sep 17 00:00:00 2001
+From: Jonathan Kim <jonathan.kim@amd.com>
+Date: Wed, 15 Jan 2025 15:29:34 -0500
+Subject: drm/amdkfd: implement per queue sdma reset for gfx 9.4+
+Git-commit: bac38ca8c4755452fcd7e9f2603dea944bcfe76e
+Patch-mainline: v6.15-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+To reset hung SDMA queues on GFX 9.4+ for the GFX9 family, a soft reset
+must be issued through SMU.  Since soft resets will reset an entire SDMA
+engine, use a common KGD call to do the reset as the KGD will handle
+avoiding a reset of in flight GFX and paging queues on that engine.
+
+In addition, create a common call for all reset types to simplify
+the handling of module parameter settings that block gpu resets.
+
+Signed-off-by: Jonathan Kim <jonathan.kim@amd.com>
+Reviewed-by: Harish Kasiviswanathan <harish.kasiviswanathan@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../drm/amd/amdgpu/amdgpu_amdkfd_aldebaran.c  |   1 +
+ .../drm/amd/amdgpu/amdgpu_amdkfd_arcturus.c   |   3 +-
+ .../drm/amd/amdgpu/amdgpu_amdkfd_gc_9_4_3.c   |  14 +-
+ .../drm/amd/amdgpu/amdgpu_amdkfd_gfx_v10.c    |   9 +-
+ .../drm/amd/amdgpu/amdgpu_amdkfd_gfx_v10.h    |   2 +
+ .../drm/amd/amdgpu/amdgpu_amdkfd_gfx_v10_3.c  |   3 +-
+ .../drm/amd/amdgpu/amdgpu_amdkfd_gfx_v11.c    |   9 +-
+ .../drm/amd/amdgpu/amdgpu_amdkfd_gfx_v12.c    |   7 +
+ .../gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v9.c |  16 ++-
+ .../gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v9.h |   2 +
+ .../drm/amd/amdkfd/kfd_device_queue_manager.c | 128 ++++++++++++++++--
+ .../gpu/drm/amd/include/kgd_kfd_interface.h   |   2 +
+ 12 files changed, 171 insertions(+), 25 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_aldebaran.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_aldebaran.c
+index 8dfdb18197c4..6e861d08d044 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_aldebaran.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_aldebaran.c
+@@ -193,4 +193,5 @@ const struct kfd2kgd_calls aldebaran_kfd2kgd = {
+ 	.program_trap_handler_settings = kgd_gfx_v9_program_trap_handler_settings,
+ 	.hqd_get_pq_addr = kgd_gfx_v9_hqd_get_pq_addr,
+ 	.hqd_reset = kgd_gfx_v9_hqd_reset,
++	.hqd_sdma_get_doorbell = kgd_gfx_v9_hqd_sdma_get_doorbell
+ };
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_arcturus.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_arcturus.c
+index 9abf29b58ac7..c820418e8ccd 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_arcturus.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_arcturus.c
+@@ -419,5 +419,6 @@ const struct kfd2kgd_calls arcturus_kfd2kgd = {
+ 	.get_cu_occupancy = kgd_gfx_v9_get_cu_occupancy,
+ 	.program_trap_handler_settings = kgd_gfx_v9_program_trap_handler_settings,
+ 	.hqd_get_pq_addr = kgd_gfx_v9_hqd_get_pq_addr,
+-	.hqd_reset = kgd_gfx_v9_hqd_reset
++	.hqd_reset = kgd_gfx_v9_hqd_reset,
++	.hqd_sdma_get_doorbell = kgd_gfx_v9_hqd_sdma_get_doorbell
+ };
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gc_9_4_3.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gc_9_4_3.c
+index e2ae714a700f..0c0998477598 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gc_9_4_3.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gc_9_4_3.c
+@@ -509,6 +509,17 @@ static uint32_t kgd_gfx_v9_4_3_clear_address_watch(struct amdgpu_device *adev,
+ 	return 0;
+ }
+ 
++static uint32_t kgd_gfx_v9_4_3_hqd_sdma_get_doorbell(struct amdgpu_device *adev,
++						     int engine, int queue)
++{
++	uint32_t reg_offset = get_sdma_rlc_reg_offset(adev, engine, queue);
++	uint32_t status = RREG32(regSDMA_RLC0_CONTEXT_STATUS + reg_offset);
++	uint32_t doorbell_off = RREG32(regSDMA_RLC0_DOORBELL_OFFSET + reg_offset);
++	bool is_active = !!REG_GET_FIELD(status, SDMA_RLC0_CONTEXT_STATUS, SELECTED);
++
++	return is_active ? doorbell_off >> 2 : 0;
++}
++
+ const struct kfd2kgd_calls gc_9_4_3_kfd2kgd = {
+ 	.program_sh_mem_settings = kgd_gfx_v9_program_sh_mem_settings,
+ 	.set_pasid_vmid_mapping = kgd_gfx_v9_4_3_set_pasid_vmid_mapping,
+@@ -543,5 +554,6 @@ const struct kfd2kgd_calls gc_9_4_3_kfd2kgd = {
+ 	.set_address_watch = kgd_gfx_v9_4_3_set_address_watch,
+ 	.clear_address_watch = kgd_gfx_v9_4_3_clear_address_watch,
+ 	.hqd_get_pq_addr = kgd_gfx_v9_hqd_get_pq_addr,
+-	.hqd_reset = kgd_gfx_v9_hqd_reset
++	.hqd_reset = kgd_gfx_v9_hqd_reset,
++	.hqd_sdma_get_doorbell = kgd_gfx_v9_4_3_hqd_sdma_get_doorbell
+ };
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v10.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v10.c
+index 62176d607bef..2887b6f3eaa2 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v10.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v10.c
+@@ -1084,6 +1084,12 @@ uint64_t kgd_gfx_v10_hqd_reset(struct amdgpu_device *adev,
+ 	return 0;
+ }
+ 
++uint32_t kgd_gfx_v10_hqd_sdma_get_doorbell(struct amdgpu_device *adev,
++					   int engine, int queue)
++{
++	return 0;
++}
++
+ const struct kfd2kgd_calls gfx_v10_kfd2kgd = {
+ 	.program_sh_mem_settings = kgd_program_sh_mem_settings,
+ 	.set_pasid_vmid_mapping = kgd_set_pasid_vmid_mapping,
+@@ -1112,5 +1118,6 @@ const struct kfd2kgd_calls gfx_v10_kfd2kgd = {
+ 	.build_grace_period_packet_info = kgd_gfx_v10_build_grace_period_packet_info,
+ 	.program_trap_handler_settings = program_trap_handler_settings,
+ 	.hqd_get_pq_addr = kgd_gfx_v10_hqd_get_pq_addr,
+-	.hqd_reset = kgd_gfx_v10_hqd_reset
++	.hqd_reset = kgd_gfx_v10_hqd_reset,
++	.hqd_sdma_get_doorbell = kgd_gfx_v10_hqd_sdma_get_doorbell
+ };
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v10.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v10.h
+index 9efd2dd4fdd7..db577c2a847a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v10.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v10.h
+@@ -65,3 +65,5 @@ uint64_t kgd_gfx_v10_hqd_reset(struct amdgpu_device *adev,
+ 			      uint32_t queue_id,
+ 			      uint32_t inst,
+ 			      unsigned int utimeout);
++uint32_t kgd_gfx_v10_hqd_sdma_get_doorbell(struct amdgpu_device *adev,
++					   int engine, int queue);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v10_3.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v10_3.c
+index c718bedda0ca..ac9ad505f9d7 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v10_3.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v10_3.c
+@@ -682,5 +682,6 @@ const struct kfd2kgd_calls gfx_v10_3_kfd2kgd = {
+ 	.set_address_watch = kgd_gfx_v10_set_address_watch,
+ 	.clear_address_watch = kgd_gfx_v10_clear_address_watch,
+ 	.hqd_get_pq_addr = kgd_gfx_v10_hqd_get_pq_addr,
+-	.hqd_reset = kgd_gfx_v10_hqd_reset
++	.hqd_reset = kgd_gfx_v10_hqd_reset,
++	.hqd_sdma_get_doorbell = kgd_gfx_v10_hqd_sdma_get_doorbell
+ };
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v11.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v11.c
+index a4ba49cb22db..e0e6a6a49d90 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v11.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v11.c
+@@ -800,6 +800,12 @@ static uint64_t kgd_gfx_v11_hqd_reset(struct amdgpu_device *adev,
+ 	return 0;
+ }
+ 
++static uint32_t kgd_gfx_v11_hqd_sdma_get_doorbell(struct amdgpu_device *adev,
++						  int engine, int queue)
++{
++	return 0;
++}
++
+ const struct kfd2kgd_calls gfx_v11_kfd2kgd = {
+ 	.program_sh_mem_settings = program_sh_mem_settings_v11,
+ 	.set_pasid_vmid_mapping = set_pasid_vmid_mapping_v11,
+@@ -824,5 +830,6 @@ const struct kfd2kgd_calls gfx_v11_kfd2kgd = {
+ 	.set_address_watch = kgd_gfx_v11_set_address_watch,
+ 	.clear_address_watch = kgd_gfx_v11_clear_address_watch,
+ 	.hqd_get_pq_addr = kgd_gfx_v11_hqd_get_pq_addr,
+-	.hqd_reset = kgd_gfx_v11_hqd_reset
++	.hqd_reset = kgd_gfx_v11_hqd_reset,
++	.hqd_sdma_get_doorbell = kgd_gfx_v11_hqd_sdma_get_doorbell
+ };
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v12.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v12.c
+index 0dfe7093bd8a..6f0dc23c901b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v12.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v12.c
+@@ -361,6 +361,12 @@ static uint32_t kgd_gfx_v12_clear_address_watch(struct amdgpu_device *adev,
+ 	return 0;
+ }
+ 
++static uint32_t kgd_gfx_v12_hqd_sdma_get_doorbell(struct amdgpu_device *adev,
++						 int engine, int queue)
++{
++	return 0;
++}
++
+ const struct kfd2kgd_calls gfx_v12_kfd2kgd = {
+ 	.init_interrupts = init_interrupts_v12,
+ 	.hqd_dump = hqd_dump_v12,
+@@ -374,4 +380,5 @@ const struct kfd2kgd_calls gfx_v12_kfd2kgd = {
+ 	.set_wave_launch_mode = kgd_gfx_v12_set_wave_launch_mode,
+ 	.set_address_watch = kgd_gfx_v12_set_address_watch,
+ 	.clear_address_watch = kgd_gfx_v12_clear_address_watch,
++	.hqd_sdma_get_doorbell = kgd_gfx_v12_hqd_sdma_get_doorbell
+ };
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v9.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v9.c
+index 441568163e20..84135eb90660 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v9.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v9.c
+@@ -1131,9 +1131,6 @@ uint64_t kgd_gfx_v9_hqd_get_pq_addr(struct amdgpu_device *adev,
+ 	uint32_t low, high;
+ 	uint64_t queue_addr = 0;
+ 
+-	if (!amdgpu_gpu_recovery)
+-		return 0;
+-
+ 	kgd_gfx_v9_acquire_queue(adev, pipe_id, queue_id, inst);
+ 	amdgpu_gfx_rlc_enter_safe_mode(adev, inst);
+ 
+@@ -1182,9 +1179,6 @@ uint64_t kgd_gfx_v9_hqd_reset(struct amdgpu_device *adev,
+ 	uint32_t low, high, pipe_reset_data = 0;
+ 	uint64_t queue_addr = 0;
+ 
+-	if (!amdgpu_gpu_recovery)
+-		return 0;
+-
+ 	kgd_gfx_v9_acquire_queue(adev, pipe_id, queue_id, inst);
+ 	amdgpu_gfx_rlc_enter_safe_mode(adev, inst);
+ 
+@@ -1229,6 +1223,13 @@ uint64_t kgd_gfx_v9_hqd_reset(struct amdgpu_device *adev,
+ 	return queue_addr;
+ }
+ 
++uint32_t kgd_gfx_v9_hqd_sdma_get_doorbell(struct amdgpu_device *adev,
++					  int engine, int queue)
++
++{
++	return 0;
++}
++
+ const struct kfd2kgd_calls gfx_v9_kfd2kgd = {
+ 	.program_sh_mem_settings = kgd_gfx_v9_program_sh_mem_settings,
+ 	.set_pasid_vmid_mapping = kgd_gfx_v9_set_pasid_vmid_mapping,
+@@ -1258,5 +1259,6 @@ const struct kfd2kgd_calls gfx_v9_kfd2kgd = {
+ 	.get_cu_occupancy = kgd_gfx_v9_get_cu_occupancy,
+ 	.program_trap_handler_settings = kgd_gfx_v9_program_trap_handler_settings,
+ 	.hqd_get_pq_addr = kgd_gfx_v9_hqd_get_pq_addr,
+-	.hqd_reset = kgd_gfx_v9_hqd_reset
++	.hqd_reset = kgd_gfx_v9_hqd_reset,
++	.hqd_sdma_get_doorbell = kgd_gfx_v9_hqd_sdma_get_doorbell
+ };
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v9.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v9.h
+index b6a91a552aa4..90c8fa13d519 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v9.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v9.h
+@@ -111,3 +111,5 @@ uint64_t kgd_gfx_v9_hqd_reset(struct amdgpu_device *adev,
+ 			      uint32_t queue_id,
+ 			      uint32_t inst,
+ 			      unsigned int utimeout);
++uint32_t kgd_gfx_v9_hqd_sdma_get_doorbell(struct amdgpu_device *adev,
++					  int engine, int queue);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+index 257373e3bd86..812000795a86 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+@@ -36,6 +36,7 @@
+ #include "kfd_kernel_queue.h"
+ #include "amdgpu_amdkfd.h"
+ #include "amdgpu_reset.h"
++#include "amdgpu_sdma.h"
+ #include "mes_v11_api_def.h"
+ #include "kfd_debug.h"
+ 
+@@ -67,6 +68,8 @@ static int allocate_hqd(struct device_queue_manager *dqm, struct queue *q);
+ static int allocate_sdma_queue(struct device_queue_manager *dqm,
+ 				struct queue *q, const uint32_t *restore_sdma_id);
+ 
++static int reset_queues_on_hws_hang(struct device_queue_manager *dqm, bool is_sdma);
++
+ static inline
+ enum KFD_MQD_TYPE get_mqd_type_from_queue_type(enum kfd_queue_type type)
+ {
+@@ -2207,8 +2210,7 @@ static struct queue *find_queue_by_address(struct device_queue_manager *dqm, uin
+ 	return NULL;
+ }
+ 
+-/* only for compute queue */
+-static int reset_queues_on_hws_hang(struct device_queue_manager *dqm)
++static int reset_hung_queues(struct device_queue_manager *dqm)
+ {
+ 	int r = 0, reset_count = 0, i;
+ 
+@@ -2261,6 +2263,104 @@ static int reset_queues_on_hws_hang(struct device_queue_manager *dqm)
+ 	return r;
+ }
+ 
++static bool sdma_has_hang(struct device_queue_manager *dqm)
++{
++	int engine_start = dqm->dev->node_id * get_num_all_sdma_engines(dqm);
++	int engine_end = engine_start + get_num_all_sdma_engines(dqm);
++	int num_queues_per_eng =  dqm->dev->kfd->device_info.num_sdma_queues_per_engine;
++	int i, j;
++
++	for (i = engine_start; i < engine_end; i++) {
++		for (j = 0; j < num_queues_per_eng; j++) {
++			if (!dqm->dev->kfd2kgd->hqd_sdma_get_doorbell(dqm->dev->adev, i, j))
++				continue;
++
++			return true;
++		}
++	}
++
++	return false;
++}
++
++static bool set_sdma_queue_as_reset(struct device_queue_manager *dqm,
++				    uint32_t doorbell_off)
++{
++	struct device_process_node *cur;
++	struct qcm_process_device *qpd;
++	struct queue *q;
++
++	list_for_each_entry(cur, &dqm->queues, list) {
++		qpd = cur->qpd;
++		list_for_each_entry(q, &qpd->queues_list, list) {
++			if ((q->properties.type == KFD_QUEUE_TYPE_SDMA ||
++			     q->properties.type == KFD_QUEUE_TYPE_SDMA_XGMI) &&
++			     q->properties.doorbell_off == doorbell_off) {
++				set_queue_as_reset(dqm, q, qpd);
++				return true;
++			}
++		}
++	}
++
++	return false;
++}
++
++static int reset_hung_queues_sdma(struct device_queue_manager *dqm)
++{
++	int engine_start = dqm->dev->node_id * get_num_all_sdma_engines(dqm);
++	int engine_end = engine_start + get_num_all_sdma_engines(dqm);
++	int num_queues_per_eng =  dqm->dev->kfd->device_info.num_sdma_queues_per_engine;
++	int r = 0, i, j;
++
++	if (dqm->is_hws_hang)
++		return -EIO;
++
++	/* Scan for hung HW queues and reset engine. */
++	dqm->detect_hang_count = 0;
++	for (i = engine_start; i < engine_end; i++) {
++		for (j = 0; j < num_queues_per_eng; j++) {
++			uint32_t doorbell_off =
++				dqm->dev->kfd2kgd->hqd_sdma_get_doorbell(dqm->dev->adev, i, j);
++
++			if (!doorbell_off)
++				continue;
++
++			/* Reset engine and check. */
++			if (amdgpu_sdma_reset_engine(dqm->dev->adev, i, false) ||
++			    dqm->dev->kfd2kgd->hqd_sdma_get_doorbell(dqm->dev->adev, i, j) ||
++			    !set_sdma_queue_as_reset(dqm, doorbell_off)) {
++				r = -ENOTRECOVERABLE;
++				goto reset_fail;
++			}
++
++			/* Should only expect one queue active per engine */
++			dqm->detect_hang_count++;
++			break;
++		}
++	}
++
++	/* Signal process reset */
++	if (dqm->detect_hang_count)
++		kfd_signal_reset_event(dqm->dev);
++	else
++		r = -ENOTRECOVERABLE;
++
++reset_fail:
++	dqm->detect_hang_count = 0;
++
++	return r;
++}
++
++static int reset_queues_on_hws_hang(struct device_queue_manager *dqm, bool is_sdma)
++{
++	while (halt_if_hws_hang)
++		schedule();
++
++	if (!amdgpu_gpu_recovery)
++		return -ENOTRECOVERABLE;
++
++	return is_sdma ? reset_hung_queues_sdma(dqm) : reset_hung_queues(dqm);
++}
++
+ /* dqm->lock mutex has to be locked before calling this function */
+ static int unmap_queues_cpsch(struct device_queue_manager *dqm,
+ 				enum kfd_unmap_queues_filter filter,
+@@ -2311,16 +2411,13 @@ static int unmap_queues_cpsch(struct device_queue_manager *dqm,
+ 	 * check those fields
+ 	 */
+ 	mqd_mgr = dqm->mqd_mgrs[KFD_MQD_TYPE_HIQ];
+-	if (mqd_mgr->check_preemption_failed(mqd_mgr, dqm->packet_mgr.priv_queue->queue->mqd)) {
+-		while (halt_if_hws_hang)
+-			schedule();
+-		if (reset_queues_on_hws_hang(dqm)) {
+-			dqm->is_hws_hang = true;
+-			kfd_hws_hang(dqm);
+-			retval = -ETIME;
+-			goto out;
+-		}
+-	}
++	if (mqd_mgr->check_preemption_failed(mqd_mgr, dqm->packet_mgr.priv_queue->queue->mqd) &&
++	    reset_queues_on_hws_hang(dqm, false))
++		goto reset_fail;
++
++	/* Check for SDMA hang and attempt SDMA reset */
++	if (sdma_has_hang(dqm) && reset_queues_on_hws_hang(dqm, true))
++		goto reset_fail;
+ 
+ 	/* We need to reset the grace period value for this device */
+ 	if (grace_period != USE_DEFAULT_GRACE_PERIOD) {
+@@ -2331,10 +2428,15 @@ static int unmap_queues_cpsch(struct device_queue_manager *dqm,
+ 
+ 	pm_release_ib(&dqm->packet_mgr);
+ 	dqm->active_runlist = false;
+-
+ out:
+ 	up_read(&dqm->dev->adev->reset_domain->sem);
+ 	return retval;
++
++reset_fail:
++	dqm->is_hws_hang = true;
++	kfd_hws_hang(dqm);
++	up_read(&dqm->dev->adev->reset_domain->sem);
++	return -ETIME;
+ }
+ 
+ /* only for compute queue */
+diff --git a/drivers/gpu/drm/amd/include/kgd_kfd_interface.h b/drivers/gpu/drm/amd/include/kgd_kfd_interface.h
+index e3e635a31b8a..1e8dfa6c0dc8 100644
+--- a/drivers/gpu/drm/amd/include/kgd_kfd_interface.h
++++ b/drivers/gpu/drm/amd/include/kgd_kfd_interface.h
+@@ -330,6 +330,8 @@ struct kfd2kgd_calls {
+ 	uint64_t (*hqd_reset)(struct amdgpu_device *adev,
+ 			      uint32_t pipe_id, uint32_t queue_id,
+ 			      uint32_t inst, unsigned int utimeout);
++	uint32_t (*hqd_sdma_get_doorbell)(struct amdgpu_device *adev,
++					  int engine, int queue);
+ };
+ 
+ #endif	/* KGD_KFD_INTERFACE_H_INCLUDED */
+-- 
+2.52.0
+
