@@ -1,0 +1,139 @@
+From 11bbe0d9aa9680257b666e50d6b3c15bb856a27e Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Thomas=20Hellstr=C3=B6m?= <thomas.hellstrom@linux.intel.com>
+Date: Wed, 5 Mar 2025 17:26:48 -0800
+Subject: drm/xe: Add drm_pagemap ops to SVM
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 11bbe0d9aa9680257b666e50d6b3c15bb856a27e
+Patch-mainline: v6.15-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Add support for mapping device pages to Xe SVM by attaching drm_pagemap
+to a memory region, which is then linked to a GPU SVM devmem allocation.
+This enables GPU SVM to derive the device page address.
+
+V3: - Better commit message (Thomas)
+ - New drm_pagemap.h location
+V5: - s/xe_mem_region/xe_vram_region (Rebase)
+
+Signed-off-by: Matthew Brost <matthew.brost@intel.com>
+Signed-off-by: Thomas Hellström <thomas.hellstrom@linux.intel.com>
+Reviewed-by: Matthew Brost <matthew.brost@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250306012657.3505757-24-matthew.brost@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/xe/xe_device_types.h |  6 +++
+ drivers/gpu/drm/xe/xe_svm.c          | 57 ++++++++++++++++++++++++++++
+ 2 files changed, 63 insertions(+)
+
+diff --git a/drivers/gpu/drm/xe/xe_device_types.h b/drivers/gpu/drm/xe/xe_device_types.h
+index 447467d5dc3b..72ef0b6fc425 100644
+--- a/drivers/gpu/drm/xe/xe_device_types.h
++++ b/drivers/gpu/drm/xe/xe_device_types.h
+@@ -10,6 +10,7 @@
+ 
+ #include <drm/drm_device.h>
+ #include <drm/drm_file.h>
++#include <drm/drm_pagemap.h>
+ #include <drm/ttm/ttm_device.h>
+ 
+ #include "xe_devcoredump_types.h"
+@@ -108,6 +109,11 @@ struct xe_vram_region {
+ 	void __iomem *mapping;
+ 	/** @pagemap: Used to remap device memory as ZONE_DEVICE */
+ 	struct dev_pagemap pagemap;
++	/**
++	 * @dpagemap: The struct drm_pagemap of the ZONE_DEVICE memory
++	 * pages of this tile.
++	 */
++	struct drm_pagemap dpagemap;
+ 	/**
+ 	 * @hpa_base: base host physical address
+ 	 *
+diff --git a/drivers/gpu/drm/xe/xe_svm.c b/drivers/gpu/drm/xe/xe_svm.c
+index f5854fa6e415..57987bea04de 100644
+--- a/drivers/gpu/drm/xe/xe_svm.c
++++ b/drivers/gpu/drm/xe/xe_svm.c
+@@ -288,6 +288,33 @@ static void xe_svm_garbage_collector_work_func(struct work_struct *w)
+ 	up_write(&vm->lock);
+ }
+ 
++static struct xe_vram_region *page_to_vr(struct page *page)
++{
++	return container_of(page_pgmap(page), struct xe_vram_region, pagemap);
++}
++
++static struct xe_tile *vr_to_tile(struct xe_vram_region *vr)
++{
++	return container_of(vr, struct xe_tile, mem.vram);
++}
++
++static u64 xe_vram_region_page_to_dpa(struct xe_vram_region *vr,
++				      struct page *page)
++{
++	u64 dpa;
++	struct xe_tile *tile = vr_to_tile(vr);
++	u64 pfn = page_to_pfn(page);
++	u64 offset;
++
++	xe_tile_assert(tile, is_device_private_page(page));
++	xe_tile_assert(tile, (pfn << PAGE_SHIFT) >= vr->hpa_base);
++
++	offset = (pfn << PAGE_SHIFT) - vr->hpa_base;
++	dpa = vr->dpa_base + offset;
++
++	return dpa;
++}
++
+ static const struct drm_gpusvm_ops gpusvm_ops = {
+ 	.range_alloc = xe_svm_range_alloc,
+ 	.range_free = xe_svm_range_free,
+@@ -456,6 +483,32 @@ bool xe_svm_has_mapping(struct xe_vm *vm, u64 start, u64 end)
+ }
+ 
+ #if IS_ENABLED(CONFIG_DRM_XE_DEVMEM_MIRROR)
++static struct drm_pagemap_device_addr
++xe_drm_pagemap_device_map(struct drm_pagemap *dpagemap,
++			  struct device *dev,
++			  struct page *page,
++			  unsigned int order,
++			  enum dma_data_direction dir)
++{
++	struct device *pgmap_dev = dpagemap->dev;
++	enum drm_interconnect_protocol prot;
++	dma_addr_t addr;
++
++	if (pgmap_dev == dev) {
++		addr = xe_vram_region_page_to_dpa(page_to_vr(page), page);
++		prot = XE_INTERCONNECT_VRAM;
++	} else {
++		addr = DMA_MAPPING_ERROR;
++		prot = 0;
++	}
++
++	return drm_pagemap_device_addr_encode(addr, prot, order, dir);
++}
++
++static const struct drm_pagemap_ops xe_drm_pagemap_ops = {
++	.device_map = xe_drm_pagemap_device_map,
++};
++
+ /**
+  * xe_devm_add: Remap and provide memmap backing for device memory
+  * @tile: tile that the memory region belongs to
+@@ -488,6 +541,10 @@ int xe_devm_add(struct xe_tile *tile, struct xe_vram_region *vr)
+ 	vr->pagemap.ops = drm_gpusvm_pagemap_ops_get();
+ 	vr->pagemap.owner = xe_svm_devm_owner(xe);
+ 	addr = devm_memremap_pages(dev, &vr->pagemap);
++
++	vr->dpagemap.dev = dev;
++	vr->dpagemap.ops = &xe_drm_pagemap_ops;
++
+ 	if (IS_ERR(addr)) {
+ 		devm_release_mem_region(dev, res->start, resource_size(res));
+ 		ret = PTR_ERR(addr);
+-- 
+2.52.0
+
