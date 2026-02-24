@@ -1,0 +1,97 @@
+From 20972609d12ca677b8ecf576c632bfc3cfa369b5 Mon Sep 17 00:00:00 2001
+From: Jessica Zhang <quic_jesszhan@quicinc.com>
+Date: Fri, 14 Feb 2025 16:14:28 -0800
+Subject: drm/msm/dpu: Require modeset if clone mode status changes
+Git-commit: 20972609d12ca677b8ecf576c632bfc3cfa369b5
+Patch-mainline: v6.15-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+If the clone mode enabled status is changing, a modeset needs to happen
+so that the resources can be reassigned
+
+Reviewed-by: Abhinav Kumar <quic_abhinavk@quicinc.com>
+Reviewed-by: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Signed-off-by: Jessica Zhang <quic_jesszhan@quicinc.com>
+Patchwork: https://patchwork.freedesktop.org/patch/637483/
+Link: https://lore.kernel.org/r/20250214-concurrent-wb-v6-5-a44c293cf422@quicinc.com
+Signed-off-by: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c | 17 ++++++++++++-----
+ drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.h |  3 ++-
+ drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c  |  5 +++--
+ 3 files changed, 17 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+index 27078d3f90b4..41dcfa7de97e 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+@@ -1351,19 +1351,26 @@ static int dpu_crtc_assign_resources(struct drm_crtc *crtc,
+  *
+  * Check if the changes in the object properties demand full mode set.
+  */
+-int dpu_crtc_check_mode_changed(struct drm_crtc_state *crtc_state)
++int dpu_crtc_check_mode_changed(struct drm_crtc_state *old_crtc_state,
++				struct drm_crtc_state *new_crtc_state)
+ {
+ 	struct drm_encoder *drm_enc;
+-	struct drm_crtc *crtc = crtc_state->crtc;
++	struct drm_crtc *crtc = new_crtc_state->crtc;
++	bool clone_mode_enabled = drm_crtc_in_clone_mode(old_crtc_state);
++	bool clone_mode_requested = drm_crtc_in_clone_mode(new_crtc_state);
+ 
+ 	DRM_DEBUG_ATOMIC("%d\n", crtc->base.id);
+ 
+ 	/* there might be cases where encoder needs a modeset too */
+-	drm_for_each_encoder_mask(drm_enc, crtc->dev, crtc_state->encoder_mask) {
+-		if (dpu_encoder_needs_modeset(drm_enc, crtc_state->state))
+-			crtc_state->mode_changed = true;
++	drm_for_each_encoder_mask(drm_enc, crtc->dev, new_crtc_state->encoder_mask) {
++		if (dpu_encoder_needs_modeset(drm_enc, new_crtc_state->state))
++			new_crtc_state->mode_changed = true;
+ 	}
+ 
++	if ((clone_mode_requested && !clone_mode_enabled) ||
++	    (!clone_mode_requested && clone_mode_enabled))
++		new_crtc_state->mode_changed = true;
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.h
+index 51a3b5fc879a..94392b9b9245 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.h
+@@ -239,7 +239,8 @@ static inline int dpu_crtc_frame_pending(struct drm_crtc *crtc)
+ 	return crtc ? atomic_read(&to_dpu_crtc(crtc)->frame_pending) : -EINVAL;
+ }
+ 
+-int dpu_crtc_check_mode_changed(struct drm_crtc_state *crtc_state);
++int dpu_crtc_check_mode_changed(struct drm_crtc_state *old_crtc_state,
++				struct drm_crtc_state *new_crtc_state);
+ 
+ int dpu_crtc_vblank(struct drm_crtc *crtc, bool en);
+ 
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c
+index c6b3b2e147b4..423af6f8251c 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c
+@@ -449,11 +449,12 @@ static void dpu_kms_disable_commit(struct msm_kms *kms)
+ static int dpu_kms_check_mode_changed(struct msm_kms *kms, struct drm_atomic_state *state)
+ {
+ 	struct drm_crtc_state *new_crtc_state;
++	struct drm_crtc_state *old_crtc_state;
+ 	struct drm_crtc *crtc;
+ 	int i;
+ 
+-	for_each_new_crtc_in_state(state, crtc, new_crtc_state, i)
+-		dpu_crtc_check_mode_changed(new_crtc_state);
++	for_each_oldnew_crtc_in_state(state, crtc, old_crtc_state, new_crtc_state, i)
++		dpu_crtc_check_mode_changed(old_crtc_state, new_crtc_state);
+ 
+ 	return 0;
+ }
+-- 
+2.52.0
+
