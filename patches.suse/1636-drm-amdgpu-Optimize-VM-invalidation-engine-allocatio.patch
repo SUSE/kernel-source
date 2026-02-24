@@ -1,0 +1,152 @@
+From b09cdeb4d38872b84c6d59878915eae2adbe9d2b Mon Sep 17 00:00:00 2001
+From: "Jesse.zhang@amd.com" <Jesse.zhang@amd.com>
+Date: Tue, 25 Feb 2025 15:25:00 +0800
+Subject: drm/amdgpu: Optimize VM invalidation engine allocation and
+ synchronize GPU TLB flush
+Git-commit: b09cdeb4d38872b84c6d59878915eae2adbe9d2b
+Patch-mainline: v6.15-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+- Modify the VM invalidation engine allocation logic to handle SDMA page rings.
+  SDMA page rings now share the VM invalidation engine with SDMA gfx rings instead of
+  allocating a separate engine. This change ensures efficient resource management and
+  avoids the issue of insufficient VM invalidation engines.
+
+- Add synchronization for GPU TLB flush operations in gmc_v9_0.c.
+  Use spin_lock and spin_unlock to ensure thread safety and prevent race conditions
+  during TLB flush operations. This improves the stability and reliability of the driver,
+  especially in multi-threaded environments.
+
+ v2: replace the sdma ring check with a function `amdgpu_sdma_is_page_queue`
+ to check if a ring is an SDMA page queue.(Lijo)
+
+ v3: Add GC version check, only enabled on GC9.4.3/9.4.4/9.5.0
+ v4: Fix code style and add more detailed description (Christian)
+ v5: Remove dependency on vm_inv_eng loop order, explicitly lookup shared inv_eng(Christian/Lijo)
+ v6: Added search shared ring function amdgpu_sdma_get_shared_ring (Lijo)
+
+Suggested-by: Lijo Lazar <lijo.lazar@amd.com>
+Signed-off-by: Jesse Zhang <jesse.zhang@amd.com>
+Reviewed-by: Lijo Lazar <lijo.lazar@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c  | 20 ++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.c | 35 +++++++++++++++++++++++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.h |  3 ++
+ 3 files changed, 57 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
+index 4eefa17fa39b..464625282872 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
+@@ -573,6 +573,7 @@ int amdgpu_gmc_allocate_vm_inv_eng(struct amdgpu_device *adev)
+ 	unsigned vm_inv_engs[AMDGPU_MAX_VMHUBS] = {0};
+ 	unsigned i;
+ 	unsigned vmhub, inv_eng;
++	struct amdgpu_ring *shared_ring;
+ 
+ 	/* init the vm inv eng for all vmhubs */
+ 	for_each_set_bit(i, adev->vmhubs_mask, AMDGPU_MAX_VMHUBS) {
+@@ -595,6 +596,10 @@ int amdgpu_gmc_allocate_vm_inv_eng(struct amdgpu_device *adev)
+ 		    ring == &adev->cper.ring_buf)
+ 			continue;
+ 
++		/* Skip if the ring is a shared ring */
++		if (amdgpu_sdma_is_shared_inv_eng(adev, ring))
++			continue;
++
+ 		inv_eng = ffs(vm_inv_engs[vmhub]);
+ 		if (!inv_eng) {
+ 			dev_err(adev->dev, "no VM inv eng for ring %s\n",
+@@ -607,6 +612,21 @@ int amdgpu_gmc_allocate_vm_inv_eng(struct amdgpu_device *adev)
+ 
+ 		dev_info(adev->dev, "ring %s uses VM inv eng %u on hub %u\n",
+ 			 ring->name, ring->vm_inv_eng, ring->vm_hub);
++		/* SDMA has a special packet which allows it to use the same
++		 * invalidation engine for all the rings in one instance.
++		 * Therefore, we do not allocate a separate VM invalidation engine
++		 * for SDMA page rings. Instead, they share the VM invalidation
++		 * engine with the SDMA gfx ring. This change ensures efficient
++		 * resource management and avoids the issue of insufficient VM
++		 * invalidation engines.
++		 */
++		shared_ring = amdgpu_sdma_get_shared_ring(adev, ring);
++		if (shared_ring) {
++			shared_ring->vm_inv_eng = ring->vm_inv_eng;
++			dev_info(adev->dev, "ring %s shares VM invalidation engine %u with ring %s on hub %u\n",
++					ring->name, ring->vm_inv_eng, shared_ring->name, ring->vm_hub);
++			continue;
++		}
+ 	}
+ 
+ 	return 0;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.c
+index 476e93cc5626..529c9696c2f3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.c
+@@ -504,6 +504,39 @@ void amdgpu_sdma_sysfs_reset_mask_fini(struct amdgpu_device *adev)
+ 	}
+ }
+ 
++struct amdgpu_ring *amdgpu_sdma_get_shared_ring(struct amdgpu_device *adev, struct amdgpu_ring *ring)
++{
++	if (adev->sdma.has_page_queue &&
++	    (ring->me < adev->sdma.num_instances) &&
++	    (ring == &adev->sdma.instance[ring->me].ring))
++		return &adev->sdma.instance[ring->me].page;
++	else
++		return NULL;
++}
++
++/**
++* amdgpu_sdma_is_shared_inv_eng - Check if a ring is an SDMA ring that shares a VM invalidation engine
++* @adev: Pointer to the AMDGPU device structure
++* @ring: Pointer to the ring structure to check
++*
++* This function checks if the given ring is an SDMA ring that shares a VM invalidation engine.
++* It returns true if the ring is such an SDMA ring, false otherwise.
++*/
++bool amdgpu_sdma_is_shared_inv_eng(struct amdgpu_device *adev, struct amdgpu_ring *ring)
++{
++	int i = ring->me;
++
++	if (!adev->sdma.has_page_queue || i >= adev->sdma.num_instances)
++		return false;
++
++	if (amdgpu_ip_version(adev, GC_HWIP, 0) == IP_VERSION(9, 4, 3) ||
++	    amdgpu_ip_version(adev, GC_HWIP, 0) == IP_VERSION(9, 4, 4) ||
++	    amdgpu_ip_version(adev, GC_HWIP, 0) == IP_VERSION(9, 5, 0))
++		return (ring == &adev->sdma.instance[i].page);
++	else
++		return false;
++}
++
+ /**
+  * amdgpu_sdma_register_on_reset_callbacks - Register SDMA reset callbacks
+  * @funcs: Pointer to the callback structure containing pre_reset and post_reset functions
+@@ -544,7 +577,7 @@ int amdgpu_sdma_reset_engine(struct amdgpu_device *adev, uint32_t instance_id)
+ {
+ 	struct sdma_on_reset_funcs *funcs;
+ 	int ret = 0;
+-	struct amdgpu_sdma_instance *sdma_instance = &adev->sdma.instance[instance_id];;
++	struct amdgpu_sdma_instance *sdma_instance = &adev->sdma.instance[instance_id];
+ 	struct amdgpu_ring *gfx_ring = &sdma_instance->ring;
+ 	struct amdgpu_ring *page_ring = &sdma_instance->page;
+ 	bool gfx_sched_stopped = false, page_sched_stopped = false;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.h
+index dc1a81c2f9af..47d56fd0589f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.h
+@@ -196,4 +196,7 @@ int amdgpu_sdma_ras_sw_init(struct amdgpu_device *adev);
+ void amdgpu_debugfs_sdma_sched_mask_init(struct amdgpu_device *adev);
+ int amdgpu_sdma_sysfs_reset_mask_init(struct amdgpu_device *adev);
+ void amdgpu_sdma_sysfs_reset_mask_fini(struct amdgpu_device *adev);
++bool amdgpu_sdma_is_shared_inv_eng(struct amdgpu_device *adev, struct amdgpu_ring *ring);
++struct amdgpu_ring *amdgpu_sdma_get_shared_ring(struct amdgpu_device *adev,
++	struct amdgpu_ring *ring);
+ #endif
+-- 
+2.52.0
+
