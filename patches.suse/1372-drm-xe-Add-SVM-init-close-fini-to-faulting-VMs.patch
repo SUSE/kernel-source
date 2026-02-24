@@ -1,0 +1,244 @@
+From 6fd979c2f33150e8261d87d2946f94f66f22ddaa Mon Sep 17 00:00:00 2001
+From: Matthew Brost <matthew.brost@intel.com>
+Date: Wed, 5 Mar 2025 17:26:34 -0800
+Subject: drm/xe: Add SVM init / close / fini to faulting VMs
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 6fd979c2f33150e8261d87d2946f94f66f22ddaa
+Patch-mainline: v6.15-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Add SVM init / close / fini to faulting VMs. Minimual implementation
+acting as a placeholder for follow on patches.
+
+V2: - Add close function
+V3: - Better commit message (Thomas)
+ - Kernel doc (Thomas)
+ - Update chunk array to be unsigned long (Thomas)
+ - Use new drm_gpusvm.h header location (Thomas)
+ - Newlines between functions in xe_svm.h (Thomas)
+ - Call drm_gpusvm_driver_set_lock in init (Thomas)
+V6: - Only compile if CONFIG_DRM_GPUSVM selected (CI, Lucas)
+V7: - Only select CONFIG_DRM_GPUSVM if DEVICE_PRIVATE (CI)
+
+Signed-off-by: Matthew Brost <matthew.brost@intel.com>
+Reviewed-by: Himal Prasad Ghimiray <himal.prasad.ghimiray@intel.com>
+Reviewed-by: Thomas Hellström <thomas.hellstrom@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250306012657.3505757-10-matthew.brost@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/xe/Makefile      |  1 +
+ drivers/gpu/drm/xe/xe_svm.c      | 73 ++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/xe/xe_svm.h      | 35 +++++++++++++++
+ drivers/gpu/drm/xe/xe_vm.c       | 12 ++++++
+ drivers/gpu/drm/xe/xe_vm_types.h |  7 +++
+ 5 files changed, 128 insertions(+)
+ create mode 100644 drivers/gpu/drm/xe/xe_svm.c
+ create mode 100644 drivers/gpu/drm/xe/xe_svm.h
+
+diff --git a/drivers/gpu/drm/xe/Makefile b/drivers/gpu/drm/xe/Makefile
+index 1d52224355f1..9699b08585f7 100644
+--- a/drivers/gpu/drm/xe/Makefile
++++ b/drivers/gpu/drm/xe/Makefile
+@@ -125,6 +125,7 @@ xe-y += xe_bb.o \
+ 	xe_wopcm.o
+ 
+ xe-$(CONFIG_HMM_MIRROR) += xe_hmm.o
++xe-$(CONFIG_DRM_GPUSVM) += xe_svm.o
+ 
+ # graphics hardware monitoring (HWMON) support
+ xe-$(CONFIG_HWMON) += xe_hwmon.o
+diff --git a/drivers/gpu/drm/xe/xe_svm.c b/drivers/gpu/drm/xe/xe_svm.c
+new file mode 100644
+index 000000000000..79da859f02b1
+--- /dev/null
++++ b/drivers/gpu/drm/xe/xe_svm.c
+@@ -0,0 +1,73 @@
++// SPDX-License-Identifier: MIT
++/*
++ * Copyright © 2024 Intel Corporation
++ */
++
++#include "xe_svm.h"
++#include "xe_vm.h"
++#include "xe_vm_types.h"
++
++static void xe_svm_invalidate(struct drm_gpusvm *gpusvm,
++			      struct drm_gpusvm_notifier *notifier,
++			      const struct mmu_notifier_range *mmu_range)
++{
++	/* TODO: Implement */
++}
++
++static const struct drm_gpusvm_ops gpusvm_ops = {
++	.invalidate = xe_svm_invalidate,
++};
++
++static const unsigned long fault_chunk_sizes[] = {
++	SZ_2M,
++	SZ_64K,
++	SZ_4K,
++};
++
++/**
++ * xe_svm_init() - SVM initialize
++ * @vm: The VM.
++ *
++ * Initialize SVM state which is embedded within the VM.
++ *
++ * Return: 0 on success, negative error code on error.
++ */
++int xe_svm_init(struct xe_vm *vm)
++{
++	int err;
++
++	err = drm_gpusvm_init(&vm->svm.gpusvm, "Xe SVM", &vm->xe->drm,
++			      current->mm, NULL, 0, vm->size,
++			      SZ_512M, &gpusvm_ops, fault_chunk_sizes,
++			      ARRAY_SIZE(fault_chunk_sizes));
++	if (err)
++		return err;
++
++	drm_gpusvm_driver_set_lock(&vm->svm.gpusvm, &vm->lock);
++
++	return 0;
++}
++
++/**
++ * xe_svm_close() - SVM close
++ * @vm: The VM.
++ *
++ * Close SVM state (i.e., stop and flush all SVM actions).
++ */
++void xe_svm_close(struct xe_vm *vm)
++{
++	xe_assert(vm->xe, xe_vm_is_closed(vm));
++}
++
++/**
++ * xe_svm_fini() - SVM finalize
++ * @vm: The VM.
++ *
++ * Finalize SVM state which is embedded within the VM.
++ */
++void xe_svm_fini(struct xe_vm *vm)
++{
++	xe_assert(vm->xe, xe_vm_is_closed(vm));
++
++	drm_gpusvm_fini(&vm->svm.gpusvm);
++}
+diff --git a/drivers/gpu/drm/xe/xe_svm.h b/drivers/gpu/drm/xe/xe_svm.h
+new file mode 100644
+index 000000000000..ac79b208304d
+--- /dev/null
++++ b/drivers/gpu/drm/xe/xe_svm.h
+@@ -0,0 +1,35 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * Copyright © 2024 Intel Corporation
++ */
++
++#ifndef _XE_SVM_H_
++#define _XE_SVM_H_
++
++struct xe_vm;
++
++#if IS_ENABLED(CONFIG_DRM_GPUSVM)
++int xe_svm_init(struct xe_vm *vm);
++
++void xe_svm_fini(struct xe_vm *vm);
++
++void xe_svm_close(struct xe_vm *vm);
++#else
++static inline
++int xe_svm_init(struct xe_vm *vm)
++{
++	return 0;
++}
++
++static inline
++void xe_svm_fini(struct xe_vm *vm)
++{
++}
++
++static inline
++void xe_svm_close(struct xe_vm *vm)
++{
++}
++#endif
++
++#endif
+diff --git a/drivers/gpu/drm/xe/xe_vm.c b/drivers/gpu/drm/xe/xe_vm.c
+index 304ce42f94eb..e4d894dd06e8 100644
+--- a/drivers/gpu/drm/xe/xe_vm.c
++++ b/drivers/gpu/drm/xe/xe_vm.c
+@@ -35,6 +35,7 @@
+ #include "xe_pt.h"
+ #include "xe_pxp.h"
+ #include "xe_res_cursor.h"
++#include "xe_svm.h"
+ #include "xe_sync.h"
+ #include "xe_trace_bo.h"
+ #include "xe_wa.h"
+@@ -1582,6 +1583,12 @@ struct xe_vm *xe_vm_create(struct xe_device *xe, u32 flags)
+ 		}
+ 	}
+ 
++	if (flags & XE_VM_FLAG_FAULT_MODE) {
++		err = xe_svm_init(vm);
++		if (err)
++			goto err_close;
++	}
++
+ 	if (number_tiles > 1)
+ 		vm->composite_fence_ctx = dma_fence_context_alloc(1);
+ 
+@@ -1627,6 +1634,8 @@ void xe_vm_close_and_put(struct xe_vm *vm)
+ 	xe_vm_close(vm);
+ 	if (xe_vm_in_preempt_fence_mode(vm))
+ 		flush_work(&vm->preempt.rebind_work);
++	if (xe_vm_in_fault_mode(vm))
++		xe_svm_close(vm);
+ 
+ 	down_write(&vm->lock);
+ 	for_each_tile(tile, xe, id) {
+@@ -1695,6 +1704,9 @@ void xe_vm_close_and_put(struct xe_vm *vm)
+ 		xe_vma_destroy_unlocked(vma);
+ 	}
+ 
++	if (xe_vm_in_fault_mode(vm))
++		xe_svm_fini(vm);
++
+ 	up_write(&vm->lock);
+ 
+ 	down_write(&xe->usm.lock);
+diff --git a/drivers/gpu/drm/xe/xe_vm_types.h b/drivers/gpu/drm/xe/xe_vm_types.h
+index db7107e784c8..96ba631da68a 100644
+--- a/drivers/gpu/drm/xe/xe_vm_types.h
++++ b/drivers/gpu/drm/xe/xe_vm_types.h
+@@ -6,6 +6,7 @@
+ #ifndef _XE_VM_TYPES_H_
+ #define _XE_VM_TYPES_H_
+ 
++#include <drm/drm_gpusvm.h>
+ #include <drm/drm_gpuvm.h>
+ 
+ #include <linux/dma-resv.h>
+@@ -144,6 +145,12 @@ struct xe_vm {
+ 	/** @gpuvm: base GPUVM used to track VMAs */
+ 	struct drm_gpuvm gpuvm;
+ 
++	/** @svm: Shared virtual memory state */
++	struct {
++		/** @svm.gpusvm: base GPUSVM used to track fault allocations */
++		struct drm_gpusvm gpusvm;
++	} svm;
++
+ 	struct xe_device *xe;
+ 
+ 	/* exec queue used for (un)binding vma's */
+-- 
+2.52.0
+
