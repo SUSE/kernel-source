@@ -1,0 +1,118 @@
+From 95bbde1d0d079f958c0f27c94ec0e2151cb1398c Mon Sep 17 00:00:00 2001
+From: Jessica Zhang <quic_jesszhan@quicinc.com>
+Date: Fri, 14 Feb 2025 16:14:34 -0800
+Subject: drm/msm/dpu: Start frame done timer after encoder kickoff
+Git-commit: 95bbde1d0d079f958c0f27c94ec0e2151cb1398c
+Patch-mainline: v6.15-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Starting the frame done timer before the encoder is finished kicking off
+can lead to unnecessary frame done timeouts when the device is
+experiencing heavy load (ex. when debug logs are enabled).
+
+Thus, create a separate API for starting the encoder frame done timer and
+call it after the encoder kickoff is finished
+
+Reviewed-by: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Reviewed-by: Abhinav Kumar <quic_abhinavk@quicinc.com>
+Signed-off-by: Jessica Zhang <quic_jesszhan@quicinc.com>
+Patchwork: https://patchwork.freedesktop.org/patch/637502/
+Link: https://lore.kernel.org/r/20250214-concurrent-wb-v6-11-a44c293cf422@quicinc.com
+Signed-off-by: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c    |  4 ++-
+ drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c | 27 +++++++++++++++------
+ drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h |  3 ++-
+ 3 files changed, 24 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+index 41dcfa7de97e..e2bc223acd13 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+@@ -999,8 +999,10 @@ void dpu_crtc_commit_kickoff(struct drm_crtc *crtc)
+ 
+ 	dpu_vbif_clear_errors(dpu_kms);
+ 
+-	drm_for_each_encoder_mask(encoder, crtc->dev, crtc->state->encoder_mask)
++	drm_for_each_encoder_mask(encoder, crtc->dev, crtc->state->encoder_mask) {
+ 		dpu_encoder_kickoff(encoder);
++		dpu_encoder_start_frame_done_timer(encoder);
++	}
+ 
+ 	reinit_completion(&dpu_crtc->frame_done_comp);
+ 
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+index f2fc37067ec5..876bb16d88cd 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+@@ -2095,6 +2095,25 @@ bool dpu_encoder_is_valid_for_commit(struct drm_encoder *drm_enc)
+ 	return true;
+ }
+ 
++/**
++ * dpu_encoder_start_frame_done_timer - Start the encoder frame done timer
++ * @drm_enc: Pointer to drm encoder structure
++ */
++void dpu_encoder_start_frame_done_timer(struct drm_encoder *drm_enc)
++{
++	struct dpu_encoder_virt *dpu_enc;
++	unsigned long timeout_ms;
++
++	dpu_enc = to_dpu_encoder_virt(drm_enc);
++	timeout_ms = DPU_ENCODER_FRAME_DONE_TIMEOUT_FRAMES * 1000 /
++			drm_mode_vrefresh(&drm_enc->crtc->state->adjusted_mode);
++
++	atomic_set(&dpu_enc->frame_done_timeout_ms, timeout_ms);
++	mod_timer(&dpu_enc->frame_done_timer,
++			jiffies + msecs_to_jiffies(timeout_ms));
++
++}
++
+ /**
+  * dpu_encoder_kickoff - trigger a double buffer flip of the ctl path
+  *	(i.e. ctl flush and start) immediately.
+@@ -2104,7 +2123,6 @@ void dpu_encoder_kickoff(struct drm_encoder *drm_enc)
+ {
+ 	struct dpu_encoder_virt *dpu_enc;
+ 	struct dpu_encoder_phys *phys;
+-	unsigned long timeout_ms;
+ 	unsigned int i;
+ 
+ 	DPU_ATRACE_BEGIN("encoder_kickoff");
+@@ -2112,13 +2130,6 @@ void dpu_encoder_kickoff(struct drm_encoder *drm_enc)
+ 
+ 	trace_dpu_enc_kickoff(DRMID(drm_enc));
+ 
+-	timeout_ms = DPU_ENCODER_FRAME_DONE_TIMEOUT_FRAMES * 1000 /
+-			drm_mode_vrefresh(&drm_enc->crtc->state->adjusted_mode);
+-
+-	atomic_set(&dpu_enc->frame_done_timeout_ms, timeout_ms);
+-	mod_timer(&dpu_enc->frame_done_timer,
+-			jiffies + msecs_to_jiffies(timeout_ms));
+-
+ 	/* All phys encs are ready to go, trigger the kickoff */
+ 	_dpu_encoder_kickoff_phys(dpu_enc);
+ 
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h
+index b0ac10ebd02c..8503386bb503 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h
+@@ -1,6 +1,6 @@
+ /* SPDX-License-Identifier: GPL-2.0-only */
+ /*
+- * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
++ * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
+  * Copyright (c) 2015-2018, The Linux Foundation. All rights reserved.
+  * Copyright (C) 2013 Red Hat
+  * Author: Rob Clark <robdclark@gmail.com>
+@@ -95,4 +95,5 @@ void dpu_encoder_cleanup_wb_job(struct drm_encoder *drm_enc,
+ 
+ bool dpu_encoder_is_valid_for_commit(struct drm_encoder *drm_enc);
+ 
++void dpu_encoder_start_frame_done_timer(struct drm_encoder *drm_enc);
+ #endif /* __DPU_ENCODER_H__ */
+-- 
+2.52.0
+
