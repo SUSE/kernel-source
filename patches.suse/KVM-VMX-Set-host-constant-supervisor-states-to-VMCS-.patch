@@ -1,0 +1,112 @@
+From: Yang Weijiang <weijiang.yang@intel.com>
+Date: Fri, 19 Sep 2025 15:32:24 -0700
+Subject: KVM: VMX: Set host constant supervisor states to VMCS fields
+Patch-mainline: v6.18-rc1
+Git-commit: 584ba3ffb9843fd12d3b4a33cfe056e2264392a0
+References: jsc#PED-15123
+
+Save constant values to HOST_{S_CET,SSP,INTR_SSP_TABLE} field explicitly.
+Kernel IBT is supported and the setting in MSR_IA32_S_CET is static after
+post-boot(The exception is BIOS call case but vCPU thread never across it)
+and KVM doesn't need to refresh HOST_S_CET field before every VM-Enter/
+VM-Exit sequence.
+
+Host supervisor shadow stack is not enabled now and SSP is not accessible
+to kernel mode, thus it's safe to set host IA32_INT_SSP_TAB/SSP VMCS field
+to 0s. When shadow stack is enabled for CPL3, SSP is reloaded from PL3_SSP
+before it exits to userspace. Check SDM Vol 2A/B Chapter 3/4 for SYSCALL/
+SYSRET/SYSENTER SYSEXIT/RDSSP/CALL etc.
+
+Prevent KVM module loading if host supervisor shadow stack SHSTK_EN is set
+in MSR_IA32_S_CET as KVM cannot co-exit with it correctly.
+
+Suggested-by: Sean Christopherson <seanjc@google.com>
+Suggested-by: Chao Gao <chao.gao@intel.com>
+Signed-off-by: Yang Weijiang <weijiang.yang@intel.com>
+Reviewed-by: Maxim Levitsky <mlevitsk@redhat.com>
+Reviewed-by: Chao Gao <chao.gao@intel.com>
+Tested-by: Mathias Krause <minipli@grsecurity.net>
+Tested-by: John Allen <john.allen@amd.com>
+Tested-by: Rick Edgecombe <rick.p.edgecombe@intel.com>
+Signed-off-by: Chao Gao <chao.gao@intel.com>
+[sean: snapshot host S_CET if SHSTK *or* IBT is supported]
+Reviewed-by: Xiaoyao Li <xiaoyao.li@intel.com>
+Reviewed-by: Binbin Wu <binbin.wu@linux.intel.com>
+Link: https://lore.kernel.org/r/20250919223258.1604852-18-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Acked-by: Carlos López <clopez@suse.de>
+---
+ arch/x86/kvm/vmx/capabilities.h |    4 ++++
+ arch/x86/kvm/vmx/vmx.c          |   15 +++++++++++++++
+ arch/x86/kvm/x86.c              |   12 ++++++++++++
+ arch/x86/kvm/x86.h              |    1 +
+ 4 files changed, 32 insertions(+)
+
+--- a/arch/x86/kvm/vmx/capabilities.h
++++ b/arch/x86/kvm/vmx/capabilities.h
+@@ -104,6 +104,10 @@ static inline bool cpu_has_load_perf_glo
+ 	return vmcs_config.vmentry_ctrl & VM_ENTRY_LOAD_IA32_PERF_GLOBAL_CTRL;
+ }
+ 
++static inline bool cpu_has_load_cet_ctrl(void)
++{
++	return (vmcs_config.vmentry_ctrl & VM_ENTRY_LOAD_CET_STATE);
++}
+ static inline bool cpu_has_vmx_mpx(void)
+ {
+ 	return vmcs_config.vmentry_ctrl & VM_ENTRY_LOAD_BNDCFGS;
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -4317,6 +4317,21 @@ void vmx_set_constant_host_state(struct
+ 
+ 	if (cpu_has_load_ia32_efer())
+ 		vmcs_write64(HOST_IA32_EFER, kvm_host.efer);
++
++	/*
++	 * Supervisor shadow stack is not enabled on host side, i.e.,
++	 * host IA32_S_CET.SHSTK_EN bit is guaranteed to 0 now, per SDM
++	 * description(RDSSP instruction), SSP is not readable in CPL0,
++	 * so resetting the two registers to 0s at VM-Exit does no harm
++	 * to kernel execution. When execution flow exits to userspace,
++	 * SSP is reloaded from IA32_PL3_SSP. Check SDM Vol.2A/B Chapter
++	 * 3 and 4 for details.
++	 */
++	if (cpu_has_load_cet_ctrl()) {
++		vmcs_writel(HOST_S_CET, kvm_host.s_cet);
++		vmcs_writel(HOST_SSP, 0);
++		vmcs_writel(HOST_INTR_SSP_TABLE, 0);
++	}
+ }
+ 
+ void set_cr4_guest_host_mask(struct vcpu_vmx *vmx)
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -10101,6 +10101,18 @@ int kvm_x86_vendor_init(struct kvm_x86_i
+ 		return -EIO;
+ 	}
+ 
++	if (boot_cpu_has(X86_FEATURE_SHSTK) || boot_cpu_has(X86_FEATURE_IBT)) {
++		rdmsrq(MSR_IA32_S_CET, kvm_host.s_cet);
++		/*
++		 * Linux doesn't yet support supervisor shadow stacks (SSS), so
++		 * KVM doesn't save/restore the associated MSRs, i.e. KVM may
++		 * clobber the host values.  Yell and refuse to load if SSS is
++		 * unexpectedly enabled, e.g. to avoid crashing the host.
++		 */
++		if (WARN_ON_ONCE(kvm_host.s_cet & CET_SHSTK_EN))
++			return -EIO;
++	}
++
+ 	memset(&kvm_caps, 0, sizeof(kvm_caps));
+ 
+ 	x86_emulator_cache = kvm_alloc_emulator_cache();
+--- a/arch/x86/kvm/x86.h
++++ b/arch/x86/kvm/x86.h
+@@ -50,6 +50,7 @@ struct kvm_host_values {
+ 	u64 efer;
+ 	u64 xcr0;
+ 	u64 xss;
++	u64 s_cet;
+ 	u64 arch_capabilities;
+ };
+ 
