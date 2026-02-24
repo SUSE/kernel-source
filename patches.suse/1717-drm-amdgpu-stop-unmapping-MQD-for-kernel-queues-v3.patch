@@ -1,0 +1,789 @@
+From 1f86f4125e167aeb343a5b8136996c0569009c6a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Tue, 18 Mar 2025 16:15:12 +0100
+Subject: drm/amdgpu: stop unmapping MQD for kernel queues v3
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 1f86f4125e167aeb343a5b8136996c0569009c6a
+Patch-mainline: v6.15-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+This looks unnecessary and actually extremely harmful since using kmap()
+is not possible while inside the ring reset.
+
+Remove all the extra mapping and unmapping of the MQDs.
+
+V2: also fix debugfs
+V3: fix coding style typo
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c |  58 ++-----------
+ drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c   |  88 +++----------------
+ drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c   |  88 +++----------------
+ drivers/gpu/drm/amd/amdgpu/gfx_v12_0.c   | 102 ++++-------------------
+ drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c    |  45 ++--------
+ drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c    |  57 ++-----------
+ drivers/gpu/drm/amd/amdgpu/gfx_v9_4_3.c  |  61 +++-----------
+ 7 files changed, 67 insertions(+), 432 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
+index d55c8b7fdb59..59acdbfe28d8 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
+@@ -608,59 +608,17 @@ static ssize_t amdgpu_debugfs_mqd_read(struct file *f, char __user *buf,
+ 				       size_t size, loff_t *pos)
+ {
+ 	struct amdgpu_ring *ring = file_inode(f)->i_private;
+-	volatile u32 *mqd;
+-	u32 *kbuf;
+-	int r, i;
+-	uint32_t value, result;
++	ssize_t bytes = min_t(ssize_t, ring->mqd_size - *pos, size);
++	void *from = ((u8 *)ring->mqd_ptr) + *pos;
+ 
+-	if (*pos & 3 || size & 3)
+-		return -EINVAL;
+-
+-	kbuf = kmalloc(ring->mqd_size, GFP_KERNEL);
+-	if (!kbuf)
+-		return -ENOMEM;
+-
+-	r = amdgpu_bo_reserve(ring->mqd_obj, false);
+-	if (unlikely(r != 0))
+-		goto err_free;
+-
+-	r = amdgpu_bo_kmap(ring->mqd_obj, (void **)&mqd);
+-	if (r)
+-		goto err_unreserve;
+-
+-	/*
+-	 * Copy to local buffer to avoid put_user(), which might fault
+-	 * and acquire mmap_sem, under reservation_ww_class_mutex.
+-	 */
+-	for (i = 0; i < ring->mqd_size/sizeof(u32); i++)
+-		kbuf[i] = mqd[i];
++	if (*pos > ring->mqd_size)
++		return 0;
+ 
+-	amdgpu_bo_kunmap(ring->mqd_obj);
+-	amdgpu_bo_unreserve(ring->mqd_obj);
++	if (copy_to_user(buf, from, bytes))
++		return -EFAULT;
+ 
+-	result = 0;
+-	while (size) {
+-		if (*pos >= ring->mqd_size)
+-			break;
+-
+-		value = kbuf[*pos/4];
+-		r = put_user(value, (uint32_t *)buf);
+-		if (r)
+-			goto err_free;
+-		buf += 4;
+-		result += 4;
+-		size -= 4;
+-		*pos += 4;
+-	}
+-
+-	kfree(kbuf);
+-	return result;
+-
+-err_unreserve:
+-	amdgpu_bo_unreserve(ring->mqd_obj);
+-err_free:
+-	kfree(kbuf);
+-	return r;
++	*pos += bytes;
++	return bytes;
+ }
+ 
+ static const struct file_operations amdgpu_debugfs_mqd_fops = {
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c
+index 6d514efb0a6d..a63ce747863f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c
+@@ -6851,22 +6851,9 @@ static int gfx_v10_0_kgq_init_queue(struct amdgpu_ring *ring, bool reset)
+ static int gfx_v10_0_cp_async_gfx_ring_resume(struct amdgpu_device *adev)
+ {
+ 	int r, i;
+-	struct amdgpu_ring *ring;
+ 
+ 	for (i = 0; i < adev->gfx.num_gfx_rings; i++) {
+-		ring = &adev->gfx.gfx_ring[i];
+-
+-		r = amdgpu_bo_reserve(ring->mqd_obj, false);
+-		if (unlikely(r != 0))
+-			return r;
+-
+-		r = amdgpu_bo_kmap(ring->mqd_obj, (void **)&ring->mqd_ptr);
+-		if (!r) {
+-			r = gfx_v10_0_kgq_init_queue(ring, false);
+-			amdgpu_bo_kunmap(ring->mqd_obj);
+-			ring->mqd_ptr = NULL;
+-		}
+-		amdgpu_bo_unreserve(ring->mqd_obj);
++		r = gfx_v10_0_kgq_init_queue(&adev->gfx.gfx_ring[i], false);
+ 		if (r)
+ 			return r;
+ 	}
+@@ -7173,55 +7160,24 @@ static int gfx_v10_0_kcq_init_queue(struct amdgpu_ring *ring, bool restore)
+ 
+ static int gfx_v10_0_kiq_resume(struct amdgpu_device *adev)
+ {
+-	struct amdgpu_ring *ring;
+-	int r;
+-
+-	ring = &adev->gfx.kiq[0].ring;
+-
+-	r = amdgpu_bo_reserve(ring->mqd_obj, false);
+-	if (unlikely(r != 0))
+-		return r;
+-
+-	r = amdgpu_bo_kmap(ring->mqd_obj, (void **)&ring->mqd_ptr);
+-	if (unlikely(r != 0)) {
+-		amdgpu_bo_unreserve(ring->mqd_obj);
+-		return r;
+-	}
+-
+-	gfx_v10_0_kiq_init_queue(ring);
+-	amdgpu_bo_kunmap(ring->mqd_obj);
+-	ring->mqd_ptr = NULL;
+-	amdgpu_bo_unreserve(ring->mqd_obj);
++	gfx_v10_0_kiq_init_queue(&adev->gfx.kiq[0].ring);
+ 	return 0;
+ }
+ 
+ static int gfx_v10_0_kcq_resume(struct amdgpu_device *adev)
+ {
+-	struct amdgpu_ring *ring = NULL;
+-	int r = 0, i;
++	int i, r;
+ 
+ 	gfx_v10_0_cp_compute_enable(adev, true);
+ 
+ 	for (i = 0; i < adev->gfx.num_compute_rings; i++) {
+-		ring = &adev->gfx.compute_ring[i];
+-
+-		r = amdgpu_bo_reserve(ring->mqd_obj, false);
+-		if (unlikely(r != 0))
+-			goto done;
+-		r = amdgpu_bo_kmap(ring->mqd_obj, (void **)&ring->mqd_ptr);
+-		if (!r) {
+-			r = gfx_v10_0_kcq_init_queue(ring, false);
+-			amdgpu_bo_kunmap(ring->mqd_obj);
+-			ring->mqd_ptr = NULL;
+-		}
+-		amdgpu_bo_unreserve(ring->mqd_obj);
++		r = gfx_v10_0_kcq_init_queue(&adev->gfx.compute_ring[i],
++					     false);
+ 		if (r)
+-			goto done;
++			return r;
+ 	}
+ 
+-	r = amdgpu_gfx_enable_kcq(adev, 0);
+-done:
+-	return r;
++	return amdgpu_gfx_enable_kcq(adev, 0);
+ }
+ 
+ static int gfx_v10_0_cp_resume(struct amdgpu_device *adev)
+@@ -9579,20 +9535,9 @@ static int gfx_v10_0_reset_kgq(struct amdgpu_ring *ring, unsigned int vmid)
+ 	if (r)
+ 		return r;
+ 
+-	r = amdgpu_bo_reserve(ring->mqd_obj, false);
+-	if (unlikely(r != 0)) {
+-		DRM_ERROR("fail to resv mqd_obj\n");
+-		return r;
+-	}
+-	r = amdgpu_bo_kmap(ring->mqd_obj, (void **)&ring->mqd_ptr);
+-	if (!r) {
+-		r = gfx_v10_0_kgq_init_queue(ring, true);
+-		amdgpu_bo_kunmap(ring->mqd_obj);
+-		ring->mqd_ptr = NULL;
+-	}
+-	amdgpu_bo_unreserve(ring->mqd_obj);
++	r = gfx_v10_0_kgq_init_queue(ring, true);
+ 	if (r) {
+-		DRM_ERROR("fail to unresv mqd_obj\n");
++		DRM_ERROR("fail to init kgq\n");
+ 		return r;
+ 	}
+ 
+@@ -9649,20 +9594,9 @@ static int gfx_v10_0_reset_kcq(struct amdgpu_ring *ring,
+ 		return r;
+ 	}
+ 
+-	r = amdgpu_bo_reserve(ring->mqd_obj, false);
+-	if (unlikely(r != 0)) {
+-		dev_err(adev->dev, "fail to resv mqd_obj\n");
+-		return r;
+-	}
+-	r = amdgpu_bo_kmap(ring->mqd_obj, (void **)&ring->mqd_ptr);
+-	if (!r) {
+-		r = gfx_v10_0_kcq_init_queue(ring, true);
+-		amdgpu_bo_kunmap(ring->mqd_obj);
+-		ring->mqd_ptr = NULL;
+-	}
+-	amdgpu_bo_unreserve(ring->mqd_obj);
++	r = gfx_v10_0_kcq_init_queue(ring, true);
+ 	if (r) {
+-		dev_err(adev->dev, "fail to unresv mqd_obj\n");
++		dev_err(adev->dev, "fail to init kcq\n");
+ 		return r;
+ 	}
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c
+index d8772cd6db63..f66ca639f391 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c
+@@ -4115,22 +4115,9 @@ static int gfx_v11_0_kgq_init_queue(struct amdgpu_ring *ring, bool reset)
+ static int gfx_v11_0_cp_async_gfx_ring_resume(struct amdgpu_device *adev)
+ {
+ 	int r, i;
+-	struct amdgpu_ring *ring;
+ 
+ 	for (i = 0; i < adev->gfx.num_gfx_rings; i++) {
+-		ring = &adev->gfx.gfx_ring[i];
+-
+-		r = amdgpu_bo_reserve(ring->mqd_obj, false);
+-		if (unlikely(r != 0))
+-			return r;
+-
+-		r = amdgpu_bo_kmap(ring->mqd_obj, (void **)&ring->mqd_ptr);
+-		if (!r) {
+-			r = gfx_v11_0_kgq_init_queue(ring, false);
+-			amdgpu_bo_kunmap(ring->mqd_obj);
+-			ring->mqd_ptr = NULL;
+-		}
+-		amdgpu_bo_unreserve(ring->mqd_obj);
++		r = gfx_v11_0_kgq_init_queue(&adev->gfx.gfx_ring[i], false);
+ 		if (r)
+ 			return r;
+ 	}
+@@ -4452,57 +4439,24 @@ static int gfx_v11_0_kcq_init_queue(struct amdgpu_ring *ring, bool reset)
+ 
+ static int gfx_v11_0_kiq_resume(struct amdgpu_device *adev)
+ {
+-	struct amdgpu_ring *ring;
+-	int r;
+-
+-	ring = &adev->gfx.kiq[0].ring;
+-
+-	r = amdgpu_bo_reserve(ring->mqd_obj, false);
+-	if (unlikely(r != 0))
+-		return r;
+-
+-	r = amdgpu_bo_kmap(ring->mqd_obj, (void **)&ring->mqd_ptr);
+-	if (unlikely(r != 0)) {
+-		amdgpu_bo_unreserve(ring->mqd_obj);
+-		return r;
+-	}
+-
+-	gfx_v11_0_kiq_init_queue(ring);
+-	amdgpu_bo_kunmap(ring->mqd_obj);
+-	ring->mqd_ptr = NULL;
+-	amdgpu_bo_unreserve(ring->mqd_obj);
+-	ring->sched.ready = true;
++	gfx_v11_0_kiq_init_queue(&adev->gfx.kiq[0].ring);
+ 	return 0;
+ }
+ 
+ static int gfx_v11_0_kcq_resume(struct amdgpu_device *adev)
+ {
+-	struct amdgpu_ring *ring = NULL;
+-	int r = 0, i;
++	int i, r;
+ 
+ 	if (!amdgpu_async_gfx_ring)
+ 		gfx_v11_0_cp_compute_enable(adev, true);
+ 
+ 	for (i = 0; i < adev->gfx.num_compute_rings; i++) {
+-		ring = &adev->gfx.compute_ring[i];
+-
+-		r = amdgpu_bo_reserve(ring->mqd_obj, false);
+-		if (unlikely(r != 0))
+-			goto done;
+-		r = amdgpu_bo_kmap(ring->mqd_obj, (void **)&ring->mqd_ptr);
+-		if (!r) {
+-			r = gfx_v11_0_kcq_init_queue(ring, false);
+-			amdgpu_bo_kunmap(ring->mqd_obj);
+-			ring->mqd_ptr = NULL;
+-		}
+-		amdgpu_bo_unreserve(ring->mqd_obj);
++		r = gfx_v11_0_kcq_init_queue(&adev->gfx.compute_ring[i], false);
+ 		if (r)
+-			goto done;
++			return r;
+ 	}
+ 
+-	r = amdgpu_gfx_enable_kcq(adev, 0);
+-done:
+-	return r;
++	return amdgpu_gfx_enable_kcq(adev, 0);
+ }
+ 
+ static int gfx_v11_0_cp_resume(struct amdgpu_device *adev)
+@@ -6667,20 +6621,9 @@ static int gfx_v11_0_reset_kgq(struct amdgpu_ring *ring, unsigned int vmid)
+ 	if (r)
+ 		return r;
+ 
+-	r = amdgpu_bo_reserve(ring->mqd_obj, false);
+-	if (unlikely(r != 0)) {
+-		dev_err(adev->dev, "fail to resv mqd_obj\n");
+-		return r;
+-	}
+-	r = amdgpu_bo_kmap(ring->mqd_obj, (void **)&ring->mqd_ptr);
+-	if (!r) {
+-		r = gfx_v11_0_kgq_init_queue(ring, true);
+-		amdgpu_bo_kunmap(ring->mqd_obj);
+-		ring->mqd_ptr = NULL;
+-	}
+-	amdgpu_bo_unreserve(ring->mqd_obj);
++	r = gfx_v11_0_kgq_init_queue(ring, true);
+ 	if (r) {
+-		dev_err(adev->dev, "fail to unresv mqd_obj\n");
++		dev_err(adev->dev, "failed to init kgq\n");
+ 		return r;
+ 	}
+ 
+@@ -6707,20 +6650,9 @@ static int gfx_v11_0_reset_kcq(struct amdgpu_ring *ring, unsigned int vmid)
+ 		return r;
+ 	}
+ 
+-	r = amdgpu_bo_reserve(ring->mqd_obj, false);
+-	if (unlikely(r != 0)) {
+-		dev_err(adev->dev, "fail to resv mqd_obj\n");
+-		return r;
+-	}
+-	r = amdgpu_bo_kmap(ring->mqd_obj, (void **)&ring->mqd_ptr);
+-	if (!r) {
+-		r = gfx_v11_0_kcq_init_queue(ring, true);
+-		amdgpu_bo_kunmap(ring->mqd_obj);
+-		ring->mqd_ptr = NULL;
+-	}
+-	amdgpu_bo_unreserve(ring->mqd_obj);
++	r = gfx_v11_0_kcq_init_queue(ring, true);
+ 	if (r) {
+-		dev_err(adev->dev, "fail to unresv mqd_obj\n");
++		dev_err(adev->dev, "fail to init kcq\n");
+ 		return r;
+ 	}
+ 	r = amdgpu_mes_map_legacy_queue(adev, ring);
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v12_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v12_0.c
+index dceb5ad38862..b6889e32dd8f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v12_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v12_0.c
+@@ -3001,37 +3001,19 @@ static int gfx_v12_0_kgq_init_queue(struct amdgpu_ring *ring, bool reset)
+ 
+ static int gfx_v12_0_cp_async_gfx_ring_resume(struct amdgpu_device *adev)
+ {
+-	int r, i;
+-	struct amdgpu_ring *ring;
++	int i, r;
+ 
+ 	for (i = 0; i < adev->gfx.num_gfx_rings; i++) {
+-		ring = &adev->gfx.gfx_ring[i];
+-
+-		r = amdgpu_bo_reserve(ring->mqd_obj, false);
+-		if (unlikely(r != 0))
+-			goto done;
+-
+-		r = amdgpu_bo_kmap(ring->mqd_obj, (void **)&ring->mqd_ptr);
+-		if (!r) {
+-			r = gfx_v12_0_kgq_init_queue(ring, false);
+-			amdgpu_bo_kunmap(ring->mqd_obj);
+-			ring->mqd_ptr = NULL;
+-		}
+-		amdgpu_bo_unreserve(ring->mqd_obj);
++		r = gfx_v12_0_kgq_init_queue(&adev->gfx.gfx_ring[i], false);
+ 		if (r)
+-			goto done;
++			return r;
+ 	}
+ 
+ 	r = amdgpu_gfx_enable_kgq(adev, 0);
+ 	if (r)
+-		goto done;
+-
+-	r = gfx_v12_0_cp_gfx_start(adev);
+-	if (r)
+-		goto done;
++		return r;
+ 
+-done:
+-	return r;
++	return gfx_v12_0_cp_gfx_start(adev);
+ }
+ 
+ static int gfx_v12_0_compute_mqd_init(struct amdgpu_device *adev, void *m,
+@@ -3344,57 +3326,25 @@ static int gfx_v12_0_kcq_init_queue(struct amdgpu_ring *ring, bool reset)
+ 
+ static int gfx_v12_0_kiq_resume(struct amdgpu_device *adev)
+ {
+-	struct amdgpu_ring *ring;
+-	int r;
+-
+-	ring = &adev->gfx.kiq[0].ring;
+-
+-	r = amdgpu_bo_reserve(ring->mqd_obj, false);
+-	if (unlikely(r != 0))
+-		return r;
+-
+-	r = amdgpu_bo_kmap(ring->mqd_obj, (void **)&ring->mqd_ptr);
+-	if (unlikely(r != 0)) {
+-		amdgpu_bo_unreserve(ring->mqd_obj);
+-		return r;
+-	}
+-
+-	gfx_v12_0_kiq_init_queue(ring);
+-	amdgpu_bo_kunmap(ring->mqd_obj);
+-	ring->mqd_ptr = NULL;
+-	amdgpu_bo_unreserve(ring->mqd_obj);
+-	ring->sched.ready = true;
++	gfx_v12_0_kiq_init_queue(&adev->gfx.kiq[0].ring);
++	adev->gfx.kiq[0].ring.sched.ready = true;
+ 	return 0;
+ }
+ 
+ static int gfx_v12_0_kcq_resume(struct amdgpu_device *adev)
+ {
+-	struct amdgpu_ring *ring = NULL;
+-	int r = 0, i;
++	int i, r;
+ 
+ 	if (!amdgpu_async_gfx_ring)
+ 		gfx_v12_0_cp_compute_enable(adev, true);
+ 
+ 	for (i = 0; i < adev->gfx.num_compute_rings; i++) {
+-		ring = &adev->gfx.compute_ring[i];
+-
+-		r = amdgpu_bo_reserve(ring->mqd_obj, false);
+-		if (unlikely(r != 0))
+-			goto done;
+-		r = amdgpu_bo_kmap(ring->mqd_obj, (void **)&ring->mqd_ptr);
+-		if (!r) {
+-			r = gfx_v12_0_kcq_init_queue(ring, false);
+-			amdgpu_bo_kunmap(ring->mqd_obj);
+-			ring->mqd_ptr = NULL;
+-		}
+-		amdgpu_bo_unreserve(ring->mqd_obj);
++		r = gfx_v12_0_kcq_init_queue(&adev->gfx.compute_ring[i], false);
+ 		if (r)
+-			goto done;
++			return r;
+ 	}
+ 
+-	r = amdgpu_gfx_enable_kcq(adev, 0);
+-done:
+-	return r;
++	return amdgpu_gfx_enable_kcq(adev, 0);
+ }
+ 
+ static int gfx_v12_0_cp_resume(struct amdgpu_device *adev)
+@@ -5224,20 +5174,9 @@ static int gfx_v12_0_reset_kgq(struct amdgpu_ring *ring, unsigned int vmid)
+ 		return r;
+ 	}
+ 
+-	r = amdgpu_bo_reserve(ring->mqd_obj, false);
+-	if (unlikely(r != 0)) {
+-		dev_err(adev->dev, "fail to resv mqd_obj\n");
+-		return r;
+-	}
+-	r = amdgpu_bo_kmap(ring->mqd_obj, (void **)&ring->mqd_ptr);
+-	if (!r) {
+-		r = gfx_v12_0_kgq_init_queue(ring, true);
+-		amdgpu_bo_kunmap(ring->mqd_obj);
+-		ring->mqd_ptr = NULL;
+-	}
+-	amdgpu_bo_unreserve(ring->mqd_obj);
++	r = gfx_v12_0_kgq_init_queue(ring, true);
+ 	if (r) {
+-		DRM_ERROR("fail to unresv mqd_obj\n");
++		dev_err(adev->dev, "failed to init kgq\n");
+ 		return r;
+ 	}
+ 
+@@ -5264,20 +5203,9 @@ static int gfx_v12_0_reset_kcq(struct amdgpu_ring *ring, unsigned int vmid)
+ 		return r;
+ 	}
+ 
+-	r = amdgpu_bo_reserve(ring->mqd_obj, false);
+-	if (unlikely(r != 0)) {
+-		DRM_ERROR("fail to resv mqd_obj\n");
+-		return r;
+-	}
+-	r = amdgpu_bo_kmap(ring->mqd_obj, (void **)&ring->mqd_ptr);
+-	if (!r) {
+-		r = gfx_v12_0_kcq_init_queue(ring, true);
+-		amdgpu_bo_kunmap(ring->mqd_obj);
+-		ring->mqd_ptr = NULL;
+-	}
+-	amdgpu_bo_unreserve(ring->mqd_obj);
++	r = gfx_v12_0_kcq_init_queue(ring, true);
+ 	if (r) {
+-		DRM_ERROR("fail to unresv mqd_obj\n");
++		dev_err(adev->dev, "failed to init kcq\n");
+ 		return r;
+ 	}
+ 	r = amdgpu_mes_map_legacy_queue(adev, ring);
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+index d116a2e2f469..bfedd487efc5 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+@@ -4683,60 +4683,25 @@ static void gfx_v8_0_set_mec_doorbell_range(struct amdgpu_device *adev)
+ 
+ static int gfx_v8_0_kiq_resume(struct amdgpu_device *adev)
+ {
+-	struct amdgpu_ring *ring;
+-	int r;
+-
+-	ring = &adev->gfx.kiq[0].ring;
+-
+-	r = amdgpu_bo_reserve(ring->mqd_obj, false);
+-	if (unlikely(r != 0))
+-		return r;
+-
+-	r = amdgpu_bo_kmap(ring->mqd_obj, &ring->mqd_ptr);
+-	if (unlikely(r != 0)) {
+-		amdgpu_bo_unreserve(ring->mqd_obj);
+-		return r;
+-	}
+-
+-	gfx_v8_0_kiq_init_queue(ring);
+-	amdgpu_bo_kunmap(ring->mqd_obj);
+-	ring->mqd_ptr = NULL;
+-	amdgpu_bo_unreserve(ring->mqd_obj);
++	gfx_v8_0_kiq_init_queue(&adev->gfx.kiq[0].ring);
+ 	return 0;
+ }
+ 
+ static int gfx_v8_0_kcq_resume(struct amdgpu_device *adev)
+ {
+-	struct amdgpu_ring *ring = NULL;
+-	int r = 0, i;
++	int i, r;
+ 
+ 	gfx_v8_0_cp_compute_enable(adev, true);
+ 
+ 	for (i = 0; i < adev->gfx.num_compute_rings; i++) {
+-		ring = &adev->gfx.compute_ring[i];
+-
+-		r = amdgpu_bo_reserve(ring->mqd_obj, false);
+-		if (unlikely(r != 0))
+-			goto done;
+-		r = amdgpu_bo_kmap(ring->mqd_obj, &ring->mqd_ptr);
+-		if (!r) {
+-			r = gfx_v8_0_kcq_init_queue(ring);
+-			amdgpu_bo_kunmap(ring->mqd_obj);
+-			ring->mqd_ptr = NULL;
+-		}
+-		amdgpu_bo_unreserve(ring->mqd_obj);
++		r = gfx_v8_0_kcq_init_queue(&adev->gfx.compute_ring[i]);
+ 		if (r)
+-			goto done;
++			return r;
+ 	}
+ 
+ 	gfx_v8_0_set_mec_doorbell_range(adev);
+ 
+-	r = gfx_v8_0_kiq_kcq_enable(adev);
+-	if (r)
+-		goto done;
+-
+-done:
+-	return r;
++	return gfx_v8_0_kiq_kcq_enable(adev);
+ }
+ 
+ static int gfx_v8_0_cp_test_all_rings(struct amdgpu_device *adev)
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
+index d345285ea885..1080e9198ad9 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
+@@ -3890,55 +3890,23 @@ static int gfx_v9_0_kcq_init_queue(struct amdgpu_ring *ring, bool restore)
+ 
+ static int gfx_v9_0_kiq_resume(struct amdgpu_device *adev)
+ {
+-	struct amdgpu_ring *ring;
+-	int r;
+-
+-	ring = &adev->gfx.kiq[0].ring;
+-
+-	r = amdgpu_bo_reserve(ring->mqd_obj, false);
+-	if (unlikely(r != 0))
+-		return r;
+-
+-	r = amdgpu_bo_kmap(ring->mqd_obj, (void **)&ring->mqd_ptr);
+-	if (unlikely(r != 0)) {
+-		amdgpu_bo_unreserve(ring->mqd_obj);
+-		return r;
+-	}
+-
+-	gfx_v9_0_kiq_init_queue(ring);
+-	amdgpu_bo_kunmap(ring->mqd_obj);
+-	ring->mqd_ptr = NULL;
+-	amdgpu_bo_unreserve(ring->mqd_obj);
++	gfx_v9_0_kiq_init_queue(&adev->gfx.kiq[0].ring);
+ 	return 0;
+ }
+ 
+ static int gfx_v9_0_kcq_resume(struct amdgpu_device *adev)
+ {
+-	struct amdgpu_ring *ring = NULL;
+-	int r = 0, i;
++	int i, r;
+ 
+ 	gfx_v9_0_cp_compute_enable(adev, true);
+ 
+ 	for (i = 0; i < adev->gfx.num_compute_rings; i++) {
+-		ring = &adev->gfx.compute_ring[i];
+-
+-		r = amdgpu_bo_reserve(ring->mqd_obj, false);
+-		if (unlikely(r != 0))
+-			goto done;
+-		r = amdgpu_bo_kmap(ring->mqd_obj, (void **)&ring->mqd_ptr);
+-		if (!r) {
+-			r = gfx_v9_0_kcq_init_queue(ring, false);
+-			amdgpu_bo_kunmap(ring->mqd_obj);
+-			ring->mqd_ptr = NULL;
+-		}
+-		amdgpu_bo_unreserve(ring->mqd_obj);
++		r = gfx_v9_0_kcq_init_queue(&adev->gfx.compute_ring[i], false);
+ 		if (r)
+-			goto done;
++			return r;
+ 	}
+ 
+-	r = amdgpu_gfx_enable_kcq(adev, 0);
+-done:
+-	return r;
++	return amdgpu_gfx_enable_kcq(adev, 0);
+ }
+ 
+ static int gfx_v9_0_cp_resume(struct amdgpu_device *adev)
+@@ -7319,20 +7287,9 @@ static int gfx_v9_0_reset_kcq(struct amdgpu_ring *ring,
+ 		return r;
+ 	}
+ 
+-	r = amdgpu_bo_reserve(ring->mqd_obj, false);
+-	if (unlikely(r != 0)){
+-		dev_err(adev->dev, "fail to resv mqd_obj\n");
+-		return r;
+-	}
+-	r = amdgpu_bo_kmap(ring->mqd_obj, (void **)&ring->mqd_ptr);
+-	if (!r) {
+-		r = gfx_v9_0_kcq_init_queue(ring, true);
+-		amdgpu_bo_kunmap(ring->mqd_obj);
+-		ring->mqd_ptr = NULL;
+-	}
+-	amdgpu_bo_unreserve(ring->mqd_obj);
++	r = gfx_v9_0_kcq_init_queue(ring, true);
+ 	if (r) {
+-		dev_err(adev->dev, "fail to unresv mqd_obj\n");
++		dev_err(adev->dev, "fail to init kcq\n");
+ 		return r;
+ 	}
+ 	spin_lock_irqsave(&kiq->ring_lock, flags);
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v9_4_3.c b/drivers/gpu/drm/amd/amdgpu/gfx_v9_4_3.c
+index 780563a97d20..53fbf6ca7cdb 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v9_4_3.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v9_4_3.c
+@@ -2167,55 +2167,27 @@ static int gfx_v9_4_3_xcc_kcq_fini_register(struct amdgpu_device *adev, int xcc_
+ 
+ static int gfx_v9_4_3_xcc_kiq_resume(struct amdgpu_device *adev, int xcc_id)
+ {
+-	struct amdgpu_ring *ring;
+-	int r;
+-
+-	ring = &adev->gfx.kiq[xcc_id].ring;
+-
+-	r = amdgpu_bo_reserve(ring->mqd_obj, false);
+-	if (unlikely(r != 0))
+-		return r;
+-
+-	r = amdgpu_bo_kmap(ring->mqd_obj, (void **)&ring->mqd_ptr);
+-	if (unlikely(r != 0)) {
+-		amdgpu_bo_unreserve(ring->mqd_obj);
+-		return r;
+-	}
+-
+-	gfx_v9_4_3_xcc_kiq_init_queue(ring, xcc_id);
+-	amdgpu_bo_kunmap(ring->mqd_obj);
+-	ring->mqd_ptr = NULL;
+-	amdgpu_bo_unreserve(ring->mqd_obj);
++	gfx_v9_4_3_xcc_kiq_init_queue(&adev->gfx.kiq[xcc_id].ring, xcc_id);
+ 	return 0;
+ }
+ 
+ static int gfx_v9_4_3_xcc_kcq_resume(struct amdgpu_device *adev, int xcc_id)
+ {
+-	struct amdgpu_ring *ring = NULL;
+-	int r = 0, i;
++	struct amdgpu_ring *ring;
++	int i, r;
+ 
+ 	gfx_v9_4_3_xcc_cp_compute_enable(adev, true, xcc_id);
+ 
+ 	for (i = 0; i < adev->gfx.num_compute_rings; i++) {
+-		ring = &adev->gfx.compute_ring[i + xcc_id * adev->gfx.num_compute_rings];
+-
+-		r = amdgpu_bo_reserve(ring->mqd_obj, false);
+-		if (unlikely(r != 0))
+-			goto done;
+-		r = amdgpu_bo_kmap(ring->mqd_obj, (void **)&ring->mqd_ptr);
+-		if (!r) {
+-			r = gfx_v9_4_3_xcc_kcq_init_queue(ring, xcc_id, false);
+-			amdgpu_bo_kunmap(ring->mqd_obj);
+-			ring->mqd_ptr = NULL;
+-		}
+-		amdgpu_bo_unreserve(ring->mqd_obj);
++		ring = &adev->gfx.compute_ring[i + xcc_id *
++			adev->gfx.num_compute_rings];
++
++		r = gfx_v9_4_3_xcc_kcq_init_queue(ring, xcc_id, false);
+ 		if (r)
+-			goto done;
++			return r;
+ 	}
+ 
+-	r = amdgpu_gfx_enable_kcq(adev, xcc_id);
+-done:
+-	return r;
++	return amdgpu_gfx_enable_kcq(adev, xcc_id);
+ }
+ 
+ static int gfx_v9_4_3_xcc_cp_resume(struct amdgpu_device *adev, int xcc_id)
+@@ -3587,20 +3559,9 @@ static int gfx_v9_4_3_reset_kcq(struct amdgpu_ring *ring,
+ 			return r;
+ 	}
+ 
+-	r = amdgpu_bo_reserve(ring->mqd_obj, false);
+-	if (unlikely(r != 0)){
+-		dev_err(adev->dev, "fail to resv mqd_obj\n");
+-		return r;
+-	}
+-	r = amdgpu_bo_kmap(ring->mqd_obj, (void **)&ring->mqd_ptr);
+-	if (!r) {
+-		r = gfx_v9_4_3_xcc_kcq_init_queue(ring, ring->xcc_id, true);
+-		amdgpu_bo_kunmap(ring->mqd_obj);
+-		ring->mqd_ptr = NULL;
+-	}
+-	amdgpu_bo_unreserve(ring->mqd_obj);
++	r = gfx_v9_4_3_xcc_kcq_init_queue(ring, ring->xcc_id, true);
+ 	if (r) {
+-		dev_err(adev->dev, "fail to unresv mqd_obj\n");
++		dev_err(adev->dev, "fail to init kcq\n");
+ 		return r;
+ 	}
+ 	spin_lock_irqsave(&kiq->ring_lock, flags);
+-- 
+2.52.0
+
