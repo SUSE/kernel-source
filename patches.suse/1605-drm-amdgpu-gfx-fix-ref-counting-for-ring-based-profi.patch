@@ -1,0 +1,107 @@
+From 553673a3e1bc0abbb994d9884f772189c739e3a0 Mon Sep 17 00:00:00 2001
+From: Alex Deucher <alexander.deucher@amd.com>
+Date: Wed, 12 Mar 2025 09:44:19 -0400
+Subject: drm/amdgpu/gfx: fix ref counting for ring based profile handling
+Git-commit: 553673a3e1bc0abbb994d9884f772189c739e3a0
+Patch-mainline: v6.15-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+We need to make sure the workload profile ref counts are
+balanced.  This isn't currently the case because we can
+increment the count on submissions, but the decrement may
+be delayed as work comes in.  Track when we enable the
+workload profile so the references are balanced.
+
+V2: switch to a mutex and active flag
+V3: fix mutex init
+
+Fixes: 8fdb3958e396 ("drm/amdgpu/gfx: add ring helpers for setting workload profile")
+Cc: Yang Wang <kevinyang.wang@amd.com>
+Cc: Kenneth Feng <kenneth.feng@amd.com>
+Tested-by: Kenneth Feng <kenneth.feng@amd.com>
+Reviewed-by: Kenneth Feng <kenneth.feng@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c    | 30 ++++++++++++++--------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.h    |  2 ++
+ 3 files changed, 23 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 35ace1368b9c..173048c46fc3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -4282,6 +4282,7 @@ int amdgpu_device_init(struct amdgpu_device *adev,
+ 	/* Initialize the mutex for cleaner shader isolation between GFX and compute processes */
+ 	mutex_init(&adev->enforce_isolation_mutex);
+ 	mutex_init(&adev->gfx.kfd_sch_mutex);
++	mutex_init(&adev->gfx.workload_profile_mutex);
+ 
+ 	amdgpu_device_init_apu_flags(adev);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
+index 984e6ff6e463..099329d15b9f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
+@@ -2160,11 +2160,16 @@ void amdgpu_gfx_profile_idle_work_handler(struct work_struct *work)
+ 	for (i = 0; i < (AMDGPU_MAX_COMPUTE_RINGS * AMDGPU_MAX_GC_INSTANCES); ++i)
+ 		fences += amdgpu_fence_count_emitted(&adev->gfx.compute_ring[i]);
+ 	if (!fences && !atomic_read(&adev->gfx.total_submission_cnt)) {
+-		r = amdgpu_dpm_switch_power_profile(adev, profile, false);
+-		if (r)
+-			dev_warn(adev->dev, "(%d) failed to disable %s power profile mode\n", r,
+-				 profile == PP_SMC_POWER_PROFILE_FULLSCREEN3D ?
+-				 "fullscreen 3D" : "compute");
++		mutex_lock(&adev->gfx.workload_profile_mutex);
++		if (adev->gfx.workload_profile_active) {
++			r = amdgpu_dpm_switch_power_profile(adev, profile, false);
++			if (r)
++				dev_warn(adev->dev, "(%d) failed to disable %s power profile mode\n", r,
++					 profile == PP_SMC_POWER_PROFILE_FULLSCREEN3D ?
++					 "fullscreen 3D" : "compute");
++			adev->gfx.workload_profile_active = false;
++		}
++		mutex_unlock(&adev->gfx.workload_profile_mutex);
+ 	} else {
+ 		schedule_delayed_work(&adev->gfx.idle_work, GFX_PROFILE_IDLE_TIMEOUT);
+ 	}
+@@ -2184,11 +2189,16 @@ void amdgpu_gfx_profile_ring_begin_use(struct amdgpu_ring *ring)
+ 	atomic_inc(&adev->gfx.total_submission_cnt);
+ 
+ 	if (!cancel_delayed_work_sync(&adev->gfx.idle_work)) {
+-		r = amdgpu_dpm_switch_power_profile(adev, profile, true);
+-		if (r)
+-			dev_warn(adev->dev, "(%d) failed to disable %s power profile mode\n", r,
+-				 profile == PP_SMC_POWER_PROFILE_FULLSCREEN3D ?
+-				 "fullscreen 3D" : "compute");
++		mutex_lock(&adev->gfx.workload_profile_mutex);
++		if (!adev->gfx.workload_profile_active) {
++			r = amdgpu_dpm_switch_power_profile(adev, profile, true);
++			if (r)
++				dev_warn(adev->dev, "(%d) failed to disable %s power profile mode\n", r,
++					 profile == PP_SMC_POWER_PROFILE_FULLSCREEN3D ?
++					 "fullscreen 3D" : "compute");
++			adev->gfx.workload_profile_active = true;
++		}
++		mutex_unlock(&adev->gfx.workload_profile_mutex);
+ 	}
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.h
+index 3c030d3f39d4..9e2355a3b120 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.h
+@@ -482,6 +482,8 @@ struct amdgpu_gfx {
+ 
+ 	atomic_t			total_submission_cnt;
+ 	struct delayed_work		idle_work;
++	bool				workload_profile_active;
++	struct mutex                    workload_profile_mutex;
+ };
+ 
+ struct amdgpu_gfx_ras_reg_entry {
+-- 
+2.52.0
+
