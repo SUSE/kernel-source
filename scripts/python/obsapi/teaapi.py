@@ -262,6 +262,17 @@ class TeaAPI(api.API):
     def update_content(self, org, repo, branch, src, message, ignored_files=None, upload_all=False):
         ign = ['.gitattributes', '.gitignore'] + (ignored_files if ignored_files else [])
         exc = ['.osc', '.git']
+
+        def file_ignored(filename):
+            excluded = False
+            for e in exc:
+                if filename.startswith(e + '/'):
+                    excluded = True
+            basename = os.path.basename(filename)
+            if basename in ign or filename in exc or excluded:
+                return True
+            return False
+
         r = self.check_get(self.repo_path(org, repo) + '/contents-ext', params={
             'ref': branch,
             'includes': 'lfs_metadata'
@@ -277,6 +288,8 @@ class TeaAPI(api.API):
                 self.log_progress('Forcedly uploading all files.\n')
                 rq = { 'branch' : branch, 'files' : [], 'message': message }
                 for filename in sorted(files.keys()):
+                    if file_ignored(filename):
+                        continue
                     frq = { 'path' : filename, 'operation' : 'delete', 'sha' : files[filename]['sha'] }
                     rq['files'].append(frq)
                     self.log_progress('DELETE %s\n' % (filename))
@@ -285,14 +298,9 @@ class TeaAPI(api.API):
                     self.check_post(self.repo_path(org, repo) + '/contents', json=rq)
             rq = { 'branch' : branch, 'files' : [], 'message': message }
             for filename in list_files(src):
-                pathname = os.path.join(os.getcwd(), src, filename)
-                excluded = False
-                for e in exc:
-                    if filename.startswith(e + '/'):
-                        excluded = True
-                basename = os.path.basename(filename)
-                if basename in ign or filename in exc or excluded:
+                if file_ignored(filename):
                     continue
+                pathname = os.path.join(os.getcwd(), src, filename)
                 with open(pathname, 'rb') as fd:
                     content = fd.read()
                 if files.get(filename):
