@@ -1,0 +1,81 @@
+From: Steve French <stfrench@microsoft.com>
+Date: Wed, 1 Oct 2025 21:49:59 -0500
+Subject: [PATCH] smb: client: ensure open_cached_dir_by_dentry() only returns
+ valid cfid
+Git-commit: a365f2c049b3846640234bc25e4f8c46abea6c98
+References: git-fixes
+Patch-mainline: v6.18-rc1
+
+open_cached_dir_by_dentry() was exposing an invalid cached directory to
+callers. The validity check outside the function was exclusively based
+on cfid->time.
+
+Add validity check before returning success and introduce
+is_valid_cached_dir() helper for consistent checks across the code.
+
+Signed-off-by: Henrique Carvalho <henrique.carvalho@suse.com>
+Reviwed-by: Enzo Matsumiya <ematsumiya@suse.de>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+---
+ fs/smb/client/cached_dir.c |    7 ++++---
+ fs/smb/client/cached_dir.h |    6 ++++++
+ fs/smb/client/inode.c      |    2 +-
+ 3 files changed, 11 insertions(+), 4 deletions(-)
+
+--- a/fs/smb/client/cached_dir.c
++++ b/fs/smb/client/cached_dir.c
+@@ -36,9 +36,8 @@
+ 			 * fully cached or it may be in the process of
+ 			 * being deleted due to a lease break.
+ 			 */
+-			if (!cfid->time || !cfid->has_lease) {
++			if (!is_valid_cached_dir(cfid))
+ 				return NULL;
+-			}
+ 			kref_get(&cfid->refcount);
+ 			return cfid;
+ 		}
+@@ -192,7 +191,7 @@
+ 	 * Otherwise, it is either a new entry or laundromat worker removed it
+ 	 * from @cfids->entries.  Caller will put last reference if the latter.
+ 	 */
+-	if (cfid->has_lease && cfid->time) {
++	if (is_valid_cached_dir(cfid)) {
+ 		cfid->last_access_time = jiffies;
+ 		spin_unlock(&cfids->cfid_list_lock);
+ 		*ret_cfid = cfid;
+@@ -397,6 +396,8 @@
+ 	spin_lock(&cfids->cfid_list_lock);
+ 	list_for_each_entry(cfid, &cfids->entries, entry) {
+ 		if (dentry && cfid->dentry == dentry) {
++			if (!is_valid_cached_dir(cfid))
++				break;
+ 			cifs_dbg(FYI, "found a cached file handle by dentry\n");
+ 			kref_get(&cfid->refcount);
+ 			*ret_cfid = cfid;
+--- a/fs/smb/client/cached_dir.h
++++ b/fs/smb/client/cached_dir.h
+@@ -65,6 +65,12 @@
+ 	struct delayed_work laundromat_work;
+ };
+ 
++static inline bool
++is_valid_cached_dir(struct cached_fid *cfid)
++{
++	return cfid->time && cfid->has_lease;
++}
++
+ extern struct cached_fids *init_cached_dirs(void);
+ extern void free_cached_dirs(struct cached_fids *cfids);
+ extern int open_cached_dir(unsigned int xid, struct cifs_tcon *tcon,
+--- a/fs/smb/client/inode.c
++++ b/fs/smb/client/inode.c
+@@ -2400,7 +2400,7 @@
+ 		return true;
+ 
+ 	if (!open_cached_dir_by_dentry(tcon, dentry->d_parent, &cfid)) {
+-		if (cfid->time && cifs_i->time > cfid->time) {
++		if (cifs_i->time > cfid->time) {
+ 			close_cached_dir(cfid);
+ 			return false;
+ 		}

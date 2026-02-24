@@ -1,0 +1,103 @@
+From: Henrique Carvalho <henrique.carvalho@suse.com>
+Date: Mon, 2 Jun 2025 17:45:17 -0300
+Subject: [PATCH] smb: client: remove unused fid_lock
+Git-commit: 17ef15fa80cf3b60b6f82ea1d88fa499d5495994
+References: git-fixes
+Patch-mainline: v6.18-rc1
+
+The fid_lock in struct cached_fid does not currently provide any real
+synchronization. Previously, it had the intention to prevent a double
+release of the dentry, but every change to cfid->dentry is already
+protected either by cfid_list_lock (while the entry is in the list) or
+happens after the cfid has been removed (so no other thread should find
+it).
+
+Since there is no scenario in which fid_lock prevents any race, it is
+vestigial and can be removed along with its associated
+spin_lock()/spin_unlock() calls.
+
+Signed-off-by: Henrique Carvalho <henrique.carvalho@suse.com>
+Reviewed-by: Enzo Matsumiya <ematsumiya@suse.de>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+---
+ fs/smb/client/cached_dir.c | 17 +++--------------
+ fs/smb/client/cached_dir.h |  1 -
+ 2 files changed, 3 insertions(+), 15 deletions(-)
+
+diff --git a/fs/smb/client/cached_dir.c b/fs/smb/client/cached_dir.c
+index 200a52220f2d3..03bfb919ad477 100644
+--- a/fs/smb/client/cached_dir.c
++++ b/fs/smb/client/cached_dir.c
+@@ -524,10 +524,9 @@ void close_all_cached_dirs(struct cifs_sb_info *cifs_sb)
+ 				spin_unlock(&cifs_sb->tlink_tree_lock);
+ 				goto done;
+ 			}
+-			spin_lock(&cfid->fid_lock);
++
+ 			tmp_list->dentry = cfid->dentry;
+ 			cfid->dentry = NULL;
+-			spin_unlock(&cfid->fid_lock);
+ 
+ 			list_add_tail(&tmp_list->entry, &entry);
+ 		}
+@@ -610,14 +609,9 @@ static void cached_dir_put_work(struct work_struct *work)
+ {
+ 	struct cached_fid *cfid = container_of(work, struct cached_fid,
+ 					       put_work);
+-	struct dentry *dentry;
+-
+-	spin_lock(&cfid->fid_lock);
+-	dentry = cfid->dentry;
++	dput(cfid->dentry);
+ 	cfid->dentry = NULL;
+-	spin_unlock(&cfid->fid_lock);
+ 
+-	dput(dentry);
+ 	queue_work(serverclose_wq, &cfid->close_work);
+ }
+ 
+@@ -675,7 +669,6 @@ static struct cached_fid *init_cached_dir(const char *path)
+ 	INIT_LIST_HEAD(&cfid->entry);
+ 	INIT_LIST_HEAD(&cfid->dirents.entries);
+ 	mutex_init(&cfid->dirents.de_mutex);
+-	spin_lock_init(&cfid->fid_lock);
+ 	kref_init(&cfid->refcount);
+ 	return cfid;
+ }
+@@ -742,7 +735,6 @@ static void cfids_laundromat_worker(struct work_struct *work)
+ {
+ 	struct cached_fids *cfids;
+ 	struct cached_fid *cfid, *q;
+-	struct dentry *dentry;
+ 	LIST_HEAD(entry);
+ 
+ 	cfids = container_of(work, struct cached_fids, laundromat_work.work);
+@@ -769,12 +761,9 @@ static void cfids_laundromat_worker(struct work_struct *work)
+ 	list_for_each_entry_safe(cfid, q, &entry, entry) {
+ 		list_del(&cfid->entry);
+ 
+-		spin_lock(&cfid->fid_lock);
+-		dentry = cfid->dentry;
++		dput(cfid->dentry);
+ 		cfid->dentry = NULL;
+-		spin_unlock(&cfid->fid_lock);
+ 
+-		dput(dentry);
+ 		if (cfid->is_open) {
+ 			spin_lock(&cifs_tcp_ses_lock);
+ 			++cfid->tcon->tc_count;
+diff --git a/fs/smb/client/cached_dir.h b/fs/smb/client/cached_dir.h
+index 9210caf801645..31339dc327192 100644
+--- a/fs/smb/client/cached_dir.h
++++ b/fs/smb/client/cached_dir.h
+@@ -44,7 +44,6 @@ struct cached_fid {
+ 	unsigned long last_access_time; /* jiffies of when last accessed */
+ 	struct kref refcount;
+ 	struct cifs_fid fid;
+-	spinlock_t fid_lock;
+ 	struct cifs_tcon *tcon;
+ 	struct dentry *dentry;
+ 	struct work_struct put_work;
+
+-- 
+2.52.0
