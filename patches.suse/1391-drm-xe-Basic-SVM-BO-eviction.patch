@@ -1,0 +1,164 @@
+From 3ca608dc7561036949508af0834028c2f040d78a Mon Sep 17 00:00:00 2001
+From: Matthew Brost <matthew.brost@intel.com>
+Date: Wed, 5 Mar 2025 17:26:53 -0800
+Subject: drm/xe: Basic SVM BO eviction
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 3ca608dc7561036949508af0834028c2f040d78a
+Patch-mainline: v6.15-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Wire xe_bo_move to GPU SVM migration via new helper xe_svm_bo_evict.
+
+V2: - Use xe_svm_bo_evict
+ - Drop bo->range
+V3: - Kernel doc (Thomas)
+V4: - Add missing xe_bo.c code
+V5: - Add XE_BO_FLAG_CPU_ADDR_MIRROR flag in this patch (Thomas)
+ - Add message on eviction failure
+V6: - Only compile if CONFIG_DRM_GPUSVM selected (CI, Lucas)
+
+Signed-off-by: Matthew Brost <matthew.brost@intel.com>
+Reviewed-by: Thomas Hellström <thomas.hellstrom@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250306012657.3505757-29-matthew.brost@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/xe/xe_bo.c  | 22 ++++++++++++++++++++++
+ drivers/gpu/drm/xe/xe_bo.h  |  1 +
+ drivers/gpu/drm/xe/xe_svm.c | 17 ++++++++++++++++-
+ drivers/gpu/drm/xe/xe_svm.h |  9 +++++++++
+ 4 files changed, 48 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_bo.c b/drivers/gpu/drm/xe/xe_bo.c
+index 0305e4bdb18c..64f9c936eea0 100644
+--- a/drivers/gpu/drm/xe/xe_bo.c
++++ b/drivers/gpu/drm/xe/xe_bo.c
+@@ -281,6 +281,8 @@ int xe_bo_placement_for_flags(struct xe_device *xe, struct xe_bo *bo,
+ static void xe_evict_flags(struct ttm_buffer_object *tbo,
+ 			   struct ttm_placement *placement)
+ {
++	struct xe_bo *bo;
++
+ 	if (!xe_bo_is_xe_bo(tbo)) {
+ 		/* Don't handle scatter gather BOs */
+ 		if (tbo->type == ttm_bo_type_sg) {
+@@ -292,6 +294,12 @@ static void xe_evict_flags(struct ttm_buffer_object *tbo,
+ 		return;
+ 	}
+ 
++	bo = ttm_to_xe_bo(tbo);
++	if (bo->flags & XE_BO_FLAG_CPU_ADDR_MIRROR) {
++		*placement = sys_placement;
++		return;
++	}
++
+ 	/*
+ 	 * For xe, sg bos that are evicted to system just triggers a
+ 	 * rebind of the sg list upon subsequent validation to XE_PL_TT.
+@@ -789,6 +797,20 @@ static int xe_bo_move(struct ttm_buffer_object *ttm_bo, bool evict,
+ 		goto out;
+ 	}
+ 
++	if (!move_lacks_source && (bo->flags & XE_BO_FLAG_CPU_ADDR_MIRROR) &&
++	    new_mem->mem_type == XE_PL_SYSTEM) {
++		ret = xe_svm_bo_evict(bo);
++		if (!ret) {
++			drm_dbg(&xe->drm, "Evict system allocator BO success\n");
++			ttm_bo_move_null(ttm_bo, new_mem);
++		} else {
++			drm_dbg(&xe->drm, "Evict system allocator BO failed=%pe\n",
++				ERR_PTR(ret));
++		}
++
++		goto out;
++	}
++
+ 	if (old_mem_type == XE_PL_SYSTEM && new_mem->mem_type == XE_PL_TT && !handle_system_ccs) {
+ 		ttm_bo_move_null(ttm_bo, new_mem);
+ 		goto out;
+diff --git a/drivers/gpu/drm/xe/xe_bo.h b/drivers/gpu/drm/xe/xe_bo.h
+index ce3ad9007e8a..ec3e4446d027 100644
+--- a/drivers/gpu/drm/xe/xe_bo.h
++++ b/drivers/gpu/drm/xe/xe_bo.h
+@@ -47,6 +47,7 @@
+ 					 XE_BO_FLAG_GGTT1 | \
+ 					 XE_BO_FLAG_GGTT2 | \
+ 					 XE_BO_FLAG_GGTT3)
++#define XE_BO_FLAG_CPU_ADDR_MIRROR	BIT(22)
+ 
+ /* this one is trigger internally only */
+ #define XE_BO_FLAG_INTERNAL_TEST	BIT(30)
+diff --git a/drivers/gpu/drm/xe/xe_svm.c b/drivers/gpu/drm/xe/xe_svm.c
+index a92990d9fbd1..92a9c64a1fa1 100644
+--- a/drivers/gpu/drm/xe/xe_svm.c
++++ b/drivers/gpu/drm/xe/xe_svm.c
+@@ -617,7 +617,8 @@ static int xe_svm_alloc_vram(struct xe_vm *vm, struct xe_tile *tile,
+ 	bo = xe_bo_create_locked(tile_to_xe(tile), NULL, NULL,
+ 				 xe_svm_range_size(range),
+ 				 ttm_bo_type_device,
+-				 XE_BO_FLAG_VRAM_IF_DGFX(tile));
++				 XE_BO_FLAG_VRAM_IF_DGFX(tile) |
++				 XE_BO_FLAG_CPU_ADDR_MIRROR);
+ 	if (IS_ERR(bo)) {
+ 		err = PTR_ERR(bo);
+ 		if (xe_vm_validate_should_retry(NULL, err, &end))
+@@ -772,6 +773,20 @@ bool xe_svm_has_mapping(struct xe_vm *vm, u64 start, u64 end)
+ 	return drm_gpusvm_has_mapping(&vm->svm.gpusvm, start, end);
+ }
+ 
++/**
++ * xe_svm_bo_evict() - SVM evict BO to system memory
++ * @bo: BO to evict
++ *
++ * SVM evict BO to system memory. GPU SVM layer ensures all device pages
++ * are evicted before returning.
++ *
++ * Return: 0 on success standard error code otherwise
++ */
++int xe_svm_bo_evict(struct xe_bo *bo)
++{
++	return drm_gpusvm_evict_to_ram(&bo->devmem_allocation);
++}
++
+ #if IS_ENABLED(CONFIG_DRM_XE_DEVMEM_MIRROR)
+ static struct drm_pagemap_device_addr
+ xe_drm_pagemap_device_map(struct drm_pagemap *dpagemap,
+diff --git a/drivers/gpu/drm/xe/xe_svm.h b/drivers/gpu/drm/xe/xe_svm.h
+index 5d4eeb2d34ce..855aa8e1dd38 100644
+--- a/drivers/gpu/drm/xe/xe_svm.h
++++ b/drivers/gpu/drm/xe/xe_svm.h
+@@ -11,6 +11,7 @@
+ 
+ #define XE_INTERCONNECT_VRAM DRM_INTERCONNECT_DRIVER
+ 
++struct xe_bo;
+ struct xe_vram_region;
+ struct xe_tile;
+ struct xe_vm;
+@@ -67,6 +68,8 @@ int xe_svm_handle_pagefault(struct xe_vm *vm, struct xe_vma *vma,
+ 			    bool atomic);
+ 
+ bool xe_svm_has_mapping(struct xe_vm *vm, u64 start, u64 end);
++
++int xe_svm_bo_evict(struct xe_bo *bo);
+ #else
+ static inline bool xe_svm_range_pages_valid(struct xe_svm_range *range)
+ {
+@@ -108,6 +111,12 @@ bool xe_svm_has_mapping(struct xe_vm *vm, u64 start, u64 end)
+ {
+ 	return false;
+ }
++
++static inline
++int xe_svm_bo_evict(struct xe_bo *bo)
++{
++	return 0;
++}
+ #endif
+ 
+ /**
+-- 
+2.52.0
+
