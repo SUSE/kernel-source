@@ -1,0 +1,159 @@
+From: Yang Weijiang <weijiang.yang@intel.com>
+Date: Fri, 19 Sep 2025 15:32:20 -0700
+Subject: KVM: x86: Enable guest SSP read/write interface with new uAPIs
+Patch-mainline: v6.18-rc1
+Git-commit: 9d6812d415358372aaaf1dfe95bc30d11e4e95db
+References: jsc#PED-15123
+
+Add a KVM-defined ONE_REG register, KVM_REG_GUEST_SSP, to let userspace
+save and restore the guest's Shadow Stack Pointer (SSP).  On both Intel
+and AMD, SSP is a hardware register that can only be accessed by software
+via dedicated ISA (e.g. RDSSP) or via VMCS/VMCB fields (used by hardware
+to context switch SSP at entry/exit).  As a result, SSP doesn't fit in
+any of KVM's existing interfaces for saving/restoring state.
+
+Internally, treat SSP as a fake/synthetic MSR, as the semantics of writes
+to SSP follow that of several other Shadow Stack MSRs, e.g. the PLx_SSP
+MSRs.  Use a translation layer to hide the KVM-internal MSR index so that
+the arbitrary index doesn't become ABI, e.g. so that KVM can rework its
+implementation as needed, so long as the ONE_REG ABI is maintained.
+
+Explicitly reject accesses to SSP if the vCPU doesn't have Shadow Stack
+support to avoid running afoul of ignore_msrs, which unfortunately applies
+to host-initiated accesses (which is a discussion for another day).  I.e.
+ensure consistent behavior for KVM-defined registers irrespective of
+ignore_msrs.
+
+Link: https://lore.kernel.org/all/aca9d389-f11e-4811-90cf-d98e345a5cc2@intel.com
+Suggested-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Yang Weijiang <weijiang.yang@intel.com>
+Tested-by: Mathias Krause <minipli@grsecurity.net>
+Tested-by: John Allen <john.allen@amd.com>
+Tested-by: Rick Edgecombe <rick.p.edgecombe@intel.com>
+Signed-off-by: Chao Gao <chao.gao@intel.com>
+Reviewed-by: Binbin Wu <binbin.wu@linux.intel.com>
+Reviewed-by: Xiaoyao Li <xiaoyao.li@intel.com>
+Link: https://lore.kernel.org/r/20250919223258.1604852-14-seanjc@google.com
+Co-developed-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Acked-by: Carlos López <clopez@suse.de>
+---
+ Documentation/virt/kvm/api.rst  |    8 ++++++++
+ arch/x86/include/uapi/asm/kvm.h |    3 +++
+ arch/x86/kvm/x86.c              |   37 +++++++++++++++++++++++++++++++++----
+ arch/x86/kvm/x86.h              |   10 ++++++++++
+ 4 files changed, 54 insertions(+), 4 deletions(-)
+
+--- a/Documentation/virt/kvm/api.rst
++++ b/Documentation/virt/kvm/api.rst
+@@ -2892,6 +2892,14 @@ such as set vcpu counter or reset vcpu,
+ x86 MSR registers have the following id bit patterns::
+   0x2030 0002 <msr number:32>
+ 
++Following are the KVM-defined registers for x86:
++
++======================= ========= =============================================
++    Encoding            Register  Description
++======================= ========= =============================================
++  0x2030 0003 0000 0000 SSP       Shadow Stack Pointer
++======================= ========= =============================================
++
+ 4.69 KVM_GET_ONE_REG
+ --------------------
+ 
+--- a/arch/x86/include/uapi/asm/kvm.h
++++ b/arch/x86/include/uapi/asm/kvm.h
+@@ -437,6 +437,9 @@ struct kvm_xcrs {
+ #define KVM_X86_REG_KVM(index)					\
+ 	KVM_X86_REG_ID(KVM_X86_REG_TYPE_KVM, index)
+ 
++/* KVM-defined registers starting from 0 */
++#define KVM_REG_GUEST_SSP	0
++
+ #define KVM_SYNC_X86_REGS      (1UL << 0)
+ #define KVM_SYNC_X86_SREGS     (1UL << 1)
+ #define KVM_SYNC_X86_EVENTS    (1UL << 2)
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -5988,9 +5988,27 @@ struct kvm_x86_reg_id {
+ 	__u8  x86;
+ };
+ 
+-static int kvm_translate_kvm_reg(struct kvm_x86_reg_id *reg)
++static int kvm_translate_kvm_reg(struct kvm_vcpu *vcpu,
++				 struct kvm_x86_reg_id *reg)
+ {
+-	return -EINVAL;
++	switch (reg->index) {
++	case KVM_REG_GUEST_SSP:
++		/*
++		 * FIXME: If host-initiated accesses are ever exempted from
++		 * ignore_msrs (in kvm_do_msr_access()), drop this manual check
++		 * and rely on KVM's standard checks to reject accesses to regs
++		 * that don't exist.
++		 */
++		if (!guest_cpu_cap_has(vcpu, X86_FEATURE_SHSTK))
++			return -EINVAL;
++
++		reg->type = KVM_X86_REG_TYPE_MSR;
++		reg->index = MSR_KVM_INTERNAL_GUEST_SSP;
++		break;
++	default:
++		return -EINVAL;
++	}
++	return 0;
+ }
+ 
+ static int kvm_get_one_msr(struct kvm_vcpu *vcpu, u32 msr, u64 __user *user_val)
+@@ -6039,7 +6057,7 @@ static int kvm_get_set_one_reg(struct kv
+ 		return -EINVAL;
+ 
+ 	if (reg->type == KVM_X86_REG_TYPE_KVM) {
+-		r = kvm_translate_kvm_reg(reg);
++		r = kvm_translate_kvm_reg(vcpu, reg);
+ 		if (r)
+ 			return r;
+ 	}
+@@ -6070,11 +6088,22 @@ static int kvm_get_set_one_reg(struct kv
+ static int kvm_get_reg_list(struct kvm_vcpu *vcpu,
+ 			    struct kvm_reg_list __user *user_list)
+ {
+-	u64 nr_regs = 0;
++	u64 nr_regs = guest_cpu_cap_has(vcpu, X86_FEATURE_SHSTK) ? 1 : 0;
++	u64 user_nr_regs;
++
++	if (get_user(user_nr_regs, &user_list->n))
++		return -EFAULT;
+ 
+ 	if (put_user(nr_regs, &user_list->n))
+ 		return -EFAULT;
+ 
++	if (user_nr_regs < nr_regs)
++		return -E2BIG;
++
++	if (nr_regs &&
++	    put_user(KVM_X86_REG_KVM(KVM_REG_GUEST_SSP), &user_list->reg[0]))
++		return -EFAULT;
++
+ 	return 0;
+ }
+ 
+--- a/arch/x86/kvm/x86.h
++++ b/arch/x86/kvm/x86.h
+@@ -79,6 +79,16 @@ void kvm_spurious_fault(void);
+ #define KVM_SVM_DEFAULT_PLE_WINDOW_MAX	USHRT_MAX
+ #define KVM_SVM_DEFAULT_PLE_WINDOW	3000
+ 
++/*
++ * KVM's internal, non-ABI indices for synthetic MSRs. The values themselves
++ * are arbitrary and have no meaning, the only requirement is that they don't
++ * conflict with "real" MSRs that KVM supports. Use values at the upper end
++ * of KVM's reserved paravirtual MSR range to minimize churn, i.e. these values
++ * will be usable until KVM exhausts its supply of paravirtual MSR indices.
++ */
++
++#define MSR_KVM_INTERNAL_GUEST_SSP	0x4b564dff
++
+ static inline unsigned int __grow_ple_window(unsigned int val,
+ 		unsigned int base, unsigned int modifier, unsigned int max)
+ {
