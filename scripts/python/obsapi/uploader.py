@@ -377,6 +377,4 @@ class Uploader(UploaderBase):
         self.ignore_kabi_badness = ignore_kabi
         self.reset_branch = reset_branch
         self.upload_all = upload_all
-        if self.upload_all:
-            self.log_progress('Forcedly uploading all files.\n')
         self.fork_repo(self.upstream, self.reset_branch)

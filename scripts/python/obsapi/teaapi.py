@@ -274,6 +274,7 @@ class TeaAPI(api.API):
         with tempfile.TemporaryDirectory() as tmpdirname:
             hasher = init_repo(tmpdirname, repo, 'whatever')
             if upload_all:
+                self.log_progress('Forcedly uploading all files.\n')
                 rq = { 'branch' : branch, 'files' : [], 'message': message }
                 for filename in sorted(files.keys()):
                     frq = { 'path' : filename, 'operation' : 'delete', 'sha' : files[filename]['sha'] }
