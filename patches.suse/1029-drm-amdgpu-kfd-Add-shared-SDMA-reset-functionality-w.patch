@@ -1,0 +1,182 @@
+From f33044952c24f85a1527f91440b89d4423840de2 Mon Sep 17 00:00:00 2001
+From: "Jesse.zhang@amd.com" <Jesse.zhang@amd.com>
+Date: Tue, 21 Jan 2025 09:18:44 +0800
+Subject: drm/amdgpu/kfd: Add shared SDMA reset functionality with callback
+ support
+Git-commit: f33044952c24f85a1527f91440b89d4423840de2
+Patch-mainline: v6.15-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+This patch introduces shared SDMA reset functionality between AMDGPU and KFD.
+The implementation includes the following key changes:
+
+1. Added `amdgpu_sdma_reset_queue`:
+   - Resets a specific SDMA queue by instance ID.
+   - Invokes registered pre-reset and post-reset callbacks to allow KFD and AMDGPU
+     to save/restore their state during the reset process.
+
+2. Added `amdgpu_set_on_reset_callbacks`:
+   - Allows KFD and AMDGPU to register callback functions for pre-reset and
+     post-reset operations.
+   - Callbacks are stored in a global linked list and invoked in the correct order
+     during SDMA reset.
+
+This patch ensures that both AMDGPU and KFD can handle SDMA reset events
+gracefully, with proper state saving and restoration. It also provides a flexible
+callback mechanism for future extensions.
+
+V2: fix CamelCase and put the SDMA helper into amdgpu_sdma.c (Alex)
+
+V3: rename the `amdgpu_register_on_reset_callbacks` function to
+      `amdgpu_sdma_register_on_reset_callbacks`
+    move global reset_callback_list to struct amdgpu_sdma (Alex)
+
+V4: Update the reset callback function description and
+   rename the reset function to amdgpu_sdma_reset_engine (Alex)
+
+Suggested-by: Alex Deucher <alexander.deucher@amd.com>
+Suggested-by: Jiadong Zhu <Jiadong.Zhu@amd.com>
+Signed-off-by: Jesse Zhang <jesse.zhang@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.c | 73 ++++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.h | 11 ++++
+ drivers/gpu/drm/amd/amdgpu/sdma_v4_4_2.c |  2 +-
+ 3 files changed, 85 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.c
+index 174badca27e7..fe39198307ec 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.c
+@@ -460,3 +460,76 @@ void amdgpu_sdma_sysfs_reset_mask_fini(struct amdgpu_device *adev)
+ 			device_remove_file(adev->dev, &dev_attr_sdma_reset_mask);
+ 	}
+ }
++
++/**
++ * amdgpu_sdma_register_on_reset_callbacks - Register SDMA reset callbacks
++ * @funcs: Pointer to the callback structure containing pre_reset and post_reset functions
++ *
++ * This function allows KFD and AMDGPU to register their own callbacks for handling
++ * pre-reset and post-reset operations for engine reset. These are needed because engine
++ * reset will stop all queues on that engine.
++ */
++void amdgpu_sdma_register_on_reset_callbacks(struct amdgpu_device *adev, struct sdma_on_reset_funcs *funcs)
++{
++	if (!funcs)
++		return;
++
++	/* Initialize the list node in the callback structure */
++	INIT_LIST_HEAD(&funcs->list);
++
++	/* Add the callback structure to the global list */
++	list_add_tail(&funcs->list, &adev->sdma.reset_callback_list);
++}
++
++/**
++ * amdgpu_sdma_reset_engine - Reset a specific SDMA engine
++ * @adev: Pointer to the AMDGPU device
++ * @instance_id: ID of the SDMA engine instance to reset
++ *
++ * This function performs the following steps:
++ * 1. Calls all registered pre_reset callbacks to allow KFD and AMDGPU to save their state.
++ * 2. Resets the specified SDMA engine instance.
++ * 3. Calls all registered post_reset callbacks to allow KFD and AMDGPU to restore their state.
++ *
++ * Returns: 0 on success, or a negative error code on failure.
++ */
++int amdgpu_sdma_reset_engine(struct amdgpu_device *adev, uint32_t instance_id)
++{
++	struct sdma_on_reset_funcs *funcs;
++	int ret;
++
++	/* Invoke all registered pre_reset callbacks */
++	list_for_each_entry(funcs, &adev->sdma.reset_callback_list, list) {
++		if (funcs->pre_reset) {
++			ret = funcs->pre_reset(adev, instance_id);
++			if (ret) {
++				dev_err(adev->dev,
++				"beforeReset callback failed for instance %u: %d\n",
++					instance_id, ret);
++				return ret;
++			}
++		}
++	}
++
++	/* Perform the SDMA reset for the specified instance */
++	ret = amdgpu_dpm_reset_sdma(adev, 1 << instance_id);
++	if (ret) {
++		dev_err(adev->dev, "Failed to reset SDMA instance %u\n", instance_id);
++		return ret;
++	}
++
++	/* Invoke all registered post_reset callbacks */
++	list_for_each_entry(funcs, &adev->sdma.reset_callback_list, list) {
++		if (funcs->post_reset) {
++			ret = funcs->post_reset(adev, instance_id);
++			if (ret) {
++				dev_err(adev->dev,
++				"afterReset callback failed for instance %u: %d\n",
++					instance_id, ret);
++				return ret;
++			}
++		}
++	}
++
++	return 0;
++}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.h
+index 5f60736051d1..f91d75848557 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.h
+@@ -98,6 +98,13 @@ struct amdgpu_sdma_ras {
+ 	struct amdgpu_ras_block_object ras_block;
+ };
+ 
++struct sdma_on_reset_funcs {
++	int (*pre_reset)(struct amdgpu_device *adev, uint32_t instance_id);
++	int (*post_reset)(struct amdgpu_device *adev, uint32_t instance_id);
++	/* Linked list node to store this structure in a list; */
++	struct list_head list;
++};
++
+ struct amdgpu_sdma {
+ 	struct amdgpu_sdma_instance instance[AMDGPU_MAX_SDMA_INSTANCES];
+ 	struct amdgpu_irq_src	trap_irq;
+@@ -118,6 +125,7 @@ struct amdgpu_sdma {
+ 	struct amdgpu_sdma_ras	*ras;
+ 	uint32_t		*ip_dump;
+ 	uint32_t 		supported_reset;
++	struct list_head	reset_callback_list;
+ };
+ 
+ /*
+@@ -157,6 +165,9 @@ struct amdgpu_buffer_funcs {
+ 				 uint32_t byte_count);
+ };
+ 
++void amdgpu_sdma_register_on_reset_callbacks(struct amdgpu_device *adev, struct sdma_on_reset_funcs *funcs);
++int amdgpu_sdma_reset_engine(struct amdgpu_device *adev, uint32_t instance_id);
++
+ #define amdgpu_emit_copy_buffer(adev, ib, s, d, b, t) (adev)->mman.buffer_funcs->emit_copy_buffer((ib),  (s), (d), (b), (t))
+ #define amdgpu_emit_fill_buffer(adev, ib, s, d, b) (adev)->mman.buffer_funcs->emit_fill_buffer((ib), (s), (d), (b))
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v4_4_2.c b/drivers/gpu/drm/amd/amdgpu/sdma_v4_4_2.c
+index 9925b183c07f..aab9e9fe0cb8 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v4_4_2.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v4_4_2.c
+@@ -1477,7 +1477,7 @@ static int sdma_v4_4_2_sw_init(struct amdgpu_ip_block *ip_block)
+ 	r = amdgpu_sdma_sysfs_reset_mask_init(adev);
+ 	if (r)
+ 		return r;
+-
++	INIT_LIST_HEAD(&adev->sdma.reset_callback_list);
+ 	return r;
+ }
+ 
+-- 
+2.52.0
+
