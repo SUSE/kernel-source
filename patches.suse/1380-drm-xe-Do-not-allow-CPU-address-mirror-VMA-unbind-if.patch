@@ -1,0 +1,123 @@
+From f0e4238f6d6c86feb2df425a4a77c04518a1e6ac Mon Sep 17 00:00:00 2001
+From: Matthew Brost <matthew.brost@intel.com>
+Date: Wed, 5 Mar 2025 17:26:42 -0800
+Subject: drm/xe: Do not allow CPU address mirror VMA unbind if
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: f0e4238f6d6c86feb2df425a4a77c04518a1e6ac
+Patch-mainline: v6.15-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+uAPI is designed with the use case that only mapping a BO to a malloc'd
+address will unbind a CPU-address mirror VMA. Therefore, allowing a
+CPU-address mirror VMA to unbind when the GPU has bindings in the range
+being unbound does not make much sense. This behavior is not supported,
+as it simplifies the code. This decision can always be revisited if a
+use case arises.
+
+V3: - s/arrises/arises (Thomas)
+ - s/system allocator/GPU address mirror (Thomas)
+ - Kernel doc (Thomas)
+ - Newline between function defs (Thomas)
+V5: - Kernel doc (Thomas)
+V6: - Only compile if CONFIG_DRM_GPUSVM selected (CI, Lucas)
+
+Signed-off-by: Matthew Brost <matthew.brost@intel.com>
+Reviewed-by: Himal Prasad Ghimiray <himal.prasad.ghimiray@intel.com>
+Reviewed-by: Thomas Hellström <thomas.hellstrom@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250306012657.3505757-18-matthew.brost@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/xe/xe_svm.c | 15 +++++++++++++++
+ drivers/gpu/drm/xe/xe_svm.h |  8 ++++++++
+ drivers/gpu/drm/xe/xe_vm.c  | 16 ++++++++++++++++
+ 3 files changed, 39 insertions(+)
+
+diff --git a/drivers/gpu/drm/xe/xe_svm.c b/drivers/gpu/drm/xe/xe_svm.c
+index a9d32cd69ae9..80076f4dc4b4 100644
+--- a/drivers/gpu/drm/xe/xe_svm.c
++++ b/drivers/gpu/drm/xe/xe_svm.c
+@@ -434,3 +434,18 @@ int xe_svm_handle_pagefault(struct xe_vm *vm, struct xe_vma *vma,
+ 
+ 	return err;
+ }
++
++/**
++ * xe_svm_has_mapping() - SVM has mappings
++ * @vm: The VM.
++ * @start: Start address.
++ * @end: End address.
++ *
++ * Check if an address range has SVM mappings.
++ *
++ * Return: True if address range has a SVM mapping, False otherwise
++ */
++bool xe_svm_has_mapping(struct xe_vm *vm, u64 start, u64 end)
++{
++	return drm_gpusvm_has_mapping(&vm->svm.gpusvm, start, end);
++}
+diff --git a/drivers/gpu/drm/xe/xe_svm.h b/drivers/gpu/drm/xe/xe_svm.h
+index 87cbda5641bb..35e044e492e0 100644
+--- a/drivers/gpu/drm/xe/xe_svm.h
++++ b/drivers/gpu/drm/xe/xe_svm.h
+@@ -57,6 +57,8 @@ void xe_svm_close(struct xe_vm *vm);
+ int xe_svm_handle_pagefault(struct xe_vm *vm, struct xe_vma *vma,
+ 			    struct xe_tile *tile, u64 fault_addr,
+ 			    bool atomic);
++
++bool xe_svm_has_mapping(struct xe_vm *vm, u64 start, u64 end);
+ #else
+ static inline bool xe_svm_range_pages_valid(struct xe_svm_range *range)
+ {
+@@ -86,6 +88,12 @@ int xe_svm_handle_pagefault(struct xe_vm *vm, struct xe_vma *vma,
+ {
+ 	return 0;
+ }
++
++static inline
++bool xe_svm_has_mapping(struct xe_vm *vm, u64 start, u64 end)
++{
++	return false;
++}
+ #endif
+ 
+ /**
+diff --git a/drivers/gpu/drm/xe/xe_vm.c b/drivers/gpu/drm/xe/xe_vm.c
+index 45b7db60371f..6f407b392c69 100644
+--- a/drivers/gpu/drm/xe/xe_vm.c
++++ b/drivers/gpu/drm/xe/xe_vm.c
+@@ -2483,6 +2483,17 @@ static int vm_bind_ioctl_ops_parse(struct xe_vm *vm, struct drm_gpuva_ops *ops,
+ 			struct xe_vma *old =
+ 				gpuva_to_vma(op->base.remap.unmap->va);
+ 			bool skip = xe_vma_is_cpu_addr_mirror(old);
++			u64 start = xe_vma_start(old), end = xe_vma_end(old);
++
++			if (op->base.remap.prev)
++				start = op->base.remap.prev->va.addr +
++					op->base.remap.prev->va.range;
++			if (op->base.remap.next)
++				end = op->base.remap.next->va.addr;
++
++			if (xe_vma_is_cpu_addr_mirror(old) &&
++			    xe_svm_has_mapping(vm, start, end))
++				return -EBUSY;
+ 
+ 			op->remap.start = xe_vma_start(old);
+ 			op->remap.range = xe_vma_size(old);
+@@ -2564,6 +2575,11 @@ static int vm_bind_ioctl_ops_parse(struct xe_vm *vm, struct drm_gpuva_ops *ops,
+ 		case DRM_GPUVA_OP_UNMAP:
+ 			vma = gpuva_to_vma(op->base.unmap.va);
+ 
++			if (xe_vma_is_cpu_addr_mirror(vma) &&
++			    xe_svm_has_mapping(vm, xe_vma_start(vma),
++					       xe_vma_end(vma)))
++				return -EBUSY;
++
+ 			if (!xe_vma_is_cpu_addr_mirror(vma))
+ 				xe_vma_ops_incr_pt_update_ops(vops, op->tile_mask);
+ 			break;
+-- 
+2.52.0
+
