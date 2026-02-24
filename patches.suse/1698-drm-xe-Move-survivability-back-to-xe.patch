@@ -1,0 +1,168 @@
+From caf2f15648ba6cb4c329465c5686c9864a081a71 Mon Sep 17 00:00:00 2001
+From: Lucas De Marchi <lucas.demarchi@intel.com>
+Date: Fri, 14 Mar 2025 06:48:58 -0700
+Subject: drm/xe: Move survivability back to xe
+Git-commit: caf2f15648ba6cb4c329465c5686c9864a081a71
+Patch-mainline: v6.15-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Commit d40f275d96e8 ("drm/xe: Move survivability entirely to xe_pci")
+moved the survivability handling to be done entirely in the xe_pci
+layer. However there are some issues with that approach:
+
+1) Survivability mode needs at least the mmio initialized, otherwise it
+   can't really read a register to decide if it should enter that state
+2) SR-IOV mode should be initialized, otherwise it's not possible to
+   check if it's VF
+
+Besides, as pointed by Riana the check for
+xe_survivability_mode_enable() was wrong in xe_pci_probe() since it's
+not a bool return.
+
+Fix that by moving the initialization to be entirely in the xe_device
+layer, with the correct dependencies handled: only after mmio and sriov
+initialization, and not triggering it on error from
+wait_for_lmem_ready(). This restores the trigger behavior before that
+commit. The xe_pci layer now only checks for "is it enabled?",
+like it's doing in xe_pci_suspend()/xe_pci_remove(), etc.
+
+Cc: Riana Tauro <riana.tauro@intel.com>
+Fixes: d40f275d96e8 ("drm/xe: Move survivability entirely to xe_pci")
+Reviewed-by: Riana Tauro <riana.tauro@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250314-fix-survivability-v5-1-fdb3559ea965@intel.com
+Signed-off-by: Lucas De Marchi <lucas.demarchi@intel.com>
+(cherry picked from commit 86b5e0dbba07438de91dd81095464c6c4aa7a372)
+
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/xe/xe_device.c             | 17 +++++++++++++++--
+ drivers/gpu/drm/xe/xe_pci.c                | 16 +++++++---------
+ drivers/gpu/drm/xe/xe_survivability_mode.c | 19 ++++++++++++-------
+ drivers/gpu/drm/xe/xe_survivability_mode.h |  1 -
+ 4 files changed, 34 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_device.c b/drivers/gpu/drm/xe/xe_device.c
+index 5d79b439dd62..00191227bc95 100644
+--- a/drivers/gpu/drm/xe/xe_device.c
++++ b/drivers/gpu/drm/xe/xe_device.c
+@@ -53,6 +53,7 @@
+ #include "xe_pxp.h"
+ #include "xe_query.h"
+ #include "xe_shrinker.h"
++#include "xe_survivability_mode.h"
+ #include "xe_sriov.h"
+ #include "xe_tile.h"
+ #include "xe_ttm_stolen_mgr.h"
+@@ -705,8 +706,20 @@ int xe_device_probe_early(struct xe_device *xe)
+ 	sriov_update_device_info(xe);
+ 
+ 	err = xe_pcode_probe_early(xe);
+-	if (err)
+-		return err;
++	if (err) {
++		int save_err = err;
++
++		/*
++		 * Try to leave device in survivability mode if device is
++		 * possible, but still return the previous error for error
++		 * propagation
++		 */
++		err = xe_survivability_mode_enable(xe);
++		if (err)
++			return err;
++
++		return save_err;
++	}
+ 
+ 	err = wait_for_lmem_ready(xe);
+ 	if (err)
+diff --git a/drivers/gpu/drm/xe/xe_pci.c b/drivers/gpu/drm/xe/xe_pci.c
+index da9679c8cf26..818f023166d5 100644
+--- a/drivers/gpu/drm/xe/xe_pci.c
++++ b/drivers/gpu/drm/xe/xe_pci.c
+@@ -803,16 +803,14 @@ static int xe_pci_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 		return err;
+ 
+ 	err = xe_device_probe_early(xe);
+-
+-	/*
+-	 * In Boot Survivability mode, no drm card is exposed and driver is
+-	 * loaded with bare minimum to allow for firmware to be flashed through
+-	 * mei. If early probe fails, check if survivability mode is flagged by
+-	 * HW to be enabled. In that case enable it and return success.
+-	 */
+ 	if (err) {
+-		if (xe_survivability_mode_required(xe) &&
+-		    xe_survivability_mode_enable(xe))
++		/*
++		 * In Boot Survivability mode, no drm card is exposed and driver
++		 * is loaded with bare minimum to allow for firmware to be
++		 * flashed through mei. If early probe failed, but it managed to
++		 * enable survivability mode, return success.
++		 */
++		if (xe_survivability_mode_is_enabled(xe))
+ 			return 0;
+ 
+ 		return err;
+diff --git a/drivers/gpu/drm/xe/xe_survivability_mode.c b/drivers/gpu/drm/xe/xe_survivability_mode.c
+index d939ce70e6fa..7b1ec643f0f0 100644
+--- a/drivers/gpu/drm/xe/xe_survivability_mode.c
++++ b/drivers/gpu/drm/xe/xe_survivability_mode.c
+@@ -178,15 +178,16 @@ bool xe_survivability_mode_is_enabled(struct xe_device *xe)
+ 	return xe->survivability.mode;
+ }
+ 
+-/**
+- * xe_survivability_mode_required - checks if survivability mode is required
+- * @xe: xe device instance
++/*
++ * survivability_mode_requested - check if it's possible to enable
++ * survivability mode and that was requested by firmware
+  *
+- * This function reads the boot status from Pcode
++ * This function reads the boot status from Pcode.
+  *
+- * Return: true if boot status indicates failure, false otherwise
++ * Return: true if platform support is available and boot status indicates
++ * failure, false otherwise.
+  */
+-bool xe_survivability_mode_required(struct xe_device *xe)
++static bool survivability_mode_requested(struct xe_device *xe)
+ {
+ 	struct xe_survivability *survivability = &xe->survivability;
+ 	struct xe_mmio *mmio = xe_root_tile_mmio(xe);
+@@ -208,7 +209,8 @@ bool xe_survivability_mode_required(struct xe_device *xe)
+  *
+  * Initialize survivability information and enable survivability mode
+  *
+- * Return: 0 for success, negative error code otherwise.
++ * Return: 0 if survivability mode is enabled or not requested; negative error
++ * code otherwise.
+  */
+ int xe_survivability_mode_enable(struct xe_device *xe)
+ {
+@@ -216,6 +218,9 @@ int xe_survivability_mode_enable(struct xe_device *xe)
+ 	struct xe_survivability_info *info;
+ 	struct pci_dev *pdev = to_pci_dev(xe->drm.dev);
+ 
++	if (!survivability_mode_requested(xe))
++		return 0;
++
+ 	survivability->size = MAX_SCRATCH_MMIO;
+ 
+ 	info = devm_kcalloc(xe->drm.dev, survivability->size, sizeof(*info),
+diff --git a/drivers/gpu/drm/xe/xe_survivability_mode.h b/drivers/gpu/drm/xe/xe_survivability_mode.h
+index f4df5f9025ce..d7e64885570d 100644
+--- a/drivers/gpu/drm/xe/xe_survivability_mode.h
++++ b/drivers/gpu/drm/xe/xe_survivability_mode.h
+@@ -12,6 +12,5 @@ struct xe_device;
+ 
+ int xe_survivability_mode_enable(struct xe_device *xe);
+ bool xe_survivability_mode_is_enabled(struct xe_device *xe);
+-bool xe_survivability_mode_required(struct xe_device *xe);
+ 
+ #endif /* _XE_SURVIVABILITY_MODE_H_ */
+-- 
+2.52.0
+
