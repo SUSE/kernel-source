@@ -1,0 +1,1659 @@
+From f98675638f0a818a2eb802103b1e140b091358c4 Mon Sep 17 00:00:00 2001
+From: Alex Deucher <alexander.deucher@amd.com>
+Date: Fri, 15 Nov 2024 17:44:01 -0500
+Subject: drm/amdgpu/vcn: switch vcn helpers to be instance based
+Git-commit: f98675638f0a818a2eb802103b1e140b091358c4
+Patch-mainline: v6.15-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Pass the instance to the helpers.
+
+Reviewed-by: Boyuan Zhang <Boyuan.Zhang@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c | 437 ++++++++++++------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.h |  12 +-
+ drivers/gpu/drm/amd/amdgpu/vcn_v1_0.c   |  16 +-
+ drivers/gpu/drm/amd/amdgpu/vcn_v2_0.c   |  16 +-
+ drivers/gpu/drm/amd/amdgpu/vcn_v2_5.c   |  71 ++--
+ drivers/gpu/drm/amd/amdgpu/vcn_v3_0.c   |  65 ++--
+ drivers/gpu/drm/amd/amdgpu/vcn_v4_0.c   |  69 ++--
+ drivers/gpu/drm/amd/amdgpu/vcn_v4_0_3.c |  70 ++--
+ drivers/gpu/drm/amd/amdgpu/vcn_v4_0_5.c |  63 ++--
+ drivers/gpu/drm/amd/amdgpu/vcn_v5_0_0.c |  67 ++--
+ drivers/gpu/drm/amd/amdgpu/vcn_v5_0_1.c |  64 ++--
+ 11 files changed, 541 insertions(+), 409 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c
+index 9901b8e17f30..010cc64a950a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c
+@@ -93,192 +93,186 @@ MODULE_FIRMWARE(FIRMWARE_VCN5_0_1);
+ 
+ static void amdgpu_vcn_idle_work_handler(struct work_struct *work);
+ 
+-int amdgpu_vcn_early_init(struct amdgpu_device *adev)
++int amdgpu_vcn_early_init(struct amdgpu_device *adev, int i)
+ {
+ 	char ucode_prefix[25];
+-	int r, i;
++	int r;
+ 
++	adev->vcn.inst[i].adev = adev;
++	adev->vcn.inst[i].inst = i;
+ 	amdgpu_ucode_ip_version_decode(adev, UVD_HWIP, ucode_prefix, sizeof(ucode_prefix));
+-	for (i = 0; i < adev->vcn.num_vcn_inst; i++) {
+-		adev->vcn.inst[i].adev = adev;
+-		adev->vcn.inst[i].inst = i;
+-
+-		if (i == 1 && amdgpu_ip_version(adev, UVD_HWIP, 0) ==  IP_VERSION(4, 0, 6))
+-			r = amdgpu_ucode_request(adev, &adev->vcn.inst[i].fw,
+-						 AMDGPU_UCODE_REQUIRED,
+-						 "amdgpu/%s_%d.bin", ucode_prefix, i);
+-		else
+-			r = amdgpu_ucode_request(adev, &adev->vcn.inst[i].fw,
+-						 AMDGPU_UCODE_REQUIRED,
+-						 "amdgpu/%s.bin", ucode_prefix);
+-		if (r) {
+-			amdgpu_ucode_release(&adev->vcn.inst[i].fw);
+-			return r;
+-		}
++
++	if (i == 1 && amdgpu_ip_version(adev, UVD_HWIP, 0) ==  IP_VERSION(4, 0, 6))
++		r = amdgpu_ucode_request(adev, &adev->vcn.inst[i].fw,
++					 AMDGPU_UCODE_REQUIRED,
++					 "amdgpu/%s_%d.bin", ucode_prefix, i);
++	else
++		r = amdgpu_ucode_request(adev, &adev->vcn.inst[i].fw,
++					 AMDGPU_UCODE_REQUIRED,
++					 "amdgpu/%s.bin", ucode_prefix);
++	if (r) {
++		amdgpu_ucode_release(&adev->vcn.inst[i].fw);
++		return r;
+ 	}
+ 	return r;
+ }
+ 
+-int amdgpu_vcn_sw_init(struct amdgpu_device *adev)
++int amdgpu_vcn_sw_init(struct amdgpu_device *adev, int i)
+ {
+ 	unsigned long bo_size;
+ 	const struct common_firmware_header *hdr;
+ 	unsigned char fw_check;
+ 	unsigned int fw_shared_size, log_offset;
+-	int i, r;
++	int r;
+ 
+-	for (i = 0; i < adev->vcn.num_vcn_inst; i++) {
+-		mutex_init(&adev->vcn.inst[i].vcn1_jpeg1_workaround);
+-		mutex_init(&adev->vcn.inst[i].vcn_pg_lock);
+-		atomic_set(&adev->vcn.inst[i].total_submission_cnt, 0);
+-		INIT_DELAYED_WORK(&adev->vcn.inst[i].idle_work, amdgpu_vcn_idle_work_handler);
+-		atomic_set(&adev->vcn.inst[i].dpg_enc_submission_cnt, 0);
+-		if ((adev->firmware.load_type == AMDGPU_FW_LOAD_PSP) &&
+-		    (adev->pg_flags & AMD_PG_SUPPORT_VCN_DPG))
+-			adev->vcn.inst[i].indirect_sram = true;
+-
+-		/*
+-		 * Some Steam Deck's BIOS versions are incompatible with the
+-		 * indirect SRAM mode, leading to amdgpu being unable to get
+-		 * properly probed (and even potentially crashing the kernel).
+-		 * Hence, check for these versions here - notice this is
+-		 * restricted to Vangogh (Deck's APU).
+-		 */
+-		if (amdgpu_ip_version(adev, UVD_HWIP, 0) == IP_VERSION(3, 0, 2)) {
+-			const char *bios_ver = dmi_get_system_info(DMI_BIOS_VERSION);
+-
+-			if (bios_ver && (!strncmp("F7A0113", bios_ver, 7) ||
+-					 !strncmp("F7A0114", bios_ver, 7))) {
+-				adev->vcn.inst[i].indirect_sram = false;
+-				dev_info(adev->dev,
+-					 "Steam Deck quirk: indirect SRAM disabled on BIOS %s\n", bios_ver);
+-			}
++	mutex_init(&adev->vcn.inst[i].vcn1_jpeg1_workaround);
++	mutex_init(&adev->vcn.inst[i].vcn_pg_lock);
++	atomic_set(&adev->vcn.inst[i].total_submission_cnt, 0);
++	INIT_DELAYED_WORK(&adev->vcn.inst[i].idle_work, amdgpu_vcn_idle_work_handler);
++	atomic_set(&adev->vcn.inst[i].dpg_enc_submission_cnt, 0);
++	if ((adev->firmware.load_type == AMDGPU_FW_LOAD_PSP) &&
++	    (adev->pg_flags & AMD_PG_SUPPORT_VCN_DPG))
++		adev->vcn.inst[i].indirect_sram = true;
++
++	/*
++	 * Some Steam Deck's BIOS versions are incompatible with the
++	 * indirect SRAM mode, leading to amdgpu being unable to get
++	 * properly probed (and even potentially crashing the kernel).
++	 * Hence, check for these versions here - notice this is
++	 * restricted to Vangogh (Deck's APU).
++	 */
++	if (amdgpu_ip_version(adev, UVD_HWIP, 0) == IP_VERSION(3, 0, 2)) {
++		const char *bios_ver = dmi_get_system_info(DMI_BIOS_VERSION);
++
++		if (bios_ver && (!strncmp("F7A0113", bios_ver, 7) ||
++				 !strncmp("F7A0114", bios_ver, 7))) {
++			adev->vcn.inst[i].indirect_sram = false;
++			dev_info(adev->dev,
++				 "Steam Deck quirk: indirect SRAM disabled on BIOS %s\n", bios_ver);
+ 		}
++	}
+ 
+-		/* from vcn4 and above, only unified queue is used */
+-		adev->vcn.inst[i].using_unified_queue =
+-			amdgpu_ip_version(adev, UVD_HWIP, 0) >= IP_VERSION(4, 0, 0);
++	/* from vcn4 and above, only unified queue is used */
++	adev->vcn.inst[i].using_unified_queue =
++		amdgpu_ip_version(adev, UVD_HWIP, 0) >= IP_VERSION(4, 0, 0);
++
++	hdr = (const struct common_firmware_header *)adev->vcn.inst[i].fw->data;
++	adev->vcn.inst[i].fw_version = le32_to_cpu(hdr->ucode_version);
++	adev->vcn.fw_version = le32_to_cpu(hdr->ucode_version);
++
++	/* Bit 20-23, it is encode major and non-zero for new naming convention.
++	 * This field is part of version minor and DRM_DISABLED_FLAG in old naming
++	 * convention. Since the l:wq!atest version minor is 0x5B and DRM_DISABLED_FLAG
++	 * is zero in old naming convention, this field is always zero so far.
++	 * These four bits are used to tell which naming convention is present.
++	 */
++	fw_check = (le32_to_cpu(hdr->ucode_version) >> 20) & 0xf;
++	if (fw_check) {
++		unsigned int dec_ver, enc_major, enc_minor, vep, fw_rev;
++
++		fw_rev = le32_to_cpu(hdr->ucode_version) & 0xfff;
++		enc_minor = (le32_to_cpu(hdr->ucode_version) >> 12) & 0xff;
++		enc_major = fw_check;
++		dec_ver = (le32_to_cpu(hdr->ucode_version) >> 24) & 0xf;
++		vep = (le32_to_cpu(hdr->ucode_version) >> 28) & 0xf;
++		DRM_INFO("Found VCN firmware Version ENC: %u.%u DEC: %u VEP: %u Revision: %u\n",
++			 enc_major, enc_minor, dec_ver, vep, fw_rev);
++	} else {
++		unsigned int version_major, version_minor, family_id;
+ 
+-		hdr = (const struct common_firmware_header *)adev->vcn.inst[i].fw->data;
+-		adev->vcn.inst[i].fw_version = le32_to_cpu(hdr->ucode_version);
+-		adev->vcn.fw_version = le32_to_cpu(hdr->ucode_version);
+-
+-		/* Bit 20-23, it is encode major and non-zero for new naming convention.
+-		 * This field is part of version minor and DRM_DISABLED_FLAG in old naming
+-		 * convention. Since the l:wq!atest version minor is 0x5B and DRM_DISABLED_FLAG
+-		 * is zero in old naming convention, this field is always zero so far.
+-		 * These four bits are used to tell which naming convention is present.
+-		 */
+-		fw_check = (le32_to_cpu(hdr->ucode_version) >> 20) & 0xf;
+-		if (fw_check) {
+-			unsigned int dec_ver, enc_major, enc_minor, vep, fw_rev;
+-
+-			fw_rev = le32_to_cpu(hdr->ucode_version) & 0xfff;
+-			enc_minor = (le32_to_cpu(hdr->ucode_version) >> 12) & 0xff;
+-			enc_major = fw_check;
+-			dec_ver = (le32_to_cpu(hdr->ucode_version) >> 24) & 0xf;
+-			vep = (le32_to_cpu(hdr->ucode_version) >> 28) & 0xf;
+-			DRM_INFO("Found VCN firmware Version ENC: %u.%u DEC: %u VEP: %u Revision: %u\n",
+-				 enc_major, enc_minor, dec_ver, vep, fw_rev);
+-		} else {
+-			unsigned int version_major, version_minor, family_id;
++		family_id = le32_to_cpu(hdr->ucode_version) & 0xff;
++		version_major = (le32_to_cpu(hdr->ucode_version) >> 24) & 0xff;
++		version_minor = (le32_to_cpu(hdr->ucode_version) >> 8) & 0xff;
++		DRM_INFO("Found VCN firmware Version: %u.%u Family ID: %u\n",
++			 version_major, version_minor, family_id);
++	}
+ 
+-			family_id = le32_to_cpu(hdr->ucode_version) & 0xff;
+-			version_major = (le32_to_cpu(hdr->ucode_version) >> 24) & 0xff;
+-			version_minor = (le32_to_cpu(hdr->ucode_version) >> 8) & 0xff;
+-			DRM_INFO("Found VCN firmware Version: %u.%u Family ID: %u\n",
+-				 version_major, version_minor, family_id);
+-		}
++	bo_size = AMDGPU_VCN_STACK_SIZE + AMDGPU_VCN_CONTEXT_SIZE;
++	if (adev->firmware.load_type != AMDGPU_FW_LOAD_PSP)
++		bo_size += AMDGPU_GPU_PAGE_ALIGN(le32_to_cpu(hdr->ucode_size_bytes) + 8);
+ 
+-		bo_size = AMDGPU_VCN_STACK_SIZE + AMDGPU_VCN_CONTEXT_SIZE;
+-		if (adev->firmware.load_type != AMDGPU_FW_LOAD_PSP)
+-			bo_size += AMDGPU_GPU_PAGE_ALIGN(le32_to_cpu(hdr->ucode_size_bytes) + 8);
++	if (amdgpu_ip_version(adev, UVD_HWIP, 0) >= IP_VERSION(5, 0, 0)) {
++		fw_shared_size = AMDGPU_GPU_PAGE_ALIGN(sizeof(struct amdgpu_vcn5_fw_shared));
++		log_offset = offsetof(struct amdgpu_vcn5_fw_shared, fw_log);
++	} else if (amdgpu_ip_version(adev, UVD_HWIP, 0) >= IP_VERSION(4, 0, 0)) {
++		fw_shared_size = AMDGPU_GPU_PAGE_ALIGN(sizeof(struct amdgpu_vcn4_fw_shared));
++		log_offset = offsetof(struct amdgpu_vcn4_fw_shared, fw_log);
++	} else {
++		fw_shared_size = AMDGPU_GPU_PAGE_ALIGN(sizeof(struct amdgpu_fw_shared));
++		log_offset = offsetof(struct amdgpu_fw_shared, fw_log);
++	}
+ 
+-		if (amdgpu_ip_version(adev, UVD_HWIP, 0) >= IP_VERSION(5, 0, 0)) {
+-			fw_shared_size = AMDGPU_GPU_PAGE_ALIGN(sizeof(struct amdgpu_vcn5_fw_shared));
+-			log_offset = offsetof(struct amdgpu_vcn5_fw_shared, fw_log);
+-		} else if (amdgpu_ip_version(adev, UVD_HWIP, 0) >= IP_VERSION(4, 0, 0)) {
+-			fw_shared_size = AMDGPU_GPU_PAGE_ALIGN(sizeof(struct amdgpu_vcn4_fw_shared));
+-			log_offset = offsetof(struct amdgpu_vcn4_fw_shared, fw_log);
+-		} else {
+-			fw_shared_size = AMDGPU_GPU_PAGE_ALIGN(sizeof(struct amdgpu_fw_shared));
+-			log_offset = offsetof(struct amdgpu_fw_shared, fw_log);
+-		}
++	bo_size += fw_shared_size;
++
++	if (amdgpu_vcnfw_log)
++		bo_size += AMDGPU_VCNFW_LOG_SIZE;
++
++	r = amdgpu_bo_create_kernel(adev, bo_size, PAGE_SIZE,
++				    AMDGPU_GEM_DOMAIN_VRAM |
++				    AMDGPU_GEM_DOMAIN_GTT,
++				    &adev->vcn.inst[i].vcpu_bo,
++				    &adev->vcn.inst[i].gpu_addr,
++				    &adev->vcn.inst[i].cpu_addr);
++	if (r) {
++		dev_err(adev->dev, "(%d) failed to allocate vcn bo\n", r);
++		return r;
++	}
+ 
+-		bo_size += fw_shared_size;
++	adev->vcn.inst[i].fw_shared.cpu_addr = adev->vcn.inst[i].cpu_addr +
++		bo_size - fw_shared_size;
++	adev->vcn.inst[i].fw_shared.gpu_addr = adev->vcn.inst[i].gpu_addr +
++		bo_size - fw_shared_size;
+ 
+-		if (amdgpu_vcnfw_log)
+-			bo_size += AMDGPU_VCNFW_LOG_SIZE;
++	adev->vcn.inst[i].fw_shared.mem_size = fw_shared_size;
+ 
+-		r = amdgpu_bo_create_kernel(adev, bo_size, PAGE_SIZE,
++	if (amdgpu_vcnfw_log) {
++		adev->vcn.inst[i].fw_shared.cpu_addr -= AMDGPU_VCNFW_LOG_SIZE;
++		adev->vcn.inst[i].fw_shared.gpu_addr -= AMDGPU_VCNFW_LOG_SIZE;
++		adev->vcn.inst[i].fw_shared.log_offset = log_offset;
++	}
++
++	if (adev->vcn.inst[i].indirect_sram) {
++		r = amdgpu_bo_create_kernel(adev, 64 * 2 * 4, PAGE_SIZE,
+ 					    AMDGPU_GEM_DOMAIN_VRAM |
+ 					    AMDGPU_GEM_DOMAIN_GTT,
+-					    &adev->vcn.inst[i].vcpu_bo,
+-					    &adev->vcn.inst[i].gpu_addr,
+-					    &adev->vcn.inst[i].cpu_addr);
++					    &adev->vcn.inst[i].dpg_sram_bo,
++					    &adev->vcn.inst[i].dpg_sram_gpu_addr,
++					    &adev->vcn.inst[i].dpg_sram_cpu_addr);
+ 		if (r) {
+-			dev_err(adev->dev, "(%d) failed to allocate vcn bo\n", r);
++			dev_err(adev->dev, "VCN %d (%d) failed to allocate DPG bo\n", i, r);
+ 			return r;
+ 		}
+-
+-		adev->vcn.inst[i].fw_shared.cpu_addr = adev->vcn.inst[i].cpu_addr +
+-				bo_size - fw_shared_size;
+-		adev->vcn.inst[i].fw_shared.gpu_addr = adev->vcn.inst[i].gpu_addr +
+-				bo_size - fw_shared_size;
+-
+-		adev->vcn.inst[i].fw_shared.mem_size = fw_shared_size;
+-
+-		if (amdgpu_vcnfw_log) {
+-			adev->vcn.inst[i].fw_shared.cpu_addr -= AMDGPU_VCNFW_LOG_SIZE;
+-			adev->vcn.inst[i].fw_shared.gpu_addr -= AMDGPU_VCNFW_LOG_SIZE;
+-			adev->vcn.inst[i].fw_shared.log_offset = log_offset;
+-		}
+-
+-		if (adev->vcn.inst[i].indirect_sram) {
+-			r = amdgpu_bo_create_kernel(adev, 64 * 2 * 4, PAGE_SIZE,
+-					AMDGPU_GEM_DOMAIN_VRAM |
+-					AMDGPU_GEM_DOMAIN_GTT,
+-					&adev->vcn.inst[i].dpg_sram_bo,
+-					&adev->vcn.inst[i].dpg_sram_gpu_addr,
+-					&adev->vcn.inst[i].dpg_sram_cpu_addr);
+-			if (r) {
+-				dev_err(adev->dev, "VCN %d (%d) failed to allocate DPG bo\n", i, r);
+-				return r;
+-			}
+-		}
+ 	}
+ 
+ 	return 0;
+ }
+ 
+-int amdgpu_vcn_sw_fini(struct amdgpu_device *adev)
++int amdgpu_vcn_sw_fini(struct amdgpu_device *adev, int i)
+ {
+-	int i, j;
++	int j;
+ 
+-	for (j = 0; j < adev->vcn.num_vcn_inst; ++j) {
+-		if (adev->vcn.harvest_config & (1 << j))
+-			continue;
++	if (adev->vcn.harvest_config & (1 << i))
++		return 0;
+ 
+-		amdgpu_bo_free_kernel(
+-			&adev->vcn.inst[j].dpg_sram_bo,
+-			&adev->vcn.inst[j].dpg_sram_gpu_addr,
+-			(void **)&adev->vcn.inst[j].dpg_sram_cpu_addr);
++	amdgpu_bo_free_kernel(
++		&adev->vcn.inst[i].dpg_sram_bo,
++		&adev->vcn.inst[i].dpg_sram_gpu_addr,
++		(void **)&adev->vcn.inst[i].dpg_sram_cpu_addr);
+ 
+-		kvfree(adev->vcn.inst[j].saved_bo);
++	kvfree(adev->vcn.inst[i].saved_bo);
+ 
+-		amdgpu_bo_free_kernel(&adev->vcn.inst[j].vcpu_bo,
+-					  &adev->vcn.inst[j].gpu_addr,
+-					  (void **)&adev->vcn.inst[j].cpu_addr);
++	amdgpu_bo_free_kernel(&adev->vcn.inst[i].vcpu_bo,
++			      &adev->vcn.inst[i].gpu_addr,
++			      (void **)&adev->vcn.inst[i].cpu_addr);
+ 
+-		amdgpu_ring_fini(&adev->vcn.inst[j].ring_dec);
++	amdgpu_ring_fini(&adev->vcn.inst[i].ring_dec);
+ 
+-		for (i = 0; i < adev->vcn.inst[j].num_enc_rings; ++i)
+-			amdgpu_ring_fini(&adev->vcn.inst[j].ring_enc[i]);
++	for (j = 0; j < adev->vcn.inst[i].num_enc_rings; ++j)
++		amdgpu_ring_fini(&adev->vcn.inst[i].ring_enc[j]);
+ 
+-		amdgpu_ucode_release(&adev->vcn.inst[j].fw);
+-		mutex_destroy(&adev->vcn.inst[j].vcn_pg_lock);
+-		mutex_destroy(&adev->vcn.inst[j].vcn1_jpeg1_workaround);
+-	}
++	amdgpu_ucode_release(&adev->vcn.inst[i].fw);
++	mutex_destroy(&adev->vcn.inst[i].vcn_pg_lock);
++	mutex_destroy(&adev->vcn.inst[i].vcn1_jpeg1_workaround);
+ 
+ 	return 0;
+ }
+@@ -298,91 +292,102 @@ bool amdgpu_vcn_is_disabled_vcn(struct amdgpu_device *adev, enum vcn_ring_type t
+ 	return ret;
+ }
+ 
+-int amdgpu_vcn_save_vcpu_bo(struct amdgpu_device *adev)
++static int amdgpu_vcn_save_vcpu_bo_inst(struct amdgpu_device *adev, int i)
+ {
+ 	unsigned int size;
+ 	void *ptr;
+-	int i, idx;
++	int idx;
+ 
+-	for (i = 0; i < adev->vcn.num_vcn_inst; ++i) {
+-		if (adev->vcn.harvest_config & (1 << i))
+-			continue;
+-		if (adev->vcn.inst[i].vcpu_bo == NULL)
+-			return 0;
++	if (adev->vcn.harvest_config & (1 << i))
++		return 0;
++	if (adev->vcn.inst[i].vcpu_bo == NULL)
++		return 0;
+ 
+-		size = amdgpu_bo_size(adev->vcn.inst[i].vcpu_bo);
+-		ptr = adev->vcn.inst[i].cpu_addr;
++	size = amdgpu_bo_size(adev->vcn.inst[i].vcpu_bo);
++	ptr = adev->vcn.inst[i].cpu_addr;
+ 
+-		adev->vcn.inst[i].saved_bo = kvmalloc(size, GFP_KERNEL);
+-		if (!adev->vcn.inst[i].saved_bo)
+-			return -ENOMEM;
++	adev->vcn.inst[i].saved_bo = kvmalloc(size, GFP_KERNEL);
++	if (!adev->vcn.inst[i].saved_bo)
++		return -ENOMEM;
+ 
+-		if (drm_dev_enter(adev_to_drm(adev), &idx)) {
+-			memcpy_fromio(adev->vcn.inst[i].saved_bo, ptr, size);
+-			drm_dev_exit(idx);
+-		}
++	if (drm_dev_enter(adev_to_drm(adev), &idx)) {
++		memcpy_fromio(adev->vcn.inst[i].saved_bo, ptr, size);
++		drm_dev_exit(idx);
++	}
++
++	return 0;
++}
++
++int amdgpu_vcn_save_vcpu_bo(struct amdgpu_device *adev)
++{
++	int ret, i;
++
++	for (i = 0; i < adev->vcn.num_vcn_inst; ++i) {
++		ret = amdgpu_vcn_save_vcpu_bo_inst(adev, i);
++		if (ret)
++			return ret;
+ 	}
+ 
+ 	return 0;
+ }
+ 
+-int amdgpu_vcn_suspend(struct amdgpu_device *adev)
++int amdgpu_vcn_suspend(struct amdgpu_device *adev, int i)
+ {
+ 	bool in_ras_intr = amdgpu_ras_intr_triggered();
+-	int i;
+ 
+-	for (i = 0; i < adev->vcn.num_vcn_inst; ++i)
+-		cancel_delayed_work_sync(&adev->vcn.inst[i].idle_work);
++	if (adev->vcn.harvest_config & (1 << i))
++		return 0;
++
++	cancel_delayed_work_sync(&adev->vcn.inst[i].idle_work);
+ 
+ 	/* err_event_athub will corrupt VCPU buffer, so we need to
+ 	 * restore fw data and clear buffer in amdgpu_vcn_resume() */
+ 	if (in_ras_intr)
+ 		return 0;
+ 
+-	return amdgpu_vcn_save_vcpu_bo(adev);
++	return amdgpu_vcn_save_vcpu_bo_inst(adev, i);
+ }
+ 
+-int amdgpu_vcn_resume(struct amdgpu_device *adev)
++int amdgpu_vcn_resume(struct amdgpu_device *adev, int i)
+ {
+ 	unsigned int size;
+ 	void *ptr;
+-	int i, idx;
++	int idx;
+ 
+-	for (i = 0; i < adev->vcn.num_vcn_inst; ++i) {
+-		if (adev->vcn.harvest_config & (1 << i))
+-			continue;
+-		if (adev->vcn.inst[i].vcpu_bo == NULL)
+-			return -EINVAL;
++	if (adev->vcn.harvest_config & (1 << i))
++		return 0;
++	if (adev->vcn.inst[i].vcpu_bo == NULL)
++		return -EINVAL;
++
++	size = amdgpu_bo_size(adev->vcn.inst[i].vcpu_bo);
++	ptr = adev->vcn.inst[i].cpu_addr;
+ 
+-		size = amdgpu_bo_size(adev->vcn.inst[i].vcpu_bo);
+-		ptr = adev->vcn.inst[i].cpu_addr;
++	if (adev->vcn.inst[i].saved_bo != NULL) {
++		if (drm_dev_enter(adev_to_drm(adev), &idx)) {
++			memcpy_toio(ptr, adev->vcn.inst[i].saved_bo, size);
++			drm_dev_exit(idx);
++		}
++		kvfree(adev->vcn.inst[i].saved_bo);
++		adev->vcn.inst[i].saved_bo = NULL;
++	} else {
++		const struct common_firmware_header *hdr;
++		unsigned int offset;
+ 
+-		if (adev->vcn.inst[i].saved_bo != NULL) {
++		hdr = (const struct common_firmware_header *)adev->vcn.inst[i].fw->data;
++		if (adev->firmware.load_type != AMDGPU_FW_LOAD_PSP) {
++			offset = le32_to_cpu(hdr->ucode_array_offset_bytes);
+ 			if (drm_dev_enter(adev_to_drm(adev), &idx)) {
+-				memcpy_toio(ptr, adev->vcn.inst[i].saved_bo, size);
++				memcpy_toio(adev->vcn.inst[i].cpu_addr,
++					    adev->vcn.inst[i].fw->data + offset,
++					    le32_to_cpu(hdr->ucode_size_bytes));
+ 				drm_dev_exit(idx);
+ 			}
+-			kvfree(adev->vcn.inst[i].saved_bo);
+-			adev->vcn.inst[i].saved_bo = NULL;
+-		} else {
+-			const struct common_firmware_header *hdr;
+-			unsigned int offset;
+-
+-			hdr = (const struct common_firmware_header *)adev->vcn.inst[i].fw->data;
+-			if (adev->firmware.load_type != AMDGPU_FW_LOAD_PSP) {
+-				offset = le32_to_cpu(hdr->ucode_array_offset_bytes);
+-				if (drm_dev_enter(adev_to_drm(adev), &idx)) {
+-					memcpy_toio(adev->vcn.inst[i].cpu_addr,
+-						    adev->vcn.inst[i].fw->data + offset,
+-						    le32_to_cpu(hdr->ucode_size_bytes));
+-					drm_dev_exit(idx);
+-				}
+-				size -= le32_to_cpu(hdr->ucode_size_bytes);
+-				ptr += le32_to_cpu(hdr->ucode_size_bytes);
+-			}
+-			memset_io(ptr, 0, size);
++			size -= le32_to_cpu(hdr->ucode_size_bytes);
++			ptr += le32_to_cpu(hdr->ucode_size_bytes);
+ 		}
++		memset_io(ptr, 0, size);
+ 	}
++
+ 	return 0;
+ }
+ 
+@@ -1058,36 +1063,32 @@ enum amdgpu_ring_priority_level amdgpu_vcn_get_enc_ring_prio(int ring)
+ 	}
+ }
+ 
+-void amdgpu_vcn_setup_ucode(struct amdgpu_device *adev)
++void amdgpu_vcn_setup_ucode(struct amdgpu_device *adev, int i)
+ {
+-	int i;
+ 	unsigned int idx;
+ 
+ 	if (adev->firmware.load_type == AMDGPU_FW_LOAD_PSP) {
+ 		const struct common_firmware_header *hdr;
+ 
+-		for (i = 0; i < adev->vcn.num_vcn_inst; i++) {
+-			if (adev->vcn.harvest_config & (1 << i))
+-				continue;
++		if (adev->vcn.harvest_config & (1 << i))
++			return;
+ 
+-			hdr = (const struct common_firmware_header *)adev->vcn.inst[i].fw->data;
+-			/* currently only support 2 FW instances */
+-			if (i >= 2) {
+-				dev_info(adev->dev, "More then 2 VCN FW instances!\n");
+-				break;
+-			}
+-			idx = AMDGPU_UCODE_ID_VCN + i;
+-			adev->firmware.ucode[idx].ucode_id = idx;
+-			adev->firmware.ucode[idx].fw = adev->vcn.inst[i].fw;
+-			adev->firmware.fw_size +=
+-				ALIGN(le32_to_cpu(hdr->ucode_size_bytes), PAGE_SIZE);
+-
+-			if (amdgpu_ip_version(adev, UVD_HWIP, 0) ==
+-			    IP_VERSION(4, 0, 3) ||
+-			    amdgpu_ip_version(adev, UVD_HWIP, 0) ==
+-			    IP_VERSION(5, 0, 1))
+-				break;
++		if ((amdgpu_ip_version(adev, UVD_HWIP, 0) == IP_VERSION(4, 0, 3) ||
++		     amdgpu_ip_version(adev, UVD_HWIP, 0) == IP_VERSION(5, 0, 1))
++		    && (i > 0))
++			return;
++
++		hdr = (const struct common_firmware_header *)adev->vcn.inst[i].fw->data;
++		/* currently only support 2 FW instances */
++		if (i >= 2) {
++			dev_info(adev->dev, "More then 2 VCN FW instances!\n");
++			return;
+ 		}
++		idx = AMDGPU_UCODE_ID_VCN + i;
++		adev->firmware.ucode[idx].ucode_id = idx;
++		adev->firmware.ucode[idx].fw = adev->vcn.inst[i].fw;
++		adev->firmware.fw_size +=
++			ALIGN(le32_to_cpu(hdr->ucode_size_bytes), PAGE_SIZE);
+ 	}
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.h
+index 3b059f51894b..5f92cf28cc75 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.h
+@@ -503,11 +503,11 @@ enum vcn_ring_type {
+ 	VCN_UNIFIED_RING,
+ };
+ 
+-int amdgpu_vcn_early_init(struct amdgpu_device *adev);
+-int amdgpu_vcn_sw_init(struct amdgpu_device *adev);
+-int amdgpu_vcn_sw_fini(struct amdgpu_device *adev);
+-int amdgpu_vcn_suspend(struct amdgpu_device *adev);
+-int amdgpu_vcn_resume(struct amdgpu_device *adev);
++int amdgpu_vcn_early_init(struct amdgpu_device *adev, int i);
++int amdgpu_vcn_sw_init(struct amdgpu_device *adev, int i);
++int amdgpu_vcn_sw_fini(struct amdgpu_device *adev, int i);
++int amdgpu_vcn_suspend(struct amdgpu_device *adev, int i);
++int amdgpu_vcn_resume(struct amdgpu_device *adev, int i);
+ void amdgpu_vcn_ring_begin_use(struct amdgpu_ring *ring);
+ void amdgpu_vcn_ring_end_use(struct amdgpu_ring *ring);
+ 
+@@ -525,7 +525,7 @@ int amdgpu_vcn_enc_ring_test_ib(struct amdgpu_ring *ring, long timeout);
+ 
+ enum amdgpu_ring_priority_level amdgpu_vcn_get_enc_ring_prio(int ring);
+ 
+-void amdgpu_vcn_setup_ucode(struct amdgpu_device *adev);
++void amdgpu_vcn_setup_ucode(struct amdgpu_device *adev, int i);
+ 
+ void amdgpu_vcn_fwlog_init(struct amdgpu_vcn_inst *vcn);
+ void amdgpu_debugfs_vcn_fwlog_init(struct amdgpu_device *adev,
+diff --git a/drivers/gpu/drm/amd/amdgpu/vcn_v1_0.c b/drivers/gpu/drm/amd/amdgpu/vcn_v1_0.c
+index edbcd0819d17..49542d947727 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vcn_v1_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/vcn_v1_0.c
+@@ -113,7 +113,7 @@ static int vcn_v1_0_early_init(struct amdgpu_ip_block *ip_block)
+ 
+ 	jpeg_v1_0_early_init(ip_block);
+ 
+-	return amdgpu_vcn_early_init(adev);
++	return amdgpu_vcn_early_init(adev, 0);
+ }
+ 
+ /**
+@@ -145,16 +145,16 @@ static int vcn_v1_0_sw_init(struct amdgpu_ip_block *ip_block)
+ 			return r;
+ 	}
+ 
+-	r = amdgpu_vcn_sw_init(adev);
++	r = amdgpu_vcn_sw_init(adev, 0);
+ 	if (r)
+ 		return r;
+ 
+ 	/* Override the work func */
+ 	adev->vcn.inst[0].idle_work.work.func = vcn_v1_0_idle_work_handler;
+ 
+-	amdgpu_vcn_setup_ucode(adev);
++	amdgpu_vcn_setup_ucode(adev, 0);
+ 
+-	r = amdgpu_vcn_resume(adev);
++	r = amdgpu_vcn_resume(adev, 0);
+ 	if (r)
+ 		return r;
+ 
+@@ -223,13 +223,13 @@ static int vcn_v1_0_sw_fini(struct amdgpu_ip_block *ip_block)
+ 	int r;
+ 	struct amdgpu_device *adev = ip_block->adev;
+ 
+-	r = amdgpu_vcn_suspend(adev);
++	r = amdgpu_vcn_suspend(adev, 0);
+ 	if (r)
+ 		return r;
+ 
+ 	jpeg_v1_0_sw_fini(ip_block);
+ 
+-	r = amdgpu_vcn_sw_fini(adev);
++	r = amdgpu_vcn_sw_fini(adev, 0);
+ 
+ 	kfree(adev->vcn.ip_dump);
+ 
+@@ -311,7 +311,7 @@ static int vcn_v1_0_suspend(struct amdgpu_ip_block *ip_block)
+ 	if (r)
+ 		return r;
+ 
+-	r = amdgpu_vcn_suspend(adev);
++	r = amdgpu_vcn_suspend(adev, 0);
+ 
+ 	return r;
+ }
+@@ -327,7 +327,7 @@ static int vcn_v1_0_resume(struct amdgpu_ip_block *ip_block)
+ {
+ 	int r;
+ 
+-	r = amdgpu_vcn_resume(ip_block->adev);
++	r = amdgpu_vcn_resume(ip_block->adev, 0);
+ 	if (r)
+ 		return r;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/vcn_v2_0.c b/drivers/gpu/drm/amd/amdgpu/vcn_v2_0.c
+index d94fd075a910..5f537d2a5618 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vcn_v2_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/vcn_v2_0.c
+@@ -118,7 +118,7 @@ static int vcn_v2_0_early_init(struct amdgpu_ip_block *ip_block)
+ 	vcn_v2_0_set_enc_ring_funcs(adev);
+ 	vcn_v2_0_set_irq_funcs(adev);
+ 
+-	return amdgpu_vcn_early_init(adev);
++	return amdgpu_vcn_early_init(adev, 0);
+ }
+ 
+ /**
+@@ -153,13 +153,13 @@ static int vcn_v2_0_sw_init(struct amdgpu_ip_block *ip_block)
+ 			return r;
+ 	}
+ 
+-	r = amdgpu_vcn_sw_init(adev);
++	r = amdgpu_vcn_sw_init(adev, 0);
+ 	if (r)
+ 		return r;
+ 
+-	amdgpu_vcn_setup_ucode(adev);
++	amdgpu_vcn_setup_ucode(adev, 0);
+ 
+-	r = amdgpu_vcn_resume(adev);
++	r = amdgpu_vcn_resume(adev, 0);
+ 	if (r)
+ 		return r;
+ 
+@@ -254,11 +254,11 @@ static int vcn_v2_0_sw_fini(struct amdgpu_ip_block *ip_block)
+ 
+ 	amdgpu_virt_free_mm_table(adev);
+ 
+-	r = amdgpu_vcn_suspend(adev);
++	r = amdgpu_vcn_suspend(adev, 0);
+ 	if (r)
+ 		return r;
+ 
+-	r = amdgpu_vcn_sw_fini(adev);
++	r = amdgpu_vcn_sw_fini(adev, 0);
+ 
+ 	kfree(adev->vcn.ip_dump);
+ 
+@@ -338,7 +338,7 @@ static int vcn_v2_0_suspend(struct amdgpu_ip_block *ip_block)
+ 	if (r)
+ 		return r;
+ 
+-	r = amdgpu_vcn_suspend(ip_block->adev);
++	r = amdgpu_vcn_suspend(ip_block->adev, 0);
+ 
+ 	return r;
+ }
+@@ -354,7 +354,7 @@ static int vcn_v2_0_resume(struct amdgpu_ip_block *ip_block)
+ {
+ 	int r;
+ 
+-	r = amdgpu_vcn_resume(ip_block->adev);
++	r = amdgpu_vcn_resume(ip_block->adev, 0);
+ 	if (r)
+ 		return r;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/vcn_v2_5.c b/drivers/gpu/drm/amd/amdgpu/vcn_v2_5.c
+index c20619c027e7..3ee00dc6d533 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vcn_v2_5.c
++++ b/drivers/gpu/drm/amd/amdgpu/vcn_v2_5.c
+@@ -121,7 +121,7 @@ static int amdgpu_ih_clientid_vcns[] = {
+ static int vcn_v2_5_early_init(struct amdgpu_ip_block *ip_block)
+ {
+ 	struct amdgpu_device *adev = ip_block->adev;
+-	int i;
++	int i, r;
+ 
+ 	if (amdgpu_sriov_vf(adev)) {
+ 		adev->vcn.num_vcn_inst = 2;
+@@ -139,7 +139,7 @@ static int vcn_v2_5_early_init(struct amdgpu_ip_block *ip_block)
+ 			adev->vcn.inst[i].num_enc_rings = 2;
+ 		}
+ 		if (adev->vcn.harvest_config == (AMDGPU_VCN_HARVEST_VCN0 |
+-					AMDGPU_VCN_HARVEST_VCN1))
++						 AMDGPU_VCN_HARVEST_VCN1))
+ 			/* both instances are harvested, disable the block */
+ 			return -ENOENT;
+ 	}
+@@ -149,7 +149,13 @@ static int vcn_v2_5_early_init(struct amdgpu_ip_block *ip_block)
+ 	vcn_v2_5_set_irq_funcs(adev);
+ 	vcn_v2_5_set_ras_funcs(adev);
+ 
+-	return amdgpu_vcn_early_init(adev);
++	for (i = 0; i < adev->vcn.num_vcn_inst; i++) {
++		r = amdgpu_vcn_early_init(adev, i);
++		if (r)
++			return r;
++	}
++
++	return 0;
+ }
+ 
+ /**
+@@ -168,6 +174,8 @@ static int vcn_v2_5_sw_init(struct amdgpu_ip_block *ip_block)
+ 	struct amdgpu_device *adev = ip_block->adev;
+ 
+ 	for (j = 0; j < adev->vcn.num_vcn_inst; j++) {
++		volatile struct amdgpu_fw_shared *fw_shared;
++
+ 		if (adev->vcn.harvest_config & (1 << j))
+ 			continue;
+ 		/* VCN DEC TRAP */
+@@ -189,23 +197,17 @@ static int vcn_v2_5_sw_init(struct amdgpu_ip_block *ip_block)
+ 			VCN_2_6__SRCID_UVD_POISON, &adev->vcn.inst[j].ras_poison_irq);
+ 		if (r)
+ 			return r;
+-	}
+-
+-	r = amdgpu_vcn_sw_init(adev);
+-	if (r)
+-		return r;
+ 
+-	amdgpu_vcn_setup_ucode(adev);
++		r = amdgpu_vcn_sw_init(adev, j);
++		if (r)
++			return r;
+ 
+-	r = amdgpu_vcn_resume(adev);
+-	if (r)
+-		return r;
++		amdgpu_vcn_setup_ucode(adev, j);
+ 
+-	for (j = 0; j < adev->vcn.num_vcn_inst; j++) {
+-		volatile struct amdgpu_fw_shared *fw_shared;
++		r = amdgpu_vcn_resume(adev, j);
++		if (r)
++			return r;
+ 
+-		if (adev->vcn.harvest_config & (1 << j))
+-			continue;
+ 		adev->vcn.inst[j].internal.context_id = mmUVD_CONTEXT_ID_INTERNAL_OFFSET;
+ 		adev->vcn.inst[j].internal.ib_vmid = mmUVD_LMI_RBC_IB_VMID_INTERNAL_OFFSET;
+ 		adev->vcn.inst[j].internal.ib_bar_low = mmUVD_LMI_RBC_IB_64BIT_BAR_LOW_INTERNAL_OFFSET;
+@@ -323,15 +325,18 @@ static int vcn_v2_5_sw_fini(struct amdgpu_ip_block *ip_block)
+ 	if (amdgpu_sriov_vf(adev))
+ 		amdgpu_virt_free_mm_table(adev);
+ 
+-	r = amdgpu_vcn_suspend(adev);
+-	if (r)
+-		return r;
+-
+-	r = amdgpu_vcn_sw_fini(adev);
++	for (i = 0; i < adev->vcn.num_vcn_inst; i++) {
++		r = amdgpu_vcn_suspend(adev, i);
++		if (r)
++			return r;
++		r = amdgpu_vcn_sw_fini(adev, i);
++		if (r)
++			return r;
++	}
+ 
+ 	kfree(adev->vcn.ip_dump);
+ 
+-	return r;
++	return 0;
+ }
+ 
+ /**
+@@ -421,15 +426,20 @@ static int vcn_v2_5_hw_fini(struct amdgpu_ip_block *ip_block)
+  */
+ static int vcn_v2_5_suspend(struct amdgpu_ip_block *ip_block)
+ {
+-	int r;
++	struct amdgpu_device *adev = ip_block->adev;
++	int r, i;
+ 
+ 	r = vcn_v2_5_hw_fini(ip_block);
+ 	if (r)
+ 		return r;
+ 
+-	r = amdgpu_vcn_suspend(ip_block->adev);
++	for (i = 0; i < adev->vcn.num_vcn_inst; i++) {
++		r = amdgpu_vcn_suspend(ip_block->adev, i);
++		if (r)
++			return r;
++	}
+ 
+-	return r;
++	return 0;
+ }
+ 
+ /**
+@@ -441,11 +451,14 @@ static int vcn_v2_5_suspend(struct amdgpu_ip_block *ip_block)
+  */
+ static int vcn_v2_5_resume(struct amdgpu_ip_block *ip_block)
+ {
+-	int r;
++	struct amdgpu_device *adev = ip_block->adev;
++	int r, i;
+ 
+-	r = amdgpu_vcn_resume(ip_block->adev);
+-	if (r)
+-		return r;
++	for (i = 0; i < adev->vcn.num_vcn_inst; i++) {
++		r = amdgpu_vcn_resume(ip_block->adev, i);
++		if (r)
++			return r;
++	}
+ 
+ 	r = vcn_v2_5_hw_init(ip_block);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/vcn_v3_0.c b/drivers/gpu/drm/amd/amdgpu/vcn_v3_0.c
+index 282a186cb0c5..6052e963fcab 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vcn_v3_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/vcn_v3_0.c
+@@ -127,7 +127,7 @@ static void vcn_v3_0_enc_ring_set_wptr(struct amdgpu_ring *ring);
+ static int vcn_v3_0_early_init(struct amdgpu_ip_block *ip_block)
+ {
+ 	struct amdgpu_device *adev = ip_block->adev;
+-	int i;
++	int i, r;
+ 
+ 	if (amdgpu_sriov_vf(adev)) {
+ 		adev->vcn.num_vcn_inst = VCN_INSTANCES_SIENNA_CICHLID;
+@@ -154,7 +154,12 @@ static int vcn_v3_0_early_init(struct amdgpu_ip_block *ip_block)
+ 	vcn_v3_0_set_enc_ring_funcs(adev);
+ 	vcn_v3_0_set_irq_funcs(adev);
+ 
+-	return amdgpu_vcn_early_init(adev);
++	for (i = 0; i < adev->vcn.num_vcn_inst; i++) {
++		r = amdgpu_vcn_early_init(adev, i);
++		if (r)
++			return r;
++	}
++	return 0;
+ }
+ 
+ /**
+@@ -173,16 +178,6 @@ static int vcn_v3_0_sw_init(struct amdgpu_ip_block *ip_block)
+ 	uint32_t *ptr;
+ 	struct amdgpu_device *adev = ip_block->adev;
+ 
+-	r = amdgpu_vcn_sw_init(adev);
+-	if (r)
+-		return r;
+-
+-	amdgpu_vcn_setup_ucode(adev);
+-
+-	r = amdgpu_vcn_resume(adev);
+-	if (r)
+-		return r;
+-
+ 	/*
+ 	 * Note: doorbell assignment is fixed for SRIOV multiple VCN engines
+ 	 * Formula:
+@@ -202,6 +197,16 @@ static int vcn_v3_0_sw_init(struct amdgpu_ip_block *ip_block)
+ 		if (adev->vcn.harvest_config & (1 << i))
+ 			continue;
+ 
++		r = amdgpu_vcn_sw_init(adev, i);
++		if (r)
++			return r;
++
++		amdgpu_vcn_setup_ucode(adev, i);
++
++		r = amdgpu_vcn_resume(adev, i);
++		if (r)
++			return r;
++
+ 		adev->vcn.inst[i].internal.context_id = mmUVD_CONTEXT_ID_INTERNAL_OFFSET;
+ 		adev->vcn.inst[i].internal.ib_vmid = mmUVD_LMI_RBC_IB_VMID_INTERNAL_OFFSET;
+ 		adev->vcn.inst[i].internal.ib_bar_low = mmUVD_LMI_RBC_IB_64BIT_BAR_LOW_INTERNAL_OFFSET;
+@@ -333,14 +338,18 @@ static int vcn_v3_0_sw_fini(struct amdgpu_ip_block *ip_block)
+ 	if (amdgpu_sriov_vf(adev))
+ 		amdgpu_virt_free_mm_table(adev);
+ 
+-	r = amdgpu_vcn_suspend(adev);
+-	if (r)
+-		return r;
++	for (i = 0; i < adev->vcn.num_vcn_inst; i++) {
++		r = amdgpu_vcn_suspend(adev, i);
++		if (r)
++			return r;
+ 
+-	r = amdgpu_vcn_sw_fini(adev);
++		r = amdgpu_vcn_sw_fini(adev, i);
++		if (r)
++			return r;
++	}
+ 
+ 	kfree(adev->vcn.ip_dump);
+-	return r;
++	return 0;
+ }
+ 
+ /**
+@@ -459,15 +468,20 @@ static int vcn_v3_0_hw_fini(struct amdgpu_ip_block *ip_block)
+  */
+ static int vcn_v3_0_suspend(struct amdgpu_ip_block *ip_block)
+ {
+-	int r;
++	struct amdgpu_device *adev = ip_block->adev;
++	int r, i;
+ 
+ 	r = vcn_v3_0_hw_fini(ip_block);
+ 	if (r)
+ 		return r;
+ 
+-	r = amdgpu_vcn_suspend(ip_block->adev);
++	for (i = 0; i < adev->vcn.num_vcn_inst; i++) {
++		r = amdgpu_vcn_suspend(ip_block->adev, i);
++		if (r)
++			return r;
++	}
+ 
+-	return r;
++	return 0;
+ }
+ 
+ /**
+@@ -479,11 +493,14 @@ static int vcn_v3_0_suspend(struct amdgpu_ip_block *ip_block)
+  */
+ static int vcn_v3_0_resume(struct amdgpu_ip_block *ip_block)
+ {
+-	int r;
++	struct amdgpu_device *adev = ip_block->adev;
++	int r, i;
+ 
+-	r = amdgpu_vcn_resume(ip_block->adev);
+-	if (r)
+-		return r;
++	for (i = 0; i < adev->vcn.num_vcn_inst; i++) {
++		r = amdgpu_vcn_resume(ip_block->adev, i);
++		if (r)
++			return r;
++	}
+ 
+ 	r = vcn_v3_0_hw_init(ip_block);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/vcn_v4_0.c b/drivers/gpu/drm/amd/amdgpu/vcn_v4_0.c
+index f5bb241c1af1..8c7566960a3b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vcn_v4_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/vcn_v4_0.c
+@@ -117,7 +117,7 @@ static void vcn_v4_0_set_ras_funcs(struct amdgpu_device *adev);
+ static int vcn_v4_0_early_init(struct amdgpu_ip_block *ip_block)
+ {
+ 	struct amdgpu_device *adev = ip_block->adev;
+-	int i;
++	int i, r;
+ 
+ 	if (amdgpu_sriov_vf(adev)) {
+ 		adev->vcn.harvest_config = VCN_HARVEST_MMSCH;
+@@ -137,7 +137,13 @@ static int vcn_v4_0_early_init(struct amdgpu_ip_block *ip_block)
+ 	vcn_v4_0_set_irq_funcs(adev);
+ 	vcn_v4_0_set_ras_funcs(adev);
+ 
+-	return amdgpu_vcn_early_init(adev);
++	for (i = 0; i < adev->vcn.num_vcn_inst; ++i) {
++		r = amdgpu_vcn_early_init(adev, i);
++		if (r)
++			return r;
++	}
++
++	return 0;
+ }
+ 
+ static int vcn_v4_0_fw_shared_init(struct amdgpu_device *adev, int inst_idx)
+@@ -180,20 +186,20 @@ static int vcn_v4_0_sw_init(struct amdgpu_ip_block *ip_block)
+ 	uint32_t reg_count = ARRAY_SIZE(vcn_reg_list_4_0);
+ 	uint32_t *ptr;
+ 
+-	r = amdgpu_vcn_sw_init(adev);
+-	if (r)
+-		return r;
+-
+-	amdgpu_vcn_setup_ucode(adev);
+-
+-	r = amdgpu_vcn_resume(adev);
+-	if (r)
+-		return r;
+-
+ 	for (i = 0; i < adev->vcn.num_vcn_inst; i++) {
+ 		if (adev->vcn.harvest_config & (1 << i))
+ 			continue;
+ 
++		r = amdgpu_vcn_sw_init(adev, i);
++		if (r)
++			return r;
++
++		amdgpu_vcn_setup_ucode(adev, i);
++
++		r = amdgpu_vcn_resume(adev, i);
++		if (r)
++			return r;
++
+ 		/* Init instance 0 sched_score to 1, so it's scheduled after other instances */
+ 		if (i == 0)
+ 			atomic_set(&adev->vcn.inst[i].sched_score, 1);
+@@ -294,16 +300,23 @@ static int vcn_v4_0_sw_fini(struct amdgpu_ip_block *ip_block)
+ 	if (amdgpu_sriov_vf(adev))
+ 		amdgpu_virt_free_mm_table(adev);
+ 
+-	r = amdgpu_vcn_suspend(adev);
+-	if (r)
+-		return r;
++	for (i = 0; i < adev->vcn.num_vcn_inst; i++) {
++		r = amdgpu_vcn_suspend(adev, i);
++		if (r)
++			return r;
++	}
+ 
+ 	amdgpu_vcn_sysfs_reset_mask_fini(adev);
+-	r = amdgpu_vcn_sw_fini(adev);
++
++	for (i = 0; i < adev->vcn.num_vcn_inst; i++) {
++		r = amdgpu_vcn_sw_fini(adev, i);
++		if (r)
++			return r;
++	}
+ 
+ 	kfree(adev->vcn.ip_dump);
+ 
+-	return r;
++	return 0;
+ }
+ 
+ /**
+@@ -394,15 +407,20 @@ static int vcn_v4_0_hw_fini(struct amdgpu_ip_block *ip_block)
+  */
+ static int vcn_v4_0_suspend(struct amdgpu_ip_block *ip_block)
+ {
+-	int r;
++	struct amdgpu_device *adev = ip_block->adev;
++	int r, i;
+ 
+ 	r = vcn_v4_0_hw_fini(ip_block);
+ 	if (r)
+ 		return r;
+ 
+-	r = amdgpu_vcn_suspend(ip_block->adev);
++	for (i = 0; i < adev->vcn.num_vcn_inst; i++) {
++		r = amdgpu_vcn_suspend(ip_block->adev, i);
++		if (r)
++			return r;
++	}
+ 
+-	return r;
++	return 0;
+ }
+ 
+ /**
+@@ -414,11 +432,14 @@ static int vcn_v4_0_suspend(struct amdgpu_ip_block *ip_block)
+  */
+ static int vcn_v4_0_resume(struct amdgpu_ip_block *ip_block)
+ {
+-	int r;
++	struct amdgpu_device *adev = ip_block->adev;
++	int r, i;
+ 
+-	r = amdgpu_vcn_resume(ip_block->adev);
+-	if (r)
+-		return r;
++	for (i = 0; i < adev->vcn.num_vcn_inst; i++) {
++		r = amdgpu_vcn_resume(ip_block->adev, i);
++		if (r)
++			return r;
++	}
+ 
+ 	r = vcn_v4_0_hw_init(ip_block);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/vcn_v4_0_3.c b/drivers/gpu/drm/amd/amdgpu/vcn_v4_0_3.c
+index fbe599c539c8..a0b848ad097b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vcn_v4_0_3.c
++++ b/drivers/gpu/drm/amd/amdgpu/vcn_v4_0_3.c
+@@ -114,7 +114,7 @@ static inline bool vcn_v4_0_3_normalizn_reqd(struct amdgpu_device *adev)
+ static int vcn_v4_0_3_early_init(struct amdgpu_ip_block *ip_block)
+ {
+ 	struct amdgpu_device *adev = ip_block->adev;
+-	int i;
++	int i, r;
+ 
+ 	for (i = 0; i < adev->vcn.num_vcn_inst; ++i)
+ 		/* re-use enc ring as unified ring */
+@@ -124,7 +124,13 @@ static int vcn_v4_0_3_early_init(struct amdgpu_ip_block *ip_block)
+ 	vcn_v4_0_3_set_irq_funcs(adev);
+ 	vcn_v4_0_3_set_ras_funcs(adev);
+ 
+-	return amdgpu_vcn_early_init(adev);
++	for (i = 0; i < adev->vcn.num_vcn_inst; ++i) {
++		r = amdgpu_vcn_early_init(adev, i);
++		if (r)
++			return r;
++	}
++
++	return 0;
+ }
+ 
+ static int vcn_v4_0_3_fw_shared_init(struct amdgpu_device *adev, int inst_idx)
+@@ -156,16 +162,6 @@ static int vcn_v4_0_3_sw_init(struct amdgpu_ip_block *ip_block)
+ 	uint32_t reg_count = ARRAY_SIZE(vcn_reg_list_4_0_3);
+ 	uint32_t *ptr;
+ 
+-	r = amdgpu_vcn_sw_init(adev);
+-	if (r)
+-		return r;
+-
+-	amdgpu_vcn_setup_ucode(adev);
+-
+-	r = amdgpu_vcn_resume(adev);
+-	if (r)
+-		return r;
+-
+ 	/* VCN DEC TRAP */
+ 	r = amdgpu_irq_add_id(adev, SOC15_IH_CLIENTID_VCN,
+ 		VCN_4_0__SRCID__UVD_ENC_GENERAL_PURPOSE, &adev->vcn.inst->irq);
+@@ -173,6 +169,17 @@ static int vcn_v4_0_3_sw_init(struct amdgpu_ip_block *ip_block)
+ 		return r;
+ 
+ 	for (i = 0; i < adev->vcn.num_vcn_inst; i++) {
++
++		r = amdgpu_vcn_sw_init(adev, i);
++		if (r)
++			return r;
++
++		amdgpu_vcn_setup_ucode(adev, i);
++
++		r = amdgpu_vcn_resume(adev, i);
++		if (r)
++			return r;
++
+ 		vcn_inst = GET_INST(VCN, i);
+ 
+ 		ring = &adev->vcn.inst[i].ring_enc[0];
+@@ -261,16 +268,23 @@ static int vcn_v4_0_3_sw_fini(struct amdgpu_ip_block *ip_block)
+ 	if (amdgpu_sriov_vf(adev))
+ 		amdgpu_virt_free_mm_table(adev);
+ 
+-	r = amdgpu_vcn_suspend(adev);
+-	if (r)
+-		return r;
++	for (i = 0; i < adev->vcn.num_vcn_inst; i++) {
++		r = amdgpu_vcn_suspend(adev, i);
++		if (r)
++			return r;
++	}
+ 
+ 	amdgpu_vcn_sysfs_reset_mask_fini(adev);
+-	r = amdgpu_vcn_sw_fini(adev);
++
++	for (i = 0; i < adev->vcn.num_vcn_inst; i++) {
++		r = amdgpu_vcn_sw_fini(adev, i);
++		if (r)
++			return r;
++	}
+ 
+ 	kfree(adev->vcn.ip_dump);
+ 
+-	return r;
++	return 0;
+ }
+ 
+ /**
+@@ -375,15 +389,20 @@ static int vcn_v4_0_3_hw_fini(struct amdgpu_ip_block *ip_block)
+  */
+ static int vcn_v4_0_3_suspend(struct amdgpu_ip_block *ip_block)
+ {
+-	int r;
++	struct amdgpu_device *adev = ip_block->adev;
++	int r, i;
+ 
+ 	r = vcn_v4_0_3_hw_fini(ip_block);
+ 	if (r)
+ 		return r;
+ 
+-	r = amdgpu_vcn_suspend(ip_block->adev);
++	for (i = 0; i < adev->vcn.num_vcn_inst; i++) {
++		r = amdgpu_vcn_suspend(adev, i);
++		if (r)
++			return r;
++	}
+ 
+-	return r;
++	return 0;
+ }
+ 
+ /**
+@@ -395,11 +414,14 @@ static int vcn_v4_0_3_suspend(struct amdgpu_ip_block *ip_block)
+  */
+ static int vcn_v4_0_3_resume(struct amdgpu_ip_block *ip_block)
+ {
+-	int r;
++	struct amdgpu_device *adev = ip_block->adev;
++	int r, i;
+ 
+-	r = amdgpu_vcn_resume(ip_block->adev);
+-	if (r)
+-		return r;
++	for (i = 0; i < adev->vcn.num_vcn_inst; i++) {
++		r = amdgpu_vcn_resume(ip_block->adev, i);
++		if (r)
++			return r;
++	}
+ 
+ 	r = vcn_v4_0_3_hw_init(ip_block);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/vcn_v4_0_5.c b/drivers/gpu/drm/amd/amdgpu/vcn_v4_0_5.c
+index 2513929b2d43..68ed7950e3d5 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vcn_v4_0_5.c
++++ b/drivers/gpu/drm/amd/amdgpu/vcn_v4_0_5.c
+@@ -115,7 +115,7 @@ static void vcn_v4_0_5_unified_ring_set_wptr(struct amdgpu_ring *ring);
+ static int vcn_v4_0_5_early_init(struct amdgpu_ip_block *ip_block)
+ {
+ 	struct amdgpu_device *adev = ip_block->adev;
+-	int i;
++	int i, r;
+ 
+ 	for (i = 0; i < adev->vcn.num_vcn_inst; ++i)
+ 		/* re-use enc ring as unified ring */
+@@ -123,7 +123,13 @@ static int vcn_v4_0_5_early_init(struct amdgpu_ip_block *ip_block)
+ 	vcn_v4_0_5_set_unified_ring_funcs(adev);
+ 	vcn_v4_0_5_set_irq_funcs(adev);
+ 
+-	return amdgpu_vcn_early_init(adev);
++	for (i = 0; i < adev->vcn.num_vcn_inst; ++i) {
++		r = amdgpu_vcn_early_init(adev, i);
++		if (r)
++			return r;
++	}
++
++	return 0;
+ }
+ 
+ /**
+@@ -141,15 +147,6 @@ static int vcn_v4_0_5_sw_init(struct amdgpu_ip_block *ip_block)
+ 	uint32_t reg_count = ARRAY_SIZE(vcn_reg_list_4_0_5);
+ 	uint32_t *ptr;
+ 
+-	r = amdgpu_vcn_sw_init(adev);
+-	if (r)
+-		return r;
+-
+-	amdgpu_vcn_setup_ucode(adev);
+-
+-	r = amdgpu_vcn_resume(adev);
+-	if (r)
+-		return r;
+ 
+ 	for (i = 0; i < adev->vcn.num_vcn_inst; i++) {
+ 		volatile struct amdgpu_vcn4_fw_shared *fw_shared;
+@@ -157,6 +154,16 @@ static int vcn_v4_0_5_sw_init(struct amdgpu_ip_block *ip_block)
+ 		if (adev->vcn.harvest_config & (1 << i))
+ 			continue;
+ 
++		r = amdgpu_vcn_sw_init(adev, i);
++		if (r)
++			return r;
++
++		amdgpu_vcn_setup_ucode(adev, i);
++
++		r = amdgpu_vcn_resume(adev, i);
++		if (r)
++			return r;
++
+ 		atomic_set(&adev->vcn.inst[i].sched_score, 0);
+ 
+ 		/* VCN UNIFIED TRAP */
+@@ -252,15 +259,19 @@ static int vcn_v4_0_5_sw_fini(struct amdgpu_ip_block *ip_block)
+ 	if (amdgpu_sriov_vf(adev))
+ 		amdgpu_virt_free_mm_table(adev);
+ 
+-	r = amdgpu_vcn_suspend(adev);
+-	if (r)
+-		return r;
++	for (i = 0; i < adev->vcn.num_vcn_inst; i++) {
++		r = amdgpu_vcn_suspend(adev, i);
++		if (r)
++			return r;
+ 
+-	r = amdgpu_vcn_sw_fini(adev);
++		r = amdgpu_vcn_sw_fini(adev, i);
++		if (r)
++			return r;
++	}
+ 
+ 	kfree(adev->vcn.ip_dump);
+ 
+-	return r;
++	return 0;
+ }
+ 
+ /**
+@@ -332,13 +343,18 @@ static int vcn_v4_0_5_hw_fini(struct amdgpu_ip_block *ip_block)
+  */
+ static int vcn_v4_0_5_suspend(struct amdgpu_ip_block *ip_block)
+ {
+-	int r;
++	struct amdgpu_device *adev = ip_block->adev;
++	int r, i;
+ 
+ 	r = vcn_v4_0_5_hw_fini(ip_block);
+ 	if (r)
+ 		return r;
+ 
+-	r = amdgpu_vcn_suspend(ip_block->adev);
++	for (i = 0; i < adev->vcn.num_vcn_inst; i++) {
++		r = amdgpu_vcn_suspend(ip_block->adev, i);
++		if (r)
++			return r;
++	}
+ 
+ 	return r;
+ }
+@@ -352,11 +368,14 @@ static int vcn_v4_0_5_suspend(struct amdgpu_ip_block *ip_block)
+  */
+ static int vcn_v4_0_5_resume(struct amdgpu_ip_block *ip_block)
+ {
+-	int r;
++	struct amdgpu_device *adev = ip_block->adev;
++	int r, i;
+ 
+-	r = amdgpu_vcn_resume(ip_block->adev);
+-	if (r)
+-		return r;
++	for (i = 0; i < adev->vcn.num_vcn_inst; i++) {
++		r = amdgpu_vcn_resume(ip_block->adev, i);
++		if (r)
++			return r;
++	}
+ 
+ 	r = vcn_v4_0_5_hw_init(ip_block);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/vcn_v5_0_0.c b/drivers/gpu/drm/amd/amdgpu/vcn_v5_0_0.c
+index 50e0928c3a20..d773766ebbe2 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vcn_v5_0_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/vcn_v5_0_0.c
+@@ -98,7 +98,7 @@ static void vcn_v5_0_0_unified_ring_set_wptr(struct amdgpu_ring *ring);
+ static int vcn_v5_0_0_early_init(struct amdgpu_ip_block *ip_block)
+ {
+ 	struct amdgpu_device *adev = ip_block->adev;
+-	int i;
++	int i, r;
+ 
+ 	for (i = 0; i < adev->vcn.num_vcn_inst; ++i)
+ 		/* re-use enc ring as unified ring */
+@@ -107,7 +107,13 @@ static int vcn_v5_0_0_early_init(struct amdgpu_ip_block *ip_block)
+ 	vcn_v5_0_0_set_unified_ring_funcs(adev);
+ 	vcn_v5_0_0_set_irq_funcs(adev);
+ 
+-	return amdgpu_vcn_early_init(adev);
++	for (i = 0; i < adev->vcn.num_vcn_inst; ++i) {
++		r = amdgpu_vcn_early_init(adev, i);
++		if (r)
++			return r;
++	}
++
++	return 0;
+ }
+ 
+ void vcn_v5_0_0_alloc_ip_dump(struct amdgpu_device *adev)
+@@ -138,22 +144,22 @@ static int vcn_v5_0_0_sw_init(struct amdgpu_ip_block *ip_block)
+ 	struct amdgpu_device *adev = ip_block->adev;
+ 	int i, r;
+ 
+-	r = amdgpu_vcn_sw_init(adev);
+-	if (r)
+-		return r;
+-
+-	amdgpu_vcn_setup_ucode(adev);
+-
+-	r = amdgpu_vcn_resume(adev);
+-	if (r)
+-		return r;
+-
+ 	for (i = 0; i < adev->vcn.num_vcn_inst; i++) {
+ 		volatile struct amdgpu_vcn5_fw_shared *fw_shared;
+ 
+ 		if (adev->vcn.harvest_config & (1 << i))
+ 			continue;
+ 
++		r = amdgpu_vcn_sw_init(adev, i);
++		if (r)
++			return r;
++
++		amdgpu_vcn_setup_ucode(adev, i);
++
++		r = amdgpu_vcn_resume(adev, i);
++		if (r)
++			return r;
++
+ 		atomic_set(&adev->vcn.inst[i].sched_score, 0);
+ 
+ 		/* VCN UNIFIED TRAP */
+@@ -231,16 +237,23 @@ static int vcn_v5_0_0_sw_fini(struct amdgpu_ip_block *ip_block)
+ 		drm_dev_exit(idx);
+ 	}
+ 
+-	r = amdgpu_vcn_suspend(adev);
+-	if (r)
+-		return r;
++	for (i = 0; i < adev->vcn.num_vcn_inst; i++) {
++		r = amdgpu_vcn_suspend(adev, i);
++		if (r)
++			return r;
++	}
+ 
+ 	amdgpu_vcn_sysfs_reset_mask_fini(adev);
+-	r = amdgpu_vcn_sw_fini(adev);
++
++	for (i = 0; i < adev->vcn.num_vcn_inst; i++) {
++		r = amdgpu_vcn_sw_fini(adev, i);
++		if (r)
++			return r;
++	}
+ 
+ 	kfree(adev->vcn.ip_dump);
+ 
+-	return r;
++	return 0;
+ }
+ 
+ /**
+@@ -312,13 +325,18 @@ static int vcn_v5_0_0_hw_fini(struct amdgpu_ip_block *ip_block)
+  */
+ static int vcn_v5_0_0_suspend(struct amdgpu_ip_block *ip_block)
+ {
+-	int r;
++	struct amdgpu_device *adev = ip_block->adev;
++	int r, i;
+ 
+ 	r = vcn_v5_0_0_hw_fini(ip_block);
+ 	if (r)
+ 		return r;
+ 
+-	r = amdgpu_vcn_suspend(ip_block->adev);
++	for (i = 0; i < adev->vcn.num_vcn_inst; i++) {
++		r = amdgpu_vcn_suspend(ip_block->adev, i);
++		if (r)
++			return r;
++	}
+ 
+ 	return r;
+ }
+@@ -332,11 +350,14 @@ static int vcn_v5_0_0_suspend(struct amdgpu_ip_block *ip_block)
+  */
+ static int vcn_v5_0_0_resume(struct amdgpu_ip_block *ip_block)
+ {
+-	int r;
++	struct amdgpu_device *adev = ip_block->adev;
++	int r, i;
+ 
+-	r = amdgpu_vcn_resume(ip_block->adev);
+-	if (r)
+-		return r;
++	for (i = 0; i < adev->vcn.num_vcn_inst; i++) {
++		r = amdgpu_vcn_resume(ip_block->adev, i);
++		if (r)
++			return r;
++	}
+ 
+ 	r = vcn_v5_0_0_hw_init(ip_block);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/vcn_v5_0_1.c b/drivers/gpu/drm/amd/amdgpu/vcn_v5_0_1.c
+index ebe977507bc3..afa8f1f0b572 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vcn_v5_0_1.c
++++ b/drivers/gpu/drm/amd/amdgpu/vcn_v5_0_1.c
+@@ -58,7 +58,7 @@ static void vcn_v5_0_1_unified_ring_set_wptr(struct amdgpu_ring *ring);
+ static int vcn_v5_0_1_early_init(struct amdgpu_ip_block *ip_block)
+ {
+ 	struct amdgpu_device *adev = ip_block->adev;
+-	int i;
++	int i, r;
+ 
+ 	for (i = 0; i < adev->vcn.num_vcn_inst; ++i)
+ 		/* re-use enc ring as unified ring */
+@@ -67,7 +67,13 @@ static int vcn_v5_0_1_early_init(struct amdgpu_ip_block *ip_block)
+ 	vcn_v5_0_1_set_unified_ring_funcs(adev);
+ 	vcn_v5_0_1_set_irq_funcs(adev);
+ 
+-	return amdgpu_vcn_early_init(adev);
++	for (i = 0; i < adev->vcn.num_vcn_inst; ++i) {
++		r = amdgpu_vcn_early_init(adev, i);
++		if (r)
++			return r;
++	}
++
++	return 0;
+ }
+ 
+ /**
+@@ -83,16 +89,6 @@ static int vcn_v5_0_1_sw_init(struct amdgpu_ip_block *ip_block)
+ 	struct amdgpu_ring *ring;
+ 	int i, r, vcn_inst;
+ 
+-	r = amdgpu_vcn_sw_init(adev);
+-	if (r)
+-		return r;
+-
+-	amdgpu_vcn_setup_ucode(adev);
+-
+-	r = amdgpu_vcn_resume(adev);
+-	if (r)
+-		return r;
+-
+ 	/* VCN UNIFIED TRAP */
+ 	r = amdgpu_irq_add_id(adev, SOC15_IH_CLIENTID_VCN,
+ 		VCN_5_0__SRCID__UVD_ENC_GENERAL_PURPOSE, &adev->vcn.inst->irq);
+@@ -104,6 +100,16 @@ static int vcn_v5_0_1_sw_init(struct amdgpu_ip_block *ip_block)
+ 
+ 		vcn_inst = GET_INST(VCN, i);
+ 
++		r = amdgpu_vcn_sw_init(adev, i);
++		if (r)
++			return r;
++
++		amdgpu_vcn_setup_ucode(adev, i);
++
++		r = amdgpu_vcn_resume(adev, i);
++		if (r)
++			return r;
++
+ 		ring = &adev->vcn.inst[i].ring_enc[0];
+ 		ring->use_doorbell = true;
+ 		ring->doorbell_index = (adev->doorbell_index.vcn.vcn_ring0_1 << 1) + 9 * vcn_inst;
+@@ -157,17 +163,23 @@ static int vcn_v5_0_1_sw_fini(struct amdgpu_ip_block *ip_block)
+ 		drm_dev_exit(idx);
+ 	}
+ 
+-	r = amdgpu_vcn_suspend(adev);
+-	if (r)
+-		return r;
++	for (i = 0; i < adev->vcn.num_vcn_inst; i++) {
++		r = amdgpu_vcn_suspend(adev, i);
++		if (r)
++			return r;
++	}
+ 
+-	r = amdgpu_vcn_sw_fini(adev);
++	for (i = 0; i < adev->vcn.num_vcn_inst; i++) {
++		r = amdgpu_vcn_sw_fini(adev, i);
++		if (r)
++			return r;
++	}
+ 
+ 	amdgpu_vcn_sysfs_reset_mask_fini(adev);
+ 
+ 	kfree(adev->vcn.ip_dump);
+ 
+-	return r;
++	return 0;
+ }
+ 
+ /**
+@@ -229,13 +241,17 @@ static int vcn_v5_0_1_hw_fini(struct amdgpu_ip_block *ip_block)
+ static int vcn_v5_0_1_suspend(struct amdgpu_ip_block *ip_block)
+ {
+ 	struct amdgpu_device *adev = ip_block->adev;
+-	int r;
++	int r, i;
+ 
+ 	r = vcn_v5_0_1_hw_fini(ip_block);
+ 	if (r)
+ 		return r;
+ 
+-	r = amdgpu_vcn_suspend(adev);
++	for (i = 0; i < adev->vcn.num_vcn_inst; i++) {
++		r = amdgpu_vcn_suspend(ip_block->adev, i);
++		if (r)
++			return r;
++	}
+ 
+ 	return r;
+ }
+@@ -250,11 +266,13 @@ static int vcn_v5_0_1_suspend(struct amdgpu_ip_block *ip_block)
+ static int vcn_v5_0_1_resume(struct amdgpu_ip_block *ip_block)
+ {
+ 	struct amdgpu_device *adev = ip_block->adev;
+-	int r;
++	int r, i;
+ 
+-	r = amdgpu_vcn_resume(adev);
+-	if (r)
+-		return r;
++	for (i = 0; i < adev->vcn.num_vcn_inst; i++) {
++		r = amdgpu_vcn_resume(ip_block->adev, i);
++		if (r)
++			return r;
++	}
+ 
+ 	r = vcn_v5_0_1_hw_init(ip_block);
+ 
+-- 
+2.52.0
+
