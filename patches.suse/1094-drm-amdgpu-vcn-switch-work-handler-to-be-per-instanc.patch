@@ -1,0 +1,472 @@
+From bee48570cf8e312faec9b8f465762052555158d0 Mon Sep 17 00:00:00 2001
+From: Alex Deucher <alexander.deucher@amd.com>
+Date: Wed, 13 Nov 2024 14:43:15 -0500
+Subject: drm/amdgpu/vcn: switch work handler to be per instance
+Git-commit: bee48570cf8e312faec9b8f465762052555158d0
+Patch-mainline: v6.15-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Have a separate work handler for each VCN instance. This
+paves the way for per instance VCN power gating at runtime.
+
+V2: index instances directly on vcn1.0 and 2.0 to make
+it clear that they only support a single instance (Lijo)
+
+Reviewed-by: Boyuan Zhang <Boyuan.Zhang@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c | 84 +++++++++++++------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.h |  8 ++-
+ drivers/gpu/drm/amd/amdgpu/jpeg_v1_0.c  |  2 +-
+ drivers/gpu/drm/amd/amdgpu/vcn_v1_0.c   | 17 ++---
+ drivers/gpu/drm/amd/amdgpu/vcn_v2_0.c   |  2 +-
+ drivers/gpu/drm/amd/amdgpu/vcn_v2_5.c   |  4 +-
+ drivers/gpu/drm/amd/amdgpu/vcn_v3_0.c   |  4 +-
+ drivers/gpu/drm/amd/amdgpu/vcn_v4_0.c   |  5 +-
+ drivers/gpu/drm/amd/amdgpu/vcn_v4_0_3.c |  4 +-
+ drivers/gpu/drm/amd/amdgpu/vcn_v4_0_5.c |  5 +-
+ drivers/gpu/drm/amd/amdgpu/vcn_v5_0_0.c |  5 +-
+ drivers/gpu/drm/amd/amdgpu/vcn_v5_0_1.c |  4 +-
+ 12 files changed, 80 insertions(+), 64 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c
+index 83faf6e6788a..0c3081a198d9 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c
+@@ -100,6 +100,9 @@ int amdgpu_vcn_early_init(struct amdgpu_device *adev)
+ 
+ 	amdgpu_ucode_ip_version_decode(adev, UVD_HWIP, ucode_prefix, sizeof(ucode_prefix));
+ 	for (i = 0; i < adev->vcn.num_vcn_inst; i++) {
++		adev->vcn.inst[i].adev = adev;
++		adev->vcn.inst[i].inst = i;
++
+ 		if (i == 1 && amdgpu_ip_version(adev, UVD_HWIP, 0) ==  IP_VERSION(4, 0, 6))
+ 			r = amdgpu_ucode_request(adev, &adev->vcn.inst[i].fw,
+ 						 AMDGPU_UCODE_REQUIRED,
+@@ -124,12 +127,13 @@ int amdgpu_vcn_sw_init(struct amdgpu_device *adev)
+ 	unsigned int fw_shared_size, log_offset;
+ 	int i, r;
+ 
+-	INIT_DELAYED_WORK(&adev->vcn.idle_work, amdgpu_vcn_idle_work_handler);
+-	mutex_init(&adev->vcn.vcn_pg_lock);
+ 	mutex_init(&adev->vcn.vcn1_jpeg1_workaround);
+-	atomic_set(&adev->vcn.total_submission_cnt, 0);
+-	for (i = 0; i < adev->vcn.num_vcn_inst; i++)
++	for (i = 0; i < adev->vcn.num_vcn_inst; i++) {
++		mutex_init(&adev->vcn.inst[i].vcn_pg_lock);
++		atomic_set(&adev->vcn.inst[i].total_submission_cnt, 0);
++		INIT_DELAYED_WORK(&adev->vcn.inst[i].idle_work, amdgpu_vcn_idle_work_handler);
+ 		atomic_set(&adev->vcn.inst[i].dpg_enc_submission_cnt, 0);
++	}
+ 
+ 	if ((adev->firmware.load_type == AMDGPU_FW_LOAD_PSP) &&
+ 	    (adev->pg_flags & AMD_PG_SUPPORT_VCN_DPG))
+@@ -277,10 +281,10 @@ int amdgpu_vcn_sw_fini(struct amdgpu_device *adev)
+ 			amdgpu_ring_fini(&adev->vcn.inst[j].ring_enc[i]);
+ 
+ 		amdgpu_ucode_release(&adev->vcn.inst[j].fw);
++		mutex_destroy(&adev->vcn.inst[j].vcn_pg_lock);
+ 	}
+ 
+ 	mutex_destroy(&adev->vcn.vcn1_jpeg1_workaround);
+-	mutex_destroy(&adev->vcn.vcn_pg_lock);
+ 
+ 	return 0;
+ }
+@@ -331,8 +335,10 @@ int amdgpu_vcn_save_vcpu_bo(struct amdgpu_device *adev)
+ int amdgpu_vcn_suspend(struct amdgpu_device *adev)
+ {
+ 	bool in_ras_intr = amdgpu_ras_intr_triggered();
++	int i;
+ 
+-	cancel_delayed_work_sync(&adev->vcn.idle_work);
++	for (i = 0; i < adev->vcn.num_vcn_inst; ++i)
++		cancel_delayed_work_sync(&adev->vcn.inst[i].idle_work);
+ 
+ 	/* err_event_athub will corrupt VCPU buffer, so we need to
+ 	 * restore fw data and clear buffer in amdgpu_vcn_resume() */
+@@ -388,46 +394,45 @@ int amdgpu_vcn_resume(struct amdgpu_device *adev)
+ 
+ static void amdgpu_vcn_idle_work_handler(struct work_struct *work)
+ {
+-	struct amdgpu_device *adev =
+-		container_of(work, struct amdgpu_device, vcn.idle_work.work);
++	struct amdgpu_vcn_inst *vcn_inst =
++		container_of(work, struct amdgpu_vcn_inst, idle_work.work);
++	struct amdgpu_device *adev = vcn_inst->adev;
+ 	unsigned int fences = 0, fence[AMDGPU_MAX_VCN_INSTANCES] = {0};
+-	unsigned int i, j;
++	unsigned int i = vcn_inst->inst, j;
+ 	int r = 0;
+ 
+-	for (j = 0; j < adev->vcn.num_vcn_inst; ++j) {
+-		if (adev->vcn.harvest_config & (1 << j))
+-			continue;
+-
+-		for (i = 0; i < adev->vcn.num_enc_rings; ++i)
+-			fence[j] += amdgpu_fence_count_emitted(&adev->vcn.inst[j].ring_enc[i]);
++	if (adev->vcn.harvest_config & (1 << i))
++		return;
+ 
+-		/* Only set DPG pause for VCN3 or below, VCN4 and above will be handled by FW */
+-		if (adev->pg_flags & AMD_PG_SUPPORT_VCN_DPG &&
+-		    !adev->vcn.using_unified_queue) {
+-			struct dpg_pause_state new_state;
++	for (j = 0; j < adev->vcn.num_enc_rings; ++j)
++		fence[i] += amdgpu_fence_count_emitted(&vcn_inst->ring_enc[j]);
+ 
+-			if (fence[j] ||
+-				unlikely(atomic_read(&adev->vcn.inst[j].dpg_enc_submission_cnt)))
+-				new_state.fw_based = VCN_DPG_STATE__PAUSE;
+-			else
+-				new_state.fw_based = VCN_DPG_STATE__UNPAUSE;
++	/* Only set DPG pause for VCN3 or below, VCN4 and above will be handled by FW */
++	if (adev->pg_flags & AMD_PG_SUPPORT_VCN_DPG &&
++	    !adev->vcn.using_unified_queue) {
++		struct dpg_pause_state new_state;
+ 
+-			adev->vcn.pause_dpg_mode(adev, j, &new_state);
+-		}
++		if (fence[i] ||
++		    unlikely(atomic_read(&vcn_inst->dpg_enc_submission_cnt)))
++			new_state.fw_based = VCN_DPG_STATE__PAUSE;
++		else
++			new_state.fw_based = VCN_DPG_STATE__UNPAUSE;
+ 
+-		fence[j] += amdgpu_fence_count_emitted(&adev->vcn.inst[j].ring_dec);
+-		fences += fence[j];
++		adev->vcn.pause_dpg_mode(adev, i, &new_state);
+ 	}
+ 
+-	if (!fences && !atomic_read(&adev->vcn.total_submission_cnt)) {
++	fence[i] += amdgpu_fence_count_emitted(&vcn_inst->ring_dec);
++	fences += fence[i];
++
++	if (!fences && !atomic_read(&vcn_inst->total_submission_cnt)) {
+ 		amdgpu_device_ip_set_powergating_state(adev, AMD_IP_BLOCK_TYPE_VCN,
+-		       AMD_PG_STATE_GATE);
++						       AMD_PG_STATE_GATE);
+ 		r = amdgpu_dpm_switch_power_profile(adev, PP_SMC_POWER_PROFILE_VIDEO,
+-				false);
++						    false);
+ 		if (r)
+ 			dev_warn(adev->dev, "(%d) failed to disable video power profile mode\n", r);
+ 	} else {
+-		schedule_delayed_work(&adev->vcn.idle_work, VCN_IDLE_TIMEOUT);
++		schedule_delayed_work(&vcn_inst->idle_work, VCN_IDLE_TIMEOUT);
+ 	}
+ }
+ 
+@@ -436,18 +441,18 @@ void amdgpu_vcn_ring_begin_use(struct amdgpu_ring *ring)
+ 	struct amdgpu_device *adev = ring->adev;
+ 	int r = 0;
+ 
+-	atomic_inc(&adev->vcn.total_submission_cnt);
++	atomic_inc(&adev->vcn.inst[ring->me].total_submission_cnt);
+ 
+-	if (!cancel_delayed_work_sync(&adev->vcn.idle_work)) {
++	if (!cancel_delayed_work_sync(&adev->vcn.inst[ring->me].idle_work)) {
+ 		r = amdgpu_dpm_switch_power_profile(adev, PP_SMC_POWER_PROFILE_VIDEO,
+ 				true);
+ 		if (r)
+ 			dev_warn(adev->dev, "(%d) failed to switch to video power profile mode\n", r);
+ 	}
+ 
+-	mutex_lock(&adev->vcn.vcn_pg_lock);
++	mutex_lock(&adev->vcn.inst[ring->me].vcn_pg_lock);
+ 	amdgpu_device_ip_set_powergating_state(adev, AMD_IP_BLOCK_TYPE_VCN,
+-	       AMD_PG_STATE_UNGATE);
++					       AMD_PG_STATE_UNGATE);
+ 
+ 	/* Only set DPG pause for VCN3 or below, VCN4 and above will be handled by FW */
+ 	if (adev->pg_flags & AMD_PG_SUPPORT_VCN_DPG &&
+@@ -472,7 +477,7 @@ void amdgpu_vcn_ring_begin_use(struct amdgpu_ring *ring)
+ 
+ 		adev->vcn.pause_dpg_mode(adev, ring->me, &new_state);
+ 	}
+-	mutex_unlock(&adev->vcn.vcn_pg_lock);
++	mutex_unlock(&adev->vcn.inst[ring->me].vcn_pg_lock);
+ }
+ 
+ void amdgpu_vcn_ring_end_use(struct amdgpu_ring *ring)
+@@ -485,9 +490,10 @@ void amdgpu_vcn_ring_end_use(struct amdgpu_ring *ring)
+ 	    !adev->vcn.using_unified_queue)
+ 		atomic_dec(&ring->adev->vcn.inst[ring->me].dpg_enc_submission_cnt);
+ 
+-	atomic_dec(&ring->adev->vcn.total_submission_cnt);
++	atomic_dec(&ring->adev->vcn.inst[ring->me].total_submission_cnt);
+ 
+-	schedule_delayed_work(&ring->adev->vcn.idle_work, VCN_IDLE_TIMEOUT);
++	schedule_delayed_work(&ring->adev->vcn.inst[ring->me].idle_work,
++			      VCN_IDLE_TIMEOUT);
+ }
+ 
+ int amdgpu_vcn_dec_ring_test_ring(struct amdgpu_ring *ring)
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.h
+index c92f683ee595..f1685283c2f1 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.h
+@@ -295,6 +295,8 @@ struct amdgpu_vcn_fw_shared {
+ };
+ 
+ struct amdgpu_vcn_inst {
++	struct amdgpu_device	*adev;
++	int			inst;
+ 	struct amdgpu_bo	*vcpu_bo;
+ 	void			*cpu_addr;
+ 	uint64_t		gpu_addr;
+@@ -316,6 +318,9 @@ struct amdgpu_vcn_inst {
+ 	const struct firmware	*fw; /* VCN firmware */
+ 	uint8_t			vcn_config;
+ 	uint32_t		vcn_codec_disable_mask;
++	atomic_t		total_submission_cnt;
++	struct mutex		vcn_pg_lock;
++	struct delayed_work	idle_work;
+ };
+ 
+ struct amdgpu_vcn_ras {
+@@ -324,7 +329,6 @@ struct amdgpu_vcn_ras {
+ 
+ struct amdgpu_vcn {
+ 	unsigned		fw_version;
+-	struct delayed_work	idle_work;
+ 	unsigned		num_enc_rings;
+ 	enum amd_powergating_state cur_state;
+ 	bool			indirect_sram;
+@@ -332,9 +336,7 @@ struct amdgpu_vcn {
+ 	uint8_t	num_vcn_inst;
+ 	struct amdgpu_vcn_inst	 inst[AMDGPU_MAX_VCN_INSTANCES];
+ 	struct amdgpu_vcn_reg	 internal;
+-	struct mutex		 vcn_pg_lock;
+ 	struct mutex		vcn1_jpeg1_workaround;
+-	atomic_t		 total_submission_cnt;
+ 
+ 	unsigned	harvest_config;
+ 	int (*pause_dpg_mode)(struct amdgpu_device *adev,
+diff --git a/drivers/gpu/drm/amd/amdgpu/jpeg_v1_0.c b/drivers/gpu/drm/amd/amdgpu/jpeg_v1_0.c
+index 03b8b7cd5229..8031406e20ff 100644
+--- a/drivers/gpu/drm/amd/amdgpu/jpeg_v1_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/jpeg_v1_0.c
+@@ -604,7 +604,7 @@ static void jpeg_v1_0_set_irq_funcs(struct amdgpu_device *adev)
+ static void jpeg_v1_0_ring_begin_use(struct amdgpu_ring *ring)
+ {
+ 	struct	amdgpu_device *adev = ring->adev;
+-	bool	set_clocks = !cancel_delayed_work_sync(&adev->vcn.idle_work);
++	bool	set_clocks = !cancel_delayed_work_sync(&adev->vcn.inst[0].idle_work);
+ 	int		cnt = 0;
+ 
+ 	mutex_lock(&adev->vcn.vcn1_jpeg1_workaround);
+diff --git a/drivers/gpu/drm/amd/amdgpu/vcn_v1_0.c b/drivers/gpu/drm/amd/amdgpu/vcn_v1_0.c
+index 06e1bbcf1a52..cccf8e5b0037 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vcn_v1_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/vcn_v1_0.c
+@@ -150,7 +150,7 @@ static int vcn_v1_0_sw_init(struct amdgpu_ip_block *ip_block)
+ 		return r;
+ 
+ 	/* Override the work func */
+-	adev->vcn.idle_work.work.func = vcn_v1_0_idle_work_handler;
++	adev->vcn.inst[0].idle_work.work.func = vcn_v1_0_idle_work_handler;
+ 
+ 	amdgpu_vcn_setup_ucode(adev);
+ 
+@@ -277,7 +277,7 @@ static int vcn_v1_0_hw_fini(struct amdgpu_ip_block *ip_block)
+ {
+ 	struct amdgpu_device *adev = ip_block->adev;
+ 
+-	cancel_delayed_work_sync(&adev->vcn.idle_work);
++	cancel_delayed_work_sync(&adev->vcn.inst[0].idle_work);
+ 
+ 	if ((adev->pg_flags & AMD_PG_SUPPORT_VCN_DPG) ||
+ 		(adev->vcn.cur_state != AMD_PG_STATE_GATE &&
+@@ -301,7 +301,7 @@ static int vcn_v1_0_suspend(struct amdgpu_ip_block *ip_block)
+ 	struct amdgpu_device *adev = ip_block->adev;
+ 	bool idle_work_unexecuted;
+ 
+-	idle_work_unexecuted = cancel_delayed_work_sync(&adev->vcn.idle_work);
++	idle_work_unexecuted = cancel_delayed_work_sync(&adev->vcn.inst[0].idle_work);
+ 	if (idle_work_unexecuted) {
+ 		if (adev->pm.dpm_enabled)
+ 			amdgpu_dpm_enable_vcn(adev, false, 0);
+@@ -1828,8 +1828,9 @@ static int vcn_v1_0_set_powergating_state(struct amdgpu_ip_block *ip_block,
+ 
+ static void vcn_v1_0_idle_work_handler(struct work_struct *work)
+ {
+-	struct amdgpu_device *adev =
+-		container_of(work, struct amdgpu_device, vcn.idle_work.work);
++	struct amdgpu_vcn_inst *vcn_inst =
++		container_of(work, struct amdgpu_vcn_inst, idle_work.work);
++	struct amdgpu_device *adev = vcn_inst->adev;
+ 	unsigned int fences = 0, i;
+ 
+ 	for (i = 0; i < adev->vcn.num_enc_rings; ++i)
+@@ -1862,14 +1863,14 @@ static void vcn_v1_0_idle_work_handler(struct work_struct *work)
+ 			amdgpu_device_ip_set_powergating_state(adev, AMD_IP_BLOCK_TYPE_VCN,
+ 			       AMD_PG_STATE_GATE);
+ 	} else {
+-		schedule_delayed_work(&adev->vcn.idle_work, VCN_IDLE_TIMEOUT);
++		schedule_delayed_work(&adev->vcn.inst[0].idle_work, VCN_IDLE_TIMEOUT);
+ 	}
+ }
+ 
+ static void vcn_v1_0_ring_begin_use(struct amdgpu_ring *ring)
+ {
+ 	struct	amdgpu_device *adev = ring->adev;
+-	bool set_clocks = !cancel_delayed_work_sync(&adev->vcn.idle_work);
++	bool set_clocks = !cancel_delayed_work_sync(&adev->vcn.inst[0].idle_work);
+ 
+ 	mutex_lock(&adev->vcn.vcn1_jpeg1_workaround);
+ 
+@@ -1921,7 +1922,7 @@ void vcn_v1_0_set_pg_for_begin_use(struct amdgpu_ring *ring, bool set_clocks)
+ 
+ void vcn_v1_0_ring_end_use(struct amdgpu_ring *ring)
+ {
+-	schedule_delayed_work(&ring->adev->vcn.idle_work, VCN_IDLE_TIMEOUT);
++	schedule_delayed_work(&ring->adev->vcn.inst[0].idle_work, VCN_IDLE_TIMEOUT);
+ 	mutex_unlock(&ring->adev->vcn.vcn1_jpeg1_workaround);
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/vcn_v2_0.c b/drivers/gpu/drm/amd/amdgpu/vcn_v2_0.c
+index 1e1c8f57d4cd..86d20141f39c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vcn_v2_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/vcn_v2_0.c
+@@ -313,7 +313,7 @@ static int vcn_v2_0_hw_fini(struct amdgpu_ip_block *ip_block)
+ {
+ 	struct amdgpu_device *adev = ip_block->adev;
+ 
+-	cancel_delayed_work_sync(&adev->vcn.idle_work);
++	cancel_delayed_work_sync(&adev->vcn.inst[0].idle_work);
+ 
+ 	if ((adev->pg_flags & AMD_PG_SUPPORT_VCN_DPG) ||
+ 	    (adev->vcn.cur_state != AMD_PG_STATE_GATE &&
+diff --git a/drivers/gpu/drm/amd/amdgpu/vcn_v2_5.c b/drivers/gpu/drm/amd/amdgpu/vcn_v2_5.c
+index e36e2a5676df..aee236aaa7d0 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vcn_v2_5.c
++++ b/drivers/gpu/drm/amd/amdgpu/vcn_v2_5.c
+@@ -390,12 +390,12 @@ static int vcn_v2_5_hw_fini(struct amdgpu_ip_block *ip_block)
+ 	struct amdgpu_device *adev = ip_block->adev;
+ 	int i;
+ 
+-	cancel_delayed_work_sync(&adev->vcn.idle_work);
+-
+ 	for (i = 0; i < adev->vcn.num_vcn_inst; ++i) {
+ 		if (adev->vcn.harvest_config & (1 << i))
+ 			continue;
+ 
++		cancel_delayed_work_sync(&adev->vcn.inst[i].idle_work);
++
+ 		if ((adev->pg_flags & AMD_PG_SUPPORT_VCN_DPG) ||
+ 		    (adev->vcn.cur_state != AMD_PG_STATE_GATE &&
+ 		     RREG32_SOC15(VCN, i, mmUVD_STATUS)))
+diff --git a/drivers/gpu/drm/amd/amdgpu/vcn_v3_0.c b/drivers/gpu/drm/amd/amdgpu/vcn_v3_0.c
+index ec42a456c541..dd3f3c409105 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vcn_v3_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/vcn_v3_0.c
+@@ -422,12 +422,12 @@ static int vcn_v3_0_hw_fini(struct amdgpu_ip_block *ip_block)
+ 	struct amdgpu_device *adev = ip_block->adev;
+ 	int i;
+ 
+-	cancel_delayed_work_sync(&adev->vcn.idle_work);
+-
+ 	for (i = 0; i < adev->vcn.num_vcn_inst; ++i) {
+ 		if (adev->vcn.harvest_config & (1 << i))
+ 			continue;
+ 
++		cancel_delayed_work_sync(&adev->vcn.inst[i].idle_work);
++
+ 		if (!amdgpu_sriov_vf(adev)) {
+ 			if ((adev->pg_flags & AMD_PG_SUPPORT_VCN_DPG) ||
+ 				(adev->vcn.cur_state != AMD_PG_STATE_GATE &&
+diff --git a/drivers/gpu/drm/amd/amdgpu/vcn_v4_0.c b/drivers/gpu/drm/amd/amdgpu/vcn_v4_0.c
+index c99c121faac0..4d20d58802f6 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vcn_v4_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/vcn_v4_0.c
+@@ -359,11 +359,12 @@ static int vcn_v4_0_hw_fini(struct amdgpu_ip_block *ip_block)
+ 	struct amdgpu_device *adev = ip_block->adev;
+ 	int i;
+ 
+-	cancel_delayed_work_sync(&adev->vcn.idle_work);
+-
+ 	for (i = 0; i < adev->vcn.num_vcn_inst; ++i) {
+ 		if (adev->vcn.harvest_config & (1 << i))
+ 			continue;
++
++		cancel_delayed_work_sync(&adev->vcn.inst[i].idle_work);
++
+ 		if (!amdgpu_sriov_vf(adev)) {
+ 			if ((adev->pg_flags & AMD_PG_SUPPORT_VCN_DPG) ||
+ 				(adev->vcn.cur_state != AMD_PG_STATE_GATE &&
+diff --git a/drivers/gpu/drm/amd/amdgpu/vcn_v4_0_3.c b/drivers/gpu/drm/amd/amdgpu/vcn_v4_0_3.c
+index 00b94d01cd4c..932b65072dbc 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vcn_v4_0_3.c
++++ b/drivers/gpu/drm/amd/amdgpu/vcn_v4_0_3.c
+@@ -349,8 +349,10 @@ static int vcn_v4_0_3_hw_init(struct amdgpu_ip_block *ip_block)
+ static int vcn_v4_0_3_hw_fini(struct amdgpu_ip_block *ip_block)
+ {
+ 	struct amdgpu_device *adev = ip_block->adev;
++	int i;
+ 
+-	cancel_delayed_work_sync(&adev->vcn.idle_work);
++	for (i = 0; i < adev->vcn.num_vcn_inst; ++i)
++		cancel_delayed_work_sync(&adev->vcn.inst[i].idle_work);
+ 
+ 	if (adev->vcn.cur_state != AMD_PG_STATE_GATE)
+ 		vcn_v4_0_3_set_powergating_state(ip_block, AMD_PG_STATE_GATE);
+diff --git a/drivers/gpu/drm/amd/amdgpu/vcn_v4_0_5.c b/drivers/gpu/drm/amd/amdgpu/vcn_v4_0_5.c
+index c2bbacb176c1..83093e5c5cca 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vcn_v4_0_5.c
++++ b/drivers/gpu/drm/amd/amdgpu/vcn_v4_0_5.c
+@@ -300,11 +300,12 @@ static int vcn_v4_0_5_hw_fini(struct amdgpu_ip_block *ip_block)
+ 	struct amdgpu_device *adev = ip_block->adev;
+ 	int i;
+ 
+-	cancel_delayed_work_sync(&adev->vcn.idle_work);
+-
+ 	for (i = 0; i < adev->vcn.num_vcn_inst; ++i) {
+ 		if (adev->vcn.harvest_config & (1 << i))
+ 			continue;
++
++		cancel_delayed_work_sync(&adev->vcn.inst[i].idle_work);
++
+ 		if (!amdgpu_sriov_vf(adev)) {
+ 			if ((adev->pg_flags & AMD_PG_SUPPORT_VCN_DPG) ||
+ 				(adev->vcn.cur_state != AMD_PG_STATE_GATE &&
+diff --git a/drivers/gpu/drm/amd/amdgpu/vcn_v5_0_0.c b/drivers/gpu/drm/amd/amdgpu/vcn_v5_0_0.c
+index 188cd6f1dda2..26f788ceeb11 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vcn_v5_0_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/vcn_v5_0_0.c
+@@ -280,11 +280,12 @@ static int vcn_v5_0_0_hw_fini(struct amdgpu_ip_block *ip_block)
+ 	struct amdgpu_device *adev = ip_block->adev;
+ 	int i;
+ 
+-	cancel_delayed_work_sync(&adev->vcn.idle_work);
+-
+ 	for (i = 0; i < adev->vcn.num_vcn_inst; ++i) {
+ 		if (adev->vcn.harvest_config & (1 << i))
+ 			continue;
++
++		cancel_delayed_work_sync(&adev->vcn.inst[i].idle_work);
++
+ 		if (!amdgpu_sriov_vf(adev)) {
+ 			if ((adev->pg_flags & AMD_PG_SUPPORT_VCN_DPG) ||
+ 				(adev->vcn.cur_state != AMD_PG_STATE_GATE &&
+diff --git a/drivers/gpu/drm/amd/amdgpu/vcn_v5_0_1.c b/drivers/gpu/drm/amd/amdgpu/vcn_v5_0_1.c
+index bfe48e4a4859..512e5f6ae7b3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vcn_v5_0_1.c
++++ b/drivers/gpu/drm/amd/amdgpu/vcn_v5_0_1.c
+@@ -206,8 +206,10 @@ static int vcn_v5_0_1_hw_init(struct amdgpu_ip_block *ip_block)
+ static int vcn_v5_0_1_hw_fini(struct amdgpu_ip_block *ip_block)
+ {
+ 	struct amdgpu_device *adev = ip_block->adev;
++	int i;
+ 
+-	cancel_delayed_work_sync(&adev->vcn.idle_work);
++	for (i = 0; i < adev->vcn.num_vcn_inst; ++i)
++		cancel_delayed_work_sync(&adev->vcn.inst[i].idle_work);
+ 
+ 	return 0;
+ }
+-- 
+2.52.0
+
