@@ -1,0 +1,203 @@
+From: Yang Weijiang <weijiang.yang@intel.com>
+Date: Fri, 19 Sep 2025 15:32:35 -0700
+Subject: KVM: x86: Enable CET virtualization for VMX and advertise to
+ userspace
+Patch-mainline: v6.18-rc1
+Git-commit: e140467bbdafff84f1f346a7c59f404cd9782b82
+References: jsc#PED-15123
+
+Add support for the LOAD_CET_STATE VM-Enter and VM-Exit controls, the
+CET XFEATURE bits in XSS, and  advertise support for IBT and SHSTK to
+userspace.  Explicitly clear IBT and SHSTK onn SVM, as additional work is
+needed to enable CET on SVM, e.g. to context switch S_CET and other state.
+
+Disable KVM CET feature if unrestricted_guest is unsupported/disabled as
+KVM does not support emulating CET, as running without Unrestricted Guest
+can result in KVM emulating large swaths of guest code.  While it's highly
+unlikely any guest will trigger emulation while also utilizing IBT or
+SHSTK, there's zero reason to allow CET without Unrestricted Guest as that
+combination should only be possible when explicitly disabling
+unrestricted_guest for testing purposes.
+
+Disable CET if VMX_BASIC[bit56] == 0, i.e. if hardware strictly enforces
+the presence of an Error Code based on exception vector, as attempting to
+inject a #CP with an Error Code (#CP architecturally has an Error Code)
+will fail due to the #CP vector historically not having an Error Code.
+
+Clear S_CET and SSP-related VMCS on "reset" to emulate the architectural
+of CET MSRs and SSP being reset to 0 after RESET, power-up and INIT.  Note,
+KVM already clears guest CET state that is managed via XSTATE in
+kvm_xstate_reset().
+
+Signed-off-by: Yang Weijiang <weijiang.yang@intel.com>
+Signed-off-by: Mathias Krause <minipli@grsecurity.net>
+Tested-by: Mathias Krause <minipli@grsecurity.net>
+Tested-by: John Allen <john.allen@amd.com>
+Tested-by: Rick Edgecombe <rick.p.edgecombe@intel.com>
+Signed-off-by: Chao Gao <chao.gao@intel.com>
+[sean: move some bits to separate patches, massage changelog]
+Reviewed-by: Binbin Wu <binbin.wu@linux.intel.com>
+Reviewed-by: Xiaoyao Li <xiaoyao.li@intel.com>
+Link: https://lore.kernel.org/r/20250919223258.1604852-29-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Acked-by: Carlos López <clopez@suse.de>
+---
+ arch/x86/include/asm/vmx.h      |    1 +
+ arch/x86/kvm/cpuid.c            |    2 ++
+ arch/x86/kvm/svm/svm.c          |    4 ++++
+ arch/x86/kvm/vmx/capabilities.h |    5 +++++
+ arch/x86/kvm/vmx/vmx.c          |   30 +++++++++++++++++++++++++++++-
+ arch/x86/kvm/vmx/vmx.h          |    6 ++++--
+ 6 files changed, 45 insertions(+), 3 deletions(-)
+
+--- a/arch/x86/include/asm/vmx.h
++++ b/arch/x86/include/asm/vmx.h
+@@ -134,6 +134,7 @@
+ #define VMX_BASIC_DUAL_MONITOR_TREATMENT	BIT_ULL(49)
+ #define VMX_BASIC_INOUT				BIT_ULL(54)
+ #define VMX_BASIC_TRUE_CTLS			BIT_ULL(55)
++#define VMX_BASIC_NO_HW_ERROR_CODE_CC		BIT_ULL(56)
+ 
+ static inline u32 vmx_basic_vmcs_revision_id(u64 vmx_basic)
+ {
+--- a/arch/x86/kvm/cpuid.c
++++ b/arch/x86/kvm/cpuid.c
+@@ -940,6 +940,7 @@ void kvm_set_cpu_caps(void)
+ 		VENDOR_F(WAITPKG),
+ 		F(SGX_LC),
+ 		F(BUS_LOCK_DETECT),
++		X86_64_F(SHSTK),
+ 	);
+ 
+ 	/*
+@@ -974,6 +975,7 @@ void kvm_set_cpu_caps(void)
+ 		F(AMX_INT8),
+ 		F(AMX_BF16),
+ 		F(FLUSH_L1D),
++		F(IBT),
+ 	);
+ 
+ 	/*
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -5163,6 +5163,10 @@ static __init void svm_set_cpu_caps(void
+ 	kvm_caps.supported_perf_cap = 0;
+ 	kvm_caps.supported_xss = 0;
+ 
++	/* KVM doesn't yet support CET virtualization for SVM. */
++	kvm_cpu_cap_clear(X86_FEATURE_SHSTK);
++	kvm_cpu_cap_clear(X86_FEATURE_IBT);
++
+ 	/* CPUID 0x80000001 and 0x8000000A (SVM features) */
+ 	if (nested) {
+ 		kvm_cpu_cap_set(X86_FEATURE_SVM);
+--- a/arch/x86/kvm/vmx/capabilities.h
++++ b/arch/x86/kvm/vmx/capabilities.h
+@@ -77,6 +77,11 @@ static inline bool cpu_has_vmx_basic_ino
+ 	return	vmcs_config.basic & VMX_BASIC_INOUT;
+ }
+ 
++static inline bool cpu_has_vmx_basic_no_hw_errcode_cc(void)
++{
++	return	vmcs_config.basic & VMX_BASIC_NO_HW_ERROR_CODE_CC;
++}
++
+ static inline bool cpu_has_virtual_nmis(void)
+ {
+ 	return vmcs_config.pin_based_exec_ctrl & PIN_BASED_VIRTUAL_NMIS &&
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -2586,6 +2586,7 @@ static int setup_vmcs_config(struct vmcs
+ 		{ VM_ENTRY_LOAD_IA32_EFER,		VM_EXIT_LOAD_IA32_EFER },
+ 		{ VM_ENTRY_LOAD_BNDCFGS,		VM_EXIT_CLEAR_BNDCFGS },
+ 		{ VM_ENTRY_LOAD_IA32_RTIT_CTL,		VM_EXIT_CLEAR_IA32_RTIT_CTL },
++		{ VM_ENTRY_LOAD_CET_STATE,		VM_EXIT_LOAD_CET_STATE },
+ 	};
+ 
+ 	memset(vmcs_conf, 0, sizeof(*vmcs_conf));
+@@ -4879,6 +4880,14 @@ void vmx_vcpu_reset(struct kvm_vcpu *vcp
+ 
+ 	vmcs_write32(VM_ENTRY_INTR_INFO_FIELD, 0);  /* 22.2.1 */
+ 
++	if (kvm_cpu_cap_has(X86_FEATURE_SHSTK)) {
++		vmcs_writel(GUEST_SSP, 0);
++		vmcs_writel(GUEST_INTR_SSP_TABLE, 0);
++	}
++	if (kvm_cpu_cap_has(X86_FEATURE_IBT) ||
++	    kvm_cpu_cap_has(X86_FEATURE_SHSTK))
++		vmcs_writel(GUEST_S_CET, 0);
++
+ 	kvm_make_request(KVM_REQ_APIC_PAGE_RELOAD, vcpu);
+ 
+ 	vpid_sync_context(vmx->vpid);
+@@ -6296,6 +6305,10 @@ void dump_vmcs(struct kvm_vcpu *vcpu)
+ 	if (vmcs_read32(VM_EXIT_MSR_STORE_COUNT) > 0)
+ 		vmx_dump_msrs("guest autostore", &vmx->msr_autostore.guest);
+ 
++	if (vmentry_ctl & VM_ENTRY_LOAD_CET_STATE)
++		pr_err("S_CET = 0x%016lx, SSP = 0x%016lx, SSP TABLE = 0x%016lx\n",
++		       vmcs_readl(GUEST_S_CET), vmcs_readl(GUEST_SSP),
++		       vmcs_readl(GUEST_INTR_SSP_TABLE));
+ 	pr_err("*** Host State ***\n");
+ 	pr_err("RIP = 0x%016lx  RSP = 0x%016lx\n",
+ 	       vmcs_readl(HOST_RIP), vmcs_readl(HOST_RSP));
+@@ -6326,6 +6339,10 @@ void dump_vmcs(struct kvm_vcpu *vcpu)
+ 		       vmcs_read64(HOST_IA32_PERF_GLOBAL_CTRL));
+ 	if (vmcs_read32(VM_EXIT_MSR_LOAD_COUNT) > 0)
+ 		vmx_dump_msrs("host autoload", &vmx->msr_autoload.host);
++	if (vmexit_ctl & VM_EXIT_LOAD_CET_STATE)
++		pr_err("S_CET = 0x%016lx, SSP = 0x%016lx, SSP TABLE = 0x%016lx\n",
++		       vmcs_readl(HOST_S_CET), vmcs_readl(HOST_SSP),
++		       vmcs_readl(HOST_INTR_SSP_TABLE));
+ 
+ 	pr_err("*** Control State ***\n");
+ 	pr_err("CPUBased=0x%08x SecondaryExec=0x%08x TertiaryExec=0x%016llx\n",
+@@ -7900,7 +7917,6 @@ static __init void vmx_set_cpu_caps(void
+ 		kvm_cpu_cap_set(X86_FEATURE_UMIP);
+ 
+ 	/* CPUID 0xD.1 */
+-	kvm_caps.supported_xss = 0;
+ 	if (!cpu_has_vmx_xsaves())
+ 		kvm_cpu_cap_clear(X86_FEATURE_XSAVES);
+ 
+@@ -7912,6 +7928,18 @@ static __init void vmx_set_cpu_caps(void
+ 
+ 	if (cpu_has_vmx_waitpkg())
+ 		kvm_cpu_cap_check_and_set(X86_FEATURE_WAITPKG);
++
++	/*
++	 * Disable CET if unrestricted_guest is unsupported as KVM doesn't
++	 * enforce CET HW behaviors in emulator. On platforms with
++	 * VMX_BASIC[bit56] == 0, inject #CP at VMX entry with error code
++	 * fails, so disable CET in this case too.
++	 */
++	if (!cpu_has_load_cet_ctrl() || !enable_unrestricted_guest ||
++	    !cpu_has_vmx_basic_no_hw_errcode_cc()) {
++		kvm_cpu_cap_clear(X86_FEATURE_SHSTK);
++		kvm_cpu_cap_clear(X86_FEATURE_IBT);
++	}
+ }
+ 
+ static int vmx_check_intercept_io(struct kvm_vcpu *vcpu,
+--- a/arch/x86/kvm/vmx/vmx.h
++++ b/arch/x86/kvm/vmx/vmx.h
+@@ -481,7 +481,8 @@ static inline u8 vmx_get_rvi(void)
+ 	 VM_ENTRY_LOAD_IA32_EFER |					\
+ 	 VM_ENTRY_LOAD_BNDCFGS |					\
+ 	 VM_ENTRY_PT_CONCEAL_PIP |					\
+-	 VM_ENTRY_LOAD_IA32_RTIT_CTL)
++	 VM_ENTRY_LOAD_IA32_RTIT_CTL |					\
++	 VM_ENTRY_LOAD_CET_STATE)
+ 
+ #define __KVM_REQUIRED_VMX_VM_EXIT_CONTROLS				\
+ 	(VM_EXIT_SAVE_DEBUG_CONTROLS |					\
+@@ -503,7 +504,8 @@ static inline u8 vmx_get_rvi(void)
+ 	       VM_EXIT_LOAD_IA32_EFER |					\
+ 	       VM_EXIT_CLEAR_BNDCFGS |					\
+ 	       VM_EXIT_PT_CONCEAL_PIP |					\
+-	       VM_EXIT_CLEAR_IA32_RTIT_CTL)
++	       VM_EXIT_CLEAR_IA32_RTIT_CTL |				\
++	       VM_EXIT_LOAD_CET_STATE)
+ 
+ #define KVM_REQUIRED_VMX_PIN_BASED_VM_EXEC_CONTROL			\
+ 	(PIN_BASED_EXT_INTR_MASK |					\
