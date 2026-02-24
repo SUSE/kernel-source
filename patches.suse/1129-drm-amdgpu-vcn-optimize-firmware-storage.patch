@@ -1,0 +1,112 @@
+From c51aa7923e28f30519a16bf89ed3c4f27460835c Mon Sep 17 00:00:00 2001
+From: Alex Deucher <alexander.deucher@amd.com>
+Date: Tue, 7 Jan 2025 12:16:28 -0500
+Subject: drm/amdgpu/vcn: optimize firmware storage
+Git-commit: c51aa7923e28f30519a16bf89ed3c4f27460835c
+Patch-mainline: v6.15-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+If each instance uses the same fw image, only store one
+copy in the driver.
+
+Acked-by: Boyuan Zhang <Boyuan.Zhang@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c | 30 +++++++++++++++++--------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.h |  4 +++-
+ drivers/gpu/drm/amd/amdgpu/vcn_v4_0_5.c |  3 +++
+ 3 files changed, 27 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c
+index e4ef0fb970b2..edbcb11c382a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c
+@@ -102,18 +102,25 @@ int amdgpu_vcn_early_init(struct amdgpu_device *adev, int i)
+ 	adev->vcn.inst[i].inst = i;
+ 	amdgpu_ucode_ip_version_decode(adev, UVD_HWIP, ucode_prefix, sizeof(ucode_prefix));
+ 
+-	if (i == 1 && amdgpu_ip_version(adev, UVD_HWIP, 0) ==  IP_VERSION(4, 0, 6))
++	if (i != 0 && adev->vcn.per_inst_fw) {
+ 		r = amdgpu_ucode_request(adev, &adev->vcn.inst[i].fw,
+ 					 AMDGPU_UCODE_REQUIRED,
+ 					 "amdgpu/%s_%d.bin", ucode_prefix, i);
+-	else
+-		r = amdgpu_ucode_request(adev, &adev->vcn.inst[i].fw,
+-					 AMDGPU_UCODE_REQUIRED,
+-					 "amdgpu/%s.bin", ucode_prefix);
+-	if (r) {
+-		amdgpu_ucode_release(&adev->vcn.inst[i].fw);
+-		return r;
++		if (r)
++			amdgpu_ucode_release(&adev->vcn.inst[i].fw);
++	} else {
++		if (!adev->vcn.inst[0].fw) {
++			r = amdgpu_ucode_request(adev, &adev->vcn.inst[0].fw,
++						 AMDGPU_UCODE_REQUIRED,
++						 "amdgpu/%s.bin", ucode_prefix);
++			if (r)
++				amdgpu_ucode_release(&adev->vcn.inst[0].fw);
++		} else {
++			r = 0;
++		}
++		adev->vcn.inst[i].fw = adev->vcn.inst[0].fw;
+ 	}
++
+ 	return r;
+ }
+ 
+@@ -270,7 +277,12 @@ int amdgpu_vcn_sw_fini(struct amdgpu_device *adev, int i)
+ 	for (j = 0; j < adev->vcn.inst[i].num_enc_rings; ++j)
+ 		amdgpu_ring_fini(&adev->vcn.inst[i].ring_enc[j]);
+ 
+-	amdgpu_ucode_release(&adev->vcn.inst[i].fw);
++	if (adev->vcn.per_inst_fw) {
++		amdgpu_ucode_release(&adev->vcn.inst[i].fw);
++	} else {
++		amdgpu_ucode_release(&adev->vcn.inst[0].fw);
++		adev->vcn.inst[i].fw = NULL;
++	}
+ 	mutex_destroy(&adev->vcn.inst[i].vcn_pg_lock);
+ 	mutex_destroy(&adev->vcn.inst[i].vcn1_jpeg1_workaround);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.h
+index a023f46ec904..26c9c2d90f45 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.h
+@@ -339,7 +339,6 @@ struct amdgpu_vcn_ras {
+ };
+ 
+ struct amdgpu_vcn {
+-	unsigned		fw_version;
+ 	uint8_t	num_vcn_inst;
+ 	struct amdgpu_vcn_inst	 inst[AMDGPU_MAX_VCN_INSTANCES];
+ 
+@@ -356,6 +355,9 @@ struct amdgpu_vcn {
+ 
+ 	uint32_t		supported_reset;
+ 	uint32_t		caps;
++
++	bool			per_inst_fw;
++	unsigned		fw_version;
+ };
+ 
+ struct amdgpu_fw_shared_rb_ptrs_struct {
+diff --git a/drivers/gpu/drm/amd/amdgpu/vcn_v4_0_5.c b/drivers/gpu/drm/amd/amdgpu/vcn_v4_0_5.c
+index 0aac132a56d3..ba603b2246e2 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vcn_v4_0_5.c
++++ b/drivers/gpu/drm/amd/amdgpu/vcn_v4_0_5.c
+@@ -114,6 +114,9 @@ static int vcn_v4_0_5_early_init(struct amdgpu_ip_block *ip_block)
+ 	struct amdgpu_device *adev = ip_block->adev;
+ 	int i, r;
+ 
++	if (amdgpu_ip_version(adev, UVD_HWIP, 0) == IP_VERSION(4, 0, 6))
++		adev->vcn.per_inst_fw = true;
++
+ 	for (i = 0; i < adev->vcn.num_vcn_inst; ++i)
+ 		/* re-use enc ring as unified ring */
+ 		adev->vcn.inst[i].num_enc_rings = 1;
+-- 
+2.52.0
+
