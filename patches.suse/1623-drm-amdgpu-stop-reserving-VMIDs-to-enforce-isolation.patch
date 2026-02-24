@@ -1,0 +1,112 @@
+From db1e58ec86c6e533f983abdbd43145f2ec16bbb8 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Mon, 27 Jan 2025 16:27:51 +0100
+Subject: drm/amdgpu: stop reserving VMIDs to enforce isolation
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: db1e58ec86c6e533f983abdbd43145f2ec16bbb8
+Patch-mainline: v6.15-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+That was quite troublesome for gang submit. Completely drop this
+approach and enforce the isolation separately.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Acked-by: Srinivasan Shanmugam <srinivasan.shanmugam@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c  |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c |  9 +--------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ids.c | 11 +++--------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ids.h |  3 +--
+ 4 files changed, 6 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index 4a5b406601fa..82df06a72ee0 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -1111,7 +1111,7 @@ static int amdgpu_cs_vm_handling(struct amdgpu_cs_parser *p)
+ 			struct drm_gpu_scheduler *sched = entity->rq->sched;
+ 			struct amdgpu_ring *ring = to_amdgpu_ring(sched);
+ 
+-			if (amdgpu_vmid_uses_reserved(adev, vm, ring->vm_hub))
++			if (amdgpu_vmid_uses_reserved(vm, ring->vm_hub))
+ 				return -EINVAL;
+ 		}
+ 	}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
+index 4beb0609e703..72af5e5a894a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
+@@ -1665,15 +1665,8 @@ static ssize_t amdgpu_gfx_set_enforce_isolation(struct device *dev,
+ 	}
+ 
+ 	mutex_lock(&adev->enforce_isolation_mutex);
+-	for (i = 0; i < num_partitions; i++) {
+-		if (adev->enforce_isolation[i] && !partition_values[i])
+-			/* Going from enabled to disabled */
+-			amdgpu_vmid_free_reserved(adev, AMDGPU_GFXHUB(i));
+-		else if (!adev->enforce_isolation[i] && partition_values[i])
+-			/* Going from disabled to enabled */
+-			amdgpu_vmid_alloc_reserved(adev, AMDGPU_GFXHUB(i));
++	for (i = 0; i < num_partitions; i++)
+ 		adev->enforce_isolation[i] = partition_values[i];
+-	}
+ 	mutex_unlock(&adev->enforce_isolation_mutex);
+ 
+ 	amdgpu_mes_update_enforce_isolation(adev);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ids.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ids.c
+index 92ab821afc06..4c4e087230ac 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ids.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ids.c
+@@ -411,7 +411,7 @@ int amdgpu_vmid_grab(struct amdgpu_vm *vm, struct amdgpu_ring *ring,
+ 	if (r || !idle)
+ 		goto error;
+ 
+-	if (amdgpu_vmid_uses_reserved(adev, vm, vmhub)) {
++	if (amdgpu_vmid_uses_reserved(vm, vmhub)) {
+ 		r = amdgpu_vmid_grab_reserved(vm, ring, job, &id, fence);
+ 		if (r || !id)
+ 			goto error;
+@@ -464,19 +464,14 @@ int amdgpu_vmid_grab(struct amdgpu_vm *vm, struct amdgpu_ring *ring,
+ 
+ /*
+  * amdgpu_vmid_uses_reserved - check if a VM will use a reserved VMID
+- * @adev: amdgpu_device pointer
+  * @vm: the VM to check
+  * @vmhub: the VMHUB which will be used
+  *
+  * Returns: True if the VM will use a reserved VMID.
+  */
+-bool amdgpu_vmid_uses_reserved(struct amdgpu_device *adev,
+-			       struct amdgpu_vm *vm, unsigned int vmhub)
++bool amdgpu_vmid_uses_reserved(struct amdgpu_vm *vm, unsigned int vmhub)
+ {
+-	return vm->reserved_vmid[vmhub] ||
+-		(adev->enforce_isolation[(vm->root.bo->xcp_id != AMDGPU_XCP_NO_PARTITION) ?
+-					 vm->root.bo->xcp_id : 0] &&
+-		 AMDGPU_IS_GFXHUB(vmhub));
++	return vm->reserved_vmid[vmhub];
+ }
+ 
+ int amdgpu_vmid_alloc_reserved(struct amdgpu_device *adev,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ids.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ids.h
+index 4012fb2dd08a..240fa6751260 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ids.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ids.h
+@@ -78,8 +78,7 @@ void amdgpu_pasid_free_delayed(struct dma_resv *resv,
+ 
+ bool amdgpu_vmid_had_gpu_reset(struct amdgpu_device *adev,
+ 			       struct amdgpu_vmid *id);
+-bool amdgpu_vmid_uses_reserved(struct amdgpu_device *adev,
+-			       struct amdgpu_vm *vm, unsigned int vmhub);
++bool amdgpu_vmid_uses_reserved(struct amdgpu_vm *vm, unsigned int vmhub);
+ int amdgpu_vmid_alloc_reserved(struct amdgpu_device *adev,
+ 				unsigned vmhub);
+ void amdgpu_vmid_free_reserved(struct amdgpu_device *adev,
+-- 
+2.52.0
+
