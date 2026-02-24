@@ -1,0 +1,152 @@
+From 1524c28b995279db7f01abda7bf0fd26e47aefba Mon Sep 17 00:00:00 2001
+From: Andrzej Kacprowski <Andrzej.Kacprowski@intel.com>
+Date: Tue, 1 Apr 2025 17:59:12 +0200
+Subject: accel/ivpu: Show NPU frequency in sysfs
+Git-commit: 1524c28b995279db7f01abda7bf0fd26e47aefba
+Patch-mainline: v6.15-rc3
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Add sysfs files that show maximum and current
+frequency of the NPU's data processing unit.
+New sysfs entries:
+- npu_max_frequency_mhz
+- npu_current_frequency_mhz
+
+Signed-off-by: Andrzej Kacprowski <Andrzej.Kacprowski@intel.com>
+Signed-off-by: Maciej Falkowski <maciej.falkowski@linux.intel.com>
+Reviewed-by: Jacek Lawrynowicz <jacek.lawrynowicz@linux.intel.com>
+Signed-off-by: Jacek Lawrynowicz <jacek.lawrynowicz@linux.intel.com>
+Link: https://lore.kernel.org/r/20250401155912.4049340-3-maciej.falkowski@linux.intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/accel/ivpu/ivpu_hw.h      |  5 ++++
+ drivers/accel/ivpu/ivpu_hw_btrs.c |  8 +++++
+ drivers/accel/ivpu/ivpu_hw_btrs.h |  1 +
+ drivers/accel/ivpu/ivpu_sysfs.c   | 49 ++++++++++++++++++++++++++++++-
+ 4 files changed, 62 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/accel/ivpu/ivpu_hw.h b/drivers/accel/ivpu/ivpu_hw.h
+index 6e67e736ef8e..d79668fe1609 100644
+--- a/drivers/accel/ivpu/ivpu_hw.h
++++ b/drivers/accel/ivpu/ivpu_hw.h
+@@ -87,6 +87,11 @@ static inline u32 ivpu_hw_dpu_max_freq_get(struct ivpu_device *vdev)
+ 	return ivpu_hw_btrs_dpu_max_freq_get(vdev);
+ }
+ 
++static inline u32 ivpu_hw_dpu_freq_get(struct ivpu_device *vdev)
++{
++	return ivpu_hw_btrs_dpu_freq_get(vdev);
++}
++
+ static inline void ivpu_hw_irq_clear(struct ivpu_device *vdev)
+ {
+ 	ivpu_hw_ip_irq_clear(vdev);
+diff --git a/drivers/accel/ivpu/ivpu_hw_btrs.c b/drivers/accel/ivpu/ivpu_hw_btrs.c
+index 91eb8a93c15b..b236c7234daa 100644
+--- a/drivers/accel/ivpu/ivpu_hw_btrs.c
++++ b/drivers/accel/ivpu/ivpu_hw_btrs.c
+@@ -606,6 +606,14 @@ u32 ivpu_hw_btrs_dpu_max_freq_get(struct ivpu_device *vdev)
+ 	return pll_ratio_to_dpu_freq(vdev, vdev->hw->pll.max_ratio);
+ }
+ 
++u32 ivpu_hw_btrs_dpu_freq_get(struct ivpu_device *vdev)
++{
++	if (ivpu_hw_btrs_gen(vdev) == IVPU_HW_BTRS_MTL)
++		return pll_ratio_to_dpu_freq_mtl(pll_config_get_mtl(vdev));
++	else
++		return pll_ratio_to_dpu_freq_lnl(pll_config_get_lnl(vdev));
++}
++
+ /* Handler for IRQs from Buttress core (irqB) */
+ bool ivpu_hw_btrs_irq_handler_mtl(struct ivpu_device *vdev, int irq)
+ {
+diff --git a/drivers/accel/ivpu/ivpu_hw_btrs.h b/drivers/accel/ivpu/ivpu_hw_btrs.h
+index a2f0877237e8..300f749971d4 100644
+--- a/drivers/accel/ivpu/ivpu_hw_btrs.h
++++ b/drivers/accel/ivpu/ivpu_hw_btrs.h
+@@ -32,6 +32,7 @@ void ivpu_hw_btrs_profiling_freq_reg_set_lnl(struct ivpu_device *vdev);
+ void ivpu_hw_btrs_ats_print_lnl(struct ivpu_device *vdev);
+ void ivpu_hw_btrs_clock_relinquish_disable_lnl(struct ivpu_device *vdev);
+ u32 ivpu_hw_btrs_dpu_max_freq_get(struct ivpu_device *vdev);
++u32 ivpu_hw_btrs_dpu_freq_get(struct ivpu_device *vdev);
+ bool ivpu_hw_btrs_irq_handler_mtl(struct ivpu_device *vdev, int irq);
+ bool ivpu_hw_btrs_irq_handler_lnl(struct ivpu_device *vdev, int irq);
+ int ivpu_hw_btrs_dct_get_request(struct ivpu_device *vdev, bool *enable);
+diff --git a/drivers/accel/ivpu/ivpu_sysfs.c b/drivers/accel/ivpu/ivpu_sysfs.c
+index 97102feaf8dd..268ab7744a8b 100644
+--- a/drivers/accel/ivpu/ivpu_sysfs.c
++++ b/drivers/accel/ivpu/ivpu_sysfs.c
+@@ -1,10 +1,12 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /*
+- * Copyright (C) 2024 Intel Corporation
++ * Copyright (C) 2024-2025 Intel Corporation
+  */
+ 
+ #include <linux/device.h>
+ #include <linux/err.h>
++#include <linux/pm_runtime.h>
++#include <linux/units.h>
+ 
+ #include "ivpu_drv.h"
+ #include "ivpu_gem.h"
+@@ -90,10 +92,55 @@ sched_mode_show(struct device *dev, struct device_attribute *attr, char *buf)
+ 
+ static DEVICE_ATTR_RO(sched_mode);
+ 
++/**
++ * DOC: npu_max_frequency
++ *
++ * The npu_max_frequency shows maximum frequency in MHz of the NPU's data
++ * processing unit
++ */
++static ssize_t
++npu_max_frequency_mhz_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct drm_device *drm = dev_get_drvdata(dev);
++	struct ivpu_device *vdev = to_ivpu_device(drm);
++	u32 freq = ivpu_hw_dpu_max_freq_get(vdev);
++
++	return sysfs_emit(buf, "%lu\n", freq / HZ_PER_MHZ);
++}
++
++static DEVICE_ATTR_RO(npu_max_frequency_mhz);
++
++/**
++ * DOC: npu_current_frequency_mhz
++ *
++ * The npu_current_frequency_mhz shows current frequency in MHz of the NPU's
++ * data processing unit
++ */
++static ssize_t
++npu_current_frequency_mhz_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct drm_device *drm = dev_get_drvdata(dev);
++	struct ivpu_device *vdev = to_ivpu_device(drm);
++	u32 freq = 0;
++
++	/* Read frequency only if device is active, otherwise frequency is 0 */
++	if (pm_runtime_get_if_active(vdev->drm.dev) > 0) {
++		freq = ivpu_hw_dpu_freq_get(vdev);
++
++		pm_runtime_put_autosuspend(vdev->drm.dev);
++	}
++
++	return sysfs_emit(buf, "%lu\n", freq / HZ_PER_MHZ);
++}
++
++static DEVICE_ATTR_RO(npu_current_frequency_mhz);
++
+ static struct attribute *ivpu_dev_attrs[] = {
+ 	&dev_attr_npu_busy_time_us.attr,
+ 	&dev_attr_npu_memory_utilization.attr,
+ 	&dev_attr_sched_mode.attr,
++	&dev_attr_npu_max_frequency_mhz.attr,
++	&dev_attr_npu_current_frequency_mhz.attr,
+ 	NULL,
+ };
+ 
+-- 
+2.52.0
+
