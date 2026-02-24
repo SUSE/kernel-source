@@ -1,0 +1,244 @@
+From 63f6e480d11592933a73eefe90bcae4684f26f11 Mon Sep 17 00:00:00 2001
+From: Matthew Brost <matthew.brost@intel.com>
+Date: Wed, 5 Mar 2025 17:26:40 -0800
+Subject: drm/xe: Add SVM garbage collector
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 63f6e480d11592933a73eefe90bcae4684f26f11
+Patch-mainline: v6.15-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Add basic SVM garbage collector which destroy a SVM range upon a MMU
+UNMAP event. The garbage collector runs on worker or in GPU fault
+handler and is required as locks in the path of reclaim are required and
+cannot be taken the notifier.
+
+V2: - Flush garbage collector in xe_svm_close
+V3: - Better commit message (Thomas)
+ - Kernel doc (Thomas)
+ - Use list_first_entry_or_null for garbage collector loop (Thomas)
+ - Don't add to garbage collector if VM is closed (Thomas)
+V4: - Use %pe to print error (Thomas)
+V5: - s/visable/visible (Thomas)
+
+Signed-off-by: Matthew Brost <matthew.brost@intel.com>
+Reviewed-by: Thomas Hellström <thomas.hellstrom@linux.intel.com>
+Reviewed-by: Himal Prasad Ghimiray <himal.prasad.ghimiray@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250306012657.3505757-16-matthew.brost@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/xe/xe_svm.c      | 91 +++++++++++++++++++++++++++++++-
+ drivers/gpu/drm/xe/xe_svm.h      |  5 ++
+ drivers/gpu/drm/xe/xe_vm.c       |  4 ++
+ drivers/gpu/drm/xe/xe_vm_types.h | 18 +++++++
+ 4 files changed, 116 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_svm.c b/drivers/gpu/drm/xe/xe_svm.c
+index 401583cf8e73..6d1c811ced6f 100644
+--- a/drivers/gpu/drm/xe/xe_svm.c
++++ b/drivers/gpu/drm/xe/xe_svm.c
+@@ -38,6 +38,7 @@ xe_svm_range_alloc(struct drm_gpusvm *gpusvm)
+ 	if (!range)
+ 		return ERR_PTR(-ENOMEM);
+ 
++	INIT_LIST_HEAD(&range->garbage_collector_link);
+ 	xe_vm_get(gpusvm_to_vm(gpusvm));
+ 
+ 	return &range->base;
+@@ -54,6 +55,24 @@ static struct xe_svm_range *to_xe_range(struct drm_gpusvm_range *r)
+ 	return container_of(r, struct xe_svm_range, base);
+ }
+ 
++static void
++xe_svm_garbage_collector_add_range(struct xe_vm *vm, struct xe_svm_range *range,
++				   const struct mmu_notifier_range *mmu_range)
++{
++	struct xe_device *xe = vm->xe;
++
++	drm_gpusvm_range_set_unmapped(&range->base, mmu_range);
++
++	spin_lock(&vm->svm.garbage_collector.lock);
++	if (list_empty(&range->garbage_collector_link))
++		list_add_tail(&range->garbage_collector_link,
++			      &vm->svm.garbage_collector.range_list);
++	spin_unlock(&vm->svm.garbage_collector.lock);
++
++	queue_work(xe_device_get_root_tile(xe)->primary_gt->usm.pf_wq,
++		   &vm->svm.garbage_collector.work);
++}
++
+ static u8
+ xe_svm_range_notifier_event_begin(struct xe_vm *vm, struct drm_gpusvm_range *r,
+ 				  const struct mmu_notifier_range *mmu_range,
+@@ -98,7 +117,9 @@ xe_svm_range_notifier_event_end(struct xe_vm *vm, struct drm_gpusvm_range *r,
+ 	xe_svm_assert_in_notifier(vm);
+ 
+ 	drm_gpusvm_range_unmap_pages(&vm->svm.gpusvm, r, &ctx);
+-	/* TODO: Add range to garbage collector if VM is not closed */
++	if (!xe_vm_is_closed(vm) && mmu_range->event == MMU_NOTIFY_UNMAP)
++		xe_svm_garbage_collector_add_range(vm, to_xe_range(r),
++						   mmu_range);
+ }
+ 
+ static void xe_svm_invalidate(struct drm_gpusvm *gpusvm,
+@@ -198,6 +219,63 @@ static void xe_svm_invalidate(struct drm_gpusvm *gpusvm,
+ 		xe_svm_range_notifier_event_end(vm, r, mmu_range);
+ }
+ 
++static int __xe_svm_garbage_collector(struct xe_vm *vm,
++				      struct xe_svm_range *range)
++{
++	/* TODO: Do unbind */
++
++	drm_gpusvm_range_remove(&vm->svm.gpusvm, &range->base);
++
++	return 0;
++}
++
++static int xe_svm_garbage_collector(struct xe_vm *vm)
++{
++	struct xe_svm_range *range;
++	int err;
++
++	lockdep_assert_held_write(&vm->lock);
++
++	if (xe_vm_is_closed_or_banned(vm))
++		return -ENOENT;
++
++	spin_lock(&vm->svm.garbage_collector.lock);
++	for (;;) {
++		range = list_first_entry_or_null(&vm->svm.garbage_collector.range_list,
++						 typeof(*range),
++						 garbage_collector_link);
++		if (!range)
++			break;
++
++		list_del(&range->garbage_collector_link);
++		spin_unlock(&vm->svm.garbage_collector.lock);
++
++		err = __xe_svm_garbage_collector(vm, range);
++		if (err) {
++			drm_warn(&vm->xe->drm,
++				 "Garbage collection failed: %pe\n",
++				 ERR_PTR(err));
++			xe_vm_kill(vm, true);
++			return err;
++		}
++
++		spin_lock(&vm->svm.garbage_collector.lock);
++	}
++	spin_unlock(&vm->svm.garbage_collector.lock);
++
++	return 0;
++}
++
++static void xe_svm_garbage_collector_work_func(struct work_struct *w)
++{
++	struct xe_vm *vm = container_of(w, struct xe_vm,
++					svm.garbage_collector.work);
++
++	down_write(&vm->lock);
++	xe_svm_garbage_collector(vm);
++	up_write(&vm->lock);
++}
++
+ static const struct drm_gpusvm_ops gpusvm_ops = {
+ 	.range_alloc = xe_svm_range_alloc,
+ 	.range_free = xe_svm_range_free,
+@@ -222,6 +300,11 @@ int xe_svm_init(struct xe_vm *vm)
+ {
+ 	int err;
+ 
++	spin_lock_init(&vm->svm.garbage_collector.lock);
++	INIT_LIST_HEAD(&vm->svm.garbage_collector.range_list);
++	INIT_WORK(&vm->svm.garbage_collector.work,
++		  xe_svm_garbage_collector_work_func);
++
+ 	err = drm_gpusvm_init(&vm->svm.gpusvm, "Xe SVM", &vm->xe->drm,
+ 			      current->mm, NULL, 0, vm->size,
+ 			      SZ_512M, &gpusvm_ops, fault_chunk_sizes,
+@@ -243,6 +326,7 @@ int xe_svm_init(struct xe_vm *vm)
+ void xe_svm_close(struct xe_vm *vm)
+ {
+ 	xe_assert(vm->xe, xe_vm_is_closed(vm));
++	flush_work(&vm->svm.garbage_collector.work);
+ }
+ 
+ /**
+@@ -292,7 +376,10 @@ int xe_svm_handle_pagefault(struct xe_vm *vm, struct xe_vma *vma,
+ 	xe_assert(vm->xe, xe_vma_is_cpu_addr_mirror(vma));
+ 
+ retry:
+-	/* TODO: Run garbage collector */
++	/* Always process UNMAPs first so view SVM ranges is current */
++	err = xe_svm_garbage_collector(vm);
++	if (err)
++		return err;
+ 
+ 	r = drm_gpusvm_range_find_or_insert(&vm->svm.gpusvm, fault_addr,
+ 					    xe_vma_start(vma), xe_vma_end(vma),
+diff --git a/drivers/gpu/drm/xe/xe_svm.h b/drivers/gpu/drm/xe/xe_svm.h
+index e03699becb3d..87cbda5641bb 100644
+--- a/drivers/gpu/drm/xe/xe_svm.h
++++ b/drivers/gpu/drm/xe/xe_svm.h
+@@ -19,6 +19,11 @@ struct xe_vma;
+ struct xe_svm_range {
+ 	/** @base: base drm_gpusvm_range */
+ 	struct drm_gpusvm_range base;
++	/**
++	 * @garbage_collector_link: Link into VM's garbage collect SVM range
++	 * list. Protected by VM's garbage collect lock.
++	 */
++	struct list_head garbage_collector_link;
+ 	/**
+ 	 * @tile_present: Tile mask of binding is present for this range.
+ 	 * Protected by GPU SVM notifier lock.
+diff --git a/drivers/gpu/drm/xe/xe_vm.c b/drivers/gpu/drm/xe/xe_vm.c
+index f96d5cb4a5de..355bf8d61672 100644
+--- a/drivers/gpu/drm/xe/xe_vm.c
++++ b/drivers/gpu/drm/xe/xe_vm.c
+@@ -3217,6 +3217,10 @@ int xe_vm_bind_ioctl(struct drm_device *dev, void *data, struct drm_file *file)
+ 		}
+ 	}
+ 
++	/* Ensure all UNMAPs visible */
++	if (xe_vm_in_fault_mode(vm))
++		flush_work(&vm->svm.garbage_collector.work);
++
+ 	err = down_write_killable(&vm->lock);
+ 	if (err)
+ 		goto put_exec_queue;
+diff --git a/drivers/gpu/drm/xe/xe_vm_types.h b/drivers/gpu/drm/xe/xe_vm_types.h
+index c9009b7db585..3b1058f6aa3b 100644
+--- a/drivers/gpu/drm/xe/xe_vm_types.h
++++ b/drivers/gpu/drm/xe/xe_vm_types.h
+@@ -150,6 +150,24 @@ struct xe_vm {
+ 	struct {
+ 		/** @svm.gpusvm: base GPUSVM used to track fault allocations */
+ 		struct drm_gpusvm gpusvm;
++		/**
++		 * @svm.garbage_collector: Garbage collector which is used unmap
++		 * SVM range's GPU bindings and destroy the ranges.
++		 */
++		struct {
++			/** @svm.garbage_collector.lock: Protect's range list */
++			spinlock_t lock;
++			/**
++			 * @svm.garbage_collector.range_list: List of SVM ranges
++			 * in the garbage collector.
++			 */
++			struct list_head range_list;
++			/**
++			 * @svm.garbage_collector.work: Worker which the
++			 * garbage collector runs on.
++			 */
++			struct work_struct work;
++		} garbage_collector;
+ 	} svm;
+ 
+ 	struct xe_device *xe;
+-- 
+2.52.0
+
