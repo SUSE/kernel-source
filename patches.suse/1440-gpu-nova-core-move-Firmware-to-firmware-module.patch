@@ -1,0 +1,154 @@
+From 61479ae38cb7bf6083de302598b7d491ec54168a Mon Sep 17 00:00:00 2001
+From: Alexandre Courbot <acourbot@nvidia.com>
+Date: Wed, 7 May 2025 22:52:34 +0900
+Subject: gpu: nova-core: move Firmware to firmware module
+Git-commit: 61479ae38cb7bf6083de302598b7d491ec54168a
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+We will extend the firmware methods, so move it to its own module
+instead to keep gpu.rs focused.
+
+Signed-off-by: Alexandre Courbot <acourbot@nvidia.com>
+Link: https://lore.kernel.org/r/20250507-nova-frts-v3-7-fcb02749754d@nvidia.com
+[ Don't require a bound device, remove pub visibility from Firmware
+  fields, use FIRMWARE_VERSION consistently. - Danilo ]
+
+Signed-off-by: Danilo Krummrich <dakr@kernel.org>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/nova-core/firmware.rs | 44 ++++++++++++++++++++++++++++---
+ drivers/gpu/nova-core/gpu.rs      | 35 +++---------------------
+ 2 files changed, 43 insertions(+), 36 deletions(-)
+
+diff --git a/drivers/gpu/nova-core/firmware.rs b/drivers/gpu/nova-core/firmware.rs
+index 6e6361c59ca1..4b8a38358a4f 100644
+--- a/drivers/gpu/nova-core/firmware.rs
++++ b/drivers/gpu/nova-core/firmware.rs
+@@ -1,13 +1,49 @@
+ // SPDX-License-Identifier: GPL-2.0
+ 
+-use crate::gpu;
++//! Contains structures and functions dedicated to the parsing, building and patching of firmwares
++//! to be loaded into a given execution unit.
++
++use kernel::device;
+ use kernel::firmware;
++use kernel::prelude::*;
++use kernel::str::CString;
++
++use crate::gpu;
++use crate::gpu::Chipset;
++
++pub(crate) const FIRMWARE_VERSION: &str = "535.113.01";
++
++/// Structure encapsulating the firmware blobs required for the GPU to operate.
++#[expect(dead_code)]
++pub(crate) struct Firmware {
++    booter_load: firmware::Firmware,
++    booter_unload: firmware::Firmware,
++    bootloader: firmware::Firmware,
++    gsp: firmware::Firmware,
++}
++
++impl Firmware {
++    pub(crate) fn new(dev: &device::Device, chipset: Chipset, ver: &str) -> Result<Firmware> {
++        let mut chip_name = CString::try_from_fmt(fmt!("{}", chipset))?;
++        chip_name.make_ascii_lowercase();
++
++        let request = |name_| {
++            CString::try_from_fmt(fmt!("nvidia/{}/gsp/{}-{}.bin", &*chip_name, name_, ver))
++                .and_then(|path| firmware::Firmware::request(&path, dev))
++        };
++
++        Ok(Firmware {
++            booter_load: request("booter_load")?,
++            booter_unload: request("booter_unload")?,
++            bootloader: request("bootloader")?,
++            gsp: request("gsp")?,
++        })
++    }
++}
+ 
+ pub(crate) struct ModInfoBuilder<const N: usize>(firmware::ModInfoBuilder<N>);
+ 
+ impl<const N: usize> ModInfoBuilder<N> {
+-    const VERSION: &'static str = "535.113.01";
+-
+     const fn make_entry_file(self, chipset: &str, fw: &str) -> Self {
+         ModInfoBuilder(
+             self.0
+@@ -17,7 +53,7 @@ const fn make_entry_file(self, chipset: &str, fw: &str) -> Self {
+                 .push("/gsp/")
+                 .push(fw)
+                 .push("-")
+-                .push(Self::VERSION)
++                .push(FIRMWARE_VERSION)
+                 .push(".bin"),
+         )
+     }
+diff --git a/drivers/gpu/nova-core/gpu.rs b/drivers/gpu/nova-core/gpu.rs
+index 5eecddf8a392..60b86f370284 100644
+--- a/drivers/gpu/nova-core/gpu.rs
++++ b/drivers/gpu/nova-core/gpu.rs
+@@ -1,10 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0
+ 
+-use kernel::{
+-    device, devres::Devres, error::code::*, firmware, fmt, pci, prelude::*, str::CString,
+-};
++use kernel::{device, devres::Devres, error::code::*, pci, prelude::*};
+ 
+ use crate::driver::Bar0;
++use crate::firmware::{Firmware, FIRMWARE_VERSION};
+ use crate::regs;
+ use crate::util;
+ use core::fmt;
+@@ -157,34 +156,6 @@ fn new(bar: &Bar0) -> Result<Spec> {
+     }
+ }
+ 
+-/// Structure encapsulating the firmware blobs required for the GPU to operate.
+-#[expect(dead_code)]
+-pub(crate) struct Firmware {
+-    booter_load: firmware::Firmware,
+-    booter_unload: firmware::Firmware,
+-    bootloader: firmware::Firmware,
+-    gsp: firmware::Firmware,
+-}
+-
+-impl Firmware {
+-    fn new(dev: &device::Device, spec: &Spec, ver: &str) -> Result<Firmware> {
+-        let mut chip_name = CString::try_from_fmt(fmt!("{}", spec.chipset))?;
+-        chip_name.make_ascii_lowercase();
+-
+-        let request = |name_| {
+-            CString::try_from_fmt(fmt!("nvidia/{}/gsp/{}-{}.bin", &*chip_name, name_, ver))
+-                .and_then(|path| firmware::Firmware::request(&path, dev))
+-        };
+-
+-        Ok(Firmware {
+-            booter_load: request("booter_load")?,
+-            booter_unload: request("booter_unload")?,
+-            bootloader: request("bootloader")?,
+-            gsp: request("gsp")?,
+-        })
+-    }
+-}
+-
+ /// Structure holding the resources required to operate the GPU.
+ #[pin_data]
+ pub(crate) struct Gpu {
+@@ -201,7 +172,7 @@ pub(crate) fn new(
+     ) -> Result<impl PinInit<Self>> {
+         let bar = devres_bar.access(pdev.as_ref())?;
+         let spec = Spec::new(bar)?;
+-        let fw = Firmware::new(pdev.as_ref(), &spec, "535.113.01")?;
++        let fw = Firmware::new(pdev.as_ref(), spec.chipset, FIRMWARE_VERSION)?;
+ 
+         dev_info!(
+             pdev.as_ref(),
+-- 
+2.52.0
+
