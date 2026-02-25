@@ -1,0 +1,246 @@
+From b1ca384772b657df433acf0c36f0771d5ebe1138 Mon Sep 17 00:00:00 2001
+From: Ben Skeggs <bskeggs@nvidia.com>
+Date: Fri, 7 Feb 2025 14:16:11 +1000
+Subject: drm/nouveau/gv100-: switch to volta semaphore methods
+Git-commit: b1ca384772b657df433acf0c36f0771d5ebe1138
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+HOPPER_CHANNEL_GPFIFO_A removes the SEMAPHORE[A-D] methods that are
+currently used by nouveau to implement fences on GF100 and newer.
+
+Switch to the newer SEM methods available from VOLTA_CHANNEL_GPFIFO,
+which are also available on the Hopper/Blackwell host classes.
+
+Signed-off-by: Ben Skeggs <bskeggs@nvidia.com>
+Reviewed-by: Dave Airlie <airlied@redhat.com>
+Reviewed-by: Timur Tabi <ttabi@nvidia.com>
+Tested-by: Timur Tabi <ttabi@nvidia.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/nouveau/Kbuild                |  1 +
+ drivers/gpu/drm/nouveau/gv100_fence.c         | 93 +++++++++++++++++++
+ .../drm/nouveau/include/nvhw/class/clc36f.h   | 52 +++++++++++
+ .../gpu/drm/nouveau/include/nvif/push906f.h   |  1 +
+ drivers/gpu/drm/nouveau/nouveau_drm.c         |  4 +-
+ drivers/gpu/drm/nouveau/nouveau_fence.h       |  1 +
+ 6 files changed, 151 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/gpu/drm/nouveau/gv100_fence.c
+ create mode 100644 drivers/gpu/drm/nouveau/include/nvhw/class/clc36f.h
+
+diff --git a/drivers/gpu/drm/nouveau/Kbuild b/drivers/gpu/drm/nouveau/Kbuild
+index 0759ba15954b..385d24530d1e 100644
+--- a/drivers/gpu/drm/nouveau/Kbuild
++++ b/drivers/gpu/drm/nouveau/Kbuild
+@@ -69,5 +69,6 @@ nouveau-y += nv17_fence.o
+ nouveau-y += nv50_fence.o
+ nouveau-y += nv84_fence.o
+ nouveau-y += nvc0_fence.o
++nouveau-y += gv100_fence.o
+ 
+ obj-$(CONFIG_DRM_NOUVEAU) += nouveau.o
+diff --git a/drivers/gpu/drm/nouveau/gv100_fence.c b/drivers/gpu/drm/nouveau/gv100_fence.c
+new file mode 100644
+index 000000000000..cccdeca72002
+--- /dev/null
++++ b/drivers/gpu/drm/nouveau/gv100_fence.c
+@@ -0,0 +1,93 @@
++/* SPDX-License-Identifier: MIT
++ *
++ * Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
++ */
++#include "nouveau_drv.h"
++#include "nouveau_dma.h"
++#include "nouveau_fence.h"
++
++#include "nv50_display.h"
++
++#include <nvif/push906f.h>
++
++#include <nvhw/class/clc36f.h>
++
++static int
++gv100_fence_emit32(struct nouveau_channel *chan, u64 virtual, u32 sequence)
++{
++	struct nvif_push *push = &chan->chan.push;
++	int ret;
++
++	ret = PUSH_WAIT(push, 8);
++	if (ret)
++		return ret;
++
++	PUSH_MTHD(push, NVC36F, SEM_ADDR_LO, lower_32_bits(virtual),
++				SEM_ADDR_HI, upper_32_bits(virtual),
++				SEM_PAYLOAD_LO, sequence);
++
++	PUSH_MTHD(push, NVC36F, SEM_EXECUTE,
++		  NVDEF(NVC36F, SEM_EXECUTE, OPERATION, RELEASE) |
++		  NVDEF(NVC36F, SEM_EXECUTE, RELEASE_WFI, EN) |
++		  NVDEF(NVC36F, SEM_EXECUTE, PAYLOAD_SIZE, 32BIT) |
++		  NVDEF(NVC36F, SEM_EXECUTE, RELEASE_TIMESTAMP, DIS));
++
++	PUSH_MTHD(push, NVC36F, NON_STALL_INTERRUPT, 0);
++
++	PUSH_KICK(push);
++	return 0;
++}
++
++static int
++gv100_fence_sync32(struct nouveau_channel *chan, u64 virtual, u32 sequence)
++{
++	struct nvif_push *push = &chan->chan.push;
++	int ret;
++
++	ret = PUSH_WAIT(push, 6);
++	if (ret)
++		return ret;
++
++	PUSH_MTHD(push, NVC36F, SEM_ADDR_LO, lower_32_bits(virtual),
++				SEM_ADDR_HI, upper_32_bits(virtual),
++				SEM_PAYLOAD_LO, sequence);
++
++	PUSH_MTHD(push, NVC36F, SEM_EXECUTE,
++		  NVDEF(NVC36F, SEM_EXECUTE, OPERATION, ACQ_CIRC_GEQ) |
++		  NVDEF(NVC36F, SEM_EXECUTE, ACQUIRE_SWITCH_TSG, EN) |
++		  NVDEF(NVC36F, SEM_EXECUTE, PAYLOAD_SIZE, 32BIT));
++
++	PUSH_KICK(push);
++	return 0;
++}
++
++static int
++gv100_fence_context_new(struct nouveau_channel *chan)
++{
++	struct nv84_fence_chan *fctx;
++	int ret;
++
++	ret = nv84_fence_context_new(chan);
++	if (ret)
++		return ret;
++
++	fctx = chan->fence;
++	fctx->base.emit32 = gv100_fence_emit32;
++	fctx->base.sync32 = gv100_fence_sync32;
++	return 0;
++}
++
++int
++gv100_fence_create(struct nouveau_drm *drm)
++{
++	struct nv84_fence_priv *priv;
++	int ret;
++
++	ret = nv84_fence_create(drm);
++	if (ret)
++		return ret;
++
++	priv = drm->fence;
++	priv->base.context_new = gv100_fence_context_new;
++	return 0;
++}
+diff --git a/drivers/gpu/drm/nouveau/include/nvhw/class/clc36f.h b/drivers/gpu/drm/nouveau/include/nvhw/class/clc36f.h
+new file mode 100644
+index 000000000000..8735dda4c8a7
+--- /dev/null
++++ b/drivers/gpu/drm/nouveau/include/nvhw/class/clc36f.h
+@@ -0,0 +1,52 @@
++/* SPDX-License-Identifier: MIT
++ *
++ * Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
++ */
++#ifndef _clc36f_h_
++#define _clc36f_h_
++
++#define NVC36F_NON_STALL_INTERRUPT                                 (0x00000020)
++#define NVC36F_NON_STALL_INTERRUPT_HANDLE                                 31:0
++#define NVC36F_SEM_ADDR_LO                                         (0x0000005c)
++#define NVC36F_SEM_ADDR_LO_OFFSET                                         31:2
++#define NVC36F_SEM_ADDR_HI                                         (0x00000060)
++#define NVC36F_SEM_ADDR_HI_OFFSET                                          7:0
++#define NVC36F_SEM_PAYLOAD_LO                                      (0x00000064)
++#define NVC36F_SEM_PAYLOAD_LO_PAYLOAD                                     31:0
++#define NVC36F_SEM_PAYLOAD_HI                                      (0x00000068)
++#define NVC36F_SEM_PAYLOAD_HI_PAYLOAD                                     31:0
++#define NVC36F_SEM_EXECUTE                                         (0x0000006c)
++#define NVC36F_SEM_EXECUTE_OPERATION                                       2:0
++#define NVC36F_SEM_EXECUTE_OPERATION_ACQUIRE                        0x00000000
++#define NVC36F_SEM_EXECUTE_OPERATION_RELEASE                        0x00000001
++#define NVC36F_SEM_EXECUTE_OPERATION_ACQ_STRICT_GEQ                 0x00000002
++#define NVC36F_SEM_EXECUTE_OPERATION_ACQ_CIRC_GEQ                   0x00000003
++#define NVC36F_SEM_EXECUTE_OPERATION_ACQ_AND                        0x00000004
++#define NVC36F_SEM_EXECUTE_OPERATION_ACQ_NOR                        0x00000005
++#define NVC36F_SEM_EXECUTE_OPERATION_REDUCTION                      0x00000006
++#define NVC36F_SEM_EXECUTE_ACQUIRE_SWITCH_TSG                            12:12
++#define NVC36F_SEM_EXECUTE_ACQUIRE_SWITCH_TSG_DIS                   0x00000000
++#define NVC36F_SEM_EXECUTE_ACQUIRE_SWITCH_TSG_EN                    0x00000001
++#define NVC36F_SEM_EXECUTE_RELEASE_WFI                                   20:20
++#define NVC36F_SEM_EXECUTE_RELEASE_WFI_DIS                          0x00000000
++#define NVC36F_SEM_EXECUTE_RELEASE_WFI_EN                           0x00000001
++#define NVC36F_SEM_EXECUTE_PAYLOAD_SIZE                                  24:24
++#define NVC36F_SEM_EXECUTE_PAYLOAD_SIZE_32BIT                       0x00000000
++#define NVC36F_SEM_EXECUTE_PAYLOAD_SIZE_64BIT                       0x00000001
++#define NVC36F_SEM_EXECUTE_RELEASE_TIMESTAMP                             25:25
++#define NVC36F_SEM_EXECUTE_RELEASE_TIMESTAMP_DIS                    0x00000000
++#define NVC36F_SEM_EXECUTE_RELEASE_TIMESTAMP_EN                     0x00000001
++#define NVC36F_SEM_EXECUTE_REDUCTION                                     30:27
++#define NVC36F_SEM_EXECUTE_REDUCTION_IMIN                           0x00000000
++#define NVC36F_SEM_EXECUTE_REDUCTION_IMAX                           0x00000001
++#define NVC36F_SEM_EXECUTE_REDUCTION_IXOR                           0x00000002
++#define NVC36F_SEM_EXECUTE_REDUCTION_IAND                           0x00000003
++#define NVC36F_SEM_EXECUTE_REDUCTION_IOR                            0x00000004
++#define NVC36F_SEM_EXECUTE_REDUCTION_IADD                           0x00000005
++#define NVC36F_SEM_EXECUTE_REDUCTION_INC                            0x00000006
++#define NVC36F_SEM_EXECUTE_REDUCTION_DEC                            0x00000007
++#define NVC36F_SEM_EXECUTE_REDUCTION_FORMAT                              31:31
++#define NVC36F_SEM_EXECUTE_REDUCTION_FORMAT_SIGNED                  0x00000000
++#define NVC36F_SEM_EXECUTE_REDUCTION_FORMAT_UNSIGNED                0x00000001
++
++#endif
+diff --git a/drivers/gpu/drm/nouveau/include/nvif/push906f.h b/drivers/gpu/drm/nouveau/include/nvif/push906f.h
+index cc2866bc8b0a..79df71de98d2 100644
+--- a/drivers/gpu/drm/nouveau/include/nvif/push906f.h
++++ b/drivers/gpu/drm/nouveau/include/nvif/push906f.h
+@@ -7,6 +7,7 @@
+ #ifndef PUSH906F_SUBC
+ // Host methods
+ #define PUSH906F_SUBC_NV906F	0
++#define PUSH906F_SUBC_NVC36F	0
+ 
+ // Twod
+ #define PUSH906F_SUBC_NV902D	3
+diff --git a/drivers/gpu/drm/nouveau/nouveau_drm.c b/drivers/gpu/drm/nouveau/nouveau_drm.c
+index c69139701056..e7544942791d 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_drm.c
++++ b/drivers/gpu/drm/nouveau/nouveau_drm.c
+@@ -503,11 +503,13 @@ nouveau_accel_init(struct nouveau_drm *drm)
+ 		case KEPLER_CHANNEL_GPFIFO_B:
+ 		case MAXWELL_CHANNEL_GPFIFO_A:
+ 		case PASCAL_CHANNEL_GPFIFO_A:
++			ret = nvc0_fence_create(drm);
++			break;
+ 		case VOLTA_CHANNEL_GPFIFO_A:
+ 		case TURING_CHANNEL_GPFIFO_A:
+ 		case AMPERE_CHANNEL_GPFIFO_A:
+ 		case AMPERE_CHANNEL_GPFIFO_B:
+-			ret = nvc0_fence_create(drm);
++			ret = gv100_fence_create(drm);
+ 			break;
+ 		default:
+ 			break;
+diff --git a/drivers/gpu/drm/nouveau/nouveau_fence.h b/drivers/gpu/drm/nouveau/nouveau_fence.h
+index 8bc065acfe35..6a983dd9f7b9 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_fence.h
++++ b/drivers/gpu/drm/nouveau/nouveau_fence.h
+@@ -83,6 +83,7 @@ void nv17_fence_resume(struct nouveau_drm *drm);
+ int nv50_fence_create(struct nouveau_drm *);
+ int nv84_fence_create(struct nouveau_drm *);
+ int nvc0_fence_create(struct nouveau_drm *);
++int gv100_fence_create(struct nouveau_drm *);
+ 
+ struct nv84_fence_chan {
+ 	struct nouveau_fence_chan base;
+-- 
+2.52.0
+
