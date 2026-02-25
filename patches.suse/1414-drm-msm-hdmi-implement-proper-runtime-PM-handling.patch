@@ -1,0 +1,298 @@
+From 0c5ec818cc166b4633c5f12e26abfddb57f6af9f Mon Sep 17 00:00:00 2001
+From: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Date: Mon, 5 May 2025 03:14:53 +0300
+Subject: drm/msm/hdmi: implement proper runtime PM handling
+Git-commit: 0c5ec818cc166b4633c5f12e26abfddb57f6af9f
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+It is completely not obvious, but the so-called 'hpd' clocks and
+regulators are required for the HDMI host to function properly. Merge
+pwr and hpd regulators. Use regulators, clocks and pinctrl to implement
+proper runtime PM callbacks.
+
+Reviewed-by: Jessica Zhang <quic_jesszhan@quicinc.com>
+Signed-off-by: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Patchwork: https://patchwork.freedesktop.org/patch/651715/
+Link: https://lore.kernel.org/r/20250505-fd-hdmi-hpd-v5-9-48541f76318c@oss.qualcomm.com
+Signed-off-by: Dmitry Baryshkov <dmitry.baryshkov@oss.qualcomm.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/msm/hdmi/hdmi.c        | 62 +++++++++++++++++++-------
+ drivers/gpu/drm/msm/hdmi/hdmi.h        |  5 ---
+ drivers/gpu/drm/msm/hdmi/hdmi_bridge.c | 12 -----
+ drivers/gpu/drm/msm/hdmi/hdmi_hpd.c    | 42 +----------------
+ 4 files changed, 47 insertions(+), 74 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/hdmi/hdmi.c b/drivers/gpu/drm/msm/hdmi/hdmi.c
+index 603f056012c2..dfa262956cbc 100644
+--- a/drivers/gpu/drm/msm/hdmi/hdmi.c
++++ b/drivers/gpu/drm/msm/hdmi/hdmi.c
+@@ -8,6 +8,7 @@
+ #include <linux/gpio/consumer.h>
+ #include <linux/of_irq.h>
+ #include <linux/of_platform.h>
++#include <linux/pinctrl/consumer.h>
+ #include <linux/platform_device.h>
+ 
+ #include <drm/drm_bridge_connector.h>
+@@ -224,11 +225,11 @@ int msm_hdmi_modeset_init(struct hdmi *hdmi,
+ 	.item ## _names = item ##_names_ ## entry, \
+ 	.item ## _cnt   = ARRAY_SIZE(item ## _names_ ## entry)
+ 
+-static const char * const hpd_reg_names_8960[] = {"core-vdda"};
++static const char * const pwr_reg_names_8960[] = {"core-vdda"};
+ static const char * const hpd_clk_names_8960[] = {"core", "master_iface", "slave_iface"};
+ 
+ static const struct hdmi_platform_config hdmi_tx_8960_config = {
+-		HDMI_CFG(hpd_reg, 8960),
++		HDMI_CFG(pwr_reg, 8960),
+ 		HDMI_CFG(hpd_clk, 8960),
+ };
+ 
+@@ -318,20 +319,6 @@ static int msm_hdmi_dev_probe(struct platform_device *pdev)
+ 	if (hdmi->irq < 0)
+ 		return hdmi->irq;
+ 
+-	hdmi->hpd_regs = devm_kcalloc(&pdev->dev,
+-				      config->hpd_reg_cnt,
+-				      sizeof(hdmi->hpd_regs[0]),
+-				      GFP_KERNEL);
+-	if (!hdmi->hpd_regs)
+-		return -ENOMEM;
+-
+-	for (i = 0; i < config->hpd_reg_cnt; i++)
+-		hdmi->hpd_regs[i].supply = config->hpd_reg_names[i];
+-
+-	ret = devm_regulator_bulk_get(&pdev->dev, config->hpd_reg_cnt, hdmi->hpd_regs);
+-	if (ret)
+-		return dev_err_probe(dev, ret, "failed to get hpd regulators\n");
+-
+ 	hdmi->pwr_regs = devm_kcalloc(&pdev->dev,
+ 				      config->pwr_reg_cnt,
+ 				      sizeof(hdmi->pwr_regs[0]),
+@@ -409,6 +396,48 @@ static void msm_hdmi_dev_remove(struct platform_device *pdev)
+ 	msm_hdmi_put_phy(hdmi);
+ }
+ 
++static int msm_hdmi_runtime_suspend(struct device *dev)
++{
++	struct hdmi *hdmi = dev_get_drvdata(dev);
++	const struct hdmi_platform_config *config = hdmi->config;
++
++	clk_bulk_disable_unprepare(config->hpd_clk_cnt, hdmi->hpd_clks);
++
++	pinctrl_pm_select_sleep_state(dev);
++
++	regulator_bulk_disable(config->pwr_reg_cnt, hdmi->pwr_regs);
++
++	return 0;
++}
++
++static int msm_hdmi_runtime_resume(struct device *dev)
++{
++	struct hdmi *hdmi = dev_get_drvdata(dev);
++	const struct hdmi_platform_config *config = hdmi->config;
++	int ret;
++
++	ret = regulator_bulk_enable(config->pwr_reg_cnt, hdmi->pwr_regs);
++	if (ret)
++		return ret;
++
++	ret = pinctrl_pm_select_default_state(dev);
++	if (ret)
++		goto fail;
++
++	ret = clk_bulk_prepare_enable(config->hpd_clk_cnt, hdmi->hpd_clks);
++	if (ret)
++		goto fail;
++
++	return 0;
++
++fail:
++	pinctrl_pm_select_sleep_state(dev);
++
++	return ret;
++}
++
++DEFINE_RUNTIME_DEV_PM_OPS(msm_hdmi_pm_ops, msm_hdmi_runtime_suspend, msm_hdmi_runtime_resume, NULL);
++
+ static const struct of_device_id msm_hdmi_dt_match[] = {
+ 	{ .compatible = "qcom,hdmi-tx-8998", .data = &hdmi_tx_8974_config },
+ 	{ .compatible = "qcom,hdmi-tx-8996", .data = &hdmi_tx_8974_config },
+@@ -426,6 +455,7 @@ static struct platform_driver msm_hdmi_driver = {
+ 	.driver = {
+ 		.name = "hdmi_msm",
+ 		.of_match_table = msm_hdmi_dt_match,
++		.pm = &msm_hdmi_pm_ops,
+ 	},
+ };
+ 
+diff --git a/drivers/gpu/drm/msm/hdmi/hdmi.h b/drivers/gpu/drm/msm/hdmi/hdmi.h
+index 3f87535bcf43..7e3c035cf913 100644
+--- a/drivers/gpu/drm/msm/hdmi/hdmi.h
++++ b/drivers/gpu/drm/msm/hdmi/hdmi.h
+@@ -47,7 +47,6 @@ struct hdmi {
+ 	void __iomem *qfprom_mmio;
+ 	phys_addr_t mmio_phy_addr;
+ 
+-	struct regulator_bulk_data *hpd_regs;
+ 	struct regulator_bulk_data *pwr_regs;
+ 	struct clk_bulk_data *hpd_clks;
+ 	struct clk *extp_clk;
+@@ -83,10 +82,6 @@ struct hdmi {
+ 
+ /* platform config data (ie. from DT, or pdata) */
+ struct hdmi_platform_config {
+-	/* regulators that need to be on for hpd: */
+-	const char * const *hpd_reg_names;
+-	int hpd_reg_cnt;
+-
+ 	/* regulators that need to be on for screen pwr: */
+ 	const char * const *pwr_reg_names;
+ 	int pwr_reg_cnt;
+diff --git a/drivers/gpu/drm/msm/hdmi/hdmi_bridge.c b/drivers/gpu/drm/msm/hdmi/hdmi_bridge.c
+index 3ae305e868a5..665c5e1323d0 100644
+--- a/drivers/gpu/drm/msm/hdmi/hdmi_bridge.c
++++ b/drivers/gpu/drm/msm/hdmi/hdmi_bridge.c
+@@ -18,15 +18,10 @@ static void msm_hdmi_power_on(struct drm_bridge *bridge)
+ 	struct drm_device *dev = bridge->dev;
+ 	struct hdmi_bridge *hdmi_bridge = to_hdmi_bridge(bridge);
+ 	struct hdmi *hdmi = hdmi_bridge->hdmi;
+-	const struct hdmi_platform_config *config = hdmi->config;
+ 	int ret;
+ 
+ 	pm_runtime_resume_and_get(&hdmi->pdev->dev);
+ 
+-	ret = regulator_bulk_enable(config->pwr_reg_cnt, hdmi->pwr_regs);
+-	if (ret)
+-		DRM_DEV_ERROR(dev->dev, "failed to enable pwr regulator: %d\n", ret);
+-
+ 	if (hdmi->extp_clk) {
+ 		DBG("pixclock: %lu", hdmi->pixclock);
+ 		ret = clk_set_rate(hdmi->extp_clk, hdmi->pixclock);
+@@ -41,11 +36,8 @@ static void msm_hdmi_power_on(struct drm_bridge *bridge)
+ 
+ static void power_off(struct drm_bridge *bridge)
+ {
+-	struct drm_device *dev = bridge->dev;
+ 	struct hdmi_bridge *hdmi_bridge = to_hdmi_bridge(bridge);
+ 	struct hdmi *hdmi = hdmi_bridge->hdmi;
+-	const struct hdmi_platform_config *config = hdmi->config;
+-	int ret;
+ 
+ 	/* TODO do we need to wait for final vblank somewhere before
+ 	 * cutting the clocks?
+@@ -55,10 +47,6 @@ static void power_off(struct drm_bridge *bridge)
+ 	if (hdmi->extp_clk)
+ 		clk_disable_unprepare(hdmi->extp_clk);
+ 
+-	ret = regulator_bulk_disable(config->pwr_reg_cnt, hdmi->pwr_regs);
+-	if (ret)
+-		DRM_DEV_ERROR(dev->dev, "failed to disable pwr regulator: %d\n", ret);
+-
+ 	pm_runtime_put(&hdmi->pdev->dev);
+ }
+ 
+diff --git a/drivers/gpu/drm/msm/hdmi/hdmi_hpd.c b/drivers/gpu/drm/msm/hdmi/hdmi_hpd.c
+index d77c68914c5f..a42ed26a5b7c 100644
+--- a/drivers/gpu/drm/msm/hdmi/hdmi_hpd.c
++++ b/drivers/gpu/drm/msm/hdmi/hdmi_hpd.c
+@@ -64,36 +64,17 @@ int msm_hdmi_hpd_enable(struct drm_bridge *bridge)
+ {
+ 	struct hdmi_bridge *hdmi_bridge = to_hdmi_bridge(bridge);
+ 	struct hdmi *hdmi = hdmi_bridge->hdmi;
+-	const struct hdmi_platform_config *config = hdmi->config;
+ 	struct device *dev = &hdmi->pdev->dev;
+ 	uint32_t hpd_ctrl;
+ 	int ret;
+ 	unsigned long flags;
+ 
+-	ret = regulator_bulk_enable(config->hpd_reg_cnt, hdmi->hpd_regs);
+-	if (ret) {
+-		DRM_DEV_ERROR(dev, "failed to enable hpd regulators: %d\n", ret);
+-		goto fail;
+-	}
+-
+-	ret = pinctrl_pm_select_default_state(dev);
+-	if (ret) {
+-		DRM_DEV_ERROR(dev, "pinctrl state chg failed: %d\n", ret);
+-		goto fail;
+-	}
+-
+ 	if (hdmi->hpd_gpiod)
+ 		gpiod_set_value_cansleep(hdmi->hpd_gpiod, 1);
+ 
+ 	ret = pm_runtime_resume_and_get(dev);
+-	if (ret) {
+-		DRM_DEV_ERROR(dev, "runtime resume failed: %d\n", ret);
+-		goto fail;
+-	}
+-
+-	ret = clk_bulk_prepare_enable(config->hpd_clk_cnt, hdmi->hpd_clks);
+ 	if (ret)
+-		goto fail;
++		return ret;
+ 
+ 	msm_hdmi_set_mode(hdmi, false);
+ 	msm_hdmi_phy_reset(hdmi);
+@@ -119,32 +100,18 @@ int msm_hdmi_hpd_enable(struct drm_bridge *bridge)
+ 	spin_unlock_irqrestore(&hdmi->reg_lock, flags);
+ 
+ 	return 0;
+-
+-fail:
+-	return ret;
+ }
+ 
+ void msm_hdmi_hpd_disable(struct hdmi *hdmi)
+ {
+-	const struct hdmi_platform_config *config = hdmi->config;
+ 	struct device *dev = &hdmi->pdev->dev;
+-	int ret;
+ 
+ 	/* Disable HPD interrupt */
+ 	hdmi_write(hdmi, REG_HDMI_HPD_INT_CTRL, 0);
+ 
+ 	msm_hdmi_set_mode(hdmi, false);
+ 
+-	clk_bulk_disable_unprepare(config->hpd_clk_cnt, hdmi->hpd_clks);
+ 	pm_runtime_put(dev);
+-
+-	ret = pinctrl_pm_select_sleep_state(dev);
+-	if (ret)
+-		dev_warn(dev, "pinctrl state chg failed: %d\n", ret);
+-
+-	ret = regulator_bulk_disable(config->hpd_reg_cnt, hdmi->hpd_regs);
+-	if (ret)
+-		dev_warn(dev, "failed to disable hpd regulator: %d\n", ret);
+ }
+ 
+ void msm_hdmi_hpd_irq(struct drm_bridge *bridge)
+@@ -179,7 +146,6 @@ void msm_hdmi_hpd_irq(struct drm_bridge *bridge)
+ 
+ static enum drm_connector_status detect_reg(struct hdmi *hdmi)
+ {
+-	const struct hdmi_platform_config *config = hdmi->config;
+ 	u32 hpd_int_status = 0;
+ 	int ret;
+ 
+@@ -187,14 +153,8 @@ static enum drm_connector_status detect_reg(struct hdmi *hdmi)
+ 	if (ret)
+ 		goto out;
+ 
+-	ret = clk_bulk_prepare_enable(config->hpd_clk_cnt, hdmi->hpd_clks);
+-	if (ret)
+-		goto out;
+-
+ 	hpd_int_status = hdmi_read(hdmi, REG_HDMI_HPD_INT_STATUS);
+ 
+-	clk_bulk_disable_unprepare(config->hpd_clk_cnt, hdmi->hpd_clks);
+-
+ out:
+ 	pm_runtime_put(&hdmi->pdev->dev);
+ 
+-- 
+2.52.0
+
