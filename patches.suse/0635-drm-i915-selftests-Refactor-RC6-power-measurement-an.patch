@@ -1,0 +1,135 @@
+From c235b03145b97b8eb94af03e99740833e20c955d Mon Sep 17 00:00:00 2001
+From: Sk Anirban <sk.anirban@intel.com>
+Date: Fri, 28 Mar 2025 00:49:24 +0530
+Subject: drm/i915/selftests: Refactor RC6 power measurement and error handling
+Git-commit: c235b03145b97b8eb94af03e99740833e20c955d
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Revise the power measurement logic to save and evaluate energy values.
+Previously, the test only checked whether the system had entered the RC6
+state, without considering any potential interruptions in that state.
+This update introduces a threshold check to ensure that the GPU remains
+in the RC6 state properly during the specified sleep duration.
+
+V3: - Reorder threshold check (Badal)
+
+V4: - Improved commit message (Anshuman)
+
+V5: - Rename variables for improved readability (Anshuman)
+
+Signed-off-by: Sk Anirban <sk.anirban@intel.com>
+Reviewed-by: Badal Nilawar <badal.nilawar@intel.com>
+Signed-off-by: Anshuman Gupta <anshuman.gupta@intel.com>
+Link: https://lore.kernel.org/r/20250327191924.4131598-1-sk.anirban@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/gt/selftest_rc6.c | 51 ++++++++++++++++++--------
+ 1 file changed, 35 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/selftest_rc6.c b/drivers/gpu/drm/i915/gt/selftest_rc6.c
+index 99de5d85a096..41716ed454b7 100644
+--- a/drivers/gpu/drm/i915/gt/selftest_rc6.c
++++ b/drivers/gpu/drm/i915/gt/selftest_rc6.c
+@@ -33,15 +33,22 @@ int live_rc6_manual(void *arg)
+ {
+ 	struct intel_gt *gt = arg;
+ 	struct intel_rc6 *rc6 = &gt->rc6;
+-	u64 rc0_power, rc6_power;
++	struct intel_rps *rps = &gt->rps;
+ 	intel_wakeref_t wakeref;
++	u64 rc0_sample_energy[2];
++	u64 rc6_sample_energy[2];
++	u64 sleep_time = 1000;
++	u32 rc0_freq = 0;
++	u32 rc6_freq = 0;
++	u64 rc0_power;
++	u64 rc6_power;
+ 	bool has_power;
++	u64 threshold;
+ 	ktime_t dt;
+ 	u64 res[2];
+ 	int err = 0;
+-	u32 rc0_freq = 0;
+-	u32 rc6_freq = 0;
+-	struct intel_rps *rps = &gt->rps;
++	u64 diff;
++
+ 
+ 	/*
+ 	 * Our claim is that we can "encourage" the GPU to enter rc6 at will.
+@@ -66,9 +73,9 @@ int live_rc6_manual(void *arg)
+ 	res[0] = rc6_residency(rc6);
+ 
+ 	dt = ktime_get();
+-	rc0_power = librapl_energy_uJ();
+-	msleep(1000);
+-	rc0_power = librapl_energy_uJ() - rc0_power;
++	rc0_sample_energy[0] = librapl_energy_uJ();
++	msleep(sleep_time);
++	rc0_sample_energy[1] = librapl_energy_uJ() - rc0_sample_energy[0];
+ 	dt = ktime_sub(ktime_get(), dt);
+ 	res[1] = rc6_residency(rc6);
+ 	rc0_freq = intel_rps_read_actual_frequency_fw(rps);
+@@ -80,11 +87,12 @@ int live_rc6_manual(void *arg)
+ 	}
+ 
+ 	if (has_power) {
+-		rc0_power = div64_u64(NSEC_PER_SEC * rc0_power,
++		rc0_power = div64_u64(NSEC_PER_SEC * rc0_sample_energy[1],
+ 				      ktime_to_ns(dt));
++
+ 		if (!rc0_power) {
+ 			if (rc0_freq)
+-				pr_debug("No power measured while in RC0! GPU Freq: %u in RC0\n",
++				pr_debug("No power measured while in RC0! GPU Freq: %uMHz in RC0\n",
+ 					 rc0_freq);
+ 			else
+ 				pr_err("No power and freq measured while in RC0\n");
+@@ -99,10 +107,10 @@ int live_rc6_manual(void *arg)
+ 	res[0] = rc6_residency(rc6);
+ 	intel_uncore_forcewake_flush(rc6_to_uncore(rc6), FORCEWAKE_ALL);
+ 	dt = ktime_get();
+-	rc6_power = librapl_energy_uJ();
+-	msleep(1000);
++	rc6_sample_energy[0] = librapl_energy_uJ();
++	msleep(sleep_time);
+ 	rc6_freq = intel_rps_read_actual_frequency_fw(rps);
+-	rc6_power = librapl_energy_uJ() - rc6_power;
++	rc6_sample_energy[1] = librapl_energy_uJ() - rc6_sample_energy[0];
+ 	dt = ktime_sub(ktime_get(), dt);
+ 	res[1] = rc6_residency(rc6);
+ 	if (res[1] == res[0]) {
+@@ -114,13 +122,24 @@ int live_rc6_manual(void *arg)
+ 	}
+ 
+ 	if (has_power) {
+-		rc6_power = div64_u64(NSEC_PER_SEC * rc6_power,
++		rc6_power = div64_u64(NSEC_PER_SEC * rc6_sample_energy[1],
+ 				      ktime_to_ns(dt));
+-		pr_info("GPU consumed %llduW in RC0 and %llduW in RC6\n",
++		pr_info("GPU consumed %lluuW in RC0 and %lluuW in RC6\n",
+ 			rc0_power, rc6_power);
++
+ 		if (2 * rc6_power > rc0_power) {
+-			pr_err("GPU leaked energy while in RC6! GPU Freq: %u in RC6 and %u in RC0\n",
+-			       rc6_freq, rc0_freq);
++			pr_err("GPU leaked energy while in RC6!\n"
++			       "GPU Freq: %uMHz in RC6 and %uMHz in RC0\n"
++			       "RC0 energy before & after sleep respectively: %lluuJ %lluuJ\n"
++			       "RC6 energy before & after sleep respectively: %lluuJ %lluuJ\n",
++			       rc6_freq, rc0_freq, rc0_sample_energy[0], rc0_sample_energy[1],
++			       rc6_sample_energy[0], rc6_sample_energy[1]);
++
++			diff = res[1] - res[0];
++			threshold = (9 * NSEC_PER_MSEC * sleep_time) / 10;
++			if (diff < threshold)
++				pr_err("Did not enter RC6 properly, RC6 start residency=%lluns, RC6 end residency=%lluns\n",
++				       res[0], res[1]);
+ 			err = -EINVAL;
+ 			goto out_unlock;
+ 		}
+-- 
+2.52.0
+
