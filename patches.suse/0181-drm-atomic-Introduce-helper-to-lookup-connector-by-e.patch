@@ -1,0 +1,141 @@
+From a7e4886e06f723045ce52de69491196a08cf14e9 Mon Sep 17 00:00:00 2001
+From: Maxime Ripard <mripard@kernel.org>
+Date: Thu, 13 Mar 2025 12:59:58 +0100
+Subject: drm/atomic: Introduce helper to lookup connector by encoder
+Git-commit: a7e4886e06f723045ce52de69491196a08cf14e9
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+With the bridges switching over to drm_bridge_connector, the direct
+association between a bridge driver and its connector was lost.
+
+This is mitigated for atomic bridge drivers by the fact you can access
+the encoder, and then call drm_atomic_get_old_connector_for_encoder() or
+drm_atomic_get_new_connector_for_encoder() with drm_atomic_state.
+
+This was also made easier by providing drm_atomic_state directly to all
+atomic hooks bridges can implement.
+
+However, bridge drivers don't have a way to access drm_atomic_state
+outside of the modeset path, like from the hotplug interrupt path or any
+interrupt handler.
+
+Let's introduce a function to retrieve the connector currently assigned
+to an encoder, without using drm_atomic_state, to make these drivers'
+life easier.
+
+Reviewed-by: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Reviewed-by: Simona Vetter <simona.vetter@ffwll.ch>
+Tested-by: Herve Codina <herve.codina@bootlin.com>
+Co-developed-by: Simona Vetter <simona.vetter@intel.com>
+Signed-off-by: Simona Vetter <simona.vetter@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250313-bridge-connector-v6-4-511c54a604fb@kernel.org
+Signed-off-by: Maxime Ripard <mripard@kernel.org>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/drm_atomic.c | 59 ++++++++++++++++++++++++++++++++++++
+ include/drm/drm_atomic.h     |  3 ++
+ 2 files changed, 62 insertions(+)
+
+diff --git a/drivers/gpu/drm/drm_atomic.c b/drivers/gpu/drm/drm_atomic.c
+index 9ea2611770f4..0138cf0b8b63 100644
+--- a/drivers/gpu/drm/drm_atomic.c
++++ b/drivers/gpu/drm/drm_atomic.c
+@@ -933,6 +933,9 @@ EXPORT_SYMBOL(drm_atomic_get_new_private_obj_state);
+  * state). This is especially true in enable hooks because the pipeline has
+  * changed.
+  *
++ * If you don't have access to the atomic state, see
++ * drm_atomic_get_connector_for_encoder().
++ *
+  * Returns: The old connector connected to @encoder, or NULL if the encoder is
+  * not connected.
+  */
+@@ -967,6 +970,9 @@ EXPORT_SYMBOL(drm_atomic_get_old_connector_for_encoder);
+  * attached to @encoder vs ones that do (and to inspect their state). This is
+  * especially true in disable hooks because the pipeline will change.
+  *
++ * If you don't have access to the atomic state, see
++ * drm_atomic_get_connector_for_encoder().
++ *
+  * Returns: The new connector connected to @encoder, or NULL if the encoder is
+  * not connected.
+  */
+@@ -987,6 +993,59 @@ drm_atomic_get_new_connector_for_encoder(const struct drm_atomic_state *state,
+ }
+ EXPORT_SYMBOL(drm_atomic_get_new_connector_for_encoder);
+ 
++/**
++ * drm_atomic_get_connector_for_encoder - Get connector currently assigned to an encoder
++ * @encoder: The encoder to find the connector of
++ * @ctx: Modeset locking context
++ *
++ * This function finds and returns the connector currently assigned to
++ * an @encoder.
++ *
++ * It is similar to the drm_atomic_get_old_connector_for_encoder() and
++ * drm_atomic_get_new_connector_for_encoder() helpers, but doesn't
++ * require access to the atomic state. If you have access to it, prefer
++ * using these. This helper is typically useful in situations where you
++ * don't have access to the atomic state, like detect, link repair,
++ * threaded interrupt handlers, or hooks from other frameworks (ALSA,
++ * CEC, etc.).
++ *
++ * Returns:
++ * The connector connected to @encoder, or an error pointer otherwise.
++ * When the error is EDEADLK, a deadlock has been detected and the
++ * sequence must be restarted.
++ */
++struct drm_connector *
++drm_atomic_get_connector_for_encoder(const struct drm_encoder *encoder,
++				     struct drm_modeset_acquire_ctx *ctx)
++{
++	struct drm_connector_list_iter conn_iter;
++	struct drm_connector *out_connector = ERR_PTR(-EINVAL);
++	struct drm_connector *connector;
++	struct drm_device *dev = encoder->dev;
++	int ret;
++
++	ret = drm_modeset_lock(&dev->mode_config.connection_mutex, ctx);
++	if (ret)
++		return ERR_PTR(ret);
++
++	drm_connector_list_iter_begin(dev, &conn_iter);
++	drm_for_each_connector_iter(connector, &conn_iter) {
++		if (!connector->state)
++			continue;
++
++		if (encoder == connector->state->best_encoder) {
++			out_connector = connector;
++			break;
++		}
++	}
++	drm_connector_list_iter_end(&conn_iter);
++	drm_modeset_unlock(&dev->mode_config.connection_mutex);
++
++	return out_connector;
++}
++EXPORT_SYMBOL(drm_atomic_get_connector_for_encoder);
++
++
+ /**
+  * drm_atomic_get_old_crtc_for_encoder - Get old crtc for an encoder
+  * @state: Atomic state
+diff --git a/include/drm/drm_atomic.h b/include/drm/drm_atomic.h
+index 4c673f0698fe..38636a593c9d 100644
+--- a/include/drm/drm_atomic.h
++++ b/include/drm/drm_atomic.h
+@@ -625,6 +625,9 @@ drm_atomic_get_old_connector_for_encoder(const struct drm_atomic_state *state,
+ struct drm_connector *
+ drm_atomic_get_new_connector_for_encoder(const struct drm_atomic_state *state,
+ 					 struct drm_encoder *encoder);
++struct drm_connector *
++drm_atomic_get_connector_for_encoder(const struct drm_encoder *encoder,
++				     struct drm_modeset_acquire_ctx *ctx);
+ 
+ struct drm_crtc *
+ drm_atomic_get_old_crtc_for_encoder(struct drm_atomic_state *state,
+-- 
+2.52.0
+
