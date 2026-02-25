@@ -1,0 +1,123 @@
+From ad6c120f6888033b1eb198a7a15ed4c6355edf6d Mon Sep 17 00:00:00 2001
+From: Arvind Yadav <Arvind.Yadav@amd.com>
+Date: Tue, 18 Feb 2025 18:56:25 +0530
+Subject: drm/amdgpu: fix the memleak caused by fence not released
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: ad6c120f6888033b1eb198a7a15ed4c6355edf6d
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Encountering a taint issue during the unloading of gpu_sched
+due to the fence not being released/put. In this context,
+amdgpu_vm_clear_freed is responsible for creating a job to
+update the page table (PT). It allocates kmem_cache for
+drm_sched_fence and returns the finished fence associated
+with job->base.s_fence. In case of Usermode queue this finished
+fence is added to the timeline sync object through
+amdgpu_gem_update_bo_mapping, which is utilized by user
+space to ensure the completion of the PT update.
+
+[  508.900587] =============================================================================
+[  508.900605] BUG drm_sched_fence (Tainted: G                 N): Objects remaining in drm_sched_fence on __kmem_cache_shutdown()
+[  508.900617] -----------------------------------------------------------------------------
+
+[  508.900627] Slab 0xffffe0cc04548780 objects=32 used=2 fp=0xffff8ea81521f000 flags=0x17ffffc0000240(workingset|head|node=0|zone=2|lastcpupid=0x1fffff)
+[  508.900645] CPU: 3 UID: 0 PID: 2337 Comm: rmmod Tainted: G                 N 6.12.0+ #1
+[  508.900651] Tainted: [N]=TEST
+[  508.900653] Hardware name: Gigabyte Technology Co., Ltd. X570 AORUS ELITE/X570 AORUS ELITE, BIOS F34 06/10/2021
+[  508.900656] Call Trace:
+[  508.900659]  <TASK>
+[  508.900665]  dump_stack_lvl+0x70/0x90
+[  508.900674]  dump_stack+0x14/0x20
+[  508.900678]  slab_err+0xcb/0x110
+[  508.900687]  ? srso_return_thunk+0x5/0x5f
+[  508.900692]  ? try_to_grab_pending+0xd3/0x1d0
+[  508.900697]  ? srso_return_thunk+0x5/0x5f
+[  508.900701]  ? mutex_lock+0x17/0x50
+[  508.900708]  __kmem_cache_shutdown+0x144/0x2d0
+[  508.900713]  ? flush_rcu_work+0x50/0x60
+[  508.900719]  kmem_cache_destroy+0x46/0x1f0
+[  508.900728]  drm_sched_fence_slab_fini+0x19/0x970 [gpu_sched]
+[  508.900736]  __do_sys_delete_module.constprop.0+0x184/0x320
+[  508.900744]  ? srso_return_thunk+0x5/0x5f
+[  508.900747]  ? debug_smp_processor_id+0x1b/0x30
+[  508.900754]  __x64_sys_delete_module+0x16/0x20
+[  508.900758]  x64_sys_call+0xdf/0x20d0
+[  508.900763]  do_syscall_64+0x51/0x120
+[  508.900769]  entry_SYSCALL_64_after_hwframe+0x76/0x7e
+
+V2: call dma_fence_put in amdgpu_gem_va_update_vm
+V3: Addressed review comments from Christian.
+    - calling amdgpu_gem_update_timeline_node before switch.
+    - puting a dma_fence in case of error or !timeline_syncobj.
+V4: Addressed review comments from Christian.
+
+Cc: Alex Deucher <alexander.deucher@amd.com>
+Cc: Christian König <christian.koenig@amd.com>
+Cc: Shashank Sharma <shashank.sharma@amd.com>
+Cc: Sunil Khatri <sunil.khatri@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Le Ma <le.ma@amd.com>
+Signed-off-by: Arvind Yadav <arvind.yadav@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c | 28 ++++++++++++++-----------
+ 1 file changed, 16 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+index b9b80b0b60ca..f03fc3cf4d50 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+@@ -934,6 +934,14 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
+ 		bo_va = NULL;
+ 	}
+ 
++	r = amdgpu_gem_update_timeline_node(filp,
++					    args->vm_timeline_syncobj_out,
++					    args->vm_timeline_point,
++					    &timeline_syncobj,
++					    &timeline_chain);
++	if (r)
++		goto error;
++
+ 	switch (args->operation) {
+ 	case AMDGPU_VA_OP_MAP:
+ 		va_flags = amdgpu_gem_va_map_flags(adev, args->flags);
+@@ -960,22 +968,18 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
+ 		break;
+ 	}
+ 	if (!r && !(args->flags & AMDGPU_VM_DELAY_UPDATE) && !adev->debug_vm) {
+-
+-		r = amdgpu_gem_update_timeline_node(filp,
+-						    args->vm_timeline_syncobj_out,
+-						    args->vm_timeline_point,
+-						    &timeline_syncobj,
+-						    &timeline_chain);
+-
+ 		fence = amdgpu_gem_va_update_vm(adev, &fpriv->vm, bo_va,
+ 						args->operation);
+ 
+-		if (!r)
++		if (timeline_syncobj)
+ 			amdgpu_gem_update_bo_mapping(filp, bo_va,
+-						     args->operation,
+-						     args->vm_timeline_point,
+-						     fence, timeline_syncobj,
+-						     timeline_chain);
++					     args->operation,
++					     args->vm_timeline_point,
++					     fence, timeline_syncobj,
++					     timeline_chain);
++		else
++			dma_fence_put(fence);
++
+ 	}
+ 
+ error:
+-- 
+2.52.0
+
