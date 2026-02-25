@@ -1,10 +1,10 @@
 From ca6575a32a37c1a3ebab904792bb415249481992 Mon Sep 17 00:00:00 2001
 From: Alex Deucher <alexander.deucher@amd.com>
 Date: Wed, 12 Mar 2025 09:48:47 -0400
-Subject: [PATCH] drm/amdgpu/vcn: fix ref counting for ring based profile handling
+Subject: drm/amdgpu/vcn: fix ref counting for ring based profile handling
 Git-commit: ca6575a32a37c1a3ebab904792bb415249481992
 Patch-mainline: v6.15-rc1
-References: git-fixes
+References: git-fixes jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
 
 We need to make sure the workload profile ref counts are
 balanced.  This isn't currently the case because we can
@@ -20,32 +20,37 @@ Cc: Yang Wang <kevinyang.wang@amd.com>
 Cc: Kenneth Feng <kenneth.feng@amd.com>
 Reviewed-by: Kenneth Feng <kenneth.feng@amd.com>
 Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
-Acked-by: Takashi Iwai <tiwai@suse.de>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
 
 ---
- drivers/gpu/drm/amd/amdgpu/amdgpu_device.c |    1 +
- drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c    |   26 ++++++++++++++++++--------
- drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.h    |    3 +++
- 3 files changed, 22 insertions(+), 8 deletions(-)
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c    | 26 +++++++++++++++-------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.h    |  3 +++
+ drivers/gpu/drm/amd/amdgpu/vcn_v2_5.c      | 26 +++++++++++++++-------
+ 4 files changed, 40 insertions(+), 16 deletions(-)
 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 173048c46fc3..44d3afad71d2 100644
 --- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
 +++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
-@@ -4152,6 +4152,7 @@ int amdgpu_device_init(struct amdgpu_dev
- 	/* Initialize the mutex for cleaner shader isolation between GFX and compute processes */
+@@ -4283,6 +4283,7 @@ int amdgpu_device_init(struct amdgpu_device *adev,
  	mutex_init(&adev->enforce_isolation_mutex);
  	mutex_init(&adev->gfx.kfd_sch_mutex);
+ 	mutex_init(&adev->gfx.workload_profile_mutex);
 +	mutex_init(&adev->vcn.workload_profile_mutex);
  
  	amdgpu_device_init_apu_flags(adev);
  
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c
+index 8d8b39e6d197..6b410e601bb6 100644
 --- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c
 +++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c
-@@ -410,10 +410,15 @@ static void amdgpu_vcn_idle_work_handler
- 	if (!fences && !atomic_read(&adev->vcn.total_submission_cnt)) {
- 		amdgpu_device_ip_set_powergating_state(adev, AMD_IP_BLOCK_TYPE_VCN,
- 		       AMD_PG_STATE_GATE);
+@@ -438,10 +438,15 @@ static void amdgpu_vcn_idle_work_handler(struct work_struct *work)
+ 
+ 	if (!fences && !atomic_read(&vcn_inst->total_submission_cnt)) {
+ 		vcn_inst->set_pg_state(vcn_inst, AMD_PG_STATE_GATE);
 -		r = amdgpu_dpm_switch_power_profile(adev, PP_SMC_POWER_PROFILE_VIDEO,
--				false);
+-						    false);
 -		if (r)
 -			dev_warn(adev->dev, "(%d) failed to disable video power profile mode\n", r);
 +		mutex_lock(&adev->vcn.workload_profile_mutex);
@@ -58,12 +63,12 @@ Acked-by: Takashi Iwai <tiwai@suse.de>
 +		}
 +		mutex_unlock(&adev->vcn.workload_profile_mutex);
  	} else {
- 		schedule_delayed_work(&adev->vcn.idle_work, VCN_IDLE_TIMEOUT);
+ 		schedule_delayed_work(&vcn_inst->idle_work, VCN_IDLE_TIMEOUT);
  	}
-@@ -427,10 +432,15 @@ void amdgpu_vcn_ring_begin_use(struct am
- 	atomic_inc(&adev->vcn.total_submission_cnt);
+@@ -456,10 +461,15 @@ void amdgpu_vcn_ring_begin_use(struct amdgpu_ring *ring)
+ 	atomic_inc(&vcn_inst->total_submission_cnt);
  
- 	if (!cancel_delayed_work_sync(&adev->vcn.idle_work)) {
+ 	if (!cancel_delayed_work_sync(&vcn_inst->idle_work)) {
 -		r = amdgpu_dpm_switch_power_profile(adev, PP_SMC_POWER_PROFILE_VIDEO,
 -				true);
 -		if (r)
@@ -79,16 +84,65 @@ Acked-by: Takashi Iwai <tiwai@suse.de>
 +		mutex_unlock(&adev->vcn.workload_profile_mutex);
  	}
  
- 	mutex_lock(&adev->vcn.vcn_pg_lock);
+ 	mutex_lock(&vcn_inst->vcn_pg_lock);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.h
+index 26c9c2d90f45..cdcdae7f71ce 100644
 --- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.h
 +++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.h
-@@ -332,6 +332,9 @@ struct amdgpu_vcn {
+@@ -358,6 +358,9 @@ struct amdgpu_vcn {
  
- 	/* IP reg dump */
- 	uint32_t		*ip_dump;
+ 	bool			per_inst_fw;
+ 	unsigned		fw_version;
 +
 +	bool			workload_profile_active;
 +	struct mutex            workload_profile_mutex;
  };
  
  struct amdgpu_fw_shared_rb_ptrs_struct {
+diff --git a/drivers/gpu/drm/amd/amdgpu/vcn_v2_5.c b/drivers/gpu/drm/amd/amdgpu/vcn_v2_5.c
+index ff03436698a4..b4b8091980ad 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vcn_v2_5.c
++++ b/drivers/gpu/drm/amd/amdgpu/vcn_v2_5.c
+@@ -147,10 +147,15 @@ static void vcn_v2_5_idle_work_handler(struct work_struct *work)
+ 	if (!fences && !atomic_read(&adev->vcn.inst[0].total_submission_cnt)) {
+ 		amdgpu_device_ip_set_powergating_state(adev, AMD_IP_BLOCK_TYPE_VCN,
+ 						       AMD_PG_STATE_GATE);
+-		r = amdgpu_dpm_switch_power_profile(adev, PP_SMC_POWER_PROFILE_VIDEO,
+-						    false);
+-		if (r)
+-			dev_warn(adev->dev, "(%d) failed to disable video power profile mode\n", r);
++		mutex_lock(&adev->vcn.workload_profile_mutex);
++		if (adev->vcn.workload_profile_active) {
++			r = amdgpu_dpm_switch_power_profile(adev, PP_SMC_POWER_PROFILE_VIDEO,
++							    false);
++			if (r)
++				dev_warn(adev->dev, "(%d) failed to disable video power profile mode\n", r);
++			adev->vcn.workload_profile_active = false;
++		}
++		mutex_unlock(&adev->vcn.workload_profile_mutex);
+ 	} else {
+ 		schedule_delayed_work(&adev->vcn.inst[0].idle_work, VCN_IDLE_TIMEOUT);
+ 	}
+@@ -165,10 +170,15 @@ static void vcn_v2_5_ring_begin_use(struct amdgpu_ring *ring)
+ 	atomic_inc(&adev->vcn.inst[0].total_submission_cnt);
+ 
+ 	if (!cancel_delayed_work_sync(&adev->vcn.inst[0].idle_work)) {
+-		r = amdgpu_dpm_switch_power_profile(adev, PP_SMC_POWER_PROFILE_VIDEO,
+-						    true);
+-		if (r)
+-			dev_warn(adev->dev, "(%d) failed to switch to video power profile mode\n", r);
++		mutex_lock(&adev->vcn.workload_profile_mutex);
++		if (!adev->vcn.workload_profile_active) {
++			r = amdgpu_dpm_switch_power_profile(adev, PP_SMC_POWER_PROFILE_VIDEO,
++							    true);
++			if (r)
++				dev_warn(adev->dev, "(%d) failed to switch to video power profile mode\n", r);
++			adev->vcn.workload_profile_active = true;
++		}
++		mutex_unlock(&adev->vcn.workload_profile_mutex);
+ 	}
+ 
+ 	mutex_lock(&adev->vcn.inst[0].vcn_pg_lock);
+-- 
+2.52.0
+

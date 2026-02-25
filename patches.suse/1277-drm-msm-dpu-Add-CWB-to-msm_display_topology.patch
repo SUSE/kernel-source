@@ -1,0 +1,115 @@
+From 2ea34682263b90566130d70a20bc742ed8de2e3f Mon Sep 17 00:00:00 2001
+From: Jessica Zhang <quic_jesszhan@quicinc.com>
+Date: Fri, 14 Feb 2025 16:14:27 -0800
+Subject: drm/msm/dpu: Add CWB to msm_display_topology
+Git-commit: 2ea34682263b90566130d70a20bc742ed8de2e3f
+Patch-mainline: v6.15-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Currently, the topology is calculated based on the assumption that the
+user cannot request real-time and writeback simultaneously. For example,
+the number of LMs and CTLs are currently based off the number of phys
+encoders under the assumption there will be at least 1 LM/CTL per phys
+encoder.
+
+This will not hold true for concurrent writeback as both phys encoders
+(1 real-time and 1 writeback) must be driven by 1 LM/CTL when concurrent
+writeback is enabled.
+
+To account for this, add a cwb_enabled flag and only adjust the number of
+CTL/LMs needed by a given topology based on the number of phys encoders
+only if CWB is not enabled.
+
+Reviewed-by: Abhinav Kumar <quic_abhinavk@quicinc.com>
+Reviewed-by: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Signed-off-by: Jessica Zhang <quic_jesszhan@quicinc.com>
+Patchwork: https://patchwork.freedesktop.org/patch/637486/
+Link: https://lore.kernel.org/r/20250214-concurrent-wb-v6-4-a44c293cf422@quicinc.com
+Signed-off-by: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c | 11 ++++++++++-
+ drivers/gpu/drm/msm/disp/dpu1/dpu_rm.c   | 14 ++++++++++++--
+ drivers/gpu/drm/msm/disp/dpu1/dpu_rm.h   |  2 ++
+ 3 files changed, 24 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+index 10653bd52885..27078d3f90b4 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+@@ -1246,6 +1246,8 @@ static struct msm_display_topology dpu_crtc_get_topology(
+ 		dpu_encoder_update_topology(drm_enc, &topology, crtc_state->state,
+ 					    &crtc_state->adjusted_mode);
+ 
++	topology.cwb_enabled = drm_crtc_in_clone_mode(crtc_state);
++
+ 	/*
+ 	 * Datapath topology selection
+ 	 *
+@@ -1259,9 +1261,16 @@ static struct msm_display_topology dpu_crtc_get_topology(
+ 	 * If DSC is enabled, use 2 LMs for 2:2:1 topology
+ 	 *
+ 	 * Add dspps to the reservation requirements if ctm is requested
++	 *
++	 * Only hardcode num_lm to 2 for cases where num_intf == 2 and CWB is not
++	 * enabled. This is because in cases where CWB is enabled, num_intf will
++	 * count both the WB and real-time phys encoders.
++	 *
++	 * For non-DSC CWB usecases, have the num_lm be decided by the
++	 * (mode->hdisplay > MAX_HDISPLAY_SPLIT) check.
+ 	 */
+ 
+-	if (topology.num_intf == 2)
++	if (topology.num_intf == 2 && !topology.cwb_enabled)
+ 		topology.num_lm = 2;
+ 	else if (topology.num_dsc == 2)
+ 		topology.num_lm = 2;
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_rm.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_rm.c
+index a7b4086ae990..0fbb92021b18 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_rm.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_rm.c
+@@ -381,8 +381,18 @@ static int _dpu_rm_reserve_ctls(
+ 	int i = 0, j, num_ctls;
+ 	bool needs_split_display;
+ 
+-	/* each hw_intf needs its own hw_ctrl to program its control path */
+-	num_ctls = top->num_intf;
++	/*
++	 * For non-CWB mode, each hw_intf needs its own hw_ctl to program its
++	 * control path.
++	 *
++	 * Hardcode num_ctls to 1 if CWB is enabled because in CWB, both the
++	 * writeback and real-time encoders must be driven by the same control
++	 * path
++	 */
++	if (top->cwb_enabled)
++		num_ctls = 1;
++	else
++		num_ctls = top->num_intf;
+ 
+ 	needs_split_display = _dpu_rm_needs_split_display(top);
+ 
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_rm.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_rm.h
+index 463c532cdfdf..b854e42d319d 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_rm.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_rm.h
+@@ -52,6 +52,7 @@ struct dpu_rm_sspp_requirements {
+  * @num_dspp:     number of dspp blocks used
+  * @num_dsc:      number of Display Stream Compression (DSC) blocks used
+  * @needs_cdm:    indicates whether cdm block is needed for this display topology
++ * @cwb_enabled:  indicates whether CWB is enabled for this display topology
+  */
+ struct msm_display_topology {
+ 	u32 num_lm;
+@@ -59,6 +60,7 @@ struct msm_display_topology {
+ 	u32 num_dspp;
+ 	u32 num_dsc;
+ 	bool needs_cdm;
++	bool cwb_enabled;
+ };
+ 
+ int dpu_rm_init(struct drm_device *dev,
+-- 
+2.52.0
+

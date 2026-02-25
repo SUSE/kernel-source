@@ -1,0 +1,242 @@
+From c286e8501adedc2a22620a5c60dcd14286b38514 Mon Sep 17 00:00:00 2001
+From: Cruise Hung <Cruise.Hung@amd.com>
+Date: Thu, 20 Feb 2025 11:29:50 +0800
+Subject: drm/amd/display: Add tunneling IRQ handler
+Git-commit: c286e8501adedc2a22620a5c60dcd14286b38514
+Patch-mainline: v6.15-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+USB4 DP BW Allocation uses DP_TUNNELING_IRQ to indicate the status update.
+The DP_TUNNELING_IRQ is defined in LINK_SERVICE_IRQ_VECTOR_ESI0. When
+receiving DP HPD IRQ in USB4, read the LINK_SERVICE_IRQ_VECTOR_ESI0.
+
+Reviewed-by: Wenjing Liu <wenjing.liu@amd.com>
+Signed-off-by: Cruise Hung <Cruise.Hung@amd.com>
+Signed-off-by: Wayne Lin <wayne.lin@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/display/dc/dc_dp_types.h  | 40 +++++++++++++++--
+ .../dc/link/protocols/link_dp_dpia_bw.c       | 26 +++++++++++
+ .../dc/link/protocols/link_dp_dpia_bw.h       | 10 +++++
+ .../dc/link/protocols/link_dp_irq_handler.c   | 43 +++++++++++++++++--
+ 4 files changed, 112 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_dp_types.h b/drivers/gpu/drm/amd/display/dc/dc_dp_types.h
+index d988c00f5ca4..1f4f11adc491 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_dp_types.h
++++ b/drivers/gpu/drm/amd/display/dc/dc_dp_types.h
+@@ -300,6 +300,19 @@ union lane_align_status_updated {
+ 	uint8_t raw;
+ };
+ 
++union link_service_irq_vector_esi0 {
++	struct {
++		uint8_t DP_LINK_RX_CAP_CHANGED:1;
++		uint8_t DP_LINK_STATUS_CHANGED:1;
++		uint8_t DP_LINK_STREAM_STATUS_CHANGED:1;
++		uint8_t DP_LINK_HDMI_LINK_STATUS_CHANGED:1;
++		uint8_t DP_LINK_CONNECTED_OFF_ENTRY_REQUESTED:1;
++		uint8_t DP_LINK_TUNNELING_IRQ:1;
++		uint8_t reserved:2;
++	} bits;
++	uint8_t raw;
++};
++
+ union lane_adjust {
+ 	struct {
+ 		uint8_t VOLTAGE_SWING_LANE:2;
+@@ -462,8 +475,10 @@ union sink_status {
+ 	uint8_t raw;
+ };
+ 
+-/*6-byte structure corresponding to 6 registers (200h-205h)
+-read during handling of HPD-IRQ*/
++/* 7-byte structure corresponding to 6 registers (200h-205h)
++ * and LINK_SERVICE_IRQ_ESI0 (2005h) for tunneling IRQ
++ * read during handling of HPD-IRQ
++ */
+ union hpd_irq_data {
+ 	struct {
+ 		union sink_count sink_cnt;/* 200h */
+@@ -471,9 +486,10 @@ union hpd_irq_data {
+ 		union lane_status lane01_status;/* 202h */
+ 		union lane_status lane23_status;/* 203h */
+ 		union lane_align_status_updated lane_status_updated;/* 204h */
+-		union sink_status sink_status;
++		union sink_status sink_status;/* 205h */
++		union link_service_irq_vector_esi0 link_service_irq_esi0;/* 2005h */
+ 	} bytes;
+-	uint8_t raw[6];
++	uint8_t raw[7];
+ };
+ 
+ union down_stream_port_count {
+@@ -1430,4 +1446,20 @@ struct dp_trace {
+ #ifndef REQUESTED_BW
+ #define REQUESTED_BW					0xE0031 /* 1.4a */
+ #endif
++# ifndef DP_TUNNELING_BW_ALLOC_BITS_MASK
++# define DP_TUNNELING_BW_ALLOC_BITS_MASK		(0x0F << 0)
++# endif
++# ifndef DP_TUNNELING_BW_REQUEST_FAILED
++# define DP_TUNNELING_BW_REQUEST_FAILED			(1 << 0)
++# endif
++# ifndef DP_TUNNELING_BW_REQUEST_SUCCEEDED
++# define DP_TUNNELING_BW_REQUEST_SUCCEEDED		(1 << 1)
++# endif
++# ifndef DP_TUNNELING_ESTIMATED_BW_CHANGED
++# define DP_TUNNELING_ESTIMATED_BW_CHANGED		(1 << 2)
++# endif
++# ifndef DP_TUNNELING_BW_ALLOC_CAP_CHANGED
++# define DP_TUNNELING_BW_ALLOC_CAP_CHANGED		(1 << 3)
++# endif
++
+ #endif /* DC_DP_TYPES_H */
+diff --git a/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_dpia_bw.c b/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_dpia_bw.c
+index 0f1c411523a2..a5541b8fc95b 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_dpia_bw.c
++++ b/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_dpia_bw.c
+@@ -356,6 +356,32 @@ bool link_dp_dpia_set_dptx_usb4_bw_alloc_support(struct dc_link *link)
+ 	return ret;
+ }
+ 
++/*
++ * Handle DP BW allocation status register
++ *
++ * @link: pointer to the dc_link struct instance
++ * @status: content of DP tunneling status DPCD register
++ *
++ * return: none
++ */
++void link_dp_dpia_handle_bw_alloc_status(struct dc_link *link, uint8_t status)
++{
++	if (status & DP_TUNNELING_BW_REQUEST_SUCCEEDED) {
++		DC_LOG_DEBUG("%s: BW Allocation request succeeded on link(%d)",
++				__func__, link->link_index);
++	} else if (status & DP_TUNNELING_BW_REQUEST_FAILED) {
++		DC_LOG_DEBUG("%s: BW Allocation request failed on link(%d)  allocated/estimated BW=%d",
++				__func__, link->link_index, link->dpia_bw_alloc_config.estimated_bw);
++	} else if (status & DP_TUNNELING_ESTIMATED_BW_CHANGED) {
++		DC_LOG_DEBUG("%s: Estimated BW changed on link(%d)  new estimated BW=%d",
++				__func__, link->link_index, link->dpia_bw_alloc_config.estimated_bw);
++	}
++
++	core_link_write_dpcd(
++		link, DP_TUNNELING_STATUS,
++		&status, sizeof(status));
++}
++
+ void dpia_handle_bw_alloc_response(struct dc_link *link, uint8_t bw, uint8_t result)
+ {
+ 	int bw_needed = 0;
+diff --git a/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_dpia_bw.h b/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_dpia_bw.h
+index 3b6d8494f9d5..1b240a2f6ce0 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_dpia_bw.h
++++ b/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_dpia_bw.h
+@@ -108,4 +108,14 @@ bool dpia_validate_usb4_bw(struct dc_link **link, int *bw_needed, const unsigned
+  */
+ int link_dp_dpia_get_dp_overhead_in_dp_tunneling(struct dc_link *link);
+ 
++/*
++ * Handle DP BW allocation status register
++ *
++ * @link: pointer to the dc_link struct instance
++ * @status: content of DP tunneling status register
++ *
++ * return: none
++ */
++void link_dp_dpia_handle_bw_alloc_status(struct dc_link *link, uint8_t status);
++
+ #endif /* DC_INC_LINK_DP_DPIA_BW_H_ */
+diff --git a/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_irq_handler.c b/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_irq_handler.c
+index a08403c022ea..5be00e4ce10b 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_irq_handler.c
++++ b/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_irq_handler.c
+@@ -37,6 +37,7 @@
+ #include "link/accessories/link_dp_trace.h"
+ #include "link/link_dpms.h"
+ #include "dm_helpers.h"
++#include "link_dp_dpia_bw.h"
+ 
+ #define DC_LOGGER \
+ 	link->ctx->logger
+@@ -286,6 +287,30 @@ void dp_handle_link_loss(struct dc_link *link)
+ 	}
+ }
+ 
++static void dp_handle_tunneling_irq(struct dc_link *link)
++{
++	enum dc_status retval;
++	uint8_t tunneling_status = 0;
++
++	retval = core_link_read_dpcd(
++			link, DP_TUNNELING_STATUS,
++			&tunneling_status,
++			sizeof(tunneling_status));
++
++	if (retval == DC_OK) {
++		DC_LOG_HW_HPD_IRQ("%s: Got DP tunneling status on link %d status=0x%x",
++				__func__, link->link_index, tunneling_status);
++
++		if (tunneling_status & DP_TUNNELING_BW_ALLOC_BITS_MASK)
++			link_dp_dpia_handle_bw_alloc_status(link, tunneling_status);
++	}
++
++	tunneling_status = DP_TUNNELING_IRQ;
++	core_link_write_dpcd(
++		link, DP_LINK_SERVICE_IRQ_VECTOR_ESI0,
++		&tunneling_status, 1);
++}
++
+ static void read_dpcd204h_on_irq_hpd(struct dc_link *link, union hpd_irq_data *irq_data)
+ {
+ 	enum dc_status retval;
+@@ -319,13 +344,19 @@ enum dc_status dp_read_hpd_rx_irq_data(
+ 	 *
+ 	 * For DP 1.4 we need to read those from 2002h range.
+ 	 */
+-	if (link->dpcd_caps.dpcd_rev.raw < DPCD_REV_14)
++	if (link->dpcd_caps.dpcd_rev.raw < DPCD_REV_14) {
+ 		retval = core_link_read_dpcd(
+ 			link,
+ 			DP_SINK_COUNT,
+ 			irq_data->raw,
+-			sizeof(union hpd_irq_data));
+-	else {
++			DP_SINK_STATUS - DP_SINK_COUNT + 1);
++
++		if (link->ep_type == DISPLAY_ENDPOINT_USB4_DPIA) {
++			retval = core_link_read_dpcd(
++					link, DP_LINK_SERVICE_IRQ_VECTOR_ESI0,
++					&irq_data->bytes.link_service_irq_esi0.raw, 1);
++		}
++	} else {
+ 		/* Read 14 bytes in a single read and then copy only the required fields.
+ 		 * This is more efficient than doing it in two separate AUX reads. */
+ 
+@@ -346,6 +377,7 @@ enum dc_status dp_read_hpd_rx_irq_data(
+ 		irq_data->bytes.lane23_status.raw = tmp[DP_LANE2_3_STATUS_ESI - DP_SINK_COUNT_ESI];
+ 		irq_data->bytes.lane_status_updated.raw = tmp[DP_LANE_ALIGN_STATUS_UPDATED_ESI - DP_SINK_COUNT_ESI];
+ 		irq_data->bytes.sink_status.raw = tmp[DP_SINK_STATUS_ESI - DP_SINK_COUNT_ESI];
++		irq_data->bytes.link_service_irq_esi0.raw = tmp[DP_LINK_SERVICE_IRQ_VECTOR_ESI0 - DP_SINK_COUNT_ESI];
+ 
+ 		/*
+ 		 * This display doesn't have correct values in DPCD200Eh.
+@@ -488,6 +520,11 @@ bool dp_handle_hpd_rx_irq(struct dc_link *link,
+ 		dp_trace_link_loss_increment(link);
+ 	}
+ 
++	if (link->ep_type == DISPLAY_ENDPOINT_USB4_DPIA) {
++		if (hpd_irq_dpcd_data.bytes.link_service_irq_esi0.bits.DP_LINK_TUNNELING_IRQ)
++			dp_handle_tunneling_irq(link);
++	}
++
+ 	if (link->type == dc_connection_sst_branch &&
+ 		hpd_irq_dpcd_data.bytes.sink_cnt.bits.SINK_COUNT
+ 			!= link->dpcd_sink_count)
+-- 
+2.52.0
+

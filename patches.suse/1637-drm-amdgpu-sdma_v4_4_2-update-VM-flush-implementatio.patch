@@ -1,0 +1,241 @@
+From 6ec04e38b2f640c12030a8af4b8fd5401f7e2235 Mon Sep 17 00:00:00 2001
+From: "Jesse.zhang@amd.com" <Jesse.zhang@amd.com>
+Date: Thu, 27 Feb 2025 19:33:19 +0800
+Subject: drm/amdgpu/sdma_v4_4_2: update VM flush implementation for SDMA
+Git-commit: 6ec04e38b2f640c12030a8af4b8fd5401f7e2235
+Patch-mainline: v6.15-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+This commit updates the VM flush implementation for the SDMA engine.
+
+- Added a new function `sdma_v4_4_2_get_invalidate_req` to construct the VM_INVALIDATE_ENG0_REQ
+  register value for the specified VMID and flush type. This function ensures that all relevant
+  page table cache levels (L1 PTEs, L2 PTEs, and L2 PDEs) are invalidated.
+
+- Modified the `sdma_v4_4_2_ring_emit_vm_flush` function to use the new `sdma_v4_4_2_get_invalidate_req`
+  function. The updated function emits the necessary register writes and waits to perform a VM flush
+  for the specified VMID. It updates the PTB address registers and issues a VM invalidation request
+  using the specified VM invalidation engine.
+
+- Included the necessary header file `gc/gc_9_0_sh_mask.h` to provide access to the required register
+  definitions.
+
+V2: vm flush by the vm inalidation packet (Lijo)
+V3: code stle and define thh macro for the vm invalidation packet (Christian)
+V4: Format definition sdma vm invalidate packet (Lijo)
+
+Suggested-by: Lijo Lazar <lijo.lazar@amd.com>
+Signed-off-by: Jesse Zhang <jesse.zhang@amd.com>
+Reviewed-by: Lijo Lazar <lijo.lazar@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/sdma_v4_4_2.c      | 77 +++++++++++++++----
+ .../gpu/drm/amd/amdgpu/vega10_sdma_pkt_open.h | 70 +++++++++++++++++
+ 2 files changed, 133 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v4_4_2.c b/drivers/gpu/drm/amd/amdgpu/sdma_v4_4_2.c
+index ea2d8f28b126..dc94d58d33a6 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v4_4_2.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v4_4_2.c
+@@ -31,6 +31,7 @@
+ #include "amdgpu_ucode.h"
+ #include "amdgpu_trace.h"
+ #include "amdgpu_reset.h"
++#include "gc/gc_9_0_sh_mask.h"
+ 
+ #include "sdma/sdma_4_4_2_offset.h"
+ #include "sdma/sdma_4_4_2_sh_mask.h"
+@@ -1290,21 +1291,71 @@ static void sdma_v4_4_2_ring_emit_pipeline_sync(struct amdgpu_ring *ring)
+ 			       seq, 0xffffffff, 4);
+ }
+ 
+-
+-/**
+- * sdma_v4_4_2_ring_emit_vm_flush - vm flush using sDMA
++/*
++ * sdma_v4_4_2_get_invalidate_req - Construct the VM_INVALIDATE_ENG0_REQ register value
++ * @vmid: The VMID to invalidate
++ * @flush_type: The type of flush (0 = legacy, 1 = lightweight, 2 = heavyweight)
+  *
+- * @ring: amdgpu_ring pointer
+- * @vmid: vmid number to use
+- * @pd_addr: address
++ * This function constructs the VM_INVALIDATE_ENG0_REQ register value for the specified VMID
++ * and flush type. It ensures that all relevant page table cache levels (L1 PTEs, L2 PTEs, and
++ * L2 PDEs) are invalidated.
++ */
++static uint32_t sdma_v4_4_2_get_invalidate_req(unsigned int vmid,
++						uint32_t flush_type)
++{
++	u32 req = 0;
++
++	req = REG_SET_FIELD(req, VM_INVALIDATE_ENG0_REQ,
++			    PER_VMID_INVALIDATE_REQ, 1 << vmid);
++	req = REG_SET_FIELD(req, VM_INVALIDATE_ENG0_REQ, FLUSH_TYPE, flush_type);
++	req = REG_SET_FIELD(req, VM_INVALIDATE_ENG0_REQ, INVALIDATE_L2_PTES, 1);
++	req = REG_SET_FIELD(req, VM_INVALIDATE_ENG0_REQ, INVALIDATE_L2_PDE0, 1);
++	req = REG_SET_FIELD(req, VM_INVALIDATE_ENG0_REQ, INVALIDATE_L2_PDE1, 1);
++	req = REG_SET_FIELD(req, VM_INVALIDATE_ENG0_REQ, INVALIDATE_L2_PDE2, 1);
++	req = REG_SET_FIELD(req, VM_INVALIDATE_ENG0_REQ, INVALIDATE_L1_PTES, 1);
++	req = REG_SET_FIELD(req, VM_INVALIDATE_ENG0_REQ,
++			    CLEAR_PROTECTION_FAULT_STATUS_ADDR,	0);
++
++	return req;
++}
++
++/*
++ * sdma_v4_4_2_ring_emit_vm_flush - Emit VM flush commands for SDMA
++ * @ring: The SDMA ring
++ * @vmid: The VMID to flush
++ * @pd_addr: The page directory address
+  *
+- * Update the page table base and flush the VM TLB
+- * using sDMA.
++ * This function emits the necessary register writes and waits to perform a VM flush for the
++ * specified VMID. It updates the PTB address registers and issues a VM invalidation request
++ * using the specified VM invalidation engine.
+  */
+ static void sdma_v4_4_2_ring_emit_vm_flush(struct amdgpu_ring *ring,
+-					 unsigned vmid, uint64_t pd_addr)
++					    unsigned int vmid, uint64_t pd_addr)
+ {
+-	amdgpu_gmc_emit_flush_gpu_tlb(ring, vmid, pd_addr);
++	struct amdgpu_device *adev = ring->adev;
++	uint32_t req = sdma_v4_4_2_get_invalidate_req(vmid, 0);
++	unsigned int eng = ring->vm_inv_eng;
++	struct amdgpu_vmhub *hub = &adev->vmhub[ring->vm_hub];
++
++	amdgpu_ring_emit_wreg(ring, hub->ctx0_ptb_addr_lo32 +
++				(hub->ctx_addr_distance * vmid),
++				lower_32_bits(pd_addr));
++
++	amdgpu_ring_emit_wreg(ring, hub->ctx0_ptb_addr_hi32 +
++				(hub->ctx_addr_distance * vmid),
++				upper_32_bits(pd_addr));
++	/*
++	 * Construct and emit the VM invalidation packet
++	 */
++	amdgpu_ring_write(ring,
++		SDMA_PKT_VM_INVALIDATION_HEADER_OP(SDMA_OP_VM_INVALIDATE) |
++		SDMA_PKT_VM_INVALIDATION_HEADER_SUB_OP(SDMA_SUBOP_VM_INVALIDATE) |
++		SDMA_PKT_VM_INVALIDATION_HEADER_XCC0_ENG_ID(0x1f) |
++		SDMA_PKT_VM_INVALIDATION_HEADER_XCC1_ENG_ID(0x1f) |
++		SDMA_PKT_VM_INVALIDATION_HEADER_MMHUB_ENG_ID(eng));
++	amdgpu_ring_write(ring, SDMA_PKT_VM_INVALIDATION_INVALIDATEREQ_INVALIDATEREQ(req));
++	amdgpu_ring_write(ring, 0);
++	amdgpu_ring_write(ring, SDMA_PKT_VM_INVALIDATION_ADDRESSRANGEHI_INVALIDATEACK(BIT(vmid)));
+ }
+ 
+ static void sdma_v4_4_2_ring_emit_wreg(struct amdgpu_ring *ring,
+@@ -2126,8 +2177,7 @@ static const struct amdgpu_ring_funcs sdma_v4_4_2_ring_funcs = {
+ 		3 + /* hdp invalidate */
+ 		6 + /* sdma_v4_4_2_ring_emit_pipeline_sync */
+ 		/* sdma_v4_4_2_ring_emit_vm_flush */
+-		SOC15_FLUSH_GPU_TLB_NUM_WREG * 3 +
+-		SOC15_FLUSH_GPU_TLB_NUM_REG_WAIT * 6 +
++		4 + 2 * 3 +
+ 		10 + 10 + 10, /* sdma_v4_4_2_ring_emit_fence x3 for user fence, vm fence */
+ 	.emit_ib_size = 7 + 6, /* sdma_v4_4_2_ring_emit_ib */
+ 	.emit_ib = sdma_v4_4_2_ring_emit_ib,
+@@ -2159,8 +2209,7 @@ static const struct amdgpu_ring_funcs sdma_v4_4_2_page_ring_funcs = {
+ 		3 + /* hdp invalidate */
+ 		6 + /* sdma_v4_4_2_ring_emit_pipeline_sync */
+ 		/* sdma_v4_4_2_ring_emit_vm_flush */
+-		SOC15_FLUSH_GPU_TLB_NUM_WREG * 3 +
+-		SOC15_FLUSH_GPU_TLB_NUM_REG_WAIT * 6 +
++		4 + 2 * 3 +
+ 		10 + 10 + 10, /* sdma_v4_4_2_ring_emit_fence x3 for user fence, vm fence */
+ 	.emit_ib_size = 7 + 6, /* sdma_v4_4_2_ring_emit_ib */
+ 	.emit_ib = sdma_v4_4_2_ring_emit_ib,
+diff --git a/drivers/gpu/drm/amd/amdgpu/vega10_sdma_pkt_open.h b/drivers/gpu/drm/amd/amdgpu/vega10_sdma_pkt_open.h
+index 8de4ccce5e38..3ca8a417c6d8 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vega10_sdma_pkt_open.h
++++ b/drivers/gpu/drm/amd/amdgpu/vega10_sdma_pkt_open.h
+@@ -64,6 +64,9 @@
+ #define HEADER_BARRIER  5
+ #define SDMA_OP_AQL_COPY  0
+ #define SDMA_OP_AQL_BARRIER_OR  0
++/* vm invalidation is only available for GC9.4.3/GC9.4.4/GC9.5.0 */
++#define SDMA_OP_VM_INVALIDATE 8
++#define SDMA_SUBOP_VM_INVALIDATE 4
+ 
+ /*define for op field*/
+ #define SDMA_PKT_HEADER_op_offset 0
+@@ -3331,5 +3334,72 @@
+ #define SDMA_AQL_PKT_BARRIER_OR_COMPLETION_SIGNAL_HI_completion_signal_63_32_shift  0
+ #define SDMA_AQL_PKT_BARRIER_OR_COMPLETION_SIGNAL_HI_COMPLETION_SIGNAL_63_32(x) (((x) & SDMA_AQL_PKT_BARRIER_OR_COMPLETION_SIGNAL_HI_completion_signal_63_32_mask) << SDMA_AQL_PKT_BARRIER_OR_COMPLETION_SIGNAL_HI_completion_signal_63_32_shift)
+ 
++/*
++** Definitions for SDMA_PKT_VM_INVALIDATION packet
++*/
++
++/*define for HEADER word*/
++/*define for op field*/
++#define SDMA_PKT_VM_INVALIDATION_HEADER_op_offset 0
++#define SDMA_PKT_VM_INVALIDATION_HEADER_op_mask   0x000000FF
++#define SDMA_PKT_VM_INVALIDATION_HEADER_op_shift  0
++#define SDMA_PKT_VM_INVALIDATION_HEADER_OP(x) ((x & SDMA_PKT_VM_INVALIDATION_HEADER_op_mask) << SDMA_PKT_VM_INVALIDATION_HEADER_op_shift)
++
++/*define for sub_op field*/
++#define SDMA_PKT_VM_INVALIDATION_HEADER_sub_op_offset 0
++#define SDMA_PKT_VM_INVALIDATION_HEADER_sub_op_mask   0x000000FF
++#define SDMA_PKT_VM_INVALIDATION_HEADER_sub_op_shift  8
++#define SDMA_PKT_VM_INVALIDATION_HEADER_SUB_OP(x) ((x & SDMA_PKT_VM_INVALIDATION_HEADER_sub_op_mask) << SDMA_PKT_VM_INVALIDATION_HEADER_sub_op_shift)
++
++/*define for xcc0_eng_id field*/
++#define SDMA_PKT_VM_INVALIDATION_HEADER_xcc0_eng_id_offset 0
++#define SDMA_PKT_VM_INVALIDATION_HEADER_xcc0_eng_id_mask   0x0000001F
++#define SDMA_PKT_VM_INVALIDATION_HEADER_xcc0_eng_id_shift  16
++#define SDMA_PKT_VM_INVALIDATION_HEADER_XCC0_ENG_ID(x) ((x & SDMA_PKT_VM_INVALIDATION_HEADER_xcc0_eng_id_mask) << SDMA_PKT_VM_INVALIDATION_HEADER_xcc0_eng_id_shift)
++
++/*define for xcc1_eng_id field*/
++#define SDMA_PKT_VM_INVALIDATION_HEADER_xcc1_eng_id_offset 0
++#define SDMA_PKT_VM_INVALIDATION_HEADER_xcc1_eng_id_mask   0x0000001F
++#define SDMA_PKT_VM_INVALIDATION_HEADER_xcc1_eng_id_shift  21
++#define SDMA_PKT_VM_INVALIDATION_HEADER_XCC1_ENG_ID(x) ((x & SDMA_PKT_VM_INVALIDATION_HEADER_xcc1_eng_id_mask) << SDMA_PKT_VM_INVALIDATION_HEADER_xcc1_eng_id_shift)
++
++/*define for mmhub_eng_id field*/
++#define SDMA_PKT_VM_INVALIDATION_HEADER_mmhub_eng_id_offset 0
++#define SDMA_PKT_VM_INVALIDATION_HEADER_mmhub_eng_id_mask   0x0000001F
++#define SDMA_PKT_VM_INVALIDATION_HEADER_mmhub_eng_id_shift  26
++#define SDMA_PKT_VM_INVALIDATION_HEADER_MMHUB_ENG_ID(x) ((x & SDMA_PKT_VM_INVALIDATION_HEADER_mmhub_eng_id_mask) << SDMA_PKT_VM_INVALIDATION_HEADER_mmhub_eng_id_shift)
++
++/*define for INVALIDATEREQ word*/
++/*define for invalidatereq field*/
++#define SDMA_PKT_VM_INVALIDATION_INVALIDATEREQ_invalidatereq_offset 1
++#define SDMA_PKT_VM_INVALIDATION_INVALIDATEREQ_invalidatereq_mask   0xFFFFFFFF
++#define SDMA_PKT_VM_INVALIDATION_INVALIDATEREQ_invalidatereq_shift  0
++#define SDMA_PKT_VM_INVALIDATION_INVALIDATEREQ_INVALIDATEREQ(x) ((x & SDMA_PKT_VM_INVALIDATION_INVALIDATEREQ_invalidatereq_mask) << SDMA_PKT_VM_INVALIDATION_INVALIDATEREQ_invalidatereq_shift)
++
++/*define for ADDRESSRANGELO word*/
++/*define for addressrangelo field*/
++#define SDMA_PKT_VM_INVALIDATION_ADDRESSRANGELO_addressrangelo_offset 2
++#define SDMA_PKT_VM_INVALIDATION_ADDRESSRANGELO_addressrangelo_mask   0xFFFFFFFF
++#define SDMA_PKT_VM_INVALIDATION_ADDRESSRANGELO_addressrangelo_shift  0
++#define SDMA_PKT_VM_INVALIDATION_ADDRESSRANGELO_ADDRESSRANGELO(x) ((x & SDMA_PKT_VM_INVALIDATION_ADDRESSRANGELO_addressrangelo_mask) << SDMA_PKT_VM_INVALIDATION_ADDRESSRANGELO_addressrangelo_shift)
++
++/*define for ADDRESSRANGEHI word*/
++/*define for invalidateack field*/
++#define SDMA_PKT_VM_INVALIDATION_ADDRESSRANGEHI_invalidateack_offset 3
++#define SDMA_PKT_VM_INVALIDATION_ADDRESSRANGEHI_invalidateack_mask   0x0000FFFF
++#define SDMA_PKT_VM_INVALIDATION_ADDRESSRANGEHI_invalidateack_shift  0
++#define SDMA_PKT_VM_INVALIDATION_ADDRESSRANGEHI_INVALIDATEACK(x) ((x & SDMA_PKT_VM_INVALIDATION_ADDRESSRANGEHI_invalidateack_mask) << SDMA_PKT_VM_INVALIDATION_ADDRESSRANGEHI_invalidateack_shift)
++
++/*define for addressrangehi field*/
++#define SDMA_PKT_VM_INVALIDATION_ADDRESSRANGEHI_addressrangehi_offset 3
++#define SDMA_PKT_VM_INVALIDATION_ADDRESSRANGEHI_addressrangehi_mask   0x0000001F
++#define SDMA_PKT_VM_INVALIDATION_ADDRESSRANGEHI_addressrangehi_shift  16
++#define SDMA_PKT_VM_INVALIDATION_ADDRESSRANGEHI_ADDRESSRANGEHI(x) ((x & SDMA_PKT_VM_INVALIDATION_ADDRESSRANGEHI_addressrangehi_mask) << SDMA_PKT_VM_INVALIDATION_ADDRESSRANGEHI_addressrangehi_shift)
++
++/*define for reserved field*/
++#define SDMA_PKT_VM_INVALIDATION_ADDRESSRANGEHI_reserved_offset 3
++#define SDMA_PKT_VM_INVALIDATION_ADDRESSRANGEHI_reserved_mask   0x000001FF
++#define SDMA_PKT_VM_INVALIDATION_ADDRESSRANGEHI_reserved_shift  23
++#define SDMA_PKT_VM_INVALIDATION_ADDRESSRANGEHI_RESERVED(x) ((x & SDMA_PKT_VM_INVALIDATION_ADDRESSRANGEHI_reserved_mask) << SDMA_PKT_VM_INVALIDATION_ADDRESSRANGEHI_reserved_shift)
+ 
+ #endif /* __SDMA_PKT_OPEN_H_ */
+-- 
+2.52.0
+

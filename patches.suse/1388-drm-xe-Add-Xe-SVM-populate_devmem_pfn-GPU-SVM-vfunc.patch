@@ -1,0 +1,92 @@
+From ecacec0f4aff9130e333e67ecfa21f3e0b630298 Mon Sep 17 00:00:00 2001
+From: Matthew Brost <matthew.brost@intel.com>
+Date: Wed, 5 Mar 2025 17:26:50 -0800
+Subject: drm/xe: Add Xe SVM populate_devmem_pfn GPU SVM vfunc
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: ecacec0f4aff9130e333e67ecfa21f3e0b630298
+Patch-mainline: v6.15-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Get device pfns from BO's buddy blocks. Used in migrate_* core MM
+functions called in GPU SVM to migrate between device and system memory.
+
+V2: - Use new drm_gpusvm_devmem_ops
+V3: - Better commit message (Thomas)
+V5: - s/xe_mem_region/xe_vram_region (Rebase)
+
+Signed-off-by: Niranjana Vishwanathapura <niranjana.vishwanathapura@intel.com>
+Signed-off-by: Oak Zeng <oak.zeng@intel.com>
+Signed-off-by: Matthew Brost <matthew.brost@intel.com>
+Reviewed-by: Thomas Hellström <thomas.hellstrom@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250306012657.3505757-26-matthew.brost@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/xe/xe_svm.c | 40 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 40 insertions(+)
+
+diff --git a/drivers/gpu/drm/xe/xe_svm.c b/drivers/gpu/drm/xe/xe_svm.c
+index 47b81b66ab25..a0fbbd29b92c 100644
+--- a/drivers/gpu/drm/xe/xe_svm.c
++++ b/drivers/gpu/drm/xe/xe_svm.c
+@@ -7,6 +7,7 @@
+ #include "xe_migrate.h"
+ #include "xe_pt.h"
+ #include "xe_svm.h"
++#include "xe_ttm_vram_mgr.h"
+ #include "xe_vm.h"
+ #include "xe_vm_types.h"
+ 
+@@ -461,8 +462,47 @@ static int xe_svm_copy_to_ram(struct page **pages, dma_addr_t *dma_addr,
+ 	return xe_svm_copy(pages, dma_addr, npages, XE_SVM_COPY_TO_SRAM);
+ }
+ 
++static struct xe_bo *to_xe_bo(struct drm_gpusvm_devmem *devmem_allocation)
++{
++	return container_of(devmem_allocation, struct xe_bo, devmem_allocation);
++}
++
++static u64 block_offset_to_pfn(struct xe_vram_region *vr, u64 offset)
++{
++	return PHYS_PFN(offset + vr->hpa_base);
++}
++
++static struct drm_buddy *tile_to_buddy(struct xe_tile *tile)
++{
++	return &tile->mem.vram.ttm.mm;
++}
++
++static int xe_svm_populate_devmem_pfn(struct drm_gpusvm_devmem *devmem_allocation,
++				      unsigned long npages, unsigned long *pfn)
++{
++	struct xe_bo *bo = to_xe_bo(devmem_allocation);
++	struct ttm_resource *res = bo->ttm.resource;
++	struct list_head *blocks = &to_xe_ttm_vram_mgr_resource(res)->blocks;
++	struct drm_buddy_block *block;
++	int j = 0;
++
++	list_for_each_entry(block, blocks, link) {
++		struct xe_vram_region *vr = block->private;
++		struct xe_tile *tile = vr_to_tile(vr);
++		struct drm_buddy *buddy = tile_to_buddy(tile);
++		u64 block_pfn = block_offset_to_pfn(vr, drm_buddy_block_offset(block));
++		int i;
++
++		for (i = 0; i < drm_buddy_block_size(buddy, block) >> PAGE_SHIFT; ++i)
++			pfn[j++] = block_pfn + i;
++	}
++
++	return 0;
++}
++
+ __maybe_unused
+ static const struct drm_gpusvm_devmem_ops gpusvm_devmem_ops = {
++	.populate_devmem_pfn = xe_svm_populate_devmem_pfn,
+ 	.copy_to_devmem = xe_svm_copy_to_devmem,
+ 	.copy_to_ram = xe_svm_copy_to_ram,
+ };
+-- 
+2.52.0
+

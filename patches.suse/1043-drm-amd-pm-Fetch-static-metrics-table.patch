@@ -1,0 +1,236 @@
+From 95eebc05a72942582669f3ae675d7185dc275205 Mon Sep 17 00:00:00 2001
+From: Asad Kamal <asad.kamal@amd.com>
+Date: Tue, 11 Feb 2025 00:03:18 +0800
+Subject: drm/amd/pm: Fetch static metrics table
+Git-commit: 95eebc05a72942582669f3ae675d7185dc275205
+Patch-mainline: v6.15-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Fetch clock frequency table from static metrics table for
+smu_v13_0_12
+
+V2: Move PPTable definition, remove unnecessary checks for getting
+static metrics table(Lijo)
+
+Signed-off-by: Asad Kamal <asad.kamal@amd.com>
+Reviewed-by: Lijo Lazar <lijo.lazar@amd.com>
+Reviewed-by: Hawking Zhang <Hawking.Zhang@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/pm/swsmu/inc/smu_v13_0.h  |  6 ++
+ .../drm/amd/pm/swsmu/smu13/smu_v13_0_12_ppt.c | 70 +++++++++++++++++++
+ .../drm/amd/pm/swsmu/smu13/smu_v13_0_6_ppt.c  | 29 +++-----
+ .../drm/amd/pm/swsmu/smu13/smu_v13_0_6_ppt.h  | 16 +++++
+ 4 files changed, 101 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/inc/smu_v13_0.h b/drivers/gpu/drm/amd/pm/swsmu/inc/smu_v13_0.h
+index 609a04c75129..4dc3b37d52b9 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/inc/smu_v13_0.h
++++ b/drivers/gpu/drm/amd/pm/swsmu/inc/smu_v13_0.h
+@@ -53,6 +53,10 @@
+ 
+ #define SMU_13_VCLK_SHIFT		16
+ 
++#define SMUQ10_TO_UINT(x) ((x) >> 10)
++#define SMUQ10_FRAC(x) ((x) & 0x3ff)
++#define SMUQ10_ROUND(x) ((SMUQ10_TO_UINT(x)) + ((SMUQ10_FRAC(x)) >= 0x200))
++
+ extern const int pmfw_decoded_link_speed[5];
+ extern const int pmfw_decoded_link_width[7];
+ 
+@@ -307,6 +311,8 @@ int smu_v13_0_get_boot_freq_by_index(struct smu_context *smu,
+ 
+ void smu_v13_0_interrupt_work(struct smu_context *smu);
+ bool smu_v13_0_12_is_dpm_running(struct smu_context *smu);
++int smu_v13_0_12_get_max_metrics_size(void);
++int smu_v13_0_12_setup_driver_pptable(struct smu_context *smu);
+ extern const struct cmn2asic_mapping smu_v13_0_12_feature_mask_map[];
+ extern const struct cmn2asic_msg_mapping smu_v13_0_12_message_map[];
+ #endif
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_12_ppt.c b/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_12_ppt.c
+index 5ad5dd879e81..1555fb954487 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_12_ppt.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_12_ppt.c
+@@ -145,6 +145,76 @@ static int smu_v13_0_12_get_enabled_mask(struct smu_context *smu,
+ 	return ret;
+ }
+ 
++int smu_v13_0_12_get_max_metrics_size(void)
++{
++	return sizeof(StaticMetricsTable_t);
++}
++
++static int smu_v13_0_12_get_static_metrics_table(struct smu_context *smu)
++{
++	struct smu_table_context *smu_table = &smu->smu_table;
++	uint32_t table_size = smu_table->tables[SMU_TABLE_SMU_METRICS].size;
++	struct smu_table *table = &smu_table->driver_table;
++	int ret;
++
++	ret = smu_cmn_send_smc_msg(smu, SMU_MSG_GetStaticMetricsTable, NULL);
++	if (ret) {
++		dev_info(smu->adev->dev,
++			 "Failed to export static metrics table!\n");
++		return ret;
++	}
++
++	amdgpu_asic_invalidate_hdp(smu->adev, NULL);
++	memcpy(smu_table->metrics_table, table->cpu_addr, table_size);
++
++	return 0;
++}
++
++int smu_v13_0_12_setup_driver_pptable(struct smu_context *smu)
++{
++	struct smu_table_context *smu_table = &smu->smu_table;
++	StaticMetricsTable_t *static_metrics = (StaticMetricsTable_t *)smu_table->metrics_table;
++	struct PPTable_t *pptable =
++		(struct PPTable_t *)smu_table->driver_pptable;
++	int ret, i;
++
++	if (!pptable->Init) {
++		ret = smu_v13_0_12_get_static_metrics_table(smu);
++		if (ret)
++			return ret;
++
++		pptable->MaxSocketPowerLimit =
++			SMUQ10_ROUND(static_metrics->MaxSocketPowerLimit);
++		pptable->MaxGfxclkFrequency =
++			SMUQ10_ROUND(static_metrics->MaxGfxclkFrequency);
++		pptable->MinGfxclkFrequency =
++			SMUQ10_ROUND(static_metrics->MinGfxclkFrequency);
++
++		for (i = 0; i < 4; ++i) {
++			pptable->FclkFrequencyTable[i] =
++				SMUQ10_ROUND(static_metrics->FclkFrequencyTable[i]);
++			pptable->UclkFrequencyTable[i] =
++				SMUQ10_ROUND(static_metrics->UclkFrequencyTable[i]);
++			pptable->SocclkFrequencyTable[i] =
++				SMUQ10_ROUND(static_metrics->SocclkFrequencyTable[i]);
++			pptable->VclkFrequencyTable[i] =
++				SMUQ10_ROUND(static_metrics->VclkFrequencyTable[i]);
++			pptable->DclkFrequencyTable[i] =
++				SMUQ10_ROUND(static_metrics->DclkFrequencyTable[i]);
++			pptable->LclkFrequencyTable[i] =
++				SMUQ10_ROUND(static_metrics->LclkFrequencyTable[i]);
++		}
++
++		/* use AID0 serial number by default */
++		pptable->PublicSerialNumber_AID =
++			static_metrics->PublicSerialNumber_AID[0];
++
++		pptable->Init = true;
++	}
++
++	return 0;
++}
++
+ bool smu_v13_0_12_is_dpm_running(struct smu_context *smu)
+ {
+ 	int ret;
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_6_ppt.c b/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_6_ppt.c
+index c43fce62df1c..c3e0da680cf8 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_6_ppt.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_6_ppt.c
+@@ -116,6 +116,7 @@ enum smu_v13_0_6_caps {
+ 	SMU_CAP(RMA_MSG),
+ 	SMU_CAP(ACA_SYND),
+ 	SMU_CAP(SDMA_RESET),
++	SMU_CAP(STATIC_METRICS),
+ 	SMU_CAP(ALL),
+ };
+ 
+@@ -252,25 +253,6 @@ static const uint8_t smu_v13_0_6_throttler_map[] = {
+ 	[THROTTLER_PROCHOT_BIT]		= (SMU_THROTTLER_PROCHOT_GFX_BIT),
+ };
+ 
+-struct PPTable_t {
+-	uint32_t MaxSocketPowerLimit;
+-	uint32_t MaxGfxclkFrequency;
+-	uint32_t MinGfxclkFrequency;
+-	uint32_t FclkFrequencyTable[4];
+-	uint32_t UclkFrequencyTable[4];
+-	uint32_t SocclkFrequencyTable[4];
+-	uint32_t VclkFrequencyTable[4];
+-	uint32_t DclkFrequencyTable[4];
+-	uint32_t LclkFrequencyTable[4];
+-	uint32_t MaxLclkDpmRange;
+-	uint32_t MinLclkDpmRange;
+-	uint64_t PublicSerialNumber_AID;
+-	bool Init;
+-};
+-
+-#define SMUQ10_TO_UINT(x) ((x) >> 10)
+-#define SMUQ10_FRAC(x) ((x) & 0x3ff)
+-#define SMUQ10_ROUND(x) ((SMUQ10_TO_UINT(x)) + ((SMUQ10_FRAC(x)) >= 0x200))
+ #define GET_GPU_METRIC_FIELD(field, version) ((version == METRICS_VERSION_V0) ?\
+ 		(metrics_v0->field) : (metrics_v2->field))
+ #define GET_METRIC_FIELD(field, version) ((version == METRICS_VERSION_V1) ?\
+@@ -368,6 +350,9 @@ static void smu_v13_0_12_init_caps(struct smu_context *smu)
+ 
+ 	if (fw_ver >= 0x00561700)
+ 		smu_v13_0_6_cap_set(smu, SMU_CAP(SDMA_RESET));
++
++	if (fw_ver >= 0x00561E00)
++		smu_v13_0_6_cap_set(smu, SMU_CAP(STATIC_METRICS));
+ }
+ 
+ static void smu_v13_0_6_init_caps(struct smu_context *smu)
+@@ -523,13 +508,14 @@ static int smu_v13_0_6_tables_init(struct smu_context *smu)
+ 	struct smu_table_context *smu_table = &smu->smu_table;
+ 	struct smu_table *tables = smu_table->tables;
+ 	struct amdgpu_device *adev = smu->adev;
++	int gpu_metrcs_size = METRICS_TABLE_SIZE;
+ 
+ 	if (!(adev->flags & AMD_IS_APU))
+ 		SMU_TABLE_INIT(tables, SMU_TABLE_PMSTATUSLOG, SMU13_TOOL_SIZE,
+ 			       PAGE_SIZE, AMDGPU_GEM_DOMAIN_VRAM);
+ 
+ 	SMU_TABLE_INIT(tables, SMU_TABLE_SMU_METRICS,
+-		       METRICS_TABLE_SIZE,
++		       max(gpu_metrcs_size, smu_v13_0_12_get_max_metrics_size()),
+ 		       PAGE_SIZE,
+ 		       AMDGPU_GEM_DOMAIN_VRAM | AMDGPU_GEM_DOMAIN_GTT);
+ 
+@@ -776,6 +762,9 @@ static int smu_v13_0_6_setup_driver_pptable(struct smu_context *smu)
+ 	int ret, i, retry = 100;
+ 	uint32_t table_version;
+ 
++	if (smu_v13_0_6_cap_supported(smu, SMU_CAP(STATIC_METRICS)))
++		return smu_v13_0_12_setup_driver_pptable(smu);
++
+ 	/* Store one-time values in driver PPTable */
+ 	if (!pptable->Init) {
+ 		while (--retry) {
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_6_ppt.h b/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_6_ppt.h
+index 717fe669882e..83745909e564 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_6_ppt.h
++++ b/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_6_ppt.h
+@@ -35,6 +35,22 @@ typedef enum {
+ /*3*/   NUM_METRICS                         = 3
+ } METRICS_LIST_e;
+ 
++struct PPTable_t {
++	uint32_t MaxSocketPowerLimit;
++	uint32_t MaxGfxclkFrequency;
++	uint32_t MinGfxclkFrequency;
++	uint32_t FclkFrequencyTable[4];
++	uint32_t UclkFrequencyTable[4];
++	uint32_t SocclkFrequencyTable[4];
++	uint32_t VclkFrequencyTable[4];
++	uint32_t DclkFrequencyTable[4];
++	uint32_t LclkFrequencyTable[4];
++	uint32_t MaxLclkDpmRange;
++	uint32_t MinLclkDpmRange;
++	uint64_t PublicSerialNumber_AID;
++	bool Init;
++};
++
+ extern void smu_v13_0_6_set_ppt_funcs(struct smu_context *smu);
+ 
+ #endif
+-- 
+2.52.0
+

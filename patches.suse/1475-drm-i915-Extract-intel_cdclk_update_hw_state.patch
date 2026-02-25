@@ -1,0 +1,150 @@
+From bd17fc4b6b2b522567982b7a0b2f6c5972e504fa Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Thu, 6 Mar 2025 18:34:11 +0200
+Subject: drm/i915: Extract intel_cdclk_update_hw_state()
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: bd17fc4b6b2b522567982b7a0b2f6c5972e504fa
+Patch-mainline: v6.15-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Hoist the cdclk stuff into a separate function from
+intel_modeset_readout_hw_state() so that the details
+are better hidden inside intel_cdclk.c.
+
+Reviewed-by: Vinod Govindapillai <vinod.govindapillai@intel.com>
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250306163420.3961-10-ville.syrjala@linux.intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/intel_cdclk.c    | 29 ++++++++++++++++++-
+ drivers/gpu/drm/i915/display/intel_cdclk.h    |  2 +-
+ .../drm/i915/display/intel_modeset_setup.c    | 16 ++--------
+ 3 files changed, 31 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_cdclk.c b/drivers/gpu/drm/i915/display/intel_cdclk.c
+index 4b7058e65588..947833a96ab7 100644
+--- a/drivers/gpu/drm/i915/display/intel_cdclk.c
++++ b/drivers/gpu/drm/i915/display/intel_cdclk.c
+@@ -2788,7 +2788,7 @@ static int intel_planes_min_cdclk(const struct intel_crtc_state *crtc_state)
+ 	return min_cdclk;
+ }
+ 
+-int intel_crtc_compute_min_cdclk(const struct intel_crtc_state *crtc_state)
++static int intel_crtc_compute_min_cdclk(const struct intel_crtc_state *crtc_state)
+ {
+ 	int min_cdclk;
+ 
+@@ -3340,6 +3340,33 @@ int intel_modeset_calc_cdclk(struct intel_atomic_state *state)
+ 	return 0;
+ }
+ 
++void intel_cdclk_update_hw_state(struct intel_display *display)
++{
++	struct intel_cdclk_state *cdclk_state =
++		to_intel_cdclk_state(display->cdclk.obj.state);
++	struct intel_crtc *crtc;
++
++	cdclk_state->active_pipes = 0;
++
++	for_each_intel_crtc(display->drm, crtc) {
++		const struct intel_crtc_state *crtc_state =
++			to_intel_crtc_state(crtc->base.state);
++		enum pipe pipe = crtc->pipe;
++		int min_cdclk = 0;
++
++		if (crtc_state->hw.active) {
++			cdclk_state->active_pipes |= BIT(pipe);
++
++			min_cdclk = intel_crtc_compute_min_cdclk(crtc_state);
++			if (drm_WARN_ON(display->drm, min_cdclk < 0))
++				min_cdclk = 0;
++		}
++
++		cdclk_state->min_cdclk[pipe] = min_cdclk;
++		cdclk_state->min_voltage_level[pipe] = crtc_state->min_voltage_level;
++	}
++}
++
+ void intel_cdclk_crtc_disable_noatomic(struct intel_crtc *crtc)
+ {
+ 	struct intel_display *display = to_intel_display(crtc);
+diff --git a/drivers/gpu/drm/i915/display/intel_cdclk.h b/drivers/gpu/drm/i915/display/intel_cdclk.h
+index 689e12e2196b..a1cefd455d92 100644
+--- a/drivers/gpu/drm/i915/display/intel_cdclk.h
++++ b/drivers/gpu/drm/i915/display/intel_cdclk.h
+@@ -59,7 +59,6 @@ struct intel_cdclk_state {
+ 	bool disable_pipes;
+ };
+ 
+-int intel_crtc_compute_min_cdclk(const struct intel_crtc_state *crtc_state);
+ void intel_cdclk_init_hw(struct intel_display *display);
+ void intel_cdclk_uninit_hw(struct intel_display *display);
+ void intel_init_cdclk_hooks(struct intel_display *display);
+@@ -84,6 +83,7 @@ int intel_cdclk_atomic_check(struct intel_atomic_state *state,
+ int intel_cdclk_state_set_joined_mbus(struct intel_atomic_state *state, bool joined_mbus);
+ struct intel_cdclk_state *
+ intel_atomic_get_cdclk_state(struct intel_atomic_state *state);
++void intel_cdclk_update_hw_state(struct intel_display *display);
+ void intel_cdclk_crtc_disable_noatomic(struct intel_crtc *crtc);
+ 
+ #define to_intel_cdclk_state(global_state) \
+diff --git a/drivers/gpu/drm/i915/display/intel_modeset_setup.c b/drivers/gpu/drm/i915/display/intel_modeset_setup.c
+index e9b0533526f6..1cfa03bd3224 100644
+--- a/drivers/gpu/drm/i915/display/intel_modeset_setup.c
++++ b/drivers/gpu/drm/i915/display/intel_modeset_setup.c
+@@ -693,8 +693,6 @@ static void readout_plane_state(struct drm_i915_private *i915)
+ static void intel_modeset_readout_hw_state(struct drm_i915_private *i915)
+ {
+ 	struct intel_display *display = &i915->display;
+-	struct intel_cdclk_state *cdclk_state =
+-		to_intel_cdclk_state(i915->display.cdclk.obj.state);
+ 	struct intel_dbuf_state *dbuf_state =
+ 		to_intel_dbuf_state(i915->display.dbuf.obj.state);
+ 	struct intel_pmdemand_state *pmdemand_state =
+@@ -730,7 +728,6 @@ static void intel_modeset_readout_hw_state(struct drm_i915_private *i915)
+ 			    str_enabled_disabled(crtc_state->hw.active));
+ 	}
+ 
+-	cdclk_state->active_pipes = active_pipes;
+ 	dbuf_state->active_pipes = active_pipes;
+ 
+ 	readout_plane_state(i915);
+@@ -833,7 +830,6 @@ static void intel_modeset_readout_hw_state(struct drm_i915_private *i915)
+ 		struct intel_crtc_state *crtc_state =
+ 			to_intel_crtc_state(crtc->base.state);
+ 		struct intel_plane *plane;
+-		int min_cdclk = 0;
+ 
+ 		if (crtc_state->hw.active) {
+ 			/*
+@@ -882,22 +878,14 @@ static void intel_modeset_readout_hw_state(struct drm_i915_private *i915)
+ 				    crtc_state->min_cdclk[plane->id]);
+ 		}
+ 
+-		if (crtc_state->hw.active) {
+-			min_cdclk = intel_crtc_compute_min_cdclk(crtc_state);
+-			if (drm_WARN_ON(&i915->drm, min_cdclk < 0))
+-				min_cdclk = 0;
+-		}
+-
+-		cdclk_state->min_cdclk[crtc->pipe] = min_cdclk;
+-		cdclk_state->min_voltage_level[crtc->pipe] =
+-			crtc_state->min_voltage_level;
+-
+ 		intel_pmdemand_update_port_clock(display, pmdemand_state, pipe,
+ 						 crtc_state->port_clock);
+ 
+ 		intel_bw_crtc_update(bw_state, crtc_state);
+ 	}
+ 
++	intel_cdclk_update_hw_state(display);
++
+ 	intel_pmdemand_init_pmdemand_params(display, pmdemand_state);
+ }
+ 
+-- 
+2.52.0
+

@@ -1,0 +1,134 @@
+From 41b830476009f50233e8df538113765c0a59308d Mon Sep 17 00:00:00 2001
+From: Aurabindo Pillai <aurabindo.pillai@amd.com>
+Date: Mon, 24 Feb 2025 14:24:45 -0500
+Subject: drm/amd/display: Add workaround for a panel
+Git-commit: 41b830476009f50233e8df538113765c0a59308d
+Patch-mainline: v6.15-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Implement w/a for a panel which requires 10s delay after link detect.
+
+Signed-off-by: Aurabindo Pillai <aurabindo.pillai@amd.com>
+Reviewed-by: Alex Hung <alex.hung@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 27 ++++++++++++++++++-
+ .../amd/display/amdgpu_dm/amdgpu_dm_helpers.c | 10 +++++--
+ drivers/gpu/drm/amd/display/dc/dc_types.h     |  1 +
+ 3 files changed, 35 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 8814749c5b28..c744077ee2bc 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -3334,6 +3334,24 @@ static void dm_gpureset_commit_state(struct dc_state *dc_state,
+ 	}
+ }
+ 
++static void apply_delay_after_dpcd_poweroff(struct amdgpu_device *adev,
++					    struct dc_sink *sink)
++{
++	struct dc_panel_patch *ppatch = NULL;
++
++	if (!sink)
++		return;
++
++	ppatch = &sink->edid_caps.panel_patch;
++	if (ppatch->wait_after_dpcd_poweroff_ms) {
++		msleep(ppatch->wait_after_dpcd_poweroff_ms);
++		drm_dbg_driver(adev_to_drm(adev),
++			       "%s: adding a %ds delay as w/a for panel\n",
++			       __func__,
++			       ppatch->wait_after_dpcd_poweroff_ms / 1000);
++	}
++}
++
+ static int dm_resume(struct amdgpu_ip_block *ip_block)
+ {
+ 	struct amdgpu_device *adev = ip_block->adev;
+@@ -3466,6 +3484,7 @@ static int dm_resume(struct amdgpu_ip_block *ip_block)
+ 	/* Do detection*/
+ 	drm_connector_list_iter_begin(ddev, &iter);
+ 	drm_for_each_connector_iter(connector, &iter) {
++		bool ret;
+ 
+ 		if (connector->connector_type == DRM_MODE_CONNECTOR_WRITEBACK)
+ 			continue;
+@@ -3491,7 +3510,11 @@ static int dm_resume(struct amdgpu_ip_block *ip_block)
+ 		} else {
+ 			guard(mutex)(&dm->dc_lock);
+ 			dc_exit_ips_for_hw_access(dm->dc);
+-			dc_link_detect(aconnector->dc_link, DETECT_REASON_RESUMEFROMS3S4);
++			ret = dc_link_detect(aconnector->dc_link, DETECT_REASON_RESUMEFROMS3S4);
++			if (ret) {
++				/* w/a delay for certain panels */
++				apply_delay_after_dpcd_poweroff(adev, aconnector->dc_sink);
++			}
+ 		}
+ 
+ 		if (aconnector->fake_enable && aconnector->dc_link->local_sink)
+@@ -3857,6 +3880,8 @@ static void handle_hpd_irq_helper(struct amdgpu_dm_connector *aconnector)
+ 			ret = dc_link_detect(aconnector->dc_link, DETECT_REASON_HPD);
+ 		}
+ 		if (ret) {
++			/* w/a delay for certain panels */
++			apply_delay_after_dpcd_poweroff(adev, aconnector->dc_sink);
+ 			amdgpu_dm_update_connector_after_detect(aconnector);
+ 
+ 			drm_modeset_lock_all(dev);
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
+index fbd80d8545a8..253aac93e3d8 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c
+@@ -55,11 +55,16 @@ static u32 edid_extract_panel_id(struct edid *edid)
+ 	       (u32)EDID_PRODUCT_ID(edid);
+ }
+ 
+-static void apply_edid_quirks(struct edid *edid, struct dc_edid_caps *edid_caps)
++static void apply_edid_quirks(struct drm_device *dev, struct edid *edid, struct dc_edid_caps *edid_caps)
+ {
+ 	uint32_t panel_id = edid_extract_panel_id(edid);
+ 
+ 	switch (panel_id) {
++	/* Workaround for monitors that need a delay after detecting the link */
++	case drm_edid_encode_panel_id('G', 'B', 'T', 0x3215):
++		drm_dbg_driver(dev, "Add 10s delay for link detection for panel id %X\n", panel_id);
++		edid_caps->panel_patch.wait_after_dpcd_poweroff_ms = 10000;
++		break;
+ 	/* Workaround for some monitors which does not work well with FAMS */
+ 	case drm_edid_encode_panel_id('S', 'A', 'M', 0x0E5E):
+ 	case drm_edid_encode_panel_id('S', 'A', 'M', 0x7053):
+@@ -101,6 +106,7 @@ enum dc_edid_status dm_helpers_parse_edid_caps(
+ {
+ 	struct amdgpu_dm_connector *aconnector = link->priv;
+ 	struct drm_connector *connector = &aconnector->base;
++	struct drm_device *dev = connector->dev;
+ 	struct edid *edid_buf = edid ? (struct edid *) edid->raw_edid : NULL;
+ 	struct cea_sad *sads;
+ 	int sad_count = -1;
+@@ -130,7 +136,7 @@ enum dc_edid_status dm_helpers_parse_edid_caps(
+ 
+ 	edid_caps->edid_hdmi = connector->display_info.is_hdmi;
+ 
+-	apply_edid_quirks(edid_buf, edid_caps);
++	apply_edid_quirks(dev, edid_buf, edid_caps);
+ 
+ 	sad_count = drm_edid_to_sad((struct edid *) edid->raw_edid, &sads);
+ 	if (sad_count <= 0)
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_types.h b/drivers/gpu/drm/amd/display/dc/dc_types.h
+index e60898c2df01..acd3b373a18e 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_types.h
++++ b/drivers/gpu/drm/amd/display/dc/dc_types.h
+@@ -181,6 +181,7 @@ struct dc_panel_patch {
+ 	uint8_t blankstream_before_otg_off;
+ 	bool oled_optimize_display_on;
+ 	unsigned int force_mst_blocked_discovery;
++	unsigned int wait_after_dpcd_poweroff_ms;
+ };
+ 
+ struct dc_edid_caps {
+-- 
+2.52.0
+

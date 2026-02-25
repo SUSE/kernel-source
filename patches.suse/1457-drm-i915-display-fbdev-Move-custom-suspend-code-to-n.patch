@@ -1,0 +1,144 @@
+From a1c008b987d0f0fc5a9d746dd7782350ba48ce57 Mon Sep 17 00:00:00 2001
+From: Thomas Zimmermann <tzimmermann@suse.de>
+Date: Thu, 12 Dec 2024 18:08:47 +0100
+Subject: drm/i915/display: fbdev: Move custom suspend code to new callback
+Git-commit: a1c008b987d0f0fc5a9d746dd7782350ba48ce57
+Patch-mainline: v6.15-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+If the fbdev buffer is backed by stolen memory, it has to be cleared
+upon resume from hibernation. Move the code into the new callback
+fb_set_suspend, so that it can run from DRM's generic fbdev client.
+No functional change. Other drivers are not affected.
+
+Signed-off-by: Thomas Zimmermann <tzimmermann@suse.de>
+Reviewed-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241212170913.185939-7-tzimmermann@suse.de
+Signed-off-by: Maarten Lankhorst <dev@lankhorst.se>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/drm_fb_helper.c            |  9 +++++--
+ drivers/gpu/drm/i915/display/intel_fbdev.c | 28 +++++++++++++---------
+ include/drm/drm_fb_helper.h                | 14 +++++++++++
+ 3 files changed, 38 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_fb_helper.c b/drivers/gpu/drm/drm_fb_helper.c
+index 87bb25648d92..0703fddd750f 100644
+--- a/drivers/gpu/drm/drm_fb_helper.c
++++ b/drivers/gpu/drm/drm_fb_helper.c
+@@ -757,7 +757,12 @@ EXPORT_SYMBOL(drm_fb_helper_deferred_io);
+  */
+ void drm_fb_helper_set_suspend(struct drm_fb_helper *fb_helper, bool suspend)
+ {
+-	if (fb_helper && fb_helper->info)
++	if (!fb_helper || !fb_helper->info)
++		return;
++
++	if (fb_helper->funcs->fb_set_suspend)
++		fb_helper->funcs->fb_set_suspend(fb_helper, suspend);
++	else
+ 		fb_set_suspend(fb_helper->info, suspend);
+ }
+ EXPORT_SYMBOL(drm_fb_helper_set_suspend);
+@@ -803,7 +808,7 @@ void drm_fb_helper_set_suspend_unlocked(struct drm_fb_helper *fb_helper,
+ 		}
+ 	}
+ 
+-	fb_set_suspend(fb_helper->info, suspend);
++	drm_fb_helper_set_suspend(fb_helper, suspend);
+ 	console_unlock();
+ }
+ EXPORT_SYMBOL(drm_fb_helper_set_suspend_unlocked);
+diff --git a/drivers/gpu/drm/i915/display/intel_fbdev.c b/drivers/gpu/drm/i915/display/intel_fbdev.c
+index 408e44251c47..a99793723695 100644
+--- a/drivers/gpu/drm/i915/display/intel_fbdev.c
++++ b/drivers/gpu/drm/i915/display/intel_fbdev.c
+@@ -285,10 +285,27 @@ static void intelfb_restore(struct drm_fb_helper *fb_helper)
+ 	intel_fbdev_invalidate(ifbdev);
+ }
+ 
++static void intelfb_set_suspend(struct drm_fb_helper *fb_helper, bool suspend)
++{
++	struct fb_info *info = fb_helper->info;
++
++	/*
++	 * When resuming from hibernation, Linux restores the object's
++	 * content from swap if the buffer is backed by shmemfs. If the
++	 * object is stolen however, it will be full of whatever garbage
++	 * was left in there. Clear it to zero in this case.
++	 */
++	if (!suspend && !intel_bo_is_shmem(intel_fb_bo(fb_helper->fb)))
++		memset_io(info->screen_base, 0, info->screen_size);
++
++	fb_set_suspend(info, suspend);
++}
++
+ static const struct drm_fb_helper_funcs intel_fb_helper_funcs = {
+ 	.fb_probe = intelfb_create,
+ 	.fb_dirty = intelfb_dirty,
+ 	.fb_restore = intelfb_restore,
++	.fb_set_suspend = intelfb_set_suspend,
+ };
+ 
+ /*
+@@ -457,7 +474,6 @@ void intel_fbdev_set_suspend(struct drm_device *dev, int state, bool synchronous
+ {
+ 	struct drm_i915_private *dev_priv = to_i915(dev);
+ 	struct intel_fbdev *ifbdev = dev_priv->display.fbdev.fbdev;
+-	struct fb_info *info;
+ 
+ 	if (!ifbdev)
+ 		return;
+@@ -468,8 +484,6 @@ void intel_fbdev_set_suspend(struct drm_device *dev, int state, bool synchronous
+ 	if (!ifbdev->vma)
+ 		return;
+ 
+-	info = ifbdev->helper.info;
+-
+ 	if (synchronous) {
+ 		/* Flush any pending work to turn the console on, and then
+ 		 * wait to turn it off. It must be synchronous as we are
+@@ -499,14 +513,6 @@ void intel_fbdev_set_suspend(struct drm_device *dev, int state, bool synchronous
+ 		}
+ 	}
+ 
+-	/* On resume from hibernation: If the object is shmemfs backed, it has
+-	 * been restored from swap. If the object is stolen however, it will be
+-	 * full of whatever garbage was left in there.
+-	 */
+-	if (state == FBINFO_STATE_RUNNING &&
+-	    !intel_bo_is_shmem(intel_fb_bo(&ifbdev->fb->base)))
+-		memset_io(info->screen_base, 0, info->screen_size);
+-
+ 	drm_fb_helper_set_suspend(&ifbdev->helper, state);
+ 	console_unlock();
+ }
+diff --git a/include/drm/drm_fb_helper.h b/include/drm/drm_fb_helper.h
+index a7d7a3b945ea..ddce2408ca2b 100644
+--- a/include/drm/drm_fb_helper.h
++++ b/include/drm/drm_fb_helper.h
+@@ -112,6 +112,20 @@ struct drm_fb_helper_funcs {
+ 	 * TODO: Fix i915 to not require this callback.
+ 	 */
+ 	void (*fb_restore)(struct drm_fb_helper *helper);
++
++	/**
++	 * @fb_set_suspend:
++	 *
++	 * Driver callback to suspend or resume, if set, fbdev emulation will
++	 * invoke this callback during suspend and resume. Driver should call
++	 * fb_set_suspend() from their implementation. If not set, fbdev
++	 * emulation will invoke fb_set_suspend() directly.
++	 *
++	 * Only for i915. Do not use in new code.
++	 *
++	 * TODO: Fix i915 to not require this callback.
++	 */
++	void (*fb_set_suspend)(struct drm_fb_helper *helper, bool suspend);
+ };
+ 
+ /**
+-- 
+2.52.0
+

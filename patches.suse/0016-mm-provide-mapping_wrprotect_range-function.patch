@@ -1,0 +1,161 @@
+From a4811f53bb89b3524629b1be41add9349fe0a750 Mon Sep 17 00:00:00 2001
+From: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Date: Sat, 8 Feb 2025 15:52:55 +0000
+Subject: mm: provide mapping_wrprotect_range() function
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: a4811f53bb89b3524629b1be41add9349fe0a750
+Patch-mainline: v6.15-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+In the fb_defio video driver, page dirty state is used to determine when
+frame buffer pages have been changed, allowing for batched, deferred I/O
+to be performed for efficiency.
+
+This implementation had only one means of doing so effectively - the use
+of the folio_mkclean() function.
+
+However, this use of the function is inappropriate, as the fb_defio
+implementation allocates kernel memory to back the framebuffer, and then
+is forced to specified page->index, mapping fields in order to permit the
+folio_mkclean() rmap traversal to proceed correctly.
+
+It is not correct to specify these fields on kernel-allocated memory, and
+moreover since these are not folios, page->index, mapping are deprecated
+fields, soon to be removed.
+
+We therefore need to provide a means by which we can correctly traverse
+the reverse mapping and write-protect mappings for a page backing an
+address_space page cache object at a given offset.
+
+This patch provides this - mapping_wrprotect_range() - which allows for
+this operation to be performed for a specified address_space, offset, PFN
+and size, without requiring a folio nor, of course, an inappropriate use
+of page->index, mapping.
+
+With this provided, we can subsequently adjust the fb_defio implementation
+to make use of this function and avoid incorrect invocation of
+folio_mkclean() and more importantly, incorrect manipulation of
+page->index and mapping fields.
+
+Link: https://lkml.kernel.org/r/e5bf969d64e7f2f2ae944d42341fc8994b736a81.1739029358.git.lorenzo.stoakes@oracle.com
+Signed-off-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Helge Deller <deller@gmx.de>
+Cc: Jaya Kumar <jayakumar.lkml@gmail.com>
+Cc: Kajtar Zsolt <soci@c64.rulez.org>
+Cc: Maíra Canal <mcanal@igalia.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Simona Vetter <simona.vetter@ffwll.ch>
+Cc: Thomas Zimemrmann <tzimmermann@suse.de>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ include/linux/rmap.h |  3 ++
+ mm/rmap.c            | 74 ++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 77 insertions(+)
+
+diff --git a/include/linux/rmap.h b/include/linux/rmap.h
+index d5e93e44322e..6e20a573c508 100644
+--- a/include/linux/rmap.h
++++ b/include/linux/rmap.h
+@@ -742,6 +742,9 @@ unsigned long page_address_in_vma(struct page *, struct vm_area_struct *);
+  */
+ int folio_mkclean(struct folio *);
+ 
++int mapping_wrprotect_range(struct address_space *mapping, pgoff_t pgoff,
++		unsigned long pfn, unsigned long nr_pages);
++
+ int pfn_mkclean_range(unsigned long pfn, unsigned long nr_pages, pgoff_t pgoff,
+ 		      struct vm_area_struct *vma);
+ 
+diff --git a/mm/rmap.c b/mm/rmap.c
+index 09f2a04d4e43..77f7d115bc57 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -1117,6 +1117,80 @@ int folio_mkclean(struct folio *folio)
+ }
+ EXPORT_SYMBOL_GPL(folio_mkclean);
+ 
++struct wrprotect_file_state {
++	int cleaned;
++	pgoff_t pgoff;
++	unsigned long pfn;
++	unsigned long nr_pages;
++};
++
++static bool mapping_wrprotect_range_one(struct folio *folio,
++		struct vm_area_struct *vma, unsigned long address, void *arg)
++{
++	struct wrprotect_file_state *state = (struct wrprotect_file_state *)arg;
++	struct page_vma_mapped_walk pvmw = {
++		.pfn		= state->pfn,
++		.nr_pages	= state->nr_pages,
++		.pgoff		= state->pgoff,
++		.vma		= vma,
++		.address	= address,
++		.flags		= PVMW_SYNC,
++	};
++
++	state->cleaned += page_vma_mkclean_one(&pvmw);
++
++	return true;
++}
++
++static void __rmap_walk_file(struct folio *folio, struct address_space *mapping,
++			     pgoff_t pgoff_start, unsigned long nr_pages,
++			     struct rmap_walk_control *rwc, bool locked);
++
++/**
++ * mapping_wrprotect_range() - Write-protect all mappings in a specified range.
++ *
++ * @mapping:	The mapping whose reverse mapping should be traversed.
++ * @pgoff:	The page offset at which @pfn is mapped within @mapping.
++ * @pfn:	The PFN of the page mapped in @mapping at @pgoff.
++ * @nr_pages:	The number of physically contiguous base pages spanned.
++ *
++ * Traverses the reverse mapping, finding all VMAs which contain a shared
++ * mapping of the pages in the specified range in @mapping, and write-protects
++ * them (that is, updates the page tables to mark the mappings read-only such
++ * that a write protection fault arises when the mappings are written to).
++ *
++ * The @pfn value need not refer to a folio, but rather can reference a kernel
++ * allocation which is mapped into userland. We therefore do not require that
++ * the page maps to a folio with a valid mapping or index field, rather the
++ * caller specifies these in @mapping and @pgoff.
++ *
++ * Return: the number of write-protected PTEs, or an error.
++ */
++int mapping_wrprotect_range(struct address_space *mapping, pgoff_t pgoff,
++		unsigned long pfn, unsigned long nr_pages)
++{
++	struct wrprotect_file_state state = {
++		.cleaned = 0,
++		.pgoff = pgoff,
++		.pfn = pfn,
++		.nr_pages = nr_pages,
++	};
++	struct rmap_walk_control rwc = {
++		.arg = (void *)&state,
++		.rmap_one = mapping_wrprotect_range_one,
++		.invalid_vma = invalid_mkclean_vma,
++	};
++
++	if (!mapping)
++		return 0;
++
++	__rmap_walk_file(/* folio = */NULL, mapping, pgoff, nr_pages, &rwc,
++			 /* locked = */false);
++
++	return state.cleaned;
++}
++EXPORT_SYMBOL_GPL(mapping_wrprotect_range);
++
+ /**
+  * pfn_mkclean_range - Cleans the PTEs (including PMDs) mapped with range of
+  *                     [@pfn, @pfn + @nr_pages) at the specific offset (@pgoff)
+-- 
+2.52.0
+

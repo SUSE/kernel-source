@@ -1,0 +1,139 @@
+From fc2f191f850d9a2fb1b78c51d49076e60fb42c49 Mon Sep 17 00:00:00 2001
+From: Alice Ryhl <aliceryhl@google.com>
+Date: Mon, 3 Mar 2025 08:45:16 +0000
+Subject: panic_qr: use new #[export] macro
+Git-commit: fc2f191f850d9a2fb1b78c51d49076e60fb42c49
+Patch-mainline: v6.15-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+This validates at compile time that the signatures match what is in the
+header file. It highlights one annoyance with the compile-time check,
+which is that it can only be used with functions marked unsafe.
+
+If the function is not unsafe, then this error is emitted:
+
+Error[e0308]: `if` and `else` have incompatible types
+   --> <linux>/drivers/gpu/drm/drm_panic_qr.rs:987:19
+    |
+986 | #[export]
+    | --------- expected because of this
+987 | pub extern "C" fn drm_panic_qr_max_data_size(version: u8, url_len: usize) -> usize {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^ expected unsafe fn, found safe fn
+    |
+    = note: expected fn item `unsafe extern "C" fn(_, _) -> _ {kernel::bindings::drm_panic_qr_max_data_size}`
+               found fn item `extern "C" fn(_, _) -> _ {drm_panic_qr_max_data_size}`
+
+The signature declarations are moved to a header file so it can be
+included in the Rust bindings helper, and the extern keyword is removed
+as it is unnecessary.
+
+Reviewed-by: Andreas Hindborg <a.hindborg@kernel.org>
+Reviewed-by: Tamir Duberstein <tamird@gmail.com>
+Acked-by: Simona Vetter <simona.vetter@ffwll.ch>
+Acked-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Alice Ryhl <aliceryhl@google.com>
+Reviewed-by: Jocelyn Falempe <jfalempe@redhat.com>
+Link: https://lore.kernel.org/r/20250303-export-macro-v3-5-41fbad85a27f@google.com
+[ Fixed `rustfmt`. Moved on top the unsafe requirement comment to follow
+  the usual style, and slightly reworded it for clarity. Formatted
+  bindings helper comment. - Miguel ]
+
+Signed-off-by: Miguel Ojeda <ojeda@kernel.org>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/drm_panic.c     |  5 -----
+ drivers/gpu/drm/drm_panic_qr.rs | 13 +++++++++----
+ include/drm/drm_panic.h         |  7 +++++++
+ rust/bindings/bindings_helper.h |  5 +++++
+ 4 files changed, 21 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_panic.c b/drivers/gpu/drm/drm_panic.c
+index ab42a2b1567d..b47ea25fdfaa 100644
+--- a/drivers/gpu/drm/drm_panic.c
++++ b/drivers/gpu/drm/drm_panic.c
+@@ -486,11 +486,6 @@ static void drm_panic_qr_exit(void)
+ 	stream.workspace = NULL;
+ }
+ 
+-extern size_t drm_panic_qr_max_data_size(u8 version, size_t url_len);
+-
+-extern u8 drm_panic_qr_generate(const char *url, u8 *data, size_t data_len, size_t data_size,
+-				u8 *tmp, size_t tmp_size);
+-
+ static int drm_panic_get_qr_code_url(u8 **qr_image)
+ {
+ 	struct kmsg_dump_iter iter;
+diff --git a/drivers/gpu/drm/drm_panic_qr.rs b/drivers/gpu/drm/drm_panic_qr.rs
+index 81a4ed724894..8004e4d19606 100644
+--- a/drivers/gpu/drm/drm_panic_qr.rs
++++ b/drivers/gpu/drm/drm_panic_qr.rs
+@@ -27,7 +27,7 @@
+ //! * <https://github.com/erwanvivien/fast_qr>
+ //! * <https://github.com/bjguillot/qr>
+ 
+-use kernel::str::CStr;
++use kernel::{prelude::*, str::CStr};
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Ord, PartialOrd)]
+ struct Version(usize);
+@@ -891,7 +891,7 @@ fn draw_all(&mut self, data: impl Iterator<Item = u8>) {
+ /// * `tmp` must be valid for reading and writing for `tmp_size` bytes.
+ ///
+ /// They must remain valid for the duration of the function call.
+-#[no_mangle]
++#[export]
+ pub unsafe extern "C" fn drm_panic_qr_generate(
+     url: *const i8,
+     data: *mut u8,
+@@ -942,8 +942,13 @@ fn draw_all(&mut self, data: impl Iterator<Item = u8>) {
+ /// * If `url_len` > 0, remove the 2 segments header/length and also count the
+ ///   conversion to numeric segments.
+ /// * If `url_len` = 0, only removes 3 bytes for 1 binary segment.
+-#[no_mangle]
+-pub extern "C" fn drm_panic_qr_max_data_size(version: u8, url_len: usize) -> usize {
++///
++/// # Safety
++///
++/// Always safe to call.
++// Required to be unsafe due to the `#[export]` annotation.
++#[export]
++pub unsafe extern "C" fn drm_panic_qr_max_data_size(version: u8, url_len: usize) -> usize {
+     #[expect(clippy::manual_range_contains)]
+     if version < 1 || version > 40 {
+         return 0;
+diff --git a/include/drm/drm_panic.h b/include/drm/drm_panic.h
+index f4e1fa9ae607..ff78d00c3da5 100644
+--- a/include/drm/drm_panic.h
++++ b/include/drm/drm_panic.h
+@@ -163,4 +163,11 @@ static inline void drm_panic_unlock(struct drm_device *dev, unsigned long flags)
+ 
+ #endif
+ 
++#if defined(CONFIG_DRM_PANIC_SCREEN_QR_CODE)
++size_t drm_panic_qr_max_data_size(u8 version, size_t url_len);
++
++u8 drm_panic_qr_generate(const char *url, u8 *data, size_t data_len, size_t data_size,
++			 u8 *tmp, size_t tmp_size);
++#endif
++
+ #endif /* __DRM_PANIC_H__ */
+diff --git a/rust/bindings/bindings_helper.h b/rust/bindings/bindings_helper.h
+index ae82e9c941af..801c33782e2c 100644
+--- a/rust/bindings/bindings_helper.h
++++ b/rust/bindings/bindings_helper.h
+@@ -22,6 +22,11 @@
+ #include <linux/wait.h>
+ #include <linux/workqueue.h>
+ 
++#if defined(CONFIG_DRM_PANIC_SCREEN_QR_CODE)
++// Used by `#[export]` in `drivers/gpu/drm/drm_panic_qr.rs`.
++#include <drm/drm_panic.h>
++#endif
++
+ /* `bindgen` gets confused at certain things. */
+ const size_t RUST_CONST_HELPER_ARCH_SLAB_MINALIGN = ARCH_SLAB_MINALIGN;
+ const size_t RUST_CONST_HELPER_PAGE_SIZE = PAGE_SIZE;
+-- 
+2.52.0
+

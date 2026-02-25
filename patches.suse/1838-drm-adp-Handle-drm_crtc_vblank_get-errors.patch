@@ -1,0 +1,75 @@
+From 7a7d6681d5adde7dc7e648dcc6b9e9be6ca93d5d Mon Sep 17 00:00:00 2001
+From: Janne Grunau <j@jannau.net>
+Date: Mon, 28 Apr 2025 13:37:14 +0200
+Subject: drm: adp: Handle drm_crtc_vblank_get() errors
+Git-commit: 7a7d6681d5adde7dc7e648dcc6b9e9be6ca93d5d
+Patch-mainline: v6.15-rc5
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+drm_crtc_vblank_get() may fail when it's called before
+drm_crtc_vblank_on() on a resetted CRTC. This occurs in
+drm_crtc_helper_funcs' atomic_flush() calls after
+drm_atomic_helper_crtc_reset() for example directly after probe.  Send
+the vblank event directly in such cases.  Avoids following warning in
+the subsequent drm_crtc_vblank_put() call from the vblank irq handler as
+Below: 
+
+adp 228200000.display-pipe: [drm] drm_WARN_ON(atomic_read(&vblank->refcount) == 0)
+WARNING: CPU: 5 PID: 1206 at drivers/gpu/drm/drm_vblank.c:1247 drm_vblank_put+0x158/0x170
+...
+Call trace:
+ drm_vblank_put+0x158/0x170 (P)
+ drm_crtc_vblank_put+0x24/0x38
+ adp_fe_irq+0xd8/0xe8 [adpdrm]
+ __handle_irq_event_percpu+0x94/0x318
+ handle_irq_event+0x54/0xd0
+ handle_fasteoi_irq+0xa8/0x240
+ handle_irq_desc+0x3c/0x68
+ generic_handle_domain_irq+0x24/0x40
+
+Modifying `crtc->state->event` here is fine as crtc->mutex is locked by
+the non-async atomic commit. In retrospect this looks so obvious that it
+doesn't warrant a comment in the file.
+
+Signed-off-by: Janne Grunau <j@jannau.net>
+Reviewed-by: Alyssa Rosenzweig <alyssa@rosenzweig.io>
+Link: https://lore.kernel.org/r/20250428-drm_adp_fixes-v2-2-912e081e55d8@jannau.net
+Signed-off-by: Alyssa Rosenzweig <alyssa@rosenzweig.io>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/adp/adp_drv.c | 16 +++++++++++-----
+ 1 file changed, 11 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/adp/adp_drv.c b/drivers/gpu/drm/adp/adp_drv.c
+index 157298a8ff42..bdf27ee742ea 100644
+--- a/drivers/gpu/drm/adp/adp_drv.c
++++ b/drivers/gpu/drm/adp/adp_drv.c
+@@ -331,13 +331,19 @@ static void adp_crtc_atomic_flush(struct drm_crtc *crtc,
+ 	}
+ 	writel(ADBE_FIFO_SYNC | frame_num, adp->be + ADBE_FIFO);
+ 	//FIXME: use adbe flush interrupt
+-	spin_lock_irqsave(&crtc->dev->event_lock, flags);
+ 	if (crtc->state->event) {
+-		drm_crtc_vblank_get(crtc);
+-		adp->event = crtc->state->event;
++		struct drm_pending_vblank_event *event = crtc->state->event;
++
++		crtc->state->event = NULL;
++		spin_lock_irqsave(&crtc->dev->event_lock, flags);
++
++		if (drm_crtc_vblank_get(crtc) != 0)
++			drm_crtc_send_vblank_event(crtc, event);
++		else
++			adp->event = event;
++
++		spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
+ 	}
+-	crtc->state->event = NULL;
+-	spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
+ }
+ 
+ static const struct drm_crtc_funcs adp_crtc_funcs = {
+-- 
+2.52.0
+

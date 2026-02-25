@@ -1,0 +1,113 @@
+From 6718b10a5b98ad6629cd6b2004b0628fe68beac0 Mon Sep 17 00:00:00 2001
+From: Sonny Jiang <sonny.jiang@amd.com>
+Date: Wed, 23 Apr 2025 12:32:01 -0400
+Subject: drm/amdgpu: Add DPG pause for VCN v5.0.1
+Git-commit: 6718b10a5b98ad6629cd6b2004b0628fe68beac0
+Patch-mainline: v6.15-rc5
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+For vcn5.0.1 only, enable DPG PAUSE to avoid DPG resets.
+
+Signed-off-by: Sonny Jiang <sonny.jiang@amd.com>
+Reviewed-by: Leo Liu <leo.liu@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+(cherry picked from commit 3e5f86c14c3440171f2a3e7a68ceb739297726e9)
+
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/vcn_v5_0_1.c | 54 +++++++++++++++++++++++++
+ 1 file changed, 54 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/vcn_v5_0_1.c b/drivers/gpu/drm/amd/amdgpu/vcn_v5_0_1.c
+index 581d8629b9d9..e0e84ef7f568 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vcn_v5_0_1.c
++++ b/drivers/gpu/drm/amd/amdgpu/vcn_v5_0_1.c
+@@ -502,6 +502,52 @@ static void vcn_v5_0_1_enable_clock_gating(struct amdgpu_vcn_inst *vinst)
+ {
+ }
+ 
++/**
++ * vcn_v5_0_1_pause_dpg_mode - VCN pause with dpg mode
++ *
++ * @vinst: VCN instance
++ * @new_state: pause state
++ *
++ * Pause dpg mode for VCN block
++ */
++static int vcn_v5_0_1_pause_dpg_mode(struct amdgpu_vcn_inst *vinst,
++				     struct dpg_pause_state *new_state)
++{
++	struct amdgpu_device *adev = vinst->adev;
++	uint32_t reg_data = 0;
++	int vcn_inst;
++
++	vcn_inst = GET_INST(VCN, vinst->inst);
++
++	/* pause/unpause if state is changed */
++	if (vinst->pause_state.fw_based != new_state->fw_based) {
++		DRM_DEV_DEBUG(adev->dev, "dpg pause state changed %d -> %d %s\n",
++			vinst->pause_state.fw_based, new_state->fw_based,
++			new_state->fw_based ? "VCN_DPG_STATE__PAUSE" : "VCN_DPG_STATE__UNPAUSE");
++		reg_data = RREG32_SOC15(VCN, vcn_inst, regUVD_DPG_PAUSE) &
++			(~UVD_DPG_PAUSE__NJ_PAUSE_DPG_ACK_MASK);
++
++		if (new_state->fw_based == VCN_DPG_STATE__PAUSE) {
++			/* pause DPG */
++			reg_data |= UVD_DPG_PAUSE__NJ_PAUSE_DPG_REQ_MASK;
++			WREG32_SOC15(VCN, vcn_inst, regUVD_DPG_PAUSE, reg_data);
++
++			/* wait for ACK */
++			SOC15_WAIT_ON_RREG(VCN, vcn_inst, regUVD_DPG_PAUSE,
++					UVD_DPG_PAUSE__NJ_PAUSE_DPG_ACK_MASK,
++					UVD_DPG_PAUSE__NJ_PAUSE_DPG_ACK_MASK);
++		} else {
++			/* unpause DPG, no need to wait */
++			reg_data &= ~UVD_DPG_PAUSE__NJ_PAUSE_DPG_REQ_MASK;
++			WREG32_SOC15(VCN, vcn_inst, regUVD_DPG_PAUSE, reg_data);
++		}
++		vinst->pause_state.fw_based = new_state->fw_based;
++	}
++
++	return 0;
++}
++
++
+ /**
+  * vcn_v5_0_1_start_dpg_mode - VCN start with dpg mode
+  *
+@@ -518,6 +564,7 @@ static int vcn_v5_0_1_start_dpg_mode(struct amdgpu_vcn_inst *vinst,
+ 	volatile struct amdgpu_vcn5_fw_shared *fw_shared =
+ 		adev->vcn.inst[inst_idx].fw_shared.cpu_addr;
+ 	struct amdgpu_ring *ring;
++	struct dpg_pause_state state = {.fw_based = VCN_DPG_STATE__PAUSE};
+ 	int vcn_inst;
+ 	uint32_t tmp;
+ 
+@@ -582,6 +629,9 @@ static int vcn_v5_0_1_start_dpg_mode(struct amdgpu_vcn_inst *vinst,
+ 	if (indirect)
+ 		amdgpu_vcn_psp_update_sram(adev, inst_idx, AMDGPU_UCODE_ID_VCN0_RAM);
+ 
++	/* Pause dpg */
++	vcn_v5_0_1_pause_dpg_mode(vinst, &state);
++
+ 	ring = &adev->vcn.inst[inst_idx].ring_enc[0];
+ 
+ 	WREG32_SOC15(VCN, vcn_inst, regUVD_RB_BASE_LO, lower_32_bits(ring->gpu_addr));
+@@ -775,9 +825,13 @@ static void vcn_v5_0_1_stop_dpg_mode(struct amdgpu_vcn_inst *vinst)
+ 	int inst_idx = vinst->inst;
+ 	uint32_t tmp;
+ 	int vcn_inst;
++	struct dpg_pause_state state = {.fw_based = VCN_DPG_STATE__UNPAUSE};
+ 
+ 	vcn_inst = GET_INST(VCN, inst_idx);
+ 
++	/* Unpause dpg */
++	vcn_v5_0_1_pause_dpg_mode(vinst, &state);
++
+ 	/* Wait for power status to be 1 */
+ 	SOC15_WAIT_ON_RREG(VCN, vcn_inst, regUVD_POWER_STATUS, 1,
+ 		UVD_POWER_STATUS__UVD_POWER_STATUS_MASK);
+-- 
+2.52.0
+

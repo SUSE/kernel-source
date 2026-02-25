@@ -1,0 +1,165 @@
+From 17666e764f389282fe1e35989e210401a0851980 Mon Sep 17 00:00:00 2001
+From: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Date: Fri, 14 Feb 2025 16:14:24 -0800
+Subject: drm/msm/dpu: fill CRTC resources in dpu_crtc.c
+Git-commit: 17666e764f389282fe1e35989e210401a0851980
+Patch-mainline: v6.15-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Stop poking into CRTC state from dpu_encoder.c, fill CRTC HW resources
+from dpu_crtc_assign_resources().
+
+Signed-off-by: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+[quic_abhinavk@quicinc.com: cleaned up formatting]
+Signed-off-by: Abhinav Kumar <quic_abhinavk@quicinc.com>
+Reviewed-by: Abhinav Kumar <quic_abhinavk@quicinc.com>
+Reviewed-by: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Signed-off-by: Jessica Zhang <quic_jesszhan@quicinc.com>
+Patchwork: https://patchwork.freedesktop.org/patch/637485/
+Link: https://lore.kernel.org/r/20250214-concurrent-wb-v6-1-a44c293cf422@quicinc.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c    | 63 +++++++++++++++++++++
+ drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c | 37 ------------
+ 2 files changed, 63 insertions(+), 37 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+index 29485e76f531..90fc94d1a2b3 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+@@ -1230,6 +1230,63 @@ static int dpu_crtc_reassign_planes(struct drm_crtc *crtc, struct drm_crtc_state
+ 	return ret;
+ }
+ 
++#define MAX_CHANNELS_PER_CRTC 2
++
++static int dpu_crtc_assign_resources(struct drm_crtc *crtc,
++				     struct drm_crtc_state *crtc_state)
++{
++	struct dpu_hw_blk *hw_ctl[MAX_CHANNELS_PER_CRTC];
++	struct dpu_hw_blk *hw_lm[MAX_CHANNELS_PER_CRTC];
++	struct dpu_hw_blk *hw_dspp[MAX_CHANNELS_PER_CRTC];
++	int i, num_lm, num_ctl, num_dspp;
++	struct dpu_kms *dpu_kms = _dpu_crtc_get_kms(crtc);
++	struct dpu_global_state *global_state;
++	struct dpu_crtc_state *cstate;
++	struct drm_encoder *drm_enc;
++
++	/*
++	 * For now, grab the first encoder in the crtc state as we don't
++	 * support clone mode yet
++	 */
++	drm_for_each_encoder_mask(drm_enc, crtc->dev, crtc_state->encoder_mask)
++		break;
++
++	global_state = dpu_kms_get_global_state(crtc_state->state);
++	if (IS_ERR(global_state))
++		return PTR_ERR(global_state);
++
++	if (!crtc_state->enable)
++		return 0;
++
++	cstate = to_dpu_crtc_state(crtc_state);
++
++	num_ctl = dpu_rm_get_assigned_resources(&dpu_kms->rm, global_state,
++						drm_enc->base.id,
++						DPU_HW_BLK_CTL, hw_ctl,
++						ARRAY_SIZE(hw_ctl));
++	num_lm = dpu_rm_get_assigned_resources(&dpu_kms->rm, global_state,
++					       drm_enc->base.id,
++					       DPU_HW_BLK_LM, hw_lm,
++					       ARRAY_SIZE(hw_lm));
++	num_dspp = dpu_rm_get_assigned_resources(&dpu_kms->rm, global_state,
++						 drm_enc->base.id,
++						 DPU_HW_BLK_DSPP, hw_dspp,
++						 ARRAY_SIZE(hw_dspp));
++
++	for (i = 0; i < num_lm; i++) {
++		int ctl_idx = (i < num_ctl) ? i : (num_ctl-1);
++
++		cstate->mixers[i].hw_lm = to_dpu_hw_mixer(hw_lm[i]);
++		cstate->mixers[i].lm_ctl = to_dpu_hw_ctl(hw_ctl[ctl_idx]);
++		if (i < num_dspp)
++			cstate->mixers[i].hw_dspp = to_dpu_hw_dspp(hw_dspp[i]);
++	}
++
++	cstate->num_mixers = num_lm;
++
++	return 0;
++}
++
+ static int dpu_crtc_atomic_check(struct drm_crtc *crtc,
+ 		struct drm_atomic_state *state)
+ {
+@@ -1245,6 +1302,12 @@ static int dpu_crtc_atomic_check(struct drm_crtc *crtc,
+ 
+ 	bool needs_dirtyfb = dpu_crtc_needs_dirtyfb(crtc_state);
+ 
++	if (drm_atomic_crtc_needs_modeset(crtc_state)) {
++		rc = dpu_crtc_assign_resources(crtc, crtc_state);
++		if (rc < 0)
++			return rc;
++	}
++
+ 	if (dpu_use_virtual_planes &&
+ 	    (crtc_state->planes_changed || crtc_state->zpos_changed)) {
+ 		rc = dpu_crtc_reassign_planes(crtc, crtc_state);
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+index 1fc220a2ce0d..61903f77730d 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+@@ -726,40 +726,6 @@ static struct msm_display_topology dpu_encoder_get_topology(
+ 	return topology;
+ }
+ 
+-static void dpu_encoder_assign_crtc_resources(struct dpu_kms *dpu_kms,
+-					      struct drm_encoder *drm_enc,
+-					      struct dpu_global_state *global_state,
+-					      struct drm_crtc_state *crtc_state)
+-{
+-	struct dpu_crtc_state *cstate;
+-	struct dpu_hw_blk *hw_ctl[MAX_CHANNELS_PER_ENC];
+-	struct dpu_hw_blk *hw_lm[MAX_CHANNELS_PER_ENC];
+-	struct dpu_hw_blk *hw_dspp[MAX_CHANNELS_PER_ENC];
+-	int num_lm, num_ctl, num_dspp, i;
+-
+-	cstate = to_dpu_crtc_state(crtc_state);
+-
+-	memset(cstate->mixers, 0, sizeof(cstate->mixers));
+-
+-	num_ctl = dpu_rm_get_assigned_resources(&dpu_kms->rm, global_state,
+-		drm_enc->base.id, DPU_HW_BLK_CTL, hw_ctl, ARRAY_SIZE(hw_ctl));
+-	num_lm = dpu_rm_get_assigned_resources(&dpu_kms->rm, global_state,
+-		drm_enc->base.id, DPU_HW_BLK_LM, hw_lm, ARRAY_SIZE(hw_lm));
+-	num_dspp = dpu_rm_get_assigned_resources(&dpu_kms->rm, global_state,
+-		drm_enc->base.id, DPU_HW_BLK_DSPP, hw_dspp,
+-		ARRAY_SIZE(hw_dspp));
+-
+-	for (i = 0; i < num_lm; i++) {
+-		int ctl_idx = (i < num_ctl) ? i : (num_ctl-1);
+-
+-		cstate->mixers[i].hw_lm = to_dpu_hw_mixer(hw_lm[i]);
+-		cstate->mixers[i].lm_ctl = to_dpu_hw_ctl(hw_ctl[ctl_idx]);
+-		cstate->mixers[i].hw_dspp = i < num_dspp ? to_dpu_hw_dspp(hw_dspp[i]) : NULL;
+-	}
+-
+-	cstate->num_mixers = num_lm;
+-}
+-
+ /**
+  * dpu_encoder_virt_check_mode_changed: check if full modeset is required
+  * @drm_enc:    Pointer to drm encoder structure
+@@ -830,9 +796,6 @@ static int dpu_encoder_virt_atomic_check(
+ 		if (crtc_state->enable)
+ 			ret = dpu_rm_reserve(&dpu_kms->rm, global_state,
+ 					drm_enc, crtc_state, &topology);
+-		if (!ret)
+-			dpu_encoder_assign_crtc_resources(dpu_kms, drm_enc,
+-							  global_state, crtc_state);
+ 	}
+ 
+ 	trace_dpu_enc_atomic_check_flags(DRMID(drm_enc), adj_mode->flags);
+-- 
+2.52.0
+

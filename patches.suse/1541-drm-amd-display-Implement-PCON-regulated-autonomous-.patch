@@ -1,0 +1,166 @@
+From 084e0735448ae4d01928b537c03c7042aef2ab81 Mon Sep 17 00:00:00 2001
+From: George Shen <george.shen@amd.com>
+Date: Thu, 13 Feb 2025 14:46:49 -0500
+Subject: drm/amd/display: Implement PCON regulated autonomous mode handling
+Git-commit: 084e0735448ae4d01928b537c03c7042aef2ab81
+Patch-mainline: v6.15-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+[Why/How]
+DP spec has been updated recently to make regulated autonomous mode more
+well-defined. In case any PCON vendors choose to implement regulated
+autonomous mode in the future, pre-emptively add handling for the
+regulated autonomous mode based on current spec.
+
+Reviewed-by: Wenjing Liu <wenjing.liu@amd.com>
+Signed-off-by: George Shen <george.shen@amd.com>
+Signed-off-by: Tom Chung <chiahsuan.chung@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/display/dc/dc_dp_types.h  | 27 ++++++++-
+ .../dc/link/protocols/link_dp_capability.c    | 55 +++++++++++++++----
+ 2 files changed, 71 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_dp_types.h b/drivers/gpu/drm/amd/display/dc/dc_dp_types.h
+index 1f4f11adc491..77c87ad57220 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_dp_types.h
++++ b/drivers/gpu/drm/amd/display/dc/dc_dp_types.h
+@@ -432,7 +432,28 @@ union hdmi_encoded_link_bw {
+ 		uint8_t BW_32Gbps:1;
+ 		uint8_t BW_40Gbps:1;
+ 		uint8_t BW_48Gbps:1;
+-		uint8_t RESERVED:1; // Bit 7
++		uint8_t FRL_LINK_TRAINING_FINISHED:1; // Bit 7
++	} bits;
++	uint8_t raw;
++};
++
++union hdmi_tx_link_status {
++	struct {
++		uint8_t HDMI_TX_LINK_ACTIVE_STATUS:1;
++		uint8_t HDMI_TX_READY_STATUS:1;
++		uint8_t RESERVED:6;
++	} bits;
++	uint8_t raw;
++};
++
++union autonomous_mode_and_frl_link_status {
++	struct {
++		uint8_t FRL_LT_IN_PROGRESS_STATUS:1;
++		uint8_t FRL_LT_LINK_CONFIG_IN_PROGRESS:3;
++		uint8_t RESERVED:1;
++		uint8_t FALLBACK_POLICY:1;
++		uint8_t FALLBACK_POLICY_VALID:1;
++		uint8_t REGULATED_AUTONOMOUS_MODE_SUPPORTED:1;
+ 	} bits;
+ 	uint8_t raw;
+ };
+@@ -1166,6 +1187,7 @@ struct dc_dongle_caps {
+ 	uint32_t dp_hdmi_max_bpc;
+ 	uint32_t dp_hdmi_max_pixel_clk_in_khz;
+ 	uint32_t dp_hdmi_frl_max_link_bw_in_kbps;
++	uint32_t dp_hdmi_regulated_autonomous_mode_support;
+ 	struct dc_dongle_dfp_cap_ext dfp_cap_ext;
+ };
+ 
+@@ -1394,6 +1416,9 @@ struct dp_trace {
+ #ifndef DP_LTTPR_ALPM_CAPABILITIES
+ #define DP_LTTPR_ALPM_CAPABILITIES              0xF0009
+ #endif
++#ifndef DP_REGULATED_AUTONOMOUS_MODE_SUPPORTED_AND_HDMI_LINK_TRAINING_STATUS
++#define DP_REGULATED_AUTONOMOUS_MODE_SUPPORTED_AND_HDMI_LINK_TRAINING_STATUS	0x303C
++#endif
+ #ifndef DP_REPEATER_CONFIGURATION_AND_STATUS_SIZE
+ #define DP_REPEATER_CONFIGURATION_AND_STATUS_SIZE	0x50
+ #endif
+diff --git a/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_capability.c b/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_capability.c
+index a77410122636..21ee0d96c9d4 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_capability.c
++++ b/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_capability.c
+@@ -265,6 +265,8 @@ static uint32_t intersect_frl_link_bw_support(
+ 		supported_bw_in_kbps = 18000000;
+ 	else if (hdmi_encoded_link_bw.bits.BW_9Gbps)
+ 		supported_bw_in_kbps = 9000000;
++	else if (hdmi_encoded_link_bw.bits.FRL_LINK_TRAINING_FINISHED)
++		supported_bw_in_kbps = 0; /* This case should only get hit in regulated autonomous mode. */
+ 
+ 	return supported_bw_in_kbps;
+ }
+@@ -1075,6 +1077,48 @@ static enum dc_status wake_up_aux_channel(struct dc_link *link)
+ 	return DC_OK;
+ }
+ 
++static void read_and_intersect_post_frl_lt_status(
++	struct dc_link *link)
++{
++	union autonomous_mode_and_frl_link_status autonomous_mode_caps = {0};
++	union hdmi_tx_link_status hdmi_tx_link_status = {0};
++	union hdmi_encoded_link_bw hdmi_encoded_link_bw = {0};
++
++	/* Check if dongle supports regulated autonomous mode. */
++	core_link_read_dpcd(link, DP_REGULATED_AUTONOMOUS_MODE_SUPPORTED_AND_HDMI_LINK_TRAINING_STATUS,
++		&autonomous_mode_caps.raw, sizeof(autonomous_mode_caps));
++
++	link->dpcd_caps.dongle_caps.dp_hdmi_regulated_autonomous_mode_support =
++			autonomous_mode_caps.bits.REGULATED_AUTONOMOUS_MODE_SUPPORTED;
++
++	if (link->dpcd_caps.dongle_caps.dp_hdmi_regulated_autonomous_mode_support) {
++		DC_LOG_DC("%s: PCON supports regulated autonomous mode.\n", __func__);
++
++		core_link_read_dpcd(link, DP_PCON_HDMI_TX_LINK_STATUS,
++				&hdmi_tx_link_status.raw, sizeof(hdmi_tx_link_status));
++	}
++
++	// Intersect reported max link bw support with the supported link rate post FRL link training
++	if (core_link_read_dpcd(link, DP_PCON_HDMI_POST_FRL_STATUS,
++			&hdmi_encoded_link_bw.raw, sizeof(hdmi_encoded_link_bw)) == DC_OK) {
++
++		if (link->dpcd_caps.dongle_caps.dp_hdmi_regulated_autonomous_mode_support &&
++				(!hdmi_tx_link_status.bits.HDMI_TX_READY_STATUS ||
++						!hdmi_encoded_link_bw.bits.FRL_LINK_TRAINING_FINISHED)) {
++			DC_LOG_WARNING("%s: PCON TX link training has not finished.\n", __func__);
++
++			/* Link training not finished, ignore values from this DPCD reg. */
++			return;
++		}
++
++		link->dpcd_caps.dongle_caps.dp_hdmi_frl_max_link_bw_in_kbps = intersect_frl_link_bw_support(
++				link->dpcd_caps.dongle_caps.dp_hdmi_frl_max_link_bw_in_kbps,
++				hdmi_encoded_link_bw);
++		DC_LOG_DC("%s: pcon frl link bw = %u\n", __func__,
++			link->dpcd_caps.dongle_caps.dp_hdmi_frl_max_link_bw_in_kbps);
++	}
++}
++
+ static void get_active_converter_info(
+ 	uint8_t data, struct dc_link *link)
+ {
+@@ -1163,21 +1207,12 @@ static void get_active_converter_info(
+ 							hdmi_color_caps.bits.MAX_BITS_PER_COLOR_COMPONENT);
+ 
+ 					if (link->dc->caps.dp_hdmi21_pcon_support) {
+-						union hdmi_encoded_link_bw hdmi_encoded_link_bw;
+ 
+ 						link->dpcd_caps.dongle_caps.dp_hdmi_frl_max_link_bw_in_kbps =
+ 								link_bw_kbps_from_raw_frl_link_rate_data(
+ 										hdmi_color_caps.bits.MAX_ENCODED_LINK_BW_SUPPORT);
+ 
+-						// Intersect reported max link bw support with the supported link rate post FRL link training
+-						if (core_link_read_dpcd(link, DP_PCON_HDMI_POST_FRL_STATUS,
+-								&hdmi_encoded_link_bw.raw, sizeof(hdmi_encoded_link_bw)) == DC_OK) {
+-							link->dpcd_caps.dongle_caps.dp_hdmi_frl_max_link_bw_in_kbps = intersect_frl_link_bw_support(
+-									link->dpcd_caps.dongle_caps.dp_hdmi_frl_max_link_bw_in_kbps,
+-									hdmi_encoded_link_bw);
+-							DC_LOG_DC("%s: pcon frl link bw = %u\n", __func__,
+-								link->dpcd_caps.dongle_caps.dp_hdmi_frl_max_link_bw_in_kbps);
+-						}
++						read_and_intersect_post_frl_lt_status(link);
+ 
+ 						if (link->dpcd_caps.dongle_caps.dp_hdmi_frl_max_link_bw_in_kbps > 0)
+ 							link->dpcd_caps.dongle_caps.extendedCapValid = true;
+-- 
+2.52.0
+

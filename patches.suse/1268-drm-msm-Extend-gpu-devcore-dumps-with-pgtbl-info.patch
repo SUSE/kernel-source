@@ -1,0 +1,137 @@
+From d7a5ac67d82c50c1f909c7056f78b1630a0f71cf Mon Sep 17 00:00:00 2001
+From: Rob Clark <robdclark@chromium.org>
+Date: Tue, 10 Dec 2024 08:51:22 -0800
+Subject: drm/msm: Extend gpu devcore dumps with pgtbl info
+Git-commit: d7a5ac67d82c50c1f909c7056f78b1630a0f71cf
+Patch-mainline: v6.15-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+In the case of iova fault triggered devcore dumps, include additional
+debug information based on what we think is the current page tables,
+including the TTBR0 value (which should match what we have in
+adreno_smmu_fault_info unless things have gone horribly wrong), and
+the pagetable entries traversed in the process of resolving the
+faulting iova.
+
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+Patchwork: https://patchwork.freedesktop.org/patch/628117/
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/msm/adreno/adreno_gpu.c | 10 ++++++++++
+ drivers/gpu/drm/msm/msm_gpu.c           |  9 +++++++++
+ drivers/gpu/drm/msm/msm_gpu.h           |  8 ++++++++
+ drivers/gpu/drm/msm/msm_iommu.c         | 22 ++++++++++++++++++++++
+ drivers/gpu/drm/msm/msm_mmu.h           |  3 ++-
+ 5 files changed, 51 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/msm/adreno/adreno_gpu.c b/drivers/gpu/drm/msm/adreno/adreno_gpu.c
+index 1238f3265978..7156cda07b03 100644
+--- a/drivers/gpu/drm/msm/adreno/adreno_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/adreno_gpu.c
+@@ -883,6 +883,16 @@ void adreno_show(struct msm_gpu *gpu, struct msm_gpu_state *state,
+ 		drm_printf(p, "  - dir=%s\n", info->flags & IOMMU_FAULT_WRITE ? "WRITE" : "READ");
+ 		drm_printf(p, "  - type=%s\n", info->type);
+ 		drm_printf(p, "  - source=%s\n", info->block);
++
++		/* Information extracted from what we think are the current
++		 * pgtables.  Hopefully the TTBR0 matches what we've extracted
++		 * from the SMMU registers in smmu_info!
++		 */
++		drm_puts(p, "pgtable-fault-info:\n");
++		drm_printf(p, "  - ttbr0: %.16llx\n", (u64)info->pgtbl_ttbr0);
++		drm_printf(p, "  - asid: %d\n", info->asid);
++		drm_printf(p, "  - ptes: %.16llx %.16llx %.16llx %.16llx\n",
++			   info->ptes[0], info->ptes[1], info->ptes[2], info->ptes[3]);
+ 	}
+ 
+ 	drm_printf(p, "rbbm-status: 0x%08x\n", state->rbbm_status);
+diff --git a/drivers/gpu/drm/msm/msm_gpu.c b/drivers/gpu/drm/msm/msm_gpu.c
+index 0d4a3744cfcb..82f204f3bb8f 100644
+--- a/drivers/gpu/drm/msm/msm_gpu.c
++++ b/drivers/gpu/drm/msm/msm_gpu.c
+@@ -281,6 +281,15 @@ static void msm_gpu_crashstate_capture(struct msm_gpu *gpu,
+ 	if (submit) {
+ 		int i;
+ 
++		if (state->fault_info.ttbr0) {
++			struct msm_gpu_fault_info *info = &state->fault_info;
++			struct msm_mmu *mmu = submit->aspace->mmu;
++
++			msm_iommu_pagetable_params(mmu, &info->pgtbl_ttbr0,
++						   &info->asid);
++			msm_iommu_pagetable_walk(mmu, info->iova, info->ptes);
++		}
++
+ 		state->bos = kcalloc(submit->nr_bos,
+ 			sizeof(struct msm_gpu_state_bo), GFP_KERNEL);
+ 
+diff --git a/drivers/gpu/drm/msm/msm_gpu.h b/drivers/gpu/drm/msm/msm_gpu.h
+index 7cabc8480d7c..e25009150579 100644
+--- a/drivers/gpu/drm/msm/msm_gpu.h
++++ b/drivers/gpu/drm/msm/msm_gpu.h
+@@ -101,6 +101,14 @@ struct msm_gpu_fault_info {
+ 	int flags;
+ 	const char *type;
+ 	const char *block;
++
++	/* Information about what we think/expect is the current SMMU state,
++	 * for example expected_ttbr0 should match smmu_info.ttbr0 which
++	 * was read back from SMMU registers.
++	 */
++	phys_addr_t pgtbl_ttbr0;
++	u64 ptes[4];
++	int asid;
+ };
+ 
+ /**
+diff --git a/drivers/gpu/drm/msm/msm_iommu.c b/drivers/gpu/drm/msm/msm_iommu.c
+index b5d8503d28f9..fd73dcd3f30e 100644
+--- a/drivers/gpu/drm/msm/msm_iommu.c
++++ b/drivers/gpu/drm/msm/msm_iommu.c
+@@ -195,6 +195,28 @@ struct iommu_domain_geometry *msm_iommu_get_geometry(struct msm_mmu *mmu)
+ 	return &iommu->domain->geometry;
+ }
+ 
++int
++msm_iommu_pagetable_walk(struct msm_mmu *mmu, unsigned long iova, uint64_t ptes[4])
++{
++	struct msm_iommu_pagetable *pagetable;
++	struct arm_lpae_io_pgtable_walk_data wd = {};
++
++	if (mmu->type != MSM_MMU_IOMMU_PAGETABLE)
++		return -EINVAL;
++
++	pagetable = to_pagetable(mmu);
++
++	if (!pagetable->pgtbl_ops->pgtable_walk)
++		return -EINVAL;
++
++	pagetable->pgtbl_ops->pgtable_walk(pagetable->pgtbl_ops, iova, &wd);
++
++	for (int i = 0; i < ARRAY_SIZE(wd.ptes); i++)
++		ptes[i] = wd.ptes[i];
++
++	return 0;
++}
++
+ static const struct msm_mmu_funcs pagetable_funcs = {
+ 		.map = msm_iommu_pagetable_map,
+ 		.unmap = msm_iommu_pagetable_unmap,
+diff --git a/drivers/gpu/drm/msm/msm_mmu.h b/drivers/gpu/drm/msm/msm_mmu.h
+index 730458d08d6b..daf91529e02b 100644
+--- a/drivers/gpu/drm/msm/msm_mmu.h
++++ b/drivers/gpu/drm/msm/msm_mmu.h
+@@ -54,7 +54,8 @@ static inline void msm_mmu_set_fault_handler(struct msm_mmu *mmu, void *arg,
+ struct msm_mmu *msm_iommu_pagetable_create(struct msm_mmu *parent);
+ 
+ int msm_iommu_pagetable_params(struct msm_mmu *mmu, phys_addr_t *ttbr,
+-		int *asid);
++			       int *asid);
++int msm_iommu_pagetable_walk(struct msm_mmu *mmu, unsigned long iova, uint64_t ptes[4]);
+ struct iommu_domain_geometry *msm_iommu_get_geometry(struct msm_mmu *mmu);
+ 
+ #endif /* __MSM_MMU_H__ */
+-- 
+2.52.0
+

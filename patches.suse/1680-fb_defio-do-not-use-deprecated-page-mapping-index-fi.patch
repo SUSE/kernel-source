@@ -1,0 +1,168 @@
+From 6cdef2ddce2b7de8faca69061a6780080cfecc10 Mon Sep 17 00:00:00 2001
+From: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Date: Sat, 8 Feb 2025 15:52:56 +0000
+Subject: fb_defio: do not use deprecated page->mapping, index fields
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 6cdef2ddce2b7de8faca69061a6780080cfecc10
+Patch-mainline: v6.15-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+With the introduction of mapping_wrprotect_range() there is no need to use
+folio_mkclean() in order to write-protect mappings of frame buffer pages,
+and therefore no need to inappropriately set kernel-allocated page->index,
+mapping fields to permit this operation.
+
+Instead, store the pointer to the page cache object for the mapped driver
+in the fb_deferred_io object, and use the already stored page offset from
+the pageref object to look up mappings in order to write-protect them.
+
+This is justified, as for the page objects to store a mapping pointer at
+the point of assignment of pages, they must all reference the same
+underlying address_space object.  Since the life time of the pagerefs is
+also the lifetime of the fb_deferred_io object, storing the pointer here
+makes sense.
+
+This eliminates the need for all of the logic around setting and
+maintaining page->index,mapping which we remove.
+
+This eliminates the use of folio_mkclean() entirely but otherwise should
+have no functional change.
+
+[lorenzo.stoakes@oracle.com: fixup unused variable warnings]
+  Link: https://lkml.kernel.org/r/d4018405-2762-4385-a816-e54cc23839ac@lucifer.local
+Link: https://lkml.kernel.org/r/81171ab16c14e3df28f6de9d14982cee528d8519.1739029358.git.lorenzo.stoakes@oracle.com
+Signed-off-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Tested-by: Kajtar Zsolt <soci@c64.rulez.org>
+Acked-by: Thomas Zimmermann <tzimmermann@suse.de>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Helge Deller <deller@gmx.de>
+Cc: Jaya Kumar <jayakumar.lkml@gmail.com>
+Cc: Maíra Canal <mcanal@igalia.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Simona Vetter <simona.vetter@ffwll.ch>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/video/fbdev/core/fb_defio.c | 43 ++++++++++-------------------
+ include/linux/fb.h                  |  1 +
+ 2 files changed, 16 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/video/fbdev/core/fb_defio.c b/drivers/video/fbdev/core/fb_defio.c
+index 65363df8e81b..4fc93f253e06 100644
+--- a/drivers/video/fbdev/core/fb_defio.c
++++ b/drivers/video/fbdev/core/fb_defio.c
+@@ -69,14 +69,6 @@ static struct fb_deferred_io_pageref *fb_deferred_io_pageref_lookup(struct fb_in
+ 	return pageref;
+ }
+ 
+-static void fb_deferred_io_pageref_clear(struct fb_deferred_io_pageref *pageref)
+-{
+-	struct page *page = pageref->page;
+-
+-	if (page)
+-		page->mapping = NULL;
+-}
+-
+ static struct fb_deferred_io_pageref *fb_deferred_io_pageref_get(struct fb_info *info,
+ 								 unsigned long offset,
+ 								 struct page *page)
+@@ -140,13 +132,10 @@ static vm_fault_t fb_deferred_io_fault(struct vm_fault *vmf)
+ 	if (!page)
+ 		return VM_FAULT_SIGBUS;
+ 
+-	if (vmf->vma->vm_file)
+-		page->mapping = vmf->vma->vm_file->f_mapping;
+-	else
+-		printk(KERN_ERR "no mapping available\n");
++	if (!vmf->vma->vm_file)
++		fb_err(info, "no mapping available\n");
+ 
+-	BUG_ON(!page->mapping);
+-	page->index = vmf->pgoff; /* for folio_mkclean() */
++	BUG_ON(!info->fbdefio->mapping);
+ 
+ 	vmf->page = page;
+ 	return 0;
+@@ -194,9 +183,9 @@ static vm_fault_t fb_deferred_io_track_page(struct fb_info *info, unsigned long
+ 
+ 	/*
+ 	 * We want the page to remain locked from ->page_mkwrite until
+-	 * the PTE is marked dirty to avoid folio_mkclean() being called
+-	 * before the PTE is updated, which would leave the page ignored
+-	 * by defio.
++	 * the PTE is marked dirty to avoid mapping_wrprotect_range()
++	 * being called before the PTE is updated, which would leave
++	 * the page ignored by defio.
+ 	 * Do this by locking the page here and informing the caller
+ 	 * about it with VM_FAULT_LOCKED.
+ 	 */
+@@ -274,15 +263,17 @@ static void fb_deferred_io_work(struct work_struct *work)
+ 	struct fb_deferred_io_pageref *pageref, *next;
+ 	struct fb_deferred_io *fbdefio = info->fbdefio;
+ 
+-	/* here we mkclean the pages, then do all deferred IO */
++	/* here we wrprotect the page's mappings, then do all deferred IO. */
+ 	mutex_lock(&fbdefio->lock);
++#ifdef CONFIG_MMU
+ 	list_for_each_entry(pageref, &fbdefio->pagereflist, list) {
+-		struct folio *folio = page_folio(pageref->page);
++		struct page *page = pageref->page;
++		pgoff_t pgoff = pageref->offset >> PAGE_SHIFT;
+ 
+-		folio_lock(folio);
+-		folio_mkclean(folio);
+-		folio_unlock(folio);
++		mapping_wrprotect_range(fbdefio->mapping, pgoff,
++					page_to_pfn(page), 1);
+ 	}
++#endif
+ 
+ 	/* driver's callback with pagereflist */
+ 	fbdefio->deferred_io(info, &fbdefio->pagereflist);
+@@ -337,6 +328,7 @@ void fb_deferred_io_open(struct fb_info *info,
+ {
+ 	struct fb_deferred_io *fbdefio = info->fbdefio;
+ 
++	fbdefio->mapping = file->f_mapping;
+ 	file->f_mapping->a_ops = &fb_deferred_io_aops;
+ 	fbdefio->open_count++;
+ }
+@@ -344,13 +336,7 @@ EXPORT_SYMBOL_GPL(fb_deferred_io_open);
+ 
+ static void fb_deferred_io_lastclose(struct fb_info *info)
+ {
+-	unsigned long i;
+-
+ 	flush_delayed_work(&info->deferred_work);
+-
+-	/* clear out the mapping that we setup */
+-	for (i = 0; i < info->npagerefs; ++i)
+-		fb_deferred_io_pageref_clear(&info->pagerefs[i]);
+ }
+ 
+ void fb_deferred_io_release(struct fb_info *info)
+@@ -370,5 +356,6 @@ void fb_deferred_io_cleanup(struct fb_info *info)
+ 
+ 	kvfree(info->pagerefs);
+ 	mutex_destroy(&fbdefio->lock);
++	fbdefio->mapping = NULL;
+ }
+ EXPORT_SYMBOL_GPL(fb_deferred_io_cleanup);
+diff --git a/include/linux/fb.h b/include/linux/fb.h
+index 5ba187e08cf7..cd653862ab99 100644
+--- a/include/linux/fb.h
++++ b/include/linux/fb.h
+@@ -225,6 +225,7 @@ struct fb_deferred_io {
+ 	int open_count; /* number of opened files; protected by fb_info lock */
+ 	struct mutex lock; /* mutex that protects the pageref list */
+ 	struct list_head pagereflist; /* list of pagerefs for touched pages */
++	struct address_space *mapping; /* page cache object for fb device */
+ 	/* callback */
+ 	struct page *(*get_page)(struct fb_info *info, unsigned long offset);
+ 	void (*deferred_io)(struct fb_info *info, struct list_head *pagelist);
+-- 
+2.52.0
+

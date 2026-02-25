@@ -1,0 +1,158 @@
+From d0a83b2e212dbb3e61c08e154f48d7238a4a8950 Mon Sep 17 00:00:00 2001
+From: Thomas Zimmermann <tzimmermann@suse.de>
+Date: Thu, 12 Dec 2024 18:08:42 +0100
+Subject: drm/{i915, xe}: Suspend/resume fbdev emulation via client interfaces
+Git-commit: d0a83b2e212dbb3e61c08e154f48d7238a4a8950
+Patch-mainline: v6.15-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Implement drm_client_dev_suspend() and drm_client_dev_resume() for
+i915's fbdev emulation and call the helper via DRM client interfaces.
+This is required to convert i915 and xe to DRM's generic fbdev client.
+No functional changes.
+
+Signed-off-by: Thomas Zimmermann <tzimmermann@suse.de>
+Reviewed-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Reviewed-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20241212170913.185939-2-tzimmermann@suse.de
+Signed-off-by: Maarten Lankhorst <dev@lankhorst.se>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/intel_fbdev.c | 16 ++++++++++++++++
+ drivers/gpu/drm/i915/i915_driver.c         |  9 +++++----
+ drivers/gpu/drm/xe/display/xe_display.c    | 10 ++++++----
+ 3 files changed, 27 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_fbdev.c b/drivers/gpu/drm/i915/display/intel_fbdev.c
+index 64fbd2461df3..ea5f92906354 100644
+--- a/drivers/gpu/drm/i915/display/intel_fbdev.c
++++ b/drivers/gpu/drm/i915/display/intel_fbdev.c
+@@ -643,11 +643,27 @@ static int intel_fbdev_client_hotplug(struct drm_client_dev *client)
+ 	return ret;
+ }
+ 
++static int intel_fbdev_client_suspend(struct drm_client_dev *client, bool holds_console_lock)
++{
++	intel_fbdev_set_suspend(client->dev, FBINFO_STATE_SUSPENDED, true);
++
++	return 0;
++}
++
++static int intel_fbdev_client_resume(struct drm_client_dev *client, bool holds_console_lock)
++{
++	intel_fbdev_set_suspend(client->dev, FBINFO_STATE_RUNNING, false);
++
++	return 0;
++}
++
+ static const struct drm_client_funcs intel_fbdev_client_funcs = {
+ 	.owner		= THIS_MODULE,
+ 	.unregister	= intel_fbdev_client_unregister,
+ 	.restore	= intel_fbdev_client_restore,
+ 	.hotplug	= intel_fbdev_client_hotplug,
++	.suspend	= intel_fbdev_client_suspend,
++	.resume		= intel_fbdev_client_resume,
+ };
+ 
+ void intel_fbdev_setup(struct drm_i915_private *i915)
+diff --git a/drivers/gpu/drm/i915/i915_driver.c b/drivers/gpu/drm/i915/i915_driver.c
+index 59bf2d45403f..2cabfd611671 100644
+--- a/drivers/gpu/drm/i915/i915_driver.c
++++ b/drivers/gpu/drm/i915/i915_driver.c
+@@ -41,6 +41,8 @@
+ #include <linux/vt.h>
+ 
+ #include <drm/drm_atomic_helper.h>
++#include <drm/drm_client.h>
++#include <drm/drm_client_event.h>
+ #include <drm/drm_ioctl.h>
+ #include <drm/drm_managed.h>
+ #include <drm/drm_probe_helper.h>
+@@ -54,7 +56,6 @@
+ #include "display/intel_dp.h"
+ #include "display/intel_dpt.h"
+ #include "display/intel_encoder.h"
+-#include "display/intel_fbdev.h"
+ #include "display/intel_hotplug.h"
+ #include "display/intel_overlay.h"
+ #include "display/intel_pch_refclk.h"
+@@ -968,7 +969,7 @@ void i915_driver_shutdown(struct drm_i915_private *i915)
+ 	intel_runtime_pm_disable(&i915->runtime_pm);
+ 	intel_power_domains_disable(display);
+ 
+-	intel_fbdev_set_suspend(&i915->drm, FBINFO_STATE_SUSPENDED, true);
++	drm_client_dev_suspend(&i915->drm, false);
+ 	if (HAS_DISPLAY(i915)) {
+ 		drm_kms_helper_poll_disable(&i915->drm);
+ 		intel_display_driver_disable_user_access(display);
+@@ -1051,7 +1052,7 @@ static int i915_drm_suspend(struct drm_device *dev)
+ 	/* We do a lot of poking in a lot of registers, make sure they work
+ 	 * properly. */
+ 	intel_power_domains_disable(display);
+-	intel_fbdev_set_suspend(dev, FBINFO_STATE_SUSPENDED, true);
++	drm_client_dev_suspend(dev, false);
+ 	if (HAS_DISPLAY(dev_priv)) {
+ 		drm_kms_helper_poll_disable(dev);
+ 		intel_display_driver_disable_user_access(display);
+@@ -1237,7 +1238,7 @@ static int i915_drm_resume(struct drm_device *dev)
+ 
+ 	intel_opregion_resume(display);
+ 
+-	intel_fbdev_set_suspend(dev, FBINFO_STATE_RUNNING, false);
++	drm_client_dev_resume(dev, false);
+ 
+ 	intel_power_domains_enable(display);
+ 
+diff --git a/drivers/gpu/drm/xe/display/xe_display.c b/drivers/gpu/drm/xe/display/xe_display.c
+index d5d453dc927a..ba7f3e913a81 100644
+--- a/drivers/gpu/drm/xe/display/xe_display.c
++++ b/drivers/gpu/drm/xe/display/xe_display.c
+@@ -8,6 +8,8 @@
+ 
+ #include <linux/fb.h>
+ 
++#include <drm/drm_client.h>
++#include <drm/drm_client_event.h>
+ #include <drm/drm_drv.h>
+ #include <drm/drm_managed.h>
+ #include <drm/drm_probe_helper.h>
+@@ -25,7 +27,6 @@
+ #include "intel_dmc_wl.h"
+ #include "intel_dp.h"
+ #include "intel_encoder.h"
+-#include "intel_fbdev.h"
+ #include "intel_hdcp.h"
+ #include "intel_hotplug.h"
+ #include "intel_opregion.h"
+@@ -339,7 +340,7 @@ void xe_display_pm_suspend(struct xe_device *xe)
+ 	 * properly.
+ 	 */
+ 	intel_power_domains_disable(display);
+-	intel_fbdev_set_suspend(&xe->drm, FBINFO_STATE_SUSPENDED, true);
++	drm_client_dev_suspend(&xe->drm, false);
+ 
+ 	if (has_display(xe)) {
+ 		drm_kms_helper_poll_disable(&xe->drm);
+@@ -369,7 +370,8 @@ void xe_display_pm_shutdown(struct xe_device *xe)
+ 		return;
+ 
+ 	intel_power_domains_disable(display);
+-	intel_fbdev_set_suspend(&xe->drm, FBINFO_STATE_SUSPENDED, true);
++	drm_client_dev_suspend(&xe->drm, false);
++
+ 	if (has_display(xe)) {
+ 		drm_kms_helper_poll_disable(&xe->drm);
+ 		intel_display_driver_disable_user_access(display);
+@@ -488,7 +490,7 @@ void xe_display_pm_resume(struct xe_device *xe)
+ 
+ 	intel_opregion_resume(display);
+ 
+-	intel_fbdev_set_suspend(&xe->drm, FBINFO_STATE_RUNNING, false);
++	drm_client_dev_resume(&xe->drm, false);
+ 
+ 	intel_power_domains_enable(display);
+ }
+-- 
+2.52.0
+

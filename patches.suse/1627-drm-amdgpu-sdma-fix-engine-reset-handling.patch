@@ -1,0 +1,141 @@
+From e02fcf73081b7fc941aa6de007b0239e67688e15 Mon Sep 17 00:00:00 2001
+From: Alex Deucher <alexander.deucher@amd.com>
+Date: Fri, 14 Mar 2025 19:23:46 -0400
+Subject: drm/amdgpu/sdma: fix engine reset handling
+Git-commit: e02fcf73081b7fc941aa6de007b0239e67688e15
+Patch-mainline: v6.15-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499
+
+Move the kfd suspend/resume code into the caller.  That
+is where the KFD is likely to detect a reset so on the KFD
+side there is no need to call them.  Also add a mutex to
+lock the actual reset sequence.
+
+V2: make the locking per instance
+
+Fixes: bac38ca8c475 ("drm/amdkfd: implement per queue sdma reset for gfx 9.4+")
+Reviewed-by: Jesse Zhang <jesse.zhang@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.c          | 15 +++------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.h          |  3 ++-
+ drivers/gpu/drm/amd/amdgpu/sdma_v4_4_2.c          |  8 +++++++-
+ .../gpu/drm/amd/amdkfd/kfd_device_queue_manager.c |  2 +-
+ 4 files changed, 13 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.c
+index 1334c209201f..476e93cc5626 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.c
+@@ -532,7 +532,6 @@ void amdgpu_sdma_register_on_reset_callbacks(struct amdgpu_device *adev, struct
+  * amdgpu_sdma_reset_engine - Reset a specific SDMA engine
+  * @adev: Pointer to the AMDGPU device
+  * @instance_id: ID of the SDMA engine instance to reset
+- * @suspend_user_queues: check if suspend user queue.
+  *
+  * This function performs the following steps:
+  * 1. Calls all registered pre_reset callbacks to allow KFD and AMDGPU to save their state.
+@@ -541,7 +540,7 @@ void amdgpu_sdma_register_on_reset_callbacks(struct amdgpu_device *adev, struct
+  *
+  * Returns: 0 on success, or a negative error code on failure.
+  */
+-int amdgpu_sdma_reset_engine(struct amdgpu_device *adev, uint32_t instance_id, bool suspend_user_queues)
++int amdgpu_sdma_reset_engine(struct amdgpu_device *adev, uint32_t instance_id)
+ {
+ 	struct sdma_on_reset_funcs *funcs;
+ 	int ret = 0;
+@@ -550,13 +549,7 @@ int amdgpu_sdma_reset_engine(struct amdgpu_device *adev, uint32_t instance_id, b
+ 	struct amdgpu_ring *page_ring = &sdma_instance->page;
+ 	bool gfx_sched_stopped = false, page_sched_stopped = false;
+ 
+-	/* Suspend KFD if suspend_user_queues is true.
+-	 * prevent the destruction of in-flight healthy user queue packets and
+-	 * avoid race conditions between KFD and KGD during the reset process.
+-	 */
+-	if (suspend_user_queues)
+-		amdgpu_amdkfd_suspend(adev, false);
+-
++	mutex_lock(&sdma_instance->engine_reset_mutex);
+ 	/* Stop the scheduler's work queue for the GFX and page rings if they are running.
+ 	* This ensures that no new tasks are submitted to the queues while
+ 	* the reset is in progress.
+@@ -617,9 +610,7 @@ int amdgpu_sdma_reset_engine(struct amdgpu_device *adev, uint32_t instance_id, b
+ 			drm_sched_wqueue_start(&page_ring->sched);
+ 		}
+ 	}
+-
+-	if (suspend_user_queues)
+-		amdgpu_amdkfd_resume(adev, false);
++	mutex_unlock(&sdma_instance->engine_reset_mutex);
+ 
+ 	return ret;
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.h
+index 965169320065..8e7e794ff136 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.h
+@@ -64,6 +64,7 @@ struct amdgpu_sdma_instance {
+ 	struct amdgpu_bo	*sdma_fw_obj;
+ 	uint64_t		sdma_fw_gpu_addr;
+ 	uint32_t		*sdma_fw_ptr;
++	struct mutex		engine_reset_mutex;
+ };
+ 
+ enum amdgpu_sdma_ras_memory_id {
+@@ -169,7 +170,7 @@ struct amdgpu_buffer_funcs {
+ };
+ 
+ void amdgpu_sdma_register_on_reset_callbacks(struct amdgpu_device *adev, struct sdma_on_reset_funcs *funcs);
+-int amdgpu_sdma_reset_engine(struct amdgpu_device *adev, uint32_t instance_id, bool suspend_user_queues);
++int amdgpu_sdma_reset_engine(struct amdgpu_device *adev, uint32_t instance_id);
+ 
+ #define amdgpu_emit_copy_buffer(adev, ib, s, d, b, t) (adev)->mman.buffer_funcs->emit_copy_buffer((ib),  (s), (d), (b), (t))
+ #define amdgpu_emit_fill_buffer(adev, ib, s, d, b) (adev)->mman.buffer_funcs->emit_fill_buffer((ib), (s), (d), (b))
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v4_4_2.c b/drivers/gpu/drm/amd/amdgpu/sdma_v4_4_2.c
+index e77c99180fa3..aedfd22b4445 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v4_4_2.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v4_4_2.c
+@@ -1445,6 +1445,7 @@ static int sdma_v4_4_2_sw_init(struct amdgpu_ip_block *ip_block)
+ 	}
+ 
+ 	for (i = 0; i < adev->sdma.num_instances; i++) {
++		mutex_init(&adev->sdma.instance[i].engine_reset_mutex);
+ 		ring = &adev->sdma.instance[i].ring;
+ 		ring->ring_obj = NULL;
+ 		ring->use_doorbell = true;
+@@ -1666,11 +1667,16 @@ static int sdma_v4_4_2_reset_queue(struct amdgpu_ring *ring, unsigned int vmid)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+ 	u32 id = GET_INST(SDMA0, ring->me);
++	int r;
+ 
+ 	if (!(adev->sdma.supported_reset & AMDGPU_RESET_TYPE_PER_QUEUE))
+ 		return -EOPNOTSUPP;
+ 
+-	return amdgpu_sdma_reset_engine(adev, id, true);
++	amdgpu_amdkfd_suspend(adev, false);
++	r = amdgpu_sdma_reset_engine(adev, id);
++	amdgpu_amdkfd_resume(adev, false);
++
++	return r;
+ }
+ 
+ static int sdma_v4_4_2_stop_queue(struct amdgpu_device *adev, uint32_t instance_id)
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+index 2ed003d3ff0e..c610e172a2b8 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+@@ -2310,7 +2310,7 @@ static int reset_hung_queues_sdma(struct device_queue_manager *dqm)
+ 				continue;
+ 
+ 			/* Reset engine and check. */
+-			if (amdgpu_sdma_reset_engine(dqm->dev->adev, i, false) ||
++			if (amdgpu_sdma_reset_engine(dqm->dev->adev, i) ||
+ 			    dqm->dev->kfd2kgd->hqd_sdma_get_doorbell(dqm->dev->adev, i, j) ||
+ 			    !set_sdma_queue_as_reset(dqm, doorbell_off)) {
+ 				r = -ENOTRECOVERABLE;
+-- 
+2.52.0
+
