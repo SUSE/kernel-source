@@ -1,0 +1,238 @@
+From c21b039715ce9f4a10b77782e636c39dd8869869 Mon Sep 17 00:00:00 2001
+From: Ben Skeggs <bskeggs@nvidia.com>
+Date: Wed, 29 Jan 2025 10:29:40 +1000
+Subject: drm/nouveau/gsp: add hals for fbsr.suspend/resume()
+Git-commit: c21b039715ce9f4a10b77782e636c39dd8869869
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+555.42.02 has incompatible changes to FBSR.
+
+At the same time, move the calling of FBSR functions from the instmem
+subdev's suspend/resume paths, to GSP's.  This is needed to fix ordering
+issues that arise from changes to FBSR in newer RM versions.
+
+Signed-off-by: Ben Skeggs <bskeggs@nvidia.com>
+Reviewed-by: Dave Airlie <airlied@redhat.com>
+Reviewed-by: Timur Tabi <ttabi@nvidia.com>
+Tested-by: Timur Tabi <ttabi@nvidia.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../gpu/drm/nouveau/include/nvkm/subdev/gsp.h |  1 +
+ .../drm/nouveau/include/nvkm/subdev/instmem.h |  5 ----
+ .../nouveau/nvkm/subdev/gsp/rm/r535/fbsr.c    | 29 +++++++++----------
+ .../drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c | 11 +++++++
+ .../drm/nouveau/nvkm/subdev/gsp/rm/r535/rm.c  |  1 +
+ .../gpu/drm/nouveau/nvkm/subdev/gsp/rm/rm.h   |  6 ++++
+ .../drm/nouveau/nvkm/subdev/instmem/base.c    |  8 +++--
+ 7 files changed, 38 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/subdev/gsp.h b/drivers/gpu/drm/nouveau/include/nvkm/subdev/gsp.h
+index ef781c4ca11f..40e1b5300dff 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/subdev/gsp.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/subdev/gsp.h
+@@ -133,6 +133,7 @@ struct nvkm_gsp {
+ 		struct sg_table sgt;
+ 		struct nvkm_gsp_radix3 radix3;
+ 		struct nvkm_gsp_mem meta;
++		struct sg_table fbsr;
+ 	} sr;
+ 
+ 	struct {
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/subdev/instmem.h b/drivers/gpu/drm/nouveau/include/nvkm/subdev/instmem.h
+index e10cbd9203ec..7d93c742ee59 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/subdev/instmem.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/subdev/instmem.h
+@@ -24,11 +24,6 @@ struct nvkm_instmem {
+ 	struct nvkm_ramht  *ramht;
+ 	struct nvkm_memory *ramro;
+ 	struct nvkm_memory *ramfc;
+-
+-	struct {
+-		struct sg_table fbsr;
+-		bool fbsr_valid;
+-	} rm;
+ };
+ 
+ u32 nvkm_instmem_rd32(struct nvkm_instmem *, u32 addr);
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/fbsr.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/fbsr.c
+index b2f22bd93f4e..0e436c4fb4e0 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/fbsr.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/fbsr.c
+@@ -201,21 +201,18 @@ fbsr_inst(struct fbsr *fbsr, const char *type, struct nvkm_memory *memory)
+ }
+ 
+ static void
+-r535_instmem_resume(struct nvkm_instmem *imem)
++r535_fbsr_resume(struct nvkm_gsp *gsp)
+ {
+ 	/* RM has restored VRAM contents already, so just need to free the sysmem buffer. */
+-	if (imem->rm.fbsr_valid) {
+-		nvkm_gsp_sg_free(imem->subdev.device, &imem->rm.fbsr);
+-		imem->rm.fbsr_valid = false;
+-	}
++	nvkm_gsp_sg_free(gsp->subdev.device, &gsp->sr.fbsr);
+ }
+ 
+ static int
+-r535_instmem_suspend(struct nvkm_instmem *imem)
++r535_fbsr_suspend(struct nvkm_gsp *gsp)
+ {
+-	struct nvkm_subdev *subdev = &imem->subdev;
++	struct nvkm_subdev *subdev = &gsp->subdev;
+ 	struct nvkm_device *device = subdev->device;
+-	struct nvkm_gsp *gsp = device->gsp;
++	struct nvkm_instmem *imem = device->imem;
+ 	struct nvkm_instobj *iobj;
+ 	struct fbsr fbsr = {};
+ 	struct fbsr_item *item, *temp;
+@@ -256,7 +253,7 @@ r535_instmem_suspend(struct nvkm_instmem *imem)
+ 	fbsr.size += gsp->fb.bios.vga_workspace.size;
+ 	nvkm_debug(subdev, "fbsr: size: 0x%llx bytes\n", fbsr.size);
+ 
+-	ret = nvkm_gsp_sg(gsp->subdev.device, fbsr.size, &imem->rm.fbsr);
++	ret = nvkm_gsp_sg(gsp->subdev.device, fbsr.size, &gsp->sr.fbsr);
+ 	if (ret)
+ 		goto done;
+ 
+@@ -265,7 +262,7 @@ r535_instmem_suspend(struct nvkm_instmem *imem)
+ 	if (ret)
+ 		goto done_sgt;
+ 
+-	ret = fbsr_init(&fbsr, &imem->rm.fbsr, items_size);
++	ret = fbsr_init(&fbsr, &gsp->sr.fbsr, items_size);
+ 	if (WARN_ON(ret))
+ 		goto done_sgt;
+ 
+@@ -276,12 +273,10 @@ r535_instmem_suspend(struct nvkm_instmem *imem)
+ 			goto done_sgt;
+ 	}
+ 
+-	imem->rm.fbsr_valid = true;
+-
+ 	/* Cleanup everything except the sysmem backup, which will be removed after resume. */
+ done_sgt:
+ 	if (ret) /* ... unless we failed already. */
+-		nvkm_gsp_sg_free(device, &imem->rm.fbsr);
++		nvkm_gsp_sg_free(device, &gsp->sr.fbsr);
+ done:
+ 	list_for_each_entry_safe(item, temp, &fbsr.items, head) {
+ 		list_del(&item->head);
+@@ -293,6 +288,12 @@ r535_instmem_suspend(struct nvkm_instmem *imem)
+ 	return ret;
+ }
+ 
++const struct nvkm_rm_api_fbsr
++r535_fbsr = {
++	.suspend = r535_fbsr_suspend,
++	.resume = r535_fbsr_resume,
++};
++
+ static void *
+ r535_instmem_dtor(struct nvkm_instmem *imem)
+ {
+@@ -313,8 +314,6 @@ r535_instmem_new(const struct nvkm_instmem_func *hw,
+ 
+ 	rm->dtor = r535_instmem_dtor;
+ 	rm->fini = hw->fini;
+-	rm->suspend = r535_instmem_suspend;
+-	rm->resume  = r535_instmem_resume;
+ 	rm->memory_new = hw->memory_new;
+ 	rm->memory_wrap = hw->memory_wrap;
+ 	rm->zero = false;
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c
+index 0c05a0448766..64e9ecf93441 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c
+@@ -1730,6 +1730,7 @@ nvkm_gsp_radix3_sg(struct nvkm_gsp *gsp, struct sg_table *sgt, u64 size,
+ int
+ r535_gsp_fini(struct nvkm_gsp *gsp, bool suspend)
+ {
++	struct nvkm_rm *rm = gsp->rm;
+ 	int ret;
+ 
+ 	if (suspend) {
+@@ -1754,6 +1755,14 @@ r535_gsp_fini(struct nvkm_gsp *gsp, bool suspend)
+ 		sr->revision = GSP_FW_SR_META_REVISION;
+ 		sr->sysmemAddrOfSuspendResumeData = gsp->sr.radix3.lvl0.addr;
+ 		sr->sizeOfSuspendResumeData = len;
++
++		ret = rm->api->fbsr->suspend(gsp);
++		if (ret) {
++			nvkm_gsp_mem_dtor(&gsp->sr.meta);
++			nvkm_gsp_radix3_dtor(gsp, &gsp->sr.radix3);
++			nvkm_gsp_sg_free(gsp->subdev.device, &gsp->sr.sgt);
++			return ret;
++		}
+ 	}
+ 
+ 	ret = r535_gsp_rpc_unloading_guest_driver(gsp, suspend);
+@@ -1787,6 +1796,8 @@ r535_gsp_init(struct nvkm_gsp *gsp)
+ 
+ done:
+ 	if (gsp->sr.meta.data) {
++		gsp->rm->api->fbsr->resume(gsp);
++
+ 		nvkm_gsp_mem_dtor(&gsp->sr.meta);
+ 		nvkm_gsp_radix3_dtor(gsp, &gsp->sr.radix3);
+ 		nvkm_gsp_sg_free(gsp->subdev.device, &gsp->sr.sgt);
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/rm.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/rm.c
+index 43cf44bf3abb..a4190676e1ad 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/rm.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/rm.c
+@@ -28,6 +28,7 @@ r535_api = {
+ 	.alloc = &r535_alloc,
+ 	.client = &r535_client,
+ 	.device = &r535_device,
++	.fbsr = &r535_fbsr,
+ 	.disp = &r535_disp,
+ 	.fifo = &r535_fifo,
+ 	.ce = &r535_ce,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/rm.h b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/rm.h
+index 3d677e5bdd2c..ce04ed9e3c27 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/rm.h
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/rm.h
+@@ -73,6 +73,11 @@ struct nvkm_rm_api {
+ 		} event;
+ 	} *device;
+ 
++	const struct nvkm_rm_api_fbsr {
++		int (*suspend)(struct nvkm_gsp *);
++		void (*resume)(struct nvkm_gsp *);
++	} *fbsr;
++
+ 	const struct nvkm_rm_api_disp {
+ 		int (*get_static_info)(struct nvkm_disp *);
+ 
+@@ -113,6 +118,7 @@ extern const struct nvkm_rm_api_ctrl r535_ctrl;
+ extern const struct nvkm_rm_api_alloc r535_alloc;
+ extern const struct nvkm_rm_api_client r535_client;
+ extern const struct nvkm_rm_api_device r535_device;
++extern const struct nvkm_rm_api_fbsr r535_fbsr;
+ extern const struct nvkm_rm_api_disp r535_disp;
+ extern const struct nvkm_rm_api_fifo r535_fifo;
+ extern const struct nvkm_rm_api_engine r535_ce;
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/instmem/base.c b/drivers/gpu/drm/nouveau/nvkm/subdev/instmem/base.c
+index a2cd3330efc6..2f55bab8e132 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/instmem/base.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/instmem/base.c
+@@ -182,9 +182,11 @@ nvkm_instmem_fini(struct nvkm_subdev *subdev, bool suspend)
+ 	int ret;
+ 
+ 	if (suspend) {
+-		ret = imem->func->suspend(imem);
+-		if (ret)
+-			return ret;
++		if (imem->func->suspend) {
++			ret = imem->func->suspend(imem);
++			if (ret)
++				return ret;
++		}
+ 
+ 		imem->suspend = true;
+ 	}
+-- 
+2.52.0
+
