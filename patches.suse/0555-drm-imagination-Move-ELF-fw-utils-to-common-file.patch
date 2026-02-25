@@ -1,0 +1,209 @@
+From f48485ab506850b4e35ff56550568f710a22a586 Mon Sep 17 00:00:00 2001
+From: Matt Coster <matt.coster@imgtec.com>
+Date: Thu, 10 Apr 2025 10:55:12 +0100
+Subject: drm/imagination: Move ELF fw utils to common file
+Git-commit: f48485ab506850b4e35ff56550568f710a22a586
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Currently only MIPS firmware processors use ELF-formatted firmware. When
+adding support for RISC-V firmware processors, it will be useful to have
+ELF handling functions ready to go.
+
+Reviewed-by: Frank Binns <frank.binns@imgtec.com>
+Link: https://lore.kernel.org/r/20250410-sets-bxs-4-64-patch-v1-v6-13-eda620c5865f@imgtec.com
+Signed-off-by: Matt Coster <matt.coster@imgtec.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/imagination/Makefile      |  1 +
+ drivers/gpu/drm/imagination/pvr_fw.h      |  5 ++
+ drivers/gpu/drm/imagination/pvr_fw_mips.c | 58 +-------------------
+ drivers/gpu/drm/imagination/pvr_fw_util.c | 66 +++++++++++++++++++++++
+ 4 files changed, 74 insertions(+), 56 deletions(-)
+ create mode 100644 drivers/gpu/drm/imagination/pvr_fw_util.c
+
+diff --git a/drivers/gpu/drm/imagination/Makefile b/drivers/gpu/drm/imagination/Makefile
+index 3d9d4d40fb80..f45782063f43 100644
+--- a/drivers/gpu/drm/imagination/Makefile
++++ b/drivers/gpu/drm/imagination/Makefile
+@@ -14,6 +14,7 @@ powervr-y := \
+ 	pvr_fw_mips.o \
+ 	pvr_fw_startstop.o \
+ 	pvr_fw_trace.o \
++	pvr_fw_util.o \
+ 	pvr_gem.o \
+ 	pvr_hwrt.o \
+ 	pvr_job.o \
+diff --git a/drivers/gpu/drm/imagination/pvr_fw.h b/drivers/gpu/drm/imagination/pvr_fw.h
+index ab69f40a7fbc..e120eae06bf7 100644
+--- a/drivers/gpu/drm/imagination/pvr_fw.h
++++ b/drivers/gpu/drm/imagination/pvr_fw.h
+@@ -478,4 +478,9 @@ pvr_fw_object_get_fw_addr(struct pvr_fw_object *fw_obj, u32 *fw_addr_out)
+ 	pvr_fw_object_get_fw_addr_offset(fw_obj, 0, fw_addr_out);
+ }
+ 
++/* Util functions defined in pvr_fw_util.c. These are intended for use in pvr_fw_<arch>.c files. */
++int
++pvr_fw_process_elf_command_stream(struct pvr_device *pvr_dev, const u8 *fw, u8 *fw_code_ptr,
++				  u8 *fw_data_ptr, u8 *fw_core_code_ptr, u8 *fw_core_data_ptr);
++
+ #endif /* PVR_FW_H */
+diff --git a/drivers/gpu/drm/imagination/pvr_fw_mips.c b/drivers/gpu/drm/imagination/pvr_fw_mips.c
+index 7526dddbf520..6914fc46db50 100644
+--- a/drivers/gpu/drm/imagination/pvr_fw_mips.c
++++ b/drivers/gpu/drm/imagination/pvr_fw_mips.c
+@@ -8,7 +8,6 @@
+ #include "pvr_rogue_mips.h"
+ #include "pvr_vm_mips.h"
+ 
+-#include <linux/elf.h>
+ #include <linux/err.h>
+ #include <linux/types.h>
+ 
+@@ -16,59 +15,6 @@
+ #define ROGUE_FW_HEAP_MIPS_SHIFT 24 /* 16 MB */
+ #define ROGUE_FW_HEAP_MIPS_RESERVED_SIZE SZ_1M
+ 
+-/**
+- * process_elf_command_stream() - Process ELF firmware image and populate
+- *                                firmware sections
+- * @pvr_dev: Device pointer.
+- * @fw: Pointer to firmware image.
+- * @fw_code_ptr: Pointer to FW code section.
+- * @fw_data_ptr: Pointer to FW data section.
+- * @fw_core_code_ptr: Pointer to FW coremem code section.
+- * @fw_core_data_ptr: Pointer to FW coremem data section.
+- *
+- * Returns :
+- *  * 0 on success, or
+- *  * -EINVAL on any error in ELF command stream.
+- */
+-static int
+-process_elf_command_stream(struct pvr_device *pvr_dev, const u8 *fw, u8 *fw_code_ptr,
+-			   u8 *fw_data_ptr, u8 *fw_core_code_ptr, u8 *fw_core_data_ptr)
+-{
+-	struct elf32_hdr *header = (struct elf32_hdr *)fw;
+-	struct elf32_phdr *program_header = (struct elf32_phdr *)(fw + header->e_phoff);
+-	struct drm_device *drm_dev = from_pvr_device(pvr_dev);
+-	int err;
+-
+-	for (u32 entry = 0; entry < header->e_phnum; entry++, program_header++) {
+-		void *write_addr;
+-
+-		/* Only consider loadable entries in the ELF segment table */
+-		if (program_header->p_type != PT_LOAD)
+-			continue;
+-
+-		err = pvr_fw_find_mmu_segment(pvr_dev, program_header->p_vaddr,
+-					      program_header->p_memsz, fw_code_ptr, fw_data_ptr,
+-					      fw_core_code_ptr, fw_core_data_ptr, &write_addr);
+-		if (err) {
+-			drm_err(drm_dev,
+-				"Addr 0x%x (size: %d) not found in any firmware segment",
+-				program_header->p_vaddr, program_header->p_memsz);
+-			return err;
+-		}
+-
+-		/* Write to FW allocation only if available */
+-		if (write_addr) {
+-			memcpy(write_addr, fw + program_header->p_offset,
+-			       program_header->p_filesz);
+-
+-			memset((u8 *)write_addr + program_header->p_filesz, 0,
+-			       program_header->p_memsz - program_header->p_filesz);
+-		}
+-	}
+-
+-	return 0;
+-}
+-
+ static int
+ pvr_mips_init(struct pvr_device *pvr_dev)
+ {
+@@ -98,8 +44,8 @@ pvr_mips_fw_process(struct pvr_device *pvr_dev, const u8 *fw,
+ 	dma_addr_t dma_addr;
+ 	int err;
+ 
+-	err = process_elf_command_stream(pvr_dev, fw, fw_code_ptr, fw_data_ptr, fw_core_code_ptr,
+-					 fw_core_data_ptr);
++	err = pvr_fw_process_elf_command_stream(pvr_dev, fw, fw_code_ptr, fw_data_ptr,
++						fw_core_code_ptr, fw_core_data_ptr);
+ 	if (err)
+ 		return err;
+ 
+diff --git a/drivers/gpu/drm/imagination/pvr_fw_util.c b/drivers/gpu/drm/imagination/pvr_fw_util.c
+new file mode 100644
+index 000000000000..377fe72d86b8
+--- /dev/null
++++ b/drivers/gpu/drm/imagination/pvr_fw_util.c
+@@ -0,0 +1,66 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++/* Copyright (c) 2024 Imagination Technologies Ltd. */
++
++#include "pvr_device.h"
++#include "pvr_fw.h"
++
++#include <drm/drm_device.h>
++#include <drm/drm_print.h>
++
++#include <linux/elf.h>
++#include <linux/string.h>
++#include <linux/types.h>
++
++/**
++ * pvr_fw_process_elf_command_stream() - Process ELF firmware image and populate
++ *                                       firmware sections
++ * @pvr_dev: Device pointer.
++ * @fw: Pointer to firmware image.
++ * @fw_code_ptr: Pointer to FW code section.
++ * @fw_data_ptr: Pointer to FW data section.
++ * @fw_core_code_ptr: Pointer to FW coremem code section.
++ * @fw_core_data_ptr: Pointer to FW coremem data section.
++ *
++ * Returns :
++ *  * 0 on success, or
++ *  * -EINVAL on any error in ELF command stream.
++ */
++int
++pvr_fw_process_elf_command_stream(struct pvr_device *pvr_dev, const u8 *fw,
++				  u8 *fw_code_ptr, u8 *fw_data_ptr,
++				  u8 *fw_core_code_ptr, u8 *fw_core_data_ptr)
++{
++	struct elf32_hdr *header = (struct elf32_hdr *)fw;
++	struct elf32_phdr *program_header = (struct elf32_phdr *)(fw + header->e_phoff);
++	struct drm_device *drm_dev = from_pvr_device(pvr_dev);
++	int err;
++
++	for (u32 entry = 0; entry < header->e_phnum; entry++, program_header++) {
++		void *write_addr;
++
++		/* Only consider loadable entries in the ELF segment table */
++		if (program_header->p_type != PT_LOAD)
++			continue;
++
++		err = pvr_fw_find_mmu_segment(pvr_dev, program_header->p_vaddr,
++					      program_header->p_memsz, fw_code_ptr, fw_data_ptr,
++					      fw_core_code_ptr, fw_core_data_ptr, &write_addr);
++		if (err) {
++			drm_err(drm_dev,
++				"Addr 0x%x (size: %d) not found in any firmware segment",
++				program_header->p_vaddr, program_header->p_memsz);
++			return err;
++		}
++
++		/* Write to FW allocation only if available */
++		if (write_addr) {
++			memcpy(write_addr, fw + program_header->p_offset,
++			       program_header->p_filesz);
++
++			memset((u8 *)write_addr + program_header->p_filesz, 0,
++			       program_header->p_memsz - program_header->p_filesz);
++		}
++	}
++
++	return 0;
++}
+-- 
+2.52.0
+
