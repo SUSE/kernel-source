@@ -1,0 +1,129 @@
+From 7e3711eb87c584ed224a7ad7000eba36e6fa3a51 Mon Sep 17 00:00:00 2001
+From: Thomas Zimmermann <tzimmermann@suse.de>
+Date: Fri, 21 Mar 2025 10:53:55 +0100
+Subject: fbdev: Track display blanking state
+Git-commit: 7e3711eb87c584ed224a7ad7000eba36e6fa3a51
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Store the display's blank status in struct fb_info.blank and track
+it in fb_blank(). As an extra, the status is now available from the
+sysfs blank attribute.
+
+Support for blanking is optional. Therefore framebuffer_alloc()
+initializes the state to FB_BLANK_UNBLANK (i.e., the display is
+on). If the fb_blank callback has been set, register_framebuffer()
+sets the state to FB_BLANK_POWERDOWN. On the first modeset, the
+call to fb_blank() will update it to _UNBLANK. This is important,
+as listeners to FB_EVENT_BLANK will now see the display being
+switched on.
+
+Signed-off-by: Thomas Zimmermann <tzimmermann@suse.de>
+Acked-by: Simona Vetter <simona.vetter@ffwll.ch>
+Link: https://lore.kernel.org/r/20250321095517.313713-3-tzimmermann@suse.de
+Signed-off-by: Lee Jones <lee@kernel.org>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/video/fbdev/core/fb_info.c |  1 +
+ drivers/video/fbdev/core/fbmem.c   | 17 ++++++++++++++++-
+ drivers/video/fbdev/core/fbsysfs.c |  8 ++++----
+ include/linux/fb.h                 |  2 ++
+ 4 files changed, 23 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/video/fbdev/core/fb_info.c b/drivers/video/fbdev/core/fb_info.c
+index 4847ebe50d7d..52f9bd2c5417 100644
+--- a/drivers/video/fbdev/core/fb_info.c
++++ b/drivers/video/fbdev/core/fb_info.c
+@@ -42,6 +42,7 @@ struct fb_info *framebuffer_alloc(size_t size, struct device *dev)
+ 
+ 	info->device = dev;
+ 	info->fbcon_rotate_hint = -1;
++	info->blank = FB_BLANK_UNBLANK;
+ 
+ #if IS_ENABLED(CONFIG_FB_BACKLIGHT)
+ 	mutex_init(&info->bl_curve_mutex);
+diff --git a/drivers/video/fbdev/core/fbmem.c b/drivers/video/fbdev/core/fbmem.c
+index eb28caaae970..94eb366f591c 100644
+--- a/drivers/video/fbdev/core/fbmem.c
++++ b/drivers/video/fbdev/core/fbmem.c
+@@ -343,6 +343,7 @@ EXPORT_SYMBOL(fb_set_var);
+ 
+ int fb_blank(struct fb_info *info, int blank)
+ {
++	int old_blank = info->blank;
+ 	struct fb_event event;
+ 	int ret;
+ 
+@@ -355,13 +356,19 @@ int fb_blank(struct fb_info *info, int blank)
+ 	event.info = info;
+ 	event.data = &blank;
+ 
++	info->blank = blank;
++
+ 	ret = info->fbops->fb_blank(blank, info);
+ 	if (ret)
+-		return ret;
++		goto err;
+ 
+ 	fb_notifier_call_chain(FB_EVENT_BLANK, &event);
+ 
+ 	return 0;
++
++err:
++	info->blank = old_blank;
++	return ret;
+ }
+ EXPORT_SYMBOL(fb_blank);
+ 
+@@ -418,6 +425,14 @@ static int do_register_framebuffer(struct fb_info *fb_info)
+ 	mutex_init(&fb_info->lock);
+ 	mutex_init(&fb_info->mm_lock);
+ 
++	/*
++	 * With an fb_blank callback present, we assume that the
++	 * display is blank, so that fb_blank() enables it on the
++	 * first modeset.
++	 */
++	if (fb_info->fbops->fb_blank)
++		fb_info->blank = FB_BLANK_POWERDOWN;
++
+ 	fb_device_create(fb_info);
+ 
+ 	if (fb_info->pixmap.addr == NULL) {
+diff --git a/drivers/video/fbdev/core/fbsysfs.c b/drivers/video/fbdev/core/fbsysfs.c
+index 06d75c767579..b8344c40073b 100644
+--- a/drivers/video/fbdev/core/fbsysfs.c
++++ b/drivers/video/fbdev/core/fbsysfs.c
+@@ -242,11 +242,11 @@ static ssize_t store_blank(struct device *device,
+ 	return count;
+ }
+ 
+-static ssize_t show_blank(struct device *device,
+-			  struct device_attribute *attr, char *buf)
++static ssize_t show_blank(struct device *device, struct device_attribute *attr, char *buf)
+ {
+-//	struct fb_info *fb_info = dev_get_drvdata(device);
+-	return 0;
++	struct fb_info *fb_info = dev_get_drvdata(device);
++
++	return sysfs_emit(buf, "%d\n", fb_info->blank);
+ }
+ 
+ static ssize_t store_console(struct device *device,
+diff --git a/include/linux/fb.h b/include/linux/fb.h
+index cd653862ab99..348aa2e146e2 100644
+--- a/include/linux/fb.h
++++ b/include/linux/fb.h
+@@ -472,6 +472,8 @@ struct fb_info {
+ 	struct list_head modelist;      /* mode list */
+ 	struct fb_videomode *mode;	/* current mode */
+ 
++	int blank; /* current blanking; see FB_BLANK_ constants */
++
+ #if IS_ENABLED(CONFIG_FB_BACKLIGHT)
+ 	/* assigned backlight device */
+ 	/* set before framebuffer registration,
+-- 
+2.52.0
+
