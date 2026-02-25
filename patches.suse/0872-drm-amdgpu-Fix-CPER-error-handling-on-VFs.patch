@@ -1,0 +1,87 @@
+From f9fbc338811c8d123f0c05cd699ffa3ae7f08d34 Mon Sep 17 00:00:00 2001
+From: Victor Skvortsov <Victor.Skvortsov@amd.com>
+Date: Sun, 30 Mar 2025 13:54:06 -0500
+Subject: drm/amdgpu: Fix CPER error handling on VFs
+Git-commit: f9fbc338811c8d123f0c05cd699ffa3ae7f08d34
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+CPER read will loop infinitely if an error is encountered and
+the more bit is set. Add error checks to break upon failure.
+
+V2: added function pointer checks
+
+Suggested-by: Tony Yi <Tony.Yi@amd.com>
+Signed-off-by: Victor Skvortsov <Victor.Skvortsov@amd.com>
+Reviewed-by: Hawking Zhang <Hawking.Zhang@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_virt.c | 16 ++++++++++++----
+ 1 file changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_virt.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_virt.c
+index 0bb8cbe0dcc0..83f3334b3931 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_virt.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_virt.c
+@@ -1323,6 +1323,9 @@ static int amdgpu_virt_req_ras_err_count_internal(struct amdgpu_device *adev, bo
+ {
+ 	struct amdgpu_virt *virt = &adev->virt;
+ 
++	if (!virt->ops || !virt->ops->req_ras_err_count)
++		return -EOPNOTSUPP;
++
+ 	/* Host allows 15 ras telemetry requests per 60 seconds. Afterwhich, the Host
+ 	 * will ignore incoming guest messages. Ratelimit the guest messages to
+ 	 * prevent guest self DOS.
+@@ -1378,14 +1381,16 @@ amdgpu_virt_write_cpers_to_ring(struct amdgpu_device *adev,
+ 	used_size = host_telemetry->header.used_size;
+ 
+ 	if (used_size > (AMD_SRIOV_RAS_TELEMETRY_SIZE_KB << 10))
+-		return 0;
++		return -EINVAL;
+ 
+ 	cper_dump = kmemdup(&host_telemetry->body.cper_dump, used_size, GFP_KERNEL);
+ 	if (!cper_dump)
+ 		return -ENOMEM;
+ 
+-	if (checksum != amd_sriov_msg_checksum(cper_dump, used_size, 0, 0))
++	if (checksum != amd_sriov_msg_checksum(cper_dump, used_size, 0, 0)) {
++		ret = -EINVAL;
+ 		goto out;
++	}
+ 
+ 	*more = cper_dump->more;
+ 
+@@ -1425,7 +1430,7 @@ static int amdgpu_virt_req_ras_cper_dump_internal(struct amdgpu_device *adev)
+ 	int ret = 0;
+ 	uint32_t more = 0;
+ 
+-	if (!amdgpu_sriov_ras_cper_en(adev))
++	if (!virt->ops || !virt->ops->req_ras_cper_dump)
+ 		return -EOPNOTSUPP;
+ 
+ 	do {
+@@ -1434,7 +1439,7 @@ static int amdgpu_virt_req_ras_cper_dump_internal(struct amdgpu_device *adev)
+ 				adev, virt->fw_reserve.ras_telemetry, &more);
+ 		else
+ 			ret = 0;
+-	} while (more);
++	} while (more && !ret);
+ 
+ 	return ret;
+ }
+@@ -1444,6 +1449,9 @@ int amdgpu_virt_req_ras_cper_dump(struct amdgpu_device *adev, bool force_update)
+ 	struct amdgpu_virt *virt = &adev->virt;
+ 	int ret = 0;
+ 
++	if (!amdgpu_sriov_ras_cper_en(adev))
++		return -EOPNOTSUPP;
++
+ 	if ((__ratelimit(&virt->ras.ras_cper_dump_rs) || force_update) &&
+ 	    down_read_trylock(&adev->reset_domain->sem)) {
+ 		mutex_lock(&virt->ras.ras_telemetry_mutex);
+-- 
+2.52.0
+
