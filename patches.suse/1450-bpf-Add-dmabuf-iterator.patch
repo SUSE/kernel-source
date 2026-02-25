@@ -1,0 +1,244 @@
+From 76ea95534995adde1aa3cb1aa97ef33f50a617a9 Mon Sep 17 00:00:00 2001
+From: "T.J. Mercier" <tjmercier@google.com>
+Date: Thu, 22 May 2025 23:04:26 +0000
+Subject: bpf: Add dmabuf iterator
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 76ea95534995adde1aa3cb1aa97ef33f50a617a9
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+The dmabuf iterator traverses the list of all DMA buffers.
+
+DMA buffers are refcounted through their associated struct file. A
+reference is taken on each buffer as the list is iterated to ensure each
+buffer persists for the duration of the bpf program execution without
+holding the list mutex.
+
+Signed-off-by: T.J. Mercier <tjmercier@google.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Acked-by: Song Liu <song@kernel.org>
+Link: https://lore.kernel.org/r/20250522230429.941193-3-tjmercier@google.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/dma-buf/dma-buf.c |   68 ++++++++++++++++++++++++++++++
+ include/linux/dma-buf.h   |    2 
+ kernel/bpf/Makefile       |    3 +
+ kernel/bpf/dmabuf_iter.c  |  102 ++++++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 175 insertions(+)
+ create mode 100644 kernel/bpf/dmabuf_iter.c
+
+--- a/drivers/dma-buf/dma-buf.c
++++ b/drivers/dma-buf/dma-buf.c
+@@ -19,7 +19,9 @@
+ #include <linux/anon_inodes.h>
+ #include <linux/export.h>
+ #include <linux/debugfs.h>
++#include <linux/list.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ #include <linux/seq_file.h>
+ #include <linux/sync_file.h>
+ #include <linux/poll.h>
+@@ -55,6 +57,72 @@ static void __dma_buf_list_del(struct dm
+ 	mutex_unlock(&dmabuf_list_mutex);
+ }
+ 
++/**
++ * dma_buf_iter_begin - begin iteration through global list of all DMA buffers
++ *
++ * Returns the first buffer in the global list of DMA-bufs that's not in the
++ * process of being destroyed. Increments that buffer's reference count to
++ * prevent buffer destruction. Callers must release the reference, either by
++ * continuing iteration with dma_buf_iter_next(), or with dma_buf_put().
++ *
++ * Return:
++ * * First buffer from global list, with refcount elevated
++ * * NULL if no active buffers are present
++ */
++struct dma_buf *dma_buf_iter_begin(void)
++{
++	struct dma_buf *ret = NULL, *dmabuf;
++
++	/*
++	 * The list mutex does not protect a dmabuf's refcount, so it can be
++	 * zeroed while we are iterating. We cannot call get_dma_buf() since the
++	 * caller may not already own a reference to the buffer.
++	 */
++	mutex_lock(&dmabuf_list_mutex);
++	list_for_each_entry(dmabuf, &dmabuf_list, list_node) {
++		if (file_ref_get(&dmabuf->file->f_ref)) {
++			ret = dmabuf;
++			break;
++		}
++	}
++	mutex_unlock(&dmabuf_list_mutex);
++	return ret;
++}
++
++/**
++ * dma_buf_iter_next - continue iteration through global list of all DMA buffers
++ * @dmabuf:	[in]	pointer to dma_buf
++ *
++ * Decrements the reference count on the provided buffer. Returns the next
++ * buffer from the remainder of the global list of DMA-bufs with its reference
++ * count incremented. Callers must release the reference, either by continuing
++ * iteration with dma_buf_iter_next(), or with dma_buf_put().
++ *
++ * Return:
++ * * Next buffer from global list, with refcount elevated
++ * * NULL if no additional active buffers are present
++ */
++struct dma_buf *dma_buf_iter_next(struct dma_buf *dmabuf)
++{
++	struct dma_buf *ret = NULL;
++
++	/*
++	 * The list mutex does not protect a dmabuf's refcount, so it can be
++	 * zeroed while we are iterating. We cannot call get_dma_buf() since the
++	 * caller may not already own a reference to the buffer.
++	 */
++	mutex_lock(&dmabuf_list_mutex);
++	dma_buf_put(dmabuf);
++	list_for_each_entry_continue(dmabuf, &dmabuf_list, list_node) {
++		if (file_ref_get(&dmabuf->file->f_ref)) {
++			ret = dmabuf;
++			break;
++		}
++	}
++	mutex_unlock(&dmabuf_list_mutex);
++	return ret;
++}
++
+ static char *dmabuffs_dname(struct dentry *dentry, char *buffer, int buflen)
+ {
+ 	struct dma_buf *dmabuf;
+--- a/include/linux/dma-buf.h
++++ b/include/linux/dma-buf.h
+@@ -607,4 +607,6 @@ int dma_buf_vmap(struct dma_buf *dmabuf,
+ void dma_buf_vunmap(struct dma_buf *dmabuf, struct iosys_map *map);
+ int dma_buf_vmap_unlocked(struct dma_buf *dmabuf, struct iosys_map *map);
+ void dma_buf_vunmap_unlocked(struct dma_buf *dmabuf, struct iosys_map *map);
++struct dma_buf *dma_buf_iter_begin(void);
++struct dma_buf *dma_buf_iter_next(struct dma_buf *dmbuf);
+ #endif /* __DMA_BUF_H__ */
+--- a/kernel/bpf/Makefile
++++ b/kernel/bpf/Makefile
+@@ -53,6 +53,9 @@ obj-$(CONFIG_BPF_SYSCALL) += relo_core.o
+ obj-$(CONFIG_BPF_SYSCALL) += btf_iter.o
+ obj-$(CONFIG_BPF_SYSCALL) += btf_relocate.o
+ obj-$(CONFIG_BPF_SYSCALL) += kmem_cache_iter.o
++ifeq ($(CONFIG_DMA_SHARED_BUFFER),y)
++obj-$(CONFIG_BPF_SYSCALL) += dmabuf_iter.o
++endif
+ 
+ CFLAGS_REMOVE_percpu_freelist.o = $(CC_FLAGS_FTRACE)
+ CFLAGS_REMOVE_bpf_lru_list.o = $(CC_FLAGS_FTRACE)
+--- /dev/null
++++ b/kernel/bpf/dmabuf_iter.c
+@@ -0,0 +1,102 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Copyright (c) 2025 Google LLC */
++#include <linux/bpf.h>
++#include <linux/btf_ids.h>
++#include <linux/dma-buf.h>
++#include <linux/kernel.h>
++#include <linux/seq_file.h>
++
++static void *dmabuf_iter_seq_start(struct seq_file *seq, loff_t *pos)
++{
++	if (*pos)
++		return NULL;
++
++	return dma_buf_iter_begin();
++}
++
++static void *dmabuf_iter_seq_next(struct seq_file *seq, void *v, loff_t *pos)
++{
++	struct dma_buf *dmabuf = v;
++
++	++*pos;
++
++	return dma_buf_iter_next(dmabuf);
++}
++
++struct bpf_iter__dmabuf {
++	__bpf_md_ptr(struct bpf_iter_meta *, meta);
++	__bpf_md_ptr(struct dma_buf *, dmabuf);
++};
++
++static int __dmabuf_seq_show(struct seq_file *seq, void *v, bool in_stop)
++{
++	struct bpf_iter_meta meta = {
++		.seq = seq,
++	};
++	struct bpf_iter__dmabuf ctx = {
++		.meta = &meta,
++		.dmabuf = v,
++	};
++	struct bpf_prog *prog = bpf_iter_get_info(&meta, in_stop);
++
++	if (prog)
++		return bpf_iter_run_prog(prog, &ctx);
++
++	return 0;
++}
++
++static int dmabuf_iter_seq_show(struct seq_file *seq, void *v)
++{
++	return __dmabuf_seq_show(seq, v, false);
++}
++
++static void dmabuf_iter_seq_stop(struct seq_file *seq, void *v)
++{
++	struct dma_buf *dmabuf = v;
++
++	if (dmabuf)
++		dma_buf_put(dmabuf);
++}
++
++static const struct seq_operations dmabuf_iter_seq_ops = {
++	.start	= dmabuf_iter_seq_start,
++	.next	= dmabuf_iter_seq_next,
++	.stop	= dmabuf_iter_seq_stop,
++	.show	= dmabuf_iter_seq_show,
++};
++
++static void bpf_iter_dmabuf_show_fdinfo(const struct bpf_iter_aux_info *aux,
++					struct seq_file *seq)
++{
++	seq_puts(seq, "dmabuf iter\n");
++}
++
++static const struct bpf_iter_seq_info dmabuf_iter_seq_info = {
++	.seq_ops		= &dmabuf_iter_seq_ops,
++	.init_seq_private	= NULL,
++	.fini_seq_private	= NULL,
++	.seq_priv_size		= 0,
++};
++
++static struct bpf_iter_reg bpf_dmabuf_reg_info = {
++	.target			= "dmabuf",
++	.feature                = BPF_ITER_RESCHED,
++	.show_fdinfo		= bpf_iter_dmabuf_show_fdinfo,
++	.ctx_arg_info_size	= 1,
++	.ctx_arg_info		= {
++		{ offsetof(struct bpf_iter__dmabuf, dmabuf),
++		  PTR_TO_BTF_ID_OR_NULL },
++	},
++	.seq_info		= &dmabuf_iter_seq_info,
++};
++
++DEFINE_BPF_ITER_FUNC(dmabuf, struct bpf_iter_meta *meta, struct dma_buf *dmabuf)
++BTF_ID_LIST_SINGLE(bpf_dmabuf_btf_id, struct, dma_buf)
++
++static int __init dmabuf_iter_init(void)
++{
++	bpf_dmabuf_reg_info.ctx_arg_info[0].btf_id = bpf_dmabuf_btf_id[0];
++	return bpf_iter_reg_target(&bpf_dmabuf_reg_info);
++}
++
++late_initcall(dmabuf_iter_init);
