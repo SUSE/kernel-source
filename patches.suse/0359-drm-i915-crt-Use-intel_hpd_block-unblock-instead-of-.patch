@@ -1,0 +1,179 @@
+From 6ace085c453ccdcad34e64eead21eb120270c383 Mon Sep 17 00:00:00 2001
+From: Imre Deak <imre.deak@intel.com>
+Date: Tue, 4 Mar 2025 17:29:17 +0200
+Subject: drm/i915/crt: Use intel_hpd_block/unblock() instead of
+ intel_hpd_disable/enable()
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 6ace085c453ccdcad34e64eead21eb120270c383
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+intel_hpd_disable/enable() have the same purpose as
+intel_hpd_block/unblock(), except that disable/enable will drop any HPD
+IRQs which were triggered while the HPD was disabled, while
+block/unblock will handle such IRQs after the IRQ handling is unblocked.
+Use intel_hpd_block/unblock() for crt as well, by adding a helper to
+explicitly clear any pending IRQs before unblocking.
+
+V2: 
+- Handle encoders without a port assigned to them.
+- Rebase on change in intel_hpd_suspend() documentation.
+V3: 
+- Rebase on the suspend/resume -> block/unblock rename change.
+- Clear the pending events only after all encoders have unblocked the
+  HPD handling.
+- Clear the short/long port events for all encoders using the given HPD
+  pin.
+V4: 
+- Rebase on port->hpd_pin tracking. (Ville)
+
+Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Reviewed-by: Jani Nikula <jani.nikula@intel.com>
+Signed-off-by: Imre Deak <imre.deak@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250304152917.3407080-7-imre.deak@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/intel_crt.c     |  7 +--
+ drivers/gpu/drm/i915/display/intel_hotplug.c | 60 +++++++++++---------
+ drivers/gpu/drm/i915/display/intel_hotplug.h |  3 +-
+ 3 files changed, 35 insertions(+), 35 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_crt.c b/drivers/gpu/drm/i915/display/intel_crt.c
+index 76ffb3f8467c..bca91d49cb96 100644
+--- a/drivers/gpu/drm/i915/display/intel_crt.c
++++ b/drivers/gpu/drm/i915/display/intel_crt.c
+@@ -532,8 +532,6 @@ static bool valleyview_crt_detect_hotplug(struct drm_connector *connector)
+ {
+ 	struct intel_display *display = to_intel_display(connector->dev);
+ 	struct intel_crt *crt = intel_attached_crt(to_intel_connector(connector));
+-	struct drm_i915_private *dev_priv = to_i915(connector->dev);
+-	bool reenable_hpd;
+ 	u32 adpa;
+ 	bool ret;
+ 	u32 save_adpa;
+@@ -550,7 +548,7 @@ static bool valleyview_crt_detect_hotplug(struct drm_connector *connector)
+ 	 *
+ 	 * Just disable HPD interrupts here to prevent this
+ 	 */
+-	reenable_hpd = intel_hpd_disable(dev_priv, crt->base.hpd_pin);
++	intel_hpd_block(&crt->base);
+ 
+ 	save_adpa = adpa = intel_de_read(display, crt->adpa_reg);
+ 	drm_dbg_kms(display->drm,
+@@ -577,8 +575,7 @@ static bool valleyview_crt_detect_hotplug(struct drm_connector *connector)
+ 	drm_dbg_kms(display->drm,
+ 		    "valleyview hotplug adpa=0x%x, result %d\n", adpa, ret);
+ 
+-	if (reenable_hpd)
+-		intel_hpd_enable(dev_priv, crt->base.hpd_pin);
++	intel_hpd_clear_and_unblock(&crt->base);
+ 
+ 	return ret;
+ }
+diff --git a/drivers/gpu/drm/i915/display/intel_hotplug.c b/drivers/gpu/drm/i915/display/intel_hotplug.c
+index 94b4dcf10f58..c69b1f5fd160 100644
+--- a/drivers/gpu/drm/i915/display/intel_hotplug.c
++++ b/drivers/gpu/drm/i915/display/intel_hotplug.c
+@@ -996,33 +996,6 @@ void intel_hpd_cancel_work(struct drm_i915_private *dev_priv)
+ 		drm_dbg_kms(&dev_priv->drm, "Hotplug detection work still active\n");
+ }
+ 
+-bool intel_hpd_disable(struct drm_i915_private *dev_priv, enum hpd_pin pin)
+-{
+-	bool ret = false;
+-
+-	if (pin == HPD_NONE)
+-		return false;
+-
+-	spin_lock_irq(&dev_priv->irq_lock);
+-	if (dev_priv->display.hotplug.stats[pin].state == HPD_ENABLED) {
+-		dev_priv->display.hotplug.stats[pin].state = HPD_DISABLED;
+-		ret = true;
+-	}
+-	spin_unlock_irq(&dev_priv->irq_lock);
+-
+-	return ret;
+-}
+-
+-void intel_hpd_enable(struct drm_i915_private *dev_priv, enum hpd_pin pin)
+-{
+-	if (pin == HPD_NONE)
+-		return;
+-
+-	spin_lock_irq(&dev_priv->irq_lock);
+-	dev_priv->display.hotplug.stats[pin].state = HPD_ENABLED;
+-	spin_unlock_irq(&dev_priv->irq_lock);
+-}
+-
+ static void queue_work_for_missed_irqs(struct drm_i915_private *i915)
+ {
+ 	struct intel_display *display = to_intel_display(&i915->drm);
+@@ -1101,7 +1074,8 @@ static bool unblock_hpd_pin(struct intel_display *display, enum hpd_pin pin)
+  *   drm_connector_funcs::detect()) remains allowed, for instance as part of
+  *   userspace connector probing, or DRM core's connector polling.
+  *
+- * The call must be followed by calling intel_hpd_unblock().
++ * The call must be followed by calling intel_hpd_unblock(), or
++ * intel_hpd_clear_and_unblock().
+  *
+  * Note that the handling of HPD IRQs for another encoder using the same HPD
+  * pin as that of @encoder will be also blocked.
+@@ -1152,6 +1126,36 @@ void intel_hpd_unblock(struct intel_encoder *encoder)
+ 	spin_unlock_irq(&i915->irq_lock);
+ }
+ 
++/**
++ * intel_hpd_clear_and_unblock - Unblock handling of new HPD IRQs on an HPD pin
++ * @encoder: Encoder to unblock the HPD handling for
++ *
++ * Unblock the handling of HPD IRQs on the HPD pin of @encoder, which was
++ * previously blocked by intel_hpd_block(). Any HPD IRQ raised on the
++ * HPD pin while it was blocked will be cleared, handling only new IRQs.
++ */
++void intel_hpd_clear_and_unblock(struct intel_encoder *encoder)
++{
++	struct intel_display *display = to_intel_display(encoder);
++	struct drm_i915_private *i915 = to_i915(display->drm);
++	struct intel_hotplug *hotplug = &display->hotplug;
++	enum hpd_pin pin = encoder->hpd_pin;
++
++	if (pin == HPD_NONE)
++		return;
++
++	spin_lock_irq(&i915->irq_lock);
++
++	if (unblock_hpd_pin(display, pin)) {
++		hotplug->event_bits &= ~BIT(pin);
++		hotplug->retry_bits &= ~BIT(pin);
++		hotplug->short_hpd_pin_mask &= ~BIT(pin);
++		hotplug->long_hpd_pin_mask &= ~BIT(pin);
++	}
++
++	spin_unlock_irq(&i915->irq_lock);
++}
++
+ void intel_hpd_enable_detection_work(struct drm_i915_private *i915)
+ {
+ 	spin_lock_irq(&i915->irq_lock);
+diff --git a/drivers/gpu/drm/i915/display/intel_hotplug.h b/drivers/gpu/drm/i915/display/intel_hotplug.h
+index 5f9857136f5e..f189b871904e 100644
+--- a/drivers/gpu/drm/i915/display/intel_hotplug.h
++++ b/drivers/gpu/drm/i915/display/intel_hotplug.h
+@@ -26,10 +26,9 @@ void intel_hpd_init(struct drm_i915_private *dev_priv);
+ void intel_hpd_init_early(struct drm_i915_private *i915);
+ void intel_hpd_cancel_work(struct drm_i915_private *dev_priv);
+ enum hpd_pin intel_hpd_pin_default(enum port port);
+-bool intel_hpd_disable(struct drm_i915_private *dev_priv, enum hpd_pin pin);
+-void intel_hpd_enable(struct drm_i915_private *dev_priv, enum hpd_pin pin);
+ void intel_hpd_block(struct intel_encoder *encoder);
+ void intel_hpd_unblock(struct intel_encoder *encoder);
++void intel_hpd_clear_and_unblock(struct intel_encoder *encoder);
+ void intel_hpd_debugfs_register(struct drm_i915_private *i915);
+ 
+ void intel_hpd_enable_detection_work(struct drm_i915_private *i915);
+-- 
+2.52.0
+
