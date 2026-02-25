@@ -1,0 +1,77 @@
+From 0132ba7ff0f613915d332a30fcf14cf66e317f98 Mon Sep 17 00:00:00 2001
+From: "Jesse.Zhang" <Jesse.Zhang@amd.com>
+Date: Thu, 15 May 2025 15:02:13 +0800
+Subject: drm/amdgpu: Fix eviction fence worker race during fd close
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 0132ba7ff0f613915d332a30fcf14cf66e317f98
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+The current cleanup order during file descriptor close can lead to
+a race condition where the eviction fence worker attempts to access
+a destroyed mutex from the user queue manager:
+
+[  517.294055] DEBUG_LOCKS_WARN_ON(lock->magic != lock)
+[  517.294060] WARNING: CPU: 8 PID: 2030 at kernel/locking/mutex.c:564
+[  517.294094] Workqueue: events amdgpu_eviction_fence_suspend_worker [amdgpu]
+
+The issue occurs because:
+1. We destroy the user queue manager (including its mutex) first
+2. Then try to destroy eviction fences which may have pending work
+3. The eviction fence worker may try to access the already-destroyed mutex
+
+Fix this by reordering the cleanup to:
+1. First mark the fd as closing and destroy eviction fences,
+   which flushes any pending work
+2. Then safely destroy the user queue manager after we're certain
+   no more fence work will be executed
+
+The copy in amdgpu_driver_postclose_kms() needs to be removed (Christian)
+
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Prike Liang <Prike.Liang@amd.com>
+Reviewed-by: Arvind Yadav <Arvind.Yadav@amd.com>
+Signed-off-by: Jesse Zhang <Jesse.Zhang@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c | 2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c | 5 -----
+ 2 files changed, 1 insertion(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+index 4ddd08ce8885..4db92e0a60da 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+@@ -2913,8 +2913,8 @@ static int amdgpu_drm_release(struct inode *inode, struct file *filp)
+ 
+ 	if (fpriv) {
+ 		fpriv->evf_mgr.fd_closing = true;
+-		amdgpu_userq_mgr_fini(&fpriv->userq_mgr);
+ 		amdgpu_eviction_fence_destroy(&fpriv->evf_mgr);
++		amdgpu_userq_mgr_fini(&fpriv->userq_mgr);
+ 	}
+ 
+ 	return drm_release(inode, filp);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+index 9fbb04aee97b..d2ce7d86dbc8 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+@@ -1502,11 +1502,6 @@ void amdgpu_driver_postclose_kms(struct drm_device *dev,
+ 		amdgpu_bo_unreserve(pd);
+ 	}
+ 
+-	if (!fpriv->evf_mgr.fd_closing) {
+-		fpriv->evf_mgr.fd_closing = true;
+-		amdgpu_userq_mgr_fini(&fpriv->userq_mgr);
+-		amdgpu_eviction_fence_destroy(&fpriv->evf_mgr);
+-	}
+ 	amdgpu_ctx_mgr_fini(&fpriv->ctx_mgr);
+ 	amdgpu_vm_fini(adev, &fpriv->vm);
+ 
+-- 
+2.52.0
+
