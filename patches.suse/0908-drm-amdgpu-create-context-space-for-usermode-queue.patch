@@ -1,0 +1,134 @@
+From defb41e8ef3a7d0421009de58d74da54ca25da76 Mon Sep 17 00:00:00 2001
+From: Shashank Sharma <shashank.sharma@amd.com>
+Date: Thu, 2 May 2024 13:46:06 +0200
+Subject: drm/amdgpu: create context space for usermode queue
+Git-commit: defb41e8ef3a7d0421009de58d74da54ca25da76
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+The MES FW expects us to allocate at least one page as context
+space to process gang and process related context data. This
+patch creates a joint object for the same, and calculates GPU
+space offsets of these spaces.
+
+V1: Addressed review comments on RFC patch:
+    Alex: Make this function IP specific
+
+V2: Addressed review comments from Christian
+    - Allocate only one object for total FW space, and calculate
+      offsets for each of these objects.
+
+V3: Integration with doorbell manager
+
+V4: Review comments:
+    - Remove shadow from FW space list from cover letter (Alex)
+    - Alignment of macro (Luben)
+
+V5: Merged patches 5 and 6 into this single patch
+    Addressed review comments:
+    - Use lower_32_bits instead of mask (Christian)
+    - gfx_v11_0 instead of gfx_v11 in function names (Alex)
+    - Shadow and GDS objects are now coming from userspace (Christian,
+      Alex)
+
+V6: - Add a comment to replace amdgpu_bo_create_kernel() with
+      amdgpu_bo_create() during fw_ctx object creation (Christian).
+    - Move proc_ctx_gpu_addr, gang_ctx_gpu_addr and fw_ctx_gpu_addr out
+      of generic queue structure and make it gen11 specific (Alex).
+
+V7: - Using helper function to create/destroy userqueue objects.
+   - Removed FW object space allocation.
+
+V8: - Updating FW object address from user values.
+
+V9: - uppdated function name from gfx_v11_* to mes_v11_*
+
+V10: - making this patch independent of IP based changes, moving any
+     GFX object related changes in GFX specific patch (Alex)
+
+Cc: Alex Deucher <alexander.deucher@amd.com>
+Cc: Christian Koenig <christian.koenig@amd.com>
+Acked-by: Christian Koenig <christian.koenig@amd.com>
+Signed-off-by: Shashank Sharma <shashank.sharma@amd.com>
+Signed-off-by: Arvind Yadav <arvind.yadav@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../gpu/drm/amd/amdgpu/mes_v11_0_userqueue.c  | 33 +++++++++++++++++++
+ .../gpu/drm/amd/include/amdgpu_userqueue.h    |  1 +
+ 2 files changed, 34 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/mes_v11_0_userqueue.c b/drivers/gpu/drm/amd/amdgpu/mes_v11_0_userqueue.c
+index 63fd48a5b8b0..2486ea2d72fe 100644
+--- a/drivers/gpu/drm/amd/amdgpu/mes_v11_0_userqueue.c
++++ b/drivers/gpu/drm/amd/amdgpu/mes_v11_0_userqueue.c
+@@ -27,6 +27,31 @@
+ #include "mes_v11_0.h"
+ #include "mes_v11_0_userqueue.h"
+ 
++#define AMDGPU_USERQ_PROC_CTX_SZ PAGE_SIZE
++#define AMDGPU_USERQ_GANG_CTX_SZ PAGE_SIZE
++
++static int mes_v11_0_userq_create_ctx_space(struct amdgpu_userq_mgr *uq_mgr,
++					    struct amdgpu_usermode_queue *queue,
++					    struct drm_amdgpu_userq_in *mqd_user)
++{
++	struct amdgpu_userq_obj *ctx = &queue->fw_obj;
++	int r, size;
++
++	/*
++	 * The FW expects at least one page space allocated for
++	 * process ctx and gang ctx each. Create an object
++	 * for the same.
++	 */
++	size = AMDGPU_USERQ_PROC_CTX_SZ + AMDGPU_USERQ_GANG_CTX_SZ;
++	r = amdgpu_userqueue_create_object(uq_mgr, ctx, size);
++	if (r) {
++		DRM_ERROR("Failed to allocate ctx space bo for userqueue, err:%d\n", r);
++		return r;
++	}
++
++	return 0;
++}
++
+ static int mes_v11_0_userq_mqd_create(struct amdgpu_userq_mgr *uq_mgr,
+ 				      struct drm_amdgpu_userq_in *args_in,
+ 				      struct amdgpu_usermode_queue *queue)
+@@ -73,6 +98,13 @@ static int mes_v11_0_userq_mqd_create(struct amdgpu_userq_mgr *uq_mgr,
+ 		goto free_mqd;
+ 	}
+ 
++	/* Create BO for FW operations */
++	r = mes_v11_0_userq_create_ctx_space(uq_mgr, queue, mqd_user);
++	if (r) {
++		DRM_ERROR("Failed to allocate BO for userqueue (%d)", r);
++		goto free_mqd;
++	}
++
+ 	return 0;
+ 
+ free_mqd:
+@@ -88,6 +120,7 @@ static void
+ mes_v11_0_userq_mqd_destroy(struct amdgpu_userq_mgr *uq_mgr,
+ 			    struct amdgpu_usermode_queue *queue)
+ {
++	amdgpu_userqueue_destroy_object(uq_mgr, &queue->fw_obj);
+ 	kfree(queue->userq_prop);
+ 	amdgpu_userqueue_destroy_object(uq_mgr, &queue->mqd);
+ }
+diff --git a/drivers/gpu/drm/amd/include/amdgpu_userqueue.h b/drivers/gpu/drm/amd/include/amdgpu_userqueue.h
+index bbd29f68b8d4..643f31474bd8 100644
+--- a/drivers/gpu/drm/amd/include/amdgpu_userqueue.h
++++ b/drivers/gpu/drm/amd/include/amdgpu_userqueue.h
+@@ -44,6 +44,7 @@ struct amdgpu_usermode_queue {
+ 	struct amdgpu_userq_mgr *userq_mgr;
+ 	struct amdgpu_vm	*vm;
+ 	struct amdgpu_userq_obj mqd;
++	struct amdgpu_userq_obj fw_obj;
+ };
+ 
+ struct amdgpu_userq_funcs {
+-- 
+2.52.0
+
