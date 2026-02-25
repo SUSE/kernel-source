@@ -1,10 +1,10 @@
 From 98d3f772ca7d6822bdfc8c960f5f909574db97c9 Mon Sep 17 00:00:00 2001
 From: Jacek Lawrynowicz <jacek.lawrynowicz@linux.intel.com>
 Date: Wed, 28 May 2025 17:43:25 +0200
-Subject: [PATCH] accel/ivpu: Use dma_resv_lock() instead of a custom mutex
+Subject: accel/ivpu: Use dma_resv_lock() instead of a custom mutex
 Git-commit: 98d3f772ca7d6822bdfc8c960f5f909574db97c9
 Patch-mainline: v6.16-rc1
-References: git-fixes
+References: git-fixes jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
 
 This fixes a potential race conditions in:
  - ivpu_bo_unbind_locked() where we modified the shmem->sgt without
@@ -21,19 +21,19 @@ Cc: stable@vger.kernel.org # v6.9+
 Reviewed-by: Lizhi Hou <lizhi.hou@amd.com>
 Signed-off-by: Jacek Lawrynowicz <jacek.lawrynowicz@linux.intel.com>
 Link: https://lore.kernel.org/r/20250528154325.500684-1-jacek.lawrynowicz@linux.intel.com
-Acked-by: Takashi Iwai <tiwai@suse.de>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
 
 ---
- drivers/accel/ivpu/ivpu_gem.c | 65 +++++++++++++++++++----------------
+ drivers/accel/ivpu/ivpu_gem.c | 63 +++++++++++++++++++----------------
  drivers/accel/ivpu/ivpu_gem.h |  1 -
- 2 files changed, 35 insertions(+), 31 deletions(-)
+ 2 files changed, 34 insertions(+), 30 deletions(-)
 
 diff --git a/drivers/accel/ivpu/ivpu_gem.c b/drivers/accel/ivpu/ivpu_gem.c
-index c193a80241f5..5908268ca45e 100644
+index 2ad80c9b0de4..d9bb89f91709 100644
 --- a/drivers/accel/ivpu/ivpu_gem.c
 +++ b/drivers/accel/ivpu/ivpu_gem.c
 @@ -33,6 +33,16 @@ static inline void ivpu_dbg_bo(struct ivpu_device *vdev, struct ivpu_bo *bo, con
- 		 (bool)bo->base.base.import_attach);
+ 		 (bool)drm_gem_is_imported(&bo->base.base));
  }
  
 +static inline int ivpu_bo_lock(struct ivpu_bo *bo)
@@ -60,25 +60,24 @@ index c193a80241f5..5908268ca45e 100644
 -
  	ivpu_dbg_bo(vdev, bo, "pin");
 -	drm_WARN_ON(&vdev->drm, !bo->ctx);
-+
+ 
+-	if (!bo->mmu_mapped) {
+-		struct sg_table *sgt = drm_gem_shmem_get_pages_sgt(&bo->base);
 +	sgt = drm_gem_shmem_get_pages_sgt(&bo->base);
 +	if (IS_ERR(sgt)) {
 +		ret = PTR_ERR(sgt);
 +		ivpu_err(vdev, "Failed to map BO in IOMMU: %d\n", ret);
 +		return ret;
 +	}
-+
-+	ivpu_bo_lock(bo);
  
- 	if (!bo->mmu_mapped) {
--		struct sg_table *sgt = drm_gem_shmem_get_pages_sgt(&bo->base);
--
 -		if (IS_ERR(sgt)) {
 -			ret = PTR_ERR(sgt);
 -			ivpu_err(vdev, "Failed to map BO in IOMMU: %d\n", ret);
 -			goto unlock;
 -		}
--
++	ivpu_bo_lock(bo);
+ 
++	if (!bo->mmu_mapped) {
 +		drm_WARN_ON(&vdev->drm, !bo->ctx);
  		ret = ivpu_mmu_context_map_sgt(vdev, bo->ctx, bo->vpu_addr, sgt,
  					       ivpu_bo_is_snooped(bo));
@@ -120,7 +119,7 @@ index c193a80241f5..5908268ca45e 100644
  	if (bo->mmu_mapped) {
  		drm_WARN_ON(&vdev->drm, !bo->ctx);
 @@ -123,14 +133,12 @@ static void ivpu_bo_unbind_locked(struct ivpu_bo *bo)
- 	if (bo->base.base.import_attach)
+ 	if (drm_gem_is_imported(&bo->base.base))
  		return;
  
 -	dma_resv_lock(bo->base.base.resv, NULL);
@@ -163,7 +162,7 @@ index c193a80241f5..5908268ca45e 100644
  
 -	mutex_destroy(&bo->lock);
 -
- 	drm_WARN_ON(obj->dev, bo->base.pages_use_count > 1);
+ 	drm_WARN_ON(obj->dev, refcount_read(&bo->base.pages_use_count) > 1);
  	drm_gem_shmem_free(&bo->base);
  }
 @@ -370,9 +375,9 @@ ivpu_bo_create(struct ivpu_device *vdev, struct ivpu_mmu_context *ctx,
@@ -172,7 +171,7 @@ index c193a80241f5..5908268ca45e 100644
  	if (flags & DRM_IVPU_BO_MAPPABLE) {
 -		dma_resv_lock(bo->base.base.resv, NULL);
 +		ivpu_bo_lock(bo);
- 		ret = drm_gem_shmem_vmap(&bo->base, &map);
+ 		ret = drm_gem_shmem_vmap_locked(&bo->base, &map);
 -		dma_resv_unlock(bo->base.base.resv);
 +		ivpu_bo_unlock(bo);
  
@@ -184,7 +183,7 @@ index c193a80241f5..5908268ca45e 100644
  	if (bo->flags & DRM_IVPU_BO_MAPPABLE) {
 -		dma_resv_lock(bo->base.base.resv, NULL);
 +		ivpu_bo_lock(bo);
- 		drm_gem_shmem_vunmap(&bo->base, &map);
+ 		drm_gem_shmem_vunmap_locked(&bo->base, &map);
 -		dma_resv_unlock(bo->base.base.resv);
 +		ivpu_bo_unlock(bo);
  	}
@@ -236,5 +235,5 @@ index 0c93118c85bd..aa8ff14f7aae 100644
  	u32 flags;
  	u32 job_status; /* Valid only for command buffer */
 -- 
-2.49.0
+2.52.0
 
