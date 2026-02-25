@@ -1,0 +1,509 @@
+From b0328087c179f47ea6558c3b91b4487c5e10deda Mon Sep 17 00:00:00 2001
+From: Shashank Sharma <shashank.sharma@amd.com>
+Date: Wed, 20 Nov 2024 18:59:49 +0100
+Subject: drm/amdgpu: suspend gfx userqueues
+Git-commit: b0328087c179f47ea6558c3b91b4487c5e10deda
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+This patch adds suspend support for gfx userqueues. It typically does
+the following:
+- adds an enable_signaling function for the eviction fence, so that it
+  can trigger the userqueue suspend,
+- adds a delayed work to handle suspending of the eviction_fence
+- adds a suspend function to handle suspending of userqueues which
+  suspends all the queues under this userq manager and signals the
+  eviction fence,
+- adds a function to replace the old eviction fence with a new one and
+  attach it to each of the objects,
+- adds reference of userq manager in the eviction fence container so
+  that it can be used in the suspend function.
+
+V2: Addressed Christian's review comments:
+    - schedule suspend work immediately
+
+V4: Addressed Christian's review comments:
+    - wait for pending uq fences before starting suspend, added
+      queue->last_fence for the same
+    - accommodate ev_fence_mgr into existing code
+    - some bug fixes and NULL checks
+
+V5: Addressed Christian's review comments (gitlab)
+    - Wait for eviction fence to get signaled in destroy,
+      don't signal it
+    - Wait for eviction fence to get signaled in replace fence,
+      don't signal it
+
+V6: Addressed Christian's review comments
+    - Do not destroy the old eviction fence until we have it replaced
+    - Change the sequence of fence replacement sub-tasks
+    - reusing the ev_fence delayed work for userqueue suspend as well
+      (Shashank).
+
+V7: Addressed Christian's review comments
+    - give evf_mgr as argument (instead of fpriv) to replace_fence()
+    - save ptr to evf_mgr in ev_fence (instead of uq_mgr)
+    - modify suspend_all_queues logic to reflect error properly
+    - remove the garbage drm_exec_lock section in wait_for_signal
+    - grab the userqueue mutex before starting the wait for fence
+    - remove the unrelated gobj check from signal_ioctl
+
+V8: Added race condition fixes
+
+Cc: Alex Deucher <alexander.deucher@amd.com>
+Cc: Christian Koenig <christian.koenig@amd.com>
+Acked-by: Christian Koenig <christian.koenig@amd.com>
+Signed-off-by: Shashank Sharma <shashank.sharma@amd.com>
+Signed-off-by: Arvind Yadav <arvind.yadav@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../drm/amd/amdgpu/amdgpu_eviction_fence.c    | 127 ++++++++++++++++++
+ .../drm/amd/amdgpu/amdgpu_eviction_fence.h    |   4 +
+ .../gpu/drm/amd/amdgpu/amdgpu_userq_fence.c   |  37 +++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c | 110 +++++++++++++++
+ .../gpu/drm/amd/include/amdgpu_userqueue.h    |   9 ++
+ 5 files changed, 276 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_eviction_fence.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_eviction_fence.c
+index 056798e2b050..189afb872775 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_eviction_fence.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_eviction_fence.c
+@@ -22,8 +22,12 @@
+  *
+  */
+ #include <linux/sched.h>
++#include <drm/drm_exec.h>
+ #include "amdgpu.h"
+ 
++#define work_to_evf_mgr(w, name) container_of(w, struct amdgpu_eviction_fence_mgr, name)
++#define evf_mgr_to_fpriv(e) container_of(e, struct amdgpu_fpriv, evf_mgr)
++
+ static const char *
+ amdgpu_eviction_fence_get_driver_name(struct dma_fence *fence)
+ {
+@@ -39,10 +43,131 @@ amdgpu_eviction_fence_get_timeline_name(struct dma_fence *f)
+ 	return ef->timeline_name;
+ }
+ 
++int
++amdgpu_eviction_fence_replace_fence(struct amdgpu_eviction_fence_mgr *evf_mgr,
++				    struct drm_exec *exec)
++{
++	struct amdgpu_eviction_fence *old_ef, *new_ef;
++	struct drm_gem_object *obj;
++	unsigned long index;
++	int ret;
++
++	/*
++	 * Steps to replace eviction fence:
++	 * * lock all objects in exec (caller)
++	 * * create a new eviction fence
++	 * * update new eviction fence in evf_mgr
++	 * * attach the new eviction fence to BOs
++	 * * release the old fence
++	 * * unlock the objects (caller)
++	 */
++	new_ef = amdgpu_eviction_fence_create(evf_mgr);
++	if (!new_ef) {
++		DRM_ERROR("Failed to create new eviction fence\n");
++		return -ENOMEM;
++	}
++
++	/* Update the eviction fence now */
++	spin_lock(&evf_mgr->ev_fence_lock);
++	old_ef = evf_mgr->ev_fence;
++	evf_mgr->ev_fence = new_ef;
++	spin_unlock(&evf_mgr->ev_fence_lock);
++
++	/* Attach the new fence */
++	drm_exec_for_each_locked_object(exec, index, obj) {
++		struct amdgpu_bo *bo = gem_to_amdgpu_bo(obj);
++
++		if (!bo)
++			continue;
++		ret = amdgpu_eviction_fence_attach(evf_mgr, bo);
++		if (ret) {
++			DRM_ERROR("Failed to attch new eviction fence\n");
++			goto free_err;
++		}
++	}
++
++	/* Free old fence */
++	dma_fence_put(&old_ef->base);
++	return 0;
++
++free_err:
++	kfree(new_ef);
++	return ret;
++}
++
++static void
++amdgpu_eviction_fence_suspend_worker(struct work_struct *work)
++{
++	struct amdgpu_eviction_fence_mgr *evf_mgr = work_to_evf_mgr(work, suspend_work.work);
++	struct amdgpu_fpriv *fpriv = evf_mgr_to_fpriv(evf_mgr);
++	struct amdgpu_userq_mgr *uq_mgr = &fpriv->userq_mgr;
++	struct amdgpu_vm *vm = &fpriv->vm;
++	struct amdgpu_bo_va *bo_va;
++	struct drm_exec exec;
++	bool userq_active = amdgpu_userqueue_active(uq_mgr);
++	int ret;
++
++
++	/* For userqueues, the fence replacement happens in resume path */
++	if (userq_active) {
++		amdgpu_userqueue_suspend(uq_mgr);
++		return;
++	}
++
++	/* Signal old eviction fence */
++	amdgpu_eviction_fence_signal(evf_mgr);
++
++	/* Prepare the objects to replace eviction fence */
++	drm_exec_init(&exec, DRM_EXEC_IGNORE_DUPLICATES, 0);
++	drm_exec_until_all_locked(&exec) {
++		ret = amdgpu_vm_lock_pd(vm, &exec, 2);
++		drm_exec_retry_on_contention(&exec);
++		if (unlikely(ret))
++			goto unlock_drm;
++
++		/* Lock the done list */
++		list_for_each_entry(bo_va, &vm->done, base.vm_status) {
++			struct amdgpu_bo *bo = bo_va->base.bo;
++
++			if (!bo)
++				continue;
++
++			ret = drm_exec_lock_obj(&exec, &bo->tbo.base);
++			drm_exec_retry_on_contention(&exec);
++			if (unlikely(ret))
++				goto unlock_drm;
++		}
++	}
++
++	/* Replace old eviction fence with new one */
++	ret = amdgpu_eviction_fence_replace_fence(&fpriv->evf_mgr, &exec);
++	if (ret)
++		DRM_ERROR("Failed to replace eviction fence\n");
++
++unlock_drm:
++	drm_exec_fini(&exec);
++}
++
++static bool amdgpu_eviction_fence_enable_signaling(struct dma_fence *f)
++{
++	struct amdgpu_eviction_fence_mgr *evf_mgr;
++	struct amdgpu_eviction_fence *ev_fence;
++
++	if (!f)
++		return true;
++
++	ev_fence = to_ev_fence(f);
++	evf_mgr = ev_fence->evf_mgr;
++
++	schedule_delayed_work(&evf_mgr->suspend_work, 0);
++	return true;
++}
++
+ static const struct dma_fence_ops amdgpu_eviction_fence_ops = {
+ 	.use_64bit_seqno = true,
+ 	.get_driver_name = amdgpu_eviction_fence_get_driver_name,
+ 	.get_timeline_name = amdgpu_eviction_fence_get_timeline_name,
++	.enable_signaling = amdgpu_eviction_fence_enable_signaling,
+ };
+ 
+ void amdgpu_eviction_fence_signal(struct amdgpu_eviction_fence_mgr *evf_mgr)
+@@ -140,5 +265,7 @@ int amdgpu_eviction_fence_init(struct amdgpu_eviction_fence_mgr *evf_mgr)
+ 	spin_lock(&evf_mgr->ev_fence_lock);
+ 	evf_mgr->ev_fence = ev_fence;
+ 	spin_unlock(&evf_mgr->ev_fence_lock);
++
++	INIT_DELAYED_WORK(&evf_mgr->suspend_work, amdgpu_eviction_fence_suspend_worker);
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_eviction_fence.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_eviction_fence.h
+index aba12a43f433..12f168ec3ef0 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_eviction_fence.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_eviction_fence.h
+@@ -37,6 +37,7 @@ struct amdgpu_eviction_fence_mgr {
+ 	atomic_t		ev_fence_seq;
+ 	spinlock_t		ev_fence_lock;
+ 	struct amdgpu_eviction_fence *ev_fence;
++	struct delayed_work	suspend_work;
+ };
+ 
+ /* Eviction fence helper functions */
+@@ -60,4 +61,7 @@ amdgpu_eviction_fence_init(struct amdgpu_eviction_fence_mgr *evf_mgr);
+ void
+ amdgpu_eviction_fence_signal(struct amdgpu_eviction_fence_mgr *evf_mgr);
+ 
++int
++amdgpu_eviction_fence_replace_fence(struct amdgpu_eviction_fence_mgr *evf_mgr,
++				    struct drm_exec *exec);
+ #endif
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.c
+index 6157a540c929..877cb17a14e9 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.c
+@@ -466,6 +466,16 @@ int amdgpu_userq_signal_ioctl(struct drm_device *dev, void *data,
+ 		}
+ 	}
+ 
++	/* Save the fence to wait for during suspend */
++	mutex_lock(&userq_mgr->userq_mutex);
++
++	/* Retrieve the user queue */
++	queue = idr_find(&userq_mgr->userq_idr, args->queue_id);
++	if (!queue) {
++		r = -ENOENT;
++		mutex_unlock(&userq_mgr->userq_mutex);
++	}
++
+ 	drm_exec_init(&exec, DRM_EXEC_INTERRUPTIBLE_WAIT,
+ 		      (num_read_bo_handles + num_write_bo_handles));
+ 
+@@ -473,30 +483,35 @@ int amdgpu_userq_signal_ioctl(struct drm_device *dev, void *data,
+ 	drm_exec_until_all_locked(&exec) {
+ 		r = drm_exec_prepare_array(&exec, gobj_read, num_read_bo_handles, 1);
+ 		drm_exec_retry_on_contention(&exec);
+-		if (r)
++		if (r) {
++			mutex_unlock(&userq_mgr->userq_mutex);
+ 			goto exec_fini;
++		}
+ 
+ 		r = drm_exec_prepare_array(&exec, gobj_write, num_write_bo_handles, 1);
+ 		drm_exec_retry_on_contention(&exec);
+-		if (r)
++		if (r) {
++			mutex_unlock(&userq_mgr->userq_mutex);
+ 			goto exec_fini;
+-	}
+-
+-	/*Retrieve the user queue */
+-	queue = idr_find(&userq_mgr->userq_idr, args->queue_id);
+-	if (!queue) {
+-		r = -ENOENT;
+-		goto exec_fini;
++		}
+ 	}
+ 
+ 	r = amdgpu_userq_fence_read_wptr(queue, &wptr);
+-	if (r)
++	if (r) {
++		mutex_unlock(&userq_mgr->userq_mutex);
+ 		goto exec_fini;
++	}
+ 
+ 	/* Create a new fence */
+ 	r = amdgpu_userq_fence_create(queue, wptr, &fence);
+-	if (r)
++	if (r) {
++		mutex_unlock(&userq_mgr->userq_mutex);
+ 		goto exec_fini;
++	}
++
++	dma_fence_put(queue->last_fence);
++	queue->last_fence = dma_fence_get(fence);
++	mutex_unlock(&userq_mgr->userq_mutex);
+ 
+ 	for (i = 0; i < num_read_bo_handles; i++) {
+ 		if (!gobj_read || !gobj_read[i]->resv)
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c
+index e946c6d1dd6b..43fff8869ac9 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c
+@@ -60,6 +60,16 @@ amdgpu_userqueue_cleanup(struct amdgpu_userq_mgr *uq_mgr,
+ {
+ 	struct amdgpu_device *adev = uq_mgr->adev;
+ 	const struct amdgpu_userq_funcs *uq_funcs = adev->userq_funcs[queue->queue_type];
++	struct dma_fence *f = queue->last_fence;
++	int ret;
++
++	if (f && !dma_fence_is_signaled(f)) {
++		ret = dma_fence_wait_timeout(f, true, msecs_to_jiffies(100));
++		if (ret <= 0) {
++			DRM_ERROR("Timed out waiting for fence f=%p\n", f);
++			return;
++		}
++	}
+ 
+ 	uq_funcs->mqd_destroy(uq_mgr, queue);
+ 	amdgpu_userq_fence_driver_free(queue);
+@@ -67,6 +77,22 @@ amdgpu_userqueue_cleanup(struct amdgpu_userq_mgr *uq_mgr,
+ 	kfree(queue);
+ }
+ 
++int
++amdgpu_userqueue_active(struct amdgpu_userq_mgr *uq_mgr)
++{
++	struct amdgpu_usermode_queue *queue;
++	int queue_id;
++	int ret = 0;
++
++	mutex_lock(&uq_mgr->userq_mutex);
++	/* Resume all the queues for this process */
++	idr_for_each_entry(&uq_mgr->userq_idr, queue, queue_id)
++		ret += queue->queue_active;
++
++	mutex_unlock(&uq_mgr->userq_mutex);
++	return ret;
++}
++
+ #ifdef CONFIG_DRM_AMDGPU_NAVI3X_USERQ
+ static struct amdgpu_usermode_queue *
+ amdgpu_userqueue_find(struct amdgpu_userq_mgr *uq_mgr, int qid)
+@@ -202,6 +228,7 @@ amdgpu_userqueue_destroy(struct drm_file *filp, int queue_id)
+ 	amdgpu_bo_unpin(queue->db_obj.obj);
+ 	amdgpu_bo_unref(&queue->db_obj.obj);
+ 	amdgpu_userqueue_cleanup(uq_mgr, queue, queue_id);
++	uq_mgr->num_userqs--;
+ 	mutex_unlock(&uq_mgr->userq_mutex);
+ 	return 0;
+ }
+@@ -277,6 +304,7 @@ amdgpu_userqueue_create(struct drm_file *filp, union drm_amdgpu_userq *args)
+ 		goto unlock;
+ 	}
+ 	args->out.queue_id = qid;
++	uq_mgr->num_userqs++;
+ 
+ unlock:
+ 	mutex_unlock(&uq_mgr->userq_mutex);
+@@ -317,11 +345,93 @@ int amdgpu_userq_ioctl(struct drm_device *dev, void *data,
+ }
+ #endif
+ 
++static int
++amdgpu_userqueue_suspend_all(struct amdgpu_userq_mgr *uq_mgr)
++{
++	struct amdgpu_device *adev = uq_mgr->adev;
++	const struct amdgpu_userq_funcs *userq_funcs;
++	struct amdgpu_usermode_queue *queue;
++	int queue_id;
++	int ret = 0;
++
++	userq_funcs = adev->userq_funcs[AMDGPU_HW_IP_GFX];
++
++	/* Try to suspend all the queues in this process ctx */
++	idr_for_each_entry(&uq_mgr->userq_idr, queue, queue_id)
++		ret += userq_funcs->suspend(uq_mgr, queue);
++
++	if (ret)
++		DRM_ERROR("Couldn't suspend all the queues\n");
++	return ret;
++}
++
++static int
++amdgpu_userqueue_wait_for_signal(struct amdgpu_userq_mgr *uq_mgr)
++{
++	struct amdgpu_usermode_queue *queue;
++	int queue_id, ret;
++
++	idr_for_each_entry(&uq_mgr->userq_idr, queue, queue_id) {
++		struct dma_fence *f = queue->last_fence;
++
++		if (!f || dma_fence_is_signaled(f))
++			continue;
++		ret = dma_fence_wait_timeout(f, true, msecs_to_jiffies(100));
++		if (ret <= 0) {
++			DRM_ERROR("Timed out waiting for fence f=%p\n", f);
++			return -ETIMEDOUT;
++		}
++	}
++
++	return 0;
++}
++
++void
++amdgpu_userqueue_suspend(struct amdgpu_userq_mgr *uq_mgr)
++{
++	int ret;
++	struct amdgpu_fpriv *fpriv = uq_mgr_to_fpriv(uq_mgr);
++	struct amdgpu_eviction_fence_mgr *evf_mgr = &fpriv->evf_mgr;
++
++	mutex_lock(&uq_mgr->userq_mutex);
++
++	/* Wait for any pending userqueue fence to signal */
++	ret = amdgpu_userqueue_wait_for_signal(uq_mgr);
++	if (ret) {
++		DRM_ERROR("Not suspending userqueue, timeout waiting for work\n");
++		goto unlock;
++	}
++
++	ret = amdgpu_userqueue_suspend_all(uq_mgr);
++	if (ret) {
++		DRM_ERROR("Failed to evict userqueue\n");
++		goto unlock;
++	}
++
++	/* Signal current eviction fence */
++	amdgpu_eviction_fence_signal(evf_mgr);
++
++	/* Cleanup old eviction fence entry */
++	amdgpu_eviction_fence_destroy(evf_mgr);
++
++unlock:
++	mutex_unlock(&uq_mgr->userq_mutex);
++}
++
+ int amdgpu_userq_mgr_init(struct amdgpu_userq_mgr *userq_mgr, struct amdgpu_device *adev)
+ {
++	struct amdgpu_fpriv *fpriv;
++
+ 	mutex_init(&userq_mgr->userq_mutex);
+ 	idr_init_base(&userq_mgr->userq_idr, 1);
+ 	userq_mgr->adev = adev;
++	userq_mgr->num_userqs = 0;
++
++	fpriv = uq_mgr_to_fpriv(userq_mgr);
++	if (!fpriv->evf_mgr.ev_fence) {
++		DRM_ERROR("Eviction fence not initialized yet\n");
++		return -EINVAL;
++	}
+ 
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/amd/include/amdgpu_userqueue.h b/drivers/gpu/drm/amd/include/amdgpu_userqueue.h
+index ede0178e0332..7781ee59653b 100644
+--- a/drivers/gpu/drm/amd/include/amdgpu_userqueue.h
++++ b/drivers/gpu/drm/amd/include/amdgpu_userqueue.h
+@@ -27,6 +27,9 @@
+ 
+ #define AMDGPU_MAX_USERQ_COUNT 512
+ 
++#define to_ev_fence(f) container_of(f, struct amdgpu_eviction_fence, base)
++#define uq_mgr_to_fpriv(u) container_of(u, struct amdgpu_fpriv, userq_mgr)
++
+ struct amdgpu_mqd_prop;
+ 
+ struct amdgpu_userq_obj {
+@@ -50,6 +53,7 @@ struct amdgpu_usermode_queue {
+ 	struct amdgpu_userq_obj wptr_obj;
+ 	struct xarray		fence_drv_xa;
+ 	struct amdgpu_userq_fence_driver *fence_drv;
++	struct dma_fence	*last_fence;
+ };
+ 
+ struct amdgpu_userq_funcs {
+@@ -69,6 +73,7 @@ struct amdgpu_userq_mgr {
+ 	struct idr			userq_idr;
+ 	struct mutex			userq_mutex;
+ 	struct amdgpu_device		*adev;
++	int num_userqs;
+ };
+ 
+ int amdgpu_userq_ioctl(struct drm_device *dev, void *data, struct drm_file *filp);
+@@ -83,4 +88,8 @@ int amdgpu_userqueue_create_object(struct amdgpu_userq_mgr *uq_mgr,
+ 
+ void amdgpu_userqueue_destroy_object(struct amdgpu_userq_mgr *uq_mgr,
+ 				     struct amdgpu_userq_obj *userq_obj);
++
++void amdgpu_userqueue_suspend(struct amdgpu_userq_mgr *uq_mgr);
++
++int amdgpu_userqueue_active(struct amdgpu_userq_mgr *uq_mgr);
+ #endif
+-- 
+2.52.0
+
