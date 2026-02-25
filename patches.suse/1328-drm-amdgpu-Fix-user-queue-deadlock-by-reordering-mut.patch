@@ -1,0 +1,80 @@
+From 648a0dc0d78c369233b16878e4f351efe7fd8df6 Mon Sep 17 00:00:00 2001
+From: "Jesse.Zhang" <Jesse.Zhang@amd.com>
+Date: Fri, 9 May 2025 17:18:16 +0800
+Subject: drm/amdgpu: Fix user queue deadlock by reordering mutex locking
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 648a0dc0d78c369233b16878e4f351efe7fd8df6
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+This resolves a deadlock between user queue management and GPU reset
+paths by enforcing consistent lock ordering.
+
+The deadlock occurred when:
+
+1. Process exit path (amdgpu_userq_mgr_fini) would:
+   - Take uqm->userq_mutex
+   - Then try to take adev->userq_mutex for list operations
+
+2. GPU reset path (amdgpu_userq_pre_reset) would:
+   - Take adev->userq_mutex first (for list traversal)
+   - Then take uqm->userq_mutex
+
+The solution establishes a strict top-down locking order:
+1. Always take adev->userq_mutex before any uqm->userq_mutex
+2. Maintain this order consistently across all code paths
+
+Changes made:
+- Reordered locking in amdgpu_userq_mgr_fini() to take device lock first
+- Kept existing proper order in amdgpu_userq_pre_reset()
+- Simplified the fini flow by removing redundant operations
+
+This prevents circular dependencies while maintaining thread safety
+during both normal operation and GPU reset scenarios.
+
+Fixes: 4ce60dbada96 ("drm/amdgpu: store userq_managers in a list in adev")
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Arvind Yadav <Arvind.Yadav@amd.com>
+Signed-off-by: Jesse Zhang <Jesse.Zhang@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_userq.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_userq.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_userq.c
+index ac3ab4cc8e5a..9d1f185a815e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_userq.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_userq.c
+@@ -779,22 +779,23 @@ void amdgpu_userq_mgr_fini(struct amdgpu_userq_mgr *userq_mgr)
+ 
+ 	cancel_delayed_work_sync(&userq_mgr->resume_work);
+ 
++	mutex_lock(&adev->userq_mutex);
+ 	mutex_lock(&userq_mgr->userq_mutex);
+ 	idr_for_each_entry(&userq_mgr->userq_idr, queue, queue_id) {
+ 		amdgpu_userq_wait_for_last_fence(userq_mgr, queue);
+ 		amdgpu_userq_unmap_helper(userq_mgr, queue);
+ 		amdgpu_userq_cleanup(userq_mgr, queue, queue_id);
+ 	}
+-	mutex_lock(&adev->userq_mutex);
++
+ 	list_for_each_entry_safe(uqm, tmp, &adev->userq_mgr_list, list) {
+ 		if (uqm == userq_mgr) {
+ 			list_del(&uqm->list);
+ 			break;
+ 		}
+ 	}
+-	mutex_unlock(&adev->userq_mutex);
+ 	idr_destroy(&userq_mgr->userq_idr);
+ 	mutex_unlock(&userq_mgr->userq_mutex);
++	mutex_unlock(&adev->userq_mutex);
+ 	mutex_destroy(&userq_mgr->userq_mutex);
+ }
+ 
+-- 
+2.52.0
+
