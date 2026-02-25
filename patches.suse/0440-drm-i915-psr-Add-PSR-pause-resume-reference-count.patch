@@ -1,0 +1,130 @@
+From 9900e35a3ab14e1dcd5987b7ea13150e9ba2dc02 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jouni=20H=C3=B6gander?= <jouni.hogander@intel.com>
+Date: Fri, 28 Mar 2025 10:06:23 +0200
+Subject: drm/i915/psr: Add PSR pause/resume reference count
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 9900e35a3ab14e1dcd5987b7ea13150e9ba2dc02
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+We have now seen this:
+
+<4> [2120.434153] i915 0000:00:02.0: [drm] drm_WARN_ON(psr->paused)
+<4> [2120.434196] WARNING: CPU: 3 PID: 4430 at drivers/gpu/drm/i915/display/intel_psr.c:2227 intel_psr_pause+0x16e/0x180 [i915]
+
+Comment for drm_WARN_ON(display->drm, psr->paused) in intel_psr_pause says:
+
+"If we ever hit this, we will need to add refcount to pause/resume"
+
+This patch is implementing PSR pause/resume refcount.
+
+V3: Incorporate changes missing from v2
+V2: Add drm_warn for detecting possible unbalanced pause/resume
+
+Signed-off-by: Jouni Högander <jouni.hogander@intel.com>
+Reviewed-by: Animesh Manna <animesh.manna@intel.com>
+Link: https://lore.kernel.org/r/20250328080623.1183669-1-jouni.hogander@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../drm/i915/display/intel_display_types.h    |  2 +-
+ drivers/gpu/drm/i915/display/intel_psr.c      | 31 ++++++++++---------
+ 2 files changed, 18 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display_types.h b/drivers/gpu/drm/i915/display/intel_display_types.h
+index 7d9cc430a6b8..367b53a9eae2 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_types.h
++++ b/drivers/gpu/drm/i915/display/intel_display_types.h
+@@ -1620,7 +1620,7 @@ struct intel_psr {
+ 	bool sink_support;
+ 	bool source_support;
+ 	bool enabled;
+-	bool paused;
++	int pause_counter;
+ 	enum pipe pipe;
+ 	enum transcoder transcoder;
+ 	bool active;
+diff --git a/drivers/gpu/drm/i915/display/intel_psr.c b/drivers/gpu/drm/i915/display/intel_psr.c
+index c4be3f46511f..55414fa55b12 100644
+--- a/drivers/gpu/drm/i915/display/intel_psr.c
++++ b/drivers/gpu/drm/i915/display/intel_psr.c
+@@ -2014,7 +2014,7 @@ static void intel_psr_enable_locked(struct intel_dp *intel_dp,
+ 
+ 	intel_psr_enable_source(intel_dp, crtc_state);
+ 	intel_dp->psr.enabled = true;
+-	intel_dp->psr.paused = false;
++	intel_dp->psr.pause_counter = 0;
+ 
+ 	/*
+ 	 * Link_ok is sticky and set here on PSR enable. We can assume link
+@@ -2199,7 +2199,6 @@ void intel_psr_disable(struct intel_dp *intel_dp,
+  */
+ void intel_psr_pause(struct intel_dp *intel_dp)
+ {
+-	struct intel_display *display = to_intel_display(intel_dp);
+ 	struct intel_psr *psr = &intel_dp->psr;
+ 
+ 	if (!CAN_PSR(intel_dp) && !CAN_PANEL_REPLAY(intel_dp))
+@@ -2212,12 +2211,10 @@ void intel_psr_pause(struct intel_dp *intel_dp)
+ 		return;
+ 	}
+ 
+-	/* If we ever hit this, we will need to add refcount to pause/resume */
+-	drm_WARN_ON(display->drm, psr->paused);
+-
+-	intel_psr_exit(intel_dp);
+-	intel_psr_wait_exit_locked(intel_dp);
+-	psr->paused = true;
++	if (intel_dp->psr.pause_counter++ == 0) {
++		intel_psr_exit(intel_dp);
++		intel_psr_wait_exit_locked(intel_dp);
++	}
+ 
+ 	mutex_unlock(&psr->lock);
+ 
+@@ -2233,6 +2230,7 @@ void intel_psr_pause(struct intel_dp *intel_dp)
+  */
+ void intel_psr_resume(struct intel_dp *intel_dp)
+ {
++	struct intel_display *display = to_intel_display(intel_dp);
+ 	struct intel_psr *psr = &intel_dp->psr;
+ 
+ 	if (!CAN_PSR(intel_dp) && !CAN_PANEL_REPLAY(intel_dp))
+@@ -2240,13 +2238,18 @@ void intel_psr_resume(struct intel_dp *intel_dp)
+ 
+ 	mutex_lock(&psr->lock);
+ 
+-	if (!psr->paused)
+-		goto unlock;
++	if (!psr->enabled)
++		goto out;
+ 
+-	psr->paused = false;
+-	intel_psr_activate(intel_dp);
++	if (!psr->pause_counter) {
++		drm_warn(display->drm, "Unbalanced PSR pause/resume!\n");
++		goto out;
++	}
+ 
+-unlock:
++	if (--intel_dp->psr.pause_counter == 0)
++		intel_psr_activate(intel_dp);
++
++out:
+ 	mutex_unlock(&psr->lock);
+ }
+ 
+@@ -3298,7 +3301,7 @@ void intel_psr_flush(struct intel_display *display,
+ 		 * we have to ensure that the PSR is not activated until
+ 		 * intel_psr_resume() is called.
+ 		 */
+-		if (intel_dp->psr.paused)
++		if (intel_dp->psr.pause_counter)
+ 			goto unlock;
+ 
+ 		if (origin == ORIGIN_FLIP ||
+-- 
+2.52.0
+
