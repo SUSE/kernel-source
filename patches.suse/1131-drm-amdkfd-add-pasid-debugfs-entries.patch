@@ -1,0 +1,166 @@
+From 7295e00df06368b48f386875daaad275d9ca5181 Mon Sep 17 00:00:00 2001
+From: Eric Huang <jinhuieric.huang@amd.com>
+Date: Wed, 23 Apr 2025 11:29:06 -0400
+Subject: drm/amdkfd: add pasid debugfs entries
+Git-commit: 7295e00df06368b48f386875daaad275d9ca5181
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+the entries will be appearing at
+/sys/kernel/debug/kfd/proc/<pid>/pasid_<gpuid>.
+
+Signed-off-by: Eric Huang <jinhuieric.huang@amd.com>
+Reviewed-by: Harish Kasiviswanathan <Harish.Kasiviswanathan@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_debugfs.c | 76 ++++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h    |  5 ++
+ drivers/gpu/drm/amd/amdkfd/kfd_process.c |  3 +
+ 3 files changed, 84 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_debugfs.c b/drivers/gpu/drm/amd/amdkfd/kfd_debugfs.c
+index 4a5a0a4e00f2..9bde2c64540f 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_debugfs.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_debugfs.c
+@@ -27,6 +27,16 @@
+ #include "kfd_priv.h"
+ 
+ static struct dentry *debugfs_root;
++static struct dentry *debugfs_proc;
++static struct list_head procs;
++
++struct debugfs_proc_entry {
++	struct list_head list;
++	struct dentry *proc_dentry;
++	pid_t pid;
++};
++
++#define MAX_DEBUGFS_FILENAME_LEN 32
+ 
+ static int kfd_debugfs_open(struct inode *inode, struct file *file)
+ {
+@@ -92,6 +102,8 @@ static const struct file_operations kfd_debugfs_hang_hws_fops = {
+ void kfd_debugfs_init(void)
+ {
+ 	debugfs_root = debugfs_create_dir("kfd", NULL);
++	debugfs_proc = debugfs_create_dir("proc", debugfs_root);
++	INIT_LIST_HEAD(&procs);
+ 
+ 	debugfs_create_file("mqds", S_IFREG | 0444, debugfs_root,
+ 			    kfd_debugfs_mqds_by_process, &kfd_debugfs_fops);
+@@ -107,5 +119,69 @@ void kfd_debugfs_init(void)
+ 
+ void kfd_debugfs_fini(void)
+ {
++	debugfs_remove_recursive(debugfs_proc);
+ 	debugfs_remove_recursive(debugfs_root);
+ }
++
++static ssize_t kfd_debugfs_pasid_read(struct file *file, char __user *buf,
++				      size_t count, loff_t *ppos)
++{
++	struct kfd_process_device *pdd = file_inode(file)->i_private;
++	char tmp[32];
++	int len;
++
++	len = snprintf(tmp, sizeof(tmp), "%u\n", pdd->pasid);
++
++	return simple_read_from_buffer(buf, count, ppos, tmp, len);
++}
++
++static const struct file_operations kfd_debugfs_pasid_fops = {
++	.owner = THIS_MODULE,
++	.read = kfd_debugfs_pasid_read,
++};
++
++void kfd_debugfs_add_process(struct kfd_process *p)
++{
++	int i;
++	char name[MAX_DEBUGFS_FILENAME_LEN];
++	struct debugfs_proc_entry *entry;
++
++	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
++	if (!entry)
++		return;
++
++	list_add(&entry->list, &procs);
++	entry->pid = p->lead_thread->pid;
++	snprintf(name, MAX_DEBUGFS_FILENAME_LEN, "%d",
++		 (int)entry->pid);
++	entry->proc_dentry = debugfs_create_dir(name, debugfs_proc);
++
++	/* Create debugfs files for each GPU:
++	 * - proc/<pid>/pasid_<gpuid>
++	 */
++	for (i = 0; i < p->n_pdds; i++) {
++		struct kfd_process_device *pdd = p->pdds[i];
++
++		snprintf(name, MAX_DEBUGFS_FILENAME_LEN, "pasid_%u",
++			 pdd->dev->id);
++		debugfs_create_file((const char *)name, S_IFREG | 0444,
++				    entry->proc_dentry, pdd,
++				    &kfd_debugfs_pasid_fops);
++	}
++}
++
++void kfd_debugfs_remove_process(struct kfd_process *p)
++{
++	struct debugfs_proc_entry *entry, *next;
++
++	mutex_lock(&kfd_processes_mutex);
++	list_for_each_entry_safe(entry, next, &procs, list) {
++		if (entry->pid != p->lead_thread->pid)
++			continue;
++
++		debugfs_remove_recursive(entry->proc_dentry);
++		list_del(&entry->list);
++		kfree(entry);
++	}
++	mutex_unlock(&kfd_processes_mutex);
++}
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index f6aedf69c644..0ae794539bb0 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -1581,10 +1581,15 @@ int kfd_debugfs_hang_hws(struct kfd_node *dev);
+ int pm_debugfs_hang_hws(struct packet_manager *pm);
+ int dqm_debugfs_hang_hws(struct device_queue_manager *dqm);
+ 
++void kfd_debugfs_add_process(struct kfd_process *p);
++void kfd_debugfs_remove_process(struct kfd_process *p);
++
+ #else
+ 
+ static inline void kfd_debugfs_init(void) {}
+ static inline void kfd_debugfs_fini(void) {}
++static inline void kfd_debugfs_add_process(struct kfd_process *p) {}
++static inline void kfd_debugfs_remove_process(struct kfd_process *p) {}
+ 
+ #endif
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process.c b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+index 41d7dc8c2850..722ac1662bdc 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@ -900,6 +900,8 @@ struct kfd_process *kfd_create_process(struct task_struct *thread)
+ 		kfd_procfs_add_sysfs_files(process);
+ 		kfd_procfs_add_sysfs_counters(process);
+ 
++		kfd_debugfs_add_process(process);
++
+ 		init_waitqueue_head(&process->wait_irq_drain);
+ 	}
+ out:
+@@ -1176,6 +1178,7 @@ static void kfd_process_wq_release(struct work_struct *work)
+ 		dma_fence_signal(ef);
+ 
+ 	kfd_process_remove_sysfs(p);
++	kfd_debugfs_remove_process(p);
+ 
+ 	kfd_process_kunmap_signal_bo(p);
+ 	kfd_process_free_outstanding_kfd_bos(p);
+-- 
+2.52.0
+
