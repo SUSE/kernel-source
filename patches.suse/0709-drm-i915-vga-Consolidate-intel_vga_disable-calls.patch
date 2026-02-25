@@ -1,0 +1,151 @@
+From fcd95af591e8cd5880c0c553641beb0e97ba92f6 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Thu, 17 Apr 2025 14:44:54 +0300
+Subject: drm/i915/vga: Consolidate intel_vga_disable() calls
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: fcd95af591e8cd5880c0c553641beb0e97ba92f6
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Currently we disable the VGA plane from various places, sometimes
+multiple times in the same init/resume sequence. Get rid of all this
+mess and do it just once. The most correct place seems to be just
+after intel_early_display_was() as that one applies various workarounds
+that need to be in place before we touch any planes (including the
+VGA plane).
+
+Actually, we do still have a second caller in
+vlv_display_power_well_init(). I think we still need that as the reset
+value of VGACNTR is 0x0 and thus technically the VGA plane will be
+(at least partially) enabled after the power well has been toggled.
+
+In both cases we have the necessary power reference already held
+(INIT power domain for load/resume case, and the display power well
+itself being what we need for vlv_display_power_well_init()).
+
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250417114454.12836-7-ville.syrjala@linux.intel.com
+Reviewed-by: Jani Nikula <jani.nikula@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../drm/i915/display/intel_display_driver.c   |  3 ---
+ .../drm/i915/display/intel_modeset_setup.c    |  3 +++
+ drivers/gpu/drm/i915/display/intel_vga.c      | 22 -------------------
+ drivers/gpu/drm/i915/display/intel_vga.h      |  1 -
+ drivers/gpu/drm/i915/i915_driver.c            |  3 ---
+ 5 files changed, 3 insertions(+), 29 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display_driver.c b/drivers/gpu/drm/i915/display/intel_display_driver.c
+index 69678e758c46..5c74ab5fd1aa 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_driver.c
++++ b/drivers/gpu/drm/i915/display/intel_display_driver.c
+@@ -458,8 +458,6 @@ int intel_display_driver_probe_nogem(struct intel_display *display)
+ 
+ 	intel_hti_init(display);
+ 
+-	/* Just disable it once at startup */
+-	intel_vga_disable(display);
+ 	intel_setup_outputs(display);
+ 
+ 	ret = intel_dp_tunnel_mgr_init(display);
+@@ -696,7 +694,6 @@ __intel_display_driver_resume(struct intel_display *display,
+ 	int ret, i;
+ 
+ 	intel_modeset_setup_hw_state(display, ctx);
+-	intel_vga_redisable(display);
+ 
+ 	if (!state)
+ 		return 0;
+diff --git a/drivers/gpu/drm/i915/display/intel_modeset_setup.c b/drivers/gpu/drm/i915/display/intel_modeset_setup.c
+index 5d5ade7fdd77..0325b0c9506d 100644
+--- a/drivers/gpu/drm/i915/display/intel_modeset_setup.c
++++ b/drivers/gpu/drm/i915/display/intel_modeset_setup.c
+@@ -31,6 +31,7 @@
+ #include "intel_pmdemand.h"
+ #include "intel_tc.h"
+ #include "intel_vblank.h"
++#include "intel_vga.h"
+ #include "intel_wm.h"
+ #include "skl_watermark.h"
+ 
+@@ -935,6 +936,8 @@ void intel_modeset_setup_hw_state(struct intel_display *display,
+ 	wakeref = intel_display_power_get(display, POWER_DOMAIN_INIT);
+ 
+ 	intel_early_display_was(display);
++	intel_vga_disable(display);
++
+ 	intel_modeset_readout_hw_state(display);
+ 
+ 	/* HW state is read out, now we need to sanitize this mess. */
+diff --git a/drivers/gpu/drm/i915/display/intel_vga.c b/drivers/gpu/drm/i915/display/intel_vga.c
+index 21c1dbaf652d..05d140c8032d 100644
+--- a/drivers/gpu/drm/i915/display/intel_vga.c
++++ b/drivers/gpu/drm/i915/display/intel_vga.c
+@@ -77,28 +77,6 @@ void intel_vga_disable(struct intel_display *display)
+ 	intel_de_posting_read(display, vga_reg);
+ }
+ 
+-void intel_vga_redisable(struct intel_display *display)
+-{
+-	intel_wakeref_t wakeref;
+-
+-	/*
+-	 * This function can be called both from intel_modeset_setup_hw_state or
+-	 * at a very early point in our resume sequence, where the power well
+-	 * structures are not yet restored. Since this function is at a very
+-	 * paranoid "someone might have enabled VGA while we were not looking"
+-	 * level, just check if the power well is enabled instead of trying to
+-	 * follow the "don't touch the power well if we don't need it" policy
+-	 * the rest of the driver uses.
+-	 */
+-	wakeref = intel_display_power_get_if_enabled(display, POWER_DOMAIN_VGA);
+-	if (!wakeref)
+-		return;
+-
+-	intel_vga_disable(display);
+-
+-	intel_display_power_put(display, POWER_DOMAIN_VGA, wakeref);
+-}
+-
+ void intel_vga_reset_io_mem(struct intel_display *display)
+ {
+ 	struct pci_dev *pdev = to_pci_dev(display->drm->dev);
+diff --git a/drivers/gpu/drm/i915/display/intel_vga.h b/drivers/gpu/drm/i915/display/intel_vga.h
+index d0716782c1f9..16d699f3b641 100644
+--- a/drivers/gpu/drm/i915/display/intel_vga.h
++++ b/drivers/gpu/drm/i915/display/intel_vga.h
+@@ -10,7 +10,6 @@ struct intel_display;
+ 
+ void intel_vga_reset_io_mem(struct intel_display *display);
+ void intel_vga_disable(struct intel_display *display);
+-void intel_vga_redisable(struct intel_display *display);
+ int intel_vga_register(struct intel_display *display);
+ void intel_vga_unregister(struct intel_display *display);
+ 
+diff --git a/drivers/gpu/drm/i915/i915_driver.c b/drivers/gpu/drm/i915/i915_driver.c
+index 97ff9855b5de..96a52f963475 100644
+--- a/drivers/gpu/drm/i915/i915_driver.c
++++ b/drivers/gpu/drm/i915/i915_driver.c
+@@ -62,7 +62,6 @@
+ #include "display/intel_pch_refclk.h"
+ #include "display/intel_pps.h"
+ #include "display/intel_sprite_uapi.h"
+-#include "display/intel_vga.h"
+ #include "display/skl_watermark.h"
+ 
+ #include "gem/i915_gem_context.h"
+@@ -1202,8 +1201,6 @@ static int i915_drm_resume(struct drm_device *dev)
+ 
+ 	i9xx_display_sr_restore(display);
+ 
+-	intel_vga_redisable(display);
+-
+ 	intel_gmbus_reset(display);
+ 
+ 	intel_pps_unlock_regs_wa(display);
+-- 
+2.52.0
+
