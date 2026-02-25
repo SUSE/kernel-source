@@ -1,0 +1,175 @@
+From 223038731489c0ed6bdd3498ad187d4286536ce3 Mon Sep 17 00:00:00 2001
+From: Janusz Krzysztofik <janusz.krzysztofik@linux.intel.com>
+Date: Fri, 14 Mar 2025 21:38:35 +0100
+Subject: drm/i915: Fix harmful driver register/unregister asymmetry
+Git-commit: 223038731489c0ed6bdd3498ad187d4286536ce3
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Starting with commit ec3e00b4ee27 ("drm/i915: stop registering if
+drm_dev_register() fails"), we return from i915_driver_register()
+immediately if drm_dev_register() fails, skipping remaining registration
+steps, and continue only with remaining probe steps.  However, the
+_unregister() counterpart called at driver remove knows nothing about that
+skip and executes reverts of all those steps.  As a consequence, a number
+of kernel warnings that taint the kernel are triggered:
+
+<3> [525.823143] i915 0000:00:02.0: [drm] *ERROR* Failed to register driver for userspace access!
+...
+<4> [525.831069] ------------[ cut here ]------------
+<4> [525.831071] i915 0000:00:02.0: [drm] drm_WARN_ON(power_domains->init_wakeref)
+<4> [525.831095] WARNING: CPU: 6 PID: 3440 at drivers/gpu/drm/i915/display/intel_display_power.c:2074 intel_power_domains_disable+0xc2/0xd0 [i915]
+...
+<4> [525.831328] CPU: 6 UID: 0 PID: 3440 Comm: i915_module_loa Tainted: G     U             6.14.0-rc1-CI_DRM_16076-g7a632b6798b6+ #1
+...
+<4> [525.831334] RIP: 0010:intel_power_domains_disable+0xc2/0xd0 [i915]
+...
+<4> [525.831483] Call Trace:
+<4> [525.831484]  <TASK>
+...
+<4> [525.831943]  i915_driver_remove+0x4b/0x140 [i915]
+<4> [525.832028]  i915_pci_remove+0x1e/0x40 [i915]
+<4> [525.832099]  pci_device_remove+0x3e/0xb0
+<4> [525.832103]  device_remove+0x40/0x80
+<4> [525.832107]  device_release_driver_internal+0x215/0x280
+...
+
+Moreover, that unexpected PM reference is left untouched (not released)
+but overwritten, then that triggers another kernel warning at driver
+release phase:
+
+<4> [526.685700] ------------[ cut here ]------------
+<4> [526.685706] i915 0000:00:02.0: [drm] i915 raw-wakerefs=1 wakelocks=1 on cleanup
+<4> [526.685734] WARNING: CPU: 1 PID: 3440 at drivers/gpu/drm/i915/intel_runtime_pm.c:443 intel_runtime_pm_driver_release+0x75/0x90 [i915]
+...
+<4> [526.686090] RIP: 0010:intel_runtime_pm_driver_release+0x75/0x90 [i915]
+...
+<4> [526.686294] Call Trace:
+<4> [526.686296]  <TASK>
+...
+<4> [526.687025]  i915_driver_release+0x7e/0xb0 [i915]
+<4> [526.687243]  drm_dev_put.part.0+0x47/0x90
+<4> [526.687250]  devm_drm_dev_init_release+0x13/0x30
+<4> [526.687255]  devm_action_release+0x12/0x30
+<4> [526.687261]  release_nodes+0x3a/0x120
+<4> [526.687268]  devres_release_all+0x97/0xe0
+<4> [526.687277]  device_unbind_cleanup+0x12/0x80
+<4> [526.687282]  device_release_driver_internal+0x23a/0x280
+...
+
+A call to intel_power_domains_disable() was already there.  It triggers
+the drm_WARN_ON() when it finds a reference to a wakeref taken on device
+probe and not released after device registration failure.  That wakeref is
+then left held forever once its handle gets lost overwritten with another
+wakeref, hence another WARN() is called from
+intel_runtime_pm_driver_release().
+
+The WARN() triggered by kernfs_remove_by_name_ns() from
+i915_teardown_sysfs()->i915_gpu_error_sysfs_teardown(), formerly
+i915_teardown_error_capture(), was also there when the return was added.
+
+A call to intel_gt_sysfs_unregister() that triggers the WARN() from
+kobject_put() was added to intel_gt_driver_unregister() with commit
+69d6bf5c3754ff ("drm/i915/gt: Fix memory leaks in per-gt sysfs").
+
+Fix the asymmetry by failing the driver probe on device registration
+failure and going through rewind paths.
+
+For that to work as expected, we apparently need to start the rewind path
+of i915_driver_register() with drm_dev_unregister(), even if
+drm_dev_register() returned an error.
+
+V5: Drop unsigned keyword from ret variable declaration (Krzysztof),
+  - keep the "Failed to register driver for userspace access" error
+    message (Krzysztof),
+  - split PXP cleanup addition to rewind path out to a separate patch.
+V4: Switch to taking an error rewind path on device registration failure
+    (Krzysztof, Lucas).
+V3: Based on Andi's commitment on introducing a flag, try to address
+    Jani's "must find another way" by finding a better place and name for
+    the flag (in hope that's what Jani had on mind),
+  - split into a series of patches and limit the scope of the first (this)
+    one to a minimum of omitting conditionally only those unregister
+    (sub)steps that trigger kernel warnings when not registered.
+V2: Check in _unregister whether the drm_dev_register has succeeded and
+    skip some of the _unregister() steps. (Andi)
+
+Link: https://gitlab.freedesktop.org/drm/i915/kernel/-/issues/10047
+Closes: https://gitlab.freedesktop.org/drm/i915/kernel/-/issues/10131
+Closes: https://gitlab.freedesktop.org/drm/i915/kernel/-/issues/10887
+Closes: https://gitlab.freedesktop.org/drm/i915/kernel/-/issues/12817
+Cc: Lucas De Marchi <lucas.demarchi@intel.com>
+Cc: Chris Wilson <chris.p.wilson@linux.intel.com>
+Cc: Ashutosh Dixit <ashutosh.dixit@intel.com>
+Cc: Andi Shyti <andi.shyti@linux.intel.com>
+Cc: Krzysztof Niemiec <krzysztof.niemiec@intel.com>
+Cc: Jani Nikula <jani.nikula@linux.intel.com>
+Signed-off-by: Janusz Krzysztofik <janusz.krzysztofik@linux.intel.com>
+Reviewed-by: Krzysztof Niemiec <krzysztof.niemiec@intel.com>
+Reviewed-by: Andi Shyti <andi.shyti@linux.intel.com>
+Signed-off-by: Andi Shyti <andi.shyti@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250314205202.809563-8-janusz.krzysztofik@linux.intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/i915_driver.c | 17 +++++++++++++----
+ 1 file changed, 13 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_driver.c b/drivers/gpu/drm/i915/i915_driver.c
+index 10d1d4f3c11c..cba56cf73b96 100644
+--- a/drivers/gpu/drm/i915/i915_driver.c
++++ b/drivers/gpu/drm/i915/i915_driver.c
+@@ -622,11 +622,12 @@ static void i915_driver_hw_remove(struct drm_i915_private *dev_priv)
+  * Perform any steps necessary to make the driver available via kernel
+  * internal or userspace interfaces.
+  */
+-static void i915_driver_register(struct drm_i915_private *dev_priv)
++static int i915_driver_register(struct drm_i915_private *dev_priv)
+ {
+ 	struct intel_display *display = &dev_priv->display;
+ 	struct intel_gt *gt;
+ 	unsigned int i;
++	int ret;
+ 
+ 	i915_gem_driver_register(dev_priv);
+ 	i915_pmu_register(dev_priv);
+@@ -634,10 +635,14 @@ static void i915_driver_register(struct drm_i915_private *dev_priv)
+ 	intel_vgpu_register(dev_priv);
+ 
+ 	/* Reveal our presence to userspace */
+-	if (drm_dev_register(&dev_priv->drm, 0)) {
++	ret = drm_dev_register(&dev_priv->drm, 0);
++	if (ret) {
+ 		i915_probe_error(dev_priv,
+ 				 "Failed to register driver for userspace access!\n");
+-		return;
++		drm_dev_unregister(&dev_priv->drm);
++		i915_pmu_unregister(dev_priv);
++		i915_gem_driver_unregister(dev_priv);
++		return ret;
+ 	}
+ 
+ 	i915_debugfs_register(dev_priv);
+@@ -660,6 +665,8 @@ static void i915_driver_register(struct drm_i915_private *dev_priv)
+ 
+ 	if (i915_switcheroo_register(dev_priv))
+ 		drm_err(&dev_priv->drm, "Failed to register vga switcheroo!\n");
++
++	return 0;
+ }
+ 
+ /**
+@@ -834,7 +841,9 @@ int i915_driver_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 	if (ret)
+ 		goto out_cleanup_gem;
+ 
+-	i915_driver_register(i915);
++	ret = i915_driver_register(i915);
++	if (ret)
++		goto out_cleanup_gem;
+ 
+ 	enable_rpm_wakeref_asserts(&i915->runtime_pm);
+ 
+-- 
+2.52.0
+
