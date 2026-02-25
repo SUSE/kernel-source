@@ -1,0 +1,137 @@
+From 38c67ec9aa4be7bc0ae55e7bebe95f615fa09a1e Mon Sep 17 00:00:00 2001
+From: Arvind Yadav <arvind.yadav@amd.com>
+Date: Wed, 25 Sep 2024 18:10:41 +0200
+Subject: drm/amdgpu: Add input fence to sync bo map/unmap
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 38c67ec9aa4be7bc0ae55e7bebe95f615fa09a1e
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+This patch adds input fences to VM_IOCTL for buffer object.
+The kernel will map/unmap the BO only when the fence is signaled.
+The UAPI for the same has been approved here:
+https://gitlab.freedesktop.org/mesa/drm/-/merge_requests/392
+
+V2: Bug fix (Arvind)
+V3: Bug fix (Arvind)
+V4: Rename UAPI objects as per UAPI review (Marek)
+V5: Addressed review comemnts from Christian
+     - function should return error.
+     - Add 'TODO' comment
+     - The input fence should be independent of the operation.
+V6: Addressed review comemnts from Christian
+    - Release the memory allocated by memdup_user().
+V7: Addressed review comemnts from Christian
+    - Drop the debug print and add "return r;" for the error handling.
+
+V11: Rebase
+V12: Fix 32-bit holes issue in sturct drm_amdgpu_gem_va.
+V13: Fix deadlock issue.
+V14: Fix merge conflict.
+V15: Fix review comment by renaming syncobj handles.
+
+Cc: Alex Deucher <alexander.deucher@amd.com>
+Cc: Christian Koenig <christian.koenig@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Arvind Yadav <arvind.yadav@amd.com>
+Signed-off-by: Shashank Sharma <shashank.sharma@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c | 46 +++++++++++++++++++++++++
+ include/uapi/drm/amdgpu_drm.h           |  4 +++
+ 2 files changed, 50 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+index 542a1b70f2ee..bdf46cb4327f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+@@ -45,6 +45,45 @@
+ #include "amdgpu_xgmi.h"
+ #include "amdgpu_vm.h"
+ 
++static int
++amdgpu_gem_add_input_fence(struct drm_file *filp,
++			   uint64_t syncobj_handles_array,
++			   uint32_t num_syncobj_handles)
++{
++	struct dma_fence *fence;
++	uint32_t *syncobj_handles;
++	int ret, i;
++
++	if (!num_syncobj_handles)
++		return 0;
++
++	syncobj_handles = memdup_user(u64_to_user_ptr(syncobj_handles_array),
++				      sizeof(uint32_t) * num_syncobj_handles);
++	if (IS_ERR(syncobj_handles))
++		return PTR_ERR(syncobj_handles);
++
++	for (i = 0; i < num_syncobj_handles; i++) {
++
++		if (!syncobj_handles[i]) {
++			ret = -EINVAL;
++			goto free_memdup;
++		}
++
++		ret = drm_syncobj_find_fence(filp, syncobj_handles[i], 0, 0, &fence);
++		if (ret)
++			goto free_memdup;
++
++		dma_fence_wait(fence, false);
++
++		/* TODO: optimize async handling */
++		dma_fence_put(fence);
++	}
++
++free_memdup:
++	kfree(syncobj_handles);
++	return ret;
++}
++
+ static int
+ amdgpu_gem_update_timeline_node(struct drm_file *filp,
+ 				uint32_t syncobj_handle,
+@@ -854,6 +893,12 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
+ 		abo = NULL;
+ 	}
+ 
++	r = amdgpu_gem_add_input_fence(filp,
++				       args->input_fence_syncobj_handles,
++				       args->num_syncobj_handles);
++	if (r)
++		goto error_put_gobj;
++
+ 	drm_exec_init(&exec, DRM_EXEC_INTERRUPTIBLE_WAIT |
+ 		      DRM_EXEC_IGNORE_DUPLICATES, 0);
+ 	drm_exec_until_all_locked(&exec) {
+@@ -928,6 +973,7 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
+ 
+ error:
+ 	drm_exec_fini(&exec);
++error_put_gobj:
+ 	drm_gem_object_put(gobj);
+ 	return r;
+ }
+diff --git a/include/uapi/drm/amdgpu_drm.h b/include/uapi/drm/amdgpu_drm.h
+index 02cf03e811d5..0910a6f8c5f2 100644
+--- a/include/uapi/drm/amdgpu_drm.h
++++ b/include/uapi/drm/amdgpu_drm.h
+@@ -884,6 +884,10 @@ struct drm_amdgpu_gem_va {
+ 	 * at vm_timeline_point.
+ 	 */
+ 	__u32 vm_timeline_syncobj_out;
++	/** the number of syncobj handles in @input_fence_syncobj_handles */
++	__u32 num_syncobj_handles;
++	/** Array of sync object handle to wait for given input fences */
++	__u64 input_fence_syncobj_handles;
+ };
+ 
+ #define AMDGPU_HW_IP_GFX          0
+-- 
+2.52.0
+
