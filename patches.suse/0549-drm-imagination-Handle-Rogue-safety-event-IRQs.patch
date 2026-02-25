@@ -1,0 +1,231 @@
+From 96822d38ff574433e06a2ec0f88ebc50d44c8eaa Mon Sep 17 00:00:00 2001
+From: Alessio Belle <alessio.belle@imgtec.com>
+Date: Thu, 10 Apr 2025 10:55:06 +0100
+Subject: drm/imagination: Handle Rogue safety event IRQs
+Git-commit: 96822d38ff574433e06a2ec0f88ebc50d44c8eaa
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Extend interrupt handling logic to check for safety event IRQs, then clear
+and handle them in the IRQ handler thread.
+
+Safety events need to be checked and cleared with a different set of GPU
+registers than those the IRQ handler has been using so far.
+
+Only two safety events need to be handled on the host: FW fault (ECC error
+correction or detection) and device watchdog timeout. Handling right now
+simply consists of clearing any error and logging the event. If either of
+these events results in an unrecoverable GPU or FW, the driver will
+eventually attempt to recover from it e.g. via pvr_power_reset().
+
+Note that Rogue GPUs may send interrupts to the host for all types of
+safety events, not just the two above. For events not handled by the host,
+clearing the associated interrupt is sufficient.
+
+Signed-off-by: Alessio Belle <alessio.belle@imgtec.com>
+Reviewed-by: Frank Binns <frank.binns@imgtec.com>
+Link: https://lore.kernel.org/r/20250410-sets-bxs-4-64-patch-v1-v6-7-eda620c5865f@imgtec.com
+Signed-off-by: Matt Coster <matt.coster@imgtec.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/imagination/pvr_device.c | 113 ++++++++++++++++++++++-
+ drivers/gpu/drm/imagination/pvr_device.h |   3 +
+ drivers/gpu/drm/imagination/pvr_fw.c     |   3 +
+ 3 files changed, 117 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/imagination/pvr_device.c b/drivers/gpu/drm/imagination/pvr_device.c
+index b6ce936f07c8..a47dd1dd8243 100644
+--- a/drivers/gpu/drm/imagination/pvr_device.c
++++ b/drivers/gpu/drm/imagination/pvr_device.c
+@@ -146,9 +146,61 @@ static void pvr_device_process_active_queues(struct pvr_device *pvr_dev)
+ 	mutex_unlock(&pvr_dev->queues.lock);
+ }
+ 
++static bool pvr_device_safety_irq_pending(struct pvr_device *pvr_dev)
++{
++	u32 events;
++
++	WARN_ON_ONCE(!pvr_dev->has_safety_events);
++
++	events = pvr_cr_read32(pvr_dev, ROGUE_CR_EVENT_STATUS);
++
++	return (events & ROGUE_CR_EVENT_STATUS_SAFETY_EN) != 0;
++}
++
++static void pvr_device_safety_irq_clear(struct pvr_device *pvr_dev)
++{
++	WARN_ON_ONCE(!pvr_dev->has_safety_events);
++
++	pvr_cr_write32(pvr_dev, ROGUE_CR_EVENT_CLEAR,
++		       ROGUE_CR_EVENT_CLEAR_SAFETY_EN);
++}
++
++static void pvr_device_handle_safety_events(struct pvr_device *pvr_dev)
++{
++	struct drm_device *drm_dev = from_pvr_device(pvr_dev);
++	u32 events;
++
++	WARN_ON_ONCE(!pvr_dev->has_safety_events);
++
++	events = pvr_cr_read32(pvr_dev, ROGUE_CR_SAFETY_EVENT_STATUS__ROGUEXE);
++
++	/* Handle only these events on the host and leave the rest to the FW. */
++	events &= ROGUE_CR_SAFETY_EVENT_STATUS__ROGUEXE__FAULT_FW_EN |
++		ROGUE_CR_SAFETY_EVENT_STATUS__ROGUEXE__WATCHDOG_TIMEOUT_EN;
++
++	pvr_cr_write32(pvr_dev, ROGUE_CR_SAFETY_EVENT_CLEAR__ROGUEXE, events);
++
++	if (events & ROGUE_CR_SAFETY_EVENT_STATUS__ROGUEXE__FAULT_FW_EN) {
++		u32 fault_fw = pvr_cr_read32(pvr_dev, ROGUE_CR_FAULT_FW_STATUS);
++
++		pvr_cr_write32(pvr_dev, ROGUE_CR_FAULT_FW_CLEAR, fault_fw);
++
++		drm_info(drm_dev, "Safety event: FW fault (mask=0x%08x)\n", fault_fw);
++	}
++
++	if (events & ROGUE_CR_SAFETY_EVENT_STATUS__ROGUEXE__WATCHDOG_TIMEOUT_EN) {
++		/*
++		 * The watchdog timer is disabled by the driver so this event
++		 * should never be fired.
++		 */
++		drm_info(drm_dev, "Safety event: Watchdog timeout\n");
++	}
++}
++
+ static irqreturn_t pvr_device_irq_thread_handler(int irq, void *data)
+ {
+ 	struct pvr_device *pvr_dev = data;
++	struct drm_device *drm_dev = from_pvr_device(pvr_dev);
+ 	irqreturn_t ret = IRQ_NONE;
+ 
+ 	/* We are in the threaded handler, we can keep dequeuing events until we
+@@ -164,24 +216,76 @@ static irqreturn_t pvr_device_irq_thread_handler(int irq, void *data)
+ 			pvr_device_process_active_queues(pvr_dev);
+ 		}
+ 
+-		pm_runtime_mark_last_busy(from_pvr_device(pvr_dev)->dev);
++		pm_runtime_mark_last_busy(drm_dev->dev);
+ 
+ 		ret = IRQ_HANDLED;
+ 	}
+ 
++	if (pvr_dev->has_safety_events) {
++		int err;
++
++		/*
++		 * Ensure the GPU is powered on since some safety events (such
++		 * as ECC faults) can happen outside of job submissions, which
++		 * are otherwise the only time a power reference is held.
++		 */
++		err = pvr_power_get(pvr_dev);
++		if (err) {
++			drm_err_ratelimited(drm_dev,
++					    "%s: could not take power reference (%d)\n",
++					    __func__, err);
++			return ret;
++		}
++
++		while (pvr_device_safety_irq_pending(pvr_dev)) {
++			pvr_device_safety_irq_clear(pvr_dev);
++			pvr_device_handle_safety_events(pvr_dev);
++
++			ret = IRQ_HANDLED;
++		}
++
++		pvr_power_put(pvr_dev);
++	}
++
+ 	return ret;
+ }
+ 
+ static irqreturn_t pvr_device_irq_handler(int irq, void *data)
+ {
+ 	struct pvr_device *pvr_dev = data;
++	bool safety_irq_pending = false;
++
++	if (pvr_dev->has_safety_events)
++		safety_irq_pending = pvr_device_safety_irq_pending(pvr_dev);
+ 
+-	if (!pvr_fw_irq_pending(pvr_dev))
++	if (!pvr_fw_irq_pending(pvr_dev) && !safety_irq_pending)
+ 		return IRQ_NONE; /* Spurious IRQ - ignore. */
+ 
+ 	return IRQ_WAKE_THREAD;
+ }
+ 
++static void pvr_device_safety_irq_init(struct pvr_device *pvr_dev)
++{
++	u32 num_ecc_rams = 0;
++
++	/*
++	 * Safety events are an optional feature of the RogueXE platform. They
++	 * are only enabled if at least one of ECC memory or the watchdog timer
++	 * are present in HW. While safety events can be generated by other
++	 * systems, that will never happen if the above mentioned hardware is
++	 * not present.
++	 */
++	if (!PVR_HAS_FEATURE(pvr_dev, roguexe)) {
++		pvr_dev->has_safety_events = false;
++		return;
++	}
++
++	PVR_FEATURE_VALUE(pvr_dev, ecc_rams, &num_ecc_rams);
++
++	pvr_dev->has_safety_events =
++		num_ecc_rams > 0 || PVR_HAS_FEATURE(pvr_dev, watchdog_timer);
++}
++
+ /**
+  * pvr_device_irq_init() - Initialise IRQ required by a PowerVR device
+  * @pvr_dev: Target PowerVR device.
+@@ -199,6 +303,8 @@ pvr_device_irq_init(struct pvr_device *pvr_dev)
+ 
+ 	init_waitqueue_head(&pvr_dev->kccb.rtn_q);
+ 
++	pvr_device_safety_irq_init(pvr_dev);
++
+ 	pvr_dev->irq = platform_get_irq(plat_dev, 0);
+ 	if (pvr_dev->irq < 0)
+ 		return pvr_dev->irq;
+@@ -207,6 +313,9 @@ pvr_device_irq_init(struct pvr_device *pvr_dev)
+ 	pvr_fw_irq_clear(pvr_dev);
+ 	pvr_fw_irq_enable(pvr_dev);
+ 
++	if (pvr_dev->has_safety_events)
++		pvr_device_safety_irq_clear(pvr_dev);
++
+ 	/*
+ 	 * The ONESHOT flag ensures IRQs are masked while the thread handler is
+ 	 * running.
+diff --git a/drivers/gpu/drm/imagination/pvr_device.h b/drivers/gpu/drm/imagination/pvr_device.h
+index 2dd8a8885fe0..6c01d96657de 100644
+--- a/drivers/gpu/drm/imagination/pvr_device.h
++++ b/drivers/gpu/drm/imagination/pvr_device.h
+@@ -308,6 +308,9 @@ struct pvr_device {
+ 	 *  struct pvr_file.
+ 	 */
+ 	spinlock_t ctx_list_lock;
++
++	/** @has_safety_events: Whether this device can raise safety events. */
++	bool has_safety_events;
+ };
+ 
+ /**
+diff --git a/drivers/gpu/drm/imagination/pvr_fw.c b/drivers/gpu/drm/imagination/pvr_fw.c
+index 012596402a33..17c29b5081f4 100644
+--- a/drivers/gpu/drm/imagination/pvr_fw.c
++++ b/drivers/gpu/drm/imagination/pvr_fw.c
+@@ -437,6 +437,9 @@ fw_runtime_cfg_init(void *cpu_ptr, void *priv)
+ 	runtime_cfg->active_pm_latency_persistant = true;
+ 	WARN_ON(PVR_FEATURE_VALUE(pvr_dev, num_clusters,
+ 				  &runtime_cfg->default_dusts_num_init) != 0);
++
++	/* Keep watchdog timer disabled. */
++	runtime_cfg->wdg_period_us = 0;
+ }
+ 
+ static void
+-- 
+2.52.0
+
