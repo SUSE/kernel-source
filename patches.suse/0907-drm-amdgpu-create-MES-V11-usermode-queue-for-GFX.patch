@@ -1,0 +1,227 @@
+From fbf136b932358da1c65eb6fedd064a33a7a96aaa Mon Sep 17 00:00:00 2001
+From: Shashank Sharma <shashank.sharma@amd.com>
+Date: Mon, 26 Aug 2024 23:12:21 +0530
+Subject: drm/amdgpu: create MES-V11 usermode queue for GFX
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: fbf136b932358da1c65eb6fedd064a33a7a96aaa
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+A Memory queue descriptor (MQD) of a userqueue defines it in
+the hw's context. As MQD format can vary between different
+graphics IPs, we need gfx GEN specific handlers to create MQDs.
+
+This patch:
+- Adds a new file which will be used for MES based userqueue
+  functions targeting GFX and SDMA IP.
+- Introduces MQD handler functions for the usermode queues.
+
+V1: Worked on review comments from Alex:
+    - Make MQD functions GEN and IP specific
+
+V2: Worked on review comments from Alex:
+    - Reuse the existing adev->mqd[ip] for MQD creation
+    - Formatting and arrangement of code
+
+V3: - Integration with doorbell manager
+
+V4: Review comments addressed:
+    - Do not create a new file for userq, reuse gfx_v11_0.c (Alex)
+    - Align name of structure members (Luben)
+    - Don't break up the Cc tag list and the Sob tag list in commit
+      message (Luben)
+V5: - No need to reserve the bo for MQD (Christian).
+   - Some more changes to support IP specific MQD creation.
+
+V6: - Add a comment reminding us to replace the amdgpu_bo_create_kernel()
+     calls while creating MQD object to amdgpu_bo_create() once eviction
+     fences are ready (Christian).
+
+V7: - Re-arrange userqueue functions in adev instead of uq_mgr (Alex)
+   - Use memdup_user instead of copy_from_user (Christian)
+
+V9: - Moved userqueue code from gfx_v11_0.c to new file mes_v11_0.c so
+     that it can be reused for SDMA userqueues as well (Shashank, Alex)
+
+V10: Addressed review comments from Alex
+   - Making this patch independent of IP engine(GFX/SDMA/Compute) and
+     specific to MES V11 only, using the generic MQD structure.
+   - Splitting a spearate patch to enabling GFX support from here.
+   - Verify mqd va address to be non-NULL.
+   - Add a separate header file.
+
+Cc: Alex Deucher <alexander.deucher@amd.com>
+Cc: Christian Koenig <christian.koenig@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Shashank Sharma <shashank.sharma@amd.com>
+Signed-off-by: Arvind Yadav <arvind.yadav@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/Makefile           |  3 +-
+ .../gpu/drm/amd/amdgpu/mes_v11_0_userqueue.c  | 98 +++++++++++++++++++
+ .../gpu/drm/amd/amdgpu/mes_v11_0_userqueue.h  | 30 ++++++
+ 3 files changed, 130 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/gpu/drm/amd/amdgpu/mes_v11_0_userqueue.c
+ create mode 100644 drivers/gpu/drm/amd/amdgpu/mes_v11_0_userqueue.h
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/Makefile b/drivers/gpu/drm/amd/amdgpu/Makefile
+index 69b56faa2d71..f42b9b4be9a4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/Makefile
++++ b/drivers/gpu/drm/amd/amdgpu/Makefile
+@@ -174,7 +174,8 @@ amdgpu-y += \
+ amdgpu-y += \
+ 	amdgpu_mes.o \
+ 	mes_v11_0.o \
+-	mes_v12_0.o
++	mes_v12_0.o \
++	mes_v11_0_userqueue.o
+ 
+ # add UVD block
+ amdgpu-y += \
+diff --git a/drivers/gpu/drm/amd/amdgpu/mes_v11_0_userqueue.c b/drivers/gpu/drm/amd/amdgpu/mes_v11_0_userqueue.c
+new file mode 100644
+index 000000000000..63fd48a5b8b0
+--- /dev/null
++++ b/drivers/gpu/drm/amd/amdgpu/mes_v11_0_userqueue.c
+@@ -0,0 +1,98 @@
++// SPDX-License-Identifier: MIT
++/*
++ * Copyright 2024 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++#include "amdgpu.h"
++#include "amdgpu_gfx.h"
++#include "v11_structs.h"
++#include "mes_v11_0.h"
++#include "mes_v11_0_userqueue.h"
++
++static int mes_v11_0_userq_mqd_create(struct amdgpu_userq_mgr *uq_mgr,
++				      struct drm_amdgpu_userq_in *args_in,
++				      struct amdgpu_usermode_queue *queue)
++{
++	struct amdgpu_device *adev = uq_mgr->adev;
++	struct amdgpu_mqd *mqd_hw_default = &adev->mqds[queue->queue_type];
++	struct drm_amdgpu_userq_in *mqd_user = args_in;
++	struct amdgpu_mqd_prop *userq_props;
++	int r;
++
++	/* Structure to initialize MQD for userqueue using generic MQD init function */
++	userq_props = kzalloc(sizeof(struct amdgpu_mqd_prop), GFP_KERNEL);
++	if (!userq_props) {
++		DRM_ERROR("Failed to allocate memory for userq_props\n");
++		return -ENOMEM;
++	}
++
++	if (!mqd_user->wptr_va || !mqd_user->rptr_va ||
++	    !mqd_user->queue_va || mqd_user->queue_size == 0) {
++		DRM_ERROR("Invalid MQD parameters for userqueue\n");
++		r = -EINVAL;
++		goto free_props;
++	}
++
++	r = amdgpu_userqueue_create_object(uq_mgr, &queue->mqd, mqd_hw_default->mqd_size);
++	if (r) {
++		DRM_ERROR("Failed to create MQD object for userqueue\n");
++		goto free_props;
++	}
++
++	/* Initialize the MQD BO with user given values */
++	userq_props->wptr_gpu_addr = mqd_user->wptr_va;
++	userq_props->rptr_gpu_addr = mqd_user->rptr_va;
++	userq_props->queue_size = mqd_user->queue_size;
++	userq_props->hqd_base_gpu_addr = mqd_user->queue_va;
++	userq_props->mqd_gpu_addr = queue->mqd.gpu_addr;
++	userq_props->use_doorbell = true;
++
++	queue->userq_prop = userq_props;
++
++	r = mqd_hw_default->init_mqd(adev, (void *)queue->mqd.cpu_ptr, userq_props);
++	if (r) {
++		DRM_ERROR("Failed to initialize MQD for userqueue\n");
++		goto free_mqd;
++	}
++
++	return 0;
++
++free_mqd:
++	amdgpu_userqueue_destroy_object(uq_mgr, &queue->mqd);
++
++free_props:
++	kfree(userq_props);
++
++	return r;
++}
++
++static void
++mes_v11_0_userq_mqd_destroy(struct amdgpu_userq_mgr *uq_mgr,
++			    struct amdgpu_usermode_queue *queue)
++{
++	kfree(queue->userq_prop);
++	amdgpu_userqueue_destroy_object(uq_mgr, &queue->mqd);
++}
++
++const struct amdgpu_userq_funcs userq_mes_v11_0_funcs = {
++	.mqd_create = mes_v11_0_userq_mqd_create,
++	.mqd_destroy = mes_v11_0_userq_mqd_destroy,
++};
+diff --git a/drivers/gpu/drm/amd/amdgpu/mes_v11_0_userqueue.h b/drivers/gpu/drm/amd/amdgpu/mes_v11_0_userqueue.h
+new file mode 100644
+index 000000000000..2c102361ca82
+--- /dev/null
++++ b/drivers/gpu/drm/amd/amdgpu/mes_v11_0_userqueue.h
+@@ -0,0 +1,30 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * Copyright 2024 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++
++#ifndef MES_V11_0_USERQ_H
++#define MES_V11_0_USERQ_H
++#include "amdgpu_userqueue.h"
++
++extern const struct amdgpu_userq_funcs userq_mes_v11_0_funcs;
++#endif
+-- 
+2.52.0
+
