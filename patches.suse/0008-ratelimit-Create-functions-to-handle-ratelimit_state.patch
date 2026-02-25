@@ -1,0 +1,120 @@
+From 56a7b9f8b05981e929becb45a826558779bca6f6 Mon Sep 17 00:00:00 2001
+From: "Paul E. McKenney" <paulmck@kernel.org>
+Date: Thu, 13 Mar 2025 15:31:50 -0700
+Subject: ratelimit: Create functions to handle ratelimit_state internals
+Git-commit: 56a7b9f8b05981e929becb45a826558779bca6f6
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+A number of ratelimit use cases do open-coded access to the
+ratelimit_state structure's ->missed field.  This works, but is a bit
+messy and makes it more annoying to make changes to this field.
+
+Therefore, provide a ratelimit_state_inc_miss() function that increments
+the ->missed field, a ratelimit_state_get_miss() function that reads
+out the ->missed field, and a ratelimit_state_reset_miss() function
+that reads out that field, but that also resets its value to zero.
+These functions will replace client-code open-coded uses of ->missed.
+
+In addition, a new ratelimit_state_reset_interval() function encapsulates
+what was previously open-coded lock acquisition and direct field updates.
+
+[ paulmck: Apply kernel test robot feedback. ]
+
+Link: https://lore.kernel.org/all/fbe93a52-365e-47fe-93a4-44a44547d601@paulmck-laptop/
+Link: https://lore.kernel.org/all/20250423115409.3425-1-spasswolf@web.de/
+Signed-off-by: Paul E. McKenney <paulmck@kernel.org>
+Reviewed-by: Petr Mladek <pmladek@suse.com>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: Kuniyuki Iwashima <kuniyu@amazon.com>
+Cc: Mateusz Guzik <mjguzik@gmail.com>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Cc: John Ogness <john.ogness@linutronix.de>
+Cc: Sergey Senozhatsky <senozhatsky@chromium.org>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ include/linux/ratelimit.h | 40 ++++++++++++++++++++++++++++++++++-----
+ lib/ratelimit.c           |  8 ++++----
+ 2 files changed, 39 insertions(+), 9 deletions(-)
+
+diff --git a/include/linux/ratelimit.h b/include/linux/ratelimit.h
+index b17e0cd0a30c..8400c5356c18 100644
+--- a/include/linux/ratelimit.h
++++ b/include/linux/ratelimit.h
+@@ -22,16 +22,46 @@ static inline void ratelimit_default_init(struct ratelimit_state *rs)
+ 					DEFAULT_RATELIMIT_BURST);
+ }
+ 
++static inline void ratelimit_state_inc_miss(struct ratelimit_state *rs)
++{
++	rs->missed++;
++}
++
++static inline int ratelimit_state_get_miss(struct ratelimit_state *rs)
++{
++	return rs->missed;
++}
++
++static inline int ratelimit_state_reset_miss(struct ratelimit_state *rs)
++{
++	int ret = rs->missed;
++
++	rs->missed = 0;
++	return ret;
++}
++
++static inline void ratelimit_state_reset_interval(struct ratelimit_state *rs, int interval_init)
++{
++	unsigned long flags;
++
++	raw_spin_lock_irqsave(&rs->lock, flags);
++	rs->interval = interval_init;
++	rs->begin = 0;
++	rs->printed = 0;
++	ratelimit_state_reset_miss(rs);
++	raw_spin_unlock_irqrestore(&rs->lock, flags);
++}
++
+ static inline void ratelimit_state_exit(struct ratelimit_state *rs)
+ {
++	int m;
++
+ 	if (!(rs->flags & RATELIMIT_MSG_ON_RELEASE))
+ 		return;
+ 
+-	if (rs->missed) {
+-		pr_warn("%s: %d output lines suppressed due to ratelimiting\n",
+-			current->comm, rs->missed);
+-		rs->missed = 0;
+-	}
++	m = ratelimit_state_reset_miss(rs);
++	if (m)
++		pr_warn("%s: %d output lines suppressed due to ratelimiting\n", current->comm, m);
+ }
+ 
+ static inline void
+diff --git a/lib/ratelimit.c b/lib/ratelimit.c
+index ce945c17980b..85e22f00180c 100644
+--- a/lib/ratelimit.c
++++ b/lib/ratelimit.c
+@@ -51,12 +51,12 @@ int ___ratelimit(struct ratelimit_state *rs, const char *func)
+ 		rs->begin = jiffies;
+ 
+ 	if (time_is_before_jiffies(rs->begin + interval)) {
+-		if (rs->missed) {
++		int m = ratelimit_state_reset_miss(rs);
++
++		if (m) {
+ 			if (!(rs->flags & RATELIMIT_MSG_ON_RELEASE)) {
+ 				printk_deferred(KERN_WARNING
+-						"%s: %d callbacks suppressed\n",
+-						func, rs->missed);
+-				rs->missed = 0;
++						"%s: %d callbacks suppressed\n", func, m);
+ 			}
+ 		}
+ 		rs->begin   = jiffies;
+-- 
+2.52.0
+
