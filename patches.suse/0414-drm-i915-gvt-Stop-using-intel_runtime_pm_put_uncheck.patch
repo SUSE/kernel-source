@@ -1,0 +1,230 @@
+From 5babdd45b737702e1563db317867594a12857eeb Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Tue, 11 Feb 2025 02:01:34 +0200
+Subject: drm/i915/gvt: Stop using intel_runtime_pm_put_unchecked()
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 5babdd45b737702e1563db317867594a12857eeb
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+intel_runtime_pm_put_unchecked() is not meant to be used
+outside the runtime pm implementation, so don't.
+
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250211000135.6096-4-ville.syrjala@linux.intel.com
+Reviewed-by: Jani Nikula <jani.nikula@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/gvt/aperture_gm.c  |  7 ++++---
+ drivers/gpu/drm/i915/gvt/debugfs.c      |  5 +++--
+ drivers/gpu/drm/i915/gvt/gtt.c          |  6 ++++--
+ drivers/gpu/drm/i915/gvt/gvt.h          |  9 +++++----
+ drivers/gpu/drm/i915/gvt/handlers.c     | 23 +++++++++++++++--------
+ drivers/gpu/drm/i915/gvt/sched_policy.c |  5 +++--
+ 6 files changed, 34 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gvt/aperture_gm.c b/drivers/gpu/drm/i915/gvt/aperture_gm.c
+index eedd1865bb98..62d14f82256f 100644
+--- a/drivers/gpu/drm/i915/gvt/aperture_gm.c
++++ b/drivers/gpu/drm/i915/gvt/aperture_gm.c
+@@ -46,6 +46,7 @@ static int alloc_gm(struct intel_vgpu *vgpu, bool high_gm)
+ 	unsigned int flags;
+ 	u64 start, end, size;
+ 	struct drm_mm_node *node;
++	intel_wakeref_t wakeref;
+ 	int ret;
+ 
+ 	if (high_gm) {
+@@ -63,12 +64,12 @@ static int alloc_gm(struct intel_vgpu *vgpu, bool high_gm)
+ 	}
+ 
+ 	mutex_lock(&gt->ggtt->vm.mutex);
+-	mmio_hw_access_pre(gt);
++	wakeref = mmio_hw_access_pre(gt);
+ 	ret = i915_gem_gtt_insert(&gt->ggtt->vm, NULL, node,
+ 				  size, I915_GTT_PAGE_SIZE,
+ 				  I915_COLOR_UNEVICTABLE,
+ 				  start, end, flags);
+-	mmio_hw_access_post(gt);
++	mmio_hw_access_post(gt, wakeref);
+ 	mutex_unlock(&gt->ggtt->vm.mutex);
+ 	if (ret)
+ 		gvt_err("fail to alloc %s gm space from host\n",
+@@ -226,7 +227,7 @@ static int alloc_vgpu_fence(struct intel_vgpu *vgpu)
+ 		vgpu->fence.regs[i] = NULL;
+ 	}
+ 	mutex_unlock(&gvt->gt->ggtt->vm.mutex);
+-	intel_runtime_pm_put_unchecked(uncore->rpm);
++	intel_runtime_pm_put(uncore->rpm, wakeref);
+ 	return -ENOSPC;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/gvt/debugfs.c b/drivers/gpu/drm/i915/gvt/debugfs.c
+index baccbf1761b7..673534f061ef 100644
+--- a/drivers/gpu/drm/i915/gvt/debugfs.c
++++ b/drivers/gpu/drm/i915/gvt/debugfs.c
+@@ -91,16 +91,17 @@ static int vgpu_mmio_diff_show(struct seq_file *s, void *unused)
+ 		.diff = 0,
+ 	};
+ 	struct diff_mmio *node, *next;
++	intel_wakeref_t wakeref;
+ 
+ 	INIT_LIST_HEAD(&param.diff_mmio_list);
+ 
+ 	mutex_lock(&gvt->lock);
+ 	spin_lock_bh(&gvt->scheduler.mmio_context_lock);
+ 
+-	mmio_hw_access_pre(gvt->gt);
++	wakeref = mmio_hw_access_pre(gvt->gt);
+ 	/* Recognize all the diff mmios to list. */
+ 	intel_gvt_for_each_tracked_mmio(gvt, mmio_diff_handler, &param);
+-	mmio_hw_access_post(gvt->gt);
++	mmio_hw_access_post(gvt->gt, wakeref);
+ 
+ 	spin_unlock_bh(&gvt->scheduler.mmio_context_lock);
+ 	mutex_unlock(&gvt->lock);
+diff --git a/drivers/gpu/drm/i915/gvt/gtt.c b/drivers/gpu/drm/i915/gvt/gtt.c
+index 2fa7ca19ba5d..ae9b0ded3651 100644
+--- a/drivers/gpu/drm/i915/gvt/gtt.c
++++ b/drivers/gpu/drm/i915/gvt/gtt.c
+@@ -220,9 +220,11 @@ static u64 read_pte64(struct i915_ggtt *ggtt, unsigned long index)
+ 
+ static void ggtt_invalidate(struct intel_gt *gt)
+ {
+-	mmio_hw_access_pre(gt);
++	intel_wakeref_t wakeref;
++
++	wakeref = mmio_hw_access_pre(gt);
+ 	intel_uncore_write(gt->uncore, GFX_FLSH_CNTL_GEN6, GFX_FLSH_CNTL_EN);
+-	mmio_hw_access_post(gt);
++	mmio_hw_access_post(gt, wakeref);
+ }
+ 
+ static void write_pte64(struct i915_ggtt *ggtt, unsigned long index, u64 pte)
+diff --git a/drivers/gpu/drm/i915/gvt/gvt.h b/drivers/gpu/drm/i915/gvt/gvt.h
+index 01d890999f25..1d10c16e6465 100644
+--- a/drivers/gpu/drm/i915/gvt/gvt.h
++++ b/drivers/gpu/drm/i915/gvt/gvt.h
+@@ -570,14 +570,15 @@ enum {
+ 	GVT_FAILSAFE_GUEST_ERR,
+ };
+ 
+-static inline void mmio_hw_access_pre(struct intel_gt *gt)
++static inline intel_wakeref_t mmio_hw_access_pre(struct intel_gt *gt)
+ {
+-	intel_runtime_pm_get(gt->uncore->rpm);
++	return intel_runtime_pm_get(gt->uncore->rpm);
+ }
+ 
+-static inline void mmio_hw_access_post(struct intel_gt *gt)
++static inline void mmio_hw_access_post(struct intel_gt *gt,
++				       intel_wakeref_t wakeref)
+ {
+-	intel_runtime_pm_put_unchecked(gt->uncore->rpm);
++	intel_runtime_pm_put(gt->uncore->rpm, wakeref);
+ }
+ 
+ /**
+diff --git a/drivers/gpu/drm/i915/gvt/handlers.c b/drivers/gpu/drm/i915/gvt/handlers.c
+index 4efee6797873..02f45929592e 100644
+--- a/drivers/gpu/drm/i915/gvt/handlers.c
++++ b/drivers/gpu/drm/i915/gvt/handlers.c
+@@ -264,6 +264,7 @@ static int fence_mmio_write(struct intel_vgpu *vgpu, unsigned int off,
+ {
+ 	struct intel_gvt *gvt = vgpu->gvt;
+ 	unsigned int fence_num = offset_to_fence_num(off);
++	intel_wakeref_t wakeref;
+ 	int ret;
+ 
+ 	ret = sanitize_fence_mmio_access(vgpu, fence_num, p_data, bytes);
+@@ -271,10 +272,10 @@ static int fence_mmio_write(struct intel_vgpu *vgpu, unsigned int off,
+ 		return ret;
+ 	write_vreg(vgpu, off, p_data, bytes);
+ 
+-	mmio_hw_access_pre(gvt->gt);
++	wakeref = mmio_hw_access_pre(gvt->gt);
+ 	intel_vgpu_write_fence(vgpu, fence_num,
+ 			vgpu_vreg64(vgpu, fence_num_to_offset(fence_num)));
+-	mmio_hw_access_post(gvt->gt);
++	mmio_hw_access_post(gvt->gt, wakeref);
+ 	return 0;
+ }
+ 
+@@ -1975,10 +1976,12 @@ static int mmio_read_from_hw(struct intel_vgpu *vgpu,
+ 	    vgpu == gvt->scheduler.engine_owner[engine->id] ||
+ 	    offset == i915_mmio_reg_offset(RING_TIMESTAMP(engine->mmio_base)) ||
+ 	    offset == i915_mmio_reg_offset(RING_TIMESTAMP_UDW(engine->mmio_base))) {
+-		mmio_hw_access_pre(gvt->gt);
++		intel_wakeref_t wakeref;
++
++		wakeref = mmio_hw_access_pre(gvt->gt);
+ 		vgpu_vreg(vgpu, offset) =
+ 			intel_uncore_read(gvt->gt->uncore, _MMIO(offset));
+-		mmio_hw_access_post(gvt->gt);
++		mmio_hw_access_post(gvt->gt, wakeref);
+ 	}
+ 
+ 	return intel_vgpu_default_mmio_read(vgpu, offset, p_data, bytes);
+@@ -3209,10 +3212,12 @@ void intel_gvt_restore_fence(struct intel_gvt *gvt)
+ 	int i, id;
+ 
+ 	idr_for_each_entry(&(gvt)->vgpu_idr, vgpu, id) {
+-		mmio_hw_access_pre(gvt->gt);
++		intel_wakeref_t wakeref;
++
++		wakeref = mmio_hw_access_pre(gvt->gt);
+ 		for (i = 0; i < vgpu_fence_sz(vgpu); i++)
+ 			intel_vgpu_write_fence(vgpu, i, vgpu_vreg64(vgpu, fence_num_to_offset(i)));
+-		mmio_hw_access_post(gvt->gt);
++		mmio_hw_access_post(gvt->gt, wakeref);
+ 	}
+ }
+ 
+@@ -3233,8 +3238,10 @@ void intel_gvt_restore_mmio(struct intel_gvt *gvt)
+ 	int id;
+ 
+ 	idr_for_each_entry(&(gvt)->vgpu_idr, vgpu, id) {
+-		mmio_hw_access_pre(gvt->gt);
++		intel_wakeref_t wakeref;
++
++		wakeref = mmio_hw_access_pre(gvt->gt);
+ 		intel_gvt_for_each_tracked_mmio(gvt, mmio_pm_restore_handler, vgpu);
+-		mmio_hw_access_post(gvt->gt);
++		mmio_hw_access_post(gvt->gt, wakeref);
+ 	}
+ }
+diff --git a/drivers/gpu/drm/i915/gvt/sched_policy.c b/drivers/gpu/drm/i915/gvt/sched_policy.c
+index 9f97f743aa71..6c2d68e88266 100644
+--- a/drivers/gpu/drm/i915/gvt/sched_policy.c
++++ b/drivers/gpu/drm/i915/gvt/sched_policy.c
+@@ -447,6 +447,7 @@ void intel_vgpu_stop_schedule(struct intel_vgpu *vgpu)
+ 	struct drm_i915_private *dev_priv = vgpu->gvt->gt->i915;
+ 	struct intel_engine_cs *engine;
+ 	enum intel_engine_id id;
++	intel_wakeref_t wakeref;
+ 
+ 	if (!vgpu_data->active)
+ 		return;
+@@ -465,7 +466,7 @@ void intel_vgpu_stop_schedule(struct intel_vgpu *vgpu)
+ 		scheduler->current_vgpu = NULL;
+ 	}
+ 
+-	intel_runtime_pm_get(&dev_priv->runtime_pm);
++	wakeref = intel_runtime_pm_get(&dev_priv->runtime_pm);
+ 	spin_lock_bh(&scheduler->mmio_context_lock);
+ 	for_each_engine(engine, vgpu->gvt->gt, id) {
+ 		if (scheduler->engine_owner[engine->id] == vgpu) {
+@@ -474,6 +475,6 @@ void intel_vgpu_stop_schedule(struct intel_vgpu *vgpu)
+ 		}
+ 	}
+ 	spin_unlock_bh(&scheduler->mmio_context_lock);
+-	intel_runtime_pm_put_unchecked(&dev_priv->runtime_pm);
++	intel_runtime_pm_put(&dev_priv->runtime_pm, wakeref);
+ 	mutex_unlock(&vgpu->gvt->sched_lock);
+ }
+-- 
+2.52.0
+
