@@ -1,0 +1,264 @@
+From 45a78c640510af520c26737d10ad5eacb3d72841 Mon Sep 17 00:00:00 2001
+From: Ben Skeggs <bskeggs@nvidia.com>
+Date: Thu, 14 Nov 2024 13:02:37 +1000
+Subject: drm/nouveau/gsp: split client handling out on its own
+Git-commit: 45a78c640510af520c26737d10ad5eacb3d72841
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Split NV01_ROOT handling out into its own module.
+
+Aside from moving the function pointers, no code change is intended.
+
+Signed-off-by: Ben Skeggs <bskeggs@nvidia.com>
+Reviewed-by: Dave Airlie <airlied@redhat.com>
+Reviewed-by: Timur Tabi <ttabi@nvidia.com>
+Tested-by: Timur Tabi <ttabi@nvidia.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../gpu/drm/nouveau/include/nvkm/subdev/gsp.h |  7 +-
+ .../gpu/drm/nouveau/nvkm/subdev/gsp/r535.c    | 53 ------------
+ .../nouveau/nvkm/subdev/gsp/rm/r535/Kbuild    |  1 +
+ .../nouveau/nvkm/subdev/gsp/rm/r535/client.c  | 80 +++++++++++++++++++
+ .../drm/nouveau/nvkm/subdev/gsp/rm/r535/rm.c  |  1 +
+ .../gpu/drm/nouveau/nvkm/subdev/gsp/rm/rm.h   |  6 ++
+ 6 files changed, 90 insertions(+), 58 deletions(-)
+ create mode 100644 drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/client.c
+
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/subdev/gsp.h b/drivers/gpu/drm/nouveau/include/nvkm/subdev/gsp.h
+index 66e3873155f0..2c3d8fd04516 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/subdev/gsp.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/subdev/gsp.h
+@@ -212,9 +212,6 @@ struct nvkm_gsp {
+ 	const struct nvkm_gsp_rm {
+ 		const struct nvkm_rm_api *api;
+ 
+-		int (*client_ctor)(struct nvkm_gsp *, struct nvkm_gsp_client *);
+-		void (*client_dtor)(struct nvkm_gsp_client *);
+-
+ 		int (*device_ctor)(struct nvkm_gsp_client *, struct nvkm_gsp_device *);
+ 		void (*device_dtor)(struct nvkm_gsp_device *);
+ 
+@@ -425,14 +422,14 @@ nvkm_gsp_client_ctor(struct nvkm_gsp *gsp, struct nvkm_gsp_client *client)
+ 	if (WARN_ON(!gsp->rm))
+ 		return -ENOSYS;
+ 
+-	return gsp->rm->client_ctor(gsp, client);
++	return gsp->rm->api->client->ctor(gsp, client);
+ }
+ 
+ static inline void
+ nvkm_gsp_client_dtor(struct nvkm_gsp_client *client)
+ {
+ 	if (client->gsp)
+-		client->gsp->rm->client_dtor(client);
++		client->gsp->rm->api->client->dtor(client);
+ }
+ 
+ static inline int
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/r535.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/r535.c
+index e9be8c2ef07e..c6fce9541c0e 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/r535.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/r535.c
+@@ -33,7 +33,6 @@
+ #include <nvfw/fw.h>
+ 
+ #include <nvrm/nvtypes.h>
+-#include <nvrm/535.113.01/common/sdk/nvidia/inc/class/cl0000.h>
+ #include <nvrm/535.113.01/common/sdk/nvidia/inc/class/cl0005.h>
+ #include <nvrm/535.113.01/common/sdk/nvidia/inc/class/cl0080.h>
+ #include <nvrm/535.113.01/common/sdk/nvidia/inc/class/cl2080.h>
+@@ -177,62 +176,10 @@ r535_gsp_device_ctor(struct nvkm_gsp_client *client, struct nvkm_gsp_device *dev
+ 	return ret;
+ }
+ 
+-static void
+-r535_gsp_client_dtor(struct nvkm_gsp_client *client)
+-{
+-	struct nvkm_gsp *gsp = client->gsp;
+-
+-	nvkm_gsp_rm_free(&client->object);
+-
+-	mutex_lock(&gsp->client_id.mutex);
+-	idr_remove(&gsp->client_id.idr, client->object.handle & 0xffff);
+-	mutex_unlock(&gsp->client_id.mutex);
+-
+-	client->gsp = NULL;
+-}
+-
+-static int
+-r535_gsp_client_ctor(struct nvkm_gsp *gsp, struct nvkm_gsp_client *client)
+-{
+-	NV0000_ALLOC_PARAMETERS *args;
+-	int ret;
+-
+-	mutex_lock(&gsp->client_id.mutex);
+-	ret = idr_alloc(&gsp->client_id.idr, client, 0, 0xffff + 1, GFP_KERNEL);
+-	mutex_unlock(&gsp->client_id.mutex);
+-	if (ret < 0)
+-		return ret;
+-
+-	client->gsp = gsp;
+-	client->object.client = client;
+-	INIT_LIST_HEAD(&client->events);
+-
+-	args = nvkm_gsp_rm_alloc_get(&client->object, 0xc1d00000 | ret, NV01_ROOT, sizeof(*args),
+-				     &client->object);
+-	if (IS_ERR(args)) {
+-		r535_gsp_client_dtor(client);
+-		return ret;
+-	}
+-
+-	args->hClient = client->object.handle;
+-	args->processID = ~0;
+-
+-	ret = nvkm_gsp_rm_alloc_wr(&client->object, args);
+-	if (ret) {
+-		r535_gsp_client_dtor(client);
+-		return ret;
+-	}
+-
+-	return 0;
+-}
+-
+ const struct nvkm_gsp_rm
+ r535_gsp_rm = {
+ 	.api = &r535_rm,
+ 
+-	.client_ctor = r535_gsp_client_ctor,
+-	.client_dtor = r535_gsp_client_dtor,
+-
+ 	.device_ctor = r535_gsp_device_ctor,
+ 	.device_dtor = r535_gsp_device_dtor,
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/Kbuild b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/Kbuild
+index 48b432c9005d..f25b438fa3d9 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/Kbuild
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/Kbuild
+@@ -6,3 +6,4 @@ nvkm-y += nvkm/subdev/gsp/rm/r535/rm.o
+ nvkm-y += nvkm/subdev/gsp/rm/r535/rpc.o
+ nvkm-y += nvkm/subdev/gsp/rm/r535/ctrl.o
+ nvkm-y += nvkm/subdev/gsp/rm/r535/alloc.o
++nvkm-y += nvkm/subdev/gsp/rm/r535/client.o
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/client.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/client.c
+new file mode 100644
+index 000000000000..7a2da37af283
+--- /dev/null
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/client.c
+@@ -0,0 +1,80 @@
++/*
++ * Copyright 2023 Red Hat Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ */
++#include <rm/rm.h>
++
++#include <nvrm/nvtypes.h>
++#include <nvrm/535.113.01/common/sdk/nvidia/inc/class/cl0000.h>
++
++static void
++r535_gsp_client_dtor(struct nvkm_gsp_client *client)
++{
++	struct nvkm_gsp *gsp = client->gsp;
++
++	nvkm_gsp_rm_free(&client->object);
++
++	mutex_lock(&gsp->client_id.mutex);
++	idr_remove(&gsp->client_id.idr, client->object.handle & 0xffff);
++	mutex_unlock(&gsp->client_id.mutex);
++
++	client->gsp = NULL;
++}
++
++static int
++r535_gsp_client_ctor(struct nvkm_gsp *gsp, struct nvkm_gsp_client *client)
++{
++	NV0000_ALLOC_PARAMETERS *args;
++	int ret;
++
++	mutex_lock(&gsp->client_id.mutex);
++	ret = idr_alloc(&gsp->client_id.idr, client, 0, 0xffff + 1, GFP_KERNEL);
++	mutex_unlock(&gsp->client_id.mutex);
++	if (ret < 0)
++		return ret;
++
++	client->gsp = gsp;
++	client->object.client = client;
++	INIT_LIST_HEAD(&client->events);
++
++	args = nvkm_gsp_rm_alloc_get(&client->object, 0xc1d00000 | ret, NV01_ROOT, sizeof(*args),
++				     &client->object);
++	if (IS_ERR(args)) {
++		r535_gsp_client_dtor(client);
++		return ret;
++	}
++
++	args->hClient = client->object.handle;
++	args->processID = ~0;
++
++	ret = nvkm_gsp_rm_alloc_wr(&client->object, args);
++	if (ret) {
++		r535_gsp_client_dtor(client);
++		return ret;
++	}
++
++	return 0;
++}
++
++const struct nvkm_rm_api_client
++r535_client = {
++	.ctor = r535_gsp_client_ctor,
++	.dtor = r535_gsp_client_dtor,
++};
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/rm.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/rm.c
+index f6fcd89ec502..dba1d2058b37 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/rm.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/rm.c
+@@ -9,4 +9,5 @@ r535_rm = {
+ 	.rpc = &r535_rpc,
+ 	.ctrl = &r535_ctrl,
+ 	.alloc = &r535_alloc,
++	.client = &r535_client,
+ };
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/rm.h b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/rm.h
+index 6d0eb8e202ca..c3341631fbd5 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/rm.h
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/rm.h
+@@ -27,10 +27,16 @@ struct nvkm_rm_api {
+ 
+ 		int (*free)(struct nvkm_gsp_object *);
+ 	} *alloc;
++
++	const struct nvkm_rm_api_client {
++		int (*ctor)(struct nvkm_gsp *, struct nvkm_gsp_client *);
++		void (*dtor)(struct nvkm_gsp_client *);
++	} *client;
+ };
+ 
+ extern const struct nvkm_rm_api r535_rm;
+ extern const struct nvkm_rm_api_rpc r535_rpc;
+ extern const struct nvkm_rm_api_ctrl r535_ctrl;
+ extern const struct nvkm_rm_api_alloc r535_alloc;
++extern const struct nvkm_rm_api_client r535_client;
+ #endif
+-- 
+2.52.0
+
