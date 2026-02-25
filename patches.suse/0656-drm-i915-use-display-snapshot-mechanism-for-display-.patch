@@ -1,0 +1,202 @@
+From 737c725b2c88c4defd3fc92bb934ee6804a4d851 Mon Sep 17 00:00:00 2001
+From: Jani Nikula <jani.nikula@intel.com>
+Date: Mon, 14 Apr 2025 14:29:46 +0300
+Subject: drm/i915: use display snapshot mechanism for display irq regs
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 737c725b2c88c4defd3fc92bb934ee6804a4d851
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Move more display specific parts of GPU error logging behind the display
+snapshot interface.
+
+With the display register capture reduced to just one register, DERRMR,
+there's quite a bit of boilerplate here. However, it's still a nice
+abstraction and removes a DISPLAY_VER() usage from core i915. With this
+approach, it's also easy to add to xe as needed.
+
+V2: Remove stale comment
+
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://lore.kernel.org/r/13206969df04426d290d2863dc574e22ca45193a.1744630147.git.jani.nikula@intel.com
+Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../gpu/drm/i915/display/intel_display_irq.c  | 28 +++++++++++++++++++
+ .../gpu/drm/i915/display/intel_display_irq.h  |  5 ++++
+ .../drm/i915/display/intel_display_snapshot.c |  5 ++++
+ drivers/gpu/drm/i915/i915_gpu_error.c         | 18 ------------
+ drivers/gpu/drm/i915/i915_gpu_error.h         |  2 --
+ 5 files changed, 38 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display_irq.c b/drivers/gpu/drm/i915/display/intel_display_irq.c
+index d2a35e3630b1..f5dc050a6344 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_irq.c
++++ b/drivers/gpu/drm/i915/display/intel_display_irq.c
+@@ -2329,3 +2329,31 @@ void intel_display_irq_init(struct intel_display *display)
+ 
+ 	INIT_WORK(&display->irq.vblank_dc_work, intel_display_vblank_dc_work);
+ }
++
++struct intel_display_irq_snapshot {
++	u32 derrmr;
++};
++
++struct intel_display_irq_snapshot *
++intel_display_irq_snapshot_capture(struct intel_display *display)
++{
++	struct intel_display_irq_snapshot *snapshot;
++
++	snapshot = kzalloc(sizeof(*snapshot), GFP_ATOMIC);
++	if (!snapshot)
++		return NULL;
++
++	if (DISPLAY_VER(display) >= 6 && DISPLAY_VER(display) < 20)
++		snapshot->derrmr = intel_de_read(display, DERRMR);
++
++	return snapshot;
++}
++
++void intel_display_irq_snapshot_print(const struct intel_display_irq_snapshot *snapshot,
++				      struct drm_printer *p)
++{
++	if (!snapshot)
++		return;
++
++	drm_printf(p, "DERRMR: 0x%08x\n", snapshot->derrmr);
++}
+diff --git a/drivers/gpu/drm/i915/display/intel_display_irq.h b/drivers/gpu/drm/i915/display/intel_display_irq.h
+index f72727768351..4f0e27a37854 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_irq.h
++++ b/drivers/gpu/drm/i915/display/intel_display_irq.h
+@@ -12,7 +12,9 @@
+ 
+ enum pipe;
+ struct drm_crtc;
++struct drm_printer;
+ struct intel_display;
++struct intel_display_irq_snapshot;
+ 
+ void valleyview_enable_display_irqs(struct intel_display *display);
+ void valleyview_disable_display_irqs(struct intel_display *display);
+@@ -82,4 +84,7 @@ void intel_display_irq_init(struct intel_display *display);
+ 
+ void i915gm_irq_cstate_wa(struct intel_display *display, bool enable);
+ 
++struct intel_display_irq_snapshot *intel_display_irq_snapshot_capture(struct intel_display *display);
++void intel_display_irq_snapshot_print(const struct intel_display_irq_snapshot *snapshot, struct drm_printer *p);
++
+ #endif /* __INTEL_DISPLAY_IRQ_H__ */
+diff --git a/drivers/gpu/drm/i915/display/intel_display_snapshot.c b/drivers/gpu/drm/i915/display/intel_display_snapshot.c
+index 25ba043cbb65..66087302fdbc 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_snapshot.c
++++ b/drivers/gpu/drm/i915/display/intel_display_snapshot.c
+@@ -7,6 +7,7 @@
+ 
+ #include "intel_display_core.h"
+ #include "intel_display_device.h"
++#include "intel_display_irq.h"
+ #include "intel_display_params.h"
+ #include "intel_display_snapshot.h"
+ #include "intel_dmc.h"
+@@ -20,6 +21,7 @@ struct intel_display_snapshot {
+ 	struct intel_display_params params;
+ 	struct intel_overlay_snapshot *overlay;
+ 	struct intel_dmc_snapshot *dmc;
++	struct intel_display_irq_snapshot *irq;
+ };
+ 
+ struct intel_display_snapshot *intel_display_snapshot_capture(struct intel_display *display)
+@@ -38,6 +40,7 @@ struct intel_display_snapshot *intel_display_snapshot_capture(struct intel_displ
+ 
+ 	intel_display_params_copy(&snapshot->params);
+ 
++	snapshot->irq = intel_display_irq_snapshot_capture(display);
+ 	snapshot->overlay = intel_overlay_snapshot_capture(display);
+ 	snapshot->dmc = intel_dmc_snapshot_capture(display);
+ 
+@@ -57,6 +60,7 @@ void intel_display_snapshot_print(const struct intel_display_snapshot *snapshot,
+ 	intel_display_device_info_print(&snapshot->info, &snapshot->runtime_info, p);
+ 	intel_display_params_dump(&snapshot->params, display->drm->driver->name, p);
+ 
++	intel_display_irq_snapshot_print(snapshot->irq, p);
+ 	intel_overlay_snapshot_print(snapshot->overlay, p);
+ 	intel_dmc_snapshot_print(snapshot->dmc, p);
+ }
+@@ -68,6 +72,7 @@ void intel_display_snapshot_free(struct intel_display_snapshot *snapshot)
+ 
+ 	intel_display_params_free(&snapshot->params);
+ 
++	kfree(snapshot->irq);
+ 	kfree(snapshot->overlay);
+ 	kfree(snapshot->dmc);
+ 	kfree(snapshot);
+diff --git a/drivers/gpu/drm/i915/i915_gpu_error.c b/drivers/gpu/drm/i915/i915_gpu_error.c
+index 50cd0c433e6d..62e4a293ed9b 100644
+--- a/drivers/gpu/drm/i915/i915_gpu_error.c
++++ b/drivers/gpu/drm/i915/i915_gpu_error.c
+@@ -726,12 +726,6 @@ static void err_print_gt_info(struct drm_i915_error_state_buf *m,
+ 	intel_sseu_print_topology(gt->_gt->i915, &gt->info.sseu, &p);
+ }
+ 
+-static void err_print_gt_display(struct drm_i915_error_state_buf *m,
+-				 struct intel_gt_coredump *gt)
+-{
+-	err_printf(m, "DERRMR: 0x%08x\n", gt->derrmr);
+-}
+-
+ static void err_print_gt_global_nonguc(struct drm_i915_error_state_buf *m,
+ 				       struct intel_gt_coredump *gt)
+ {
+@@ -877,7 +871,6 @@ static void __err_print_to_sgl(struct drm_i915_error_state_buf *m,
+ 		if (error->gt->uc && error->gt->uc->guc.is_guc_capture)
+ 			print_guc_capture = true;
+ 
+-		err_print_gt_display(m, error->gt);
+ 		err_print_gt_global_nonguc(m, error->gt);
+ 		err_print_gt_fences(m, error->gt);
+ 
+@@ -1766,16 +1759,6 @@ gt_record_uc(struct intel_gt_coredump *gt,
+ 	return error_uc;
+ }
+ 
+-/* Capture display registers. */
+-static void gt_record_display_regs(struct intel_gt_coredump *gt)
+-{
+-	struct intel_uncore *uncore = gt->_gt->uncore;
+-	struct drm_i915_private *i915 = uncore->i915;
+-
+-	if (DISPLAY_VER(i915) >= 6 && DISPLAY_VER(i915) < 20)
+-		gt->derrmr = intel_uncore_read(uncore, DERRMR);
+-}
+-
+ /* Capture all other registers that GuC doesn't capture. */
+ static void gt_record_global_nonguc_regs(struct intel_gt_coredump *gt)
+ {
+@@ -2034,7 +2017,6 @@ intel_gt_coredump_alloc(struct intel_gt *gt, gfp_t gfp, u32 dump_flags)
+ 	gc->_gt = gt;
+ 	gc->awake = intel_gt_pm_is_awake(gt);
+ 
+-	gt_record_display_regs(gc);
+ 	gt_record_global_nonguc_regs(gc);
+ 
+ 	/*
+diff --git a/drivers/gpu/drm/i915/i915_gpu_error.h b/drivers/gpu/drm/i915/i915_gpu_error.h
+index ac55603a81d7..182324979278 100644
+--- a/drivers/gpu/drm/i915/i915_gpu_error.h
++++ b/drivers/gpu/drm/i915/i915_gpu_error.h
+@@ -163,8 +163,6 @@ struct intel_gt_coredump {
+ 	u32 clock_frequency;
+ 	u32 clock_period_ns;
+ 
+-	/* Display related */
+-	u32 derrmr;
+ 	u32 sfc_done[I915_MAX_SFC]; /* gen12 */
+ 
+ 	u32 nfence;
+-- 
+2.52.0
+
