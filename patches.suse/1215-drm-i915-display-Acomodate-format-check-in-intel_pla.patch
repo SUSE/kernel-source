@@ -1,0 +1,137 @@
+From ed1d563c7f0fee5e63048c53c10fa1ef69c74f77 Mon Sep 17 00:00:00 2001
+From: Arun R Murthy <arun.r.murthy@intel.com>
+Date: Mon, 7 Apr 2025 11:13:47 +0530
+Subject: drm/i915/display: Acomodate format check in
+ intel_plane_can_async_flip()
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: ed1d563c7f0fee5e63048c53c10fa1ef69c74f77
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+The function intel_plane_can_async_flip() checks for async supported
+modifier, add format support check also in the same function.
+
+Note: on ADL the surface base addr is required to be 16k aligned and if
+not might generate DMAR and GGTT faults leading to glitches. This patch
+changes the 16k alignment to 4k for planar formats.
+
+V11: Move filtering Indexed 8bit to a separate patch (Ville)
+V12: correct the commit msg and remove unwanted debug print (Ville)
+
+Signed-off-by: Arun R Murthy <arun.r.murthy@intel.com>
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Signed-off-by: Suraj Kandpal <suraj.kandpal@intel.com>
+Link: https://lore.kernel.org/r/20250407-asyn-v13-3-b93ef83076c5@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/i9xx_plane.c          |  4 ++--
+ drivers/gpu/drm/i915/display/intel_atomic_plane.c  |  6 +++++-
+ drivers/gpu/drm/i915/display/intel_atomic_plane.h  |  3 ++-
+ drivers/gpu/drm/i915/display/intel_display.c       | 14 ++++----------
+ drivers/gpu/drm/i915/display/skl_universal_plane.c |  2 +-
+ 5 files changed, 14 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/i9xx_plane.c b/drivers/gpu/drm/i915/display/i9xx_plane.c
+index 83778a6ff007..04cc337c7202 100644
+--- a/drivers/gpu/drm/i915/display/i9xx_plane.c
++++ b/drivers/gpu/drm/i915/display/i9xx_plane.c
+@@ -821,7 +821,7 @@ unsigned int vlv_plane_min_alignment(struct intel_plane *plane,
+ {
+ 	struct intel_display *display = to_intel_display(plane);
+ 
+-	if (intel_plane_can_async_flip(plane, fb->modifier))
++	if (intel_plane_can_async_flip(plane, fb->format->format, fb->modifier))
+ 		return 256 * 1024;
+ 
+ 	/* FIXME undocumented so not sure what's actually needed */
+@@ -845,7 +845,7 @@ static unsigned int g4x_primary_min_alignment(struct intel_plane *plane,
+ {
+ 	struct intel_display *display = to_intel_display(plane);
+ 
+-	if (intel_plane_can_async_flip(plane, fb->modifier))
++	if (intel_plane_can_async_flip(plane, fb->format->format, fb->modifier))
+ 		return 256 * 1024;
+ 
+ 	if (intel_scanout_needs_vtd_wa(display))
+diff --git a/drivers/gpu/drm/i915/display/intel_atomic_plane.c b/drivers/gpu/drm/i915/display/intel_atomic_plane.c
+index 7276179df878..1ec730047759 100644
+--- a/drivers/gpu/drm/i915/display/intel_atomic_plane.c
++++ b/drivers/gpu/drm/i915/display/intel_atomic_plane.c
+@@ -174,8 +174,12 @@ bool intel_plane_needs_physical(struct intel_plane *plane)
+ 		DISPLAY_INFO(display)->cursor_needs_physical;
+ }
+ 
+-bool intel_plane_can_async_flip(struct intel_plane *plane, u64 modifier)
++bool intel_plane_can_async_flip(struct intel_plane *plane, u32 format,
++				u64 modifier)
+ {
++	if (intel_format_info_is_yuv_semiplanar(drm_format_info(format), modifier))
++		return false;
++
+ 	return plane->can_async_flip && plane->can_async_flip(modifier);
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/display/intel_atomic_plane.h b/drivers/gpu/drm/i915/display/intel_atomic_plane.h
+index 6efac923dcbc..772a12aa9c69 100644
+--- a/drivers/gpu/drm/i915/display/intel_atomic_plane.h
++++ b/drivers/gpu/drm/i915/display/intel_atomic_plane.h
+@@ -21,7 +21,8 @@ enum plane_id;
+ 
+ struct intel_plane *
+ intel_crtc_get_plane(struct intel_crtc *crtc, enum plane_id plane_id);
+-bool intel_plane_can_async_flip(struct intel_plane *plane, u64 modifier);
++bool intel_plane_can_async_flip(struct intel_plane *plane, u32 format,
++				u64 modifier);
+ unsigned int intel_adjusted_rate(const struct drm_rect *src,
+ 				 const struct drm_rect *dst,
+ 				 unsigned int rate);
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index 287110e4e435..6f0a0bc71b06 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -6030,22 +6030,16 @@ static int intel_async_flip_check_hw(struct intel_atomic_state *state, struct in
+ 		if (!plane->async_flip)
+ 			continue;
+ 
+-		if (!intel_plane_can_async_flip(plane, new_plane_state->hw.fb->modifier)) {
++		if (!intel_plane_can_async_flip(plane, new_plane_state->hw.fb->format->format,
++						new_plane_state->hw.fb->modifier)) {
+ 			drm_dbg_kms(display->drm,
+-				    "[PLANE:%d:%s] Modifier 0x%llx does not support async flip\n",
++				    "[PLANE:%d:%s] pixel format %p4cc / modifier 0x%llx does not support async flip\n",
+ 				    plane->base.base.id, plane->base.name,
++				    &new_plane_state->hw.fb->format->format,
+ 				    new_plane_state->hw.fb->modifier);
+ 			return -EINVAL;
+ 		}
+ 
+-		if (intel_format_info_is_yuv_semiplanar(new_plane_state->hw.fb->format,
+-							new_plane_state->hw.fb->modifier)) {
+-			drm_dbg_kms(display->drm,
+-				    "[PLANE:%d:%s] Planar formats do not support async flips\n",
+-				    plane->base.base.id, plane->base.name);
+-			return -EINVAL;
+-		}
+-
+ 		/*
+ 		 * We turn the first async flip request into a sync flip
+ 		 * so that we can reconfigure the plane (eg. change modifier).
+diff --git a/drivers/gpu/drm/i915/display/skl_universal_plane.c b/drivers/gpu/drm/i915/display/skl_universal_plane.c
+index 844519286b1c..fd0f17f818b1 100644
+--- a/drivers/gpu/drm/i915/display/skl_universal_plane.c
++++ b/drivers/gpu/drm/i915/display/skl_universal_plane.c
+@@ -601,7 +601,7 @@ static u32 tgl_plane_min_alignment(struct intel_plane *plane,
+ 	 * Figure out what's going on here...
+ 	 */
+ 	if (display->platform.alderlake_p &&
+-	    intel_plane_can_async_flip(plane, fb->modifier))
++	    intel_plane_can_async_flip(plane, fb->format->format, fb->modifier))
+ 		return mult * 16 * 1024;
+ 
+ 	switch (fb->modifier) {
+-- 
+2.52.0
+
