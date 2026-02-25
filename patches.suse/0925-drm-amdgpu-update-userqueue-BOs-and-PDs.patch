@@ -1,0 +1,260 @@
+From 70773bef4e091ff6d2a91e3dfb4f29013eb81f1f Mon Sep 17 00:00:00 2001
+From: Arvind Yadav <arvind.yadav@amd.com>
+Date: Wed, 25 Sep 2024 18:09:49 +0200
+Subject: drm/amdgpu: update userqueue BOs and PDs
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 70773bef4e091ff6d2a91e3dfb4f29013eb81f1f
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+This patch updates the VM_IOCTL to allow userspace to synchronize
+the mapping/unmapping of a BO in the page table.
+
+The major changes are:
+- it adds a drm_timeline object as an input parameter to the VM IOCTL.
+- this object is used by the kernel to sync the update of the BO in
+  the page table during the mapping of the object.
+- the kernel also synchronizes the tlb flush of the page table entry of
+  this object during the unmapping (Added in this series:
+  https://patchwork.freedesktop.org/series/131276/ and
+  https://patchwork.freedesktop.org/patch/584182/)
+- the userspace can wait on this timeline, and then the BO is ready to
+  be consumed by the GPU.
+
+The UAPI for the same has been approved here:
+https://gitlab.freedesktop.org/mesa/drm/-/merge_requests/392
+
+V2: - remove the eviction fence coupling
+
+V3: - added the drm timeline support instead of input/output fence
+   (Christian)
+
+V4: - made timeline 64-bit (Christian)
+ - bug fix (Arvind)
+
+V5: GLCTS bug fix (Arvind)
+V6: Rename syncobj_handle -> timeline_syncobj_out
+    Rename point -> timeline_point_in (Marek)
+V7: Addressed review comments from Christian:
+    - do not send last_update fence in case of vm_clear_freed, instead
+      return the fence from gen_va_update_vm
+    - move the functions to update bo_mapping  to amdgpu_gem.c
+    - do not use amdgpu_userq_update_vm anymore in userq_create()
+V8: Addressed review comments from Christian:
+    - Split amdgpu_gem_update_bo_mapping function.
+    - amdgpu_gem_va_update_vm should return stub for error.
+V9: Addressed review comments from Christian:
+    - Rename the function amdgpu_gem_update_timeline_node.
+    - amdgpu_gem_update_timeline_node should be void function.
+    - when timeline_point is zero don't allocate a chain and
+      call drm_syncobj_replace_fence() instead of
+      drm_syncobj_add_point().
+V11: rebase
+V12: Fix 32-bit holes issue in sturct drm_amdgpu_gem_va.
+V13: Fix the review comment by renaming timeline syncobj (Marek)
+
+Cc: Alex Deucher <alexander.deucher@amd.com>
+Cc: Felix Kuehling <felix.kuehling@amd.com>
+Cc: Christian König <christian.koenig@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Arvind Yadav <arvind.yadav@amd.com>
+Signed-off-by: Shashank Sharma <shashank.sharma@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c | 113 ++++++++++++++++++++++--
+ include/uapi/drm/amdgpu_drm.h           |   9 ++
+ 2 files changed, 113 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+index 69429df09477..542a1b70f2ee 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+@@ -36,6 +36,7 @@
+ #include <drm/drm_exec.h>
+ #include <drm/drm_gem_ttm_helper.h>
+ #include <drm/ttm/ttm_tt.h>
++#include <drm/drm_syncobj.h>
+ 
+ #include "amdgpu.h"
+ #include "amdgpu_display.h"
+@@ -44,6 +45,75 @@
+ #include "amdgpu_xgmi.h"
+ #include "amdgpu_vm.h"
+ 
++static int
++amdgpu_gem_update_timeline_node(struct drm_file *filp,
++				uint32_t syncobj_handle,
++				uint64_t point,
++				struct drm_syncobj **syncobj,
++				struct dma_fence_chain **chain)
++{
++	if (!syncobj_handle)
++		return 0;
++
++	/* Find the sync object */
++	*syncobj = drm_syncobj_find(filp, syncobj_handle);
++	if (!*syncobj)
++		return -ENOENT;
++
++	if (!point)
++		return 0;
++
++	/* Allocate the chain node */
++	*chain = dma_fence_chain_alloc();
++	if (!*chain) {
++		drm_syncobj_put(*syncobj);
++		return -ENOMEM;
++	}
++
++	return 0;
++}
++
++static void
++amdgpu_gem_update_bo_mapping(struct drm_file *filp,
++			     struct amdgpu_bo_va *bo_va,
++			     uint32_t operation,
++			     uint64_t point,
++			     struct dma_fence *fence,
++			     struct drm_syncobj *syncobj,
++			     struct dma_fence_chain *chain)
++{
++	struct amdgpu_bo *bo = bo_va ? bo_va->base.bo : NULL;
++	struct amdgpu_fpriv *fpriv = filp->driver_priv;
++	struct amdgpu_vm *vm = &fpriv->vm;
++	struct dma_fence *last_update;
++
++	if (!syncobj)
++		return;
++
++	/* Find the last update fence */
++	switch (operation) {
++	case AMDGPU_VA_OP_MAP:
++	case AMDGPU_VA_OP_REPLACE:
++		if (bo && (bo->tbo.base.resv == vm->root.bo->tbo.base.resv))
++			last_update = vm->last_update;
++		else
++			last_update = bo_va->last_pt_update;
++		break;
++	case AMDGPU_VA_OP_UNMAP:
++	case AMDGPU_VA_OP_CLEAR:
++		last_update = fence;
++		break;
++	default:
++		return;
++	}
++
++	/* Add fence to timeline */
++	if (!point)
++		drm_syncobj_replace_fence(syncobj, last_update);
++	else
++		drm_syncobj_add_point(syncobj, chain, last_update, point);
++}
++
+ static vm_fault_t amdgpu_gem_fault(struct vm_fault *vmf)
+ {
+ 	struct ttm_buffer_object *bo = vmf->vma->vm_private_data;
+@@ -638,18 +708,23 @@ int amdgpu_gem_metadata_ioctl(struct drm_device *dev, void *data,
+  *
+  * Update the bo_va directly after setting its address. Errors are not
+  * vital here, so they are not reported back to userspace.
++ *
++ * Returns resulting fence if freed BO(s) got cleared from the PT.
++ * otherwise stub fence in case of error.
+  */
+-static void amdgpu_gem_va_update_vm(struct amdgpu_device *adev,
+-				    struct amdgpu_vm *vm,
+-				    struct amdgpu_bo_va *bo_va,
+-				    uint32_t operation)
++static struct dma_fence *
++amdgpu_gem_va_update_vm(struct amdgpu_device *adev,
++			struct amdgpu_vm *vm,
++			struct amdgpu_bo_va *bo_va,
++			uint32_t operation)
+ {
++	struct dma_fence *fence = dma_fence_get_stub();
+ 	int r;
+ 
+ 	if (!amdgpu_vm_ready(vm))
+-		return;
++		return fence;
+ 
+-	r = amdgpu_vm_clear_freed(adev, vm, NULL);
++	r = amdgpu_vm_clear_freed(adev, vm, &fence);
+ 	if (r)
+ 		goto error;
+ 
+@@ -665,6 +740,8 @@ static void amdgpu_gem_va_update_vm(struct amdgpu_device *adev,
+ error:
+ 	if (r && r != -ERESTARTSYS)
+ 		DRM_ERROR("Couldn't update BO_VA (%d)\n", r);
++
++	return fence;
+ }
+ 
+ /**
+@@ -713,6 +790,9 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
+ 	struct amdgpu_fpriv *fpriv = filp->driver_priv;
+ 	struct amdgpu_bo *abo;
+ 	struct amdgpu_bo_va *bo_va;
++	struct drm_syncobj *timeline_syncobj = NULL;
++	struct dma_fence_chain *timeline_chain = NULL;
++	struct dma_fence *fence;
+ 	struct drm_exec exec;
+ 	uint64_t va_flags;
+ 	uint64_t vm_size;
+@@ -827,9 +907,24 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
+ 	default:
+ 		break;
+ 	}
+-	if (!r && !(args->flags & AMDGPU_VM_DELAY_UPDATE) && !adev->debug_vm)
+-		amdgpu_gem_va_update_vm(adev, &fpriv->vm, bo_va,
+-					args->operation);
++	if (!r && !(args->flags & AMDGPU_VM_DELAY_UPDATE) && !adev->debug_vm) {
++
++		r = amdgpu_gem_update_timeline_node(filp,
++						    args->vm_timeline_syncobj_out,
++						    args->vm_timeline_point,
++						    &timeline_syncobj,
++						    &timeline_chain);
++
++		fence = amdgpu_gem_va_update_vm(adev, &fpriv->vm, bo_va,
++						args->operation);
++
++		if (!r)
++			amdgpu_gem_update_bo_mapping(filp, bo_va,
++						     args->operation,
++						     args->vm_timeline_point,
++						     fence, timeline_syncobj,
++						     timeline_chain);
++	}
+ 
+ error:
+ 	drm_exec_fini(&exec);
+diff --git a/include/uapi/drm/amdgpu_drm.h b/include/uapi/drm/amdgpu_drm.h
+index 1a21259cb8c4..ca82935ff93a 100644
+--- a/include/uapi/drm/amdgpu_drm.h
++++ b/include/uapi/drm/amdgpu_drm.h
+@@ -857,6 +857,15 @@ struct drm_amdgpu_gem_va {
+ 	__u64 offset_in_bo;
+ 	/** Specify mapping size. Must be correctly aligned. */
+ 	__u64 map_size;
++	/**
++	 * vm_timeline_point is a sequence number used to add new timeline point.
++	 */
++	__u64 vm_timeline_point;
++	/**
++	 * The vm page table update fence is installed in given vm_timeline_syncobj_out
++	 * at vm_timeline_point.
++	 */
++	__u32 vm_timeline_syncobj_out;
+ };
+ 
+ #define AMDGPU_HW_IP_GFX          0
+-- 
+2.52.0
+
