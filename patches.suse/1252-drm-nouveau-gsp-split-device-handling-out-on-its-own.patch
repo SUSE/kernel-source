@@ -1,0 +1,450 @@
+From f964336483159da1f4ca67d7abef3d82e725ed36 Mon Sep 17 00:00:00 2001
+From: Ben Skeggs <bskeggs@nvidia.com>
+Date: Thu, 14 Nov 2024 13:02:37 +1000
+Subject: drm/nouveau/gsp: split device handling out on its own
+Git-commit: f964336483159da1f4ca67d7abef3d82e725ed36
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Split handling of NV01_DEVICE (and other related objects) out into its
+own module.
+
+Aside from moving the function pointers, no code change is intended.
+
+Signed-off-by: Ben Skeggs <bskeggs@nvidia.com>
+Reviewed-by: Dave Airlie <airlied@redhat.com>
+Reviewed-by: Timur Tabi <ttabi@nvidia.com>
+Tested-by: Timur Tabi <ttabi@nvidia.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../gpu/drm/nouveau/include/nvkm/subdev/gsp.h |  17 +-
+ .../gpu/drm/nouveau/nvkm/subdev/gsp/r535.c    | 127 ---------------
+ .../nouveau/nvkm/subdev/gsp/rm/r535/Kbuild    |   1 +
+ .../nouveau/nvkm/subdev/gsp/rm/r535/device.c  | 153 ++++++++++++++++++
+ .../drm/nouveau/nvkm/subdev/gsp/rm/r535/rm.c  |   1 +
+ .../gpu/drm/nouveau/nvkm/subdev/gsp/rm/rm.h   |  12 ++
+ 6 files changed, 173 insertions(+), 138 deletions(-)
+ create mode 100644 drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/device.c
+
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/subdev/gsp.h b/drivers/gpu/drm/nouveau/include/nvkm/subdev/gsp.h
+index 2c3d8fd04516..3fd279be8340 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/subdev/gsp.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/subdev/gsp.h
+@@ -211,13 +211,6 @@ struct nvkm_gsp {
+ 
+ 	const struct nvkm_gsp_rm {
+ 		const struct nvkm_rm_api *api;
+-
+-		int (*device_ctor)(struct nvkm_gsp_client *, struct nvkm_gsp_device *);
+-		void (*device_dtor)(struct nvkm_gsp_device *);
+-
+-		int (*event_ctor)(struct nvkm_gsp_device *, u32 handle, u32 id,
+-				  nvkm_gsp_event_func, struct nvkm_gsp_event *);
+-		void (*event_dtor)(struct nvkm_gsp_event *);
+ 	} *rm;
+ 
+ 	struct {
+@@ -435,14 +428,14 @@ nvkm_gsp_client_dtor(struct nvkm_gsp_client *client)
+ static inline int
+ nvkm_gsp_device_ctor(struct nvkm_gsp_client *client, struct nvkm_gsp_device *device)
+ {
+-	return client->gsp->rm->device_ctor(client, device);
++	return client->gsp->rm->api->device->ctor(client, device);
+ }
+ 
+ static inline void
+ nvkm_gsp_device_dtor(struct nvkm_gsp_device *device)
+ {
+ 	if (device->object.client)
+-		device->object.client->gsp->rm->device_dtor(device);
++		device->object.client->gsp->rm->api->device->dtor(device);
+ }
+ 
+ static inline int
+@@ -474,7 +467,9 @@ static inline int
+ nvkm_gsp_device_event_ctor(struct nvkm_gsp_device *device, u32 handle, u32 id,
+ 			   nvkm_gsp_event_func func, struct nvkm_gsp_event *event)
+ {
+-	return device->object.client->gsp->rm->event_ctor(device, handle, id, func, event);
++	const struct nvkm_gsp_rm *rm = device->object.client->gsp->rm;
++
++	return rm->api->device->event.ctor(device, handle, id, func, event);
+ }
+ 
+ static inline void
+@@ -483,7 +478,7 @@ nvkm_gsp_event_dtor(struct nvkm_gsp_event *event)
+ 	struct nvkm_gsp_device *device = event->device;
+ 
+ 	if (device)
+-		device->object.client->gsp->rm->event_dtor(event);
++		device->object.client->gsp->rm->api->device->event.dtor(event);
+ }
+ 
+ int nvkm_gsp_intr_stall(struct nvkm_gsp *, enum nvkm_subdev_type, int);
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/r535.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/r535.c
+index c6fce9541c0e..c292f5a4e1ec 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/r535.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/r535.c
+@@ -33,20 +33,14 @@
+ #include <nvfw/fw.h>
+ 
+ #include <nvrm/nvtypes.h>
+-#include <nvrm/535.113.01/common/sdk/nvidia/inc/class/cl0005.h>
+-#include <nvrm/535.113.01/common/sdk/nvidia/inc/class/cl0080.h>
+-#include <nvrm/535.113.01/common/sdk/nvidia/inc/class/cl2080.h>
+-#include <nvrm/535.113.01/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080event.h>
+ #include <nvrm/535.113.01/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080gpu.h>
+ #include <nvrm/535.113.01/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080internal.h>
+-#include <nvrm/535.113.01/common/sdk/nvidia/inc/nvos.h>
+ #include <nvrm/535.113.01/common/shared/msgq/inc/msgq/msgq_priv.h>
+ #include <nvrm/535.113.01/common/uproc/os/common/include/libos_init_args.h>
+ #include <nvrm/535.113.01/nvidia/arch/nvalloc/common/inc/gsp/gsp_fw_sr_meta.h>
+ #include <nvrm/535.113.01/nvidia/arch/nvalloc/common/inc/gsp/gsp_fw_wpr_meta.h>
+ #include <nvrm/535.113.01/nvidia/arch/nvalloc/common/inc/rmRiscvUcode.h>
+ #include <nvrm/535.113.01/nvidia/arch/nvalloc/common/inc/rmgspseq.h>
+-#include <nvrm/535.113.01/nvidia/generated/g_allclasses.h>
+ #include <nvrm/535.113.01/nvidia/generated/g_os_nvoc.h>
+ #include <nvrm/535.113.01/nvidia/generated/g_rpc-structures.h>
+ #include <nvrm/535.113.01/nvidia/inc/kernel/gpu/gsp/gsp_fw_heap.h>
+@@ -61,130 +55,9 @@
+ 
+ extern struct dentry *nouveau_debugfs_root;
+ 
+-static void
+-r535_gsp_event_dtor(struct nvkm_gsp_event *event)
+-{
+-	struct nvkm_gsp_device *device = event->device;
+-	struct nvkm_gsp_client *client = device->object.client;
+-	struct nvkm_gsp *gsp = client->gsp;
+-
+-	mutex_lock(&gsp->client_id.mutex);
+-	if (event->func) {
+-		list_del(&event->head);
+-		event->func = NULL;
+-	}
+-	mutex_unlock(&gsp->client_id.mutex);
+-
+-	nvkm_gsp_rm_free(&event->object);
+-	event->device = NULL;
+-}
+-
+-static int
+-r535_gsp_device_event_get(struct nvkm_gsp_event *event)
+-{
+-	struct nvkm_gsp_device *device = event->device;
+-	NV2080_CTRL_EVENT_SET_NOTIFICATION_PARAMS *ctrl;
+-
+-	ctrl = nvkm_gsp_rm_ctrl_get(&device->subdevice,
+-				    NV2080_CTRL_CMD_EVENT_SET_NOTIFICATION, sizeof(*ctrl));
+-	if (IS_ERR(ctrl))
+-		return PTR_ERR(ctrl);
+-
+-	ctrl->event = event->id;
+-	ctrl->action = NV2080_CTRL_EVENT_SET_NOTIFICATION_ACTION_REPEAT;
+-	return nvkm_gsp_rm_ctrl_wr(&device->subdevice, ctrl);
+-}
+-
+-static int
+-r535_gsp_device_event_ctor(struct nvkm_gsp_device *device, u32 handle, u32 id,
+-			   nvkm_gsp_event_func func, struct nvkm_gsp_event *event)
+-{
+-	struct nvkm_gsp_client *client = device->object.client;
+-	struct nvkm_gsp *gsp = client->gsp;
+-	NV0005_ALLOC_PARAMETERS *args;
+-	int ret;
+-
+-	args = nvkm_gsp_rm_alloc_get(&device->subdevice, handle,
+-				     NV01_EVENT_KERNEL_CALLBACK_EX, sizeof(*args),
+-				     &event->object);
+-	if (IS_ERR(args))
+-		return PTR_ERR(args);
+-
+-	args->hParentClient = client->object.handle;
+-	args->hSrcResource = 0;
+-	args->hClass = NV01_EVENT_KERNEL_CALLBACK_EX;
+-	args->notifyIndex = NV01_EVENT_CLIENT_RM | id;
+-	args->data = NULL;
+-
+-	ret = nvkm_gsp_rm_alloc_wr(&event->object, args);
+-	if (ret)
+-		return ret;
+-
+-	event->device = device;
+-	event->id = id;
+-
+-	ret = r535_gsp_device_event_get(event);
+-	if (ret) {
+-		nvkm_gsp_event_dtor(event);
+-		return ret;
+-	}
+-
+-	mutex_lock(&gsp->client_id.mutex);
+-	event->func = func;
+-	list_add(&event->head, &client->events);
+-	mutex_unlock(&gsp->client_id.mutex);
+-	return 0;
+-}
+-
+-static void
+-r535_gsp_device_dtor(struct nvkm_gsp_device *device)
+-{
+-	nvkm_gsp_rm_free(&device->subdevice);
+-	nvkm_gsp_rm_free(&device->object);
+-}
+-
+-static int
+-r535_gsp_subdevice_ctor(struct nvkm_gsp_device *device)
+-{
+-	NV2080_ALLOC_PARAMETERS *args;
+-
+-	return nvkm_gsp_rm_alloc(&device->object, 0x5d1d0000, NV20_SUBDEVICE_0, sizeof(*args),
+-				 &device->subdevice);
+-}
+-
+-static int
+-r535_gsp_device_ctor(struct nvkm_gsp_client *client, struct nvkm_gsp_device *device)
+-{
+-	NV0080_ALLOC_PARAMETERS *args;
+-	int ret;
+-
+-	args = nvkm_gsp_rm_alloc_get(&client->object, 0xde1d0000, NV01_DEVICE_0, sizeof(*args),
+-				     &device->object);
+-	if (IS_ERR(args))
+-		return PTR_ERR(args);
+-
+-	args->hClientShare = client->object.handle;
+-
+-	ret = nvkm_gsp_rm_alloc_wr(&device->object, args);
+-	if (ret)
+-		return ret;
+-
+-	ret = r535_gsp_subdevice_ctor(device);
+-	if (ret)
+-		nvkm_gsp_rm_free(&device->object);
+-
+-	return ret;
+-}
+-
+ const struct nvkm_gsp_rm
+ r535_gsp_rm = {
+ 	.api = &r535_rm,
+-
+-	.device_ctor = r535_gsp_device_ctor,
+-	.device_dtor = r535_gsp_device_dtor,
+-
+-	.event_ctor = r535_gsp_device_event_ctor,
+-	.event_dtor = r535_gsp_event_dtor,
+ };
+ 
+ static void
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/Kbuild b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/Kbuild
+index f25b438fa3d9..d50f2c351d93 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/Kbuild
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/Kbuild
+@@ -7,3 +7,4 @@ nvkm-y += nvkm/subdev/gsp/rm/r535/rpc.o
+ nvkm-y += nvkm/subdev/gsp/rm/r535/ctrl.o
+ nvkm-y += nvkm/subdev/gsp/rm/r535/alloc.o
+ nvkm-y += nvkm/subdev/gsp/rm/r535/client.o
++nvkm-y += nvkm/subdev/gsp/rm/r535/device.o
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/device.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/device.c
+new file mode 100644
+index 000000000000..09173ca1c050
+--- /dev/null
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/device.c
+@@ -0,0 +1,153 @@
++/*
++ * Copyright 2023 Red Hat Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ */
++#include <rm/rm.h>
++
++#include <nvrm/nvtypes.h>
++#include <nvrm/535.113.01/common/sdk/nvidia/inc/class/cl0005.h>
++#include <nvrm/535.113.01/common/sdk/nvidia/inc/class/cl0080.h>
++#include <nvrm/535.113.01/common/sdk/nvidia/inc/class/cl2080.h>
++#include <nvrm/535.113.01/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080event.h>
++#include <nvrm/535.113.01/common/sdk/nvidia/inc/nvos.h>
++#include <nvrm/535.113.01/nvidia/generated/g_allclasses.h>
++
++static void
++r535_gsp_event_dtor(struct nvkm_gsp_event *event)
++{
++	struct nvkm_gsp_device *device = event->device;
++	struct nvkm_gsp_client *client = device->object.client;
++	struct nvkm_gsp *gsp = client->gsp;
++
++	mutex_lock(&gsp->client_id.mutex);
++	if (event->func) {
++		list_del(&event->head);
++		event->func = NULL;
++	}
++	mutex_unlock(&gsp->client_id.mutex);
++
++	nvkm_gsp_rm_free(&event->object);
++	event->device = NULL;
++}
++
++static int
++r535_gsp_device_event_get(struct nvkm_gsp_event *event)
++{
++	struct nvkm_gsp_device *device = event->device;
++	NV2080_CTRL_EVENT_SET_NOTIFICATION_PARAMS *ctrl;
++
++	ctrl = nvkm_gsp_rm_ctrl_get(&device->subdevice,
++				    NV2080_CTRL_CMD_EVENT_SET_NOTIFICATION, sizeof(*ctrl));
++	if (IS_ERR(ctrl))
++		return PTR_ERR(ctrl);
++
++	ctrl->event = event->id;
++	ctrl->action = NV2080_CTRL_EVENT_SET_NOTIFICATION_ACTION_REPEAT;
++	return nvkm_gsp_rm_ctrl_wr(&device->subdevice, ctrl);
++}
++
++static int
++r535_gsp_device_event_ctor(struct nvkm_gsp_device *device, u32 handle, u32 id,
++			   nvkm_gsp_event_func func, struct nvkm_gsp_event *event)
++{
++	struct nvkm_gsp_client *client = device->object.client;
++	struct nvkm_gsp *gsp = client->gsp;
++	NV0005_ALLOC_PARAMETERS *args;
++	int ret;
++
++	args = nvkm_gsp_rm_alloc_get(&device->subdevice, handle,
++				     NV01_EVENT_KERNEL_CALLBACK_EX, sizeof(*args),
++				     &event->object);
++	if (IS_ERR(args))
++		return PTR_ERR(args);
++
++	args->hParentClient = client->object.handle;
++	args->hSrcResource = 0;
++	args->hClass = NV01_EVENT_KERNEL_CALLBACK_EX;
++	args->notifyIndex = NV01_EVENT_CLIENT_RM | id;
++	args->data = NULL;
++
++	ret = nvkm_gsp_rm_alloc_wr(&event->object, args);
++	if (ret)
++		return ret;
++
++	event->device = device;
++	event->id = id;
++
++	ret = r535_gsp_device_event_get(event);
++	if (ret) {
++		nvkm_gsp_event_dtor(event);
++		return ret;
++	}
++
++	mutex_lock(&gsp->client_id.mutex);
++	event->func = func;
++	list_add(&event->head, &client->events);
++	mutex_unlock(&gsp->client_id.mutex);
++	return 0;
++}
++
++static void
++r535_gsp_device_dtor(struct nvkm_gsp_device *device)
++{
++	nvkm_gsp_rm_free(&device->subdevice);
++	nvkm_gsp_rm_free(&device->object);
++}
++
++static int
++r535_gsp_subdevice_ctor(struct nvkm_gsp_device *device)
++{
++	NV2080_ALLOC_PARAMETERS *args;
++
++	return nvkm_gsp_rm_alloc(&device->object, 0x5d1d0000, NV20_SUBDEVICE_0, sizeof(*args),
++				 &device->subdevice);
++}
++
++static int
++r535_gsp_device_ctor(struct nvkm_gsp_client *client, struct nvkm_gsp_device *device)
++{
++	NV0080_ALLOC_PARAMETERS *args;
++	int ret;
++
++	args = nvkm_gsp_rm_alloc_get(&client->object, 0xde1d0000, NV01_DEVICE_0, sizeof(*args),
++				     &device->object);
++	if (IS_ERR(args))
++		return PTR_ERR(args);
++
++	args->hClientShare = client->object.handle;
++
++	ret = nvkm_gsp_rm_alloc_wr(&device->object, args);
++	if (ret)
++		return ret;
++
++	ret = r535_gsp_subdevice_ctor(device);
++	if (ret)
++		nvkm_gsp_rm_free(&device->object);
++
++	return ret;
++}
++
++const struct nvkm_rm_api_device
++r535_device = {
++	.ctor = r535_gsp_device_ctor,
++	.dtor = r535_gsp_device_dtor,
++	.event.ctor = r535_gsp_device_event_ctor,
++	.event.dtor = r535_gsp_event_dtor,
++};
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/rm.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/rm.c
+index dba1d2058b37..39cc3d0c740c 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/rm.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/rm.c
+@@ -10,4 +10,5 @@ r535_rm = {
+ 	.ctrl = &r535_ctrl,
+ 	.alloc = &r535_alloc,
+ 	.client = &r535_client,
++	.device = &r535_device,
+ };
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/rm.h b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/rm.h
+index c3341631fbd5..20841305fa55 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/rm.h
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/rm.h
+@@ -32,6 +32,17 @@ struct nvkm_rm_api {
+ 		int (*ctor)(struct nvkm_gsp *, struct nvkm_gsp_client *);
+ 		void (*dtor)(struct nvkm_gsp_client *);
+ 	} *client;
++
++	const struct nvkm_rm_api_device {
++		int (*ctor)(struct nvkm_gsp_client *, struct nvkm_gsp_device *);
++		void (*dtor)(struct nvkm_gsp_device *);
++
++		struct {
++			int (*ctor)(struct nvkm_gsp_device *, u32 handle, u32 id,
++				    nvkm_gsp_event_func, struct nvkm_gsp_event *);
++			void (*dtor)(struct nvkm_gsp_event *);
++		} event;
++	} *device;
+ };
+ 
+ extern const struct nvkm_rm_api r535_rm;
+@@ -39,4 +50,5 @@ extern const struct nvkm_rm_api_rpc r535_rpc;
+ extern const struct nvkm_rm_api_ctrl r535_ctrl;
+ extern const struct nvkm_rm_api_alloc r535_alloc;
+ extern const struct nvkm_rm_api_client r535_client;
++extern const struct nvkm_rm_api_device r535_device;
+ #endif
+-- 
+2.52.0
+
