@@ -1,0 +1,112 @@
+From 2930db123f510651752b50db2d30d60fc965a472 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jouni=20H=C3=B6gander?= <jouni.hogander@intel.com>
+Date: Wed, 23 Apr 2025 13:27:03 +0300
+Subject: drm/i915/display: Ensure enough lines between delayed VBlank and
+ VBlank
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 2930db123f510651752b50db2d30d60fc965a472
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+To deterministically capture the transition of the state machine going from
+SRDOFFACK to IDLE, the delayed V. Blank should be at least one line after
+the non-delayed V. Blank.
+
+Ensure this by adding new interface into intel_psr to query number of lines
+needed for vblank delay and call it from intel_crtc_vblank_delay.
+
+V3: use existing intel_crtc_vblank_delay mechanism
+V2: apply limits only when needed (VRR TG vs. Legacy TG)
+
+Bspec: 69897
+Signed-off-by: Jouni Högander <jouni.hogander@intel.com>
+Reviewed-by: Arun R Murthy <arun.r.murthy@intel.com>
+Link: https://lore.kernel.org/r/20250423102704.1368310-1-jouni.hogander@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/intel_display.c |  2 +
+ drivers/gpu/drm/i915/display/intel_psr.c     | 39 ++++++++++++++++++++
+ drivers/gpu/drm/i915/display/intel_psr.h     |  1 +
+ 3 files changed, 42 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index 58845b74f17d..a4445a29927c 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -2426,6 +2426,8 @@ static int intel_crtc_vblank_delay(const struct intel_crtc_state *crtc_state)
+ 	if (intel_crtc_needs_wa_14015401596(crtc_state))
+ 		vblank_delay = max(vblank_delay, 1);
+ 
++	vblank_delay = max(vblank_delay, intel_psr_min_vblank_delay(crtc_state));
++
+ 	return vblank_delay;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/display/intel_psr.c b/drivers/gpu/drm/i915/display/intel_psr.c
+index cc0cec0e85e9..af76c1db86cd 100644
+--- a/drivers/gpu/drm/i915/display/intel_psr.c
++++ b/drivers/gpu/drm/i915/display/intel_psr.c
+@@ -2348,6 +2348,45 @@ void intel_psr_trigger_frame_change_event(struct intel_dsb *dsb,
+ 				   CURSURFLIVE(display, crtc->pipe), 0);
+ }
+ 
++/**
++ * intel_psr_min_vblank_delay - Minimum vblank delay needed by PSR
++ * @crtc_state: the crtc state
++ *
++ * Return minimum vblank delay needed by PSR.
++ */
++int intel_psr_min_vblank_delay(const struct intel_crtc_state *crtc_state)
++{
++	struct intel_display *display = to_intel_display(crtc_state);
++
++	if (!crtc_state->has_psr || DISPLAY_VER(display) < 20)
++		return 0;
++
++	/*
++	 * Comment on SRD_STATUS register in Bspec for LunarLake and onwards:
++	 *
++	 * To deterministically capture the transition of the state machine
++	 * going from SRDOFFACK to IDLE, the delayed V. Blank should be at least
++	 * one line after the non-delayed V. Blank.
++	 *
++	 * Legacy TG: TRANS_SET_CONTEXT_LATENCY > 0
++	 * VRR TG: TRANS_VRR_CTL[ VRR Guardband ] < (TRANS_VRR_VMAX[ VRR Vmax ]
++	 * - TRANS_VTOTAL[ Vertical Active ])
++	 *
++	 * SRD_STATUS is used only by PSR1 on PantherLake.
++	 * SRD_STATUS is used by PSR1 and Panel Replay DP on LunarLake.
++	 */
++
++	if (DISPLAY_VER(display) >= 30 && (crtc_state->has_panel_replay ||
++					   crtc_state->has_sel_update))
++		return 0;
++	else if (DISPLAY_VER(display) < 30 && (crtc_state->has_sel_update ||
++					       intel_crtc_has_type(crtc_state,
++								   INTEL_OUTPUT_EDP)))
++		return 0;
++	else
++		return 1;
++}
++
+ static u32 man_trk_ctl_enable_bit_get(struct intel_display *display)
+ {
+ 	return display->platform.alderlake_p || DISPLAY_VER(display) >= 14 ? 0 :
+diff --git a/drivers/gpu/drm/i915/display/intel_psr.h b/drivers/gpu/drm/i915/display/intel_psr.h
+index 601e47ad3297..73c3fa40844b 100644
+--- a/drivers/gpu/drm/i915/display/intel_psr.h
++++ b/drivers/gpu/drm/i915/display/intel_psr.h
+@@ -73,6 +73,7 @@ void intel_psr_unlock(const struct intel_crtc_state *crtc_state);
+ void intel_psr_trigger_frame_change_event(struct intel_dsb *dsb,
+ 					  struct intel_atomic_state *state,
+ 					  struct intel_crtc *crtc);
++int intel_psr_min_vblank_delay(const struct intel_crtc_state *crtc_state);
+ void intel_psr_connector_debugfs_add(struct intel_connector *connector);
+ void intel_psr_debugfs_register(struct intel_display *display);
+ bool intel_psr_needs_alpm(struct intel_dp *intel_dp, const struct intel_crtc_state *crtc_state);
+-- 
+2.52.0
+
