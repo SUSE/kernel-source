@@ -1,0 +1,163 @@
+From: Sean Christopherson <seanjc@google.com>
+Date: Thu, 30 Oct 2025 13:09:46 -0700
+Subject: KVM: TDX: Convert INIT_MEM_REGION and INIT_VCPU to "unlocked" vCPU
+ ioctl
+Git-commit: 94428e3ba3258fc2862db3f9999e548d5a2d2a2a
+Patch-mainline: v6.19-rc1
+References: git-fixes
+
+Handle the KVM_TDX_INIT_MEM_REGION and KVM_TDX_INIT_VCPU vCPU sub-ioctls
+in the unlocked variant, i.e. outside of vcpu->mutex, in anticipation of
+taking kvm->lock along with all other vCPU mutexes, at which point the
+sub-ioctls _must_ start without vcpu->mutex held.
+
+No functional change intended.
+
+Reviewed-by: Kai Huang <kai.huang@intel.com>
+Co-developed-by: Yan Zhao <yan.y.zhao@intel.com>
+Signed-off-by: Yan Zhao <yan.y.zhao@intel.com>
+Reviewed-by: Binbin Wu <binbin.wu@linux.intel.com>
+Reviewed-by: Yan Zhao <yan.y.zhao@intel.com>
+Tested-by: Yan Zhao <yan.y.zhao@intel.com>
+Tested-by: Kai Huang <kai.huang@intel.com>
+Link: https://patch.msgid.link/20251030200951.3402865-24-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Acked-by: Nikolay Borisov <nik.borisov@suse.com>
+---
+ arch/x86/include/asm/kvm-x86-ops.h |    1 
+ arch/x86/include/asm/kvm_host.h    |    1 
+ arch/x86/kvm/vmx/main.c            |    9 +++++++
+ arch/x86/kvm/vmx/tdx.c             |   42 +++++++++++++++++++++++++++++++------
+ arch/x86/kvm/vmx/x86_ops.h         |    1 
+ arch/x86/kvm/x86.c                 |    7 ++++++
+ 6 files changed, 55 insertions(+), 6 deletions(-)
+
+--- a/arch/x86/include/asm/kvm-x86-ops.h
++++ b/arch/x86/include/asm/kvm-x86-ops.h
+@@ -128,6 +128,7 @@ KVM_X86_OP(enable_smi_window)
+ KVM_X86_OP_OPTIONAL(dev_get_attr)
+ KVM_X86_OP_OPTIONAL(mem_enc_ioctl)
+ KVM_X86_OP_OPTIONAL(vcpu_mem_enc_ioctl)
++KVM_X86_OP_OPTIONAL(vcpu_mem_enc_unlocked_ioctl)
+ KVM_X86_OP_OPTIONAL(mem_enc_register_region)
+ KVM_X86_OP_OPTIONAL(mem_enc_unregister_region)
+ KVM_X86_OP_OPTIONAL(vm_copy_enc_context_from)
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1876,6 +1876,7 @@ struct kvm_x86_ops {
+ 	int (*dev_get_attr)(u32 group, u64 attr, u64 *val);
+ 	int (*mem_enc_ioctl)(struct kvm *kvm, void __user *argp);
+ 	int (*vcpu_mem_enc_ioctl)(struct kvm_vcpu *vcpu, void __user *argp);
++	int (*vcpu_mem_enc_unlocked_ioctl)(struct kvm_vcpu *vcpu, void __user *argp);
+ 	int (*mem_enc_register_region)(struct kvm *kvm, struct kvm_enc_region *argp);
+ 	int (*mem_enc_unregister_region)(struct kvm *kvm, struct kvm_enc_region *argp);
+ 	int (*vm_copy_enc_context_from)(struct kvm *kvm, unsigned int source_fd);
+--- a/arch/x86/kvm/vmx/main.c
++++ b/arch/x86/kvm/vmx/main.c
+@@ -831,6 +831,14 @@ static int vt_vcpu_mem_enc_ioctl(struct
+ 	return tdx_vcpu_ioctl(vcpu, argp);
+ }
+ 
++static int vt_vcpu_mem_enc_unlocked_ioctl(struct kvm_vcpu *vcpu, void __user *argp)
++{
++	if (!is_td_vcpu(vcpu))
++		return -EINVAL;
++
++	return tdx_vcpu_unlocked_ioctl(vcpu, argp);
++}
++
+ static int vt_gmem_private_max_mapping_level(struct kvm *kvm, kvm_pfn_t pfn)
+ {
+ 	if (is_td(kvm))
+@@ -1004,6 +1012,7 @@ struct kvm_x86_ops vt_x86_ops __initdata
+ 
+ 	.mem_enc_ioctl = vt_op_tdx_only(mem_enc_ioctl),
+ 	.vcpu_mem_enc_ioctl = vt_op_tdx_only(vcpu_mem_enc_ioctl),
++	.vcpu_mem_enc_unlocked_ioctl = vt_op_tdx_only(vcpu_mem_enc_unlocked_ioctl),
+ 
+ 	.private_max_mapping_level = vt_op_tdx_only(gmem_private_max_mapping_level)
+ };
+--- a/arch/x86/kvm/vmx/tdx.c
++++ b/arch/x86/kvm/vmx/tdx.c
+@@ -3176,6 +3176,42 @@ static int tdx_vcpu_init_mem_region(stru
+ 	return ret;
+ }
+ 
++int tdx_vcpu_unlocked_ioctl(struct kvm_vcpu *vcpu, void __user *argp)
++{
++	struct kvm_tdx *kvm_tdx = to_kvm_tdx(vcpu->kvm);
++	struct kvm_tdx_cmd cmd;
++	int r;
++
++	r = tdx_get_cmd(argp, &cmd);
++	if (r)
++		return r;
++
++	if (!is_hkid_assigned(kvm_tdx) || kvm_tdx->state == TD_STATE_RUNNABLE)
++		return -EINVAL;
++
++	if (mutex_lock_killable(&vcpu->mutex))
++		return -EINTR;
++
++	vcpu_load(vcpu);
++
++	switch (cmd.id) {
++	case KVM_TDX_INIT_MEM_REGION:
++		r = tdx_vcpu_init_mem_region(vcpu, &cmd);
++		break;
++	case KVM_TDX_INIT_VCPU:
++		r = tdx_vcpu_init(vcpu, &cmd);
++		break;
++	default:
++		r = -ENOIOCTLCMD;
++		break;
++	}
++
++	vcpu_put(vcpu);
++
++	mutex_unlock(&vcpu->mutex);
++	return r;
++}
++
+ int tdx_vcpu_ioctl(struct kvm_vcpu *vcpu, void __user *argp)
+ {
+ 	struct kvm_tdx *kvm_tdx = to_kvm_tdx(vcpu->kvm);
+@@ -3190,12 +3226,6 @@ int tdx_vcpu_ioctl(struct kvm_vcpu *vcpu
+ 		return ret;
+ 
+ 	switch (cmd.id) {
+-	case KVM_TDX_INIT_VCPU:
+-		ret = tdx_vcpu_init(vcpu, &cmd);
+-		break;
+-	case KVM_TDX_INIT_MEM_REGION:
+-		ret = tdx_vcpu_init_mem_region(vcpu, &cmd);
+-		break;
+ 	case KVM_TDX_GET_CPUID:
+ 		ret = tdx_vcpu_get_cpuid(vcpu, &cmd);
+ 		break;
+--- a/arch/x86/kvm/vmx/x86_ops.h
++++ b/arch/x86/kvm/vmx/x86_ops.h
+@@ -149,6 +149,7 @@ int tdx_get_msr(struct kvm_vcpu *vcpu, s
+ int tdx_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr);
+ 
+ int tdx_vcpu_ioctl(struct kvm_vcpu *vcpu, void __user *argp);
++int tdx_vcpu_unlocked_ioctl(struct kvm_vcpu *vcpu, void __user *argp);
+ 
+ void tdx_flush_tlb_current(struct kvm_vcpu *vcpu);
+ void tdx_flush_tlb_all(struct kvm_vcpu *vcpu);
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -7062,6 +7062,13 @@ static int kvm_vm_ioctl_set_clock(struct
+ long kvm_arch_vcpu_unlocked_ioctl(struct file *filp, unsigned int ioctl,
+ 				  unsigned long arg)
+ {
++	struct kvm_vcpu *vcpu = filp->private_data;
++	void __user *argp = (void __user *)arg;
++
++	if (ioctl == KVM_MEMORY_ENCRYPT_OP &&
++	    kvm_x86_ops.vcpu_mem_enc_unlocked_ioctl)
++		return kvm_x86_call(vcpu_mem_enc_unlocked_ioctl)(vcpu, argp);
++
+ 	return -ENOIOCTLCMD;
+ }
+ 

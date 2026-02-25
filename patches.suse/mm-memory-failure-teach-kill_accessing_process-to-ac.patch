@@ -1,0 +1,86 @@
+From 057a6f2632c956483e2b2628477f0fcd1cd8a844 Mon Sep 17 00:00:00 2001
+From: Jane Chu <jane.chu@oracle.com>
+Date: Tue, 20 Jan 2026 16:22:34 -0700
+Subject: [PATCH] mm/memory-failure: teach kill_accessing_process to accept
+ hugetlb tail page pfn
+Patch-mainline: v6.19-rc8
+Git-commit: 057a6f2632c956483e2b2628477f0fcd1cd8a844
+References: git-fixes
+
+When a hugetlb folio is being poisoned again, try_memory_failure_hugetlb()
+passed head pfn to kill_accessing_process(), that is not right.  The
+precise pfn of the poisoned page should be used in order to determine the
+precise vaddr as the SIGBUS payload.
+
+This issue has already been taken care of in the normal path, that is,
+hwpoison_user_mappings(), see [1][2].  Further more, for [3] to work
+correctly in the hugetlb repoisoning case, it's essential to inform VM the
+precise poisoned page, not the head page.
+
+[1] https://lkml.kernel.org/r/20231218135837.3310403-1-willy@infradead.org
+[2] https://lkml.kernel.org/r/20250224211445.2663312-1-jane.chu@oracle.com
+[3] https://lore.kernel.org/lkml/20251116013223.1557158-1-jiaqiyan@google.com/
+
+Link: https://lkml.kernel.org/r/20260120232234.3462258-2-jane.chu@oracle.com
+Signed-off-by: Jane Chu <jane.chu@oracle.com>
+Reviewed-by: Liam R. Howlett <Liam.Howlett@oracle.com>
+Acked-by: Miaohe Lin <linmiaohe@huawei.com>
+Acked-by: Oscar Salvador <osalvador@suse.de>
+Cc: Chris Mason <clm@meta.com>
+Cc: David Hildenbrand <david@kernel.org>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Jiaqi Yan <jiaqiyan@google.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Naoya Horiguchi <nao.horiguchi@gmail.com>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: William Roche <william.roche@oracle.com>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+ mm/memory-failure.c |   14 ++++++++------
+ 1 file changed, 8 insertions(+), 6 deletions(-)
+
+--- a/mm/memory-failure.c
++++ b/mm/memory-failure.c
+@@ -754,6 +754,8 @@ static int check_hwpoisoned_entry(pte_t
+ 				unsigned long poisoned_pfn, struct to_kill *tk)
+ {
+ 	unsigned long pfn = 0;
++	unsigned long hwpoison_vaddr;
++	unsigned long mask;
+ 
+ 	if (pte_present(pte)) {
+ 		pfn = pte_pfn(pte);
+@@ -764,10 +766,12 @@ static int check_hwpoisoned_entry(pte_t
+ 			pfn = swp_offset_pfn(swp);
+ 	}
+ 
+-	if (!pfn || pfn != poisoned_pfn)
++	mask = ~((1UL << (shift - PAGE_SHIFT)) - 1);
++	if (!pfn || pfn != (poisoned_pfn & mask))
+ 		return 0;
+ 
+-	set_to_kill(tk, addr, shift);
++	hwpoison_vaddr = addr + ((poisoned_pfn - pfn) << PAGE_SHIFT);
++	set_to_kill(tk, hwpoison_vaddr, shift);
+ 	return 1;
+ }
+ 
+@@ -2075,10 +2079,8 @@ retry:
+ 		*hugetlb = 0;
+ 		return 0;
+ 	} else if (res == -EHWPOISON) {
+-		if (flags & MF_ACTION_REQUIRED) {
+-			folio = page_folio(p);
+-			res = kill_accessing_process(current, folio_pfn(folio), flags);
+-		}
++		if (flags & MF_ACTION_REQUIRED)
++			res = kill_accessing_process(current, pfn, flags);
+ 		action_result(pfn, MF_MSG_ALREADY_POISONED, MF_FAILED);
+ 		return res;
+ 	} else if (res == -EBUSY) {

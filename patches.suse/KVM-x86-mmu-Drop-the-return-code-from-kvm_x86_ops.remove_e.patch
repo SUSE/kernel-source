@@ -1,0 +1,132 @@
+From: Sean Christopherson <seanjc@google.com>
+Date: Thu, 30 Oct 2025 13:09:34 -0700
+Subject: KVM: x86/mmu: Drop the return code from
+ kvm_x86_ops.remove_external_spte()
+Git-commit: 7139c860650535cf517a9344212ce56a21ba37f5
+Patch-mainline: v6.19-rc1
+References: git-fixes
+
+Drop the return code from kvm_x86_ops.remove_external_spte(), a.k.a.
+tdx_sept_remove_private_spte(), as KVM simply does a KVM_BUG_ON() failure,
+and that KVM_BUG_ON() is redundant since all error paths in TDX also do a
+KVM_BUG_ON().
+
+Opportunistically pass the spte instead of the pfn, as the API is clearly
+about removing an spte.
+
+Suggested-by: Rick Edgecombe <rick.p.edgecombe@intel.com>
+Reviewed-by: Binbin Wu <binbin.wu@linux.intel.com>
+Reviewed-by: Kai Huang <kai.huang@intel.com>
+Reviewed-by: Yan Zhao <yan.y.zhao@intel.com>
+Tested-by: Yan Zhao <yan.y.zhao@intel.com>
+Tested-by: Kai Huang <kai.huang@intel.com>
+Link: https://patch.msgid.link/20251030200951.3402865-12-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Acked-by: Nikolay Borisov <nik.borisov@suse.com>
+---
+ arch/x86/include/asm/kvm_host.h |  4 ++--
+ arch/x86/kvm/mmu/tdp_mmu.c      |  8 ++------
+ arch/x86/kvm/vmx/tdx.c          | 17 ++++++++---------
+ 3 files changed, 12 insertions(+), 17 deletions(-)
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 48598d017d6f..b5867f8fe6ce 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1855,8 +1855,8 @@ struct kvm_x86_ops {
+ 				 void *external_spt);
+ 
+ 	/* Update external page table from spte getting removed, and flush TLB. */
+-	int (*remove_external_spte)(struct kvm *kvm, gfn_t gfn, enum pg_level level,
+-				    kvm_pfn_t pfn_for_gfn);
++	void (*remove_external_spte)(struct kvm *kvm, gfn_t gfn, enum pg_level level,
++				     u64 mirror_spte);
+ 
+ 	bool (*has_wbinvd_exit)(void);
+ 
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.c b/arch/x86/kvm/mmu/tdp_mmu.c
+index e735d2f8367b..e1a96e9ea1bb 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@ -362,9 +362,6 @@ static void tdp_mmu_unlink_sp(struct kvm *kvm, struct kvm_mmu_page *sp)
+ static void remove_external_spte(struct kvm *kvm, gfn_t gfn, u64 old_spte,
+ 				 int level)
+ {
+-	kvm_pfn_t old_pfn = spte_to_pfn(old_spte);
+-	int ret;
+-
+ 	/*
+ 	 * External (TDX) SPTEs are limited to PG_LEVEL_4K, and external
+ 	 * PTs are removed in a special order, involving free_external_spt().
+@@ -377,9 +374,8 @@ static void remove_external_spte(struct kvm *kvm, gfn_t gfn, u64 old_spte,
+ 
+ 	/* Zapping leaf spte is allowed only when write lock is held. */
+ 	lockdep_assert_held_write(&kvm->mmu_lock);
+-	/* Because write lock is held, operation should success. */
+-	ret = kvm_x86_call(remove_external_spte)(kvm, gfn, level, old_pfn);
+-	KVM_BUG_ON(ret, kvm);
++
++	kvm_x86_call(remove_external_spte)(kvm, gfn, level, old_spte);
+ }
+ 
+ /**
+diff --git a/arch/x86/kvm/vmx/tdx.c b/arch/x86/kvm/vmx/tdx.c
+index 667cd089eec8..247c35164565 100644
+--- a/arch/x86/kvm/vmx/tdx.c
++++ b/arch/x86/kvm/vmx/tdx.c
+@@ -1806,12 +1806,12 @@ static int tdx_sept_free_private_spt(struct kvm *kvm, gfn_t gfn,
+ 	return tdx_reclaim_page(virt_to_page(private_spt));
+ }
+ 
+-static int tdx_sept_remove_private_spte(struct kvm *kvm, gfn_t gfn,
+-					enum pg_level level, kvm_pfn_t pfn)
++static void tdx_sept_remove_private_spte(struct kvm *kvm, gfn_t gfn,
++					 enum pg_level level, u64 mirror_spte)
+ {
++	struct page *page = pfn_to_page(spte_to_pfn(mirror_spte));
+ 	int tdx_level = pg_level_to_tdx_sept_level(level);
+ 	struct kvm_tdx *kvm_tdx = to_kvm_tdx(kvm);
+-	struct page *page = pfn_to_page(pfn);
+ 	gpa_t gpa = gfn_to_gpa(gfn);
+ 	u64 err, entry, level_state;
+ 	int ret;
+@@ -1822,15 +1822,15 @@ static int tdx_sept_remove_private_spte(struct kvm *kvm, gfn_t gfn,
+ 	 * there can't be anything populated in the private EPT.
+ 	 */
+ 	if (KVM_BUG_ON(!is_hkid_assigned(to_kvm_tdx(kvm)), kvm))
+-		return -EIO;
++		return;
+ 
+ 	/* TODO: handle large pages. */
+ 	if (KVM_BUG_ON(level != PG_LEVEL_4K, kvm))
+-		return -EIO;
++		return;
+ 
+ 	ret = tdx_sept_zap_private_spte(kvm, gfn, level, page);
+ 	if (ret <= 0)
+-		return ret;
++		return;
+ 
+ 	/*
+ 	 * TDX requires TLB tracking before dropping private page.  Do
+@@ -1859,17 +1859,16 @@ static int tdx_sept_remove_private_spte(struct kvm *kvm, gfn_t gfn,
+ 
+ 	if (KVM_BUG_ON(err, kvm)) {
+ 		pr_tdx_error_2(TDH_MEM_PAGE_REMOVE, err, entry, level_state);
+-		return -EIO;
++		return;
+ 	}
+ 
+ 	err = tdh_phymem_page_wbinvd_hkid((u16)kvm_tdx->hkid, page);
+ 	if (KVM_BUG_ON(err, kvm)) {
+ 		pr_tdx_error(TDH_PHYMEM_PAGE_WBINVD, err);
+-		return -EIO;
++		return;
+ 	}
+ 
+ 	tdx_quirk_reset_page(page);
+-	return 0;
+ }
+ 
+ void tdx_deliver_interrupt(struct kvm_lapic *apic, int delivery_mode,
+

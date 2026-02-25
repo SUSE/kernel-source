@@ -1,0 +1,86 @@
+From: Sean Christopherson <seanjc@google.com>
+Date: Thu, 30 Oct 2025 13:09:35 -0700
+Subject: KVM: TDX: WARN if mirror SPTE doesn't have full RWX when creating
+ S-EPT mapping
+Git-commit: b9d5cf6de0b6bd3bdd8957b5fea5a243e43c928f
+Patch-mainline: v6.19-rc1
+References: git-fixes
+
+Pass in the mirror_spte to kvm_x86_ops.set_external_spte() to provide
+symmetry with .remove_external_spte(), and assert in TDX that the mirror
+SPTE is shadow-present with full RWX permissions (the TDX-Module doesn't
+allow the hypervisor to control protections).
+
+Reviewed-by: Binbin Wu <binbin.wu@linux.intel.com>
+Reviewed-by: Kai Huang <kai.huang@intel.com>
+Reviewed-by: Yan Zhao <yan.y.zhao@intel.com>
+Tested-by: Yan Zhao <yan.y.zhao@intel.com>
+Tested-by: Kai Huang <kai.huang@intel.com>
+Link: https://patch.msgid.link/20251030200951.3402865-13-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Acked-by: Nikolay Borisov <nik.borisov@suse.com>
+---
+ arch/x86/include/asm/kvm_host.h | 2 +-
+ arch/x86/kvm/mmu/tdp_mmu.c      | 3 +--
+ arch/x86/kvm/vmx/tdx.c          | 6 +++++-
+ 3 files changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index b5867f8fe6ce..87a5f5100b1d 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1848,7 +1848,7 @@ struct kvm_x86_ops {
+ 				void *external_spt);
+ 	/* Update the external page table from spte getting set. */
+ 	int (*set_external_spte)(struct kvm *kvm, gfn_t gfn, enum pg_level level,
+-				 kvm_pfn_t pfn_for_gfn);
++				 u64 mirror_spte);
+ 
+ 	/* Update external page tables for page table about to be freed. */
+ 	int (*free_external_spt)(struct kvm *kvm, gfn_t gfn, enum pg_level level,
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.c b/arch/x86/kvm/mmu/tdp_mmu.c
+index e1a96e9ea1bb..9c26038f6b77 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@ -515,7 +515,6 @@ static int __must_check set_external_spte_present(struct kvm *kvm, tdp_ptep_t sp
+ 	bool was_present = is_shadow_present_pte(old_spte);
+ 	bool is_present = is_shadow_present_pte(new_spte);
+ 	bool is_leaf = is_present && is_last_spte(new_spte, level);
+-	kvm_pfn_t new_pfn = spte_to_pfn(new_spte);
+ 	int ret = 0;
+ 
+ 	KVM_BUG_ON(was_present, kvm);
+@@ -534,7 +533,7 @@ static int __must_check set_external_spte_present(struct kvm *kvm, tdp_ptep_t sp
+ 	 * external page table, or leaf.
+ 	 */
+ 	if (is_leaf) {
+-		ret = kvm_x86_call(set_external_spte)(kvm, gfn, level, new_pfn);
++		ret = kvm_x86_call(set_external_spte)(kvm, gfn, level, new_spte);
+ 	} else {
+ 		void *external_spt = get_external_spt(gfn, new_spte, level);
+ 
+diff --git a/arch/x86/kvm/vmx/tdx.c b/arch/x86/kvm/vmx/tdx.c
+index 247c35164565..1315fd9fdd6e 100644
+--- a/arch/x86/kvm/vmx/tdx.c
++++ b/arch/x86/kvm/vmx/tdx.c
+@@ -1629,14 +1629,18 @@ static int tdx_mem_page_record_premap_cnt(struct kvm *kvm, gfn_t gfn,
+ }
+ 
+ static int tdx_sept_set_private_spte(struct kvm *kvm, gfn_t gfn,
+-				     enum pg_level level, kvm_pfn_t pfn)
++				     enum pg_level level, u64 mirror_spte)
+ {
+ 	struct kvm_tdx *kvm_tdx = to_kvm_tdx(kvm);
++	kvm_pfn_t pfn = spte_to_pfn(mirror_spte);
+ 
+ 	/* TODO: handle large pages. */
+ 	if (KVM_BUG_ON(level != PG_LEVEL_4K, kvm))
+ 		return -EIO;
+ 
++	WARN_ON_ONCE(!is_shadow_present_pte(mirror_spte) ||
++		     (mirror_spte & VMX_EPT_RWX_MASK) != VMX_EPT_RWX_MASK);
++
+ 	/*
+ 	 * Read 'pre_fault_allowed' before 'kvm_tdx->state'; see matching
+ 	 * barrier in tdx_td_finalize().
+
