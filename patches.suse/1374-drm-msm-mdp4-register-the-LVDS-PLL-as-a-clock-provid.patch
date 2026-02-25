@@ -1,0 +1,122 @@
+From 9c2f63da6a70d38c32fd1ea3126be0c2989a6d1d Mon Sep 17 00:00:00 2001
+From: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Date: Fri, 25 Apr 2025 12:51:53 +0300
+Subject: drm/msm/mdp4: register the LVDS PLL as a clock provider
+Git-commit: 9c2f63da6a70d38c32fd1ea3126be0c2989a6d1d
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+The LVDS/LCDC controller uses pixel clock coming from the multimedia
+controller (mmcc) rather than using the PLL directly. Stop using LVDS
+PLL directly and register it as a clock provider. Use lcdc_clk as a
+pixel clock for the LCDC.
+
+Reviewed-by: Konrad Dybcio <konrad.dybcio@oss.qualcomm.com>
+Signed-off-by: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Reviewed-by: Abhinav Kumar <quic_abhinavk@quicinc.com>
+Patchwork: https://patchwork.freedesktop.org/patch/650280/
+Link: https://lore.kernel.org/r/20250425-fd-mdp4-lvds-v4-3-6b212160b44c@oss.qualcomm.com
+Signed-off-by: Dmitry Baryshkov <dmitry.baryshkov@oss.qualcomm.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/msm/disp/mdp4/mdp4_kms.h      |  2 +-
+ .../gpu/drm/msm/disp/mdp4/mdp4_lcdc_encoder.c |  3 +-
+ drivers/gpu/drm/msm/disp/mdp4/mdp4_lvds_pll.c | 45 +++++++++++++------
+ 3 files changed, 34 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/disp/mdp4/mdp4_kms.h b/drivers/gpu/drm/msm/disp/mdp4/mdp4_kms.h
+index 142ccb68b435..3d7ffd874e0d 100644
+--- a/drivers/gpu/drm/msm/disp/mdp4/mdp4_kms.h
++++ b/drivers/gpu/drm/msm/disp/mdp4/mdp4_kms.h
+@@ -207,6 +207,6 @@ static inline struct drm_encoder *mdp4_dsi_encoder_init(struct drm_device *dev)
+ }
+ #endif
+ 
+-struct clk *mpd4_lvds_pll_init(struct drm_device *dev);
++struct clk *mpd4_get_lcdc_clock(struct drm_device *dev);
+ 
+ #endif /* __MDP4_KMS_H__ */
+diff --git a/drivers/gpu/drm/msm/disp/mdp4/mdp4_lcdc_encoder.c b/drivers/gpu/drm/msm/disp/mdp4/mdp4_lcdc_encoder.c
+index 8bbc7fb881d5..8694e5d7d3f0 100644
+--- a/drivers/gpu/drm/msm/disp/mdp4/mdp4_lcdc_encoder.c
++++ b/drivers/gpu/drm/msm/disp/mdp4/mdp4_lcdc_encoder.c
+@@ -380,8 +380,7 @@ struct drm_encoder *mdp4_lcdc_encoder_init(struct drm_device *dev,
+ 
+ 	drm_encoder_helper_add(encoder, &mdp4_lcdc_encoder_helper_funcs);
+ 
+-	/* TODO: do we need different pll in other cases? */
+-	mdp4_lcdc_encoder->lcdc_clk = mpd4_lvds_pll_init(dev);
++	mdp4_lcdc_encoder->lcdc_clk = mpd4_get_lcdc_clock(dev);
+ 	if (IS_ERR(mdp4_lcdc_encoder->lcdc_clk)) {
+ 		DRM_DEV_ERROR(dev->dev, "failed to get lvds_clk\n");
+ 		return ERR_CAST(mdp4_lcdc_encoder->lcdc_clk);
+diff --git a/drivers/gpu/drm/msm/disp/mdp4/mdp4_lvds_pll.c b/drivers/gpu/drm/msm/disp/mdp4/mdp4_lvds_pll.c
+index ab8c0c187fb2..df2bbd475cc2 100644
+--- a/drivers/gpu/drm/msm/disp/mdp4/mdp4_lvds_pll.c
++++ b/drivers/gpu/drm/msm/disp/mdp4/mdp4_lvds_pll.c
+@@ -133,29 +133,48 @@ static struct clk_init_data pll_init = {
+ 	.num_parents = ARRAY_SIZE(mpd4_lvds_pll_parents),
+ };
+ 
+-struct clk *mpd4_lvds_pll_init(struct drm_device *dev)
++static struct clk_hw *mpd4_lvds_pll_init(struct drm_device *dev)
+ {
+ 	struct mdp4_lvds_pll *lvds_pll;
+-	struct clk *clk;
+ 	int ret;
+ 
+ 	lvds_pll = devm_kzalloc(dev->dev, sizeof(*lvds_pll), GFP_KERNEL);
+-	if (!lvds_pll) {
+-		ret = -ENOMEM;
+-		goto fail;
+-	}
++	if (!lvds_pll)
++		return ERR_PTR(-ENOMEM);
+ 
+ 	lvds_pll->dev = dev;
+ 
+ 	lvds_pll->pll_hw.init = &pll_init;
+-	clk = devm_clk_register(dev->dev, &lvds_pll->pll_hw);
+-	if (IS_ERR(clk)) {
+-		ret = PTR_ERR(clk);
+-		goto fail;
++	ret = devm_clk_hw_register(dev->dev, &lvds_pll->pll_hw);
++	if (ret)
++		return ERR_PTR(ret);
++
++	ret = devm_of_clk_add_hw_provider(dev->dev, of_clk_hw_simple_get, &lvds_pll->pll_hw);
++	if (ret)
++		return ERR_PTR(ret);
++
++	return &lvds_pll->pll_hw;
++}
++
++struct clk *mpd4_get_lcdc_clock(struct drm_device *dev)
++{
++	struct clk_hw *hw;
++	struct clk *clk;
++
++
++	/* TODO: do we need different pll in other cases? */
++	hw = mpd4_lvds_pll_init(dev);
++	if (IS_ERR(hw)) {
++		DRM_DEV_ERROR(dev->dev, "failed to register LVDS PLL\n");
++		return ERR_CAST(hw);
+ 	}
+ 
+-	return clk;
++	clk = devm_clk_get(dev->dev, "lcdc_clk");
++	if (clk == ERR_PTR(-ENOENT)) {
++		drm_warn(dev, "can't get LCDC clock, using PLL directly\n");
+ 
+-fail:
+-	return ERR_PTR(ret);
++		return devm_clk_hw_get_clk(dev->dev, hw, "lcdc_clk");
++	}
++
++	return clk;
+ }
+-- 
+2.52.0
+
