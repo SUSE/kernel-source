@@ -1,0 +1,295 @@
+From ac4a1f7f13309f8235a0c4719c34094de3303dfd Mon Sep 17 00:00:00 2001
+From: Arunpravin Paneer Selvam <Arunpravin.PaneerSelvam@amd.com>
+Date: Wed, 30 Oct 2024 10:46:49 +0530
+Subject: drm/amdgpu: Remove the MES self test
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: ac4a1f7f13309f8235a0c4719c34094de3303dfd
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Remove MES self test as this conflicts the userqueue fence
+interrupts.
+
+v2:(Christian)
+  - remove the amdgpu_mes_self_test() function and any now unused code.
+
+Signed-off-by: Arunpravin Paneer Selvam <Arunpravin.PaneerSelvam@amd.com>
+Acked-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c |   3 -
+ drivers/gpu/drm/amd/amdgpu/amdgpu_mes.c    | 169 ---------------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_mes.h    |   2 -
+ drivers/gpu/drm/amd/amdgpu/mes_v11_0.c     |  14 +-
+ drivers/gpu/drm/amd/amdgpu/mes_v12_0.c     |  13 +-
+ 5 files changed, 2 insertions(+), 199 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 13c5b6f68d48..c0329ac03cc6 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -5129,9 +5129,6 @@ int amdgpu_device_resume(struct drm_device *dev, bool notify_clients)
+ 	}
+ 	adev->in_suspend = false;
+ 
+-	if (adev->enable_mes)
+-		amdgpu_mes_self_test(adev);
+-
+ 	if (amdgpu_acpi_smart_shift_update(dev, AMDGPU_SS_DEV_D0))
+ 		DRM_WARN("smart shift update failed\n");
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_mes.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_mes.c
+index f8202e6ed4b1..acdca3110c24 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_mes.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_mes.c
+@@ -1405,175 +1405,6 @@ int amdgpu_mes_ctx_unmap_meta_data(struct amdgpu_device *adev,
+ 	return r;
+ }
+ 
+-static int amdgpu_mes_test_create_gang_and_queues(struct amdgpu_device *adev,
+-					  int pasid, int *gang_id,
+-					  int queue_type, int num_queue,
+-					  struct amdgpu_ring **added_rings,
+-					  struct amdgpu_mes_ctx_data *ctx_data)
+-{
+-	struct amdgpu_ring *ring;
+-	struct amdgpu_mes_gang_properties gprops = {0};
+-	int r, j;
+-
+-	/* create a gang for the process */
+-	gprops.priority = AMDGPU_MES_PRIORITY_LEVEL_NORMAL;
+-	gprops.gang_quantum = adev->mes.default_gang_quantum;
+-	gprops.inprocess_gang_priority = AMDGPU_MES_PRIORITY_LEVEL_NORMAL;
+-	gprops.priority_level = AMDGPU_MES_PRIORITY_LEVEL_NORMAL;
+-	gprops.global_priority_level = AMDGPU_MES_PRIORITY_LEVEL_NORMAL;
+-
+-	r = amdgpu_mes_add_gang(adev, pasid, &gprops, gang_id);
+-	if (r) {
+-		DRM_ERROR("failed to add gang\n");
+-		return r;
+-	}
+-
+-	/* create queues for the gang */
+-	for (j = 0; j < num_queue; j++) {
+-		r = amdgpu_mes_add_ring(adev, *gang_id, queue_type, j,
+-					ctx_data, &ring);
+-		if (r) {
+-			DRM_ERROR("failed to add ring\n");
+-			break;
+-		}
+-
+-		DRM_INFO("ring %s was added\n", ring->name);
+-		added_rings[j] = ring;
+-	}
+-
+-	return 0;
+-}
+-
+-static int amdgpu_mes_test_queues(struct amdgpu_ring **added_rings)
+-{
+-	struct amdgpu_ring *ring;
+-	int i, r;
+-
+-	for (i = 0; i < AMDGPU_MES_CTX_MAX_RINGS; i++) {
+-		ring = added_rings[i];
+-		if (!ring)
+-			continue;
+-
+-		r = amdgpu_ring_test_helper(ring);
+-		if (r)
+-			return r;
+-
+-		r = amdgpu_ring_test_ib(ring, 1000 * 10);
+-		if (r) {
+-			DRM_DEV_ERROR(ring->adev->dev,
+-				      "ring %s ib test failed (%d)\n",
+-				      ring->name, r);
+-			return r;
+-		} else
+-			DRM_INFO("ring %s ib test pass\n", ring->name);
+-	}
+-
+-	return 0;
+-}
+-
+-int amdgpu_mes_self_test(struct amdgpu_device *adev)
+-{
+-	struct amdgpu_vm *vm = NULL;
+-	struct amdgpu_mes_ctx_data ctx_data = {0};
+-	struct amdgpu_ring *added_rings[AMDGPU_MES_CTX_MAX_RINGS] = { NULL };
+-	int gang_ids[3] = {0};
+-	int queue_types[][2] = { { AMDGPU_RING_TYPE_GFX, 1 },
+-				 { AMDGPU_RING_TYPE_COMPUTE, 1 },
+-				 { AMDGPU_RING_TYPE_SDMA, 1} };
+-	int i, r, pasid, k = 0;
+-
+-	pasid = amdgpu_pasid_alloc(16);
+-	if (pasid < 0) {
+-		dev_warn(adev->dev, "No more PASIDs available!");
+-		pasid = 0;
+-	}
+-
+-	vm = kzalloc(sizeof(*vm), GFP_KERNEL);
+-	if (!vm) {
+-		r = -ENOMEM;
+-		goto error_pasid;
+-	}
+-
+-	r = amdgpu_vm_init(adev, vm, -1);
+-	if (r) {
+-		DRM_ERROR("failed to initialize vm\n");
+-		goto error_pasid;
+-	}
+-
+-	r = amdgpu_mes_ctx_alloc_meta_data(adev, &ctx_data);
+-	if (r) {
+-		DRM_ERROR("failed to alloc ctx meta data\n");
+-		goto error_fini;
+-	}
+-
+-	ctx_data.meta_data_gpu_addr = AMDGPU_VA_RESERVED_BOTTOM;
+-	r = amdgpu_mes_ctx_map_meta_data(adev, vm, &ctx_data);
+-	if (r) {
+-		DRM_ERROR("failed to map ctx meta data\n");
+-		goto error_vm;
+-	}
+-
+-	r = amdgpu_mes_create_process(adev, pasid, vm);
+-	if (r) {
+-		DRM_ERROR("failed to create MES process\n");
+-		goto error_vm;
+-	}
+-
+-	for (i = 0; i < ARRAY_SIZE(queue_types); i++) {
+-		/* On GFX v10.3, fw hasn't supported to map sdma queue. */
+-		if (amdgpu_ip_version(adev, GC_HWIP, 0) >=
+-			    IP_VERSION(10, 3, 0) &&
+-		    amdgpu_ip_version(adev, GC_HWIP, 0) <
+-			    IP_VERSION(11, 0, 0) &&
+-		    queue_types[i][0] == AMDGPU_RING_TYPE_SDMA)
+-			continue;
+-
+-		r = amdgpu_mes_test_create_gang_and_queues(adev, pasid,
+-							   &gang_ids[i],
+-							   queue_types[i][0],
+-							   queue_types[i][1],
+-							   &added_rings[k],
+-							   &ctx_data);
+-		if (r)
+-			goto error_queues;
+-
+-		k += queue_types[i][1];
+-	}
+-
+-	/* start ring test and ib test for MES queues */
+-	amdgpu_mes_test_queues(added_rings);
+-
+-error_queues:
+-	/* remove all queues */
+-	for (i = 0; i < ARRAY_SIZE(added_rings); i++) {
+-		if (!added_rings[i])
+-			continue;
+-		amdgpu_mes_remove_ring(adev, added_rings[i]);
+-	}
+-
+-	for (i = 0; i < ARRAY_SIZE(gang_ids); i++) {
+-		if (!gang_ids[i])
+-			continue;
+-		amdgpu_mes_remove_gang(adev, gang_ids[i]);
+-	}
+-
+-	amdgpu_mes_destroy_process(adev, pasid);
+-
+-error_vm:
+-	amdgpu_mes_ctx_unmap_meta_data(adev, &ctx_data);
+-
+-error_fini:
+-	amdgpu_vm_fini(adev, vm);
+-
+-error_pasid:
+-	if (pasid)
+-		amdgpu_pasid_free(pasid);
+-
+-	amdgpu_mes_ctx_free_meta_data(&ctx_data);
+-	kfree(vm);
+-	return 0;
+-}
+-
+ int amdgpu_mes_init_microcode(struct amdgpu_device *adev, int pipe)
+ {
+ 	const struct mes_firmware_header_v1_0 *mes_hdr;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_mes.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_mes.h
+index 52dd54a32fb4..78362a838212 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_mes.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_mes.h
+@@ -470,8 +470,6 @@ int amdgpu_mes_ctx_map_meta_data(struct amdgpu_device *adev,
+ int amdgpu_mes_ctx_unmap_meta_data(struct amdgpu_device *adev,
+ 				   struct amdgpu_mes_ctx_data *ctx_data);
+ 
+-int amdgpu_mes_self_test(struct amdgpu_device *adev);
+-
+ int amdgpu_mes_doorbell_process_slice(struct amdgpu_device *adev);
+ 
+ /*
+diff --git a/drivers/gpu/drm/amd/amdgpu/mes_v11_0.c b/drivers/gpu/drm/amd/amdgpu/mes_v11_0.c
+index 4cfd86aa2ea3..ccc19a40f03d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/mes_v11_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/mes_v11_0.c
+@@ -1712,22 +1712,10 @@ static int mes_v11_0_early_init(struct amdgpu_ip_block *ip_block)
+ 	return 0;
+ }
+ 
+-static int mes_v11_0_late_init(struct amdgpu_ip_block *ip_block)
+-{
+-	struct amdgpu_device *adev = ip_block->adev;
+-
+-	/* it's only intended for use in mes_self_test case, not for s0ix and reset */
+-	if (!amdgpu_in_reset(adev) && !adev->in_s0ix && !adev->in_suspend &&
+-	    (amdgpu_ip_version(adev, GC_HWIP, 0) != IP_VERSION(11, 0, 3)))
+-		amdgpu_mes_self_test(adev);
+-
+-	return 0;
+-}
+-
+ static const struct amd_ip_funcs mes_v11_0_ip_funcs = {
+ 	.name = "mes_v11_0",
+ 	.early_init = mes_v11_0_early_init,
+-	.late_init = mes_v11_0_late_init,
++	.late_init = NULL,
+ 	.sw_init = mes_v11_0_sw_init,
+ 	.sw_fini = mes_v11_0_sw_fini,
+ 	.hw_init = mes_v11_0_hw_init,
+diff --git a/drivers/gpu/drm/amd/amdgpu/mes_v12_0.c b/drivers/gpu/drm/amd/amdgpu/mes_v12_0.c
+index 62aba0b5dbe2..801928555eff 100644
+--- a/drivers/gpu/drm/amd/amdgpu/mes_v12_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/mes_v12_0.c
+@@ -1820,21 +1820,10 @@ static int mes_v12_0_early_init(struct amdgpu_ip_block *ip_block)
+ 	return 0;
+ }
+ 
+-static int mes_v12_0_late_init(struct amdgpu_ip_block *ip_block)
+-{
+-	struct amdgpu_device *adev = ip_block->adev;
+-
+-	/* it's only intended for use in mes_self_test case, not for s0ix and reset */
+-	if (!amdgpu_in_reset(adev) && !adev->in_s0ix && !adev->in_suspend)
+-		amdgpu_mes_self_test(adev);
+-
+-	return 0;
+-}
+-
+ static const struct amd_ip_funcs mes_v12_0_ip_funcs = {
+ 	.name = "mes_v12_0",
+ 	.early_init = mes_v12_0_early_init,
+-	.late_init = mes_v12_0_late_init,
++	.late_init = NULL,
+ 	.sw_init = mes_v12_0_sw_init,
+ 	.sw_fini = mes_v12_0_sw_fini,
+ 	.hw_init = mes_v12_0_hw_init,
+-- 
+2.52.0
+
