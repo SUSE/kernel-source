@@ -1,0 +1,496 @@
+From 08ef26ea9ab315b895d57f8fbad41e02ff345bb9 Mon Sep 17 00:00:00 2001
+From: Christian Brauner <brauner@kernel.org>
+Date: Mon, 7 Oct 2024 16:23:58 +0200
+Subject: fs: add file_ref
+Git-commit: 08ef26ea9ab315b895d57f8fbad41e02ff345bb9
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+As atomic_inc_not_zero() is implemented with a try_cmpxchg() loop it has
+O(N^2) behaviour under contention with N concurrent operations and it is
+in a hot path in __fget_files_rcu().
+
+The rcuref infrastructures remedies this problem by using an
+unconditional increment relying on safe- and dead zones to make this
+work and requiring rcu protection for the data structure in question.
+This not just scales better it also introduces overflow protection.
+
+However, in contrast to generic rcuref, files require a memory barrier
+and thus cannot rely on *_relaxed() atomic operations and also require
+to be built on atomic_long_t as having massive amounts of reference
+isn't unheard of even if it is just an attack.
+
+As suggested by Linus, add a file specific variant instead of making
+this a generic library.
+
+Files are SLAB_TYPESAFE_BY_RCU and thus don't have "regular" rcu
+protection. In short, freeing of files isn't delayed until a grace
+period has elapsed. Instead, they are freed immediately and thus can be
+reused (multiple times) within the same grace period.
+
+So when picking a file from the file descriptor table via its file
+descriptor number it is thus possible to see an elevated reference count
+on file->f_count even though the file has already been recycled possibly
+multiple times by another task.
+
+To guard against this the vfs will pick the file from the file
+descriptor table twice. Once before the refcount increment and once
+after to compare the pointers (grossly simplified). If they match then
+the file is still valid. If not the caller needs to fput() it.
+
+The unconditional increment makes the following race possible as
+illustrated by rcuref:
+
+> Deconstruction race
+> ===================
+>
+> The release operation must be protected by prohibiting a grace period in
+> order to prevent a possible use after free:
+>
+>      T1                              T2
+>      put()                           get()
+>      // ref->refcnt = ONEREF
+>      if (!atomic_add_negative(-1, &ref->refcnt))
+>              return false;                           <- Not taken
+>
+>      // ref->refcnt == NOREF
+>      --> preemption
+>                                      // Elevates ref->refcnt to ONEREF
+>                                      if (!atomic_add_negative(1, &ref->refcnt))
+>                                              return true;                    <- taken
+>
+>                                      if (put(&p->ref)) { <-- Succeeds
+>                                              remove_pointer(p);
+>                                              kfree_rcu(p, rcu);
+>                                      }
+>
+>              RCU grace period ends, object is freed
+>
+>      atomic_cmpxchg(&ref->refcnt, NOREF, DEAD);      <- UAF
+>
+> [...] it prevents the grace period which keeps the object alive until
+> all put() operations complete.
+
+Having files by SLAB_TYPESAFE_BY_RCU shouldn't cause any problems for
+this deconstruction race. Afaict, the only interesting case would be
+someone freeing the file and someone immediately recycling it within the
+same grace period and reinitializing file->f_count to ONEREF while a
+concurrent fput() is doing atomic_cmpxchg(&ref->refcnt, NOREF, DEAD) as
+in the race above.
+
+But this is safe from SLAB_TYPESAFE_BY_RCU's perspective and it should
+be safe from rcuref's perspective.
+
+      T1                              T2                                                    T3
+      fput()                          fget()
+      // f_count->refcnt = ONEREF
+      if (!atomic_add_negative(-1, &f_count->refcnt))
+              return false;                           <- Not taken
+
+      // f_count->refcnt == NOREF
+      --> preemption
+                                      // Elevates f_count->refcnt to ONEREF
+                                      if (!atomic_add_negative(1, &f_count->refcnt))
+                                              return true;                    <- taken
+
+                                      if (put(&f_count)) { <-- Succeeds
+                                              remove_pointer(p);
+                                              /*
+                                               * Cache is SLAB_TYPESAFE_BY_RCU
+                                               * so this is freed without a grace period.
+                                               */
+                                              kmem_cache_free(p);
+                                      }
+
+                                                                                             kmem_cache_alloc()
+                                                                                             init_file() {
+                                                                                                     // Sets f_count->refcnt to ONEREF
+                                                                                                     rcuref_long_init(&f->f_count, 1);
+                                                                                             }
+
+                        Object has been reused within the same grace period
+                        via kmem_cache_alloc()'s SLAB_TYPESAFE_BY_RCU.
+
+      /*
+       * With SLAB_TYPESAFE_BY_RCU this would be a safe UAF access and
+       * it would work correctly because the atomic_cmpxchg()
+       * will fail because the refcount has been reset to ONEREF by T3.
+       */
+      atomic_cmpxchg(&ref->refcnt, NOREF, DEAD);      <- UAF
+
+However, there are other cases to consider:
+
+(1) Benign race due to multiple atomic_long_read()
+
+    CPU1                                                    CPU2
+
+    file_ref_put()
+    // last reference
+    // => count goes negative/FILE_REF_NOREF
+    atomic_long_add_negative_release(-1, &ref->refcnt)
+    -> __file_ref_put()
+                                                        file_ref_get()
+                                                        // goes back from negative/FILE_REF_NOREF to 0
+                                                        // and file_ref_get() succeeds
+                                                        atomic_long_add_negative(1, &ref->refcnt)
+
+                                                        // This is immediately followed by file_ref_put()
+                                                        // managing to set FILE_REF_DEAD
+                                                        file_ref_put()
+
+       // __file_ref_put() continues and sees
+       // cnt > FILE_REF_RELEASED // and splats with
+       // "imbalanced put on file reference count"
+       cnt = atomic_long_read(&ref->refcnt);
+
+    The race however is benign and the problem is the
+    atomic_long_read(). Instead of performing a separate read this uses
+    atomic_long_dec_return() and pass the value to __file_ref_put().
+    Thanks to Linus for pointing out that braino.
+
+(2) SLAB_TYPESAFE_BY_RCU may cause recycled files to be marked dead
+
+    When a file is recycled the following race exists:
+
+    CPU1                                                       CPU2
+    // @file is already dead and thus
+    // cnt >= FILE_REF_RELEASED.
+    file_ref_get(file)
+    atomic_long_add_negative(1, &ref->refcnt)
+       // We thus call into __file_ref_get()
+    -> __file_ref_get()
+
+       // which sees cnt >= FILE_REF_RELEASED
+       cnt = atomic_long_read(&ref->refcnt);
+                                                               // In the meantime @file gets freed
+                                                               kmem_cache_free()
+
+                                                               // and is immediately recycled
+                                                               file = kmem_cache_zalloc()
+                                                               // and the reference count is reinitialized
+                                                               // and the file alive again in someone
+                                                               // else's file descriptor table
+                                                               file_ref_init(&ref->refcnt, 1);
+
+       // the __file_ref_get() slowpath now continues
+       // and as it saw earlier that cnt >= FILE_REF_RELEASED
+       // it wants to ensure that we're staying in the middle
+       // of the deadzone and unconditionally sets
+       // FILE_REF_DEAD.
+       // This marks @file dead for CPU2...
+       atomic_long_set(&ref->refcnt, FILE_REF_DEAD);
+
+                                                               // Caller issues a close() system call to close @file
+                                                               close(fd)
+                                                               file = file_close_fd_locked()
+                                                               filp_flush()
+                                                               // The caller sees that cnt >= FILE_REF_RELEASED
+                                                               // and warns the first time...
+                                                               CHECK_DATA_CORRUPTION(file_count(file) == 0)
+
+                                                               // and then splats a second time because
+                                                               // __file_ref_put() sees cnt >= FILE_REF_RELEASED
+                                                               file_ref_put(&ref->refcnt);
+                                                               -> __file_ref_put()
+
+    My initial inclination was to replace the unconditional
+    atomic_long_set() with an atomic_long_try_cmpxchg() but Linus
+    pointed out that:
+
+    > I think we should just make file_ref_get() do a simple
+    >
+    >        return !atomic_long_add_negative(1, &ref->refcnt));
+    >
+    > and nothing else. Yes, multiple CPU's can race, and you can increment
+    > more than once, but the gap - even on 32-bit - between DEAD and
+    > becoming close to REF_RELEASED is so big that we simply don't care.
+    > That's the point of having a gap.
+
+I've been testing this with will-it-scale using fstat() on a machine
+that Jens gave me access (thank you very much!):
+
+processor       : 511
+vendor_id       : AuthenticAMD
+cpu family      : 25
+model           : 160
+model name      : AMD EPYC 9754 128-Core Processor
+
+and I consistently get a 3-5% improvement on 256+ threads.
+
+Reported-by: kernel test robot <oliver.sang@intel.com>
+Closes: https://lore.kernel.org/oe-lkp/202410151043.5d224a27-oliver.sang@intel.com
+Closes: https://lore.kernel.org/all/202410151611.f4cd71f2-oliver.sang@intel.com
+Link: https://lore.kernel.org/r/20241007-brauner-file-rcuref-v2-2-387e24dc9163@kernel.org
+Signed-off-by: Christian Brauner <brauner@kernel.org>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ fs/file.c                |  63 ++++++++++++++
+ include/linux/file_ref.h | 177 +++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 240 insertions(+)
+ create mode 100644 include/linux/file_ref.h
+
+diff --git a/fs/file.c b/fs/file.c
+index eb093e736972..ab15e2a3d280 100644
+--- a/fs/file.c
++++ b/fs/file.c
+@@ -20,10 +20,73 @@
+ #include <linux/spinlock.h>
+ #include <linux/rcupdate.h>
+ #include <linux/close_range.h>
++#include <linux/file_ref.h>
+ #include <net/sock.h>
+ 
+ #include "internal.h"
+ 
++/**
++ * __file_ref_put - Slowpath of file_ref_put()
++ * @ref:	Pointer to the reference count
++ * @cnt:	Current reference count
++ *
++ * Invoked when the reference count is outside of the valid zone.
++ *
++ * Return:
++ *	True if this was the last reference with no future references
++ *	possible. This signals the caller that it can safely schedule the
++ *	object, which is protected by the reference counter, for
++ *	deconstruction.
++ *
++ *	False if there are still active references or the put() raced
++ *	with a concurrent get()/put() pair. Caller is not allowed to
++ *	deconstruct the protected object.
++ */
++bool __file_ref_put(file_ref_t *ref, unsigned long cnt)
++{
++	/* Did this drop the last reference? */
++	if (likely(cnt == FILE_REF_NOREF)) {
++		/*
++		 * Carefully try to set the reference count to FILE_REF_DEAD.
++		 *
++		 * This can fail if a concurrent get() operation has
++		 * elevated it again or the corresponding put() even marked
++		 * it dead already. Both are valid situations and do not
++		 * require a retry. If this fails the caller is not
++		 * allowed to deconstruct the object.
++		 */
++		if (!atomic_long_try_cmpxchg_release(&ref->refcnt, &cnt, FILE_REF_DEAD))
++			return false;
++
++		/*
++		 * The caller can safely schedule the object for
++		 * deconstruction. Provide acquire ordering.
++		 */
++		smp_acquire__after_ctrl_dep();
++		return true;
++	}
++
++	/*
++	 * If the reference count was already in the dead zone, then this
++	 * put() operation is imbalanced. Warn, put the reference count back to
++	 * DEAD and tell the caller to not deconstruct the object.
++	 */
++	if (WARN_ONCE(cnt >= FILE_REF_RELEASED, "imbalanced put on file reference count")) {
++		atomic_long_set(&ref->refcnt, FILE_REF_DEAD);
++		return false;
++	}
++
++	/*
++	 * This is a put() operation on a saturated refcount. Restore the
++	 * mean saturation value and tell the caller to not deconstruct the
++	 * object.
++	 */
++	if (cnt > FILE_REF_MAXREF)
++		atomic_long_set(&ref->refcnt, FILE_REF_SATURATED);
++	return false;
++}
++EXPORT_SYMBOL_GPL(__file_ref_put);
++
+ unsigned int sysctl_nr_open __read_mostly = 1024*1024;
+ unsigned int sysctl_nr_open_min = BITS_PER_LONG;
+ /* our min() is unusable in constant expressions ;-/ */
+diff --git a/include/linux/file_ref.h b/include/linux/file_ref.h
+new file mode 100644
+index 000000000000..9b3a8d9b17ab
+--- /dev/null
++++ b/include/linux/file_ref.h
+@@ -0,0 +1,177 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _LINUX_FILE_REF_H
++#define _LINUX_FILE_REF_H
++
++#include <linux/atomic.h>
++#include <linux/preempt.h>
++#include <linux/types.h>
++
++/*
++ * file_ref is a reference count implementation specifically for use by
++ * files. It takes inspiration from rcuref but differs in key aspects
++ * such as support for SLAB_TYPESAFE_BY_RCU type caches.
++ *
++ * FILE_REF_ONEREF                FILE_REF_MAXREF
++ * 0x0000000000000000UL      0x7FFFFFFFFFFFFFFFUL
++ * <-------------------valid ------------------->
++ *
++ *                       FILE_REF_SATURATED
++ * 0x8000000000000000UL 0xA000000000000000UL 0xBFFFFFFFFFFFFFFFUL
++ * <-----------------------saturation zone---------------------->
++ *
++ * FILE_REF_RELEASED                   FILE_REF_DEAD
++ * 0xC000000000000000UL         0xE000000000000000UL
++ * <-------------------dead zone------------------->
++ *
++ * FILE_REF_NOREF
++ * 0xFFFFFFFFFFFFFFFFUL
++ */
++
++#ifdef CONFIG_64BIT
++#define FILE_REF_ONEREF		0x0000000000000000UL
++#define FILE_REF_MAXREF		0x7FFFFFFFFFFFFFFFUL
++#define FILE_REF_SATURATED	0xA000000000000000UL
++#define FILE_REF_RELEASED	0xC000000000000000UL
++#define FILE_REF_DEAD		0xE000000000000000UL
++#define FILE_REF_NOREF		0xFFFFFFFFFFFFFFFFUL
++#else
++#define FILE_REF_ONEREF		0x00000000U
++#define FILE_REF_MAXREF		0x7FFFFFFFU
++#define FILE_REF_SATURATED	0xA0000000U
++#define FILE_REF_RELEASED	0xC0000000U
++#define FILE_REF_DEAD		0xE0000000U
++#define FILE_REF_NOREF		0xFFFFFFFFU
++#endif
++
++typedef struct {
++#ifdef CONFIG_64BIT
++	atomic64_t refcnt;
++#else
++	atomic_t refcnt;
++#endif
++} file_ref_t;
++
++/**
++ * file_ref_init - Initialize a file reference count
++ * @ref: Pointer to the reference count
++ * @cnt: The initial reference count typically '1'
++ */
++static inline void file_ref_init(file_ref_t *ref, unsigned long cnt)
++{
++	atomic_long_set(&ref->refcnt, cnt - 1);
++}
++
++bool __file_ref_put(file_ref_t *ref, unsigned long cnt);
++
++/**
++ * file_ref_get - Acquire one reference on a file
++ * @ref: Pointer to the reference count
++ *
++ * Similar to atomic_inc_not_zero() but saturates at FILE_REF_MAXREF.
++ *
++ * Provides full memory ordering.
++ *
++ * Return: False if the attempt to acquire a reference failed. This happens
++ *         when the last reference has been put already. True if a reference
++ *         was successfully acquired
++ */
++static __always_inline __must_check bool file_ref_get(file_ref_t *ref)
++{
++	/*
++	 * Unconditionally increase the reference count with full
++	 * ordering. The saturation and dead zones provide enough
++	 * tolerance for this.
++	 *
++	 * If this indicates negative the file in question the fail can
++	 * be freed and immediately reused due to SLAB_TYPSAFE_BY_RCU.
++	 * Hence, unconditionally altering the file reference count to
++	 * e.g., reset the file reference count back to the middle of
++	 * the deadzone risk end up marking someone else's file as dead
++	 * behind their back.
++	 *
++	 * It would be possible to do a careful:
++	 *
++	 * cnt = atomic_long_inc_return();
++	 * if (likely(cnt >= 0))
++	 *	return true;
++	 *
++	 * and then something like:
++	 *
++	 * if (cnt >= FILE_REF_RELEASE)
++	 *	atomic_long_try_cmpxchg(&ref->refcnt, &cnt, FILE_REF_DEAD),
++	 *
++	 * to set the value back to the middle of the deadzone. But it's
++	 * practically impossible to go from FILE_REF_DEAD to
++	 * FILE_REF_ONEREF. It would need 2305843009213693952/2^61
++	 * file_ref_get()s to resurrect such a dead file.
++	 */
++	return !atomic_long_add_negative(1, &ref->refcnt);
++}
++
++/**
++ * file_ref_inc - Acquire one reference on a file
++ * @ref: Pointer to the reference count
++ *
++ * Acquire an additional reference on a file. Warns if the caller didn't
++ * already hold a reference.
++ */
++static __always_inline void file_ref_inc(file_ref_t *ref)
++{
++	long prior = atomic_long_fetch_inc_relaxed(&ref->refcnt);
++	WARN_ONCE(prior < 0, "file_ref_inc() on a released file reference");
++}
++
++/**
++ * file_ref_put -- Release a file reference
++ * @ref:	Pointer to the reference count
++ *
++ * Provides release memory ordering, such that prior loads and stores
++ * are done before, and provides an acquire ordering on success such
++ * that free() must come after.
++ *
++ * Return: True if this was the last reference with no future references
++ *         possible. This signals the caller that it can safely release
++ *         the object which is protected by the reference counter.
++ *         False if there are still active references or the put() raced
++ *         with a concurrent get()/put() pair. Caller is not allowed to
++ *         release the protected object.
++ */
++static __always_inline __must_check bool file_ref_put(file_ref_t *ref)
++{
++	long cnt;
++
++	/*
++	 * While files are SLAB_TYPESAFE_BY_RCU and thus file_ref_put()
++	 * calls don't risk UAFs when a file is recyclyed, it is still
++	 * vulnerable to UAFs caused by freeing the whole slab page once
++	 * it becomes unused. Prevent file_ref_put() from being
++	 * preempted protects against this.
++	 */
++	guard(preempt)();
++	/*
++	 * Unconditionally decrease the reference count. The saturation
++	 * and dead zones provide enough tolerance for this. If this
++	 * fails then we need to handle the last reference drop and
++	 * cases inside the saturation and dead zones.
++	 */
++	cnt = atomic_long_dec_return(&ref->refcnt);
++	if (cnt >= 0)
++		return false;
++	return __file_ref_put(ref, cnt);
++}
++
++/**
++ * file_ref_read - Read the number of file references
++ * @ref: Pointer to the reference count
++ *
++ * Return: The number of held references (0 ... N)
++ */
++static inline unsigned long file_ref_read(file_ref_t *ref)
++{
++	unsigned long c = atomic_long_read(&ref->refcnt);
++
++	/* Return 0 if within the DEAD zone. */
++	return c >= FILE_REF_RELEASED ? 0 : c + 1;
++}
++
++#endif
+-- 
+2.52.0
+
