@@ -1,0 +1,137 @@
+From 4b27406380b0b9ada6b4893bc8f6766dd34fff36 Mon Sep 17 00:00:00 2001
+From: Arunpravin Paneer Selvam <Arunpravin.PaneerSelvam@amd.com>
+Date: Fri, 11 Apr 2025 15:08:30 +0530
+Subject: drm/amdgpu: Add queue id support to the user queue wait IOCTL
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 4b27406380b0b9ada6b4893bc8f6766dd34fff36
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Add queue id support to the user queue wait IOCTL
+drm_amdgpu_userq_wait structure.
+
+This is required to retrieve the wait user queue and maintain
+the fence driver references in it so that the user queue in
+the same context releases their reference to the fence drivers
+at some point before queue destruction.
+
+Otherwise, we would gather those references until we
+don't have any more space left and crash.
+
+V2: Modify the UAPI comment as per the mesa and libdrm UAPI comment.
+
+Libdrm MR: https://gitlab.freedesktop.org/mesa/drm/-/merge_requests/408
+Mesa MR: https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/34493
+
+Signed-off-by: Arunpravin Paneer Selvam <Arunpravin.PaneerSelvam@amd.com>
+Suggested-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../gpu/drm/amd/amdgpu/amdgpu_userq_fence.c   | 20 +++++++++++--------
+ .../gpu/drm/amd/amdgpu/amdgpu_userq_fence.h   |  1 -
+ drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c |  1 -
+ include/uapi/drm/amdgpu_drm.h                 |  6 ++++++
+ 4 files changed, 18 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.c
+index 0a3032e01c34..ca198360cfda 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.c
+@@ -91,7 +91,6 @@ int amdgpu_userq_fence_driver_alloc(struct amdgpu_device *adev,
+ 	spin_lock_init(&fence_drv->fence_list_lock);
+ 
+ 	fence_drv->adev = adev;
+-	fence_drv->fence_drv_xa_ptr = &userq->fence_drv_xa;
+ 	fence_drv->context = dma_fence_context_alloc(1);
+ 	get_task_comm(fence_drv->timeline_name, current);
+ 
+@@ -611,6 +610,9 @@ int amdgpu_userq_wait_ioctl(struct drm_device *dev, void *data,
+ 	u32 num_syncobj, num_read_bo_handles, num_write_bo_handles;
+ 	struct drm_amdgpu_userq_fence_info *fence_info = NULL;
+ 	struct drm_amdgpu_userq_wait *wait_info = data;
++	struct amdgpu_fpriv *fpriv = filp->driver_priv;
++	struct amdgpu_userq_mgr *userq_mgr = &fpriv->userq_mgr;
++	struct amdgpu_usermode_queue *waitq;
+ 	struct drm_gem_object **gobj_write;
+ 	struct drm_gem_object **gobj_read;
+ 	struct dma_fence **fences = NULL;
+@@ -860,6 +862,10 @@ int amdgpu_userq_wait_ioctl(struct drm_device *dev, void *data,
+ 			fences[num_fences++] = fence;
+ 		}
+ 
++		waitq = idr_find(&userq_mgr->userq_idr, wait_info->waitq_id);
++		if (!waitq)
++			goto free_fences;
++
+ 		for (i = 0, cnt = 0; i < num_fences; i++) {
+ 			struct amdgpu_userq_fence_driver *fence_drv;
+ 			struct amdgpu_userq_fence *userq_fence;
+@@ -888,14 +894,12 @@ int amdgpu_userq_wait_ioctl(struct drm_device *dev, void *data,
+ 			 * Otherwise, we would gather those references until we don't
+ 			 * have any more space left and crash.
+ 			 */
+-			if (fence_drv->fence_drv_xa_ptr) {
+-				r = xa_alloc(fence_drv->fence_drv_xa_ptr, &index, fence_drv,
+-					     xa_limit_32b, GFP_KERNEL);
+-				if (r)
+-					goto free_fences;
++			r = xa_alloc(&waitq->fence_drv_xa, &index, fence_drv,
++				     xa_limit_32b, GFP_KERNEL);
++			if (r)
++				goto free_fences;
+ 
+-				amdgpu_userq_fence_driver_get(fence_drv);
+-			}
++			amdgpu_userq_fence_driver_get(fence_drv);
+ 
+ 			/* Store drm syncobj's gpu va address and value */
+ 			fence_info[cnt].va = fence_drv->va;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.h
+index 7bbae238cca0..2af4e0c15773 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.h
+@@ -55,7 +55,6 @@ struct amdgpu_userq_fence_driver {
+ 	spinlock_t fence_list_lock;
+ 	struct list_head fences;
+ 	struct amdgpu_device *adev;
+-	struct xarray *fence_drv_xa_ptr;
+ 	char timeline_name[TASK_COMM_LEN];
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c
+index 4e02d6cc66b5..8f6510b78dee 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c
+@@ -51,7 +51,6 @@ amdgpu_userqueue_cleanup(struct amdgpu_userq_mgr *uq_mgr,
+ 	}
+ 
+ 	uq_funcs->mqd_destroy(uq_mgr, queue);
+-	queue->fence_drv->fence_drv_xa_ptr = NULL;
+ 	amdgpu_userq_fence_driver_free(queue);
+ 	idr_remove(&uq_mgr->userq_idr, queue_id);
+ 	kfree(queue);
+diff --git a/include/uapi/drm/amdgpu_drm.h b/include/uapi/drm/amdgpu_drm.h
+index 284ac25ab5c4..1fd96474e64c 100644
+--- a/include/uapi/drm/amdgpu_drm.h
++++ b/include/uapi/drm/amdgpu_drm.h
+@@ -515,6 +515,12 @@ struct drm_amdgpu_userq_fence_info {
+ };
+ 
+ struct drm_amdgpu_userq_wait {
++	/**
++	 * @waitq_id: Queue handle used by the userq wait IOCTL to retrieve the
++	 * wait queue and maintain the fence driver references in it.
++	 */
++	__u32	waitq_id;
++	__u32	pad;
+ 	/**
+ 	 * @syncobj_handles: The list of syncobj handles submitted by the user queue
+ 	 * job to get the va/value pairs.
+-- 
+2.52.0
+
