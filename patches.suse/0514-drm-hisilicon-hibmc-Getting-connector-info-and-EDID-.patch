@@ -1,0 +1,123 @@
+From bd1c935811ae6bd112321c50ed83444eca4facc8 Mon Sep 17 00:00:00 2001
+From: Baihan Li <libaihan@huawei.com>
+Date: Mon, 31 Mar 2025 15:42:08 +0800
+Subject: drm/hisilicon/hibmc: Getting connector info and EDID by using AUX
+ channel
+Git-commit: bd1c935811ae6bd112321c50ed83444eca4facc8
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Add registering drm_aux and use it to get connector edid with drm
+functions. Add ddc channel in connector initialization to put drm_aux
+in drm_connector.
+
+Signed-off-by: Baihan Li <libaihan@huawei.com>
+Signed-off-by: Yongbang Shi <shiyongbang@huawei.com>
+Reviewed-by: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Link: https://lore.kernel.org/r/20250331074212.3370287-6-shiyongbang@huawei.com
+Signed-off-by: Dmitry Baryshkov <dmitry.baryshkov@oss.qualcomm.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/hisilicon/hibmc/dp/dp_aux.c   |  3 +-
+ .../gpu/drm/hisilicon/hibmc/hibmc_drm_dp.c    | 31 ++++++++++++++++---
+ .../gpu/drm/hisilicon/hibmc/hibmc_drm_drv.h   |  5 +++
+ 3 files changed, 33 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/hisilicon/hibmc/dp/dp_aux.c b/drivers/gpu/drm/hisilicon/hibmc/dp/dp_aux.c
+index ded9e7ce887a..8732cd1d8cb6 100644
+--- a/drivers/gpu/drm/hisilicon/hibmc/dp/dp_aux.c
++++ b/drivers/gpu/drm/hisilicon/hibmc/dp/dp_aux.c
+@@ -161,7 +161,8 @@ void hibmc_dp_aux_init(struct hibmc_dp *dp)
+ 				 HIBMC_DP_MIN_PULSE_NUM);
+ 
+ 	dp->aux.transfer = hibmc_dp_aux_xfer;
+-	dp->aux.is_remote = 0;
++	dp->aux.name = "HIBMC DRM dp aux";
++	dp->aux.drm_dev = dp->drm_dev;
+ 	drm_dp_aux_init(&dp->aux);
+ 	dp->dp_dev->aux = &dp->aux;
+ }
+diff --git a/drivers/gpu/drm/hisilicon/hibmc/hibmc_drm_dp.c b/drivers/gpu/drm/hisilicon/hibmc/hibmc_drm_dp.c
+index 603d6b198a54..8e5ee816dfbd 100644
+--- a/drivers/gpu/drm/hisilicon/hibmc/hibmc_drm_dp.c
++++ b/drivers/gpu/drm/hisilicon/hibmc/hibmc_drm_dp.c
+@@ -15,11 +15,16 @@
+ 
+ static int hibmc_dp_connector_get_modes(struct drm_connector *connector)
+ {
++	const struct drm_edid *drm_edid;
+ 	int count;
+ 
+-	count = drm_add_modes_noedid(connector, connector->dev->mode_config.max_width,
+-				     connector->dev->mode_config.max_height);
+-	drm_set_preferred_mode(connector, 1024, 768); // temporary implementation
++	drm_edid = drm_edid_read(connector);
++
++	drm_edid_connector_update(connector, drm_edid);
++
++	count = drm_edid_connector_add_modes(connector);
++
++	drm_edid_free(drm_edid);
+ 
+ 	return count;
+ }
+@@ -28,12 +33,28 @@ static const struct drm_connector_helper_funcs hibmc_dp_conn_helper_funcs = {
+ 	.get_modes = hibmc_dp_connector_get_modes,
+ };
+ 
++static int hibmc_dp_late_register(struct drm_connector *connector)
++{
++	struct hibmc_dp *dp = to_hibmc_dp(connector);
++
++	return drm_dp_aux_register(&dp->aux);
++}
++
++static void hibmc_dp_early_unregister(struct drm_connector *connector)
++{
++	struct hibmc_dp *dp = to_hibmc_dp(connector);
++
++	drm_dp_aux_unregister(&dp->aux);
++}
++
+ static const struct drm_connector_funcs hibmc_dp_conn_funcs = {
+ 	.reset = drm_atomic_helper_connector_reset,
+ 	.fill_modes = drm_helper_probe_single_connector_modes,
+ 	.destroy = drm_connector_cleanup,
+ 	.atomic_duplicate_state = drm_atomic_helper_connector_duplicate_state,
+ 	.atomic_destroy_state = drm_atomic_helper_connector_destroy_state,
++	.late_register = hibmc_dp_late_register,
++	.early_unregister = hibmc_dp_early_unregister,
+ };
+ 
+ static inline int hibmc_dp_prepare(struct hibmc_dp *dp, struct drm_display_mode *mode)
+@@ -103,8 +124,8 @@ int hibmc_dp_init(struct hibmc_drm_private *priv)
+ 
+ 	drm_encoder_helper_add(encoder, &hibmc_dp_encoder_helper_funcs);
+ 
+-	ret = drm_connector_init(dev, connector, &hibmc_dp_conn_funcs,
+-				 DRM_MODE_CONNECTOR_DisplayPort);
++	ret = drm_connector_init_with_ddc(dev, connector, &hibmc_dp_conn_funcs,
++					  DRM_MODE_CONNECTOR_DisplayPort, &dp->aux.ddc);
+ 	if (ret) {
+ 		drm_err(dev, "init dp connector failed: %d\n", ret);
+ 		return ret;
+diff --git a/drivers/gpu/drm/hisilicon/hibmc/hibmc_drm_drv.h b/drivers/gpu/drm/hisilicon/hibmc/hibmc_drm_drv.h
+index d982f1e4b958..3ddd71aada66 100644
+--- a/drivers/gpu/drm/hisilicon/hibmc/hibmc_drm_drv.h
++++ b/drivers/gpu/drm/hisilicon/hibmc/hibmc_drm_drv.h
+@@ -47,6 +47,11 @@ static inline struct hibmc_vdac *to_hibmc_vdac(struct drm_connector *connector)
+ 	return container_of(connector, struct hibmc_vdac, connector);
+ }
+ 
++static inline struct hibmc_dp *to_hibmc_dp(struct drm_connector *connector)
++{
++	return container_of(connector, struct hibmc_dp, connector);
++}
++
+ static inline struct hibmc_drm_private *to_hibmc_drm_private(struct drm_device *dev)
+ {
+ 	return container_of(dev, struct hibmc_drm_private, dev);
+-- 
+2.52.0
+
