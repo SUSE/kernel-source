@@ -1,13 +1,13 @@
 From 95a16160ca1d75c66bf7a1c5e0bcaffb18e7c7fc Mon Sep 17 00:00:00 2001
 From: Arunpravin Paneer Selvam <Arunpravin.PaneerSelvam@amd.com>
 Date: Wed, 16 Jul 2025 13:21:24 +0530
-Subject: [PATCH] drm/amdgpu: Reset the clear flag in buddy during resume
+Subject: drm/amdgpu: Reset the clear flag in buddy during resume
 Mime-version: 1.0
 Content-type: text/plain; charset=UTF-8
 Content-transfer-encoding: 8bit
 Git-commit: 95a16160ca1d75c66bf7a1c5e0bcaffb18e7c7fc
 Patch-mainline: v6.16
-References: git-fixes
+References: git-fixes jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
 
 - Added a handler in DRM buddy manager to reset the cleared
   flag for the blocks in the freelist.
@@ -16,7 +16,11 @@ References: git-fixes
   cluttered with BIOS data, yet the VRAM backend manager
   believes that everything has been cleared.
 
-V2: - Add lock before accessing drm_buddy_clear_reset_blocks()(Matthew Auld)  - Force merge the two dirty blocks.(Matthew Auld)  - Add a new unit test case for this issue.(Matthew Auld)  - Having this function being able to flip the state either way would be    good. (Matthew Brost)
+V2: - Add lock before accessing drm_buddy_clear_reset_blocks()(Matthew Auld)
+  - Force merge the two dirty blocks.(Matthew Auld)
+  - Add a new unit test case for this issue.(Matthew Auld)
+  - Having this function being able to flip the state either way would be
+    good. (Matthew Brost)
 
 v3(Matthew Auld):
   - Do merge step first to avoid the use of extra reset flag.
@@ -30,19 +34,21 @@ Fixes: a68c7eaa7a8f ("drm/amdgpu: Enable clear page functionality")
 Closes: https://gitlab.freedesktop.org/drm/amd/-/issues/3812
 Signed-off-by: Christian König <christian.koenig@amd.com>
 Link: https://lore.kernel.org/r/20250716075125.240637-2-Arunpravin.PaneerSelvam@amd.com
-Acked-by: Takashi Iwai <tiwai@suse.de>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
 
 ---
- drivers/gpu/drm/amd/amdgpu/amdgpu_device.c   |    2 +
- drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h      |    1 
- drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c |   17 ++++++++++
- drivers/gpu/drm/drm_buddy.c                  |   43 +++++++++++++++++++++++++++
- include/drm/drm_buddy.h                      |    2 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c   |  2 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h      |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c | 17 ++++++++
+ drivers/gpu/drm/drm_buddy.c                  | 43 ++++++++++++++++++++
+ include/drm/drm_buddy.h                      |  2 +
  5 files changed, 65 insertions(+)
 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 78f8755996f0..aa32df7e2fb2 100644
 --- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
 +++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
-@@ -4954,6 +4954,8 @@ exit:
+@@ -5193,6 +5193,8 @@ int amdgpu_device_resume(struct drm_device *dev, bool notify_clients)
  		dev->dev->power.disable_depth--;
  #endif
  	}
@@ -50,10 +56,12 @@ Acked-by: Takashi Iwai <tiwai@suse.de>
 +	amdgpu_vram_mgr_clear_reset_blocks(adev);
  	adev->in_suspend = false;
  
- 	if (adev->enable_mes)
+ 	if (amdgpu_acpi_smart_shift_update(dev, AMDGPU_SS_DEV_D0))
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
+index 208b7d1d8a27..450e4bf093b7 100644
 --- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
 +++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
-@@ -153,6 +153,7 @@ int amdgpu_vram_mgr_reserve_range(struct
+@@ -154,6 +154,7 @@ int amdgpu_vram_mgr_reserve_range(struct amdgpu_vram_mgr *mgr,
  				  uint64_t start, uint64_t size);
  int amdgpu_vram_mgr_query_page_status(struct amdgpu_vram_mgr *mgr,
  				      uint64_t start);
@@ -61,12 +69,15 @@ Acked-by: Takashi Iwai <tiwai@suse.de>
  
  bool amdgpu_res_cpu_visible(struct amdgpu_device *adev,
  			    struct ttm_resource *res);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c
+index abdc52b0895a..07c936e90d8e 100644
 --- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c
 +++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c
-@@ -783,6 +783,23 @@ uint64_t amdgpu_vram_mgr_vis_usage(struc
+@@ -782,6 +782,23 @@ uint64_t amdgpu_vram_mgr_vis_usage(struct amdgpu_vram_mgr *mgr)
+ 	return atomic64_read(&mgr->vis_usage);
  }
  
- /**
++/**
 + * amdgpu_vram_mgr_clear_reset_blocks - reset clear blocks
 + *
 + * @adev: amdgpu device pointer
@@ -83,16 +94,18 @@ Acked-by: Takashi Iwai <tiwai@suse.de>
 +	mutex_unlock(&mgr->lock);
 +}
 +
-+/**
+ /**
   * amdgpu_vram_mgr_intersects - test each drm buddy block for intersection
   *
-  * @man: TTM memory type manager
+diff --git a/drivers/gpu/drm/drm_buddy.c b/drivers/gpu/drm/drm_buddy.c
+index 241c855f891f..66aff35f8647 100644
 --- a/drivers/gpu/drm/drm_buddy.c
 +++ b/drivers/gpu/drm/drm_buddy.c
-@@ -401,6 +401,49 @@ drm_get_buddy(struct drm_buddy_block *bl
+@@ -404,6 +404,49 @@ drm_get_buddy(struct drm_buddy_block *block)
+ }
  EXPORT_SYMBOL(drm_get_buddy);
  
- /**
++/**
 + * drm_buddy_reset_clear - reset blocks clear state
 + *
 + * @mm: DRM buddy manager
@@ -135,13 +148,14 @@ Acked-by: Takashi Iwai <tiwai@suse.de>
 +}
 +EXPORT_SYMBOL(drm_buddy_reset_clear);
 +
-+/**
+ /**
   * drm_buddy_free_block - free a block
   *
-  * @mm: DRM buddy manager
+diff --git a/include/drm/drm_buddy.h b/include/drm/drm_buddy.h
+index 9689a7c5dd36..513837632b7d 100644
 --- a/include/drm/drm_buddy.h
 +++ b/include/drm/drm_buddy.h
-@@ -160,6 +160,8 @@ int drm_buddy_block_trim(struct drm_budd
+@@ -160,6 +160,8 @@ int drm_buddy_block_trim(struct drm_buddy *mm,
  			 u64 new_size,
  			 struct list_head *blocks);
  
@@ -150,3 +164,6 @@ Acked-by: Takashi Iwai <tiwai@suse.de>
  void drm_buddy_free_block(struct drm_buddy *mm, struct drm_buddy_block *block);
  
  void drm_buddy_free_list(struct drm_buddy *mm,
+-- 
+2.52.0
+
