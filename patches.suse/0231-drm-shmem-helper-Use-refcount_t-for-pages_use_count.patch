@@ -1,0 +1,196 @@
+From 051b6646d36dc974c3884d75021bf282925b171c Mon Sep 17 00:00:00 2001
+From: Dmitry Osipenko <dmitry.osipenko@collabora.com>
+Date: Sun, 23 Mar 2025 00:26:06 +0300
+Subject: drm/shmem-helper: Use refcount_t for pages_use_count
+Git-commit: 051b6646d36dc974c3884d75021bf282925b171c
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Use atomic refcount_t helper for pages_use_count to optimize pin/unpin
+functions by skipping reservation locking while GEM's pin refcount > 1.
+
+Acked-by: Maxime Ripard <mripard@kernel.org>
+Reviewed-by: Boris Brezillon <boris.brezillon@collabora.com>
+Suggested-by: Boris Brezillon <boris.brezillon@collabora.com>
+Acked-by: Thomas Zimmermann <tzimmermann@suse.d>
+Signed-off-by: Dmitry Osipenko <dmitry.osipenko@collabora.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250322212608.40511-9-dmitry.osipenko@collabora.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/drm_gem_shmem_helper.c     | 33 ++++++++++------------
+ drivers/gpu/drm/lima/lima_gem.c            |  2 +-
+ drivers/gpu/drm/panfrost/panfrost_mmu.c    |  2 +-
+ drivers/gpu/drm/tests/drm_gem_shmem_test.c |  8 +++---
+ include/drm/drm_gem_shmem_helper.h         |  2 +-
+ 5 files changed, 22 insertions(+), 25 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_gem_shmem_helper.c b/drivers/gpu/drm/drm_gem_shmem_helper.c
+index 7c6d1bbe347a..d982c7c80eaa 100644
+--- a/drivers/gpu/drm/drm_gem_shmem_helper.c
++++ b/drivers/gpu/drm/drm_gem_shmem_helper.c
+@@ -176,7 +176,7 @@ void drm_gem_shmem_free(struct drm_gem_shmem_object *shmem)
+ 		if (shmem->pages)
+ 			drm_gem_shmem_put_pages_locked(shmem);
+ 
+-		drm_WARN_ON(obj->dev, shmem->pages_use_count);
++		drm_WARN_ON(obj->dev, refcount_read(&shmem->pages_use_count));
+ 		drm_WARN_ON(obj->dev, refcount_read(&shmem->pages_pin_count));
+ 
+ 		dma_resv_unlock(shmem->base.resv);
+@@ -194,14 +194,13 @@ static int drm_gem_shmem_get_pages_locked(struct drm_gem_shmem_object *shmem)
+ 
+ 	dma_resv_assert_held(shmem->base.resv);
+ 
+-	if (shmem->pages_use_count++ > 0)
++	if (refcount_inc_not_zero(&shmem->pages_use_count))
+ 		return 0;
+ 
+ 	pages = drm_gem_get_pages(obj);
+ 	if (IS_ERR(pages)) {
+ 		drm_dbg_kms(obj->dev, "Failed to get pages (%ld)\n",
+ 			    PTR_ERR(pages));
+-		shmem->pages_use_count = 0;
+ 		return PTR_ERR(pages);
+ 	}
+ 
+@@ -217,6 +216,8 @@ static int drm_gem_shmem_get_pages_locked(struct drm_gem_shmem_object *shmem)
+ 
+ 	shmem->pages = pages;
+ 
++	refcount_set(&shmem->pages_use_count, 1);
++
+ 	return 0;
+ }
+ 
+@@ -232,21 +233,17 @@ void drm_gem_shmem_put_pages_locked(struct drm_gem_shmem_object *shmem)
+ 
+ 	dma_resv_assert_held(shmem->base.resv);
+ 
+-	if (drm_WARN_ON_ONCE(obj->dev, !shmem->pages_use_count))
+-		return;
+-
+-	if (--shmem->pages_use_count > 0)
+-		return;
+-
++	if (refcount_dec_and_test(&shmem->pages_use_count)) {
+ #ifdef CONFIG_X86
+-	if (shmem->map_wc)
+-		set_pages_array_wb(shmem->pages, obj->size >> PAGE_SHIFT);
++		if (shmem->map_wc)
++			set_pages_array_wb(shmem->pages, obj->size >> PAGE_SHIFT);
+ #endif
+ 
+-	drm_gem_put_pages(obj, shmem->pages,
+-			  shmem->pages_mark_dirty_on_put,
+-			  shmem->pages_mark_accessed_on_put);
+-	shmem->pages = NULL;
++		drm_gem_put_pages(obj, shmem->pages,
++				  shmem->pages_mark_dirty_on_put,
++				  shmem->pages_mark_accessed_on_put);
++		shmem->pages = NULL;
++	}
+ }
+ EXPORT_SYMBOL_GPL(drm_gem_shmem_put_pages_locked);
+ 
+@@ -582,8 +579,8 @@ static void drm_gem_shmem_vm_open(struct vm_area_struct *vma)
+ 	 * mmap'd, vm_open() just grabs an additional reference for the new
+ 	 * mm the vma is getting copied into (ie. on fork()).
+ 	 */
+-	if (!drm_WARN_ON_ONCE(obj->dev, !shmem->pages_use_count))
+-		shmem->pages_use_count++;
++	drm_WARN_ON_ONCE(obj->dev,
++			 !refcount_inc_not_zero(&shmem->pages_use_count));
+ 
+ 	dma_resv_unlock(shmem->base.resv);
+ 
+@@ -674,7 +671,7 @@ void drm_gem_shmem_print_info(const struct drm_gem_shmem_object *shmem,
+ 		return;
+ 
+ 	drm_printf_indent(p, indent, "pages_pin_count=%u\n", refcount_read(&shmem->pages_pin_count));
+-	drm_printf_indent(p, indent, "pages_use_count=%u\n", shmem->pages_use_count);
++	drm_printf_indent(p, indent, "pages_use_count=%u\n", refcount_read(&shmem->pages_use_count));
+ 	drm_printf_indent(p, indent, "vmap_use_count=%u\n", shmem->vmap_use_count);
+ 	drm_printf_indent(p, indent, "vaddr=%p\n", shmem->vaddr);
+ }
+diff --git a/drivers/gpu/drm/lima/lima_gem.c b/drivers/gpu/drm/lima/lima_gem.c
+index 609221351cde..5deec673c11e 100644
+--- a/drivers/gpu/drm/lima/lima_gem.c
++++ b/drivers/gpu/drm/lima/lima_gem.c
+@@ -47,7 +47,7 @@ int lima_heap_alloc(struct lima_bo *bo, struct lima_vm *vm)
+ 		}
+ 
+ 		bo->base.pages = pages;
+-		bo->base.pages_use_count = 1;
++		refcount_set(&bo->base.pages_use_count, 1);
+ 
+ 		mapping_set_unevictable(mapping);
+ 	}
+diff --git a/drivers/gpu/drm/panfrost/panfrost_mmu.c b/drivers/gpu/drm/panfrost/panfrost_mmu.c
+index b91019cd5acb..4a0b4bf03f1a 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_mmu.c
++++ b/drivers/gpu/drm/panfrost/panfrost_mmu.c
+@@ -489,7 +489,7 @@ static int panfrost_mmu_map_fault_addr(struct panfrost_device *pfdev, int as,
+ 			goto err_unlock;
+ 		}
+ 		bo->base.pages = pages;
+-		bo->base.pages_use_count = 1;
++		refcount_set(&bo->base.pages_use_count, 1);
+ 	} else {
+ 		pages = bo->base.pages;
+ 		if (pages[page_offset]) {
+diff --git a/drivers/gpu/drm/tests/drm_gem_shmem_test.c b/drivers/gpu/drm/tests/drm_gem_shmem_test.c
+index ac9bbb5aba99..1c89baa61d9b 100644
+--- a/drivers/gpu/drm/tests/drm_gem_shmem_test.c
++++ b/drivers/gpu/drm/tests/drm_gem_shmem_test.c
+@@ -134,7 +134,7 @@ static void drm_gem_shmem_test_pin_pages(struct kunit *test)
+ 	shmem = drm_gem_shmem_create(drm_dev, TEST_SIZE);
+ 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, shmem);
+ 	KUNIT_EXPECT_NULL(test, shmem->pages);
+-	KUNIT_EXPECT_EQ(test, shmem->pages_use_count, 0);
++	KUNIT_EXPECT_EQ(test, refcount_read(&shmem->pages_use_count), 0);
+ 
+ 	ret = kunit_add_action_or_reset(test, drm_gem_shmem_free_wrapper, shmem);
+ 	KUNIT_ASSERT_EQ(test, ret, 0);
+@@ -142,14 +142,14 @@ static void drm_gem_shmem_test_pin_pages(struct kunit *test)
+ 	ret = drm_gem_shmem_pin(shmem);
+ 	KUNIT_ASSERT_EQ(test, ret, 0);
+ 	KUNIT_ASSERT_NOT_NULL(test, shmem->pages);
+-	KUNIT_EXPECT_EQ(test, shmem->pages_use_count, 1);
++	KUNIT_EXPECT_EQ(test, refcount_read(&shmem->pages_use_count), 1);
+ 
+ 	for (i = 0; i < (shmem->base.size >> PAGE_SHIFT); i++)
+ 		KUNIT_ASSERT_NOT_NULL(test, shmem->pages[i]);
+ 
+ 	drm_gem_shmem_unpin(shmem);
+ 	KUNIT_EXPECT_NULL(test, shmem->pages);
+-	KUNIT_EXPECT_EQ(test, shmem->pages_use_count, 0);
++	KUNIT_EXPECT_EQ(test, refcount_read(&shmem->pages_use_count), 0);
+ }
+ 
+ /*
+@@ -254,7 +254,7 @@ static void drm_gem_shmem_test_get_sg_table(struct kunit *test)
+ 	sgt = drm_gem_shmem_get_pages_sgt(shmem);
+ 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, sgt);
+ 	KUNIT_ASSERT_NOT_NULL(test, shmem->pages);
+-	KUNIT_EXPECT_EQ(test, shmem->pages_use_count, 1);
++	KUNIT_EXPECT_EQ(test, refcount_read(&shmem->pages_use_count), 1);
+ 	KUNIT_EXPECT_PTR_EQ(test, sgt, shmem->sgt);
+ 
+ 	for_each_sgtable_sg(sgt, sg, si) {
+diff --git a/include/drm/drm_gem_shmem_helper.h b/include/drm/drm_gem_shmem_helper.h
+index d411215fe494..3a4be433d5f0 100644
+--- a/include/drm/drm_gem_shmem_helper.h
++++ b/include/drm/drm_gem_shmem_helper.h
+@@ -37,7 +37,7 @@ struct drm_gem_shmem_object {
+ 	 * Reference count on the pages table.
+ 	 * The pages are put when the count reaches zero.
+ 	 */
+-	unsigned int pages_use_count;
++	refcount_t pages_use_count;
+ 
+ 	/**
+ 	 * @pages_pin_count:
+-- 
+2.52.0
+
