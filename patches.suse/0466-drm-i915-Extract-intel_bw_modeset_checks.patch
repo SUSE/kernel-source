@@ -1,0 +1,119 @@
+From dacbfc5e9ee94a9c064bfbd0f03fa3880a5fa0c2 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Wed, 26 Mar 2025 18:25:39 +0200
+Subject: drm/i915: Extract intel_bw_modeset_checks()
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: dacbfc5e9ee94a9c064bfbd0f03fa3880a5fa0c2
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Pull the new_bw_state->active_pipes computation out from
+intel_compute_sagv_mask() and move it into the intel_bw.c
+(which is arguably the correct place for it).
+
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250326162544.3642-10-ville.syrjala@linux.intel.com
+Reviewed-by: Jani Nikula <jani.nikula@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/intel_bw.c      | 29 ++++++++++++++++++++
+ drivers/gpu/drm/i915/display/intel_bw.h      |  1 +
+ drivers/gpu/drm/i915/display/intel_display.c |  6 ++++
+ drivers/gpu/drm/i915/display/skl_watermark.c |  9 ------
+ 4 files changed, 36 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_bw.c b/drivers/gpu/drm/i915/display/intel_bw.c
+index 47de106c608f..dcf2b711b83a 100644
+--- a/drivers/gpu/drm/i915/display/intel_bw.c
++++ b/drivers/gpu/drm/i915/display/intel_bw.c
+@@ -1414,6 +1414,35 @@ static int intel_bw_check_data_rate(struct intel_atomic_state *state, bool *chan
+ 	return 0;
+ }
+ 
++int intel_bw_modeset_checks(struct intel_atomic_state *state)
++{
++	struct intel_display *display = to_intel_display(state);
++	const struct intel_bw_state *old_bw_state;
++	struct intel_bw_state *new_bw_state;
++
++	if (DISPLAY_VER(display) < 9)
++		return 0;
++
++	new_bw_state = intel_atomic_get_bw_state(state);
++	if (IS_ERR(new_bw_state))
++		return PTR_ERR(new_bw_state);
++
++	old_bw_state = intel_atomic_get_old_bw_state(state);
++
++	new_bw_state->active_pipes =
++		intel_calc_active_pipes(state, old_bw_state->active_pipes);
++
++	if (new_bw_state->active_pipes != old_bw_state->active_pipes) {
++		int ret;
++
++		ret = intel_atomic_lock_global_state(&new_bw_state->base);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
+ int intel_bw_atomic_check(struct intel_atomic_state *state)
+ {
+ 	struct intel_display *display = to_intel_display(state);
+diff --git a/drivers/gpu/drm/i915/display/intel_bw.h b/drivers/gpu/drm/i915/display/intel_bw.h
+index 4a6a033f11e4..ac435674c3ed 100644
+--- a/drivers/gpu/drm/i915/display/intel_bw.h
++++ b/drivers/gpu/drm/i915/display/intel_bw.h
+@@ -66,6 +66,7 @@ intel_atomic_get_bw_state(struct intel_atomic_state *state);
+ 
+ void intel_bw_init_hw(struct intel_display *display);
+ int intel_bw_init(struct intel_display *display);
++int intel_bw_modeset_checks(struct intel_atomic_state *state);
+ int intel_bw_atomic_check(struct intel_atomic_state *state);
+ int icl_pcode_restrict_qgv_points(struct intel_display *display,
+ 				  u32 points_mask);
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index 6aa08db93395..6c3b464a718c 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -6445,6 +6445,12 @@ int intel_atomic_check(struct drm_device *dev,
+ 	if (ret)
+ 		goto fail;
+ 
++	if (any_ms) {
++		ret = intel_bw_modeset_checks(state);
++		if (ret)
++			goto fail;
++	}
++
+ 	ret = intel_compute_global_watermarks(state);
+ 	if (ret)
+ 		goto fail;
+diff --git a/drivers/gpu/drm/i915/display/skl_watermark.c b/drivers/gpu/drm/i915/display/skl_watermark.c
+index a6af5e4ba4d4..1da1bfeadd9c 100644
+--- a/drivers/gpu/drm/i915/display/skl_watermark.c
++++ b/drivers/gpu/drm/i915/display/skl_watermark.c
+@@ -501,15 +501,6 @@ static int intel_compute_sagv_mask(struct intel_atomic_state *state)
+ 	if (!new_bw_state)
+ 		return 0;
+ 
+-	new_bw_state->active_pipes =
+-		intel_calc_active_pipes(state, old_bw_state->active_pipes);
+-
+-	if (new_bw_state->active_pipes != old_bw_state->active_pipes) {
+-		ret = intel_atomic_lock_global_state(&new_bw_state->base);
+-		if (ret)
+-			return ret;
+-	}
+-
+ 	if (intel_can_enable_sagv(i915, new_bw_state) !=
+ 	    intel_can_enable_sagv(i915, old_bw_state)) {
+ 		ret = intel_atomic_serialize_global_state(&new_bw_state->base);
+-- 
+2.52.0
+
