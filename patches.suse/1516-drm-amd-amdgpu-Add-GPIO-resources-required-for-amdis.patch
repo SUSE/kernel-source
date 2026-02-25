@@ -1,0 +1,157 @@
+From 3e9d9df850f3f93261a3259751394643f100a52a Mon Sep 17 00:00:00 2001
+From: Pratap Nirujogi <pratap.nirujogi@amd.com>
+Date: Sun, 9 Mar 2025 16:53:01 -0400
+Subject: drm/amd/amdgpu: Add GPIO resources required for amdisp
+Git-commit: 3e9d9df850f3f93261a3259751394643f100a52a
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+ISP is a child device to GFX, and its device specific information
+is not available in ACPI. Adding the 2 GPIO resources required for
+ISP_v4_1_1 in amdgpu_isp driver.
+
+- GPIO 0 to allow sensor driver to enable and disable sensor module.
+- GPIO 85 to allow ISP driver to enable and disable ISP RGB streaming mode.
+
+Signed-off-by: Pratap Nirujogi <pratap.nirujogi@amd.com>
+Reviewed-by: Mario Limonciello <mario.limonciello@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/Kconfig       |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h      |  4 +++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_acpi.c | 32 +++++++++++++++++++++++-
+ drivers/gpu/drm/amd/amdgpu/isp_v4_1_1.c  | 31 +++++++++++++++++++++++
+ 4 files changed, 67 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/Kconfig b/drivers/gpu/drm/amd/amdgpu/Kconfig
+index 058e3b3ad520..1acfed2f92ef 100644
+--- a/drivers/gpu/drm/amd/amdgpu/Kconfig
++++ b/drivers/gpu/drm/amd/amdgpu/Kconfig
+@@ -76,7 +76,7 @@ config DRM_AMDGPU_USERPTR
+ 
+ config DRM_AMD_ISP
+ 	bool "Enable AMD Image Signal Processor IP support"
+-	depends on DRM_AMDGPU
++	depends on DRM_AMDGPU && ACPI
+ 	select MFD_CORE
+ 	select PM_GENERIC_DOMAINS if PM
+ 	help
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 836ea081088a..a5ccd0ada16a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1713,6 +1713,10 @@ static inline bool amdgpu_acpi_is_s0ix_active(struct amdgpu_device *adev) { retu
+ static inline bool amdgpu_acpi_is_s3_active(struct amdgpu_device *adev) { return false; }
+ #endif
+ 
++#if defined(CONFIG_DRM_AMD_ISP)
++int amdgpu_acpi_get_isp4_dev_hid(u8 (*hid)[ACPI_ID_LEN]);
++#endif
++
+ void amdgpu_register_gpu_instance(struct amdgpu_device *adev);
+ void amdgpu_unregister_gpu_instance(struct amdgpu_device *adev);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_acpi.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_acpi.c
+index 707e131f89d2..f5466c592d94 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_acpi.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_acpi.c
+@@ -1532,5 +1532,35 @@ bool amdgpu_acpi_is_s0ix_active(struct amdgpu_device *adev)
+ 	return true;
+ #endif /* CONFIG_AMD_PMC */
+ }
+-
+ #endif /* CONFIG_SUSPEND */
++
++#if IS_ENABLED(CONFIG_DRM_AMD_ISP)
++static const struct acpi_device_id isp_sensor_ids[] = {
++	{ "OMNI5C10" },
++	{ }
++};
++
++static int isp_match_acpi_device_ids(struct device *dev, const void *data)
++{
++	return acpi_match_device(data, dev) ? 1 : 0;
++}
++
++int amdgpu_acpi_get_isp4_dev_hid(u8 (*hid)[ACPI_ID_LEN])
++{
++	struct device *pdev __free(put_device) = NULL;
++	struct acpi_device *acpi_pdev;
++
++	pdev = bus_find_device(&platform_bus_type, NULL, isp_sensor_ids,
++			       isp_match_acpi_device_ids);
++	if (!pdev)
++		return -EINVAL;
++
++	acpi_pdev = ACPI_COMPANION(pdev);
++	if (!acpi_pdev)
++		return -ENODEV;
++
++	strscpy(*hid, acpi_device_hid(acpi_pdev));
++
++	return 0;
++}
++#endif /* CONFIG_DRM_AMD_ISP */
+diff --git a/drivers/gpu/drm/amd/amdgpu/isp_v4_1_1.c b/drivers/gpu/drm/amd/amdgpu/isp_v4_1_1.c
+index 69dd92f6e86d..574880d67009 100644
+--- a/drivers/gpu/drm/amd/amdgpu/isp_v4_1_1.c
++++ b/drivers/gpu/drm/amd/amdgpu/isp_v4_1_1.c
+@@ -25,6 +25,7 @@
+  *
+  */
+ 
++#include <linux/gpio/machine.h>
+ #include "amdgpu.h"
+ #include "isp_v4_1_1.h"
+ 
+@@ -39,15 +40,45 @@ static const unsigned int isp_4_1_1_int_srcid[MAX_ISP411_INT_SRC] = {
+ 	ISP_4_1__SRCID__ISP_RINGBUFFER_WPT16
+ };
+ 
++static struct gpiod_lookup_table isp_gpio_table = {
++	.dev_id = "amd_isp_capture",
++	.table = {
++		GPIO_LOOKUP("AMDI0030:00", 85, "enable_isp", GPIO_ACTIVE_HIGH),
++		{ }
++	},
++};
++
++static struct gpiod_lookup_table isp_sensor_gpio_table = {
++	.dev_id = "i2c-ov05c10",
++	.table = {
++		GPIO_LOOKUP("amdisp-pinctrl", 0, "enable", GPIO_ACTIVE_HIGH),
++		{ }
++	},
++};
++
+ static int isp_v4_1_1_hw_init(struct amdgpu_isp *isp)
+ {
+ 	struct amdgpu_device *adev = isp->adev;
+ 	int idx, int_idx, num_res, r;
++	u8 isp_dev_hid[ACPI_ID_LEN];
+ 	u64 isp_base;
+ 
+ 	if (adev->rmmio_size == 0 || adev->rmmio_size < 0x5289)
+ 		return -EINVAL;
+ 
++	r = amdgpu_acpi_get_isp4_dev_hid(&isp_dev_hid);
++	if (r) {
++		drm_dbg(&adev->ddev, "Invalid isp platform detected (%d)", r);
++		/* allow GPU init to progress */
++		return 0;
++	}
++
++	/* add GPIO resources required for OMNI5C10 sensor */
++	if (!strcmp("OMNI5C10", isp_dev_hid)) {
++		gpiod_add_lookup_table(&isp_gpio_table);
++		gpiod_add_lookup_table(&isp_sensor_gpio_table);
++	}
++
+ 	isp_base = adev->rmmio_base;
+ 
+ 	isp->isp_cell = kcalloc(3, sizeof(struct mfd_cell), GFP_KERNEL);
+-- 
+2.52.0
+
