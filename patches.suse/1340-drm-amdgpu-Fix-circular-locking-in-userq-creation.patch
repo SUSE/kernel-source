@@ -1,0 +1,79 @@
+From 96a86dcb5b5ca65564efeaaeecfca669e79a57e1 Mon Sep 17 00:00:00 2001
+From: "Jesse.Zhang" <Jesse.Zhang@amd.com>
+Date: Tue, 13 May 2025 10:09:04 +0800
+Subject: drm/amdgpu: Fix circular locking in userq creation
+Git-commit: 96a86dcb5b5ca65564efeaaeecfca669e79a57e1
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+A circular locking dependency was detected between the global
+`adev->userq_mutex` and per-file `userq_mgr->userq_mutex` when
+creating user queues. The issue occurs because:
+
+1. `amdgpu_userq_suspend()` and `amdgpu_userq_resume` take `adev->userq_mutex` first, then
+   `userq_mgr->userq_mutex`
+2. While `amdgpu_userq_create()` takes them in reverse order
+
+This patch resolves the issue by:
+1. Moving the `adev->userq_mutex` lock earlier in `amdgpu_userq_create()`
+   to cover the `amdgpu_userq_ensure_ev_fence()` call
+2. Releasing it after we're done with both queue creation and the
+   scheduling halt check
+
+V2: remove unused adev->userq_mutex lock (Prike)
+
+Signed-off-by: Jesse Zhang <Jesse.Zhang@amd.com>
+Reviewed-by: Prike Liang <Prike.Liang@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_userq.c | 5 ++---
+ 1 file changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_userq.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_userq.c
+index 80401a37af77..295e7186e156 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_userq.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_userq.c
+@@ -394,6 +394,7 @@ amdgpu_userq_create(struct drm_file *filp, union drm_amdgpu_userq *args)
+ 	 *
+ 	 * This will also make sure we have a valid eviction fence ready to be used.
+ 	 */
++	mutex_lock(&adev->userq_mutex);
+ 	amdgpu_userq_ensure_ev_fence(&fpriv->userq_mgr, &fpriv->evf_mgr);
+ 
+ 	uq_funcs = adev->userq_funcs[args->in.ip_type];
+@@ -456,7 +457,6 @@ amdgpu_userq_create(struct drm_file *filp, union drm_amdgpu_userq *args)
+ 	}
+ 
+ 	/* don't map the queue if scheduling is halted */
+-	mutex_lock(&adev->userq_mutex);
+ 	if (adev->userq_halt_for_enforce_isolation &&
+ 	    ((queue->queue_type == AMDGPU_HW_IP_GFX) ||
+ 	     (queue->queue_type == AMDGPU_HW_IP_COMPUTE)))
+@@ -466,7 +466,6 @@ amdgpu_userq_create(struct drm_file *filp, union drm_amdgpu_userq *args)
+ 	if (!skip_map_queue) {
+ 		r = amdgpu_userq_map_helper(uq_mgr, queue);
+ 		if (r) {
+-			mutex_unlock(&adev->userq_mutex);
+ 			drm_file_err(uq_mgr->file, "Failed to map Queue\n");
+ 			idr_remove(&uq_mgr->userq_idr, qid);
+ 			amdgpu_userq_fence_driver_free(queue);
+@@ -475,13 +474,13 @@ amdgpu_userq_create(struct drm_file *filp, union drm_amdgpu_userq *args)
+ 			goto unlock;
+ 		}
+ 	}
+-	mutex_unlock(&adev->userq_mutex);
+ 
+ 
+ 	args->out.queue_id = qid;
+ 
+ unlock:
+ 	mutex_unlock(&uq_mgr->userq_mutex);
++	mutex_unlock(&adev->userq_mutex);
+ 
+ 	return r;
+ }
+-- 
+2.52.0
+
