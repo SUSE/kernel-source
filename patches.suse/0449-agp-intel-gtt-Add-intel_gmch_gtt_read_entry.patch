@@ -1,0 +1,194 @@
+From 8f0d3618c6b31b1f8ff0c6c08cf6b101e56d6f8b Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Thu, 13 Mar 2025 16:08:31 +0200
+Subject: agp/intel-gtt: Add intel_gmch_gtt_read_entry()
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 8f0d3618c6b31b1f8ff0c6c08cf6b101e56d6f8b
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+i915 wants to read out the PTE(s) populated by the BIOS/GOP
+to verify that the framebuffer is in the correct location.
+Introduce intel_gmch_gtt_read_entry() that reads out the
+PTE and decodes it to a somewhat abstract form. For now
+we just return the dma_addr, present bit, and local memory
+bit. I didn't bother with the snoop bit/etc.
+
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250313140838.29742-4-ville.syrjala@linux.intel.com
+Reviewed-by: Jouni Högander <jouni.hogander@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/char/agp/intel-gtt.c  | 55 +++++++++++++++++++++++++++++++++++
+ include/drm/intel/intel-gtt.h |  2 ++
+ 2 files changed, 57 insertions(+)
+
+diff --git a/drivers/char/agp/intel-gtt.c b/drivers/char/agp/intel-gtt.c
+index ef30445527a2..bcc26785175d 100644
+--- a/drivers/char/agp/intel-gtt.c
++++ b/drivers/char/agp/intel-gtt.c
+@@ -53,6 +53,7 @@ struct intel_gtt_driver {
+ 	 * of the mmio register file, that's done in the generic code. */
+ 	void (*cleanup)(void);
+ 	void (*write_entry)(dma_addr_t addr, unsigned int entry, unsigned int flags);
++	dma_addr_t (*read_entry)(unsigned int entry, bool *is_present, bool *is_local);
+ 	/* Flags is a more or less chipset specific opaque value.
+ 	 * For chipsets that need to support old ums (non-gem) code, this
+ 	 * needs to be identical to the various supported agp memory types! */
+@@ -336,6 +337,19 @@ static void i810_write_entry(dma_addr_t addr, unsigned int entry,
+ 	writel_relaxed(addr | pte_flags, intel_private.gtt + entry);
+ }
+ 
++static dma_addr_t i810_read_entry(unsigned int entry,
++				  bool *is_present, bool *is_local)
++{
++	u32 val;
++
++	val = readl(intel_private.gtt + entry);
++
++	*is_present = val & I810_PTE_VALID;
++	*is_local = val & I810_PTE_LOCAL;
++
++	return val & ~0xfff;
++}
++
+ static resource_size_t intel_gtt_stolen_size(void)
+ {
+ 	u16 gmch_ctrl;
+@@ -741,6 +755,19 @@ static void i830_write_entry(dma_addr_t addr, unsigned int entry,
+ 	writel_relaxed(addr | pte_flags, intel_private.gtt + entry);
+ }
+ 
++static dma_addr_t i830_read_entry(unsigned int entry,
++				  bool *is_present, bool *is_local)
++{
++	u32 val;
++
++	val = readl(intel_private.gtt + entry);
++
++	*is_present = val & I810_PTE_VALID;
++	*is_local = false;
++
++	return val & ~0xfff;
++}
++
+ bool intel_gmch_enable_gtt(void)
+ {
+ 	u8 __iomem *reg;
+@@ -878,6 +905,13 @@ void intel_gmch_gtt_insert_sg_entries(struct sg_table *st,
+ }
+ EXPORT_SYMBOL(intel_gmch_gtt_insert_sg_entries);
+ 
++dma_addr_t intel_gmch_gtt_read_entry(unsigned int pg,
++				     bool *is_present, bool *is_local)
++{
++	return intel_private.driver->read_entry(pg, is_present, is_local);
++}
++EXPORT_SYMBOL(intel_gmch_gtt_read_entry);
++
+ #if IS_ENABLED(CONFIG_AGP_INTEL)
+ static void intel_gmch_gtt_insert_pages(unsigned int first_entry,
+ 					unsigned int num_entries,
+@@ -1126,6 +1160,19 @@ static void i965_write_entry(dma_addr_t addr,
+ 	writel_relaxed(addr | pte_flags, intel_private.gtt + entry);
+ }
+ 
++static dma_addr_t i965_read_entry(unsigned int entry,
++				  bool *is_present, bool *is_local)
++{
++	u64 val;
++
++	val = readl(intel_private.gtt + entry);
++
++	*is_present = val & I810_PTE_VALID;
++	*is_local = false;
++
++	return ((val & 0xf0) << 28) | (val & ~0xfff);
++}
++
+ static int i9xx_setup(void)
+ {
+ 	phys_addr_t reg_addr;
+@@ -1187,6 +1234,7 @@ static const struct intel_gtt_driver i81x_gtt_driver = {
+ 	.cleanup = i810_cleanup,
+ 	.check_flags = i830_check_flags,
+ 	.write_entry = i810_write_entry,
++	.read_entry = i810_read_entry,
+ };
+ static const struct intel_gtt_driver i8xx_gtt_driver = {
+ 	.gen = 2,
+@@ -1194,6 +1242,7 @@ static const struct intel_gtt_driver i8xx_gtt_driver = {
+ 	.setup = i830_setup,
+ 	.cleanup = i830_cleanup,
+ 	.write_entry = i830_write_entry,
++	.read_entry = i830_read_entry,
+ 	.dma_mask_size = 32,
+ 	.check_flags = i830_check_flags,
+ 	.chipset_flush = i830_chipset_flush,
+@@ -1205,6 +1254,7 @@ static const struct intel_gtt_driver i915_gtt_driver = {
+ 	.cleanup = i9xx_cleanup,
+ 	/* i945 is the last gpu to need phys mem (for overlay and cursors). */
+ 	.write_entry = i830_write_entry,
++	.read_entry = i830_read_entry,
+ 	.dma_mask_size = 32,
+ 	.check_flags = i830_check_flags,
+ 	.chipset_flush = i9xx_chipset_flush,
+@@ -1215,6 +1265,7 @@ static const struct intel_gtt_driver g33_gtt_driver = {
+ 	.setup = i9xx_setup,
+ 	.cleanup = i9xx_cleanup,
+ 	.write_entry = i965_write_entry,
++	.read_entry = i965_read_entry,
+ 	.dma_mask_size = 36,
+ 	.check_flags = i830_check_flags,
+ 	.chipset_flush = i9xx_chipset_flush,
+@@ -1225,6 +1276,7 @@ static const struct intel_gtt_driver pineview_gtt_driver = {
+ 	.setup = i9xx_setup,
+ 	.cleanup = i9xx_cleanup,
+ 	.write_entry = i965_write_entry,
++	.read_entry = i965_read_entry,
+ 	.dma_mask_size = 36,
+ 	.check_flags = i830_check_flags,
+ 	.chipset_flush = i9xx_chipset_flush,
+@@ -1235,6 +1287,7 @@ static const struct intel_gtt_driver i965_gtt_driver = {
+ 	.setup = i9xx_setup,
+ 	.cleanup = i9xx_cleanup,
+ 	.write_entry = i965_write_entry,
++	.read_entry = i965_read_entry,
+ 	.dma_mask_size = 36,
+ 	.check_flags = i830_check_flags,
+ 	.chipset_flush = i9xx_chipset_flush,
+@@ -1244,6 +1297,7 @@ static const struct intel_gtt_driver g4x_gtt_driver = {
+ 	.setup = i9xx_setup,
+ 	.cleanup = i9xx_cleanup,
+ 	.write_entry = i965_write_entry,
++	.read_entry = i965_read_entry,
+ 	.dma_mask_size = 36,
+ 	.check_flags = i830_check_flags,
+ 	.chipset_flush = i9xx_chipset_flush,
+@@ -1254,6 +1308,7 @@ static const struct intel_gtt_driver ironlake_gtt_driver = {
+ 	.setup = i9xx_setup,
+ 	.cleanup = i9xx_cleanup,
+ 	.write_entry = i965_write_entry,
++	.read_entry = i965_read_entry,
+ 	.dma_mask_size = 36,
+ 	.check_flags = i830_check_flags,
+ 	.chipset_flush = i9xx_chipset_flush,
+diff --git a/include/drm/intel/intel-gtt.h b/include/drm/intel/intel-gtt.h
+index cb0d5b7200c7..f53bcff01f22 100644
+--- a/include/drm/intel/intel-gtt.h
++++ b/include/drm/intel/intel-gtt.h
+@@ -28,6 +28,8 @@ void intel_gmch_gtt_insert_sg_entries(struct sg_table *st,
+ 				      unsigned int pg_start,
+ 				      unsigned int flags);
+ void intel_gmch_gtt_clear_range(unsigned int first_entry, unsigned int num_entries);
++dma_addr_t intel_gmch_gtt_read_entry(unsigned int pg,
++				     bool *is_present, bool *is_local);
+ 
+ /* Special gtt memory types */
+ #define AGP_DCACHE_MEMORY	1
+-- 
+2.52.0
+
