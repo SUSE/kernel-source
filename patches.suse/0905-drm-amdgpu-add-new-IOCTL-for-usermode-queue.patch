@@ -1,0 +1,224 @@
+From 5501117d24a38dadff3dbd8d3102559b27929668 Mon Sep 17 00:00:00 2001
+From: Shashank Sharma <shashank.sharma@amd.com>
+Date: Tue, 10 Oct 2023 12:17:43 +0200
+Subject: drm/amdgpu: add new IOCTL for usermode queue
+Git-commit: 5501117d24a38dadff3dbd8d3102559b27929668
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+This patch adds:
+- A new IOCTL function to create and destroy
+- A new structure to keep all the user queue data in one place.
+- A function to generate unique index for the queue.
+
+V1: Worked on review comments from RFC patch series:
+  - Alex: Keep a list of queues, instead of single queue per process.
+  - Christian: Use the queue manager instead of global ptrs,
+           Don't keep the queue structure in amdgpu_ctx
+
+V2: Worked on review comments:
+ - Christian:
+   - Formatting of text
+   - There is no need for queuing of userqueues, with idr in place
+ - Alex:
+   - Remove use_doorbell, its unnecessary
+   - Reuse amdgpu_mqd_props for saving mqd fields
+
+ - Code formatting and re-arrangement
+
+V3: - Integration with doorbell manager
+
+V4: - Accommodate MQD union related changes in UAPI (Alex)
+ - Do not set the queue size twice (Bas)
+
+V5: - Remove wrapper functions for queue indexing (Christian)
+ - Do not save the queue id/idr in queue itself (Christian)
+ - Move the idr allocation in the IP independent generic space
+  (Christian)
+
+V6: - Check the validity of input IP type (Christian)
+
+V7: - Move uq_func from uq_mgr to adev (Alex)
+ - Add missing free(queue) for error cases (Yifan)
+
+V9: - Rebase
+
+V10: Addressed review comments from Christian, and added R-B:
+ - Do not initialize the local variable
+ - Convert DRM_ERROR to DEBUG.
+
+V11: - check the input flags to be zero (Alex)
+
+Cc: Alex Deucher <alexander.deucher@amd.com>
+Cc: Christian Koenig <christian.koenig@amd.com>
+Reviewed-by: Christian Koenig <christian.koenig@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Shashank Sharma <shashank.sharma@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c       |   1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c | 120 ++++++++++++++++++
+ .../gpu/drm/amd/include/amdgpu_userqueue.h    |   2 +
+ 3 files changed, 123 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+index 8bf7ca9ddc90..d9ddeeb2900c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+@@ -2952,6 +2952,7 @@ const struct drm_ioctl_desc amdgpu_ioctls_kms[] = {
+ 	DRM_IOCTL_DEF_DRV(AMDGPU_GEM_VA, amdgpu_gem_va_ioctl, DRM_AUTH|DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(AMDGPU_GEM_OP, amdgpu_gem_op_ioctl, DRM_AUTH|DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(AMDGPU_GEM_USERPTR, amdgpu_gem_userptr_ioctl, DRM_AUTH|DRM_RENDER_ALLOW),
++	DRM_IOCTL_DEF_DRV(AMDGPU_USERQ, amdgpu_userq_ioctl, DRM_AUTH|DRM_RENDER_ALLOW),
+ };
+ 
+ static const struct drm_driver amdgpu_kms_driver = {
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c
+index effc0c7c02cf..cf7fe68d9277 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c
+@@ -23,6 +23,126 @@
+  */
+ 
+ #include "amdgpu.h"
++#include "amdgpu_vm.h"
++#include "amdgpu_userqueue.h"
++
++static struct amdgpu_usermode_queue *
++amdgpu_userqueue_find(struct amdgpu_userq_mgr *uq_mgr, int qid)
++{
++	return idr_find(&uq_mgr->userq_idr, qid);
++}
++
++static int
++amdgpu_userqueue_destroy(struct drm_file *filp, int queue_id)
++{
++	struct amdgpu_fpriv *fpriv = filp->driver_priv;
++	struct amdgpu_userq_mgr *uq_mgr = &fpriv->userq_mgr;
++	struct amdgpu_device *adev = uq_mgr->adev;
++	const struct amdgpu_userq_funcs *uq_funcs;
++	struct amdgpu_usermode_queue *queue;
++
++	mutex_lock(&uq_mgr->userq_mutex);
++
++	queue = amdgpu_userqueue_find(uq_mgr, queue_id);
++	if (!queue) {
++		DRM_DEBUG_DRIVER("Invalid queue id to destroy\n");
++		mutex_unlock(&uq_mgr->userq_mutex);
++		return -EINVAL;
++	}
++
++	uq_funcs = adev->userq_funcs[queue->queue_type];
++	uq_funcs->mqd_destroy(uq_mgr, queue);
++	idr_remove(&uq_mgr->userq_idr, queue_id);
++	kfree(queue);
++
++	mutex_unlock(&uq_mgr->userq_mutex);
++	return 0;
++}
++
++static int
++amdgpu_userqueue_create(struct drm_file *filp, union drm_amdgpu_userq *args)
++{
++	struct amdgpu_fpriv *fpriv = filp->driver_priv;
++	struct amdgpu_userq_mgr *uq_mgr = &fpriv->userq_mgr;
++	struct amdgpu_device *adev = uq_mgr->adev;
++	const struct amdgpu_userq_funcs *uq_funcs;
++	struct amdgpu_usermode_queue *queue;
++	int qid, r = 0;
++
++	if (args->in.flags) {
++		DRM_ERROR("Usermode queue flags not supported yet\n");
++		return -EINVAL;
++	}
++
++	mutex_lock(&uq_mgr->userq_mutex);
++
++	uq_funcs = adev->userq_funcs[args->in.ip_type];
++	if (!uq_funcs) {
++		DRM_ERROR("Usermode queue is not supported for this IP (%u)\n", args->in.ip_type);
++		r = -EINVAL;
++		goto unlock;
++	}
++
++	queue = kzalloc(sizeof(struct amdgpu_usermode_queue), GFP_KERNEL);
++	if (!queue) {
++		DRM_ERROR("Failed to allocate memory for queue\n");
++		r = -ENOMEM;
++		goto unlock;
++	}
++	queue->doorbell_handle = args->in.doorbell_handle;
++	queue->doorbell_index = args->in.doorbell_offset;
++	queue->queue_type = args->in.ip_type;
++	queue->flags = args->in.flags;
++	queue->vm = &fpriv->vm;
++
++	r = uq_funcs->mqd_create(uq_mgr, &args->in, queue);
++	if (r) {
++		DRM_ERROR("Failed to create Queue\n");
++		kfree(queue);
++		goto unlock;
++	}
++
++	qid = idr_alloc(&uq_mgr->userq_idr, queue, 1, AMDGPU_MAX_USERQ_COUNT, GFP_KERNEL);
++	if (qid < 0) {
++		DRM_ERROR("Failed to allocate a queue id\n");
++		uq_funcs->mqd_destroy(uq_mgr, queue);
++		kfree(queue);
++		r = -ENOMEM;
++		goto unlock;
++	}
++	args->out.queue_id = qid;
++
++unlock:
++	mutex_unlock(&uq_mgr->userq_mutex);
++	return r;
++}
++
++int amdgpu_userq_ioctl(struct drm_device *dev, void *data,
++		       struct drm_file *filp)
++{
++	union drm_amdgpu_userq *args = data;
++	int r;
++
++	switch (args->in.op) {
++	case AMDGPU_USERQ_OP_CREATE:
++		r = amdgpu_userqueue_create(filp, args);
++		if (r)
++			DRM_ERROR("Failed to create usermode queue\n");
++		break;
++
++	case AMDGPU_USERQ_OP_FREE:
++		r = amdgpu_userqueue_destroy(filp, args->in.queue_id);
++		if (r)
++			DRM_ERROR("Failed to destroy usermode queue\n");
++		break;
++
++	default:
++		DRM_DEBUG_DRIVER("Invalid user queue op specified: %d\n", args->in.op);
++		return -EINVAL;
++	}
++
++	return r;
++}
+ 
+ int amdgpu_userq_mgr_init(struct amdgpu_userq_mgr *userq_mgr, struct amdgpu_device *adev)
+ {
+diff --git a/drivers/gpu/drm/amd/include/amdgpu_userqueue.h b/drivers/gpu/drm/amd/include/amdgpu_userqueue.h
+index 93ebe4b61682..b739274c72e1 100644
+--- a/drivers/gpu/drm/amd/include/amdgpu_userqueue.h
++++ b/drivers/gpu/drm/amd/include/amdgpu_userqueue.h
+@@ -54,6 +54,8 @@ struct amdgpu_userq_mgr {
+ 	struct amdgpu_device		*adev;
+ };
+ 
++int amdgpu_userq_ioctl(struct drm_device *dev, void *data, struct drm_file *filp);
++
+ int amdgpu_userq_mgr_init(struct amdgpu_userq_mgr *userq_mgr, struct amdgpu_device *adev);
+ 
+ void amdgpu_userq_mgr_fini(struct amdgpu_userq_mgr *userq_mgr);
+-- 
+2.52.0
+
