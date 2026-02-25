@@ -1,0 +1,207 @@
+From dc2139c0aa3283e5749109641af1878ed7bf7371 Mon Sep 17 00:00:00 2001
+From: Thomas Zimmermann <tzimmermann@suse.de>
+Date: Fri, 21 Mar 2025 10:54:03 +0100
+Subject: leds: backlight trigger: Replace fb events with a dedicated function
+ call
+Git-commit: dc2139c0aa3283e5749109641af1878ed7bf7371
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Remove support for fb events from the led backlight trigger. Provide
+the helper ledtrig_backlight_blank() instead. Call it from fbdev to
+inform the trigger of changes to a display's blank state.
+
+Fbdev maintains a list of all installed notifiers. Instead of the fbdev
+notifiers, maintain an internal list of led backlight triggers.
+
+V3: 
+- export ledtrig_backlight_blank()
+V2: 
+- maintain global list of led backlight triggers (Lee)
+- avoid IS_REACHABLE() in source file (Lee)
+- notify on changes to blank state instead of display state
+- use lock guards
+- initialize led list and list mutex
+
+Signed-off-by: Thomas Zimmermann <tzimmermann@suse.de>
+Acked-by: Simona Vetter <simona.vetter@ffwll.ch>
+Link: https://lore.kernel.org/r/20250321095517.313713-11-tzimmermann@suse.de
+Signed-off-by: Lee Jones <lee@kernel.org>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/leds/trigger/ledtrig-backlight.c | 42 ++++++++++--------------
+ drivers/video/fbdev/core/fbmem.c         | 19 ++++++-----
+ include/linux/leds.h                     |  6 ++++
+ 3 files changed, 33 insertions(+), 34 deletions(-)
+
+diff --git a/drivers/leds/trigger/ledtrig-backlight.c b/drivers/leds/trigger/ledtrig-backlight.c
+index 8e66d55a6c82..c1f0f5becaee 100644
+--- a/drivers/leds/trigger/ledtrig-backlight.c
++++ b/drivers/leds/trigger/ledtrig-backlight.c
+@@ -10,7 +10,6 @@
+ #include <linux/kernel.h>
+ #include <linux/slab.h>
+ #include <linux/init.h>
+-#include <linux/fb.h>
+ #include <linux/leds.h>
+ #include "../leds.h"
+ 
+@@ -21,10 +20,14 @@ struct bl_trig_notifier {
+ 	struct led_classdev *led;
+ 	int brightness;
+ 	int old_status;
+-	struct notifier_block notifier;
+ 	unsigned invert;
++
++	struct list_head entry;
+ };
+ 
++static DEFINE_MUTEX(ledtrig_backlight_list_mutex);
++static LIST_HEAD(ledtrig_backlight_list);
++
+ static void ledtrig_backlight_notify_blank(struct bl_trig_notifier *n, int new_status)
+ {
+ 	struct led_classdev *led = n->led;
+@@ -42,26 +45,17 @@ static void ledtrig_backlight_notify_blank(struct bl_trig_notifier *n, int new_s
+ 	n->old_status = new_status;
+ }
+ 
+-static int fb_notifier_callback(struct notifier_block *p,
+-				unsigned long event, void *data)
++void ledtrig_backlight_blank(bool blank)
+ {
+-	struct bl_trig_notifier *n = container_of(p,
+-					struct bl_trig_notifier, notifier);
+-	struct fb_event *fb_event = data;
+-	int *blank;
+-	int new_status;
+-
+-	/* If we aren't interested in this event, skip it immediately ... */
+-	if (event != FB_EVENT_BLANK)
+-		return 0;
+-
+-	blank = fb_event->data;
+-	new_status = *blank ? BLANK : UNBLANK;
++	struct bl_trig_notifier *n;
++	int new_status = blank ? BLANK : UNBLANK;
+ 
+-	ledtrig_backlight_notify_blank(n, new_status);
++	guard(mutex)(&ledtrig_backlight_list_mutex);
+ 
+-	return 0;
++	list_for_each_entry(n, &ledtrig_backlight_list, entry)
++		ledtrig_backlight_notify_blank(n, new_status);
+ }
++EXPORT_SYMBOL(ledtrig_backlight_blank);
+ 
+ static ssize_t bl_trig_invert_show(struct device *dev,
+ 		struct device_attribute *attr, char *buf)
+@@ -106,8 +100,6 @@ ATTRIBUTE_GROUPS(bl_trig);
+ 
+ static int bl_trig_activate(struct led_classdev *led)
+ {
+-	int ret;
+-
+ 	struct bl_trig_notifier *n;
+ 
+ 	n = kzalloc(sizeof(struct bl_trig_notifier), GFP_KERNEL);
+@@ -118,11 +110,9 @@ static int bl_trig_activate(struct led_classdev *led)
+ 	n->led = led;
+ 	n->brightness = led->brightness;
+ 	n->old_status = UNBLANK;
+-	n->notifier.notifier_call = fb_notifier_callback;
+ 
+-	ret = fb_register_client(&n->notifier);
+-	if (ret)
+-		dev_err(led->dev, "unable to register backlight trigger\n");
++	guard(mutex)(&ledtrig_backlight_list_mutex);
++	list_add(&n->entry, &ledtrig_backlight_list);
+ 
+ 	return 0;
+ }
+@@ -131,7 +121,9 @@ static void bl_trig_deactivate(struct led_classdev *led)
+ {
+ 	struct bl_trig_notifier *n = led_get_trigger_data(led);
+ 
+-	fb_unregister_client(&n->notifier);
++	guard(mutex)(&ledtrig_backlight_list_mutex);
++	list_del(&n->entry);
++
+ 	kfree(n);
+ }
+ 
+diff --git a/drivers/video/fbdev/core/fbmem.c b/drivers/video/fbdev/core/fbmem.c
+index 5dbab6547b94..dfcf5e4d1d4c 100644
+--- a/drivers/video/fbdev/core/fbmem.c
++++ b/drivers/video/fbdev/core/fbmem.c
+@@ -16,6 +16,7 @@
+ #include <linux/fb.h>
+ #include <linux/fbcon.h>
+ #include <linux/lcd.h>
++#include <linux/leds.h>
+ 
+ #include <video/nomodeset.h>
+ 
+@@ -371,11 +372,17 @@ static void fb_lcd_notify_blank(struct fb_info *info)
+ 	lcd_notify_blank_all(info->device, power);
+ }
+ 
++static void fb_ledtrig_backlight_notify_blank(struct fb_info *info)
++{
++	if (info->blank == FB_BLANK_UNBLANK)
++		ledtrig_backlight_blank(false);
++	else
++		ledtrig_backlight_blank(true);
++}
++
+ int fb_blank(struct fb_info *info, int blank)
+ {
+ 	int old_blank = info->blank;
+-	struct fb_event event;
+-	int data[2];
+ 	int ret;
+ 
+ 	if (!info->fbops->fb_blank)
+@@ -384,11 +391,6 @@ int fb_blank(struct fb_info *info, int blank)
+ 	if (blank > FB_BLANK_POWERDOWN)
+ 		blank = FB_BLANK_POWERDOWN;
+ 
+-	data[0] = blank;
+-	data[1] = old_blank;
+-	event.info = info;
+-	event.data = data;
+-
+ 	info->blank = blank;
+ 
+ 	ret = info->fbops->fb_blank(blank, info);
+@@ -397,8 +399,7 @@ int fb_blank(struct fb_info *info, int blank)
+ 
+ 	fb_bl_notify_blank(info, old_blank);
+ 	fb_lcd_notify_blank(info);
+-
+-	fb_notifier_call_chain(FB_EVENT_BLANK, &event);
++	fb_ledtrig_backlight_notify_blank(info);
+ 
+ 	return 0;
+ 
+diff --git a/include/linux/leds.h b/include/linux/leds.h
+index e5968c3ed4ae..ea000a241d85 100644
+--- a/include/linux/leds.h
++++ b/include/linux/leds.h
+@@ -639,6 +639,12 @@ static inline void ledtrig_flash_ctrl(bool on) {}
+ static inline void ledtrig_torch_ctrl(bool on) {}
+ #endif
+ 
++#if IS_REACHABLE(CONFIG_LEDS_TRIGGER_BACKLIGHT)
++void ledtrig_backlight_blank(bool blank);
++#else
++static inline void ledtrig_backlight_blank(bool blank) {}
++#endif
++
+ /*
+  * Generic LED platform data for describing LED names and default triggers.
+  */
+-- 
+2.52.0
+
