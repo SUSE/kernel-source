@@ -1,0 +1,180 @@
+From 53e65974924ec3e66b2cdf71780f089b338fed33 Mon Sep 17 00:00:00 2001
+From: Tvrtko Ursulin <tvrtko.ursulin@igalia.com>
+Date: Mon, 24 Mar 2025 09:26:30 +0000
+Subject: drm/sched: Add a simple timeout test
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 53e65974924ec3e66b2cdf71780f089b338fed33
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Add a very simple timeout test which submits a single job and verifies
+that the timeout handling will run if the backend failed to complete the
+job in time.
+
+Signed-off-by: Tvrtko Ursulin <tvrtko.ursulin@igalia.com>
+Cc: Christian König <christian.koenig@amd.com>
+Cc: Danilo Krummrich <dakr@kernel.org>
+Cc: Matthew Brost <matthew.brost@intel.com>
+Cc: Philipp Stanner <phasta@kernel.org>
+Acked-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Philipp Stanner <phasta@kernel.org>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250324092633.49746-4-tvrtko.ursulin@igalia.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../gpu/drm/scheduler/tests/mock_scheduler.c  | 11 +++-
+ drivers/gpu/drm/scheduler/tests/sched_tests.h |  4 +-
+ drivers/gpu/drm/scheduler/tests/tests_basic.c | 64 ++++++++++++++++++-
+ 3 files changed, 73 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/scheduler/tests/mock_scheduler.c b/drivers/gpu/drm/scheduler/tests/mock_scheduler.c
+index d039f873cc11..61efc96e6e41 100644
+--- a/drivers/gpu/drm/scheduler/tests/mock_scheduler.c
++++ b/drivers/gpu/drm/scheduler/tests/mock_scheduler.c
+@@ -203,7 +203,11 @@ static struct dma_fence *mock_sched_run_job(struct drm_sched_job *sched_job)
+ static enum drm_gpu_sched_stat
+ mock_sched_timedout_job(struct drm_sched_job *sched_job)
+ {
+-	return DRM_GPU_SCHED_STAT_ENODEV;
++	struct drm_mock_sched_job *job = drm_sched_job_to_mock_job(sched_job);
++
++	job->flags |= DRM_MOCK_SCHED_JOB_TIMEDOUT;
++
++	return DRM_GPU_SCHED_STAT_NOMINAL;
+ }
+ 
+ static void mock_sched_free_job(struct drm_sched_job *sched_job)
+@@ -234,17 +238,18 @@ static const struct drm_sched_backend_ops drm_mock_scheduler_ops = {
+  * drm_mock_sched_new - Create a new mock scheduler
+  *
+  * @test: KUnit test owning the job
++ * @timeout: Job timeout to set
+  *
+  * Returns: New mock scheduler with allocation managed by the test
+  */
+-struct drm_mock_scheduler *drm_mock_sched_new(struct kunit *test)
++struct drm_mock_scheduler *drm_mock_sched_new(struct kunit *test, long timeout)
+ {
+ 	struct drm_sched_init_args args = {
+ 		.ops		= &drm_mock_scheduler_ops,
+ 		.num_rqs	= DRM_SCHED_PRIORITY_COUNT,
+ 		.credit_limit	= U32_MAX,
+ 		.hang_limit	= 1,
+-		.timeout	= MAX_SCHEDULE_TIMEOUT,
++		.timeout	= timeout,
+ 		.name		= "drm-mock-scheduler",
+ 	};
+ 	struct drm_mock_scheduler *sched;
+diff --git a/drivers/gpu/drm/scheduler/tests/sched_tests.h b/drivers/gpu/drm/scheduler/tests/sched_tests.h
+index 31aaba3443fa..27caf8285fb7 100644
+--- a/drivers/gpu/drm/scheduler/tests/sched_tests.h
++++ b/drivers/gpu/drm/scheduler/tests/sched_tests.h
+@@ -97,6 +97,7 @@ struct drm_mock_sched_job {
+ 	struct completion	done;
+ 
+ #define DRM_MOCK_SCHED_JOB_DONE		0x1
++#define DRM_MOCK_SCHED_JOB_TIMEDOUT	0x2
+ 	unsigned long		flags;
+ 
+ 	struct list_head	link;
+@@ -129,7 +130,8 @@ drm_sched_job_to_mock_job(struct drm_sched_job *sched_job)
+ 	return container_of(sched_job, struct drm_mock_sched_job, base);
+ };
+ 
+-struct drm_mock_scheduler *drm_mock_sched_new(struct kunit *test);
++struct drm_mock_scheduler *drm_mock_sched_new(struct kunit *test,
++					      long timeout);
+ void drm_mock_sched_fini(struct drm_mock_scheduler *sched);
+ unsigned int drm_mock_sched_advance(struct drm_mock_scheduler *sched,
+ 				    unsigned int num);
+diff --git a/drivers/gpu/drm/scheduler/tests/tests_basic.c b/drivers/gpu/drm/scheduler/tests/tests_basic.c
+index c06672e13cf6..0e1fa4767b0d 100644
+--- a/drivers/gpu/drm/scheduler/tests/tests_basic.c
++++ b/drivers/gpu/drm/scheduler/tests/tests_basic.c
+@@ -12,7 +12,7 @@
+ 
+ static int drm_sched_basic_init(struct kunit *test)
+ {
+-	test->priv = drm_mock_sched_new(test);
++	test->priv = drm_mock_sched_new(test, MAX_SCHEDULE_TIMEOUT);
+ 
+ 	return 0;
+ }
+@@ -24,6 +24,13 @@ static void drm_sched_basic_exit(struct kunit *test)
+ 	drm_mock_sched_fini(sched);
+ }
+ 
++static int drm_sched_timeout_init(struct kunit *test)
++{
++	test->priv = drm_mock_sched_new(test, HZ);
++
++	return 0;
++}
++
+ static void drm_sched_basic_submit(struct kunit *test)
+ {
+ 	struct drm_mock_scheduler *sched = test->priv;
+@@ -195,4 +202,57 @@ static struct kunit_suite drm_sched_basic = {
+ 	.test_cases = drm_sched_basic_tests,
+ };
+ 
+-kunit_test_suite(drm_sched_basic);
++static void drm_sched_basic_timeout(struct kunit *test)
++{
++	struct drm_mock_scheduler *sched = test->priv;
++	struct drm_mock_sched_entity *entity;
++	struct drm_mock_sched_job *job;
++	bool done;
++
++	/*
++	 * Submit a single job against a scheduler with the timeout configured
++	 * and verify that the timeout handling will run if the backend fails
++	 * to complete it in time.
++	 */
++
++	entity = drm_mock_sched_entity_new(test,
++					   DRM_SCHED_PRIORITY_NORMAL,
++					   sched);
++	job = drm_mock_sched_job_new(test, entity);
++
++	drm_mock_sched_job_submit(job);
++
++	done = drm_mock_sched_job_wait_scheduled(job, HZ);
++	KUNIT_ASSERT_TRUE(test, done);
++
++	done = drm_mock_sched_job_wait_finished(job, HZ / 2);
++	KUNIT_ASSERT_FALSE(test, done);
++
++	KUNIT_ASSERT_EQ(test,
++			job->flags & DRM_MOCK_SCHED_JOB_TIMEDOUT,
++			0);
++
++	done = drm_mock_sched_job_wait_finished(job, HZ);
++	KUNIT_ASSERT_FALSE(test, done);
++
++	KUNIT_ASSERT_EQ(test,
++			job->flags & DRM_MOCK_SCHED_JOB_TIMEDOUT,
++			DRM_MOCK_SCHED_JOB_TIMEDOUT);
++
++	drm_mock_sched_entity_free(entity);
++}
++
++static struct kunit_case drm_sched_timeout_tests[] = {
++	KUNIT_CASE(drm_sched_basic_timeout),
++	{}
++};
++
++static struct kunit_suite drm_sched_timeout = {
++	.name = "drm_sched_basic_timeout_tests",
++	.init = drm_sched_timeout_init,
++	.exit = drm_sched_basic_exit,
++	.test_cases = drm_sched_timeout_tests,
++};
++
++kunit_test_suites(&drm_sched_basic,
++		  &drm_sched_timeout);
+-- 
+2.52.0
+
