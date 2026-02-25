@@ -1,0 +1,160 @@
+From 3a2b7389feea9a7afd18d58cda59b7a989445f38 Mon Sep 17 00:00:00 2001
+From: Michal Wilczynski <m.wilczynski@samsung.com>
+Date: Fri, 18 Apr 2025 13:22:49 +0200
+Subject: drm/imagination: Add reset controller support for GPU initialization
+Git-commit: 3a2b7389feea9a7afd18d58cda59b7a989445f38
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+All IMG Rogue GPUs include a reset line that participates in the
+power-up sequence. On some SoCs (e.g., T-Head TH1520 and Banana Pi
+BPI-F3), this reset line is exposed and must be driven explicitly to
+ensure proper initialization.  On others, such as the currently
+supported TI SoC, the reset logic is handled in hardware or firmware
+without exposing the line directly. In platforms where the reset line is
+externally accessible, if it is not driven correctly, the GPU may remain
+in an undefined state, leading to instability or performance issues.
+
+This commit adds a dedicated reset controller to the drm/imagination
+driver.  By managing the reset line (where applicable) as part of normal
+GPU bring-up, the driver ensures reliable initialization across
+platforms regardless of whether the reset is controlled externally or
+handled internally.
+
+Signed-off-by: Michal Wilczynski <m.wilczynski@samsung.com>
+Reviewed-by: Matt Coster <matt.coster@imgtec.com>
+Link: https://lore.kernel.org/r/20250418-apr_18_reset_img-v6-2-85a06757b698@samsung.com
+Signed-off-by: Matt Coster <matt.coster@imgtec.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/imagination/pvr_device.c | 21 +++++++++++++++++++++
+ drivers/gpu/drm/imagination/pvr_device.h |  9 +++++++++
+ drivers/gpu/drm/imagination/pvr_power.c  | 22 +++++++++++++++++++++-
+ 3 files changed, 51 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/imagination/pvr_device.c b/drivers/gpu/drm/imagination/pvr_device.c
+index 1e488a30c784..8b9ba4983c4c 100644
+--- a/drivers/gpu/drm/imagination/pvr_device.c
++++ b/drivers/gpu/drm/imagination/pvr_device.c
+@@ -25,6 +25,7 @@
+ #include <linux/interrupt.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
++#include <linux/reset.h>
+ #include <linux/slab.h>
+ #include <linux/stddef.h>
+ #include <linux/types.h>
+@@ -120,6 +121,21 @@ static int pvr_device_clk_init(struct pvr_device *pvr_dev)
+ 	return 0;
+ }
+ 
++static int pvr_device_reset_init(struct pvr_device *pvr_dev)
++{
++	struct drm_device *drm_dev = from_pvr_device(pvr_dev);
++	struct reset_control *reset;
++
++	reset = devm_reset_control_get_optional_exclusive(drm_dev->dev, NULL);
++	if (IS_ERR(reset))
++		return dev_err_probe(drm_dev->dev, PTR_ERR(reset),
++				     "failed to get gpu reset line\n");
++
++	pvr_dev->reset = reset;
++
++	return 0;
++}
++
+ /**
+  * pvr_device_process_active_queues() - Process all queue related events.
+  * @pvr_dev: PowerVR device to check
+@@ -615,6 +631,11 @@ pvr_device_init(struct pvr_device *pvr_dev)
+ 	if (err)
+ 		return err;
+ 
++	/* Get the reset line for the GPU */
++	err = pvr_device_reset_init(pvr_dev);
++	if (err)
++		return err;
++
+ 	/* Explicitly power the GPU so we can access control registers before the FW is booted. */
+ 	err = pm_runtime_resume_and_get(dev);
+ 	if (err)
+diff --git a/drivers/gpu/drm/imagination/pvr_device.h b/drivers/gpu/drm/imagination/pvr_device.h
+index eb5da8c7040f..7cb01c38d2a9 100644
+--- a/drivers/gpu/drm/imagination/pvr_device.h
++++ b/drivers/gpu/drm/imagination/pvr_device.h
+@@ -139,6 +139,15 @@ struct pvr_device {
+ 		u32 domain_count;
+ 	} power;
+ 
++	/**
++	 * @reset: Optional reset line.
++	 *
++	 * This may be used on some platforms to provide a reset line that needs to be de-asserted
++	 * after power-up procedure. It would also need to be asserted after the power-down
++	 * procedure.
++	 */
++	struct reset_control *reset;
++
+ 	/** @irq: IRQ number. */
+ 	int irq;
+ 
+diff --git a/drivers/gpu/drm/imagination/pvr_power.c b/drivers/gpu/drm/imagination/pvr_power.c
+index 19b079b357df..41f5d89e78b8 100644
+--- a/drivers/gpu/drm/imagination/pvr_power.c
++++ b/drivers/gpu/drm/imagination/pvr_power.c
+@@ -18,6 +18,7 @@
+ #include <linux/platform_device.h>
+ #include <linux/pm_domain.h>
+ #include <linux/pm_runtime.h>
++#include <linux/reset.h>
+ #include <linux/timer.h>
+ #include <linux/types.h>
+ #include <linux/workqueue.h>
+@@ -255,6 +256,8 @@ pvr_power_device_suspend(struct device *dev)
+ 	clk_disable_unprepare(pvr_dev->sys_clk);
+ 	clk_disable_unprepare(pvr_dev->core_clk);
+ 
++	err = reset_control_assert(pvr_dev->reset);
++
+ err_drm_dev_exit:
+ 	drm_dev_exit(idx);
+ 
+@@ -285,16 +288,33 @@ pvr_power_device_resume(struct device *dev)
+ 	if (err)
+ 		goto err_sys_clk_disable;
+ 
++	/*
++	 * According to the hardware manual, a delay of at least 32 clock
++	 * cycles is required between de-asserting the clkgen reset and
++	 * de-asserting the GPU reset. Assuming a worst-case scenario with
++	 * a very high GPU clock frequency, a delay of 1 microsecond is
++	 * sufficient to ensure this requirement is met across all
++	 * feasible GPU clock speeds.
++	 */
++	udelay(1);
++
++	err = reset_control_deassert(pvr_dev->reset);
++	if (err)
++		goto err_mem_clk_disable;
++
+ 	if (pvr_dev->fw_dev.booted) {
+ 		err = pvr_power_fw_enable(pvr_dev);
+ 		if (err)
+-			goto err_mem_clk_disable;
++			goto err_reset_assert;
+ 	}
+ 
+ 	drm_dev_exit(idx);
+ 
+ 	return 0;
+ 
++err_reset_assert:
++	reset_control_assert(pvr_dev->reset);
++
+ err_mem_clk_disable:
+ 	clk_disable_unprepare(pvr_dev->mem_clk);
+ 
+-- 
+2.52.0
+
