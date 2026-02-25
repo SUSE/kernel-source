@@ -1,0 +1,97 @@
+From 32be4e39f459f3ac9c191569ae8e3731cb82f7ab Mon Sep 17 00:00:00 2001
+From: Ausef Yousof <Ausef.Yousof@amd.com>
+Date: Fri, 28 Mar 2025 11:06:50 -0400
+Subject: drm/amd/display: dont disable dtb as dto src during dpms off
+Git-commit: 32be4e39f459f3ac9c191569ae8e3731cb82f7ab
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+fix was previously in 25.20 but was reverted out as it was accompanied
+by other changes that caused regression.
+
+[why&how]
+Disabling dtb as the dto src during dpms off relies on in the same
+instance being able to also alter the dto src bit to dpref (or not dtb
+in general), but this was recently changed to only take place in
+dcn31_program_pix_clk, as that is where we want to perform any dto src
+changes because tg is off at that point, it is unsafe to do that
+elsewhere. What this means is now instead of disabling dtb as dto src
+and modifying source bit, we are left with the configuration for a given
+tg that specifies dtb as dto src and dtb dto en simultaneously is unset.
+dcn31_program_pix_clk can rectify this but its possible for us to
+perform some tg dependant  operation that would simply hang because when
+we go to enable say crtc then, the clk we specify as dto src is "off" en
+bit is cleared, source bit was never changed, and program_pix_clk hasnt
+been called yet (as apart of dpms on)
+
+We cant disable it as dto src during dpms off if we want the luxury of
+performing tg dependant operation during dpms off and before dpms on.
+
+Reviewed-by: Yihan Zhu <yihan.zhu@amd.com>
+Signed-off-by: Ausef Yousof <Ausef.Yousof@amd.com>
+Signed-off-by: Roman Li <roman.li@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/display/dc/hwss/dce110/dce110_hwseq.c | 5 -----
+ drivers/gpu/drm/amd/display/dc/hwss/dcn20/dcn20_hwseq.c   | 8 ++++++++
+ 2 files changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/hwss/dce110/dce110_hwseq.c b/drivers/gpu/drm/amd/display/dc/hwss/dce110/dce110_hwseq.c
+index 5656d10368ad..778b68ec489e 100644
+--- a/drivers/gpu/drm/amd/display/dc/hwss/dce110/dce110_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/hwss/dce110/dce110_hwseq.c
+@@ -1152,7 +1152,6 @@ void dce110_disable_stream(struct pipe_ctx *pipe_ctx)
+ 	const struct link_hwss *link_hwss = get_link_hwss(link, &pipe_ctx->link_res);
+ 	struct dccg *dccg = dc->res_pool->dccg;
+ 	struct timing_generator *tg = pipe_ctx->stream_res.tg;
+-	struct dtbclk_dto_params dto_params = {0};
+ 	int dp_hpo_inst;
+ 	struct link_encoder *link_enc = pipe_ctx->link_res.dio_link_enc;
+ 	struct stream_encoder *stream_enc = pipe_ctx->stream_res.stream_enc;
+@@ -1179,14 +1178,10 @@ void dce110_disable_stream(struct pipe_ctx *pipe_ctx)
+ 	link_hwss->reset_stream_encoder(pipe_ctx);
+ 
+ 	if (dc->link_srv->dp_is_128b_132b_signal(pipe_ctx) && dccg) {
+-		dto_params.otg_inst = tg->inst;
+-		dto_params.timing = &pipe_ctx->stream->timing;
+ 		dp_hpo_inst = pipe_ctx->stream_res.hpo_dp_stream_enc->inst;
+ 		if (dccg) {
+ 			dccg->funcs->disable_symclk32_se(dccg, dp_hpo_inst);
+ 			dccg->funcs->set_dpstreamclk(dccg, REFCLK, tg->inst, dp_hpo_inst);
+-			if (dccg && dccg->funcs->set_dtbclk_dto)
+-				dccg->funcs->set_dtbclk_dto(dccg, &dto_params);
+ 		}
+ 	} else if (dccg && dccg->funcs->disable_symclk_se) {
+ 		dccg->funcs->disable_symclk_se(dccg, stream_enc->stream_enc_inst,
+diff --git a/drivers/gpu/drm/amd/display/dc/hwss/dcn20/dcn20_hwseq.c b/drivers/gpu/drm/amd/display/dc/hwss/dcn20/dcn20_hwseq.c
+index 846c9c51f2d9..959cd2fbb250 100644
+--- a/drivers/gpu/drm/amd/display/dc/hwss/dcn20/dcn20_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/hwss/dcn20/dcn20_hwseq.c
+@@ -2806,6 +2806,8 @@ void dcn20_reset_back_end_for_pipe(
+ {
+ 	struct dc_link *link = pipe_ctx->stream->link;
+ 	const struct link_hwss *link_hwss = get_link_hwss(link, &pipe_ctx->link_res);
++	struct dccg *dccg = dc->res_pool->dccg;
++	struct dtbclk_dto_params dto_params = {0};
+ 
+ 	DC_LOGGER_INIT(dc->ctx->logger);
+ 	if (pipe_ctx->stream_res.stream_enc == NULL) {
+@@ -2866,6 +2868,12 @@ void dcn20_reset_back_end_for_pipe(
+ 					&pipe_ctx->link_res, pipe_ctx->stream->signal);
+ 			link->phy_state.symclk_state = SYMCLK_OFF_TX_OFF;
+ 		}
++		if (dc->link_srv->dp_is_128b_132b_signal(pipe_ctx) && dccg) {
++			dto_params.otg_inst = pipe_ctx->stream_res.tg->inst;
++			dto_params.timing = &pipe_ctx->stream->timing;
++			if (dccg && dccg->funcs->set_dtbclk_dto)
++				dccg->funcs->set_dtbclk_dto(dccg, &dto_params);
++		}
+ 	}
+ 
+ /*
+-- 
+2.52.0
+
