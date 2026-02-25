@@ -1,0 +1,141 @@
+From d3815ae24f25fea2f94c99c975da05b0a521f6c2 Mon Sep 17 00:00:00 2001
+From: Jani Nikula <jani.nikula@intel.com>
+Date: Fri, 11 Apr 2025 13:27:15 +0300
+Subject: drm/i915/dpio: have chv_data_lane_soft_reset() get/put dpio
+ internally
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: d3815ae24f25fea2f94c99c975da05b0a521f6c2
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Have chv_data_lane_soft_reset() get/put dpio internally, and use a
+locked version of it within intel_dpio_phy.c. This drops the dependency
+on vlv sideband from g4x_dp.c and g4x_hdmi.c, and makes that a DPIO PHY
+implementation detail.
+
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://lore.kernel.org/r/20250411102715.613082-1-jani.nikula@intel.com
+Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/g4x_dp.c         |  7 -------
+ drivers/gpu/drm/i915/display/g4x_hdmi.c       |  8 -------
+ drivers/gpu/drm/i915/display/intel_dpio_phy.c | 21 ++++++++++++++-----
+ 3 files changed, 16 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/g4x_dp.c b/drivers/gpu/drm/i915/display/g4x_dp.c
+index b39aae9165df..18e51799d2a6 100644
+--- a/drivers/gpu/drm/i915/display/g4x_dp.c
++++ b/drivers/gpu/drm/i915/display/g4x_dp.c
+@@ -28,7 +28,6 @@
+ #include "intel_hotplug.h"
+ #include "intel_pch_display.h"
+ #include "intel_pps.h"
+-#include "vlv_sideband.h"
+ 
+ static const struct dpll g4x_dpll[] = {
+ 	{ .dot = 162000, .p1 = 2, .p2 = 10, .n = 2, .m1 = 23, .m2 = 8, },
+@@ -581,16 +580,10 @@ static void chv_post_disable_dp(struct intel_atomic_state *state,
+ 				const struct intel_crtc_state *old_crtc_state,
+ 				const struct drm_connector_state *old_conn_state)
+ {
+-	struct drm_i915_private *dev_priv = to_i915(encoder->base.dev);
+-
+ 	intel_dp_link_down(encoder, old_crtc_state);
+ 
+-	vlv_dpio_get(dev_priv);
+-
+ 	/* Assert data lane reset */
+ 	chv_data_lane_soft_reset(encoder, old_crtc_state, true);
+-
+-	vlv_dpio_put(dev_priv);
+ }
+ 
+ static void
+diff --git a/drivers/gpu/drm/i915/display/g4x_hdmi.c b/drivers/gpu/drm/i915/display/g4x_hdmi.c
+index 3dc2c59a3df0..21b5db2fa203 100644
+--- a/drivers/gpu/drm/i915/display/g4x_hdmi.c
++++ b/drivers/gpu/drm/i915/display/g4x_hdmi.c
+@@ -22,7 +22,6 @@
+ #include "intel_hdmi.h"
+ #include "intel_hotplug.h"
+ #include "intel_sdvo.h"
+-#include "vlv_sideband.h"
+ 
+ static void intel_hdmi_prepare(struct intel_encoder *encoder,
+ 			       const struct intel_crtc_state *crtc_state)
+@@ -539,15 +538,8 @@ static void chv_hdmi_post_disable(struct intel_atomic_state *state,
+ 				  const struct intel_crtc_state *old_crtc_state,
+ 				  const struct drm_connector_state *old_conn_state)
+ {
+-	struct intel_display *display = to_intel_display(encoder);
+-	struct drm_i915_private *dev_priv = to_i915(display->drm);
+-
+-	vlv_dpio_get(dev_priv);
+-
+ 	/* Assert data lane reset */
+ 	chv_data_lane_soft_reset(encoder, old_crtc_state, true);
+-
+-	vlv_dpio_put(dev_priv);
+ }
+ 
+ static void chv_hdmi_pre_enable(struct intel_atomic_state *state,
+diff --git a/drivers/gpu/drm/i915/display/intel_dpio_phy.c b/drivers/gpu/drm/i915/display/intel_dpio_phy.c
+index 429f89543789..1e1af7150723 100644
+--- a/drivers/gpu/drm/i915/display/intel_dpio_phy.c
++++ b/drivers/gpu/drm/i915/display/intel_dpio_phy.c
+@@ -808,9 +808,9 @@ void chv_set_phy_signal_level(struct intel_encoder *encoder,
+ 	vlv_dpio_put(dev_priv);
+ }
+ 
+-void chv_data_lane_soft_reset(struct intel_encoder *encoder,
+-			      const struct intel_crtc_state *crtc_state,
+-			      bool reset)
++static void __chv_data_lane_soft_reset(struct intel_encoder *encoder,
++				       const struct intel_crtc_state *crtc_state,
++				       bool reset)
+ {
+ 	struct drm_i915_private *dev_priv = to_i915(encoder->base.dev);
+ 	struct intel_digital_port *dig_port = enc_to_dig_port(encoder);
+@@ -853,6 +853,17 @@ void chv_data_lane_soft_reset(struct intel_encoder *encoder,
+ 	}
+ }
+ 
++void chv_data_lane_soft_reset(struct intel_encoder *encoder,
++			      const struct intel_crtc_state *crtc_state,
++			      bool reset)
++{
++	struct drm_i915_private *i915 = to_i915(encoder->base.dev);
++
++	vlv_dpio_get(i915);
++	__chv_data_lane_soft_reset(encoder, crtc_state, reset);
++	vlv_dpio_put(i915);
++}
++
+ void chv_phy_pre_pll_enable(struct intel_encoder *encoder,
+ 			    const struct intel_crtc_state *crtc_state)
+ {
+@@ -880,7 +891,7 @@ void chv_phy_pre_pll_enable(struct intel_encoder *encoder,
+ 	vlv_dpio_get(dev_priv);
+ 
+ 	/* Assert data lane reset */
+-	chv_data_lane_soft_reset(encoder, crtc_state, true);
++	__chv_data_lane_soft_reset(encoder, crtc_state, true);
+ 
+ 	/* program left/right clock distribution */
+ 	if (pipe != PIPE_B) {
+@@ -1008,7 +1019,7 @@ void chv_phy_pre_encoder_enable(struct intel_encoder *encoder,
+ 	}
+ 
+ 	/* Deassert data lane reset */
+-	chv_data_lane_soft_reset(encoder, crtc_state, false);
++	__chv_data_lane_soft_reset(encoder, crtc_state, false);
+ 
+ 	vlv_dpio_put(dev_priv);
+ }
+-- 
+2.52.0
+
