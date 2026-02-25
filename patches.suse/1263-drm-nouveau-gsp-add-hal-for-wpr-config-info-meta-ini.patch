@@ -1,0 +1,479 @@
+From 57fe0d30a0a6fafc0b89ab3d8ec8d81f6742f1b6 Mon Sep 17 00:00:00 2001
+From: Ben Skeggs <bskeggs@nvidia.com>
+Date: Thu, 14 Nov 2024 13:02:37 +1000
+Subject: drm/nouveau/gsp: add hal for wpr config info + meta init
+Git-commit: 57fe0d30a0a6fafc0b89ab3d8ec8d81f6742f1b6
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+545.23.06 increases the libos3 heap size requirements, and GH100/GBxxx
+will need their own implementation entirely.
+
+Signed-off-by: Ben Skeggs <bskeggs@nvidia.com>
+Reviewed-by: Dave Airlie <airlied@redhat.com>
+Reviewed-by: Timur Tabi <ttabi@nvidia.com>
+Tested-by: Timur Tabi <ttabi@nvidia.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../gpu/drm/nouveau/include/nvkm/subdev/gsp.h |  3 +
+ .../gpu/drm/nouveau/nvkm/subdev/gsp/ad102.c   |  4 -
+ .../gpu/drm/nouveau/nvkm/subdev/gsp/base.c    |  1 +
+ .../gpu/drm/nouveau/nvkm/subdev/gsp/ga100.c   |  3 -
+ .../gpu/drm/nouveau/nvkm/subdev/gsp/ga102.c   |  4 -
+ .../gpu/drm/nouveau/nvkm/subdev/gsp/priv.h    |  6 --
+ .../drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c | 92 +-----------------
+ .../nvkm/subdev/gsp/rm/r535/nvrm/gsp.h        |  8 ++
+ .../drm/nouveau/nvkm/subdev/gsp/rm/r535/rm.c  | 18 ++++
+ .../gpu/drm/nouveau/nvkm/subdev/gsp/rm/rm.h   |  8 ++
+ .../gpu/drm/nouveau/nvkm/subdev/gsp/tu102.c   | 97 ++++++++++++++++++-
+ .../gpu/drm/nouveau/nvkm/subdev/gsp/tu116.c   |  3 -
+ 12 files changed, 134 insertions(+), 113 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/subdev/gsp.h b/drivers/gpu/drm/nouveau/include/nvkm/subdev/gsp.h
+index eeaf72f6add3..ef781c4ca11f 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/subdev/gsp.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/subdev/gsp.h
+@@ -17,6 +17,9 @@ struct nvkm_gsp_mem {
+ 	dma_addr_t addr;
+ };
+ 
++int nvkm_gsp_mem_ctor(struct nvkm_gsp *, size_t size, struct nvkm_gsp_mem *);
++void nvkm_gsp_mem_dtor(struct nvkm_gsp_mem *);
++
+ struct nvkm_gsp_radix3 {
+ 	struct nvkm_gsp_mem lvl0;
+ 	struct nvkm_gsp_mem lvl1;
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/ad102.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/ad102.c
+index d7933bfc59fd..8ab02d683c90 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/ad102.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/ad102.c
+@@ -28,10 +28,6 @@ ad102_gsp = {
+ 
+ 	.sig_section = ".fwsignature_ad10x",
+ 
+-	.wpr_heap.os_carveout_size = 20 << 20,
+-	.wpr_heap.base_size = 8 << 20,
+-	.wpr_heap.min_size = 84 << 20,
+-
+ 	.booter.ctor = ga102_gsp_booter_ctor,
+ 
+ 	.dtor = r535_gsp_dtor,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/base.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/base.c
+index 0f8526aa969f..be6bbf06d58b 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/base.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/base.c
+@@ -148,6 +148,7 @@ nvkm_gsp_new_(const struct nvkm_gsp_fwif *fwif, struct nvkm_device *device,
+ 
+ 		gsp->rm->device = device;
+ 		gsp->rm->gpu = fwif->func->rm.gpu;
++		gsp->rm->wpr = fwif->rm->wpr;
+ 		gsp->rm->api = fwif->rm->api;
+ 	}
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/ga100.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/ga100.c
+index 77e3501296c9..a6836a85b2ac 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/ga100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/ga100.c
+@@ -45,9 +45,6 @@ ga100_gsp = {
+ 
+ 	.sig_section = ".fwsignature_ga100",
+ 
+-	.wpr_heap.base_size = 8 << 20,
+-	.wpr_heap.min_size = 64 << 20,
+-
+ 	.booter.ctor = tu102_gsp_booter_ctor,
+ 
+ 	.dtor = r535_gsp_dtor,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/ga102.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/ga102.c
+index 709a046d86bf..202b5bdc3980 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/ga102.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/ga102.c
+@@ -156,10 +156,6 @@ ga102_gsp_r535 = {
+ 
+ 	.sig_section = ".fwsignature_ga10x",
+ 
+-	.wpr_heap.os_carveout_size = 20 << 20,
+-	.wpr_heap.base_size = 8 << 20,
+-	.wpr_heap.min_size = 84 << 20,
+-
+ 	.booter.ctor = ga102_gsp_booter_ctor,
+ 
+ 	.dtor = r535_gsp_dtor,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/priv.h b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/priv.h
+index de274f6426c1..d42ae235d2f4 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/priv.h
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/priv.h
+@@ -36,12 +36,6 @@ struct nvkm_gsp_func {
+ 
+ 	char *sig_section;
+ 
+-	struct {
+-		u32 os_carveout_size;
+-		u32 base_size;
+-		u64 min_size;
+-	} wpr_heap;
+-
+ 	struct {
+ 		int (*ctor)(struct nvkm_gsp *, const char *name, const struct firmware *,
+ 			    struct nvkm_falcon *, struct nvkm_falcon_fw *);
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c
+index 8ca0f99ccbac..ec69fdb9492a 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c
+@@ -231,7 +231,7 @@ r535_gsp_rpc_get_gsp_static_info(struct nvkm_gsp *gsp)
+ 	return 0;
+ }
+ 
+-static void
++void
+ nvkm_gsp_mem_dtor(struct nvkm_gsp_mem *mem)
+ {
+ 	if (mem->data) {
+@@ -260,7 +260,7 @@ nvkm_gsp_mem_dtor(struct nvkm_gsp_mem *mem)
+  * so we take a device reference to ensure its lifetime. The reference is
+  * dropped in the destructor.
+  */
+-static int
++int
+ nvkm_gsp_mem_ctor(struct nvkm_gsp *gsp, size_t size, struct nvkm_gsp_mem *mem)
+ {
+ 	mem->data = dma_alloc_coherent(gsp->subdev.device->dev, size, &mem->addr, GFP_KERNEL);
+@@ -1129,55 +1129,6 @@ r535_gsp_msg_run_cpu_sequencer(void *priv, u32 fn, void *repv, u32 repc)
+ 	return 0;
+ }
+ 
+-static int
+-r535_gsp_wpr_meta_init(struct nvkm_gsp *gsp)
+-{
+-	GspFwWprMeta *meta;
+-	int ret;
+-
+-	ret = nvkm_gsp_mem_ctor(gsp, 0x1000, &gsp->wpr_meta);
+-	if (ret)
+-		return ret;
+-
+-	meta = gsp->wpr_meta.data;
+-
+-	meta->magic = GSP_FW_WPR_META_MAGIC;
+-	meta->revision = GSP_FW_WPR_META_REVISION;
+-
+-	meta->sysmemAddrOfRadix3Elf = gsp->radix3.lvl0.addr;
+-	meta->sizeOfRadix3Elf = gsp->fb.wpr2.elf.size;
+-
+-	meta->sysmemAddrOfBootloader = gsp->boot.fw.addr;
+-	meta->sizeOfBootloader = gsp->boot.fw.size;
+-	meta->bootloaderCodeOffset = gsp->boot.code_offset;
+-	meta->bootloaderDataOffset = gsp->boot.data_offset;
+-	meta->bootloaderManifestOffset = gsp->boot.manifest_offset;
+-
+-	meta->sysmemAddrOfSignature = gsp->sig.addr;
+-	meta->sizeOfSignature = gsp->sig.size;
+-
+-	meta->gspFwRsvdStart = gsp->fb.heap.addr;
+-	meta->nonWprHeapOffset = gsp->fb.heap.addr;
+-	meta->nonWprHeapSize = gsp->fb.heap.size;
+-	meta->gspFwWprStart = gsp->fb.wpr2.addr;
+-	meta->gspFwHeapOffset = gsp->fb.wpr2.heap.addr;
+-	meta->gspFwHeapSize = gsp->fb.wpr2.heap.size;
+-	meta->gspFwOffset = gsp->fb.wpr2.elf.addr;
+-	meta->bootBinOffset = gsp->fb.wpr2.boot.addr;
+-	meta->frtsOffset = gsp->fb.wpr2.frts.addr;
+-	meta->frtsSize = gsp->fb.wpr2.frts.size;
+-	meta->gspFwWprEnd = ALIGN_DOWN(gsp->fb.bios.vga_workspace.addr, 0x20000);
+-	meta->fbSize = gsp->fb.size;
+-	meta->vgaWorkspaceOffset = gsp->fb.bios.vga_workspace.addr;
+-	meta->vgaWorkspaceSize = gsp->fb.bios.vga_workspace.size;
+-	meta->bootCount = 0;
+-	meta->partitionRpcAddr = 0;
+-	meta->partitionRpcRequestOffset = 0;
+-	meta->partitionRpcReplyOffset = 0;
+-	meta->verified = 0;
+-	return 0;
+-}
+-
+ static int
+ r535_gsp_shared_init(struct nvkm_gsp *gsp)
+ {
+@@ -2179,49 +2130,10 @@ r535_gsp_oneinit(struct nvkm_gsp *gsp)
+ 	/* Release FW images - we've copied them to DMA buffers now. */
+ 	nvkm_gsp_dtor_fws(gsp);
+ 
+-	/* Calculate FB layout. */
+-	gsp->fb.wpr2.frts.size = 0x100000;
+-	gsp->fb.wpr2.frts.addr = ALIGN_DOWN(gsp->fb.bios.addr, 0x20000) - gsp->fb.wpr2.frts.size;
+-
+-	gsp->fb.wpr2.boot.size = gsp->boot.fw.size;
+-	gsp->fb.wpr2.boot.addr = ALIGN_DOWN(gsp->fb.wpr2.frts.addr - gsp->fb.wpr2.boot.size, 0x1000);
+-
+-	gsp->fb.wpr2.elf.size = gsp->fw.len;
+-	gsp->fb.wpr2.elf.addr = ALIGN_DOWN(gsp->fb.wpr2.boot.addr - gsp->fb.wpr2.elf.size, 0x10000);
+-
+-	{
+-		u32 fb_size_gb = DIV_ROUND_UP_ULL(gsp->fb.size, 1 << 30);
+-
+-		gsp->fb.wpr2.heap.size =
+-			gsp->func->wpr_heap.os_carveout_size +
+-			gsp->func->wpr_heap.base_size +
+-			ALIGN(GSP_FW_HEAP_PARAM_SIZE_PER_GB_FB * fb_size_gb, 1 << 20) +
+-			ALIGN(GSP_FW_HEAP_PARAM_CLIENT_ALLOC_SIZE, 1 << 20);
+-
+-		gsp->fb.wpr2.heap.size = max(gsp->fb.wpr2.heap.size, gsp->func->wpr_heap.min_size);
+-	}
+-
+-	gsp->fb.wpr2.heap.addr = ALIGN_DOWN(gsp->fb.wpr2.elf.addr - gsp->fb.wpr2.heap.size, 0x100000);
+-	gsp->fb.wpr2.heap.size = ALIGN_DOWN(gsp->fb.wpr2.elf.addr - gsp->fb.wpr2.heap.addr, 0x100000);
+-
+-	gsp->fb.wpr2.addr = ALIGN_DOWN(gsp->fb.wpr2.heap.addr - sizeof(GspFwWprMeta), 0x100000);
+-	gsp->fb.wpr2.size = gsp->fb.wpr2.frts.addr + gsp->fb.wpr2.frts.size - gsp->fb.wpr2.addr;
+-
+-	gsp->fb.heap.size = 0x100000;
+-	gsp->fb.heap.addr = gsp->fb.wpr2.addr - gsp->fb.heap.size;
+-
+-	ret = nvkm_gsp_fwsec_frts(gsp);
+-	if (WARN_ON(ret))
+-		return ret;
+-
+ 	ret = r535_gsp_libos_init(gsp);
+ 	if (WARN_ON(ret))
+ 		return ret;
+ 
+-	ret = r535_gsp_wpr_meta_init(gsp);
+-	if (WARN_ON(ret))
+-		return ret;
+-
+ 	ret = r535_gsp_rpc_set_system_info(gsp);
+ 	if (WARN_ON(ret))
+ 		return ret;
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/nvrm/gsp.h b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/nvrm/gsp.h
+index 085a7dac0405..b6683a5bf870 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/nvrm/gsp.h
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/nvrm/gsp.h
+@@ -814,4 +814,12 @@ typedef struct GSP_MSG_QUEUE_ELEMENT
+     NvU32 elemCount;                 // Number of message queue elements this message has.
+     NV_DECLARE_ALIGNED(rpc_message_header_v rpc, 8);
+ } GSP_MSG_QUEUE_ELEMENT;
++
++#define GSP_FW_HEAP_PARAM_OS_SIZE_LIBOS2                   (0 << 20)   // No FB heap usage
++#define GSP_FW_HEAP_PARAM_OS_SIZE_LIBOS3                  (20 << 20)
++
++#define GSP_FW_HEAP_PARAM_BASE_RM_SIZE_TU10X               (8 << 20)   // Turing thru Ada
++
++#define GSP_FW_HEAP_SIZE_OVERRIDE_LIBOS2_MIN_MB                (64u)
++#define GSP_FW_HEAP_SIZE_OVERRIDE_LIBOS3_BAREMETAL_MIN_MB      (84u)
+ #endif
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/rm.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/rm.c
+index 6de7d1a91119..60e8678b7913 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/rm.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/rm.c
+@@ -4,6 +4,22 @@
+  */
+ #include <rm/rm.h>
+ 
++#include "nvrm/gsp.h"
++
++static const struct nvkm_rm_wpr
++r535_wpr_libos2 = {
++	.os_carveout_size = GSP_FW_HEAP_PARAM_OS_SIZE_LIBOS2,
++	.base_size = GSP_FW_HEAP_PARAM_BASE_RM_SIZE_TU10X,
++	.heap_size_min = GSP_FW_HEAP_SIZE_OVERRIDE_LIBOS2_MIN_MB,
++};
++
++static const struct nvkm_rm_wpr
++r535_wpr_libos3 = {
++	.os_carveout_size = GSP_FW_HEAP_PARAM_OS_SIZE_LIBOS3,
++	.base_size = GSP_FW_HEAP_PARAM_BASE_RM_SIZE_TU10X,
++	.heap_size_min = GSP_FW_HEAP_SIZE_OVERRIDE_LIBOS3_BAREMETAL_MIN_MB,
++};
++
+ static const struct nvkm_rm_api
+ r535_api = {
+ 	.rpc = &r535_rpc,
+@@ -20,10 +36,12 @@ r535_api = {
+ 
+ const struct nvkm_rm_impl
+ r535_rm_tu102 = {
++	.wpr = &r535_wpr_libos2,
+ 	.api = &r535_api,
+ };
+ 
+ const struct nvkm_rm_impl
+ r535_rm_ga102 = {
++	.wpr = &r535_wpr_libos3,
+ 	.api = &r535_api,
+ };
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/rm.h b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/rm.h
+index 4d9e5ea3b2fa..1a2fec3935a4 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/rm.h
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/rm.h
+@@ -8,15 +8,23 @@
+ #include "handles.h"
+ 
+ struct nvkm_rm_impl {
++	const struct nvkm_rm_wpr *wpr;
+ 	const struct nvkm_rm_api *api;
+ };
+ 
+ struct nvkm_rm {
+ 	struct nvkm_device *device;
+ 	const struct nvkm_rm_gpu *gpu;
++	const struct nvkm_rm_wpr *wpr;
+ 	const struct nvkm_rm_api *api;
+ };
+ 
++struct nvkm_rm_wpr {
++	u32 os_carveout_size;
++	u32 base_size;
++	u64 heap_size_min;
++};
++
+ struct nvkm_rm_api {
+ 	const struct nvkm_rm_api_rpc {
+ 		void *(*get)(struct nvkm_gsp *, u32 fn, u32 argc);
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/tu102.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/tu102.c
+index fef9c4444017..a07f59e5ef7a 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/tu102.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/tu102.c
+@@ -24,6 +24,8 @@
+ #include <subdev/fb.h>
+ #include <engine/sec2.h>
+ 
++#include <rm/r535/nvrm/gsp.h>
++
+ #include <nvfw/flcn.h>
+ #include <nvfw/fw.h>
+ #include <nvfw/hs.h>
+@@ -195,6 +197,69 @@ tu102_gsp_init(struct nvkm_gsp *gsp)
+ 	return r535_gsp_init(gsp);
+ }
+ 
++static int
++tu102_gsp_wpr_meta_init(struct nvkm_gsp *gsp)
++{
++	GspFwWprMeta *meta;
++	int ret;
++
++	ret = nvkm_gsp_mem_ctor(gsp, sizeof(*meta), &gsp->wpr_meta);
++	if (ret)
++		return ret;
++
++	meta = gsp->wpr_meta.data;
++
++	meta->magic = GSP_FW_WPR_META_MAGIC;
++	meta->revision = GSP_FW_WPR_META_REVISION;
++
++	meta->sysmemAddrOfRadix3Elf = gsp->radix3.lvl0.addr;
++	meta->sizeOfRadix3Elf = gsp->fb.wpr2.elf.size;
++
++	meta->sysmemAddrOfBootloader = gsp->boot.fw.addr;
++	meta->sizeOfBootloader = gsp->boot.fw.size;
++	meta->bootloaderCodeOffset = gsp->boot.code_offset;
++	meta->bootloaderDataOffset = gsp->boot.data_offset;
++	meta->bootloaderManifestOffset = gsp->boot.manifest_offset;
++
++	meta->sysmemAddrOfSignature = gsp->sig.addr;
++	meta->sizeOfSignature = gsp->sig.size;
++
++	meta->gspFwRsvdStart = gsp->fb.heap.addr;
++	meta->nonWprHeapOffset = gsp->fb.heap.addr;
++	meta->nonWprHeapSize = gsp->fb.heap.size;
++	meta->gspFwWprStart = gsp->fb.wpr2.addr;
++	meta->gspFwHeapOffset = gsp->fb.wpr2.heap.addr;
++	meta->gspFwHeapSize = gsp->fb.wpr2.heap.size;
++	meta->gspFwOffset = gsp->fb.wpr2.elf.addr;
++	meta->bootBinOffset = gsp->fb.wpr2.boot.addr;
++	meta->frtsOffset = gsp->fb.wpr2.frts.addr;
++	meta->frtsSize = gsp->fb.wpr2.frts.size;
++	meta->gspFwWprEnd = ALIGN_DOWN(gsp->fb.bios.vga_workspace.addr, 0x20000);
++	meta->fbSize = gsp->fb.size;
++	meta->vgaWorkspaceOffset = gsp->fb.bios.vga_workspace.addr;
++	meta->vgaWorkspaceSize = gsp->fb.bios.vga_workspace.size;
++	meta->bootCount = 0;
++	meta->partitionRpcAddr = 0;
++	meta->partitionRpcRequestOffset = 0;
++	meta->partitionRpcReplyOffset = 0;
++	meta->verified = 0;
++	return 0;
++}
++
++static u64
++tu102_gsp_wpr_heap_size(struct nvkm_gsp *gsp)
++{
++	u32 fb_size_gb = DIV_ROUND_UP_ULL(gsp->fb.size, 1 << 30);
++	u64 heap_size;
++
++	heap_size = gsp->rm->wpr->os_carveout_size +
++		    gsp->rm->wpr->base_size +
++		    ALIGN(GSP_FW_HEAP_PARAM_SIZE_PER_GB_FB * fb_size_gb, 1 << 20) +
++		    ALIGN(GSP_FW_HEAP_PARAM_CLIENT_ALLOC_SIZE, 1 << 20);
++
++	return max(heap_size, gsp->rm->wpr->heap_size_min);
++}
++
+ static u64
+ tu102_gsp_vga_workspace_addr(struct nvkm_gsp *gsp, u64 fb_size)
+ {
+@@ -241,6 +306,35 @@ tu102_gsp_oneinit(struct nvkm_gsp *gsp)
+ 	if (ret)
+ 		return ret;
+ 
++	/* Calculate FB layout. */
++	gsp->fb.wpr2.frts.size = 0x100000;
++	gsp->fb.wpr2.frts.addr = ALIGN_DOWN(gsp->fb.bios.addr, 0x20000) - gsp->fb.wpr2.frts.size;
++
++	gsp->fb.wpr2.boot.size = gsp->boot.fw.size;
++	gsp->fb.wpr2.boot.addr = ALIGN_DOWN(gsp->fb.wpr2.frts.addr - gsp->fb.wpr2.boot.size, 0x1000);
++
++	gsp->fb.wpr2.elf.size = gsp->fw.len;
++	gsp->fb.wpr2.elf.addr = ALIGN_DOWN(gsp->fb.wpr2.boot.addr - gsp->fb.wpr2.elf.size, 0x10000);
++
++	gsp->fb.wpr2.heap.size = tu102_gsp_wpr_heap_size(gsp);
++
++	gsp->fb.wpr2.heap.addr = ALIGN_DOWN(gsp->fb.wpr2.elf.addr - gsp->fb.wpr2.heap.size, 0x100000);
++	gsp->fb.wpr2.heap.size = ALIGN_DOWN(gsp->fb.wpr2.elf.addr - gsp->fb.wpr2.heap.addr, 0x100000);
++
++	gsp->fb.wpr2.addr = ALIGN_DOWN(gsp->fb.wpr2.heap.addr - sizeof(GspFwWprMeta), 0x100000);
++	gsp->fb.wpr2.size = gsp->fb.wpr2.frts.addr + gsp->fb.wpr2.frts.size - gsp->fb.wpr2.addr;
++
++	gsp->fb.heap.size = 0x100000;
++	gsp->fb.heap.addr = gsp->fb.wpr2.addr - gsp->fb.heap.size;
++
++	ret = tu102_gsp_wpr_meta_init(gsp);
++	if (ret)
++		return ret;
++
++	ret = nvkm_gsp_fwsec_frts(gsp);
++	if (WARN_ON(ret))
++		return ret;
++
+ 	/* Reset GSP into RISC-V mode. */
+ 	ret = gsp->func->reset(gsp);
+ 	if (ret)
+@@ -274,9 +368,6 @@ tu102_gsp = {
+ 
+ 	.sig_section = ".fwsignature_tu10x",
+ 
+-	.wpr_heap.base_size = 8 << 20,
+-	.wpr_heap.min_size = 64 << 20,
+-
+ 	.booter.ctor = tu102_gsp_booter_ctor,
+ 
+ 	.dtor = r535_gsp_dtor,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/tu116.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/tu116.c
+index 5f279813626f..9e897bdcb647 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/tu116.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/tu116.c
+@@ -28,9 +28,6 @@ tu116_gsp = {
+ 
+ 	.sig_section = ".fwsignature_tu11x",
+ 
+-	.wpr_heap.base_size = 8 << 20,
+-	.wpr_heap.min_size = 64 << 20,
+-
+ 	.booter.ctor = tu102_gsp_booter_ctor,
+ 
+ 	.dtor = r535_gsp_dtor,
+-- 
+2.52.0
+
