@@ -1,0 +1,124 @@
+From 5ae4591f4ea51519934a14aac537a28f348a8a56 Mon Sep 17 00:00:00 2001
+From: Emily Deng <Emily.Deng@amd.com>
+Date: Tue, 8 Apr 2025 20:25:43 +0800
+Subject: drm/amdgpu: Clear overflow for SRIOV
+Git-commit: 5ae4591f4ea51519934a14aac537a28f348a8a56
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+For VF, it doesn't have the permission to clear overflow, clear the bit
+by reset.
+
+Signed-off-by: Emily Deng <Emily.Deng@amd.com>
+Acked-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ih.c | 15 +++++++++++++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ih.h |  1 +
+ drivers/gpu/drm/amd/amdgpu/ih_v6_0.c   |  6 +++++-
+ drivers/gpu/drm/amd/amdgpu/vega20_ih.c |  6 +++++-
+ 4 files changed, 24 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.c
+index 901f8b12c672..30f16968b578 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.c
+@@ -25,6 +25,7 @@
+ 
+ #include "amdgpu.h"
+ #include "amdgpu_ih.h"
++#include "amdgpu_reset.h"
+ 
+ /**
+  * amdgpu_ih_ring_init - initialize the IH state
+@@ -227,13 +228,23 @@ int amdgpu_ih_process(struct amdgpu_device *adev, struct amdgpu_ih_ring *ih)
+ 		ih->rptr &= ih->ptr_mask;
+ 	}
+ 
+-	amdgpu_ih_set_rptr(adev, ih);
++	if (!ih->overflow)
++		amdgpu_ih_set_rptr(adev, ih);
++
+ 	wake_up_all(&ih->wait_process);
+ 
+ 	/* make sure wptr hasn't changed while processing */
+ 	wptr = amdgpu_ih_get_wptr(adev, ih);
+ 	if (wptr != ih->rptr)
+-		goto restart_ih;
++		if (!ih->overflow)
++			goto restart_ih;
++
++	if (ih->overflow)
++		if (amdgpu_sriov_runtime(adev))
++			WARN_ONCE(!amdgpu_reset_domain_schedule(adev->reset_domain,
++				   &adev->virt.flr_work),
++				  "Failed to queue work! at %s",
++				  __func__);
+ 
+ 	return IRQ_HANDLED;
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.h
+index b0a88f92cd82..7f7ea046e209 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.h
+@@ -72,6 +72,7 @@ struct amdgpu_ih_ring {
+ 	/* For waiting on IH processing at checkpoint. */
+ 	wait_queue_head_t wait_process;
+ 	uint64_t		processed_timestamp;
++	bool overflow;
+ };
+ 
+ /* return true if time stamp t2 is after t1 with 48bit wrap around */
+diff --git a/drivers/gpu/drm/amd/amdgpu/ih_v6_0.c b/drivers/gpu/drm/amd/amdgpu/ih_v6_0.c
+index eb4185dcbd1d..5900b560b7de 100644
+--- a/drivers/gpu/drm/amd/amdgpu/ih_v6_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/ih_v6_0.c
+@@ -349,6 +349,7 @@ static int ih_v6_0_irq_init(struct amdgpu_device *adev)
+ 			if (ret)
+ 				return ret;
+ 		}
++		ih[i]->overflow = false;
+ 	}
+ 
+ 	/* update doorbell range for ih ring 0 */
+@@ -446,7 +447,10 @@ static u32 ih_v6_0_get_wptr(struct amdgpu_device *adev,
+ 	wptr = RREG32_NO_KIQ(ih_regs->ih_rb_wptr);
+ 	if (!REG_GET_FIELD(wptr, IH_RB_WPTR, RB_OVERFLOW))
+ 		goto out;
+-	wptr = REG_SET_FIELD(wptr, IH_RB_WPTR, RB_OVERFLOW, 0);
++	if (!amdgpu_sriov_vf(adev))
++		wptr = REG_SET_FIELD(wptr, IH_RB_WPTR, RB_OVERFLOW, 0);
++	else
++		ih->overflow = true;
+ 
+ 	/* When a ring buffer overflow happen start parsing interrupt
+ 	 * from the last not overwritten vector (wptr + 32). Hopefully
+diff --git a/drivers/gpu/drm/amd/amdgpu/vega20_ih.c b/drivers/gpu/drm/amd/amdgpu/vega20_ih.c
+index faa0dd75dd6d..85846fd08ce4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vega20_ih.c
++++ b/drivers/gpu/drm/amd/amdgpu/vega20_ih.c
+@@ -350,6 +350,7 @@ static int vega20_ih_irq_init(struct amdgpu_device *adev)
+ 			if (ret)
+ 				return ret;
+ 		}
++		ih[i]->overflow = false;
+ 	}
+ 
+ 	if (!amdgpu_sriov_vf(adev))
+@@ -437,7 +438,10 @@ static u32 vega20_ih_get_wptr(struct amdgpu_device *adev,
+ 	if (!REG_GET_FIELD(wptr, IH_RB_WPTR, RB_OVERFLOW))
+ 		goto out;
+ 
+-	wptr = REG_SET_FIELD(wptr, IH_RB_WPTR, RB_OVERFLOW, 0);
++	if (!amdgpu_sriov_vf(adev))
++		wptr = REG_SET_FIELD(wptr, IH_RB_WPTR, RB_OVERFLOW, 0);
++	else
++		ih->overflow = true;
+ 
+ 	/* When a ring buffer overflow happen start parsing interrupt
+ 	 * from the last not overwritten vector (wptr + 32). Hopefully
+-- 
+2.52.0
+
