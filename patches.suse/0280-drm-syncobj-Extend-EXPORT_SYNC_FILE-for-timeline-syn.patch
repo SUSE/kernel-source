@@ -1,0 +1,178 @@
+From c2d3a730069545f2cc2d644bfa8b1482e6388826 Mon Sep 17 00:00:00 2001
+From: Rob Clark <robdclark@chromium.org>
+Date: Tue, 1 Apr 2025 08:57:58 -0700
+Subject: drm/syncobj: Extend EXPORT_SYNC_FILE for timeline syncobjs
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: c2d3a730069545f2cc2d644bfa8b1482e6388826
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Add support for exporting a dma_fence fd for a specific point on a
+timeline.  This is needed for vtest/vpipe[1][2] to implement timeline
+syncobj support, as it needs a way to turn a point on a timeline back
+into a dma_fence fd.  It also closes an odd omission from the syncobj
+UAPI.
+
+[1] https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/33433
+[2] https://gitlab.freedesktop.org/virgl/virglrenderer/-/merge_requests/805
+
+V2: Add DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_TIMELINE
+V3: Add unstaged uabi header hunk
+V4: Also handle IMPORT_SYNC_FILE case
+V5: Address comments from Dmitry
+V6: checkpatch.pl nits
+
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Dmitry Osipenko <dmitry.osipenko@collabora.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250401155758.48855-1-robdclark@gmail.com
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/drm_syncobj.c | 47 +++++++++++++++++++++++++++--------
+ include/uapi/drm/drm.h        |  4 +++
+ 2 files changed, 41 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_syncobj.c b/drivers/gpu/drm/drm_syncobj.c
+index 8e3d2d7060f8..c9f6df15f864 100644
+--- a/drivers/gpu/drm/drm_syncobj.c
++++ b/drivers/gpu/drm/drm_syncobj.c
+@@ -744,7 +744,7 @@ static int drm_syncobj_fd_to_handle(struct drm_file *file_private,
+ }
+ 
+ static int drm_syncobj_import_sync_file_fence(struct drm_file *file_private,
+-					      int fd, int handle)
++					      int fd, int handle, u64 point)
+ {
+ 	struct dma_fence *fence = sync_file_get_fence(fd);
+ 	struct drm_syncobj *syncobj;
+@@ -758,14 +758,24 @@ static int drm_syncobj_import_sync_file_fence(struct drm_file *file_private,
+ 		return -ENOENT;
+ 	}
+ 
+-	drm_syncobj_replace_fence(syncobj, fence);
++	if (point) {
++		struct dma_fence_chain *chain = dma_fence_chain_alloc();
++
++		if (!chain)
++			return -ENOMEM;
++
++		drm_syncobj_add_point(syncobj, chain, fence, point);
++	} else {
++		drm_syncobj_replace_fence(syncobj, fence);
++	}
++
+ 	dma_fence_put(fence);
+ 	drm_syncobj_put(syncobj);
+ 	return 0;
+ }
+ 
+ static int drm_syncobj_export_sync_file(struct drm_file *file_private,
+-					int handle, int *p_fd)
++					int handle, u64 point, int *p_fd)
+ {
+ 	int ret;
+ 	struct dma_fence *fence;
+@@ -775,7 +785,7 @@ static int drm_syncobj_export_sync_file(struct drm_file *file_private,
+ 	if (fd < 0)
+ 		return fd;
+ 
+-	ret = drm_syncobj_find_fence(file_private, handle, 0, 0, &fence);
++	ret = drm_syncobj_find_fence(file_private, handle, point, 0, &fence);
+ 	if (ret)
+ 		goto err_put_fd;
+ 
+@@ -872,6 +882,9 @@ drm_syncobj_handle_to_fd_ioctl(struct drm_device *dev, void *data,
+ 				   struct drm_file *file_private)
+ {
+ 	struct drm_syncobj_handle *args = data;
++	unsigned int valid_flags = DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_TIMELINE |
++				   DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE;
++	u64 point = 0;
+ 
+ 	if (!drm_core_check_feature(dev, DRIVER_SYNCOBJ))
+ 		return -EOPNOTSUPP;
+@@ -879,13 +892,18 @@ drm_syncobj_handle_to_fd_ioctl(struct drm_device *dev, void *data,
+ 	if (args->pad)
+ 		return -EINVAL;
+ 
+-	if (args->flags != 0 &&
+-	    args->flags != DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE)
++	if (args->flags & ~valid_flags)
+ 		return -EINVAL;
+ 
++	if (args->flags & DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_TIMELINE)
++		point = args->point;
++
+ 	if (args->flags & DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE)
+ 		return drm_syncobj_export_sync_file(file_private, args->handle,
+-						    &args->fd);
++						    point, &args->fd);
++
++	if (args->point)
++		return -EINVAL;
+ 
+ 	return drm_syncobj_handle_to_fd(file_private, args->handle,
+ 					&args->fd);
+@@ -896,6 +914,9 @@ drm_syncobj_fd_to_handle_ioctl(struct drm_device *dev, void *data,
+ 				   struct drm_file *file_private)
+ {
+ 	struct drm_syncobj_handle *args = data;
++	unsigned int valid_flags = DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_TIMELINE |
++				   DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE;
++	u64 point = 0;
+ 
+ 	if (!drm_core_check_feature(dev, DRIVER_SYNCOBJ))
+ 		return -EOPNOTSUPP;
+@@ -903,14 +924,20 @@ drm_syncobj_fd_to_handle_ioctl(struct drm_device *dev, void *data,
+ 	if (args->pad)
+ 		return -EINVAL;
+ 
+-	if (args->flags != 0 &&
+-	    args->flags != DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE)
++	if (args->flags & ~valid_flags)
+ 		return -EINVAL;
+ 
++	if (args->flags & DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_TIMELINE)
++		point = args->point;
++
+ 	if (args->flags & DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE)
+ 		return drm_syncobj_import_sync_file_fence(file_private,
+ 							  args->fd,
+-							  args->handle);
++							  args->handle,
++							  point);
++
++	if (args->point)
++		return -EINVAL;
+ 
+ 	return drm_syncobj_fd_to_handle(file_private, args->fd,
+ 					&args->handle);
+diff --git a/include/uapi/drm/drm.h b/include/uapi/drm/drm.h
+index 7fba37b94401..e63a71d3c607 100644
+--- a/include/uapi/drm/drm.h
++++ b/include/uapi/drm/drm.h
+@@ -905,13 +905,17 @@ struct drm_syncobj_destroy {
+ };
+ 
+ #define DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE (1 << 0)
++#define DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_TIMELINE         (1 << 1)
+ #define DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE (1 << 0)
++#define DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_TIMELINE         (1 << 1)
+ struct drm_syncobj_handle {
+ 	__u32 handle;
+ 	__u32 flags;
+ 
+ 	__s32 fd;
+ 	__u32 pad;
++
++	__u64 point;
+ };
+ 
+ struct drm_syncobj_transfer {
+-- 
+2.52.0
+
