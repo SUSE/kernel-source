@@ -1,0 +1,81 @@
+From 533aae7c94dbc2b14301cfd68ae7e0e90f0c8438 Mon Sep 17 00:00:00 2001
+From: Bartosz Golaszewski <bartosz.golaszewski@linaro.org>
+Date: Mon, 5 Dec 2022 13:39:02 +0100
+Subject: [PATCH] gpiolib: cdev: fix NULL-pointer dereferences
+Git-commit: 533aae7c94dbc2b14301cfd68ae7e0e90f0c8438
+Patch-mainline: v6.2-rc1
+References: git-fixes CVE-2022-50453 bsc#1250887
+
+There are several places where we can crash the kernel by requesting
+lines, unbinding the GPIO device, then calling any of the system calls
+relevant to the GPIO character device's annonymous file descriptors:
+ioctl(), read(), poll().
+
+While I observed it with the GPIO simulator, it will also happen for any
+of the GPIO devices that can be hot-unplugged - for instance any HID GPIO
+expander (e.g. CP2112).
+
+This affects both v1 and v2 uAPI.
+
+This fixes it partially by checking if gdev->chip is not NULL but it
+doesn't entirely remedy the situation as we still have a race condition
+in which another thread can remove the device after the check.
+
+Backporting notes: partial backport only because this older kernel
+lacks v2 uAPI.
+
+Fixes: d7c51b47ac11 ("gpio: userspace ABI for reading/writing GPIO lines")
+Fixes: 3c0d9c635ae2 ("gpiolib: cdev: support GPIO_V2_GET_LINE_IOCTL and GPIO_V2_LINE_GET_VALUES_IOCTL")
+Fixes: aad955842d1c ("gpiolib: cdev: support GPIO_V2_GET_LINEINFO_IOCTL and GPIO_V2_GET_LINEINFO_WATCH_IOCTL")
+Fixes: a54756cb24ea ("gpiolib: cdev: support GPIO_V2_LINE_SET_CONFIG_IOCTL")
+Fixes: 7b8e00d98168 ("gpiolib: cdev: support GPIO_V2_LINE_SET_VALUES_IOCTL")
+Signed-off-by: Bartosz Golaszewski <bartosz.golaszewski@linaro.org>
+Reviewed-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+Reviewed-by: Linus Walleij <linus.walleij@linaro.org>
+Acked-by: Jean Delvare <jdelvare@suse.de>
+---
+ drivers/gpio/gpiolib.c |   12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+--- a/drivers/gpio/gpiolib.c
++++ b/drivers/gpio/gpiolib.c
+@@ -363,6 +363,9 @@ static long linehandle_ioctl(struct file
+ 	struct gpiohandle_data ghd;
+ 	int i;
+ 
++	if (!lh->gdev->chip)
++		return -ENODEV;
++
+ 	if (cmd == GPIOHANDLE_GET_LINE_VALUES_IOCTL) {
+ 		int val;
+ 
+@@ -606,6 +609,9 @@ static unsigned int lineevent_poll(struc
+ 	struct lineevent_state *le = filep->private_data;
+ 	unsigned int events = 0;
+ 
++	if (!le->gdev->chip)
++		return POLLHUP | POLLERR;
++
+ 	poll_wait(filep, &le->wait, wait);
+ 
+ 	if (!kfifo_is_empty(&le->events))
+@@ -624,6 +630,9 @@ static ssize_t lineevent_read(struct fil
+ 	unsigned int copied;
+ 	int ret;
+ 
++	if (!le->gdev->chip)
++		return -ENODEV;
++
+ 	if (count < sizeof(struct gpioevent_data))
+ 		return -EINVAL;
+ 
+@@ -680,6 +689,9 @@ static long lineevent_ioctl(struct file
+ 	void __user *ip = (void __user *)arg;
+ 	struct gpiohandle_data ghd;
+ 
++	if (!le->gdev->chip)
++		return -ENODEV;
++
+ 	/*
+ 	 * We can get the value for an event line but not set it,
+ 	 * because it is input by definition.
