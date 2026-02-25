@@ -1,0 +1,133 @@
+From 42f520f70d6ca066808026d0b6163040ee1d9b9d Mon Sep 17 00:00:00 2001
+From: Lijo Lazar <lijo.lazar@amd.com>
+Date: Tue, 13 May 2025 18:57:21 +0530
+Subject: drm/amd/pm: Fetch partition metrics on SMUv13.0.12
+Git-commit: 42f520f70d6ca066808026d0b6163040ee1d9b9d
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Add support to fetch compute partition related metrics in SMUv13.0.12 SOCs.
+
+Signed-off-by: Lijo Lazar <lijo.lazar@amd.com>
+Reviewed-by: Asad Kamal <asad.kamal@amd.com>
+Reviewed-by: Hawking Zhang <Hawking.Zhang@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../drm/amd/pm/swsmu/smu13/smu_v13_0_12_ppt.c | 56 +++++++++++++++++++
+ .../drm/amd/pm/swsmu/smu13/smu_v13_0_6_ppt.c  |  9 +++
+ .../drm/amd/pm/swsmu/smu13/smu_v13_0_6_ppt.h  |  3 +
+ 3 files changed, 68 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_12_ppt.c b/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_12_ppt.c
+index 5a8824cc1c63..69f92bd35bf2 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_12_ppt.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_12_ppt.c
+@@ -322,6 +322,62 @@ int smu_v13_0_12_get_smu_metrics_data(struct smu_context *smu,
+ 	return ret;
+ }
+ 
++ssize_t smu_v13_0_12_get_xcp_metrics(struct smu_context *smu, struct amdgpu_xcp *xcp, void *table, void *smu_metrics)
++{
++	const u8 num_jpeg_rings = NUM_JPEG_RINGS_FW;
++	struct amdgpu_partition_metrics_v1_0 *xcp_metrics;
++	struct amdgpu_device *adev = smu->adev;
++	MetricsTable_t *metrics;
++	int inst, j, k, idx;
++	u32 inst_mask;
++
++	metrics = (MetricsTable_t *)smu_metrics;
++	xcp_metrics = (struct amdgpu_partition_metrics_v1_0 *) table;
++	smu_cmn_init_partition_metrics(xcp_metrics, 1, 0);
++	amdgpu_xcp_get_inst_details(xcp, AMDGPU_XCP_VCN, &inst_mask);
++	idx = 0;
++	for_each_inst(k, inst_mask) {
++		/* Both JPEG and VCN has same instance */
++		inst = GET_INST(VCN, k);
++		for (j = 0; j < num_jpeg_rings; ++j) {
++			xcp_metrics->jpeg_busy[(idx * num_jpeg_rings) + j] =
++				SMUQ10_ROUND(metrics->
++					JpegBusy[(inst * num_jpeg_rings) + j]);
++		}
++		xcp_metrics->vcn_busy[idx] =
++			SMUQ10_ROUND(metrics->VcnBusy[inst]);
++		xcp_metrics->current_vclk0[idx] = SMUQ10_ROUND(
++			metrics->VclkFrequency[inst]);
++		xcp_metrics->current_dclk0[idx] = SMUQ10_ROUND(
++			metrics->DclkFrequency[inst]);
++		xcp_metrics->current_socclk[idx] = SMUQ10_ROUND(
++			metrics->SocclkFrequency[inst]);
++
++		idx++;
++	}
++
++	xcp_metrics->current_uclk =
++		SMUQ10_ROUND(metrics->UclkFrequency);
++
++	amdgpu_xcp_get_inst_details(xcp, AMDGPU_XCP_GFX, &inst_mask);
++	idx = 0;
++	for_each_inst(k, inst_mask) {
++		inst = GET_INST(GC, k);
++		xcp_metrics->current_gfxclk[idx] = SMUQ10_ROUND(metrics->GfxclkFrequency[inst]);
++		xcp_metrics->gfx_busy_inst[idx] = SMUQ10_ROUND(metrics->GfxBusy[inst]);
++		xcp_metrics->gfx_busy_acc[idx] = SMUQ10_ROUND(metrics->GfxBusyAcc[inst]);
++		if (smu_v13_0_6_cap_supported(smu, SMU_CAP(HST_LIMIT_METRICS))) {
++			xcp_metrics->gfx_below_host_limit_ppt_acc[idx] = SMUQ10_ROUND(metrics->GfxclkBelowHostLimitPptAcc[inst]);
++			xcp_metrics->gfx_below_host_limit_thm_acc[idx] = SMUQ10_ROUND(metrics->GfxclkBelowHostLimitThmAcc[inst]);
++			xcp_metrics->gfx_low_utilization_acc[idx] = SMUQ10_ROUND(metrics->GfxclkLowUtilizationAcc[inst]);
++			xcp_metrics->gfx_below_host_limit_total_acc[idx] = SMUQ10_ROUND(metrics->GfxclkBelowHostLimitTotalAcc[inst]);
++		}
++		idx++;
++	}
++
++	return sizeof(*xcp_metrics);
++}
++
+ ssize_t smu_v13_0_12_get_gpu_metrics(struct smu_context *smu, void **table)
+ {
+ 	struct smu_table_context *smu_table = &smu->smu_table;
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_6_ppt.c b/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_6_ppt.c
+index 78d831c20768..0a9488576a4e 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_6_ppt.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_6_ppt.c
+@@ -2573,6 +2573,14 @@ static ssize_t smu_v13_0_6_get_xcp_metrics(struct smu_context *smu, int xcp_id,
+ 		kfree(metrics_v0);
+ 		return ret;
+ 	}
++
++	if (amdgpu_ip_version(smu->adev, MP1_HWIP, 0) ==
++		    IP_VERSION(13, 0, 12) &&
++	    smu_v13_0_6_cap_supported(smu, SMU_CAP(STATIC_METRICS))) {
++		ret = smu_v13_0_12_get_xcp_metrics(smu, xcp, table, metrics_v0);
++		goto out;
++	}
++
+ 	metrics_v1 = (MetricsTableV1_t *)metrics_v0;
+ 	metrics_v2 = (MetricsTableV2_t *)metrics_v0;
+ 
+@@ -2642,6 +2650,7 @@ static ssize_t smu_v13_0_6_get_xcp_metrics(struct smu_context *smu, int xcp_id,
+ 			idx++;
+ 		}
+ 	}
++out:
+ 	kfree(metrics_v0);
+ 
+ 	return sizeof(*xcp_metrics);
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_6_ppt.h b/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_6_ppt.h
+index 1ccc150882eb..1a54675c576f 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_6_ppt.h
++++ b/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_6_ppt.h
+@@ -81,6 +81,9 @@ int smu_v13_0_12_setup_driver_pptable(struct smu_context *smu);
+ int smu_v13_0_12_get_smu_metrics_data(struct smu_context *smu,
+ 				      MetricsMember_t member, uint32_t *value);
+ ssize_t smu_v13_0_12_get_gpu_metrics(struct smu_context *smu, void **table);
++ssize_t smu_v13_0_12_get_xcp_metrics(struct smu_context *smu,
++				     struct amdgpu_xcp *xcp, void *table,
++				     void *smu_metrics);
+ extern const struct cmn2asic_mapping smu_v13_0_12_feature_mask_map[];
+ extern const struct cmn2asic_msg_mapping smu_v13_0_12_message_map[];
+ #endif
+-- 
+2.52.0
+
