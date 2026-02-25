@@ -1,0 +1,133 @@
+From 3e37fcb57bdf794804bec9538d20673a5bf4bdd8 Mon Sep 17 00:00:00 2001
+From: Saleemkhan Jamadar <saleemkhan.jamadar@amd.com>
+Date: Fri, 3 Jan 2025 19:02:59 +0530
+Subject: drm/amdgpu: map doorbell for the requested userq
+Git-commit: 3e37fcb57bdf794804bec9538d20673a5bf4bdd8
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Introduce db_info structure to the populate the doorbell
+information that is required to be mapped.
+
+Made changes to the doorbell mapping func more generic,
+by taking parameters that vary based on IPs and/or usecase
+into db_info structure.
+
+v2 - Fix space alignment and checkpatch warnings(Shashank)
+
+Signed-off-by: Saleemkhan Jamadar <saleemkhan.jamadar@amd.com>
+Reviewed-by: Shashank Sharma <shashank.sharma@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c | 27 +++++++++++--------
+ .../gpu/drm/amd/include/amdgpu_userqueue.h    | 12 +++++++++
+ 2 files changed, 28 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c
+index 85baba323ba5..769154223e2d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c
+@@ -189,18 +189,17 @@ void amdgpu_userqueue_destroy_object(struct amdgpu_userq_mgr *uq_mgr,
+ 	amdgpu_bo_unref(&userq_obj->obj);
+ }
+ 
+-static uint64_t
++uint64_t
+ amdgpu_userqueue_get_doorbell_index(struct amdgpu_userq_mgr *uq_mgr,
+-				     struct amdgpu_usermode_queue *queue,
+-				     struct drm_file *filp,
+-				     uint32_t doorbell_offset)
++				     struct amdgpu_db_info *db_info,
++				     struct drm_file *filp)
+ {
+ 	uint64_t index;
+ 	struct drm_gem_object *gobj;
+-	struct amdgpu_userq_obj *db_obj = &queue->db_obj;
+-	int r;
++	struct amdgpu_userq_obj *db_obj = db_info->db_obj;
++	int r, db_size;
+ 
+-	gobj = drm_gem_object_lookup(filp, queue->doorbell_handle);
++	gobj = drm_gem_object_lookup(filp, db_info->doorbell_handle);
+ 	if (gobj == NULL) {
+ 		DRM_ERROR("Can't find GEM object for doorbell\n");
+ 		return -EINVAL;
+@@ -222,8 +221,9 @@ amdgpu_userqueue_get_doorbell_index(struct amdgpu_userq_mgr *uq_mgr,
+ 		goto unpin_bo;
+ 	}
+ 
++	db_size = sizeof(u64);
+ 	index = amdgpu_doorbell_index_on_bar(uq_mgr->adev, db_obj->obj,
+-					     doorbell_offset, sizeof(u64));
++					     db_info->doorbell_offset, db_size);
+ 	DRM_DEBUG_DRIVER("[Usermode queues] doorbell index=%lld\n", index);
+ 	amdgpu_bo_unreserve(db_obj->obj);
+ 	return index;
+@@ -268,6 +268,7 @@ amdgpu_userqueue_create(struct drm_file *filp, union drm_amdgpu_userq *args)
+ 	struct amdgpu_device *adev = uq_mgr->adev;
+ 	const struct amdgpu_userq_funcs *uq_funcs;
+ 	struct amdgpu_usermode_queue *queue;
++	struct amdgpu_db_info db_info;
+ 	uint64_t index;
+ 	int qid, r = 0;
+ 
+@@ -302,19 +303,23 @@ amdgpu_userqueue_create(struct drm_file *filp, union drm_amdgpu_userq *args)
+ 		goto unlock;
+ 	}
+ 	queue->doorbell_handle = args->in.doorbell_handle;
+-	queue->doorbell_index = args->in.doorbell_offset;
+ 	queue->queue_type = args->in.ip_type;
+ 	queue->vm = &fpriv->vm;
+ 
++	db_info.queue_type = queue->queue_type;
++	db_info.doorbell_handle = queue->doorbell_handle;
++	db_info.db_obj = &queue->db_obj;
++	db_info.doorbell_offset = args->in.doorbell_offset;
++
+ 	/* Convert relative doorbell offset into absolute doorbell index */
+-	index = amdgpu_userqueue_get_doorbell_index(uq_mgr, queue, filp, args->in.doorbell_offset);
++	index = amdgpu_userqueue_get_doorbell_index(uq_mgr, &db_info, filp);
+ 	if (index == (uint64_t)-EINVAL) {
+ 		DRM_ERROR("Failed to get doorbell for queue\n");
+ 		kfree(queue);
+ 		goto unlock;
+ 	}
+-	queue->doorbell_index = index;
+ 
++	queue->doorbell_index = index;
+ 	xa_init_flags(&queue->fence_drv_xa, XA_FLAGS_ALLOC);
+ 	r = amdgpu_userq_fence_driver_alloc(adev, queue);
+ 	if (r) {
+diff --git a/drivers/gpu/drm/amd/include/amdgpu_userqueue.h b/drivers/gpu/drm/amd/include/amdgpu_userqueue.h
+index e7e8d79b689d..0f358f77f2d9 100644
+--- a/drivers/gpu/drm/amd/include/amdgpu_userqueue.h
++++ b/drivers/gpu/drm/amd/include/amdgpu_userqueue.h
+@@ -78,6 +78,13 @@ struct amdgpu_userq_mgr {
+ 	struct delayed_work		resume_work;
+ };
+ 
++struct amdgpu_db_info {
++	uint64_t doorbell_handle;
++	uint32_t queue_type;
++	uint32_t doorbell_offset;
++	struct amdgpu_userq_obj	*db_obj;
++};
++
+ int amdgpu_userq_ioctl(struct drm_device *dev, void *data, struct drm_file *filp);
+ 
+ int amdgpu_userq_mgr_init(struct amdgpu_userq_mgr *userq_mgr, struct amdgpu_device *adev);
+@@ -98,4 +105,9 @@ int amdgpu_userqueue_active(struct amdgpu_userq_mgr *uq_mgr);
+ 
+ void amdgpu_userqueue_ensure_ev_fence(struct amdgpu_userq_mgr *userq_mgr,
+ 				      struct amdgpu_eviction_fence_mgr *evf_mgr);
++
++uint64_t amdgpu_userqueue_get_doorbell_index(struct amdgpu_userq_mgr *uq_mgr,
++					     struct amdgpu_db_info *db_info,
++					     struct drm_file *filp);
++
+ #endif
+-- 
+2.52.0
+
