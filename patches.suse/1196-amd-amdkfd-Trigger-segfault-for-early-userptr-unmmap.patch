@@ -1,0 +1,100 @@
+From 2d274bf7099bc5e95fabaa93f23d0eb2977187ad Mon Sep 17 00:00:00 2001
+From: Shane Xiao <shane.xiao@amd.com>
+Date: Wed, 23 Apr 2025 17:28:50 +0800
+Subject: amd/amdkfd: Trigger segfault for early userptr unmmapping
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 2d274bf7099bc5e95fabaa93f23d0eb2977187ad
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+If applications unmap the memory before destroying the userptr, it needs
+trigger a segfault to notify user space to correct the free sequence in
+VM debug mode.
+
+V2: Send gpu access fault to user space
+V3: Report gpu address to user space, remove unnecessary params
+V4: update pr_err into one line, remove userptr log info
+
+Signed-off-by: Shane Xiao <shane.xiao@amd.com>
+Acked-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c  | 12 ++++++++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_events.c       | 19 +++++++++++++++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h         |  2 ++
+ 3 files changed, 33 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+index d2ec4130a316..260165bbe373 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+@@ -2559,6 +2559,18 @@ static int update_invalid_user_pages(struct amdkfd_process_info *process_info,
+ 			if (ret != -EFAULT)
+ 				return ret;
+ 
++			/* If applications unmap memory before destroying the userptr
++			 * from the KFD, trigger a segmentation fault in VM debug mode.
++			 */
++			if (amdgpu_ttm_adev(bo->tbo.bdev)->debug_vm_userptr) {
++				pr_err("Pid %d unmapped memory before destroying userptr at GPU addr 0x%llx\n",
++								pid_nr(process_info->pid), mem->va);
++
++				// Send GPU VM fault to user space
++				kfd_signal_vm_fault_event_with_userptr(kfd_lookup_process_by_pid(process_info->pid),
++								mem->va);
++			}
++
+ 			ret = 0;
+ 		}
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_events.c b/drivers/gpu/drm/amd/amdkfd/kfd_events.c
+index fecdb6794075..e54e708ed82d 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_events.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_events.c
+@@ -1177,6 +1177,25 @@ void kfd_signal_hw_exception_event(u32 pasid)
+ 	kfd_unref_process(p);
+ }
+ 
++void kfd_signal_vm_fault_event_with_userptr(struct kfd_process *p, uint64_t gpu_va)
++{
++	struct kfd_process_device *pdd;
++	struct kfd_hsa_memory_exception_data exception_data;
++	int i;
++
++	memset(&exception_data, 0, sizeof(exception_data));
++	exception_data.va = gpu_va;
++	exception_data.failure.NotPresent = 1;
++
++	// Send VM seg fault to all kfd process device
++	for (i = 0; i < p->n_pdds; i++) {
++		pdd = p->pdds[i];
++		exception_data.gpu_id = pdd->user_gpu_id;
++		kfd_evict_process_device(pdd);
++		kfd_signal_vm_fault_event(pdd, NULL, &exception_data);
++	}
++}
++
+ void kfd_signal_vm_fault_event(struct kfd_process_device *pdd,
+ 				struct kfd_vm_fault_info *info,
+ 				struct kfd_hsa_memory_exception_data *data)
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index 0ae794539bb0..d221c58dccc3 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -1507,6 +1507,8 @@ int kfd_event_create(struct file *devkfd, struct kfd_process *p,
+ int kfd_get_num_events(struct kfd_process *p);
+ int kfd_event_destroy(struct kfd_process *p, uint32_t event_id);
+ 
++void kfd_signal_vm_fault_event_with_userptr(struct kfd_process *p, uint64_t gpu_va);
++
+ void kfd_signal_vm_fault_event(struct kfd_process_device *pdd,
+ 				struct kfd_vm_fault_info *info,
+ 				struct kfd_hsa_memory_exception_data *data);
+-- 
+2.52.0
+
