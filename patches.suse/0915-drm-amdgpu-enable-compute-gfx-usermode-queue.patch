@@ -1,0 +1,128 @@
+From 2c695d7c072067cd53fb52e52aa0b48277120314 Mon Sep 17 00:00:00 2001
+From: Shashank Sharma <shashank.sharma@amd.com>
+Date: Thu, 9 May 2024 14:31:15 +0200
+Subject: drm/amdgpu: enable compute/gfx usermode queue
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 2c695d7c072067cd53fb52e52aa0b48277120314
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+This patch does the necessary changes required to
+enable compute workload support using the existing
+usermode queues infrastructure.
+
+V9: Patch introduced
+V10: Add custom IP specific mqd strcuture for compute (Alex)
+V11: Rename drm_amdgpu_userq_mqd_compute_gfx_v11 to
+     drm_amdgpu_userq_mqd_compute_gfx11 (Marek)
+
+Cc: Alex Deucher <alexander.deucher@amd.com>
+Cc: Christian Koenig <christian.koenig@amd.com>
+Acked-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Arvind Yadav <arvind.yadav@amd.com>
+Signed-off-by: Shashank Sharma <shashank.sharma@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c |  4 +++-
+ drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c        |  2 ++
+ .../gpu/drm/amd/amdgpu/mes_v11_0_userqueue.c  | 23 +++++++++++++++++++
+ include/uapi/drm/amdgpu_drm.h                 | 10 ++++++++
+ 4 files changed, 38 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c
+index 2c5747cc492e..5173718c3848 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c
+@@ -189,7 +189,9 @@ amdgpu_userqueue_create(struct drm_file *filp, union drm_amdgpu_userq *args)
+ 	int qid, r = 0;
+ 
+ 	/* Usermode queues are only supported for GFX IP as of now */
+-	if (args->in.ip_type != AMDGPU_HW_IP_GFX && args->in.ip_type != AMDGPU_HW_IP_DMA) {
++	if (args->in.ip_type != AMDGPU_HW_IP_GFX &&
++	    args->in.ip_type != AMDGPU_HW_IP_DMA &&
++	    args->in.ip_type != AMDGPU_HW_IP_COMPUTE) {
+ 		DRM_ERROR("Usermode queue doesn't support IP type %u\n", args->in.ip_type);
+ 		return -EINVAL;
+ 	}
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c
+index 0da5c85462dd..6f7597a1cc7e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c
+@@ -1615,6 +1615,7 @@ static int gfx_v11_0_sw_init(struct amdgpu_ip_block *ip_block)
+ 		adev->gfx.mec.num_pipe_per_mec = 4;
+ 		adev->gfx.mec.num_queue_per_pipe = 4;
+ 		adev->userq_funcs[AMDGPU_HW_IP_GFX] = &userq_mes_v11_0_funcs;
++		adev->userq_funcs[AMDGPU_HW_IP_COMPUTE] = &userq_mes_v11_0_funcs;
+ 		break;
+ 	case IP_VERSION(11, 0, 1):
+ 	case IP_VERSION(11, 0, 4):
+@@ -1629,6 +1630,7 @@ static int gfx_v11_0_sw_init(struct amdgpu_ip_block *ip_block)
+ 		adev->gfx.mec.num_pipe_per_mec = 4;
+ 		adev->gfx.mec.num_queue_per_pipe = 4;
+ 		adev->userq_funcs[AMDGPU_HW_IP_GFX] = &userq_mes_v11_0_funcs;
++		adev->userq_funcs[AMDGPU_HW_IP_COMPUTE] = &userq_mes_v11_0_funcs;
+ 		break;
+ 	default:
+ 		adev->gfx.me.num_me = 1;
+diff --git a/drivers/gpu/drm/amd/amdgpu/mes_v11_0_userqueue.c b/drivers/gpu/drm/amd/amdgpu/mes_v11_0_userqueue.c
+index dc5359742774..e70b8e429e9c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/mes_v11_0_userqueue.c
++++ b/drivers/gpu/drm/amd/amdgpu/mes_v11_0_userqueue.c
+@@ -268,6 +268,29 @@ static int mes_v11_0_userq_mqd_create(struct amdgpu_userq_mgr *uq_mgr,
+ 	userq_props->use_doorbell = true;
+ 	userq_props->doorbell_index = queue->doorbell_index;
+ 
++	if (queue->queue_type == AMDGPU_HW_IP_COMPUTE) {
++		struct drm_amdgpu_userq_mqd_compute_gfx11 *compute_mqd;
++
++		if (mqd_user->mqd_size != sizeof(*compute_mqd)) {
++			DRM_ERROR("Invalid compute IP MQD size\n");
++			r = -EINVAL;
++			goto free_mqd;
++		}
++
++		compute_mqd = memdup_user(u64_to_user_ptr(mqd_user->mqd), mqd_user->mqd_size);
++		if (IS_ERR(compute_mqd)) {
++			DRM_ERROR("Failed to read user MQD\n");
++			r = -ENOMEM;
++			goto free_mqd;
++		}
++
++		userq_props->eop_gpu_addr = compute_mqd->eop_va;
++		userq_props->hqd_pipe_priority = AMDGPU_GFX_PIPE_PRIO_NORMAL;
++		userq_props->hqd_queue_priority = AMDGPU_GFX_QUEUE_PRIORITY_MINIMUM;
++		userq_props->hqd_active = false;
++		kfree(compute_mqd);
++	}
++
+ 	queue->userq_prop = userq_props;
+ 
+ 	r = mqd_hw_default->init_mqd(adev, (void *)queue->mqd.cpu_ptr, userq_props);
+diff --git a/include/uapi/drm/amdgpu_drm.h b/include/uapi/drm/amdgpu_drm.h
+index 6ae988574084..59f0818e8dcd 100644
+--- a/include/uapi/drm/amdgpu_drm.h
++++ b/include/uapi/drm/amdgpu_drm.h
+@@ -438,6 +438,16 @@ struct drm_amdgpu_userq_mqd_sdma_gfx11 {
+ 	__u64   csa_va;
+ };
+ 
++/* GFX V11 Compute IP specific MQD parameters */
++struct drm_amdgpu_userq_mqd_compute_gfx11 {
++	/**
++	 * @eop_va: Virtual address of the GPU memory to hold the EOP buffer.
++	 * This must be a from a separate GPU object, and must be at least 1 page
++	 * sized.
++	 */
++	__u64   eop_va;
++};
++
+ /* vm ioctl */
+ #define AMDGPU_VM_OP_RESERVE_VMID	1
+ #define AMDGPU_VM_OP_UNRESERVE_VMID	2
+-- 
+2.52.0
+
