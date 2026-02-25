@@ -1,0 +1,173 @@
+From 0489149fd6711a8a020a8500029d4ee971c541ba Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Adri=C3=A1n=20Larumbe?= <adrian.larumbe@collabora.com>
+Date: Wed, 23 Apr 2025 03:12:33 +0100
+Subject: drm/panthor: Label all kernel BO's
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 0489149fd6711a8a020a8500029d4ee971c541ba
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Kernel BO's aren't exposed to UM, so labelling them is the responsibility
+of the driver itself. This kind of tagging will prove useful in further
+commits when want to expose these objects through DebugFS.
+
+Expand panthor_kernel_bo_create() interface to take a NUL-terminated
+string. No bounds checking is done because all label strings are given
+as statically-allocated literals, but if a more complex kernel BO naming
+scheme with explicit memory allocation and formatting was desired in the
+future, this would have to change.
+
+Signed-off-by: Adrián Larumbe <adrian.larumbe@collabora.com>
+Reviewed-by: Boris Brezillon <boris.brezillon@collabora.com>
+Reviewed-by: Liviu Dudau <liviu.dudau@arm.com>
+Reviewed-by: Steven Price <steven.price@arm.com>
+Link: https://lore.kernel.org/r/20250423021238.1639175-4-adrian.larumbe@collabora.com
+Signed-off-by: Boris Brezillon <boris.brezillon@collabora.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/panthor/panthor_fw.c    | 8 +++++---
+ drivers/gpu/drm/panthor/panthor_gem.c   | 5 ++++-
+ drivers/gpu/drm/panthor/panthor_gem.h   | 2 +-
+ drivers/gpu/drm/panthor/panthor_heap.c  | 6 ++++--
+ drivers/gpu/drm/panthor/panthor_sched.c | 9 ++++++---
+ 5 files changed, 20 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/panthor/panthor_fw.c b/drivers/gpu/drm/panthor/panthor_fw.c
+index 446bb377b953..7bc38e635329 100644
+--- a/drivers/gpu/drm/panthor/panthor_fw.c
++++ b/drivers/gpu/drm/panthor/panthor_fw.c
+@@ -449,7 +449,8 @@ panthor_fw_alloc_queue_iface_mem(struct panthor_device *ptdev,
+ 				       DRM_PANTHOR_BO_NO_MMAP,
+ 				       DRM_PANTHOR_VM_BIND_OP_MAP_NOEXEC |
+ 				       DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED,
+-				       PANTHOR_VM_KERNEL_AUTO_VA);
++				       PANTHOR_VM_KERNEL_AUTO_VA,
++				       "Queue FW interface");
+ 	if (IS_ERR(mem))
+ 		return mem;
+ 
+@@ -481,7 +482,8 @@ panthor_fw_alloc_suspend_buf_mem(struct panthor_device *ptdev, size_t size)
+ 	return panthor_kernel_bo_create(ptdev, panthor_fw_vm(ptdev), size,
+ 					DRM_PANTHOR_BO_NO_MMAP,
+ 					DRM_PANTHOR_VM_BIND_OP_MAP_NOEXEC,
+-					PANTHOR_VM_KERNEL_AUTO_VA);
++					PANTHOR_VM_KERNEL_AUTO_VA,
++					"FW suspend buffer");
+ }
+ 
+ static int panthor_fw_load_section_entry(struct panthor_device *ptdev,
+@@ -601,7 +603,7 @@ static int panthor_fw_load_section_entry(struct panthor_device *ptdev,
+ 		section->mem = panthor_kernel_bo_create(ptdev, panthor_fw_vm(ptdev),
+ 							section_size,
+ 							DRM_PANTHOR_BO_NO_MMAP,
+-							vm_map_flags, va);
++							vm_map_flags, va, "FW section");
+ 		if (IS_ERR(section->mem))
+ 			return PTR_ERR(section->mem);
+ 
+diff --git a/drivers/gpu/drm/panthor/panthor_gem.c b/drivers/gpu/drm/panthor/panthor_gem.c
+index 4c9d52378d1c..a61a50d8d5f5 100644
+--- a/drivers/gpu/drm/panthor/panthor_gem.c
++++ b/drivers/gpu/drm/panthor/panthor_gem.c
+@@ -76,13 +76,14 @@ void panthor_kernel_bo_destroy(struct panthor_kernel_bo *bo)
+  * @gpu_va: GPU address assigned when mapping to the VM.
+  * If gpu_va == PANTHOR_VM_KERNEL_AUTO_VA, the virtual address will be
+  * automatically allocated.
++ * @name: Descriptive label of the BO's contents
+  *
+  * Return: A valid pointer in case of success, an ERR_PTR() otherwise.
+  */
+ struct panthor_kernel_bo *
+ panthor_kernel_bo_create(struct panthor_device *ptdev, struct panthor_vm *vm,
+ 			 size_t size, u32 bo_flags, u32 vm_map_flags,
+-			 u64 gpu_va)
++			 u64 gpu_va, const char *name)
+ {
+ 	struct drm_gem_shmem_object *obj;
+ 	struct panthor_kernel_bo *kbo;
+@@ -106,6 +107,8 @@ panthor_kernel_bo_create(struct panthor_device *ptdev, struct panthor_vm *vm,
+ 	kbo->obj = &obj->base;
+ 	bo->flags = bo_flags;
+ 
++	panthor_gem_kernel_bo_set_label(kbo, name);
++
+ 	/* The system and GPU MMU page size might differ, which becomes a
+ 	 * problem for FW sections that need to be mapped at explicit address
+ 	 * since our PAGE_SIZE alignment might cover a VA range that's
+diff --git a/drivers/gpu/drm/panthor/panthor_gem.h b/drivers/gpu/drm/panthor/panthor_gem.h
+index 983cc8ca264e..3c09af568e47 100644
+--- a/drivers/gpu/drm/panthor/panthor_gem.h
++++ b/drivers/gpu/drm/panthor/panthor_gem.h
+@@ -153,7 +153,7 @@ panthor_kernel_bo_vunmap(struct panthor_kernel_bo *bo)
+ struct panthor_kernel_bo *
+ panthor_kernel_bo_create(struct panthor_device *ptdev, struct panthor_vm *vm,
+ 			 size_t size, u32 bo_flags, u32 vm_map_flags,
+-			 u64 gpu_va);
++			 u64 gpu_va, const char *name);
+ 
+ void panthor_kernel_bo_destroy(struct panthor_kernel_bo *bo);
+ 
+diff --git a/drivers/gpu/drm/panthor/panthor_heap.c b/drivers/gpu/drm/panthor/panthor_heap.c
+index 3bdf61c14264..d236e9ceade4 100644
+--- a/drivers/gpu/drm/panthor/panthor_heap.c
++++ b/drivers/gpu/drm/panthor/panthor_heap.c
+@@ -151,7 +151,8 @@ static int panthor_alloc_heap_chunk(struct panthor_heap_pool *pool,
+ 	chunk->bo = panthor_kernel_bo_create(pool->ptdev, pool->vm, heap->chunk_size,
+ 					     DRM_PANTHOR_BO_NO_MMAP,
+ 					     DRM_PANTHOR_VM_BIND_OP_MAP_NOEXEC,
+-					     PANTHOR_VM_KERNEL_AUTO_VA);
++					     PANTHOR_VM_KERNEL_AUTO_VA,
++					     "Tiler heap chunk");
+ 	if (IS_ERR(chunk->bo)) {
+ 		ret = PTR_ERR(chunk->bo);
+ 		goto err_free_chunk;
+@@ -555,7 +556,8 @@ panthor_heap_pool_create(struct panthor_device *ptdev, struct panthor_vm *vm)
+ 	pool->gpu_contexts = panthor_kernel_bo_create(ptdev, vm, bosize,
+ 						      DRM_PANTHOR_BO_NO_MMAP,
+ 						      DRM_PANTHOR_VM_BIND_OP_MAP_NOEXEC,
+-						      PANTHOR_VM_KERNEL_AUTO_VA);
++						      PANTHOR_VM_KERNEL_AUTO_VA,
++						      "Heap pool");
+ 	if (IS_ERR(pool->gpu_contexts)) {
+ 		ret = PTR_ERR(pool->gpu_contexts);
+ 		goto err_destroy_pool;
+diff --git a/drivers/gpu/drm/panthor/panthor_sched.c b/drivers/gpu/drm/panthor/panthor_sched.c
+index 446ec780eb4a..43ee57728de5 100644
+--- a/drivers/gpu/drm/panthor/panthor_sched.c
++++ b/drivers/gpu/drm/panthor/panthor_sched.c
+@@ -3332,7 +3332,8 @@ group_create_queue(struct panthor_group *group,
+ 						  DRM_PANTHOR_BO_NO_MMAP,
+ 						  DRM_PANTHOR_VM_BIND_OP_MAP_NOEXEC |
+ 						  DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED,
+-						  PANTHOR_VM_KERNEL_AUTO_VA);
++						  PANTHOR_VM_KERNEL_AUTO_VA,
++						  "CS ring buffer");
+ 	if (IS_ERR(queue->ringbuf)) {
+ 		ret = PTR_ERR(queue->ringbuf);
+ 		goto err_free_queue;
+@@ -3362,7 +3363,8 @@ group_create_queue(struct panthor_group *group,
+ 					 DRM_PANTHOR_BO_NO_MMAP,
+ 					 DRM_PANTHOR_VM_BIND_OP_MAP_NOEXEC |
+ 					 DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED,
+-					 PANTHOR_VM_KERNEL_AUTO_VA);
++					 PANTHOR_VM_KERNEL_AUTO_VA,
++					 "Group job stats");
+ 
+ 	if (IS_ERR(queue->profiling.slots)) {
+ 		ret = PTR_ERR(queue->profiling.slots);
+@@ -3493,7 +3495,8 @@ int panthor_group_create(struct panthor_file *pfile,
+ 						   DRM_PANTHOR_BO_NO_MMAP,
+ 						   DRM_PANTHOR_VM_BIND_OP_MAP_NOEXEC |
+ 						   DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED,
+-						   PANTHOR_VM_KERNEL_AUTO_VA);
++						   PANTHOR_VM_KERNEL_AUTO_VA,
++						   "Group sync objects");
+ 	if (IS_ERR(group->syncobjs)) {
+ 		ret = PTR_ERR(group->syncobjs);
+ 		goto err_put_group;
+-- 
+2.52.0
+
