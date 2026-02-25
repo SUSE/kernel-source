@@ -1,0 +1,72 @@
+From 32bd8b3ea7071ca96d4adcd0817046e09c5df415 Mon Sep 17 00:00:00 2001
+From: Arvind Yadav <Arvind.Yadav@amd.com>
+Date: Tue, 18 Mar 2025 18:45:40 +0530
+Subject: drm/amdgpu: Fix display freezing issue when resizing apps
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 32bd8b3ea7071ca96d4adcd0817046e09c5df415
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+The display is freezing because the amdgpu_userq_wait_ioctl()
+is waiting for a non-user queue fence(specifically, the PT update fence).
+
+Rootcause: 
+The resume_work is initiated by both amdgpu_userq_suspend and
+amdgpu_userqueue_ensure_ev_fence at same time. The amdgpu_userq_suspend
+signals a dma-fence and subsequently triggers the resume_work, which is
+intended to replace the existing fence by creating new dma-fence. However,
+following this, the amdgpu_userqueue_ensure_ev_fence schedules another
+resume_work that generates a new dma-fence, thereby replacing the one
+created by amdgpu_userq_suspend. Consequently, the original fence will
+never be signaled.
+
+Cc: Alex Deucher <alexander.deucher@amd.com>
+Cc: Christian König <christian.koenig@amd.com>
+Cc: Shashank Sharma <shashank.sharma@amd.com>
+Cc: Sunil Khatri <sunil.khatri@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Shashank Sharma <shashank.sharma@amd.com>
+Signed-off-by: Arvind Yadav <arvind.yadav@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_eviction_fence.c | 3 +++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c      | 3 +++
+ 2 files changed, 6 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_eviction_fence.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_eviction_fence.c
+index 167951aee502..0075469550b0 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_eviction_fence.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_eviction_fence.c
+@@ -52,6 +52,9 @@ amdgpu_eviction_fence_replace_fence(struct amdgpu_eviction_fence_mgr *evf_mgr,
+ 	unsigned long index;
+ 	int ret;
+ 
++	if (evf_mgr->ev_fence &&
++	    !dma_fence_is_signaled(&evf_mgr->ev_fence->base))
++		return 0;
+ 	/*
+ 	 * Steps to replace eviction fence:
+ 	 * * lock all objects in exec (caller)
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c
+index a02614cbda36..beae931152a3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c
+@@ -555,8 +555,11 @@ amdgpu_userqueue_validate_bos(struct amdgpu_userq_mgr *uq_mgr)
+ static void amdgpu_userqueue_resume_worker(struct work_struct *work)
+ {
+ 	struct amdgpu_userq_mgr *uq_mgr = work_to_uq_mgr(work, resume_work.work);
++	struct amdgpu_fpriv *fpriv = uq_mgr_to_fpriv(uq_mgr);
+ 	int ret;
+ 
++	flush_work(&fpriv->evf_mgr.suspend_work.work);
++
+ 	mutex_lock(&uq_mgr->userq_mutex);
+ 
+ 	ret = amdgpu_userqueue_validate_bos(uq_mgr);
+-- 
+2.52.0
+
