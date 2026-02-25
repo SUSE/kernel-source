@@ -1,0 +1,259 @@
+From b733fe7bff8bd14b9e0e2fd8f4de61696cb9f52e Mon Sep 17 00:00:00 2001
+From: Akhil P Oommen <quic_akhilpo@quicinc.com>
+Date: Sat, 19 Apr 2025 20:21:30 +0530
+Subject: drm/msm/adreno: Add support for ACD
+Git-commit: b733fe7bff8bd14b9e0e2fd8f4de61696cb9f52e
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+ACD a.k.a Adaptive Clock Distribution is a feature which helps to reduce
+the power consumption. In some chipsets, it is also a requirement to
+support higher GPU frequencies. This patch adds support for GPU ACD by
+sending necessary data to GMU and AOSS. The feature support for the
+chipset is detected based on devicetree data.
+
+Signed-off-by: Akhil P Oommen <quic_akhilpo@quicinc.com>
+Tested-by: Maya Matuszczyk <maccraft123mc@gmail.com>
+Tested-by: Anthony Ruhier <aruhier@mailbox.org>
+Reviewed-by: Konrad Dybcio <konrad.dybcio@oss.qualcomm.com>
+Patchwork: https://patchwork.freedesktop.org/patch/649342/
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/msm/adreno/a6xx_gmu.c | 84 +++++++++++++++++++++++----
+ drivers/gpu/drm/msm/adreno/a6xx_gmu.h |  1 +
+ drivers/gpu/drm/msm/adreno/a6xx_hfi.c | 36 ++++++++++++
+ drivers/gpu/drm/msm/adreno/a6xx_hfi.h | 21 +++++++
+ 4 files changed, 132 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+index 38c94915d4c9..00fdf5b242e0 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+@@ -1064,14 +1064,6 @@ int a6xx_gmu_resume(struct a6xx_gpu *a6xx_gpu)
+ 
+ 	gmu->hung = false;
+ 
+-	/* Notify AOSS about the ACD state (unimplemented for now => disable it) */
+-	if (!IS_ERR(gmu->qmp)) {
+-		ret = qmp_send(gmu->qmp, "{class: gpu, res: acd, val: %d}",
+-			       0 /* Hardcode ACD to be disabled for now */);
+-		if (ret)
+-			dev_err(gmu->dev, "failed to send GPU ACD state\n");
+-	}
+-
+ 	/* Turn on the resources */
+ 	pm_runtime_get_sync(gmu->dev);
+ 
+@@ -1671,6 +1663,68 @@ static int a6xx_gmu_pwrlevels_probe(struct a6xx_gmu *gmu)
+ 	return a6xx_gmu_rpmh_votes_init(gmu);
+ }
+ 
++static int a6xx_gmu_acd_probe(struct a6xx_gmu *gmu)
++{
++	struct a6xx_gpu *a6xx_gpu = container_of(gmu, struct a6xx_gpu, gmu);
++	struct a6xx_hfi_acd_table *cmd = &gmu->acd_table;
++	struct adreno_gpu *adreno_gpu = &a6xx_gpu->base;
++	struct msm_gpu *gpu = &adreno_gpu->base;
++	int ret, i, cmd_idx = 0;
++
++	cmd->version = 1;
++	cmd->stride = 1;
++	cmd->enable_by_level = 0;
++
++	/* Skip freq = 0 and parse acd-level for rest of the OPPs */
++	for (i = 1; i < gmu->nr_gpu_freqs; i++) {
++		struct dev_pm_opp *opp;
++		struct device_node *np;
++		unsigned long freq;
++		u32 val;
++
++		freq = gmu->gpu_freqs[i];
++		opp = dev_pm_opp_find_freq_exact(&gpu->pdev->dev, freq, true);
++		np = dev_pm_opp_get_of_node(opp);
++
++		ret = of_property_read_u32(np, "qcom,opp-acd-level", &val);
++		of_node_put(np);
++		dev_pm_opp_put(opp);
++		if (ret == -EINVAL)
++			continue;
++		else if (ret) {
++			DRM_DEV_ERROR(gmu->dev, "Unable to read acd level for freq %lu\n", freq);
++			return ret;
++		}
++
++		cmd->enable_by_level |= BIT(i);
++		cmd->data[cmd_idx++] = val;
++	}
++
++	cmd->num_levels = cmd_idx;
++
++	/* It is a problem if qmp node is unavailable when ACD is required */
++	if (cmd->enable_by_level && IS_ERR_OR_NULL(gmu->qmp)) {
++		DRM_DEV_ERROR(gmu->dev, "Unable to send ACD state to AOSS\n");
++		return -EINVAL;
++	}
++
++	/* Otherwise, nothing to do if qmp is unavailable */
++	if (IS_ERR_OR_NULL(gmu->qmp))
++		return 0;
++
++	/*
++	 * Notify AOSS about the ACD state. AOSS is supposed to assume that ACD is disabled on
++	 * system reset. So it is harmless if we couldn't notify 'OFF' state
++	 */
++	ret = qmp_send(gmu->qmp, "{class: gpu, res: acd, val: %d}", !!cmd->enable_by_level);
++	if (ret && cmd->enable_by_level) {
++		DRM_DEV_ERROR(gmu->dev, "Failed to send ACD state to AOSS\n");
++		return ret;
++	}
++
++	return 0;
++}
++
+ static int a6xx_gmu_clocks_probe(struct a6xx_gmu *gmu)
+ {
+ 	int ret = devm_clk_bulk_get_all(gmu->dev, &gmu->clocks);
+@@ -1992,7 +2046,7 @@ int a6xx_gmu_init(struct a6xx_gpu *a6xx_gpu, struct device_node *node)
+ 	gmu->qmp = qmp_get(gmu->dev);
+ 	if (IS_ERR(gmu->qmp) && adreno_is_a7xx(adreno_gpu)) {
+ 		ret = PTR_ERR(gmu->qmp);
+-		goto remove_device_link;
++		goto detach_gxpd;
+ 	}
+ 
+ 	init_completion(&gmu->pd_gate);
+@@ -2008,6 +2062,10 @@ int a6xx_gmu_init(struct a6xx_gpu *a6xx_gpu, struct device_node *node)
+ 	/* Get the power levels for the GMU and GPU */
+ 	a6xx_gmu_pwrlevels_probe(gmu);
+ 
++	ret = a6xx_gmu_acd_probe(gmu);
++	if (ret)
++		goto detach_gxpd;
++
+ 	/* Set up the HFI queues */
+ 	a6xx_hfi_init(gmu);
+ 
+@@ -2018,7 +2076,13 @@ int a6xx_gmu_init(struct a6xx_gpu *a6xx_gpu, struct device_node *node)
+ 
+ 	return 0;
+ 
+-remove_device_link:
++detach_gxpd:
++	if (!IS_ERR_OR_NULL(gmu->gxpd))
++		dev_pm_domain_detach(gmu->gxpd, false);
++
++	if (!IS_ERR_OR_NULL(gmu->qmp))
++		qmp_put(gmu->qmp);
++
+ 	device_link_del(link);
+ 
+ detach_cxpd:
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gmu.h b/drivers/gpu/drm/msm/adreno/a6xx_gmu.h
+index 0c888b326cfb..b2d4489b4024 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gmu.h
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.h
+@@ -93,6 +93,7 @@ struct a6xx_gmu {
+ 	int nr_gpu_freqs;
+ 	unsigned long gpu_freqs[GMU_MAX_GX_FREQS];
+ 	u32 gx_arc_votes[GMU_MAX_GX_FREQS];
++	struct a6xx_hfi_acd_table acd_table;
+ 
+ 	int nr_gpu_bws;
+ 	unsigned long gpu_bw_table[GMU_MAX_GX_FREQS];
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_hfi.c b/drivers/gpu/drm/msm/adreno/a6xx_hfi.c
+index 1bc40d667281..3cab07f62285 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_hfi.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_hfi.c
+@@ -765,6 +765,38 @@ static int a6xx_hfi_send_bw_table(struct a6xx_gmu *gmu)
+ 		NULL, 0);
+ }
+ 
++#define HFI_FEATURE_ACD 12
++
++static int a6xx_hfi_enable_acd(struct a6xx_gmu *gmu)
++{
++	struct a6xx_hfi_acd_table *acd_table = &gmu->acd_table;
++	struct a6xx_hfi_msg_feature_ctrl msg = {
++		.feature = HFI_FEATURE_ACD,
++		.enable = 1,
++		.data = 0,
++	};
++	int ret;
++
++	if (!acd_table->enable_by_level)
++		return 0;
++
++	/* Enable ACD feature at GMU */
++	ret = a6xx_hfi_send_msg(gmu, HFI_H2F_FEATURE_CTRL, &msg, sizeof(msg), NULL, 0);
++	if (ret) {
++		DRM_DEV_ERROR(gmu->dev, "Unable to enable ACD (%d)\n", ret);
++		return ret;
++	}
++
++	/* Send ACD table to GMU */
++	ret = a6xx_hfi_send_msg(gmu, HFI_H2F_MSG_ACD, acd_table, sizeof(*acd_table), NULL, 0);
++	if (ret) {
++		DRM_DEV_ERROR(gmu->dev, "Unable to ACD table (%d)\n", ret);
++		return ret;
++	}
++
++	return 0;
++}
++
+ static int a6xx_hfi_send_test(struct a6xx_gmu *gmu)
+ {
+ 	struct a6xx_hfi_msg_test msg = { 0 };
+@@ -862,6 +894,10 @@ int a6xx_hfi_start(struct a6xx_gmu *gmu, int boot_state)
+ 	if (ret)
+ 		return ret;
+ 
++	ret = a6xx_hfi_enable_acd(gmu);
++	if (ret)
++		return ret;
++
+ 	ret = a6xx_hfi_send_core_fw_start(gmu);
+ 	if (ret)
+ 		return ret;
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_hfi.h b/drivers/gpu/drm/msm/adreno/a6xx_hfi.h
+index 52ba4a07d7b9..653ef720e2da 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_hfi.h
++++ b/drivers/gpu/drm/msm/adreno/a6xx_hfi.h
+@@ -151,12 +151,33 @@ struct a6xx_hfi_msg_test {
+ 	u32 header;
+ };
+ 
++#define HFI_H2F_MSG_ACD 7
++#define MAX_ACD_STRIDE 2
++
++struct a6xx_hfi_acd_table {
++	u32 header;
++	u32 version;
++	u32 enable_by_level;
++	u32 stride;
++	u32 num_levels;
++	u32 data[16 * MAX_ACD_STRIDE];
++};
++
+ #define HFI_H2F_MSG_START 10
+ 
+ struct a6xx_hfi_msg_start {
+ 	u32 header;
+ };
+ 
++#define HFI_H2F_FEATURE_CTRL 11
++
++struct a6xx_hfi_msg_feature_ctrl {
++	u32 header;
++	u32 feature;
++	u32 enable;
++	u32 data;
++};
++
+ #define HFI_H2F_MSG_CORE_FW_START 14
+ 
+ struct a6xx_hfi_msg_core_fw_start {
+-- 
+2.52.0
+
