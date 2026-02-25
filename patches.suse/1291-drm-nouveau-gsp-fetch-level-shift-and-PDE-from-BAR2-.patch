@@ -1,0 +1,90 @@
+From 708d81a9f529a1bfdec62021690d03ae4ee2e964 Mon Sep 17 00:00:00 2001
+From: Ben Skeggs <bskeggs@nvidia.com>
+Date: Thu, 13 Feb 2025 18:17:53 +1000
+Subject: drm/nouveau/gsp: fetch level shift and PDE from BAR2 VMM
+Git-commit: 708d81a9f529a1bfdec62021690d03ae4ee2e964
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+When mirroring BAR2 page tables to RM, we need to know the level shift
+for the root page table (which is currently hardcoded), as well as the
+raw PDE value (which is currently hardcoded in GP1xx-AD1xx format).
+
+In order to support GH100/GBxxx, modify the code to determine the page
+shift from per-GPU info in nvkm_vmm_page, as well as read the relevant
+PDE back from the root page table rather than recalculating it.
+
+Signed-off-by: Ben Skeggs <bskeggs@nvidia.com>
+Reviewed-by: Dave Airlie <airlied@redhat.com>
+Reviewed-by: Timur Tabi <ttabi@nvidia.com>
+Tested-by: Timur Tabi <ttabi@nvidia.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../drm/nouveau/nvkm/subdev/gsp/rm/r535/bar.c | 23 ++++++++++++++-----
+ 1 file changed, 17 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/bar.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/bar.c
+index b8fb8150ae48..91242f09648e 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/bar.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/bar.c
+@@ -50,7 +50,7 @@ r535_bar_bar2_wait(struct nvkm_bar *base)
+ }
+ 
+ static int
+-r535_bar_bar2_update_pde(struct nvkm_gsp *gsp, u64 addr)
++r535_bar_bar2_update_pde(struct nvkm_gsp *gsp, u8 page_shift, u64 pdbe)
+ {
+ 	rpc_update_bar_pde_v15_00 *rpc;
+ 
+@@ -59,8 +59,8 @@ r535_bar_bar2_update_pde(struct nvkm_gsp *gsp, u64 addr)
+ 		return -EIO;
+ 
+ 	rpc->info.barType = NV_RPC_UPDATE_PDE_BAR_2;
+-	rpc->info.entryValue = addr ? ((addr >> 4) | 2) : 0; /* PD3 entry format! */
+-	rpc->info.entryLevelShift = 47; //XXX: probably fetch this from mmu!
++	rpc->info.entryValue = pdbe;
++	rpc->info.entryLevelShift = page_shift;
+ 
+ 	return nvkm_gsp_rpc_wr(gsp, rpc, NVKM_GSP_RPC_REPLY_RECV);
+ }
+@@ -68,12 +68,13 @@ r535_bar_bar2_update_pde(struct nvkm_gsp *gsp, u64 addr)
+ static void
+ r535_bar_bar2_fini(struct nvkm_bar *bar)
+ {
++	struct nvkm_vmm *vmm = gf100_bar(bar)->bar[0].vmm;
+ 	struct nvkm_gsp *gsp = bar->subdev.device->gsp;
+ 
+ 	bar->flushBAR2 = bar->flushBAR2PhysMode;
+ 	nvkm_done(bar->flushFBZero);
+ 
+-	WARN_ON(r535_bar_bar2_update_pde(gsp, 0));
++	WARN_ON(r535_bar_bar2_update_pde(gsp, vmm->func->page[0].shift, 0));
+ }
+ 
+ static void
+@@ -82,8 +83,18 @@ r535_bar_bar2_init(struct nvkm_bar *bar)
+ 	struct nvkm_device *device = bar->subdev.device;
+ 	struct nvkm_vmm *vmm = gf100_bar(bar)->bar[0].vmm;
+ 	struct nvkm_gsp *gsp = device->gsp;
+-
+-	WARN_ON(r535_bar_bar2_update_pde(gsp, vmm->pd->pde[0]->pt[0]->addr));
++	struct nvkm_memory *pdb = vmm->pd->pt[0]->memory;
++	u32 pdb_offset = vmm->pd->pt[0]->base;
++	u32 pdbe_lo, pdbe_hi;
++	u64 pdbe;
++
++	nvkm_kmap(pdb);
++	pdbe_lo = nvkm_ro32(pdb, pdb_offset + 0);
++	pdbe_hi = nvkm_ro32(pdb, pdb_offset + 4);
++	pdbe = ((u64)pdbe_hi << 32) | pdbe_lo;
++	nvkm_done(pdb);
++
++	WARN_ON(r535_bar_bar2_update_pde(gsp, vmm->func->page[0].shift, pdbe));
+ 	vmm->rm.bar2_pdb = gsp->bar.rm_bar2_pdb;
+ 
+ 	if (!bar->flushFBZero) {
+-- 
+2.52.0
+
