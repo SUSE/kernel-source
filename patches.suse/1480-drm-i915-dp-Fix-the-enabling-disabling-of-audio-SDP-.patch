@@ -1,0 +1,147 @@
+From 7d476f18abeba3241cd3a2b712b2666a23b6f6dd Mon Sep 17 00:00:00 2001
+From: Imre Deak <imre.deak@intel.com>
+Date: Tue, 20 May 2025 17:22:19 +0300
+Subject: drm/i915/dp: Fix the enabling/disabling of audio SDP splitting
+Git-commit: 7d476f18abeba3241cd3a2b712b2666a23b6f6dd
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Adjust the enabling/disabling steps of the DP audio SDP splitting
+according to a recent Bspec update. This moves the enabling to the audio
+codec enable sequence after the transcoder is enabled and disables SDP
+splitting explicitly during the audio disable sequence.
+
+Bspec requires waiting for a vblank event after the transcoder is
+enabled and before SDP splitting is enabled. There is no need for an
+explicit wait for this, since after the transcoder is enabled this
+vblank event is guaranteed to have happened via a flip done wait (see
+intel_atomic_commit_tail() -> drm_atomic_helper_wait_for_flip_done()).
+
+The bspec update is for LNL+ only, but the HW team clarified that this
+has been always the intended sequence on all platforms and bspec will be
+updated everywhere accordingly.
+
+The way SDP splitting was originally enabled matched the version of
+bspec at that time. Adding here the Fixes: line still, since this
+change fixes a FIFO underrun on PTL during output enabling when DSC is
+enabled.
+
+Bspec: 49283, 68943
+Fixes: 8853750dbad8 ("drm/i915: Enable SDP split for DP2.0")
+Cc: Vinod Govindapillai <vinod.govindapillai@intel.com>
+Acked-by: Jani Nikula <jani.nikula@intel.com>
+Reviewed-by: Vinod Govindapillai <vinod.govindapillai@intel.com>
+Signed-off-by: Imre Deak <imre.deak@intel.com>
+Link: https://lore.kernel.org/r/20250520142219.1688401-1-imre.deak@intel.com
+(cherry picked from commit 56764c845aa5be14cd53702fc9f2da23e25857de)
+
+Signed-off-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/intel_audio.c  | 27 +++++++++++++--------
+ drivers/gpu/drm/i915/display/intel_audio.h  |  1 -
+ drivers/gpu/drm/i915/display/intel_ddi.c    |  3 ---
+ drivers/gpu/drm/i915/display/intel_dp_mst.c |  2 --
+ 4 files changed, 17 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_audio.c b/drivers/gpu/drm/i915/display/intel_audio.c
+index 40d8bbd8107d..55af3a553c58 100644
+--- a/drivers/gpu/drm/i915/display/intel_audio.c
++++ b/drivers/gpu/drm/i915/display/intel_audio.c
+@@ -397,6 +397,19 @@ hsw_audio_config_update(struct intel_encoder *encoder,
+ 		hsw_hdmi_audio_config_update(encoder, crtc_state);
+ }
+ 
++static void intel_audio_sdp_split_update(const struct intel_crtc_state *crtc_state,
++					 bool enable)
++{
++	struct intel_display *display = to_intel_display(crtc_state);
++	enum transcoder trans = crtc_state->cpu_transcoder;
++
++	if (!HAS_DP20(display))
++		return;
++
++	intel_de_rmw(display, AUD_DP_2DOT0_CTRL(trans), AUD_ENABLE_SDP_SPLIT,
++		     enable && crtc_state->sdp_split_enable ? AUD_ENABLE_SDP_SPLIT : 0);
++}
++
+ static void hsw_audio_codec_disable(struct intel_encoder *encoder,
+ 				    const struct intel_crtc_state *old_crtc_state,
+ 				    const struct drm_connector_state *old_conn_state)
+@@ -430,6 +443,8 @@ static void hsw_audio_codec_disable(struct intel_encoder *encoder,
+ 	if (needs_wa_14020863754(display))
+ 		intel_de_rmw(display, AUD_CHICKENBIT_REG3, DACBE_DISABLE_MIN_HBLANK_FIX, 0);
+ 
++	intel_audio_sdp_split_update(old_crtc_state, false);
++
+ 	mutex_unlock(&display->audio.mutex);
+ }
+ 
+@@ -555,6 +570,8 @@ static void hsw_audio_codec_enable(struct intel_encoder *encoder,
+ 	if (intel_crtc_has_type(crtc_state, INTEL_OUTPUT_DP))
+ 		enable_audio_dsc_wa(encoder, crtc_state);
+ 
++	intel_audio_sdp_split_update(crtc_state, true);
++
+ 	if (needs_wa_14020863754(display))
+ 		intel_de_rmw(display, AUD_CHICKENBIT_REG3, 0, DACBE_DISABLE_MIN_HBLANK_FIX);
+ 
+@@ -681,16 +698,6 @@ static void ibx_audio_codec_enable(struct intel_encoder *encoder,
+ 	mutex_unlock(&display->audio.mutex);
+ }
+ 
+-void intel_audio_sdp_split_update(const struct intel_crtc_state *crtc_state)
+-{
+-	struct intel_display *display = to_intel_display(crtc_state);
+-	enum transcoder trans = crtc_state->cpu_transcoder;
+-
+-	if (HAS_DP20(display))
+-		intel_de_rmw(display, AUD_DP_2DOT0_CTRL(trans), AUD_ENABLE_SDP_SPLIT,
+-			     crtc_state->sdp_split_enable ? AUD_ENABLE_SDP_SPLIT : 0);
+-}
+-
+ bool intel_audio_compute_config(struct intel_encoder *encoder,
+ 				struct intel_crtc_state *crtc_state,
+ 				struct drm_connector_state *conn_state)
+diff --git a/drivers/gpu/drm/i915/display/intel_audio.h b/drivers/gpu/drm/i915/display/intel_audio.h
+index ad49eefa7182..42cf886f3d24 100644
+--- a/drivers/gpu/drm/i915/display/intel_audio.h
++++ b/drivers/gpu/drm/i915/display/intel_audio.h
+@@ -31,6 +31,5 @@ int intel_audio_min_cdclk(const struct intel_crtc_state *crtc_state);
+ void intel_audio_init(struct intel_display *display);
+ void intel_audio_register(struct intel_display *display);
+ void intel_audio_deinit(struct intel_display *display);
+-void intel_audio_sdp_split_update(const struct intel_crtc_state *crtc_state);
+ 
+ #endif /* __INTEL_AUDIO_H__ */
+diff --git a/drivers/gpu/drm/i915/display/intel_ddi.c b/drivers/gpu/drm/i915/display/intel_ddi.c
+index 74132c1d6385..d58f8fc37326 100644
+--- a/drivers/gpu/drm/i915/display/intel_ddi.c
++++ b/drivers/gpu/drm/i915/display/intel_ddi.c
+@@ -3507,9 +3507,6 @@ static void intel_ddi_enable(struct intel_atomic_state *state,
+ 
+ 	intel_vrr_transcoder_enable(crtc_state);
+ 
+-	/* Enable/Disable DP2.0 SDP split config before transcoder */
+-	intel_audio_sdp_split_update(crtc_state);
+-
+ 	/* 128b/132b SST */
+ 	if (!is_hdmi && intel_dp_is_uhbr(crtc_state)) {
+ 		struct intel_dp *intel_dp = enc_to_intel_dp(encoder);
+diff --git a/drivers/gpu/drm/i915/display/intel_dp_mst.c b/drivers/gpu/drm/i915/display/intel_dp_mst.c
+index 06f4ad8de591..e1501b13f08f 100644
+--- a/drivers/gpu/drm/i915/display/intel_dp_mst.c
++++ b/drivers/gpu/drm/i915/display/intel_dp_mst.c
+@@ -1328,8 +1328,6 @@ static void mst_stream_enable(struct intel_atomic_state *state,
+ 			     FECSTALL_DIS_DPTSTREAM_DPTTG,
+ 			     pipe_config->fec_enable ? FECSTALL_DIS_DPTSTREAM_DPTTG : 0);
+ 
+-	intel_audio_sdp_split_update(pipe_config);
+-
+ 	intel_enable_transcoder(pipe_config);
+ 
+ 	for_each_pipe_crtc_modeset_enable(display, pipe_crtc, pipe_config, i) {
+-- 
+2.52.0
+
