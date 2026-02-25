@@ -1,0 +1,121 @@
+From: Sean Christopherson <seanjc@google.com>
+Date: Tue, 27 Jan 2026 17:43:08 -0800
+Subject: KVM: x86: Explicitly configure supported XSS from
+ {svm,vmx}_set_cpu_caps()
+Patch-mainline: v6.19
+Git-commit: f8ade833b733ae0b72e87ac6d2202a1afbe3eb4a
+References: jsc#PED-15123
+
+Explicitly configure KVM's supported XSS as part of each vendor's setup
+flow to fix a bug where clearing SHSTK and IBT in kvm_cpu_caps, e.g. due
+to lack of CET XFEATURE support, makes kvm-intel.ko unloadable when nested
+VMX is enabled, i.e. when nested=1.  The late clearing results in
+nested_vmx_setup_{entry,exit}_ctls() clearing VM_{ENTRY,EXIT}_LOAD_CET_STATE
+when nested_vmx_setup_ctls_msrs() runs during the CPU compatibility checks,
+ultimately leading to a mismatched VMCS config due to the reference config
+having the CET bits set, but every CPU's "local" config having the bits
+cleared.
+
+Note, kvm_caps.supported_{xcr0,xss} are unconditionally initialized by
+kvm_x86_vendor_init(), before calling into vendor code, and not referenced
+between ops->hardware_setup() and their current/old location.
+
+Fixes: 69cc3e886582 ("KVM: x86: Add XSS support for CET_KERNEL and CET_USER")
+Cc: stable@vger.kernel.org
+Cc: Mathias Krause <minipli@grsecurity.net>
+Cc: John Allen <john.allen@amd.com>
+Cc: Rick Edgecombe <rick.p.edgecombe@intel.com>
+Cc: Chao Gao <chao.gao@intel.com>
+Cc: Binbin Wu <binbin.wu@linux.intel.com>
+Cc: Xiaoyao Li <xiaoyao.li@intel.com>
+Reviewed-by: Xiaoyao Li <xiaoyao.li@intel.com>
+Reviewed-by: Binbin Wu <binbin.wu@linux.intel.com>
+Link: https://patch.msgid.link/20260128014310.3255561-2-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Acked-by: Carlos López <clopez@suse.de>
+---
+ arch/x86/kvm/svm/svm.c |    2 ++
+ arch/x86/kvm/vmx/vmx.c |    2 ++
+ arch/x86/kvm/x86.c     |   30 +++++++++++++++++-------------
+ arch/x86/kvm/x86.h     |    2 ++
+ 4 files changed, 23 insertions(+), 13 deletions(-)
+
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -5315,6 +5315,8 @@ static __init void svm_set_cpu_caps(void
+ 
+ 	/* Don't advertise Bus Lock Detect to guest if SVM support is absent */
+ 	kvm_cpu_cap_clear(X86_FEATURE_BUS_LOCK_DETECT);
++
++	kvm_setup_xss_caps();
+ }
+ 
+ static __init int svm_hardware_setup(void)
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -7942,6 +7942,8 @@ static __init void vmx_set_cpu_caps(void
+ 		kvm_cpu_cap_clear(X86_FEATURE_SHSTK);
+ 		kvm_cpu_cap_clear(X86_FEATURE_IBT);
+ 	}
++
++	kvm_setup_xss_caps();
+ }
+ 
+ static int vmx_check_intercept_io(struct kvm_vcpu *vcpu,
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -10062,6 +10062,23 @@ static struct notifier_block pvclock_gto
+ };
+ #endif
+ 
++void kvm_setup_xss_caps(void)
++{
++	if (!kvm_cpu_cap_has(X86_FEATURE_XSAVES))
++		kvm_caps.supported_xss = 0;
++
++	if (!kvm_cpu_cap_has(X86_FEATURE_SHSTK) &&
++	    !kvm_cpu_cap_has(X86_FEATURE_IBT))
++		kvm_caps.supported_xss &= ~XFEATURE_MASK_CET_ALL;
++
++	if ((kvm_caps.supported_xss & XFEATURE_MASK_CET_ALL) != XFEATURE_MASK_CET_ALL) {
++		kvm_cpu_cap_clear(X86_FEATURE_SHSTK);
++		kvm_cpu_cap_clear(X86_FEATURE_IBT);
++		kvm_caps.supported_xss &= ~XFEATURE_MASK_CET_ALL;
++	}
++}
++EXPORT_SYMBOL_GPL(kvm_setup_xss_caps);
++
+ static inline void kvm_ops_update(struct kvm_x86_init_ops *ops)
+ {
+ 	memcpy(&kvm_x86_ops, ops->runtime_ops, sizeof(kvm_x86_ops));
+@@ -10237,19 +10254,6 @@ int kvm_x86_vendor_init(struct kvm_x86_i
+ 	if (!tdp_enabled)
+ 		kvm_caps.supported_quirks &= ~KVM_X86_QUIRK_IGNORE_GUEST_PAT;
+ 
+-	if (!kvm_cpu_cap_has(X86_FEATURE_XSAVES))
+-		kvm_caps.supported_xss = 0;
+-
+-	if (!kvm_cpu_cap_has(X86_FEATURE_SHSTK) &&
+-	    !kvm_cpu_cap_has(X86_FEATURE_IBT))
+-		kvm_caps.supported_xss &= ~XFEATURE_MASK_CET_ALL;
+-
+-	if ((kvm_caps.supported_xss & XFEATURE_MASK_CET_ALL) != XFEATURE_MASK_CET_ALL) {
+-		kvm_cpu_cap_clear(X86_FEATURE_SHSTK);
+-		kvm_cpu_cap_clear(X86_FEATURE_IBT);
+-		kvm_caps.supported_xss &= ~XFEATURE_MASK_CET_ALL;
+-	}
+-
+ 	if (kvm_caps.has_tsc_control) {
+ 		/*
+ 		 * Make sure the user can only configure tsc_khz values that
+--- a/arch/x86/kvm/x86.h
++++ b/arch/x86/kvm/x86.h
+@@ -415,6 +415,8 @@ extern struct kvm_host_values kvm_host;
+ 
+ extern bool enable_pmu;
+ 
++void kvm_setup_xss_caps(void);
++
+ /*
+  * Get a filtered version of KVM's supported XCR0 that strips out dynamic
+  * features for which the current process doesn't (yet) have permission to use.
