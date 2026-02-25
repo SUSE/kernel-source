@@ -1,0 +1,497 @@
+From 90ee6ed776c06435a3fe79c7f5344761f52e1760 Mon Sep 17 00:00:00 2001
+From: Christian Brauner <brauner@kernel.org>
+Date: Mon, 7 Oct 2024 16:23:59 +0200
+Subject: fs: port files to file_ref
+Git-commit: 90ee6ed776c06435a3fe79c7f5344761f52e1760
+Patch-mainline: v6.13-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Port files to rely on file_ref reference to improve scaling and gain
+overflow protection.
+
+- We continue to WARN during get_file() in case a file that is already
+  marked dead is revived as get_file() is only valid if the caller
+  already holds a reference to the file. This hasn't changed just the
+  check changes.
+
+- The semantics for epoll and ttm's dmabuf usage have changed. Both
+  epoll and ttm synchronize with __fput() to prevent the underlying file
+  from beeing freed.
+
+  (1) epoll
+
+      Explaining epoll is straightforward using a simple diagram.
+      Essentially, the mutex of the epoll instance needs to be taken in both
+      __fput() and around epi_fget() preventing the file from being freed
+      while it is polled or preventing the file from being resurrected.
+
+          CPU1                                   CPU2
+          fput(file)
+          -> __fput(file)
+             -> eventpoll_release(file)
+                -> eventpoll_release_file(file)
+                                                 mutex_lock(&ep->mtx)
+                                                 epi_item_poll()
+                                                 -> epi_fget()
+                                                    -> file_ref_get(file)
+                                                 mutex_unlock(&ep->mtx)
+                   mutex_lock(&ep->mtx);
+                   __ep_remove()
+                   mutex_unlock(&ep->mtx);
+             -> kmem_cache_free(file)
+
+  (2) ttm dmabuf
+
+      This explanation is a bit more involved. A regular dmabuf file stashed
+      the dmabuf in file->private_data and the file in dmabuf->file:
+
+          file->private_data = dmabuf;
+          dmabuf->file = file;
+
+      The generic release method of a dmabuf file handles file specific
+      things:
+
+          f_op->release::dma_buf_file_release()
+
+      while the generic dentry release method of a dmabuf handles dmabuf
+      freeing including driver specific things:
+
+          dentry->d_release::dma_buf_release()
+
+      During ttm dmabuf initialization in ttm_object_device_init() the ttm
+      driver copies the provided struct dma_buf_ops into a private location:
+
+          struct ttm_object_device {
+                  spinlock_t object_lock;
+                  struct dma_buf_ops ops;
+                  void (*dmabuf_release)(struct dma_buf *dma_buf);
+                  struct idr idr;
+          };
+
+          ttm_object_device_init(const struct dma_buf_ops *ops)
+          {
+                  // copy original dma_buf_ops in private location
+                  tdev->ops = *ops;
+
+                  // stash the release method of the original struct dma_buf_ops
+                  tdev->dmabuf_release = tdev->ops.release;
+
+                  // override the release method in the copy of the struct dma_buf_ops
+                  // with ttm's own dmabuf release method
+                  tdev->ops.release = ttm_prime_dmabuf_release;
+          }
+
+      When a new dmabuf is created the struct dma_buf_ops with the overriden
+      release method set to ttm_prime_dmabuf_release is passed in exp_info.ops:
+
+          DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
+          exp_info.ops = &tdev->ops;
+          exp_info.size = prime->size;
+          exp_info.flags = flags;
+          exp_info.priv = prime;
+
+      The call to dma_buf_export() then sets
+
+          mutex_lock_interruptible(&prime->mutex);
+          dma_buf = dma_buf_export(&exp_info)
+          {
+                  dmabuf->ops = exp_info->ops;
+          }
+          mutex_unlock(&prime->mutex);
+
+      which creates a new dmabuf file and then install a file descriptor to
+      it in the callers file descriptor table:
+
+          ret = dma_buf_fd(dma_buf, flags);
+
+      When that dmabuf file is closed we now get:
+
+          fput(file)
+          -> __fput(file)
+             -> f_op->release::dma_buf_file_release()
+             -> dput()
+                -> d_op->d_release::dma_buf_release()
+                   -> dmabuf->ops->release::ttm_prime_dmabuf_release()
+                      mutex_lock(&prime->mutex);
+                      if (prime->dma_buf == dma_buf)
+                            prime->dma_buf = NULL;
+                      mutex_unlock(&prime->mutex);
+
+      Where we can see that prime->dma_buf is set to NULL. So when we have
+      the following diagram:
+
+          CPU1                                                          CPU2
+          fput(file)
+          -> __fput(file)
+             -> f_op->release::dma_buf_file_release()
+             -> dput()
+                -> d_op->d_release::dma_buf_release()
+                   -> dmabuf->ops->release::ttm_prime_dmabuf_release()
+                                                                        ttm_prime_handle_to_fd()
+                                                                        mutex_lock_interruptible(&prime->mutex)
+                                                                        dma_buf = prime->dma_buf
+                                                                        dma_buf && get_dma_buf_unless_doomed(dma_buf)
+                                                                        -> file_ref_get(dma_buf->file)
+                                                                        mutex_unlock(&prime->mutex);
+
+                      mutex_lock(&prime->mutex);
+                      if (prime->dma_buf == dma_buf)
+                            prime->dma_buf = NULL;
+                      mutex_unlock(&prime->mutex);
+             -> kmem_cache_free(file)
+
+      The logic of the mechanism is the same as for epoll: sync with
+      __fput() preventing the file from being freed. Here the
+      synchronization happens through the ttm instance's prime->mutex.
+      Basically, the lifetime of the dma_buf and the file are tighly
+      coupled.
+
+  Both (1) and (2) used to call atomic_inc_not_zero() to check whether
+  the file has already been marked dead and then refuse to revive it.
+
+  This is only safe because both (1) and (2) sync with __fput() and thus
+  prevent kmem_cache_free() on the file being called and thus prevent
+  the file from being immediately recycled due to SLAB_TYPESAFE_BY_RCU.
+
+  Both (1) and (2) have been ported from atomic_inc_not_zero() to
+  file_ref_get(). That means a file that is already in the process of
+  being marked as FILE_REF_DEAD:
+
+  file_ref_put()
+  cnt = atomic_long_dec_return()
+  -> __file_ref_put(cnt)
+     if (cnt == FIlE_REF_NOREF)
+             atomic_long_try_cmpxchg_release(cnt, FILE_REF_DEAD)
+
+  can be revived again:
+
+  CPU1                                                             CPU2
+  file_ref_put()
+  cnt = atomic_long_dec_return()
+  -> __file_ref_put(cnt)
+     if (cnt == FIlE_REF_NOREF)
+                                                                   file_ref_get()
+                                                                   // Brings reference back to FILE_REF_ONEREF
+                                                                   atomic_long_add_negative()
+             atomic_long_try_cmpxchg_release(cnt, FILE_REF_DEAD)
+
+  This is fine and inherent to the file_ref_get()/file_ref_put()
+  semantics. For both (1) and (2) this is safe because __fput() is
+  prevented from making progress if file_ref_get() fails due to the
+  aforementioned synchronization mechanisms.
+
+  Two cases need to be considered that affect both (1) epoll and (2) ttm
+  dmabuf:
+
+   (i) fput()'s file_ref_put() and marks the file as FILE_REF_NOREF but
+       before that fput() can mark the file as FILE_REF_DEAD someone
+       manages to sneak in a file_ref_get() and brings the refcount back
+       from FILE_REF_NOREF to FILE_REF_ONEREF. In that case the original
+       fput() doesn't call __fput(). For epoll the poll will finish and
+       for ttm dmabuf the file can be used again. For ttm dambuf this is
+       actually an advantage because it avoids immediately allocating
+       a new dmabuf object.
+
+       CPU1                                                             CPU2
+       file_ref_put()
+       cnt = atomic_long_dec_return()
+       -> __file_ref_put(cnt)
+          if (cnt == FIlE_REF_NOREF)
+                                                                        file_ref_get()
+                                                                        // Brings reference back to FILE_REF_ONEREF
+                                                                        atomic_long_add_negative()
+                  atomic_long_try_cmpxchg_release(cnt, FILE_REF_DEAD)
+
+  (ii) fput()'s file_ref_put() marks the file FILE_REF_NOREF and
+       also suceeds in actually marking it FILE_REF_DEAD and then calls
+       into __fput() to free the file.
+
+       When either (1) or (2) call file_ref_get() they fail as
+       atomic_long_add_negative() will return true.
+
+       At the same time, both (1) and (2) all file_ref_get() under
+       mutexes that __fput() must also acquire preventing
+       kmem_cache_free() from freeing the file.
+
+  So while this might be treated as a change in semantics for (1) and
+  (2) it really isn't. It if should end up causing issues this can be
+  fixed by adding a helper that does something like:
+
+  long cnt = atomic_long_read(&ref->refcnt);
+  do {
+          if (cnt < 0)
+                  return false;
+  } while (!atomic_long_try_cmpxchg(&ref->refcnt, &cnt, cnt + 1));
+  return true;
+
+  which would block FILE_REF_NOREF to FILE_REF_ONEREF transitions.
+
+- Jann correctly pointed out that kmem_cache_zalloc() cannot be used
+  anymore once files have been ported to file_ref_t.
+
+  The kmem_cache_zalloc() call will memset() the whole struct file to
+  zero when it is reallocated. This will also set file->f_ref to zero
+  which mens that a concurrent file_ref_get() can return true:
+
+  CPU1                            CPU2
+                                  __get_file_rcu()
+                                    rcu_dereference_raw()
+  close()
+    [frees file]
+  alloc_empty_file()
+    kmem_cache_zalloc()
+      [reallocates same file]
+      memset(..., 0, ...)
+                                    file_ref_get()
+                                      [increments 0->1, returns true]
+    init_file()
+      file_ref_init(..., 1)
+        [sets to 0]
+                                    rcu_dereference_raw()
+                                    fput()
+                                      file_ref_put()
+                                        [decrements 0->FILE_REF_NOREF, frees file]
+    [UAF]
+
+   causing a concurrent __get_file_rcu() call to acquire a reference to
+   the file that is about to be reallocated and immediately freeing it
+   on realizing that it has been recycled. This causes a UAF for the
+   task that reallocated/recycled the file.
+
+   This is prevented by switching from kmem_cache_zalloc() to
+   kmem_cache_alloc() and initializing the fields manually. With
+   file->f_ref initialized last.
+
+   Note that a memset() also isn't guaranteed to atomically update an
+   unsigned long so it's theoretically possible to see torn and
+   therefore bogus counter values.
+
+Link: https://lore.kernel.org/r/20241007-brauner-file-rcuref-v2-3-387e24dc9163@kernel.org
+Signed-off-by: Christian Brauner <brauner@kernel.org>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/gt/shmem_utils.c |  2 +-
+ drivers/gpu/drm/vmwgfx/ttm_object.c   |  2 +-
+ fs/eventpoll.c                        |  2 +-
+ fs/file.c                             | 14 +++++------
+ fs/file_table.c                       | 34 ++++++++++++++++++++-------
+ include/linux/fs.h                    | 10 ++++----
+ 6 files changed, 40 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/shmem_utils.c b/drivers/gpu/drm/i915/gt/shmem_utils.c
+index 25fec7db4a2d..365c4b8b04f4 100644
+--- a/drivers/gpu/drm/i915/gt/shmem_utils.c
++++ b/drivers/gpu/drm/i915/gt/shmem_utils.c
+@@ -40,7 +40,7 @@ struct file *shmem_create_from_object(struct drm_i915_gem_object *obj)
+ 
+ 	if (i915_gem_object_is_shmem(obj)) {
+ 		file = obj->base.filp;
+-		atomic_long_inc(&file->f_count);
++		get_file(file);
+ 		return file;
+ 	}
+ 
+diff --git a/drivers/gpu/drm/vmwgfx/ttm_object.c b/drivers/gpu/drm/vmwgfx/ttm_object.c
+index 3353e97687d1..a17e62867f3b 100644
+--- a/drivers/gpu/drm/vmwgfx/ttm_object.c
++++ b/drivers/gpu/drm/vmwgfx/ttm_object.c
+@@ -471,7 +471,7 @@ void ttm_object_device_release(struct ttm_object_device **p_tdev)
+  */
+ static bool __must_check get_dma_buf_unless_doomed(struct dma_buf *dmabuf)
+ {
+-	return atomic_long_inc_not_zero(&dmabuf->file->f_count) != 0L;
++	return file_ref_get(&dmabuf->file->f_ref);
+ }
+ 
+ /**
+diff --git a/fs/eventpoll.c b/fs/eventpoll.c
+index 1ae4542f0bd8..212383cefe6c 100644
+--- a/fs/eventpoll.c
++++ b/fs/eventpoll.c
+@@ -1002,7 +1002,7 @@ static struct file *epi_fget(const struct epitem *epi)
+ 	struct file *file;
+ 
+ 	file = epi->ffd.file;
+-	if (!atomic_long_inc_not_zero(&file->f_count))
++	if (!file_ref_get(&file->f_ref))
+ 		file = NULL;
+ 	return file;
+ }
+diff --git a/fs/file.c b/fs/file.c
+index ab15e2a3d280..9598c577f713 100644
+--- a/fs/file.c
++++ b/fs/file.c
+@@ -902,7 +902,7 @@ static struct file *__get_file_rcu(struct file __rcu **f)
+ 	if (!file)
+ 		return NULL;
+ 
+-	if (unlikely(!atomic_long_inc_not_zero(&file->f_count)))
++	if (unlikely(!file_ref_get(&file->f_ref)))
+ 		return ERR_PTR(-EAGAIN);
+ 
+ 	file_reloaded = rcu_dereference_raw(*f);
+@@ -916,8 +916,8 @@ static struct file *__get_file_rcu(struct file __rcu **f)
+ 	OPTIMIZER_HIDE_VAR(file_reloaded_cmp);
+ 
+ 	/*
+-	 * atomic_long_inc_not_zero() above provided a full memory
+-	 * barrier when we acquired a reference.
++	 * file_ref_get() above provided a full memory barrier when we
++	 * acquired a reference.
+ 	 *
+ 	 * This is paired with the write barrier from assigning to the
+ 	 * __rcu protected file pointer so that if that pointer still
+@@ -1015,11 +1015,11 @@ static inline struct file *__fget_files_rcu(struct files_struct *files,
+ 		 * We need to confirm it by incrementing the refcount
+ 		 * and then check the lookup again.
+ 		 *
+-		 * atomic_long_inc_not_zero() gives us a full memory
+-		 * barrier. We only really need an 'acquire' one to
+-		 * protect the loads below, but we don't have that.
++		 * file_ref_get() gives us a full memory barrier. We
++		 * only really need an 'acquire' one to protect the
++		 * loads below, but we don't have that.
+ 		 */
+-		if (unlikely(!atomic_long_inc_not_zero(&file->f_count)))
++		if (unlikely(!file_ref_get(&file->f_ref)))
+ 			continue;
+ 
+ 		/*
+diff --git a/fs/file_table.c b/fs/file_table.c
+index 4b23eb7b79dd..db4fde6fe620 100644
+--- a/fs/file_table.c
++++ b/fs/file_table.c
+@@ -169,16 +169,32 @@ static int init_file(struct file *f, int flags, const struct cred *cred)
+ 	 * the respective member when opening the file.
+ 	 */
+ 	mutex_init(&f->f_pos_lock);
+-	f->f_flags = flags;
+-	f->f_mode = OPEN_FMODE(flags);
+-	/* f->f_version: 0 */
++	memset(&f->f_path, 0, sizeof(f->f_path));
++	memset(&f->f_ra, 0, sizeof(f->f_ra));
++
++	f->f_flags	= flags;
++	f->f_mode	= OPEN_FMODE(flags);
++
++	f->f_op		= NULL;
++	f->f_mapping	= NULL;
++	f->private_data = NULL;
++	f->f_inode	= NULL;
++	f->f_owner	= NULL;
++#ifdef CONFIG_EPOLL
++	f->f_ep		= NULL;
++#endif
++
++	f->f_iocb_flags = 0;
++	f->f_pos	= 0;
++	f->f_wb_err	= 0;
++	f->f_sb_err	= 0;
+ 
+ 	/*
+ 	 * We're SLAB_TYPESAFE_BY_RCU so initialize f_count last. While
+ 	 * fget-rcu pattern users need to be able to handle spurious
+ 	 * refcount bumps we should reinitialize the reused file first.
+ 	 */
+-	atomic_long_set(&f->f_count, 1);
++	file_ref_init(&f->f_ref, 1);
+ 	return 0;
+ }
+ 
+@@ -210,7 +226,7 @@ struct file *alloc_empty_file(int flags, const struct cred *cred)
+ 			goto over;
+ 	}
+ 
+-	f = kmem_cache_zalloc(filp_cachep, GFP_KERNEL);
++	f = kmem_cache_alloc(filp_cachep, GFP_KERNEL);
+ 	if (unlikely(!f))
+ 		return ERR_PTR(-ENOMEM);
+ 
+@@ -244,7 +260,7 @@ struct file *alloc_empty_file_noaccount(int flags, const struct cred *cred)
+ 	struct file *f;
+ 	int error;
+ 
+-	f = kmem_cache_zalloc(filp_cachep, GFP_KERNEL);
++	f = kmem_cache_alloc(filp_cachep, GFP_KERNEL);
+ 	if (unlikely(!f))
+ 		return ERR_PTR(-ENOMEM);
+ 
+@@ -271,7 +287,7 @@ struct file *alloc_empty_backing_file(int flags, const struct cred *cred)
+ 	struct backing_file *ff;
+ 	int error;
+ 
+-	ff = kmem_cache_zalloc(bfilp_cachep, GFP_KERNEL);
++	ff = kmem_cache_alloc(bfilp_cachep, GFP_KERNEL);
+ 	if (unlikely(!ff))
+ 		return ERR_PTR(-ENOMEM);
+ 
+@@ -483,7 +499,7 @@ static DECLARE_DELAYED_WORK(delayed_fput_work, delayed_fput);
+ 
+ void fput(struct file *file)
+ {
+-	if (atomic_long_dec_and_test(&file->f_count)) {
++	if (file_ref_put(&file->f_ref)) {
+ 		struct task_struct *task = current;
+ 
+ 		if (unlikely(!(file->f_mode & (FMODE_BACKING | FMODE_OPENED)))) {
+@@ -516,7 +532,7 @@ void fput(struct file *file)
+  */
+ void __fput_sync(struct file *file)
+ {
+-	if (atomic_long_dec_and_test(&file->f_count))
++	if (file_ref_put(&file->f_ref))
+ 		__fput(file);
+ }
+ 
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 3559446279c1..bdbe8f18dfe6 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -45,6 +45,7 @@
+ #include <linux/slab.h>
+ #include <linux/maple_tree.h>
+ #include <linux/rw_hint.h>
++#include <linux/file_ref.h>
+ 
+ #include <asm/byteorder.h>
+ #include <uapi/linux/fs.h>
+@@ -1005,7 +1006,7 @@ static inline int ra_has_index(struct file_ra_state *ra, pgoff_t index)
+ 
+ /**
+  * struct file - Represents a file
+- * @f_count: reference count
++ * @f_ref: reference count
+  * @f_lock: Protects f_ep, f_flags. Must not be taken from IRQ context.
+  * @f_mode: FMODE_* flags often used in hotpaths
+  * @f_op: file operations
+@@ -1030,7 +1031,7 @@ static inline int ra_has_index(struct file_ra_state *ra, pgoff_t index)
+  * @f_freeptr: Pointer used by SLAB_TYPESAFE_BY_RCU file cache (don't touch.)
+  */
+ struct file {
+-	atomic_long_t			f_count;
++	file_ref_t			f_ref;
+ 	spinlock_t			f_lock;
+ 	fmode_t				f_mode;
+ 	const struct file_operations	*f_op;
+@@ -1078,15 +1079,14 @@ struct file_handle {
+ 
+ static inline struct file *get_file(struct file *f)
+ {
+-	long prior = atomic_long_fetch_inc_relaxed(&f->f_count);
+-	WARN_ONCE(!prior, "struct file::f_count incremented from zero; use-after-free condition present!\n");
++	file_ref_inc(&f->f_ref);
+ 	return f;
+ }
+ 
+ struct file *get_file_rcu(struct file __rcu **f);
+ struct file *get_file_active(struct file **f);
+ 
+-#define file_count(x)	atomic_long_read(&(x)->f_count)
++#define file_count(f)	file_ref_read(&(f)->f_ref)
+ 
+ #define	MAX_NON_LFS	((1UL<<31) - 1)
+ 
+-- 
+2.52.0
+
