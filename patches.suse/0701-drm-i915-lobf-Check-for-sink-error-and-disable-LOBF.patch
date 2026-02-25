@@ -1,0 +1,153 @@
+From 2063174c22da83e9440466cf496ad3b20f85f5c8 Mon Sep 17 00:00:00 2001
+From: Animesh Manna <animesh.manna@intel.com>
+Date: Wed, 23 Apr 2025 14:53:32 +0530
+Subject: drm/i915/lobf: Check for sink error and disable LOBF
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 2063174c22da83e9440466cf496ad3b20f85f5c8
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Disable LOBF/ALPM for any erroneous condition from sink side.
+
+V1: Initial version.
+V2: Add centralized alpm error handling. [Jouni]
+V3: Improve debug print. [Jouni]
+V4: Disable alpm permanently for sink error. [Jouni]
+
+Signed-off-by: Animesh Manna <animesh.manna@intel.com>
+Reviewed-by: Jouni Högander <jouni.hogander@intel.com>
+Link: https://lore.kernel.org/r/20250423092334.2294483-10-animesh.manna@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/intel_alpm.c     | 28 +++++++++++++++++++
+ drivers/gpu/drm/i915/display/intel_alpm.h     |  1 +
+ .../drm/i915/display/intel_display_types.h    |  1 +
+ drivers/gpu/drm/i915/display/intel_dp.c       |  5 ++++
+ drivers/gpu/drm/i915/display/intel_psr.c      | 18 ++----------
+ 5 files changed, 37 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_alpm.c b/drivers/gpu/drm/i915/display/intel_alpm.c
+index 606cb3e5f30d..24b666e6d8f9 100644
+--- a/drivers/gpu/drm/i915/display/intel_alpm.c
++++ b/drivers/gpu/drm/i915/display/intel_alpm.c
+@@ -284,6 +284,9 @@ void intel_alpm_lobf_compute_config(struct intel_dp *intel_dp,
+ 		return;
+ 	}
+ 
++	if (intel_dp->alpm_parameters.sink_alpm_error)
++		return;
++
+ 	if (!intel_dp_is_edp(intel_dp))
+ 		return;
+ 
+@@ -546,5 +549,30 @@ void intel_alpm_disable(struct intel_dp *intel_dp)
+ 		     PORT_ALPM_CTL(cpu_transcoder),
+ 		     PORT_ALPM_CTL_ALPM_AUX_LESS_ENABLE, 0);
+ 
++	drm_dbg_kms(display->drm, "Disabling ALPM\n");
+ 	mutex_unlock(&intel_dp->alpm_parameters.lock);
+ }
++
++bool intel_alpm_get_error(struct intel_dp *intel_dp)
++{
++	struct intel_display *display = to_intel_display(intel_dp);
++	struct drm_dp_aux *aux = &intel_dp->aux;
++	u8 val;
++	int r;
++
++	r = drm_dp_dpcd_readb(aux, DP_RECEIVER_ALPM_STATUS, &val);
++	if (r != 1) {
++		drm_err(display->drm, "Error reading ALPM status\n");
++		return true;
++	}
++
++	if (val & DP_ALPM_LOCK_TIMEOUT_ERROR) {
++		drm_dbg_kms(display->drm, "ALPM lock timeout error\n");
++
++		/* Clearing error */
++		drm_dp_dpcd_writeb(aux, DP_RECEIVER_ALPM_STATUS, val);
++		return true;
++	}
++
++	return false;
++}
+diff --git a/drivers/gpu/drm/i915/display/intel_alpm.h b/drivers/gpu/drm/i915/display/intel_alpm.h
+index c043a071f84f..d7126d65b60f 100644
+--- a/drivers/gpu/drm/i915/display/intel_alpm.h
++++ b/drivers/gpu/drm/i915/display/intel_alpm.h
+@@ -31,4 +31,5 @@ void intel_alpm_lobf_debugfs_add(struct intel_connector *connector);
+ bool intel_alpm_aux_wake_supported(struct intel_dp *intel_dp);
+ bool intel_alpm_aux_less_wake_supported(struct intel_dp *intel_dp);
+ void intel_alpm_disable(struct intel_dp *intel_dp);
++bool intel_alpm_get_error(struct intel_dp *intel_dp);
+ #endif
+diff --git a/drivers/gpu/drm/i915/display/intel_display_types.h b/drivers/gpu/drm/i915/display/intel_display_types.h
+index 878f378577ab..7415564d058a 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_types.h
++++ b/drivers/gpu/drm/i915/display/intel_display_types.h
+@@ -1817,6 +1817,7 @@ struct intel_dp {
+ 		u8 silence_period_sym_clocks;
+ 		u8 lfps_half_cycle_num_of_syms;
+ 		bool lobf_disable_debug;
++		bool sink_alpm_error;
+ 	} alpm_parameters;
+ 
+ 	u8 alpm_dpcd;
+diff --git a/drivers/gpu/drm/i915/display/intel_dp.c b/drivers/gpu/drm/i915/display/intel_dp.c
+index ece787bb3335..607aea1bf6fa 100644
+--- a/drivers/gpu/drm/i915/display/intel_dp.c
++++ b/drivers/gpu/drm/i915/display/intel_dp.c
+@@ -5392,6 +5392,11 @@ intel_dp_short_pulse(struct intel_dp *intel_dp)
+ 
+ 	intel_psr_short_pulse(intel_dp);
+ 
++	if (intel_alpm_get_error(intel_dp)) {
++		intel_alpm_disable(intel_dp);
++		intel_dp->alpm_parameters.sink_alpm_error = true;
++	}
++
+ 	if (intel_dp_test_short_pulse(intel_dp))
+ 		reprobe_needed = true;
+ 
+diff --git a/drivers/gpu/drm/i915/display/intel_psr.c b/drivers/gpu/drm/i915/display/intel_psr.c
+index b3d324bd5eff..a6b925d2b7b4 100644
+--- a/drivers/gpu/drm/i915/display/intel_psr.c
++++ b/drivers/gpu/drm/i915/display/intel_psr.c
+@@ -3465,29 +3465,15 @@ static int psr_get_status_and_error_status(struct intel_dp *intel_dp,
+ 
+ static void psr_alpm_check(struct intel_dp *intel_dp)
+ {
+-	struct intel_display *display = to_intel_display(intel_dp);
+-	struct drm_dp_aux *aux = &intel_dp->aux;
+ 	struct intel_psr *psr = &intel_dp->psr;
+-	u8 val;
+-	int r;
+ 
+ 	if (!psr->sel_update_enabled)
+ 		return;
+ 
+-	r = drm_dp_dpcd_readb(aux, DP_RECEIVER_ALPM_STATUS, &val);
+-	if (r != 1) {
+-		drm_err(display->drm, "Error reading ALPM status\n");
+-		return;
+-	}
+-
+-	if (val & DP_ALPM_LOCK_TIMEOUT_ERROR) {
++	if (intel_alpm_get_error(intel_dp)) {
+ 		intel_psr_disable_locked(intel_dp);
+ 		psr->sink_not_reliable = true;
+-		drm_dbg_kms(display->drm,
+-			    "ALPM lock timeout error, disabling PSR\n");
+-
+-		/* Clearing error */
+-		drm_dp_dpcd_writeb(aux, DP_RECEIVER_ALPM_STATUS, val);
++		intel_alpm_disable(intel_dp);
+ 	}
+ }
+ 
+-- 
+2.52.0
+
