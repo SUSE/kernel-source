@@ -1,0 +1,193 @@
+From 54a01f775194a8b5acc6bd735aa0d092469dcff7 Mon Sep 17 00:00:00 2001
+From: Lijo Lazar <lijo.lazar@amd.com>
+Date: Mon, 5 May 2025 16:53:29 +0530
+Subject: drm/amd/pm: Add support to query partition metrics
+Git-commit: 54a01f775194a8b5acc6bd735aa0d092469dcff7
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Add interfaces to query compute partition related metrics data.
+
+Signed-off-by: Lijo Lazar <lijo.lazar@amd.com>
+Reviewed-by: Asad Kamal <asad.kamal@amd.com>
+Reviewed-by: Hawking Zhang <Hawking.Zhang@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../gpu/drm/amd/include/kgd_pp_interface.h    | 24 ++++++++++++++
+ drivers/gpu/drm/amd/pm/amdgpu_dpm.c           | 32 +++++++++++++++++++
+ drivers/gpu/drm/amd/pm/inc/amdgpu_dpm.h       |  2 ++
+ drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c     | 14 ++++++++
+ drivers/gpu/drm/amd/pm/swsmu/inc/amdgpu_smu.h |  6 ++++
+ drivers/gpu/drm/amd/pm/swsmu/smu_cmn.h        | 12 +++++++
+ 6 files changed, 90 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/include/kgd_pp_interface.h b/drivers/gpu/drm/amd/include/kgd_pp_interface.h
+index 0f7542d7074b..f4d914dc731f 100644
+--- a/drivers/gpu/drm/amd/include/kgd_pp_interface.h
++++ b/drivers/gpu/drm/amd/include/kgd_pp_interface.h
+@@ -494,6 +494,7 @@ struct amd_pm_funcs {
+ 	int (*set_df_cstate)(void *handle, enum pp_df_cstate state);
+ 	int (*set_xgmi_pstate)(void *handle, uint32_t pstate);
+ 	ssize_t (*get_gpu_metrics)(void *handle, void **table);
++	ssize_t (*get_xcp_metrics)(void *handle, int xcp_id, void *table);
+ 	ssize_t (*get_pm_metrics)(void *handle, void *pmmetrics, size_t size);
+ 	int (*set_watermarks_for_clock_ranges)(void *handle,
+ 					       struct pp_smu_wm_range_sets *ranges);
+@@ -1592,4 +1593,27 @@ struct amdgpu_pm_metrics {
+ 	uint8_t data[];
+ };
+ 
++struct amdgpu_partition_metrics_v1_0 {
++	struct metrics_table_header common_header;
++	/* Current clocks (Mhz) */
++	uint16_t current_gfxclk[MAX_XCC];
++	uint16_t current_socclk[MAX_CLKS];
++	uint16_t current_vclk0[MAX_CLKS];
++	uint16_t current_dclk0[MAX_CLKS];
++	uint16_t current_uclk;
++	uint16_t padding;
++
++	/* Utilization Instantaneous (%) */
++	uint32_t gfx_busy_inst[MAX_XCC];
++	uint16_t jpeg_busy[NUM_JPEG_ENG_V1];
++	uint16_t vcn_busy[NUM_VCN];
++	/* Utilization Accumulated (%) */
++	uint64_t gfx_busy_acc[MAX_XCC];
++	/* Total App Clock Counter Accumulated */
++	uint64_t gfx_below_host_limit_ppt_acc[MAX_XCC];
++	uint64_t gfx_below_host_limit_thm_acc[MAX_XCC];
++	uint64_t gfx_low_utilization_acc[MAX_XCC];
++	uint64_t gfx_below_host_limit_total_acc[MAX_XCC];
++};
++
+ #endif
+diff --git a/drivers/gpu/drm/amd/pm/amdgpu_dpm.c b/drivers/gpu/drm/amd/pm/amdgpu_dpm.c
+index 2148c8db5a59..d98c95d1ed83 100644
+--- a/drivers/gpu/drm/amd/pm/amdgpu_dpm.c
++++ b/drivers/gpu/drm/amd/pm/amdgpu_dpm.c
+@@ -2019,3 +2019,35 @@ int amdgpu_dpm_get_dpm_clock_table(struct amdgpu_device *adev,
+ 
+ 	return ret;
+ }
++
++/**
++ * amdgpu_dpm_get_xcp_metrics - Retrieve metrics for a specific compute
++ * partition
++ * @adev: Pointer to the device.
++ * @xcp_id: Identifier of the XCP for which metrics are to be retrieved.
++ * @table: Pointer to a buffer where the metrics will be stored. If NULL, the
++ * function returns the size of the metrics structure.
++ *
++ * This function retrieves metrics for a specific XCP, including details such as
++ * VCN/JPEG activity, clock frequencies, and other performance metrics. If the
++ * table parameter is NULL, the function returns the size of the metrics
++ * structure without populating it.
++ *
++ * Return: Size of the metrics structure on success, or a negative error code on failure.
++ */
++ssize_t amdgpu_dpm_get_xcp_metrics(struct amdgpu_device *adev, int xcp_id,
++				   void *table)
++{
++	const struct amd_pm_funcs *pp_funcs = adev->powerplay.pp_funcs;
++	int ret = 0;
++
++	if (!pp_funcs->get_xcp_metrics)
++		return 0;
++
++	mutex_lock(&adev->pm.mutex);
++	ret = pp_funcs->get_xcp_metrics(adev->powerplay.pp_handle, xcp_id,
++					table);
++	mutex_unlock(&adev->pm.mutex);
++
++	return ret;
++}
+diff --git a/drivers/gpu/drm/amd/pm/inc/amdgpu_dpm.h b/drivers/gpu/drm/amd/pm/inc/amdgpu_dpm.h
+index 2c3c97587dd5..c0f9ecb97fcc 100644
+--- a/drivers/gpu/drm/amd/pm/inc/amdgpu_dpm.h
++++ b/drivers/gpu/drm/amd/pm/inc/amdgpu_dpm.h
+@@ -524,6 +524,8 @@ int amdgpu_dpm_get_power_profile_mode(struct amdgpu_device *adev,
+ int amdgpu_dpm_set_power_profile_mode(struct amdgpu_device *adev,
+ 				      long *input, uint32_t size);
+ int amdgpu_dpm_get_gpu_metrics(struct amdgpu_device *adev, void **table);
++ssize_t amdgpu_dpm_get_xcp_metrics(struct amdgpu_device *adev, int xcp_id,
++				   void *table);
+ 
+ /**
+  * @get_pm_metrics: Get one snapshot of power management metrics from PMFW. The
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c b/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c
+index f24a1d8c77db..d79a1d94661a 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c
+@@ -3758,6 +3758,19 @@ int smu_set_pm_policy(struct smu_context *smu, enum pp_pm_policy p_type,
+ 	return ret;
+ }
+ 
++static ssize_t smu_sys_get_xcp_metrics(void *handle, int xcp_id, void *table)
++{
++	struct smu_context *smu = handle;
++
++	if (!smu->pm_enabled || !smu->adev->pm.dpm_enabled)
++		return -EOPNOTSUPP;
++
++	if (!smu->adev->xcp_mgr || !smu->ppt_funcs->get_xcp_metrics)
++		return -EOPNOTSUPP;
++
++	return smu->ppt_funcs->get_xcp_metrics(smu, xcp_id, table);
++}
++
+ static const struct amd_pm_funcs swsmu_pm_funcs = {
+ 	/* export for sysfs */
+ 	.set_fan_control_mode    = smu_set_fan_control_mode,
+@@ -3816,6 +3829,7 @@ static const struct amd_pm_funcs swsmu_pm_funcs = {
+ 	.get_uclk_dpm_states              = smu_get_uclk_dpm_states,
+ 	.get_dpm_clock_table              = smu_get_dpm_clock_table,
+ 	.get_smu_prv_buf_details = smu_get_prv_buffer_details,
++	.get_xcp_metrics                  = smu_sys_get_xcp_metrics,
+ };
+ 
+ int smu_wait_for_event(struct smu_context *smu, enum smu_event_type event,
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/inc/amdgpu_smu.h b/drivers/gpu/drm/amd/pm/swsmu/inc/amdgpu_smu.h
+index d47e32ae4671..9aacc7bc1c69 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/inc/amdgpu_smu.h
++++ b/drivers/gpu/drm/amd/pm/swsmu/inc/amdgpu_smu.h
+@@ -1466,6 +1466,12 @@ struct pptable_funcs {
+ 	 */
+ 	int (*set_wbrf_exclusion_ranges)(struct smu_context *smu,
+ 					struct freq_band_range *exclusion_ranges);
++	/**
++	 * @get_xcp_metrics: Get a copy of the partition metrics table from SMU.
++	 * Return: Size of table
++	 */
++	ssize_t (*get_xcp_metrics)(struct smu_context *smu, int xcp_id,
++				   void *table);
+ };
+ 
+ typedef enum {
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/smu_cmn.h b/drivers/gpu/drm/amd/pm/swsmu/smu_cmn.h
+index ade36a8ffa66..7473672abd2a 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/smu_cmn.h
++++ b/drivers/gpu/drm/amd/pm/swsmu/smu_cmn.h
+@@ -52,6 +52,18 @@
+ 		header->structure_size = sizeof(*(ptr));       \
+ 	} while (0)
+ 
++#define smu_cmn_init_partition_metrics(ptr, frev, crev)                     \
++	do {                                                                \
++		typecheck(struct amdgpu_partition_metrics_v##frev##_##crev, \
++			  typeof(*(ptr)));                                  \
++		struct metrics_table_header *header =                       \
++			(struct metrics_table_header *)(ptr);               \
++		memset(header, 0xFF, sizeof(*(ptr)));                       \
++		header->format_revision = frev;                             \
++		header->content_revision = crev;                            \
++		header->structure_size = sizeof(*(ptr));                    \
++	} while (0)
++
+ extern const int link_speed[];
+ 
+ /* Helper to Convert from PCIE Gen 1/2/3/4/5/6 to 0.1 GT/s speed units */
+-- 
+2.52.0
+
