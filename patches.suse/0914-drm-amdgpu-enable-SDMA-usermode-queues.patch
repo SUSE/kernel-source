@@ -1,0 +1,122 @@
+From 543b6145377458b5ec0d1440606c31db62867bf4 Mon Sep 17 00:00:00 2001
+From: Arvind Yadav <Arvind.Yadav@amd.com>
+Date: Tue, 27 Aug 2024 14:52:07 +0530
+Subject: drm/amdgpu: enable SDMA usermode queues
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 543b6145377458b5ec0d1440606c31db62867bf4
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+This patch does necessary modifications to enable the SDMA
+usermode queues using the existing userqueue infrastructure.
+
+V9: introduced this patch in the series
+V10: use header file instead of extern (Alex)
+V11: rename drm_amdgpu_userq_mqd_sdma_gfx_v11 to
+     drm_amdgpu_userq_mqd_sdma_gfx11 (Marek)
+
+Cc: Christian König <Christian.Koenig@amd.com>
+Cc: Alex Deucher <alexander.deucher@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Shashank Sharma <shashank.sharma@amd.com>
+Signed-off-by: Arvind Yadav <arvind.yadav@amd.com>
+Signed-off-by: Srinivasan Shanmugam <srinivasan.shanmugam@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c  |  2 +-
+ .../gpu/drm/amd/amdgpu/mes_v11_0_userqueue.c   | 18 ++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/sdma_v6_0.c         |  3 +++
+ include/uapi/drm/amdgpu_drm.h                  | 10 ++++++++++
+ 4 files changed, 32 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c
+index 5cb984c509c2..2c5747cc492e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c
+@@ -189,7 +189,7 @@ amdgpu_userqueue_create(struct drm_file *filp, union drm_amdgpu_userq *args)
+ 	int qid, r = 0;
+ 
+ 	/* Usermode queues are only supported for GFX IP as of now */
+-	if (args->in.ip_type != AMDGPU_HW_IP_GFX) {
++	if (args->in.ip_type != AMDGPU_HW_IP_GFX && args->in.ip_type != AMDGPU_HW_IP_DMA) {
+ 		DRM_ERROR("Usermode queue doesn't support IP type %u\n", args->in.ip_type);
+ 		return -EINVAL;
+ 	}
+diff --git a/drivers/gpu/drm/amd/amdgpu/mes_v11_0_userqueue.c b/drivers/gpu/drm/amd/amdgpu/mes_v11_0_userqueue.c
+index bcfa0d1ef7bf..dc5359742774 100644
+--- a/drivers/gpu/drm/amd/amdgpu/mes_v11_0_userqueue.c
++++ b/drivers/gpu/drm/amd/amdgpu/mes_v11_0_userqueue.c
+@@ -206,6 +206,24 @@ static int mes_v11_0_userq_create_ctx_space(struct amdgpu_userq_mgr *uq_mgr,
+ 		mqd->fw_work_area_base_lo = mqd_gfx_v11->csa_va & 0xFFFFFFFC;
+ 		mqd->fw_work_area_base_hi = upper_32_bits(mqd_gfx_v11->csa_va);
+ 		kfree(mqd_gfx_v11);
++	} else if (mqd_user->ip_type == AMDGPU_HW_IP_DMA) {
++		struct v11_sdma_mqd *mqd = queue->mqd.cpu_ptr;
++		struct drm_amdgpu_userq_mqd_sdma_gfx11 *mqd_sdma_v11;
++
++		if (mqd_user->mqd_size != sizeof(*mqd_sdma_v11) || !mqd_user->mqd) {
++			DRM_ERROR("Invalid SDMA MQD\n");
++			return -EINVAL;
++		}
++
++		mqd_sdma_v11 = memdup_user(u64_to_user_ptr(mqd_user->mqd), mqd_user->mqd_size);
++		if (IS_ERR(mqd_sdma_v11)) {
++			DRM_ERROR("Failed to read sdma user MQD\n");
++			amdgpu_userqueue_destroy_object(uq_mgr, ctx);
++			return -ENOMEM;
++		}
++
++		mqd->sdmax_rlcx_csa_addr_lo = mqd_sdma_v11->csa_va & 0xFFFFFFFC;
++		mqd->sdmax_rlcx_csa_addr_hi = upper_32_bits(mqd_sdma_v11->csa_va);
+ 	}
+ 
+ 	return 0;
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v6_0.c b/drivers/gpu/drm/amd/amdgpu/sdma_v6_0.c
+index c214c3d2149b..f163b253c200 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v6_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v6_0.c
+@@ -43,6 +43,7 @@
+ #include "sdma_common.h"
+ #include "sdma_v6_0.h"
+ #include "v11_structs.h"
++#include "mes_v11_0_userqueue.h"
+ 
+ MODULE_FIRMWARE("amdgpu/sdma_6_0_0.bin");
+ MODULE_FIRMWARE("amdgpu/sdma_6_0_1.bin");
+@@ -1376,6 +1377,8 @@ static int sdma_v6_0_sw_init(struct amdgpu_ip_block *ip_block)
+ 	else
+ 		DRM_ERROR("Failed to allocated memory for SDMA IP Dump\n");
+ 
++	adev->userq_funcs[AMDGPU_HW_IP_DMA] = &userq_mes_v11_0_funcs;
++
+ 	r = amdgpu_sdma_sysfs_reset_mask_init(adev);
+ 	if (r)
+ 		return r;
+diff --git a/include/uapi/drm/amdgpu_drm.h b/include/uapi/drm/amdgpu_drm.h
+index 4e07e15d5076..6ae988574084 100644
+--- a/include/uapi/drm/amdgpu_drm.h
++++ b/include/uapi/drm/amdgpu_drm.h
+@@ -428,6 +428,16 @@ struct drm_amdgpu_userq_mqd_gfx11 {
+ 	__u64   csa_va;
+ };
+ 
++/* GFX V11 SDMA IP specific MQD parameters */
++struct drm_amdgpu_userq_mqd_sdma_gfx11 {
++	/**
++	 * @csa_va: Virtual address of the GPU memory to hold the CSA buffer.
++	 * This must be a from a separate GPU object, and use AMDGPU_INFO IOCTL
++	 * to get the size.
++	 */
++	__u64   csa_va;
++};
++
+ /* vm ioctl */
+ #define AMDGPU_VM_OP_RESERVE_VMID	1
+ #define AMDGPU_VM_OP_UNRESERVE_VMID	2
+-- 
+2.52.0
+
