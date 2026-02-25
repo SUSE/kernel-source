@@ -1,0 +1,98 @@
+From 5c3e7c49538e2ddad10296a318c225bbb3d37d20 Mon Sep 17 00:00:00 2001
+From: "Jesse.zhang@amd.com" <Jesse.zhang@amd.com>
+Date: Fri, 11 Apr 2025 15:26:18 +0800
+Subject: drm/amdgpu: Implement SDMA soft reset directly for v5.x
+Git-commit: 5c3e7c49538e2ddad10296a318c225bbb3d37d20
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+This patch introduces a new function `amdgpu_sdma_soft_reset` to handle SDMA soft resets directly,
+rather than relying on the DPM interface.
+
+1. **New `amdgpu_sdma_soft_reset` Function**:
+   - Implements a soft reset for SDMA engines by directly writing to the hardware registers.
+   - Handles SDMA versions 4.x and 5.x separately:
+     - For SDMA 4.x, the existing `amdgpu_dpm_reset_sdma` function is used for backward compatibility.
+     - For SDMA 5.x, the driver directly manipulates the `GRBM_SOFT_RESET` register to reset the specified SDMA instance.
+
+2. **Integration into `amdgpu_sdma_reset_engine`**:
+   - The `amdgpu_sdma_soft_reset` function is called during the SDMA reset process, replacing the previous call to `amdgpu_dpm_reset_sdma`.
+
+V2: r should default to an error (Alex)
+
+Suggested-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Jesse Zhang <jesse.zhang@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.c | 38 +++++++++++++++++++++++-
+ 1 file changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.c
+index 7139d574c23e..f456a5a12bb7 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.c
+@@ -26,6 +26,8 @@
+ #include "amdgpu_sdma.h"
+ #include "amdgpu_ras.h"
+ #include "amdgpu_reset.h"
++#include "gc/gc_10_1_0_offset.h"
++#include "gc/gc_10_3_0_sh_mask.h"
+ 
+ #define AMDGPU_CSA_SDMA_SIZE 64
+ /* SDMA CSA reside in the 3rd page of CSA */
+@@ -554,6 +556,40 @@ void amdgpu_sdma_register_on_reset_callbacks(struct amdgpu_device *adev, struct
+ 	list_add_tail(&funcs->list, &adev->sdma.reset_callback_list);
+ }
+ 
++static int amdgpu_sdma_soft_reset(struct amdgpu_device *adev, u32 instance_id)
++{
++	struct amdgpu_sdma_instance *sdma_instance = &adev->sdma.instance[instance_id];
++	int r = -EOPNOTSUPP;
++
++	switch (amdgpu_ip_version(adev, SDMA0_HWIP, 0)) {
++	case IP_VERSION(4, 4, 2):
++	case IP_VERSION(4, 4, 4):
++	case IP_VERSION(4, 4, 5):
++		/* For SDMA 4.x, use the existing DPM interface for backward compatibility */
++		r = amdgpu_dpm_reset_sdma(adev, 1 << instance_id);
++		break;
++	case IP_VERSION(5, 0, 0):
++	case IP_VERSION(5, 0, 1):
++	case IP_VERSION(5, 0, 2):
++	case IP_VERSION(5, 0, 5):
++	case IP_VERSION(5, 2, 0):
++	case IP_VERSION(5, 2, 2):
++	case IP_VERSION(5, 2, 4):
++	case IP_VERSION(5, 2, 5):
++	case IP_VERSION(5, 2, 6):
++	case IP_VERSION(5, 2, 3):
++	case IP_VERSION(5, 2, 1):
++	case IP_VERSION(5, 2, 7):
++		if (sdma_instance->funcs->soft_reset_kernel_queue)
++			r = sdma_instance->funcs->soft_reset_kernel_queue(adev, instance_id);
++		break;
++	default:
++		break;
++	}
++
++	return r;
++}
++
+ /**
+  * amdgpu_sdma_reset_engine - Reset a specific SDMA engine
+  * @adev: Pointer to the AMDGPU device
+@@ -588,7 +624,7 @@ int amdgpu_sdma_reset_engine(struct amdgpu_device *adev, uint32_t instance_id)
+ 		sdma_instance->funcs->stop_kernel_queue(gfx_ring);
+ 
+ 	/* Perform the SDMA reset for the specified instance */
+-	ret = amdgpu_dpm_reset_sdma(adev, 1 << instance_id);
++	ret = amdgpu_sdma_soft_reset(adev, instance_id);
+ 	if (ret) {
+ 		dev_err(adev->dev, "Failed to reset SDMA instance %u\n", instance_id);
+ 		goto exit;
+-- 
+2.52.0
+
