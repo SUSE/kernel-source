@@ -1,0 +1,88 @@
+From 29c09cf200f736138707857696d1f6db2db0299b Mon Sep 17 00:00:00 2001
+From: Imre Deak <imre.deak@intel.com>
+Date: Wed, 5 Mar 2025 13:48:20 +0200
+Subject: drm/i915/dp: Queue a link check after link training is complete
+Git-commit: 29c09cf200f736138707857696d1f6db2db0299b
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+After link training - both in case of a passing and failing LT result -
+a work is scheduled to check the link state. This check should take
+place after the link training is completed by disabling the link
+training pattern and setting intel_dp::link_trained=true. Atm, the work
+is scheduled before these steps, which may result in checking the link
+state too early (and thus not retraining the link as expected).
+
+Fix the above by scheduling the link check work after link training is
+complete.
+
+V2: 
+- Add MAX_SEQ_TRAIN_FAILURES instead of open-coding it. (Jani)
+
+Reviewed-by: Jani Nikula <jani.nikula@intel.com>
+Signed-off-by: Imre Deak <imre.deak@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250305114820.3523077-2-imre.deak@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../gpu/drm/i915/display/intel_dp_link_training.c | 15 +++++++++++----
+ 1 file changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_dp_link_training.c b/drivers/gpu/drm/i915/display/intel_dp_link_training.c
+index 3906c11acc96..384eb615caf6 100644
+--- a/drivers/gpu/drm/i915/display/intel_dp_link_training.c
++++ b/drivers/gpu/drm/i915/display/intel_dp_link_training.c
+@@ -56,6 +56,8 @@
+ 		lt_dbg(_intel_dp, _dp_phy, "Sink disconnected: " _format, ## __VA_ARGS__); \
+ } while (0)
+ 
++#define MAX_SEQ_TRAIN_FAILURES 2
++
+ static void intel_dp_reset_lttpr_common_caps(struct intel_dp *intel_dp)
+ {
+ 	memset(intel_dp->lttpr_common_caps, 0, sizeof(intel_dp->lttpr_common_caps));
+@@ -1110,6 +1112,7 @@ intel_dp_128b132b_intra_hop(struct intel_dp *intel_dp,
+ void intel_dp_stop_link_train(struct intel_dp *intel_dp,
+ 			      const struct intel_crtc_state *crtc_state)
+ {
++	struct intel_display *display = to_intel_display(intel_dp);
+ 	struct intel_encoder *encoder = &dp_to_dig_port(intel_dp)->base;
+ 
+ 	intel_dp->link_trained = true;
+@@ -1124,6 +1127,13 @@ void intel_dp_stop_link_train(struct intel_dp *intel_dp,
+ 	}
+ 
+ 	intel_hpd_unblock(encoder);
++
++	if (!display->hotplug.ignore_long_hpd &&
++	    intel_dp->link.seq_train_failures < MAX_SEQ_TRAIN_FAILURES) {
++		int delay_ms = intel_dp->link.seq_train_failures ? 0 : 2000;
++
++		intel_encoder_link_check_queue_work(encoder, delay_ms);
++	}
+ }
+ 
+ static bool
+@@ -1628,7 +1638,6 @@ void intel_dp_start_link_train(struct intel_atomic_state *state,
+ 		lt_dbg(intel_dp, DP_PHY_DPRX, "Forcing link training failure\n");
+ 	} else if (passed) {
+ 		intel_dp->link.seq_train_failures = 0;
+-		intel_encoder_link_check_queue_work(encoder, 2000);
+ 		return;
+ 	}
+ 
+@@ -1651,10 +1660,8 @@ void intel_dp_start_link_train(struct intel_atomic_state *state,
+ 		return;
+ 	}
+ 
+-	if (intel_dp->link.seq_train_failures < 2) {
+-		intel_encoder_link_check_queue_work(encoder, 0);
++	if (intel_dp->link.seq_train_failures < MAX_SEQ_TRAIN_FAILURES)
+ 		return;
+-	}
+ 
+ 	if (intel_dp_schedule_fallback_link_training(state, intel_dp, crtc_state))
+ 		return;
+-- 
+2.52.0
+
