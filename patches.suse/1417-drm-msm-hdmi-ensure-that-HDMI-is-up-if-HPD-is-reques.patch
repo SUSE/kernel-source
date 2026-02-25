@@ -1,0 +1,122 @@
+From b93f19d8d03a9455aef88664c649e86140fe1430 Mon Sep 17 00:00:00 2001
+From: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Date: Mon, 5 May 2025 03:14:56 +0300
+Subject: drm/msm/hdmi: ensure that HDMI is up if HPD is requested
+Git-commit: b93f19d8d03a9455aef88664c649e86140fe1430
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+The HDMI block needs to be enabled to properly generate HPD events. Make
+sure it is not turned off in the disable paths if HPD delivery is enabled.
+
+Reviewed-by: Jessica Zhang <quic_jesszhan@quicinc.com>
+Signed-off-by: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Patchwork: https://patchwork.freedesktop.org/patch/651722/
+Link: https://lore.kernel.org/r/20250505-fd-hdmi-hpd-v5-12-48541f76318c@oss.qualcomm.com
+Signed-off-by: Dmitry Baryshkov <dmitry.baryshkov@oss.qualcomm.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/msm/hdmi/hdmi.c        | 1 +
+ drivers/gpu/drm/msm/hdmi/hdmi.h        | 2 ++
+ drivers/gpu/drm/msm/hdmi/hdmi_bridge.c | 8 +++++++-
+ drivers/gpu/drm/msm/hdmi/hdmi_hpd.c    | 9 ++++++++-
+ 4 files changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/hdmi/hdmi.c b/drivers/gpu/drm/msm/hdmi/hdmi.c
+index 34e1ef32ae64..48da532aba7c 100644
+--- a/drivers/gpu/drm/msm/hdmi/hdmi.c
++++ b/drivers/gpu/drm/msm/hdmi/hdmi.c
+@@ -293,6 +293,7 @@ static int msm_hdmi_dev_probe(struct platform_device *pdev)
+ 	hdmi->pdev = pdev;
+ 	hdmi->config = config;
+ 	spin_lock_init(&hdmi->reg_lock);
++	mutex_init(&hdmi->state_mutex);
+ 
+ 	ret = drm_of_find_panel_or_bridge(pdev->dev.of_node, 1, 0, NULL, &hdmi->next_bridge);
+ 	if (ret && ret != -ENODEV)
+diff --git a/drivers/gpu/drm/msm/hdmi/hdmi.h b/drivers/gpu/drm/msm/hdmi/hdmi.h
+index fb64652162b6..e488ee31cc86 100644
+--- a/drivers/gpu/drm/msm/hdmi/hdmi.h
++++ b/drivers/gpu/drm/msm/hdmi/hdmi.h
+@@ -41,6 +41,8 @@ struct hdmi {
+ 
+ 	/* video state: */
+ 	bool power_on;
++	bool hpd_enabled;
++	struct mutex state_mutex; /* protects two booleans */
+ 	unsigned long int pixclock;
+ 
+ 	void __iomem *mmio;
+diff --git a/drivers/gpu/drm/msm/hdmi/hdmi_bridge.c b/drivers/gpu/drm/msm/hdmi/hdmi_bridge.c
+index 665c5e1323d0..8ff0079abc80 100644
+--- a/drivers/gpu/drm/msm/hdmi/hdmi_bridge.c
++++ b/drivers/gpu/drm/msm/hdmi/hdmi_bridge.c
+@@ -302,11 +302,13 @@ static void msm_hdmi_bridge_atomic_pre_enable(struct drm_bridge *bridge,
+ 
+ 	msm_hdmi_set_timings(hdmi, &crtc_state->adjusted_mode);
+ 
++	mutex_lock(&hdmi->state_mutex);
+ 	if (!hdmi->power_on) {
+ 		msm_hdmi_phy_resource_enable(phy);
+ 		msm_hdmi_power_on(bridge);
+ 		hdmi->power_on = true;
+ 	}
++	mutex_unlock(&hdmi->state_mutex);
+ 
+ 	if (connector->display_info.is_hdmi)
+ 		msm_hdmi_audio_update(hdmi);
+@@ -332,7 +334,10 @@ static void msm_hdmi_bridge_atomic_post_disable(struct drm_bridge *bridge,
+ 		msm_hdmi_hdcp_off(hdmi->hdcp_ctrl);
+ 
+ 	DBG("power down");
+-	msm_hdmi_set_mode(hdmi, false);
++
++	/* Keep the HDMI enabled if the HPD is enabled */
++	mutex_lock(&hdmi->state_mutex);
++	msm_hdmi_set_mode(hdmi, hdmi->hpd_enabled);
+ 
+ 	msm_hdmi_phy_powerdown(phy);
+ 
+@@ -343,6 +348,7 @@ static void msm_hdmi_bridge_atomic_post_disable(struct drm_bridge *bridge,
+ 			msm_hdmi_audio_update(hdmi);
+ 		msm_hdmi_phy_resource_disable(phy);
+ 	}
++	mutex_unlock(&hdmi->state_mutex);
+ }
+ 
+ static void msm_hdmi_set_timings(struct hdmi *hdmi,
+diff --git a/drivers/gpu/drm/msm/hdmi/hdmi_hpd.c b/drivers/gpu/drm/msm/hdmi/hdmi_hpd.c
+index a42ed26a5b7c..e03d0ca230e6 100644
+--- a/drivers/gpu/drm/msm/hdmi/hdmi_hpd.c
++++ b/drivers/gpu/drm/msm/hdmi/hdmi_hpd.c
+@@ -76,10 +76,14 @@ int msm_hdmi_hpd_enable(struct drm_bridge *bridge)
+ 	if (ret)
+ 		return ret;
+ 
++	mutex_lock(&hdmi->state_mutex);
+ 	msm_hdmi_set_mode(hdmi, false);
+ 	msm_hdmi_phy_reset(hdmi);
+ 	msm_hdmi_set_mode(hdmi, true);
+ 
++	hdmi->hpd_enabled = true;
++	mutex_unlock(&hdmi->state_mutex);
++
+ 	hdmi_write(hdmi, REG_HDMI_USEC_REFTIMER, 0x0001001b);
+ 
+ 	/* enable HPD events: */
+@@ -109,7 +113,10 @@ void msm_hdmi_hpd_disable(struct hdmi *hdmi)
+ 	/* Disable HPD interrupt */
+ 	hdmi_write(hdmi, REG_HDMI_HPD_INT_CTRL, 0);
+ 
+-	msm_hdmi_set_mode(hdmi, false);
++	mutex_lock(&hdmi->state_mutex);
++	hdmi->hpd_enabled = false;
++	msm_hdmi_set_mode(hdmi, hdmi->power_on);
++	mutex_unlock(&hdmi->state_mutex);
+ 
+ 	pm_runtime_put(dev);
+ }
+-- 
+2.52.0
+
