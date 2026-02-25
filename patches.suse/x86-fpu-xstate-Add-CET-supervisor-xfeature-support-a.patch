@@ -1,0 +1,154 @@
+From: Yang Weijiang <weijiang.yang@intel.com>
+Date: Thu, 22 May 2025 08:10:09 -0700
+Subject: x86/fpu/xstate: Add CET supervisor xfeature support as a guest-only
+ feature
+Patch-mainline: v6.17-rc1
+Git-commit: 8b05b3c988162ca117b3854ae7d497927b415299
+References: jsc#PED-15123
+
+== Background ==
+
+CET defines two register states: CET user, which includes user-mode control
+registers, and CET supervisor, which consists of shadow-stack pointers for
+privilege levels 0-2.
+
+Current kernels disable shadow stacks in kernel mode, making the CET
+supervisor state unused and eliminating the need for context switching.
+
+== Problem ==
+
+To virtualize CET for guests, KVM must accurately emulate hardware
+behavior. A key challenge arises because there is no CPUID flag to indicate
+that shadow stack is supported only in user mode. Therefore, KVM cannot
+assume guests will not enable shadow stacks in kernel mode and must
+preserve the CET supervisor state of vCPUs.
+
+== Solution ==
+
+An initial proposal to manually save and restore CET supervisor states
+using raw RDMSR/WRMSR in KVM was rejected due to performance concerns and
+its impact on KVM's ABI. Instead, leveraging the kernel's FPU
+infrastructure for context switching was favored [1].
+
+The main question then became whether to enable the CET supervisor state
+globally for all processes or restrict it to vCPU processes. This decision
+involves a trade-off between a 24-byte XSTATE buffer waste for all non-vCPU
+processes and approximately 100 lines of code complexity in the kernel [2].
+The agreed approach is to first try this optimal solution [3], i.e.,
+restricting the CET supervisor state to guest FPUs only and eliminating
+unnecessary space waste.
+
+The guest-only xfeature infrastructure has already been added. Now,
+introduce CET supervisor xstate support as the first guest-only feature
+to prepare for the upcoming CET virtualization in KVM.
+
+Signed-off-by: Yang Weijiang <weijiang.yang@intel.com>
+Signed-off-by: Chao Gao <chao.gao@intel.com>
+Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+Reviewed-by: Rick Edgecombe <rick.p.edgecombe@intel.com>
+Reviewed-by: Maxim Levitsky <mlevitsk@redhat.com>
+Reviewed-by: John Allen <john.allen@amd.com>
+Link: https://lore.kernel.org/kvm/ZM1jV3UPL0AMpVDI@google.com/ [1]
+Link: https://lore.kernel.org/kvm/1c2fd06e-2e97-4724-80ab-8695aa4334e7@intel.com/ [2]
+Link: https://lore.kernel.org/kvm/2597a87b-1248-b8ce-ce60-94074bc67ea4@intel.com/ [3]
+Link: https://lore.kernel.org/all/20250522151031.426788-7-chao.gao%40intel.com
+Acked-by: Carlos López <clopez@suse.de>
+---
+ arch/x86/include/asm/fpu/types.h  |   14 ++++++++++++--
+ arch/x86/include/asm/fpu/xstate.h |    5 ++---
+ arch/x86/kernel/fpu/xstate.c      |    5 ++++-
+ 3 files changed, 18 insertions(+), 6 deletions(-)
+
+--- a/arch/x86/include/asm/fpu/types.h
++++ b/arch/x86/include/asm/fpu/types.h
+@@ -118,7 +118,7 @@ enum xfeature {
+ 	XFEATURE_PKRU,
+ 	XFEATURE_PASID,
+ 	XFEATURE_CET_USER,
+-	XFEATURE_CET_KERNEL_UNUSED,
++	XFEATURE_CET_KERNEL,
+ 	XFEATURE_RSRVD_COMP_13,
+ 	XFEATURE_RSRVD_COMP_14,
+ 	XFEATURE_LBR,
+@@ -142,7 +142,7 @@ enum xfeature {
+ #define XFEATURE_MASK_PKRU		(1 << XFEATURE_PKRU)
+ #define XFEATURE_MASK_PASID		(1 << XFEATURE_PASID)
+ #define XFEATURE_MASK_CET_USER		(1 << XFEATURE_CET_USER)
+-#define XFEATURE_MASK_CET_KERNEL	(1 << XFEATURE_CET_KERNEL_UNUSED)
++#define XFEATURE_MASK_CET_KERNEL	(1 << XFEATURE_CET_KERNEL)
+ #define XFEATURE_MASK_LBR		(1 << XFEATURE_LBR)
+ #define XFEATURE_MASK_XTILE_CFG		(1 << XFEATURE_XTILE_CFG)
+ #define XFEATURE_MASK_XTILE_DATA	(1 << XFEATURE_XTILE_DATA)
+@@ -269,6 +269,16 @@ struct cet_user_state {
+ };
+ 
+ /*
++ * State component 12 is Control-flow Enforcement supervisor states.
++ * This state includes SSP pointers for privilege levels 0 through 2.
++ */
++struct cet_supervisor_state {
++	u64 pl0_ssp;
++	u64 pl1_ssp;
++	u64 pl2_ssp;
++} __packed;
++
++/*
+  * State component 15: Architectural LBR configuration state.
+  * The size of Arch LBR state depends on the number of LBRs (lbr_depth).
+  */
+--- a/arch/x86/include/asm/fpu/xstate.h
++++ b/arch/x86/include/asm/fpu/xstate.h
+@@ -51,7 +51,7 @@
+ #define XFEATURE_MASK_USER_DYNAMIC	XFEATURE_MASK_XTILE_DATA
+ 
+ /* Supervisor features which are enabled only in guest FPUs */
+-#define XFEATURE_MASK_GUEST_SUPERVISOR	0
++#define XFEATURE_MASK_GUEST_SUPERVISOR	XFEATURE_MASK_CET_KERNEL
+ 
+ /* All currently supported supervisor features */
+ #define XFEATURE_MASK_SUPERVISOR_SUPPORTED (XFEATURE_MASK_PASID | \
+@@ -83,8 +83,7 @@
+  * Unsupported supervisor features. When a supervisor feature in this mask is
+  * supported in the future, move it to the supported supervisor feature mask.
+  */
+-#define XFEATURE_MASK_SUPERVISOR_UNSUPPORTED (XFEATURE_MASK_PT | \
+-					      XFEATURE_MASK_CET_KERNEL)
++#define XFEATURE_MASK_SUPERVISOR_UNSUPPORTED (XFEATURE_MASK_PT)
+ 
+ /* All supervisor states including supported and unsupported states. */
+ #define XFEATURE_MASK_SUPERVISOR_ALL (XFEATURE_MASK_SUPERVISOR_SUPPORTED | \
+--- a/arch/x86/kernel/fpu/xstate.c
++++ b/arch/x86/kernel/fpu/xstate.c
+@@ -54,7 +54,7 @@ static const char *xfeature_names[] =
+ 	"Protection Keys User registers",
+ 	"PASID state",
+ 	"Control-flow User registers",
+-	"Control-flow Kernel registers (unused)",
++	"Control-flow Kernel registers (KVM only)",
+ 	"unknown xstate feature",
+ 	"unknown xstate feature",
+ 	"unknown xstate feature",
+@@ -78,6 +78,7 @@ static unsigned short xsave_cpuid_featur
+ 	[XFEATURE_PKRU]				= X86_FEATURE_OSPKE,
+ 	[XFEATURE_PASID]			= X86_FEATURE_ENQCMD,
+ 	[XFEATURE_CET_USER]			= X86_FEATURE_SHSTK,
++	[XFEATURE_CET_KERNEL]			= X86_FEATURE_SHSTK,
+ 	[XFEATURE_XTILE_CFG]			= X86_FEATURE_AMX_TILE,
+ 	[XFEATURE_XTILE_DATA]			= X86_FEATURE_AMX_TILE,
+ 	[XFEATURE_APX]				= X86_FEATURE_APX,
+@@ -353,6 +354,7 @@ static __init void os_xrstor_booting(str
+ 	 XFEATURE_MASK_BNDCSR |			\
+ 	 XFEATURE_MASK_PASID |			\
+ 	 XFEATURE_MASK_CET_USER |		\
++	 XFEATURE_MASK_CET_KERNEL |		\
+ 	 XFEATURE_MASK_XTILE |			\
+ 	 XFEATURE_MASK_APX)
+ 
+@@ -554,6 +556,7 @@ static bool __init check_xstate_against_
+ 	case XFEATURE_PASID:	  return XCHECK_SZ(sz, nr, struct ia32_pasid_state);
+ 	case XFEATURE_XTILE_CFG:  return XCHECK_SZ(sz, nr, struct xtile_cfg);
+ 	case XFEATURE_CET_USER:	  return XCHECK_SZ(sz, nr, struct cet_user_state);
++	case XFEATURE_CET_KERNEL: return XCHECK_SZ(sz, nr, struct cet_supervisor_state);
+ 	case XFEATURE_APX:        return XCHECK_SZ(sz, nr, struct apx_state);
+ 	case XFEATURE_XTILE_DATA: check_xtile_data_against_struct(sz); return true;
+ 	default:
