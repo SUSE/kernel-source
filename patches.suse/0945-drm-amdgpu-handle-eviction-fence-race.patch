@@ -1,0 +1,148 @@
+From b8e6d3f68c3bd1ac54492e210ece87475e7f862b Mon Sep 17 00:00:00 2001
+From: Shashank Sharma <shashank.sharma@amd.com>
+Date: Wed, 20 Nov 2024 18:04:33 +0100
+Subject: drm/amdgpu: handle eviction fence race
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: b8e6d3f68c3bd1ac54492e210ece87475e7f862b
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+The eviction process can get into a race condition between the eviction
+fence suspend work (which replaces the old fence with new) and kms_close
+(which destroys the fence and doesn't expect a new one).
+
+This patch:
+- adds a flag to indicate that fd is closing, so fence replacement is
+  not required (evf_mgr->fd_closing)
+- adds a flush_work() during the ev_fence_destroy routine
+
+V2: Addressed review comments from Christian:
+    - Do not use mutex to sync
+    - Use flush_work and wait for suspend_work to be done
+
+V3: Fixed state machine for queue->active, which adds into race between
+    suspend/resume and queue ops
+
+Cc: Alex Deucher <alexander.deucher@amd.com>
+Cc: Christian König <christian.koenig@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Shashank Sharma <shashank.sharma@amd.com>
+Signed-off-by: Arvind Yadav <arvind.yadav@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_eviction_fence.c | 7 +++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c            | 4 +++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c      | 3 ++-
+ drivers/gpu/drm/amd/amdgpu/mes_v11_0_userqueue.c   | 9 +++++----
+ 4 files changed, 17 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_eviction_fence.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_eviction_fence.c
+index 189afb872775..c22767a75348 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_eviction_fence.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_eviction_fence.c
+@@ -117,6 +117,10 @@ amdgpu_eviction_fence_suspend_worker(struct work_struct *work)
+ 	/* Signal old eviction fence */
+ 	amdgpu_eviction_fence_signal(evf_mgr);
+ 
++	/* Do not replace eviction fence is fd is getting closed */
++	if (evf_mgr->fd_closing)
++		return;
++
+ 	/* Prepare the objects to replace eviction fence */
+ 	drm_exec_init(&exec, DRM_EXEC_IGNORE_DUPLICATES, 0);
+ 	drm_exec_until_all_locked(&exec) {
+@@ -199,6 +203,9 @@ void amdgpu_eviction_fence_destroy(struct amdgpu_eviction_fence_mgr *evf_mgr)
+ {
+ 	struct amdgpu_eviction_fence *ev_fence;
+ 
++	/* Wait for any pending work to execute */
++	flush_delayed_work(&evf_mgr->suspend_work);
++
+ 	spin_lock(&evf_mgr->ev_fence_lock);
+ 	ev_fence = evf_mgr->ev_fence;
+ 	spin_unlock(&evf_mgr->ev_fence_lock);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+index 700442584f97..f8370da08038 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+@@ -1490,10 +1490,12 @@ void amdgpu_driver_postclose_kms(struct drm_device *dev,
+ 		amdgpu_bo_unreserve(pd);
+ 	}
+ 
++	fpriv->evf_mgr.fd_closing = true;
++	amdgpu_userq_mgr_fini(&fpriv->userq_mgr);
+ 	amdgpu_eviction_fence_destroy(&fpriv->evf_mgr);
++
+ 	amdgpu_ctx_mgr_fini(&fpriv->ctx_mgr);
+ 	amdgpu_vm_fini(adev, &fpriv->vm);
+-	amdgpu_userq_mgr_fini(&fpriv->userq_mgr);
+ 
+ 	if (pasid)
+ 		amdgpu_pasid_free_delayed(pd->tbo.base.resv, pasid);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c
+index 57e502d014a1..cba51bdf2e2c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c
+@@ -614,9 +614,10 @@ void amdgpu_userq_mgr_fini(struct amdgpu_userq_mgr *userq_mgr)
+ 
+ 	cancel_delayed_work(&userq_mgr->resume_work);
+ 
++	mutex_lock(&userq_mgr->userq_mutex);
+ 	idr_for_each_entry(&userq_mgr->userq_idr, queue, queue_id)
+ 		amdgpu_userqueue_cleanup(userq_mgr, queue, queue_id);
+-
+ 	idr_destroy(&userq_mgr->userq_idr);
++	mutex_unlock(&userq_mgr->userq_mutex);
+ 	mutex_destroy(&userq_mgr->userq_mutex);
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/mes_v11_0_userqueue.c b/drivers/gpu/drm/amd/amdgpu/mes_v11_0_userqueue.c
+index ee0a757fcfa3..b1b7bc47d39f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/mes_v11_0_userqueue.c
++++ b/drivers/gpu/drm/amd/amdgpu/mes_v11_0_userqueue.c
+@@ -139,6 +139,7 @@ static int mes_v11_0_userq_map(struct amdgpu_userq_mgr *uq_mgr,
+ 		return r;
+ 	}
+ 
++	queue->queue_active = true;
+ 	DRM_DEBUG_DRIVER("Queue (doorbell:%d) mapped successfully\n", userq_props->doorbell_index);
+ 	return 0;
+ }
+@@ -160,6 +161,7 @@ static void mes_v11_0_userq_unmap(struct amdgpu_userq_mgr *uq_mgr,
+ 	amdgpu_mes_unlock(&adev->mes);
+ 	if (r)
+ 		DRM_ERROR("Failed to unmap queue in HW, err (%d)\n", r);
++	queue->queue_active = false;
+ }
+ 
+ static int mes_v11_0_userq_create_ctx_space(struct amdgpu_userq_mgr *uq_mgr,
+@@ -331,7 +333,6 @@ static int mes_v11_0_userq_mqd_create(struct amdgpu_userq_mgr *uq_mgr,
+ 		goto free_ctx;
+ 	}
+ 
+-	queue->queue_active = true;
+ 	return 0;
+ 
+ free_ctx:
+@@ -350,12 +351,12 @@ static void
+ mes_v11_0_userq_mqd_destroy(struct amdgpu_userq_mgr *uq_mgr,
+ 			    struct amdgpu_usermode_queue *queue)
+ {
+-	mes_v11_0_userq_unmap(uq_mgr, queue);
+-	amdgpu_bo_unref(&queue->wptr_obj.obj);
++	if (queue->queue_active)
++		mes_v11_0_userq_unmap(uq_mgr, queue);
++
+ 	amdgpu_userqueue_destroy_object(uq_mgr, &queue->fw_obj);
+ 	kfree(queue->userq_prop);
+ 	amdgpu_userqueue_destroy_object(uq_mgr, &queue->mqd);
+-	queue->queue_active = false;
+ }
+ 
+ static int mes_v11_0_userq_suspend(struct amdgpu_userq_mgr *uq_mgr,
+-- 
+2.52.0
+
