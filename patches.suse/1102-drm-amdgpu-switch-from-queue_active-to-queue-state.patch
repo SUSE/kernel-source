@@ -1,0 +1,332 @@
+From e67b95f0cd5e8dd57a9df5d5d15da6ba7847808a Mon Sep 17 00:00:00 2001
+From: Alex Deucher <alexander.deucher@amd.com>
+Date: Sat, 12 Apr 2025 12:59:38 -0400
+Subject: drm/amdgpu: switch from queue_active to queue state
+Git-commit: e67b95f0cd5e8dd57a9df5d5d15da6ba7847808a
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Track the state of the queue rather than simple active vs
+not.  This is needed for other states (hung, preempted, etc.).
+While we are at it, move the state tracking into the user
+queue front end code.
+
+Reviewed-by: Prike Liang <Prike.Liang@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c | 101 ++++++++++++------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.h |   9 +-
+ drivers/gpu/drm/amd/amdgpu/mes_userqueue.c    |   8 --
+ 3 files changed, 77 insertions(+), 41 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c
+index 17bf2d568ae2..712fd34740a0 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c
+@@ -44,6 +44,45 @@ u32 amdgpu_userqueue_get_supported_ip_mask(struct amdgpu_device *adev)
+ 	return userq_ip_mask;
+ }
+ 
++static int
++amdgpu_userqueue_unmap_helper(struct amdgpu_userq_mgr *uq_mgr,
++			      struct amdgpu_usermode_queue *queue)
++{
++	struct amdgpu_device *adev = uq_mgr->adev;
++	const struct amdgpu_userq_funcs *userq_funcs =
++		adev->userq_funcs[queue->queue_type];
++	int r = 0;
++
++	if (queue->state == AMDGPU_USERQ_STATE_MAPPED) {
++		r = userq_funcs->unmap(uq_mgr, queue);
++		if (r)
++			queue->state = AMDGPU_USERQ_STATE_HUNG;
++		else
++			queue->state = AMDGPU_USERQ_STATE_UNMAPPED;
++	}
++	return r;
++}
++
++static int
++amdgpu_userqueue_map_helper(struct amdgpu_userq_mgr *uq_mgr,
++			    struct amdgpu_usermode_queue *queue)
++{
++	struct amdgpu_device *adev = uq_mgr->adev;
++	const struct amdgpu_userq_funcs *userq_funcs =
++		adev->userq_funcs[queue->queue_type];
++	int r = 0;
++
++	if (queue->state == AMDGPU_USERQ_STATE_UNMAPPED) {
++		r = userq_funcs->map(uq_mgr, queue);
++		if (r) {
++			queue->state = AMDGPU_USERQ_STATE_HUNG;
++		} else {
++			queue->state = AMDGPU_USERQ_STATE_MAPPED;
++		}
++	}
++	return r;
++}
++
+ static void
+ amdgpu_userqueue_cleanup(struct amdgpu_userq_mgr *uq_mgr,
+ 			 struct amdgpu_usermode_queue *queue,
+@@ -79,7 +118,7 @@ amdgpu_userqueue_active(struct amdgpu_userq_mgr *uq_mgr)
+ 	mutex_lock(&uq_mgr->userq_mutex);
+ 	/* Resume all the queues for this process */
+ 	idr_for_each_entry(&uq_mgr->userq_idr, queue, queue_id)
+-		ret += queue->queue_active;
++		ret += queue->state == AMDGPU_USERQ_STATE_MAPPED;
+ 
+ 	mutex_unlock(&uq_mgr->userq_mutex);
+ 	return ret;
+@@ -254,9 +293,8 @@ amdgpu_userqueue_destroy(struct drm_file *filp, int queue_id)
+ 	struct amdgpu_fpriv *fpriv = filp->driver_priv;
+ 	struct amdgpu_userq_mgr *uq_mgr = &fpriv->userq_mgr;
+ 	struct amdgpu_device *adev = uq_mgr->adev;
+-	const struct amdgpu_userq_funcs *uq_funcs;
+ 	struct amdgpu_usermode_queue *queue;
+-	int r;
++	int r = 0;
+ 
+ 	cancel_delayed_work(&uq_mgr->resume_work);
+ 	mutex_lock(&uq_mgr->userq_mutex);
+@@ -267,8 +305,7 @@ amdgpu_userqueue_destroy(struct drm_file *filp, int queue_id)
+ 		mutex_unlock(&uq_mgr->userq_mutex);
+ 		return -EINVAL;
+ 	}
+-	uq_funcs = adev->userq_funcs[queue->queue_type];
+-	r = uq_funcs->unmap(uq_mgr, queue);
++	r = amdgpu_userqueue_unmap_helper(uq_mgr, queue);
+ 	amdgpu_bo_unpin(queue->db_obj.obj);
+ 	amdgpu_bo_unref(&queue->db_obj.obj);
+ 	amdgpu_userqueue_cleanup(uq_mgr, queue, queue_id);
+@@ -414,7 +451,7 @@ amdgpu_userqueue_create(struct drm_file *filp, union drm_amdgpu_userq *args)
+ 	else
+ 		skip_map_queue = false;
+ 	if (!skip_map_queue) {
+-		r = uq_funcs->map(uq_mgr, queue);
++		r = amdgpu_userqueue_map_helper(uq_mgr, queue);
+ 		if (r) {
+ 			mutex_unlock(&adev->userq_mutex);
+ 			DRM_ERROR("Failed to map Queue\n");
+@@ -489,19 +526,19 @@ static int
+ amdgpu_userqueue_resume_all(struct amdgpu_userq_mgr *uq_mgr)
+ {
+ 	struct amdgpu_device *adev = uq_mgr->adev;
+-	const struct amdgpu_userq_funcs *userq_funcs;
+ 	struct amdgpu_usermode_queue *queue;
+ 	int queue_id;
+-	int ret = 0;
++	int ret = 0, r;
+ 
+ 	/* Resume all the queues for this process */
+ 	idr_for_each_entry(&uq_mgr->userq_idr, queue, queue_id) {
+-		userq_funcs = adev->userq_funcs[queue->queue_type];
+-		ret |= userq_funcs->map(uq_mgr, queue);
++		r = amdgpu_userqueue_map_helper(uq_mgr, queue);
++		if (r)
++			ret = r;
+ 	}
+ 
+ 	if (ret)
+-		DRM_ERROR("Failed to map all the queues\n");
++		dev_err(adev->dev, "Failed to map all the queues\n");
+ 	return ret;
+ }
+ 
+@@ -647,19 +684,19 @@ static int
+ amdgpu_userqueue_suspend_all(struct amdgpu_userq_mgr *uq_mgr)
+ {
+ 	struct amdgpu_device *adev = uq_mgr->adev;
+-	const struct amdgpu_userq_funcs *userq_funcs;
+ 	struct amdgpu_usermode_queue *queue;
+ 	int queue_id;
+-	int ret = 0;
++	int ret = 0, r;
+ 
+ 	/* Try to unmap all the queues in this process ctx */
+ 	idr_for_each_entry(&uq_mgr->userq_idr, queue, queue_id) {
+-		userq_funcs = adev->userq_funcs[queue->queue_type];
+-		ret += userq_funcs->unmap(uq_mgr, queue);
++		r = amdgpu_userqueue_unmap_helper(uq_mgr, queue);
++		if (r)
++			ret = r;
+ 	}
+ 
+ 	if (ret)
+-		DRM_ERROR("Couldn't unmap all the queues\n");
++		dev_err(adev->dev, "Couldn't unmap all the queues\n");
+ 	return ret;
+ }
+ 
+@@ -760,11 +797,10 @@ void amdgpu_userq_mgr_fini(struct amdgpu_userq_mgr *userq_mgr)
+ int amdgpu_userq_suspend(struct amdgpu_device *adev)
+ {
+ 	u32 ip_mask = amdgpu_userqueue_get_supported_ip_mask(adev);
+-	const struct amdgpu_userq_funcs *userq_funcs;
+ 	struct amdgpu_usermode_queue *queue;
+ 	struct amdgpu_userq_mgr *uqm, *tmp;
+ 	int queue_id;
+-	int ret = 0;
++	int ret = 0, r;
+ 
+ 	if (!ip_mask)
+ 		return 0;
+@@ -773,8 +809,9 @@ int amdgpu_userq_suspend(struct amdgpu_device *adev)
+ 	list_for_each_entry_safe(uqm, tmp, &adev->userq_mgr_list, list) {
+ 		cancel_delayed_work_sync(&uqm->resume_work);
+ 		idr_for_each_entry(&uqm->userq_idr, queue, queue_id) {
+-			userq_funcs = adev->userq_funcs[queue->queue_type];
+-			ret |= userq_funcs->unmap(uqm, queue);
++			r = amdgpu_userqueue_unmap_helper(uqm, queue);
++			if (r)
++				ret = r;
+ 		}
+ 	}
+ 	mutex_unlock(&adev->userq_mutex);
+@@ -784,11 +821,10 @@ int amdgpu_userq_suspend(struct amdgpu_device *adev)
+ int amdgpu_userq_resume(struct amdgpu_device *adev)
+ {
+ 	u32 ip_mask = amdgpu_userqueue_get_supported_ip_mask(adev);
+-	const struct amdgpu_userq_funcs *userq_funcs;
+ 	struct amdgpu_usermode_queue *queue;
+ 	struct amdgpu_userq_mgr *uqm, *tmp;
+ 	int queue_id;
+-	int ret = 0;
++	int ret = 0, r;
+ 
+ 	if (!ip_mask)
+ 		return 0;
+@@ -796,8 +832,9 @@ int amdgpu_userq_resume(struct amdgpu_device *adev)
+ 	mutex_lock(&adev->userq_mutex);
+ 	list_for_each_entry_safe(uqm, tmp, &adev->userq_mgr_list, list) {
+ 		idr_for_each_entry(&uqm->userq_idr, queue, queue_id) {
+-			userq_funcs = adev->userq_funcs[queue->queue_type];
+-			ret |= userq_funcs->map(uqm, queue);
++			r = amdgpu_userqueue_map_helper(uqm, queue);
++			if (r)
++				ret = r;
+ 		}
+ 	}
+ 	mutex_unlock(&adev->userq_mutex);
+@@ -808,11 +845,10 @@ int amdgpu_userq_stop_sched_for_enforce_isolation(struct amdgpu_device *adev,
+ 						  u32 idx)
+ {
+ 	u32 ip_mask = amdgpu_userqueue_get_supported_ip_mask(adev);
+-	const struct amdgpu_userq_funcs *userq_funcs;
+ 	struct amdgpu_usermode_queue *queue;
+ 	struct amdgpu_userq_mgr *uqm, *tmp;
+ 	int queue_id;
+-	int ret = 0;
++	int ret = 0, r;
+ 
+ 	/* only need to stop gfx/compute */
+ 	if (!(ip_mask & ((1 << AMDGPU_HW_IP_GFX) | (1 << AMDGPU_HW_IP_COMPUTE))))
+@@ -828,8 +864,9 @@ int amdgpu_userq_stop_sched_for_enforce_isolation(struct amdgpu_device *adev,
+ 			if (((queue->queue_type == AMDGPU_HW_IP_GFX) ||
+ 			     (queue->queue_type == AMDGPU_HW_IP_COMPUTE)) &&
+ 			    (queue->xcp_id == idx)) {
+-				userq_funcs = adev->userq_funcs[queue->queue_type];
+-				ret |= userq_funcs->unmap(uqm, queue);
++				r = amdgpu_userqueue_unmap_helper(uqm, queue);
++				if (r)
++					ret = r;
+ 			}
+ 		}
+ 	}
+@@ -841,11 +878,10 @@ int amdgpu_userq_start_sched_for_enforce_isolation(struct amdgpu_device *adev,
+ 						   u32 idx)
+ {
+ 	u32 ip_mask = amdgpu_userqueue_get_supported_ip_mask(adev);
+-	const struct amdgpu_userq_funcs *userq_funcs;
+ 	struct amdgpu_usermode_queue *queue;
+ 	struct amdgpu_userq_mgr *uqm, *tmp;
+ 	int queue_id;
+-	int ret = 0;
++	int ret = 0, r;
+ 
+ 	/* only need to stop gfx/compute */
+ 	if (!(ip_mask & ((1 << AMDGPU_HW_IP_GFX) | (1 << AMDGPU_HW_IP_COMPUTE))))
+@@ -860,8 +896,9 @@ int amdgpu_userq_start_sched_for_enforce_isolation(struct amdgpu_device *adev,
+ 			if (((queue->queue_type == AMDGPU_HW_IP_GFX) ||
+ 			     (queue->queue_type == AMDGPU_HW_IP_COMPUTE)) &&
+ 			    (queue->xcp_id == idx)) {
+-				userq_funcs = adev->userq_funcs[queue->queue_type];
+-				ret |= userq_funcs->map(uqm, queue);
++				r = amdgpu_userqueue_map_helper(uqm, queue);
++				if (r)
++					ret = r;
+ 			}
+ 		}
+ 	}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.h
+index b49f147eb69c..8f392a0947a2 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.h
+@@ -32,6 +32,13 @@
+ #define uq_mgr_to_fpriv(u) container_of(u, struct amdgpu_fpriv, userq_mgr)
+ #define work_to_uq_mgr(w, name) container_of(w, struct amdgpu_userq_mgr, name)
+ 
++enum amdgpu_userqueue_state {
++	AMDGPU_USERQ_STATE_UNMAPPED = 0,
++	AMDGPU_USERQ_STATE_MAPPED,
++	AMDGPU_USERQ_STATE_PREEMPTED,
++	AMDGPU_USERQ_STATE_HUNG,
++};
++
+ struct amdgpu_mqd_prop;
+ 
+ struct amdgpu_userq_obj {
+@@ -42,7 +49,7 @@ struct amdgpu_userq_obj {
+ 
+ struct amdgpu_usermode_queue {
+ 	int			queue_type;
+-	uint8_t			queue_active;
++	enum amdgpu_userqueue_state state;
+ 	uint64_t		doorbell_handle;
+ 	uint64_t		doorbell_index;
+ 	uint64_t		flags;
+diff --git a/drivers/gpu/drm/amd/amdgpu/mes_userqueue.c b/drivers/gpu/drm/amd/amdgpu/mes_userqueue.c
+index b3157df8ae10..4c01c3a03095 100644
+--- a/drivers/gpu/drm/amd/amdgpu/mes_userqueue.c
++++ b/drivers/gpu/drm/amd/amdgpu/mes_userqueue.c
+@@ -120,9 +120,6 @@ static int mes_userq_map(struct amdgpu_userq_mgr *uq_mgr,
+ 	struct mes_add_queue_input queue_input;
+ 	int r;
+ 
+-	if (queue->queue_active)
+-		return 0;
+-
+ 	memset(&queue_input, 0x0, sizeof(struct mes_add_queue_input));
+ 
+ 	queue_input.process_va_start = 0;
+@@ -155,7 +152,6 @@ static int mes_userq_map(struct amdgpu_userq_mgr *uq_mgr,
+ 		return r;
+ 	}
+ 
+-	queue->queue_active = true;
+ 	DRM_DEBUG_DRIVER("Queue (doorbell:%d) mapped successfully\n", userq_props->doorbell_index);
+ 	return 0;
+ }
+@@ -168,9 +164,6 @@ static int mes_userq_unmap(struct amdgpu_userq_mgr *uq_mgr,
+ 	struct amdgpu_userq_obj *ctx = &queue->fw_obj;
+ 	int r;
+ 
+-	if (!queue->queue_active)
+-		return 0;
+-
+ 	memset(&queue_input, 0x0, sizeof(struct mes_remove_queue_input));
+ 	queue_input.doorbell_offset = queue->doorbell_index;
+ 	queue_input.gang_context_addr = ctx->gpu_addr + AMDGPU_USERQ_PROC_CTX_SZ;
+@@ -180,7 +173,6 @@ static int mes_userq_unmap(struct amdgpu_userq_mgr *uq_mgr,
+ 	amdgpu_mes_unlock(&adev->mes);
+ 	if (r)
+ 		DRM_ERROR("Failed to unmap queue in HW, err (%d)\n", r);
+-	queue->queue_active = false;
+ 	return r;
+ }
+ 
+-- 
+2.52.0
+
