@@ -1,0 +1,131 @@
+From 9718f7457dba2e98dab256217814296b5ad47ee4 Mon Sep 17 00:00:00 2001
+From: Rodrigo Siqueira <siqueira@igalia.com>
+Date: Mon, 21 Apr 2025 16:12:18 -0600
+Subject: drm/amdgpu/gfx: Introduce helpers handling CSB manipulation
+Git-commit: 9718f7457dba2e98dab256217814296b5ad47ee4
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+From GFX6 to GFX11, there is a function for getting the CSB buffer to be
+put into the hardware. Three common parts are duplicated in all of these
+GFX functions:
+
+1. Prepare the CSB preamble.
+2. Parser the CS data.
+3. End the CSB preamble.
+
+This commit creates helpers to be used from GFX6 to GFX11.
+
+Signed-off-by: Rodrigo Siqueira <siqueira@igalia.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c | 69 +++++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.h |  3 ++
+ 2 files changed, 72 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
+index cb9ffb17ab98..e0cc2bb083cb 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
+@@ -33,6 +33,7 @@
+ #include "amdgpu_reset.h"
+ #include "amdgpu_xcp.h"
+ #include "amdgpu_xgmi.h"
++#include "nvd.h"
+ 
+ /* delay 0.1 second to enable gfx off feature */
+ #define GFX_OFF_DELAY_ENABLE         msecs_to_jiffies(100)
+@@ -2257,6 +2258,74 @@ void amdgpu_gfx_profile_ring_end_use(struct amdgpu_ring *ring)
+ 	schedule_delayed_work(&ring->adev->gfx.idle_work, GFX_PROFILE_IDLE_TIMEOUT);
+ }
+ 
++/**
++ * amdgpu_gfx_csb_preamble_start - Set CSB preamble start
++ *
++ * @buffer: This is an output variable that gets the PACKET3 preamble setup.
++ *
++ * Return:
++ * return the latest index.
++ */
++u32 amdgpu_gfx_csb_preamble_start(volatile u32 *buffer)
++{
++	u32 count = 0;
++
++	buffer[count++] = cpu_to_le32(PACKET3(PACKET3_PREAMBLE_CNTL, 0));
++	buffer[count++] = cpu_to_le32(PACKET3_PREAMBLE_BEGIN_CLEAR_STATE);
++
++	buffer[count++] = cpu_to_le32(PACKET3(PACKET3_CONTEXT_CONTROL, 1));
++	buffer[count++] = cpu_to_le32(0x80000000);
++	buffer[count++] = cpu_to_le32(0x80000000);
++
++	return count;
++}
++
++/**
++ * amdgpu_gfx_csb_data_parser - Parser CS data
++ *
++ * @adev: amdgpu_device pointer used to get the CS data and other gfx info.
++ * @buffer: This is an output variable that gets the PACKET3 preamble end.
++ * @count: Index to start set the preemble end.
++ *
++ * Return:
++ * return the latest index.
++ */
++u32 amdgpu_gfx_csb_data_parser(struct amdgpu_device *adev, volatile u32 *buffer, u32 count)
++{
++	const struct cs_section_def *sect = NULL;
++	const struct cs_extent_def *ext = NULL;
++	u32 i;
++
++	for (sect = adev->gfx.rlc.cs_data; sect->section != NULL; ++sect) {
++		for (ext = sect->section; ext->extent != NULL; ++ext) {
++			if (sect->id == SECT_CONTEXT) {
++				buffer[count++] = cpu_to_le32(PACKET3(PACKET3_SET_CONTEXT_REG, ext->reg_count));
++				buffer[count++] = cpu_to_le32(ext->reg_index - PACKET3_SET_CONTEXT_REG_START);
++
++				for (i = 0; i < ext->reg_count; i++)
++					buffer[count++] = cpu_to_le32(ext->extent[i]);
++			}
++		}
++	}
++
++	return count;
++}
++
++/**
++ * amdgpu_gfx_csb_preamble_end - Set CSB preamble end
++ *
++ * @buffer: This is an output variable that gets the PACKET3 preamble end.
++ * @count: Index to start set the preemble end.
++ */
++void amdgpu_gfx_csb_preamble_end(volatile u32 *buffer, u32 count)
++{
++	buffer[count++] = cpu_to_le32(PACKET3(PACKET3_PREAMBLE_CNTL, 0));
++	buffer[count++] = cpu_to_le32(PACKET3_PREAMBLE_END_CLEAR_STATE);
++
++	buffer[count++] = cpu_to_le32(PACKET3(PACKET3_CLEAR_STATE, 0));
++	buffer[count++] = cpu_to_le32(0);
++}
++
+ /*
+  * debugfs for to enable/disable gfx job submission to specific core.
+  */
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.h
+index ed54095e6ad6..9187b0b3bff6 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.h
+@@ -599,6 +599,9 @@ void amdgpu_gfx_enforce_isolation_ring_end_use(struct amdgpu_ring *ring);
+ void amdgpu_gfx_profile_idle_work_handler(struct work_struct *work);
+ void amdgpu_gfx_profile_ring_begin_use(struct amdgpu_ring *ring);
+ void amdgpu_gfx_profile_ring_end_use(struct amdgpu_ring *ring);
++u32 amdgpu_gfx_csb_preamble_start(volatile u32 *buffer);
++u32 amdgpu_gfx_csb_data_parser(struct amdgpu_device *adev, volatile u32 *buffer, u32 count);
++void amdgpu_gfx_csb_preamble_end(volatile u32 *buffer, u32 count);
+ 
+ void amdgpu_debugfs_gfx_sched_mask_init(struct amdgpu_device *adev);
+ void amdgpu_debugfs_compute_sched_mask_init(struct amdgpu_device *adev);
+-- 
+2.52.0
+
