@@ -1,0 +1,100 @@
+From c0134808a9d6c364b7568546be9489ce3337c7f8 Mon Sep 17 00:00:00 2001
+From: Connor Abbott <cwabbott0@gmail.com>
+Date: Thu, 24 Apr 2025 09:30:17 -0400
+Subject: drm/msm: Be more robust when HFI response times out
+Git-commit: c0134808a9d6c364b7568546be9489ce3337c7f8
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+If the GMU takes too long to respond to an HFI message, we may return
+early. If the GMU does eventually respond, and then we send a second
+message, we will see the response for the first, throw another error,
+and keep going. But we don't currently wait for the interrupt from the
+GMU again, so if the second response isn't there immediately we may
+prematurely return. This can cause a continuous cycle of missed HFI
+messages, and for reasons I don't quite understand the GMU does not shut
+down properly when this happens.
+
+Fix this by waiting for the GMU interrupt when we see an empty queue. If
+the GMU never responds then the queue really is empty and we quit. We
+can't wait for the interrupt when we see a wrong response seqnum because
+the GMU might have already queued both responses by the time we clear
+the interrupt the first time so we do need to check the queue before
+waiting on the interrupt again.
+
+Signed-off-by: Connor Abbott <cwabbott0@gmail.com>
+Reviewed-by: Konrad Dybcio <konrad.dybcio@oss.qualcomm.com>
+Patchwork: https://patchwork.freedesktop.org/patch/650013/
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/msm/adreno/a6xx_hfi.c | 35 ++++++++++++++++++++-------
+ 1 file changed, 26 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_hfi.c b/drivers/gpu/drm/msm/adreno/a6xx_hfi.c
+index 0989aee3dd2c..1bc40d667281 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_hfi.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_hfi.c
+@@ -100,12 +100,10 @@ static int a6xx_hfi_queue_write(struct a6xx_gmu *gmu,
+ 	return 0;
+ }
+ 
+-static int a6xx_hfi_wait_for_ack(struct a6xx_gmu *gmu, u32 id, u32 seqnum,
+-		u32 *payload, u32 payload_size)
++static int a6xx_hfi_wait_for_msg_interrupt(struct a6xx_gmu *gmu, u32 id, u32 seqnum)
+ {
+-	struct a6xx_hfi_queue *queue = &gmu->queues[HFI_RESPONSE_QUEUE];
+-	u32 val;
+ 	int ret;
++	u32 val;
+ 
+ 	/* Wait for a response */
+ 	ret = gmu_poll_timeout(gmu, REG_A6XX_GMU_GMU2HOST_INTR_INFO, val,
+@@ -122,6 +120,19 @@ static int a6xx_hfi_wait_for_ack(struct a6xx_gmu *gmu, u32 id, u32 seqnum,
+ 	gmu_write(gmu, REG_A6XX_GMU_GMU2HOST_INTR_CLR,
+ 		A6XX_GMU_GMU2HOST_INTR_INFO_MSGQ);
+ 
++	return 0;
++}
++
++static int a6xx_hfi_wait_for_ack(struct a6xx_gmu *gmu, u32 id, u32 seqnum,
++		u32 *payload, u32 payload_size)
++{
++	struct a6xx_hfi_queue *queue = &gmu->queues[HFI_RESPONSE_QUEUE];
++	int ret;
++
++	ret = a6xx_hfi_wait_for_msg_interrupt(gmu, id, seqnum);
++	if (ret)
++		return ret;
++
+ 	for (;;) {
+ 		struct a6xx_hfi_msg_response resp;
+ 
+@@ -129,12 +140,18 @@ static int a6xx_hfi_wait_for_ack(struct a6xx_gmu *gmu, u32 id, u32 seqnum,
+ 		ret = a6xx_hfi_queue_read(gmu, queue, (u32 *) &resp,
+ 			sizeof(resp) >> 2);
+ 
+-		/* If the queue is empty our response never made it */
++		/* If the queue is empty, there may have been previous missed
++		 * responses that preceded the response to our packet. Wait
++		 * further before we give up.
++		 */
+ 		if (!ret) {
+-			DRM_DEV_ERROR(gmu->dev,
+-				"The HFI response queue is unexpectedly empty\n");
+-
+-			return -ENOENT;
++			ret = a6xx_hfi_wait_for_msg_interrupt(gmu, id, seqnum);
++			if (ret) {
++				DRM_DEV_ERROR(gmu->dev,
++					"The HFI response queue is unexpectedly empty\n");
++				return ret;
++			}
++			continue;
+ 		}
+ 
+ 		if (HFI_HEADER_ID(resp.header) == HFI_F2H_MSG_ERROR) {
+-- 
+2.52.0
+
