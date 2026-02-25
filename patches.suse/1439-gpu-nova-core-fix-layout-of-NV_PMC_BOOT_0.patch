@@ -1,0 +1,106 @@
+From e4bc82af9e8b095c0f7a5aa9050b780002bd0933 Mon Sep 17 00:00:00 2001
+From: Alexandre Courbot <acourbot@nvidia.com>
+Date: Wed, 7 May 2025 22:52:33 +0900
+Subject: gpu: nova-core: fix layout of NV_PMC_BOOT_0
+Git-commit: e4bc82af9e8b095c0f7a5aa9050b780002bd0933
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+The layout of NV_PMC_BOOT_0 has two small issues:
+
+- The "chipset" field, while useful to identify a chip, is actually an
+  aggregate of two distinct fields named "architecture" and
+  "implementation".
+- The "architecture" field is split, with its MSB being at a different
+  location than the rest of its bits.
+
+Redefine the register layout to match its actual definition as provided
+by OpenRM and expose the fully-constructed "architecture" field through
+our own "Architecture" type. The "chipset" pseudo-field is also useful
+to have, so keep providing it.
+
+Signed-off-by: Alexandre Courbot <acourbot@nvidia.com>
+Link: https://lore.kernel.org/r/20250507-nova-frts-v3-6-fcb02749754d@nvidia.com
+[ Use Result from kernel::prelude. - Danilo ]
+
+Signed-off-by: Danilo Krummrich <dakr@kernel.org>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/nova-core/gpu.rs  | 19 ++++++++++++++++---
+ drivers/gpu/nova-core/regs.rs | 25 +++++++++++++++++++++++--
+ 2 files changed, 39 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/nova-core/gpu.rs b/drivers/gpu/nova-core/gpu.rs
+index a4effb56e3e1..5eecddf8a392 100644
+--- a/drivers/gpu/nova-core/gpu.rs
++++ b/drivers/gpu/nova-core/gpu.rs
+@@ -101,9 +101,22 @@ fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+ /// Enum representation of the GPU generation.
+ #[derive(fmt::Debug)]
+ pub(crate) enum Architecture {
+-    Turing,
+-    Ampere,
+-    Ada,
++    Turing = 0x16,
++    Ampere = 0x17,
++    Ada = 0x19,
++}
++
++impl TryFrom<u8> for Architecture {
++    type Error = Error;
++
++    fn try_from(value: u8) -> Result<Self> {
++        match value {
++            0x16 => Ok(Self::Turing),
++            0x17 => Ok(Self::Ampere),
++            0x19 => Ok(Self::Ada),
++            _ => Err(ENODEV),
++        }
++    }
+ }
+ 
+ pub(crate) struct Revision {
+diff --git a/drivers/gpu/nova-core/regs.rs b/drivers/gpu/nova-core/regs.rs
+index 498fefb52f33..5a1273230306 100644
+--- a/drivers/gpu/nova-core/regs.rs
++++ b/drivers/gpu/nova-core/regs.rs
+@@ -7,12 +7,33 @@
+ #[macro_use]
+ mod macros;
+ 
+-use crate::gpu::Chipset;
++use crate::gpu::{Architecture, Chipset};
++use kernel::prelude::*;
+ 
+ /* PMC */
+ 
+ register!(NV_PMC_BOOT_0 @ 0x00000000, "Basic revision information about the GPU" {
+     3:0     minor_revision as u8, "Minor revision of the chip";
+     7:4     major_revision as u8, "Major revision of the chip";
+-    28:20   chipset as u32 ?=> Chipset, "Chipset model";
++    8:8     architecture_1 as u8, "MSB of the architecture";
++    23:20   implementation as u8, "Implementation version of the architecture";
++    28:24   architecture_0 as u8, "Lower bits of the architecture";
+ });
++
++impl NV_PMC_BOOT_0 {
++    /// Combines `architecture_0` and `architecture_1` to obtain the architecture of the chip.
++    pub(crate) fn architecture(self) -> Result<Architecture> {
++        Architecture::try_from(
++            self.architecture_0() | (self.architecture_1() << Self::ARCHITECTURE_0.len()),
++        )
++    }
++
++    /// Combines `architecture` and `implementation` to obtain a code unique to the chipset.
++    pub(crate) fn chipset(self) -> Result<Chipset> {
++        self.architecture()
++            .map(|arch| {
++                ((arch as u32) << Self::IMPLEMENTATION.len()) | self.implementation() as u32
++            })
++            .and_then(Chipset::try_from)
++    }
++}
+-- 
+2.52.0
+
