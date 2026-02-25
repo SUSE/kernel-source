@@ -1,0 +1,84 @@
+From 9c088a5c0d6f019bbc482d433ddddb18db6214f1 Mon Sep 17 00:00:00 2001
+From: Arnd Bergmann <arnd@arndb.de>
+Date: Wed, 30 Apr 2025 18:25:45 -0700
+Subject: drm/xe: fix devcoredump chunk alignmnent calculation
+Git-commit: 9c088a5c0d6f019bbc482d433ddddb18db6214f1
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+The device core dumps are copied in 1.5GB chunks, which leads to a
+link-time error on 32-bit builds because of the 64-bit division not
+getting trivially turned into mask and shift operations:
+
+Error: modpost: "__moddi3" [drivers/gpu/drm/xe/xe.ko] undefined!
+
+On top of this, I noticed that the ALIGN_DOWN() usage here cannot
+work because that is only defined for power-of-two alignments.
+Change ALIGN_DOWN into an explicit div_u64_rem() that avoids the
+link error and hopefully produces the right results.
+
+Doing a 1.5GB kvmalloc() does seem a bit suspicious as well, e.g.
+this will clearly fail on any 32-bit platform and is also likely
+to run out of memory on 64-bit systems under memory pressure, so
+using a much smaller power-of-two chunk size might be a good idea
+instead.
+
+V2: - Always call div_u64_rem (Matt)
+
+Reported-by: kernel test robot <lkp@intel.com>
+Closes: https://lore.kernel.org/oe-kbuild-all/202504251238.JsNgFeFc-lkp@intel.com/
+Fixes: c4a2e5f865b7 ("drm/xe: Add devcoredump chunking")
+Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+Signed-off-by: Matthew Brost <matthew.brost@intel.com>
+Reviewed-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Link: https://lore.kernel.org/r/20250501012545.1045247-1-matthew.brost@intel.com
+Signed-off-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/xe/xe_devcoredump.c | 13 +++++++++----
+ 1 file changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_devcoredump.c b/drivers/gpu/drm/xe/xe_devcoredump.c
+index a9e618abf8ac..7a8af2311318 100644
+--- a/drivers/gpu/drm/xe/xe_devcoredump.c
++++ b/drivers/gpu/drm/xe/xe_devcoredump.c
+@@ -177,6 +177,8 @@ static ssize_t xe_devcoredump_read(char *buffer, loff_t offset,
+ 	struct xe_devcoredump *coredump = data;
+ 	struct xe_devcoredump_snapshot *ss;
+ 	ssize_t byte_copied;
++	u32 chunk_offset;
++	ssize_t new_chunk_position;
+ 
+ 	if (!coredump)
+ 		return -ENODEV;
+@@ -201,10 +203,14 @@ static ssize_t xe_devcoredump_read(char *buffer, loff_t offset,
+ 		return 0;
+ 	}
+ 
++	new_chunk_position = div_u64_rem(offset,
++					 XE_DEVCOREDUMP_CHUNK_MAX,
++					 &chunk_offset);
++
+ 	if (offset >= ss->read.chunk_position + XE_DEVCOREDUMP_CHUNK_MAX ||
+ 	    offset < ss->read.chunk_position) {
+-		ss->read.chunk_position =
+-			ALIGN_DOWN(offset, XE_DEVCOREDUMP_CHUNK_MAX);
++		ss->read.chunk_position = new_chunk_position *
++			XE_DEVCOREDUMP_CHUNK_MAX;
+ 
+ 		__xe_devcoredump_read(ss->read.buffer,
+ 				      XE_DEVCOREDUMP_CHUNK_MAX,
+@@ -213,8 +219,7 @@ static ssize_t xe_devcoredump_read(char *buffer, loff_t offset,
+ 
+ 	byte_copied = count < ss->read.size - offset ? count :
+ 		ss->read.size - offset;
+-	memcpy(buffer, ss->read.buffer +
+-	       (offset % XE_DEVCOREDUMP_CHUNK_MAX), byte_copied);
++	memcpy(buffer, ss->read.buffer + chunk_offset, byte_copied);
+ 
+ 	mutex_unlock(&coredump->lock);
+ 
+-- 
+2.52.0
+
