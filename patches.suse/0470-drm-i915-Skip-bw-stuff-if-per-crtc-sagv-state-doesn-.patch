@@ -1,0 +1,90 @@
+From da885fdaf9c1a07f9b1c99e105139ef4053004e6 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Wed, 26 Mar 2025 18:25:43 +0200
+Subject: drm/i915: Skip bw stuff if per-crtc sagv state doesn't change
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: da885fdaf9c1a07f9b1c99e105139ef4053004e6
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+If there are no changes to intel_crtc_can_enable_sagv() there
+is no need to do all the sagv bw_state recomputation.
+
+The only slight caveat here is hw state takeover where we
+initially disable SAGV, and want it to get re-enabled once
+we've determined that it's safe to do so.  That can now be
+achieved by having intel_crtc_can_enable_sagv() reject SAGV
+as long as the crtc_state->inherited flag is set. Once the
+flag gets cleared (during initial commit for inactive pipes,
+during the first userspace commit for active pipes), we
+will naturally recompute all the sagv related state.
+
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250326162544.3642-14-ville.syrjala@linux.intel.com
+Reviewed-by: Jani Nikula <jani.nikula@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/intel_bw.c      |  8 +++++++-
+ drivers/gpu/drm/i915/display/skl_watermark.c | 11 +++++++++--
+ 2 files changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_bw.c b/drivers/gpu/drm/i915/display/intel_bw.c
+index b8bb2e395bb7..e819db78dfbd 100644
+--- a/drivers/gpu/drm/i915/display/intel_bw.c
++++ b/drivers/gpu/drm/i915/display/intel_bw.c
+@@ -1447,13 +1447,19 @@ static int intel_bw_check_sagv_mask(struct intel_atomic_state *state)
+ {
+ 	struct intel_display *display = to_intel_display(state);
+ 	struct drm_i915_private *i915 = to_i915(display->drm);
++	const struct intel_crtc_state *old_crtc_state;
+ 	const struct intel_crtc_state *new_crtc_state;
+ 	const struct intel_bw_state *old_bw_state = NULL;
+ 	struct intel_bw_state *new_bw_state = NULL;
+ 	struct intel_crtc *crtc;
+ 	int ret, i;
+ 
+-	for_each_new_intel_crtc_in_state(state, crtc, new_crtc_state, i) {
++	for_each_oldnew_intel_crtc_in_state(state, crtc, old_crtc_state,
++					    new_crtc_state, i) {
++		if (intel_crtc_can_enable_sagv(old_crtc_state) ==
++		    intel_crtc_can_enable_sagv(new_crtc_state))
++			continue;
++
+ 		new_bw_state = intel_atomic_get_bw_state(state);
+ 		if (IS_ERR(new_bw_state))
+ 			return PTR_ERR(new_bw_state);
+diff --git a/drivers/gpu/drm/i915/display/skl_watermark.c b/drivers/gpu/drm/i915/display/skl_watermark.c
+index baf345039deb..8b51f0b42785 100644
+--- a/drivers/gpu/drm/i915/display/skl_watermark.c
++++ b/drivers/gpu/drm/i915/display/skl_watermark.c
+@@ -434,6 +434,14 @@ bool intel_crtc_can_enable_sagv(const struct intel_crtc_state *crtc_state)
+ 	if (!i915->display.params.enable_sagv)
+ 		return false;
+ 
++	/*
++	 * SAGV is initially forced off because its current
++	 * state can't be queried from pcode. Allow SAGV to
++	 * be enabled upon the first real commit.
++	 */
++	if (crtc_state->inherited)
++		return false;
++
+ 	if (DISPLAY_VER(i915) >= 12)
+ 		return tgl_crtc_can_enable_sagv(crtc_state);
+ 	else
+@@ -458,8 +466,7 @@ static int intel_compute_sagv_mask(struct intel_atomic_state *state)
+ 	struct intel_crtc_state *new_crtc_state;
+ 	int i;
+ 
+-	for_each_new_intel_crtc_in_state(state, crtc,
+-					 new_crtc_state, i) {
++	for_each_new_intel_crtc_in_state(state, crtc, new_crtc_state, i) {
+ 		struct skl_pipe_wm *pipe_wm = &new_crtc_state->wm.skl.optimal;
+ 
+ 		/*
+-- 
+2.52.0
+
