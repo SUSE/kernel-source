@@ -1,0 +1,379 @@
+From fb796c308767606bbd6c2e1bf4fa9446ec68ce51 Mon Sep 17 00:00:00 2001
+From: Shashank Sharma <shashank.sharma@amd.com>
+Date: Tue, 27 Aug 2024 15:44:43 +0530
+Subject: drm/amdgpu: add gfx eviction fence helpers
+Git-commit: fb796c308767606bbd6c2e1bf4fa9446ec68ce51
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+This patch adds basic eviction fence framework for the gfx buffers.
+The idea is to:
+- One eviction fence is created per gfx process, at kms_open.
+- This fence is attached to all the gem buffers created
+  by this process.
+- This fence is detached to all the gem buffers at postclose_kms.
+
+This framework will be further used for usermode queues.
+
+V2: Addressed review comments from Christian
+    - keep fence_ctx and fence_seq directly in fpriv
+    - evcition_fence should be dynamically allocated
+    - do not save eviction fence instance in BO, there could be many
+      such fences attached to one BO
+    - use dma_resv_replace_fence() in detach
+
+V3: Addressed review comments from Christian
+    - eviction fence create and destroy functions should be called
+      only once from fpriv create/destroy
+    - use dma_fence_put() in eviction_fence_destroy
+
+V4: Addressed review comments from Christian:
+    - create a separate ev_fence_mgr structure
+    - cleanup fence init part
+    - do not add a domain for fence owner KGD
+
+V5: Addressed review comments from Christian:
+    - drop the dma_fence_is_signaled check
+    - use a local variable to access evf_mgr->ev_fence under the
+      spin_lock() multiple places
+    - remove the vm->is_compute_ctx check to attach gfx eviction fence,
+      in gem_object_open
+
+V6: Addressed review comments from Christian:
+    - drop the return value from eviction_fence_signal
+    - reserve_fence should be the first thing inside the
+      attach_eviction_fence function, also keep the resv_add_fence inside
+      the lock
+    - remove the unwanted ev_fence check inside detach function
+    - fix wrong variable check in eviction_fence_init function
+    - return the error value of eviction_fence_init to the caller, dont
+      keep it void.
+    - fail gem_object_open if attaching of eviction_fence fails
+    - detach the eviction fence only when amdgpu_vm_is_bo_always_valid
+      is not true.
+
+V7: Addressed review comments from Christian:
+    - Do not add a uq_mgr ptr in ev_fence, rather add evf_mgr
+
+V8: Move eviction fence enabling into separate patch for CI
+
+Cc: Christian Koenig <christian.koenig@amd.com>
+Cc: Alex Deucher <alexander.deucher@amd.com>
+Reviewed-by: Christian Koenig <christian.koenig@amd.com>
+Signed-off-by: Shashank Sharma <shashank.sharma@amd.com>
+Signed-off-by: Arvind Yadav <arvind.yadav@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/Makefile           |   2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h           |   6 +-
+ .../drm/amd/amdgpu/amdgpu_eviction_fence.c    | 144 ++++++++++++++++++
+ .../drm/amd/amdgpu/amdgpu_eviction_fence.h    |  63 ++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c       |   1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c       |   5 +
+ 6 files changed, 219 insertions(+), 2 deletions(-)
+ create mode 100644 drivers/gpu/drm/amd/amdgpu/amdgpu_eviction_fence.c
+ create mode 100644 drivers/gpu/drm/amd/amdgpu/amdgpu_eviction_fence.h
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/Makefile b/drivers/gpu/drm/amd/amdgpu/Makefile
+index 1cc307904089..0b0c8ec46516 100644
+--- a/drivers/gpu/drm/amd/amdgpu/Makefile
++++ b/drivers/gpu/drm/amd/amdgpu/Makefile
+@@ -66,7 +66,7 @@ amdgpu-y += amdgpu_device.o amdgpu_doorbell_mgr.o amdgpu_kms.o \
+ 	amdgpu_fw_attestation.o amdgpu_securedisplay.o \
+ 	amdgpu_eeprom.o amdgpu_mca.o amdgpu_psp_ta.o amdgpu_lsdma.o \
+ 	amdgpu_ring_mux.o amdgpu_xcp.o amdgpu_seq64.o amdgpu_aca.o amdgpu_dev_coredump.o \
+-	amdgpu_cper.o amdgpu_userq_fence.o
++	amdgpu_cper.o amdgpu_userq_fence.o amdgpu_eviction_fence.o
+ 
+ amdgpu-$(CONFIG_PROC_FS) += amdgpu_fdinfo.o
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 04e441f7bbcf..ab2708d62afe 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -114,6 +114,7 @@
+ #include "amdgpu_seq64.h"
+ #include "amdgpu_reg_state.h"
+ #include "amdgpu_userqueue.h"
++#include "amdgpu_eviction_fence.h"
+ #if defined(CONFIG_DRM_AMD_ISP)
+ #include "amdgpu_isp.h"
+ #endif
+@@ -490,7 +491,6 @@ struct amdgpu_flip_work {
+ 	bool				async;
+ };
+ 
+-
+ /*
+  * file private structure
+  */
+@@ -504,6 +504,10 @@ struct amdgpu_fpriv {
+ 	struct idr		bo_list_handles;
+ 	struct amdgpu_ctx_mgr	ctx_mgr;
+ 	struct amdgpu_userq_mgr	userq_mgr;
++
++	/* Eviction fence infra */
++	struct amdgpu_eviction_fence_mgr evf_mgr;
++
+ 	/** GPU partition selection */
+ 	uint32_t		xcp_id;
+ };
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_eviction_fence.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_eviction_fence.c
+new file mode 100644
+index 000000000000..056798e2b050
+--- /dev/null
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_eviction_fence.c
+@@ -0,0 +1,144 @@
++// SPDX-License-Identifier: MIT
++/*
++ * Copyright 2024 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++#include <linux/sched.h>
++#include "amdgpu.h"
++
++static const char *
++amdgpu_eviction_fence_get_driver_name(struct dma_fence *fence)
++{
++	return "amdgpu";
++}
++
++static const char *
++amdgpu_eviction_fence_get_timeline_name(struct dma_fence *f)
++{
++	struct amdgpu_eviction_fence *ef;
++
++	ef = container_of(f, struct amdgpu_eviction_fence, base);
++	return ef->timeline_name;
++}
++
++static const struct dma_fence_ops amdgpu_eviction_fence_ops = {
++	.use_64bit_seqno = true,
++	.get_driver_name = amdgpu_eviction_fence_get_driver_name,
++	.get_timeline_name = amdgpu_eviction_fence_get_timeline_name,
++};
++
++void amdgpu_eviction_fence_signal(struct amdgpu_eviction_fence_mgr *evf_mgr)
++{
++	spin_lock(&evf_mgr->ev_fence_lock);
++	dma_fence_signal(&evf_mgr->ev_fence->base);
++	spin_unlock(&evf_mgr->ev_fence_lock);
++}
++
++struct amdgpu_eviction_fence *
++amdgpu_eviction_fence_create(struct amdgpu_eviction_fence_mgr *evf_mgr)
++{
++	struct amdgpu_eviction_fence *ev_fence;
++
++	ev_fence = kzalloc(sizeof(*ev_fence), GFP_KERNEL);
++	if (!ev_fence)
++		return NULL;
++
++	ev_fence->evf_mgr = evf_mgr;
++	get_task_comm(ev_fence->timeline_name, current);
++	spin_lock_init(&ev_fence->lock);
++	dma_fence_init(&ev_fence->base, &amdgpu_eviction_fence_ops,
++		       &ev_fence->lock, evf_mgr->ev_fence_ctx,
++		       atomic_inc_return(&evf_mgr->ev_fence_seq));
++	return ev_fence;
++}
++
++void amdgpu_eviction_fence_destroy(struct amdgpu_eviction_fence_mgr *evf_mgr)
++{
++	struct amdgpu_eviction_fence *ev_fence;
++
++	spin_lock(&evf_mgr->ev_fence_lock);
++	ev_fence = evf_mgr->ev_fence;
++	spin_unlock(&evf_mgr->ev_fence_lock);
++
++	if (!ev_fence)
++		return;
++
++	/* Last unref of ev_fence */
++	dma_fence_put(&evf_mgr->ev_fence->base);
++}
++
++int amdgpu_eviction_fence_attach(struct amdgpu_eviction_fence_mgr *evf_mgr,
++				 struct amdgpu_bo *bo)
++{
++	struct dma_fence *ef;
++	struct amdgpu_eviction_fence *ev_fence;
++	struct dma_resv *resv = bo->tbo.base.resv;
++	int ret;
++
++	if (!resv)
++		return 0;
++
++	ret = dma_resv_reserve_fences(resv, 1);
++	if (ret) {
++		DRM_DEBUG_DRIVER("Failed to resv fence space\n");
++		return ret;
++	}
++
++	spin_lock(&evf_mgr->ev_fence_lock);
++	ev_fence = evf_mgr->ev_fence;
++	if (ev_fence) {
++		ef = dma_fence_get(&ev_fence->base);
++		dma_resv_add_fence(resv, ef, DMA_RESV_USAGE_BOOKKEEP);
++	}
++	spin_unlock(&evf_mgr->ev_fence_lock);
++	return 0;
++}
++
++void amdgpu_eviction_fence_detach(struct amdgpu_eviction_fence_mgr *evf_mgr,
++				  struct amdgpu_bo *bo)
++{
++	struct dma_fence *stub = dma_fence_get_stub();
++
++	dma_resv_replace_fences(bo->tbo.base.resv, evf_mgr->ev_fence_ctx,
++				stub, DMA_RESV_USAGE_BOOKKEEP);
++	dma_fence_put(stub);
++}
++
++int amdgpu_eviction_fence_init(struct amdgpu_eviction_fence_mgr *evf_mgr)
++{
++	struct amdgpu_eviction_fence *ev_fence;
++
++	/* This needs to be done one time per open */
++	atomic_set(&evf_mgr->ev_fence_seq, 0);
++	evf_mgr->ev_fence_ctx = dma_fence_context_alloc(1);
++	spin_lock_init(&evf_mgr->ev_fence_lock);
++
++	ev_fence = amdgpu_eviction_fence_create(evf_mgr);
++	if (!ev_fence) {
++		DRM_ERROR("Failed to craete eviction fence\n");
++		return -ENOMEM;
++	}
++
++	spin_lock(&evf_mgr->ev_fence_lock);
++	evf_mgr->ev_fence = ev_fence;
++	spin_unlock(&evf_mgr->ev_fence_lock);
++	return 0;
++}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_eviction_fence.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_eviction_fence.h
+new file mode 100644
+index 000000000000..aba12a43f433
+--- /dev/null
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_eviction_fence.h
+@@ -0,0 +1,63 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * Copyright 2023 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++
++#ifndef AMDGPU_EV_FENCE_H_
++#define AMDGPU_EV_FENCE_H_
++
++struct amdgpu_eviction_fence {
++	struct dma_fence base;
++	spinlock_t	 lock;
++	char		 timeline_name[TASK_COMM_LEN];
++	struct amdgpu_eviction_fence_mgr *evf_mgr;
++};
++
++struct amdgpu_eviction_fence_mgr {
++	u64			ev_fence_ctx;
++	atomic_t		ev_fence_seq;
++	spinlock_t		ev_fence_lock;
++	struct amdgpu_eviction_fence *ev_fence;
++};
++
++/* Eviction fence helper functions */
++struct amdgpu_eviction_fence *
++amdgpu_eviction_fence_create(struct amdgpu_eviction_fence_mgr *evf_mgr);
++
++void
++amdgpu_eviction_fence_destroy(struct amdgpu_eviction_fence_mgr *evf_mgr);
++
++int
++amdgpu_eviction_fence_attach(struct amdgpu_eviction_fence_mgr *evf_mgr,
++			     struct amdgpu_bo *bo);
++
++void
++amdgpu_eviction_fence_detach(struct amdgpu_eviction_fence_mgr *evf_mgr,
++			     struct amdgpu_bo *bo);
++
++int
++amdgpu_eviction_fence_init(struct amdgpu_eviction_fence_mgr *evf_mgr);
++
++void
++amdgpu_eviction_fence_signal(struct amdgpu_eviction_fence_mgr *evf_mgr);
++
++#endif
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+index 06171eab6e92..682b76cad359 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+@@ -293,6 +293,7 @@ static int amdgpu_gem_object_open(struct drm_gem_object *obj,
+ 		bo_va = amdgpu_vm_bo_add(adev, vm, abo);
+ 	else
+ 		++bo_va->ref_count;
++
+ 	amdgpu_bo_unreserve(abo);
+ 
+ 	/* Validate and add eviction fence to DMABuf imports with dynamic
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+index 2e07776dd408..700442584f97 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+@@ -1413,6 +1413,10 @@ int amdgpu_driver_open_kms(struct drm_device *dev, struct drm_file *file_priv)
+ 	mutex_init(&fpriv->bo_list_lock);
+ 	idr_init_base(&fpriv->bo_list_handles, 1);
+ 
++	r = amdgpu_eviction_fence_init(&fpriv->evf_mgr);
++	if (r)
++		goto error_vm;
++
+ 	amdgpu_ctx_mgr_init(&fpriv->ctx_mgr, adev);
+ 
+ 	r = amdgpu_userq_mgr_init(&fpriv->userq_mgr, adev);
+@@ -1486,6 +1490,7 @@ void amdgpu_driver_postclose_kms(struct drm_device *dev,
+ 		amdgpu_bo_unreserve(pd);
+ 	}
+ 
++	amdgpu_eviction_fence_destroy(&fpriv->evf_mgr);
+ 	amdgpu_ctx_mgr_fini(&fpriv->ctx_mgr);
+ 	amdgpu_vm_fini(adev, &fpriv->vm);
+ 	amdgpu_userq_mgr_fini(&fpriv->userq_mgr);
+-- 
+2.52.0
+
