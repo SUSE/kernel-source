@@ -1,0 +1,173 @@
+From 014ea4d39c09c85b4120111927ce22b31fd0ceea Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Wed, 26 Mar 2025 18:25:40 +0200
+Subject: drm/i915: Extract intel_bw_check_sagv_mask()
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 014ea4d39c09c85b4120111927ce22b31fd0ceea
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Move the bw_state->pipe_sagv_reject computation into intel_bw.c
+where it belongs.
+
+Previously we had a complicated dance between watermarks and
+sagv which required this to be computed earlier, but that was
+changed in commit 5e8146251f7b ("extract intel_bw_check_sagv_mask()")
+which allows the whole thing to be cleaned up quite a bit.
+
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250326162544.3642-11-ville.syrjala@linux.intel.com
+Reviewed-by: Jani Nikula <jani.nikula@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/intel_bw.c      | 40 ++++++++++++++++++++
+ drivers/gpu/drm/i915/display/intel_bw.h      |  1 +
+ drivers/gpu/drm/i915/display/skl_watermark.c | 31 ++-------------
+ drivers/gpu/drm/i915/display/skl_watermark.h |  1 +
+ 4 files changed, 46 insertions(+), 27 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_bw.c b/drivers/gpu/drm/i915/display/intel_bw.c
+index dcf2b711b83a..0553e902727e 100644
+--- a/drivers/gpu/drm/i915/display/intel_bw.c
++++ b/drivers/gpu/drm/i915/display/intel_bw.c
+@@ -1443,6 +1443,46 @@ int intel_bw_modeset_checks(struct intel_atomic_state *state)
+ 	return 0;
+ }
+ 
++int intel_bw_check_sagv_mask(struct intel_atomic_state *state)
++{
++	struct intel_display *display = to_intel_display(state);
++	struct drm_i915_private *i915 = to_i915(display->drm);
++	const struct intel_crtc_state *new_crtc_state;
++	const struct intel_bw_state *old_bw_state = NULL;
++	struct intel_bw_state *new_bw_state = NULL;
++	struct intel_crtc *crtc;
++	int ret, i;
++
++	for_each_new_intel_crtc_in_state(state, crtc, new_crtc_state, i) {
++		new_bw_state = intel_atomic_get_bw_state(state);
++		if (IS_ERR(new_bw_state))
++			return PTR_ERR(new_bw_state);
++
++		old_bw_state = intel_atomic_get_old_bw_state(state);
++
++		if (intel_crtc_can_enable_sagv(new_crtc_state))
++			new_bw_state->pipe_sagv_reject &= ~BIT(crtc->pipe);
++		else
++			new_bw_state->pipe_sagv_reject |= BIT(crtc->pipe);
++	}
++
++	if (!new_bw_state)
++		return 0;
++
++	if (intel_can_enable_sagv(i915, new_bw_state) !=
++	    intel_can_enable_sagv(i915, old_bw_state)) {
++		ret = intel_atomic_serialize_global_state(&new_bw_state->base);
++		if (ret)
++			return ret;
++	} else if (new_bw_state->pipe_sagv_reject != old_bw_state->pipe_sagv_reject) {
++		ret = intel_atomic_lock_global_state(&new_bw_state->base);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
+ int intel_bw_atomic_check(struct intel_atomic_state *state)
+ {
+ 	struct intel_display *display = to_intel_display(state);
+diff --git a/drivers/gpu/drm/i915/display/intel_bw.h b/drivers/gpu/drm/i915/display/intel_bw.h
+index ac435674c3ed..ee1d437340f3 100644
+--- a/drivers/gpu/drm/i915/display/intel_bw.h
++++ b/drivers/gpu/drm/i915/display/intel_bw.h
+@@ -67,6 +67,7 @@ intel_atomic_get_bw_state(struct intel_atomic_state *state);
+ void intel_bw_init_hw(struct intel_display *display);
+ int intel_bw_init(struct intel_display *display);
+ int intel_bw_modeset_checks(struct intel_atomic_state *state);
++int intel_bw_check_sagv_mask(struct intel_atomic_state *state);
+ int intel_bw_atomic_check(struct intel_atomic_state *state);
+ int icl_pcode_restrict_qgv_points(struct intel_display *display,
+ 				  u32 points_mask);
+diff --git a/drivers/gpu/drm/i915/display/skl_watermark.c b/drivers/gpu/drm/i915/display/skl_watermark.c
+index 1da1bfeadd9c..747b2b5c31bd 100644
+--- a/drivers/gpu/drm/i915/display/skl_watermark.c
++++ b/drivers/gpu/drm/i915/display/skl_watermark.c
+@@ -426,7 +426,7 @@ static bool tgl_crtc_can_enable_sagv(const struct intel_crtc_state *crtc_state)
+ 	return true;
+ }
+ 
+-static bool intel_crtc_can_enable_sagv(const struct intel_crtc_state *crtc_state)
++bool intel_crtc_can_enable_sagv(const struct intel_crtc_state *crtc_state)
+ {
+ 	struct intel_crtc *crtc = to_intel_crtc(crtc_state->uapi.crtc);
+ 	struct drm_i915_private *i915 = to_i915(crtc->base.dev);
+@@ -457,20 +457,12 @@ static int intel_compute_sagv_mask(struct intel_atomic_state *state)
+ 	int ret;
+ 	struct intel_crtc *crtc;
+ 	struct intel_crtc_state *new_crtc_state;
+-	struct intel_bw_state *new_bw_state = NULL;
+-	const struct intel_bw_state *old_bw_state = NULL;
+ 	int i;
+ 
+ 	for_each_new_intel_crtc_in_state(state, crtc,
+ 					 new_crtc_state, i) {
+ 		struct skl_pipe_wm *pipe_wm = &new_crtc_state->wm.skl.optimal;
+ 
+-		new_bw_state = intel_atomic_get_bw_state(state);
+-		if (IS_ERR(new_bw_state))
+-			return PTR_ERR(new_bw_state);
+-
+-		old_bw_state = intel_atomic_get_old_bw_state(state);
+-
+ 		/*
+ 		 * We store use_sagv_wm in the crtc state rather than relying on
+ 		 * that bw state since we have no convenient way to get at the
+@@ -491,26 +483,11 @@ static int intel_compute_sagv_mask(struct intel_atomic_state *state)
+ 		pipe_wm->use_sagv_wm = !HAS_HW_SAGV_WM(display) &&
+ 			DISPLAY_VER(i915) >= 12 &&
+ 			intel_crtc_can_enable_sagv(new_crtc_state);
+-
+-		if (intel_crtc_can_enable_sagv(new_crtc_state))
+-			new_bw_state->pipe_sagv_reject &= ~BIT(crtc->pipe);
+-		else
+-			new_bw_state->pipe_sagv_reject |= BIT(crtc->pipe);
+ 	}
+ 
+-	if (!new_bw_state)
+-		return 0;
+-
+-	if (intel_can_enable_sagv(i915, new_bw_state) !=
+-	    intel_can_enable_sagv(i915, old_bw_state)) {
+-		ret = intel_atomic_serialize_global_state(&new_bw_state->base);
+-		if (ret)
+-			return ret;
+-	} else if (new_bw_state->pipe_sagv_reject != old_bw_state->pipe_sagv_reject) {
+-		ret = intel_atomic_lock_global_state(&new_bw_state->base);
+-		if (ret)
+-			return ret;
+-	}
++	ret = intel_bw_check_sagv_mask(state);
++	if (ret)
++		return ret;
+ 
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/i915/display/skl_watermark.h b/drivers/gpu/drm/i915/display/skl_watermark.h
+index d9cff6c54310..7e8107f808b6 100644
+--- a/drivers/gpu/drm/i915/display/skl_watermark.h
++++ b/drivers/gpu/drm/i915/display/skl_watermark.h
+@@ -27,6 +27,7 @@ u8 intel_enabled_dbuf_slices_mask(struct intel_display *display);
+ 
+ void intel_sagv_pre_plane_update(struct intel_atomic_state *state);
+ void intel_sagv_post_plane_update(struct intel_atomic_state *state);
++bool intel_crtc_can_enable_sagv(const struct intel_crtc_state *crtc_state);
+ bool intel_can_enable_sagv(struct drm_i915_private *i915,
+ 			   const struct intel_bw_state *bw_state);
+ bool intel_has_sagv(struct drm_i915_private *i915);
+-- 
+2.52.0
+
