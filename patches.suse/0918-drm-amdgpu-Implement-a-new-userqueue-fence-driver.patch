@@ -1,0 +1,505 @@
+From 97ff1946253971376665ad6d90f8fb23b1288025 Mon Sep 17 00:00:00 2001
+From: Arunpravin Paneer Selvam <Arunpravin.PaneerSelvam@amd.com>
+Date: Fri, 25 Oct 2024 15:41:53 +0530
+Subject: drm/amdgpu: Implement a new userqueue fence driver
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 97ff1946253971376665ad6d90f8fb23b1288025
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Developed a userqueue fence driver for the userqueue process shared
+BO synchronization.
+
+Create a dma fence having write pointer as the seqno and allocate a
+seq64 memory for each user queue process and feed this memory address
+into the firmware/hardware, thus the firmware writes the read pointer
+into the given address when the process completes it execution.
+Compare wptr and rptr, if rptr >= wptr, signal the fences for the waiting
+process to consume the buffers.
+
+V2: Worked on review comments from Christian for the following
+    modifications
+
+    - Add wptr as sequence number into the fence
+    - Add a reference count for the fence driver
+    - Add dma_fence_put below the list_del as it might
+      frees the userq fence.
+    - Trim unnecessary code in interrupt handler.
+    - Check dma fence signaled state in dma fence creation
+      function for a potential problem of hardware completing
+      the job processing beforehand.
+    - Add necessary locks.
+    - Create a list and process all the unsignaled fences.
+    - clean up fences in destroy function.
+    - implement .signaled callback function
+
+V3: Worked on review comments from Christian
+    - Modify naming convention for reference counted objects
+    - Fix fence driver reference drop issue
+    - Drop amdgpu_userq_fence_driver_process() function return value
+
+V4: Worked on review comments from Christian
+    - Moved fence driver allocation into amdgpu_userq_fence_driver_alloc()
+    - Added detail doc mentioning the differences b/w
+      two spinlocks declared.
+
+V5: Worked on review comments from Christian
+    - Check before upcast and remove local variable
+    - Add error handling in fence_drv alloc function.
+    - Move rptr read fn outside of the loop and remove WARN_ON in
+      destroy function.
+
+V6: - clear the seq64 memory in user fence driver(Christian)
+  - fix for the wptr va bo mapping(Christian)
+  - move the fence_drv xa entry erase code from the interrupt handler
+    into user fence destroy function
+
+Signed-off-by: Arunpravin Paneer Selvam <Arunpravin.PaneerSelvam@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Suggested-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/Makefile           |   2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c       |   6 +
+ .../gpu/drm/amd/amdgpu/amdgpu_userq_fence.c   | 257 ++++++++++++++++++
+ .../gpu/drm/amd/amdgpu/amdgpu_userq_fence.h   |  69 +++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c |   8 +
+ .../gpu/drm/amd/include/amdgpu_userqueue.h    |   1 +
+ 6 files changed, 342 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.c
+ create mode 100644 drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.h
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/Makefile b/drivers/gpu/drm/amd/amdgpu/Makefile
+index 376e8f5396ae..1cc307904089 100644
+--- a/drivers/gpu/drm/amd/amdgpu/Makefile
++++ b/drivers/gpu/drm/amd/amdgpu/Makefile
+@@ -66,7 +66,7 @@ amdgpu-y += amdgpu_device.o amdgpu_doorbell_mgr.o amdgpu_kms.o \
+ 	amdgpu_fw_attestation.o amdgpu_securedisplay.o \
+ 	amdgpu_eeprom.o amdgpu_mca.o amdgpu_psp_ta.o amdgpu_lsdma.o \
+ 	amdgpu_ring_mux.o amdgpu_xcp.o amdgpu_seq64.o amdgpu_aca.o amdgpu_dev_coredump.o \
+-	amdgpu_cper.o
++	amdgpu_cper.o amdgpu_userq_fence.o
+ 
+ amdgpu-$(CONFIG_PROC_FS) += amdgpu_fdinfo.o
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+index d9ddeeb2900c..7f7c59d56a04 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+@@ -52,6 +52,7 @@
+ #include "amdgpu_sched.h"
+ #include "amdgpu_xgmi.h"
+ #include "amdgpu_userqueue.h"
++#include "amdgpu_userq_fence.h"
+ #include "../amdxcp/amdgpu_xcp_drv.h"
+ 
+ /*
+@@ -3043,6 +3044,10 @@ static int __init amdgpu_init(void)
+ 	if (r)
+ 		goto error_fence;
+ 
++	r = amdgpu_userq_fence_slab_init();
++	if (r)
++		goto error_fence;
++
+ 	DRM_INFO("amdgpu kernel modesetting enabled.\n");
+ 	amdgpu_register_atpx_handler();
+ 	amdgpu_acpi_detect();
+@@ -3074,6 +3079,7 @@ static void __exit amdgpu_exit(void)
+ 	amdgpu_acpi_release();
+ 	amdgpu_sync_fini();
+ 	amdgpu_fence_slab_fini();
++	amdgpu_userq_fence_slab_fini();
+ 	mmu_notifier_synchronize();
+ 	amdgpu_xcp_drv_release();
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.c
+new file mode 100644
+index 000000000000..f7baea2c67ab
+--- /dev/null
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.c
+@@ -0,0 +1,257 @@
++// SPDX-License-Identifier: MIT
++/*
++ * Copyright 2023 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++
++#include <linux/kref.h>
++#include <linux/slab.h>
++
++#include <drm/drm_syncobj.h>
++
++#include "amdgpu.h"
++#include "amdgpu_userq_fence.h"
++
++static const struct dma_fence_ops amdgpu_userq_fence_ops;
++static struct kmem_cache *amdgpu_userq_fence_slab;
++
++int amdgpu_userq_fence_slab_init(void)
++{
++	amdgpu_userq_fence_slab = kmem_cache_create("amdgpu_userq_fence",
++						    sizeof(struct amdgpu_userq_fence),
++						    0,
++						    SLAB_HWCACHE_ALIGN,
++						    NULL);
++	if (!amdgpu_userq_fence_slab)
++		return -ENOMEM;
++
++	return 0;
++}
++
++void amdgpu_userq_fence_slab_fini(void)
++{
++	rcu_barrier();
++	kmem_cache_destroy(amdgpu_userq_fence_slab);
++}
++
++static inline struct amdgpu_userq_fence *to_amdgpu_userq_fence(struct dma_fence *f)
++{
++	if (!f || f->ops != &amdgpu_userq_fence_ops)
++		return NULL;
++
++	return container_of(f, struct amdgpu_userq_fence, base);
++}
++
++static u64 amdgpu_userq_fence_read(struct amdgpu_userq_fence_driver *fence_drv)
++{
++	return le64_to_cpu(*fence_drv->cpu_addr);
++}
++
++int amdgpu_userq_fence_driver_alloc(struct amdgpu_device *adev,
++				    struct amdgpu_usermode_queue *userq)
++{
++	struct amdgpu_userq_fence_driver *fence_drv;
++	int r;
++
++	fence_drv = kzalloc(sizeof(*fence_drv), GFP_KERNEL);
++	if (!fence_drv) {
++		DRM_ERROR("Failed to allocate memory for fence driver\n");
++		return -ENOMEM;
++	}
++
++	/* Acquire seq64 memory */
++	r = amdgpu_seq64_alloc(adev, &fence_drv->gpu_addr,
++			       &fence_drv->cpu_addr);
++	if (r) {
++		kfree(fence_drv);
++		return -ENOMEM;
++	}
++
++	memset(fence_drv->cpu_addr, 0, sizeof(u64));
++
++	kref_init(&fence_drv->refcount);
++	INIT_LIST_HEAD(&fence_drv->fences);
++	spin_lock_init(&fence_drv->fence_list_lock);
++
++	fence_drv->adev = adev;
++	fence_drv->context = dma_fence_context_alloc(1);
++	get_task_comm(fence_drv->timeline_name, current);
++
++	userq->fence_drv = fence_drv;
++
++	return 0;
++}
++
++void amdgpu_userq_fence_driver_process(struct amdgpu_userq_fence_driver *fence_drv)
++{
++	struct amdgpu_userq_fence *userq_fence, *tmp;
++	struct dma_fence *fence;
++	u64 rptr;
++
++	if (!fence_drv)
++		return;
++
++	rptr = amdgpu_userq_fence_read(fence_drv);
++
++	spin_lock(&fence_drv->fence_list_lock);
++	list_for_each_entry_safe(userq_fence, tmp, &fence_drv->fences, link) {
++		fence = &userq_fence->base;
++
++		if (rptr >= fence->seqno) {
++			dma_fence_signal(fence);
++			list_del(&userq_fence->link);
++
++			dma_fence_put(fence);
++		} else {
++			break;
++		}
++	}
++	spin_unlock(&fence_drv->fence_list_lock);
++}
++
++void amdgpu_userq_fence_driver_destroy(struct kref *ref)
++{
++	struct amdgpu_userq_fence_driver *fence_drv = container_of(ref,
++					 struct amdgpu_userq_fence_driver,
++					 refcount);
++	struct amdgpu_device *adev = fence_drv->adev;
++	struct amdgpu_userq_fence *fence, *tmp;
++	struct dma_fence *f;
++
++	spin_lock(&fence_drv->fence_list_lock);
++	list_for_each_entry_safe(fence, tmp, &fence_drv->fences, link) {
++		f = &fence->base;
++
++		if (!dma_fence_is_signaled(f)) {
++			dma_fence_set_error(f, -ECANCELED);
++			dma_fence_signal(f);
++		}
++
++		list_del(&fence->link);
++		dma_fence_put(f);
++	}
++	spin_unlock(&fence_drv->fence_list_lock);
++
++	/* Free seq64 memory */
++	amdgpu_seq64_free(adev, fence_drv->gpu_addr);
++	kfree(fence_drv);
++}
++
++void amdgpu_userq_fence_driver_get(struct amdgpu_userq_fence_driver *fence_drv)
++{
++	kref_get(&fence_drv->refcount);
++}
++
++void amdgpu_userq_fence_driver_put(struct amdgpu_userq_fence_driver *fence_drv)
++{
++	kref_put(&fence_drv->refcount, amdgpu_userq_fence_driver_destroy);
++}
++
++int amdgpu_userq_fence_create(struct amdgpu_usermode_queue *userq,
++			      u64 seq, struct dma_fence **f)
++{
++	struct amdgpu_userq_fence_driver *fence_drv;
++	struct amdgpu_userq_fence *userq_fence;
++	struct dma_fence *fence;
++
++	fence_drv = userq->fence_drv;
++	if (!fence_drv)
++		return -EINVAL;
++
++	userq_fence = kmem_cache_alloc(amdgpu_userq_fence_slab, GFP_ATOMIC);
++	if (!userq_fence)
++		return -ENOMEM;
++
++	spin_lock_init(&userq_fence->lock);
++	INIT_LIST_HEAD(&userq_fence->link);
++	fence = &userq_fence->base;
++	userq_fence->fence_drv = fence_drv;
++
++	dma_fence_init(fence, &amdgpu_userq_fence_ops, &userq_fence->lock,
++		       fence_drv->context, seq);
++
++	amdgpu_userq_fence_driver_get(fence_drv);
++	dma_fence_get(fence);
++
++	spin_lock(&fence_drv->fence_list_lock);
++	/* Check if hardware has already processed the job */
++	if (!dma_fence_is_signaled(fence))
++		list_add_tail(&userq_fence->link, &fence_drv->fences);
++	else
++		dma_fence_put(fence);
++
++	spin_unlock(&fence_drv->fence_list_lock);
++
++	*f = fence;
++
++	return 0;
++}
++
++static const char *amdgpu_userq_fence_get_driver_name(struct dma_fence *f)
++{
++	return "amdgpu_userqueue_fence";
++}
++
++static const char *amdgpu_userq_fence_get_timeline_name(struct dma_fence *f)
++{
++	struct amdgpu_userq_fence *fence = to_amdgpu_userq_fence(f);
++
++	return fence->fence_drv->timeline_name;
++}
++
++static bool amdgpu_userq_fence_signaled(struct dma_fence *f)
++{
++	struct amdgpu_userq_fence *fence = to_amdgpu_userq_fence(f);
++	struct amdgpu_userq_fence_driver *fence_drv = fence->fence_drv;
++	u64 rptr, wptr;
++
++	rptr = amdgpu_userq_fence_read(fence_drv);
++	wptr = fence->base.seqno;
++
++	if (rptr >= wptr)
++		return true;
++
++	return false;
++}
++
++static void amdgpu_userq_fence_free(struct rcu_head *rcu)
++{
++	struct dma_fence *fence = container_of(rcu, struct dma_fence, rcu);
++	struct amdgpu_userq_fence *userq_fence = to_amdgpu_userq_fence(fence);
++	struct amdgpu_userq_fence_driver *fence_drv = userq_fence->fence_drv;
++
++	/* Release the fence driver reference */
++	amdgpu_userq_fence_driver_put(fence_drv);
++	kmem_cache_free(amdgpu_userq_fence_slab, userq_fence);
++}
++
++static void amdgpu_userq_fence_release(struct dma_fence *f)
++{
++	call_rcu(&f->rcu, amdgpu_userq_fence_free);
++}
++
++static const struct dma_fence_ops amdgpu_userq_fence_ops = {
++	.use_64bit_seqno = true,
++	.get_driver_name = amdgpu_userq_fence_get_driver_name,
++	.get_timeline_name = amdgpu_userq_fence_get_timeline_name,
++	.signaled = amdgpu_userq_fence_signaled,
++	.release = amdgpu_userq_fence_release,
++};
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.h
+new file mode 100644
+index 000000000000..c3e04cdbb9e7
+--- /dev/null
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.h
+@@ -0,0 +1,69 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * Copyright 2023 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++
++#ifndef __AMDGPU_USERQ_FENCE_H__
++#define __AMDGPU_USERQ_FENCE_H__
++
++#include <linux/types.h>
++
++#include "amdgpu_userqueue.h"
++
++struct amdgpu_userq_fence {
++	struct dma_fence base;
++	/*
++	 * This lock is necessary to synchronize the
++	 * userqueue dma fence operations.
++	 */
++	spinlock_t lock;
++	struct list_head link;
++	struct amdgpu_userq_fence_driver *fence_drv;
++};
++
++struct amdgpu_userq_fence_driver {
++	struct kref refcount;
++	u64 gpu_addr;
++	u64 *cpu_addr;
++	u64 context;
++	/*
++	 * This lock is necesaary to synchronize the access
++	 * to the fences list by the fence driver.
++	 */
++	spinlock_t fence_list_lock;
++	struct list_head fences;
++	struct amdgpu_device *adev;
++	char timeline_name[TASK_COMM_LEN];
++};
++
++int amdgpu_userq_fence_slab_init(void);
++void amdgpu_userq_fence_slab_fini(void);
++int amdgpu_userq_fence_create(struct amdgpu_usermode_queue *userq,
++			      u64 seq, struct dma_fence **f);
++void amdgpu_userq_fence_driver_get(struct amdgpu_userq_fence_driver *fence_drv);
++void amdgpu_userq_fence_driver_put(struct amdgpu_userq_fence_driver *fence_drv);
++int amdgpu_userq_fence_driver_alloc(struct amdgpu_device *adev,
++				    struct amdgpu_usermode_queue *userq);
++void amdgpu_userq_fence_driver_process(struct amdgpu_userq_fence_driver *fence_drv);
++void amdgpu_userq_fence_driver_destroy(struct kref *ref);
++
++#endif
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c
+index 21e805530a6a..bcd86c1b3a75 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c
+@@ -25,6 +25,7 @@
+ #include "amdgpu.h"
+ #include "amdgpu_vm.h"
+ #include "amdgpu_userqueue.h"
++#include "amdgpu_userq_fence.h"
+ 
+ static void
+ amdgpu_userqueue_cleanup(struct amdgpu_userq_mgr *uq_mgr,
+@@ -35,6 +36,7 @@ amdgpu_userqueue_cleanup(struct amdgpu_userq_mgr *uq_mgr,
+ 	const struct amdgpu_userq_funcs *uq_funcs = adev->userq_funcs[queue->queue_type];
+ 
+ 	uq_funcs->mqd_destroy(uq_mgr, queue);
++	amdgpu_userq_fence_driver_put(queue->fence_drv);
+ 	idr_remove(&uq_mgr->userq_idr, queue_id);
+ 	kfree(queue);
+ }
+@@ -232,6 +234,12 @@ amdgpu_userqueue_create(struct drm_file *filp, union drm_amdgpu_userq *args)
+ 	}
+ 	queue->doorbell_index = index;
+ 
++	r = amdgpu_userq_fence_driver_alloc(adev, queue);
++	if (r) {
++		DRM_ERROR("Failed to alloc fence driver\n");
++		goto unlock;
++	}
++
+ 	r = uq_funcs->mqd_create(uq_mgr, &args->in, queue);
+ 	if (r) {
+ 		DRM_ERROR("Failed to create Queue\n");
+diff --git a/drivers/gpu/drm/amd/include/amdgpu_userqueue.h b/drivers/gpu/drm/amd/include/amdgpu_userqueue.h
+index a653e31350c5..76a59c350c2a 100644
+--- a/drivers/gpu/drm/amd/include/amdgpu_userqueue.h
++++ b/drivers/gpu/drm/amd/include/amdgpu_userqueue.h
+@@ -47,6 +47,7 @@ struct amdgpu_usermode_queue {
+ 	struct amdgpu_userq_obj	db_obj;
+ 	struct amdgpu_userq_obj fw_obj;
+ 	struct amdgpu_userq_obj wptr_obj;
++	struct amdgpu_userq_fence_driver *fence_drv;
+ };
+ 
+ struct amdgpu_userq_funcs {
+-- 
+2.52.0
+
