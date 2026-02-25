@@ -1,0 +1,263 @@
+From e3d0870a90a8e3f63c486438ac6a77ab828f8d8d Mon Sep 17 00:00:00 2001
+From: Amber Lin <Amber.Lin@amd.com>
+Date: Tue, 29 Apr 2025 16:11:55 -0400
+Subject: drm/amdkfd: Support chain runlists of XNACK+/XNACK-
+Git-commit: e3d0870a90a8e3f63c486438ac6a77ab828f8d8d
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+If the MEC firmware supports chaining runlists of XNACK+/XNACK-
+processes, set SQ_CONFIG1 chicken bit and SET_RESOURCES bit 28.
+
+When the MEC/HWS supports it, KFD checks the XNACK+/XNACK- processes mix
+happens or not. If it does, enter over-subscription.
+
+Signed-off-by: Amber Lin <Amber.Lin@amd.com>
+Reviewed-by: Philip Yang <Philip.Yang@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h       |  4 ++
+ drivers/gpu/drm/amd/amdgpu/gfx_v9_4_3.c       | 31 ++++++++++
+ .../gpu/drm/amd/amdkfd/kfd_packet_manager.c   | 56 +++++++++++++++----
+ .../drm/amd/amdkfd/kfd_packet_manager_v9.c    |  2 +
+ .../gpu/drm/amd/amdkfd/kfd_pm4_headers_ai.h   |  3 +-
+ 5 files changed, 84 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h
+index bd7fc123b8f9..80fa29c26e9e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h
+@@ -62,6 +62,9 @@
+  */
+ #define AMDGPU_GMC_FAULT_TIMEOUT	5000ULL
+ 
++/* XNACK flags */
++#define AMDGPU_GMC_XNACK_FLAG_CHAIN BIT(0)
++
+ struct firmware;
+ 
+ enum amdgpu_memory_partition {
+@@ -301,6 +304,7 @@ struct amdgpu_gmc {
+ 	struct amdgpu_xgmi xgmi;
+ 	struct amdgpu_irq_src	ecc_irq;
+ 	int noretry;
++	uint32_t xnack_flags;
+ 
+ 	uint32_t	vmid0_page_table_block_size;
+ 	uint32_t	vmid0_page_table_depth;
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v9_4_3.c b/drivers/gpu/drm/amd/amdgpu/gfx_v9_4_3.c
+index e6d516b1efd9..c233edf60569 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v9_4_3.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v9_4_3.c
+@@ -1273,6 +1273,22 @@ static void gfx_v9_4_3_xcc_init_gds_vmid(struct amdgpu_device *adev, int xcc_id)
+ 	}
+ }
+ 
++/* For ASICs that needs xnack chain and MEC version supports, set SG_CONFIG1
++ * DISABLE_XNACK_CHECK_IN_RETRY_DISABLE bit and inform KFD to set xnack_chain
++ * bit in SET_RESOURCES
++ */
++static void gfx_v9_4_3_xcc_init_sq(struct amdgpu_device *adev, int xcc_id)
++{
++	uint32_t data;
++
++	if (!(adev->gmc.xnack_flags & AMDGPU_GMC_XNACK_FLAG_CHAIN))
++		return;
++
++	data = RREG32_SOC15(GC, GET_INST(GC, xcc_id), regSQ_CONFIG1);
++	data = REG_SET_FIELD(data, SQ_CONFIG1, DISABLE_XNACK_CHECK_IN_RETRY_DISABLE, 1);
++	WREG32_SOC15(GC, xcc_id, regSQ_CONFIG1, data);
++}
++
+ static void gfx_v9_4_3_xcc_constants_init(struct amdgpu_device *adev,
+ 					  int xcc_id)
+ {
+@@ -1317,6 +1333,7 @@ static void gfx_v9_4_3_xcc_constants_init(struct amdgpu_device *adev,
+ 
+ 	gfx_v9_4_3_xcc_init_compute_vmid(adev, xcc_id);
+ 	gfx_v9_4_3_xcc_init_gds_vmid(adev, xcc_id);
++	gfx_v9_4_3_xcc_init_sq(adev, xcc_id);
+ }
+ 
+ static void gfx_v9_4_3_constants_init(struct amdgpu_device *adev)
+@@ -1329,6 +1346,20 @@ static void gfx_v9_4_3_constants_init(struct amdgpu_device *adev)
+ 	adev->gfx.config.db_debug2 =
+ 		RREG32_SOC15(GC, GET_INST(GC, 0), regDB_DEBUG2);
+ 
++	switch (amdgpu_ip_version(adev, GC_HWIP, 0)) {
++	/* ToDo: GC 9.4.4 */
++	case IP_VERSION(9, 4, 3):
++		if (adev->gfx.mec_fw_version >= 184)
++			adev->gmc.xnack_flags |= AMDGPU_GMC_XNACK_FLAG_CHAIN;
++		break;
++	case IP_VERSION(9, 5, 0):
++		if (adev->gfx.mec_fw_version >= 23)
++			adev->gmc.xnack_flags |= AMDGPU_GMC_XNACK_FLAG_CHAIN;
++		break;
++	default:
++		break;
++	}
++
+ 	for (i = 0; i < num_xcc; i++)
+ 		gfx_v9_4_3_xcc_constants_init(adev, i);
+ }
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_packet_manager.c b/drivers/gpu/drm/amd/amdkfd/kfd_packet_manager.c
+index 271c567242ab..b1a6eb349bb3 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_packet_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_packet_manager.c
+@@ -31,6 +31,7 @@
+ #define OVER_SUBSCRIPTION_PROCESS_COUNT (1 << 0)
+ #define OVER_SUBSCRIPTION_COMPUTE_QUEUE_COUNT (1 << 1)
+ #define OVER_SUBSCRIPTION_GWS_QUEUE_COUNT (1 << 2)
++#define OVER_SUBSCRIPTION_XNACK_CONFLICT (1 << 3)
+ 
+ static inline void inc_wptr(unsigned int *wptr, unsigned int increment_bytes,
+ 				unsigned int buffer_size_bytes)
+@@ -44,7 +45,8 @@ static inline void inc_wptr(unsigned int *wptr, unsigned int increment_bytes,
+ 
+ static void pm_calc_rlib_size(struct packet_manager *pm,
+ 				unsigned int *rlib_size,
+-				int *over_subscription)
++				int *over_subscription,
++				int xnack_conflict)
+ {
+ 	unsigned int process_count, queue_count, compute_queue_count, gws_queue_count;
+ 	unsigned int map_queue_size;
+@@ -73,6 +75,8 @@ static void pm_calc_rlib_size(struct packet_manager *pm,
+ 		*over_subscription |= OVER_SUBSCRIPTION_COMPUTE_QUEUE_COUNT;
+ 	if (gws_queue_count > 1)
+ 		*over_subscription |= OVER_SUBSCRIPTION_GWS_QUEUE_COUNT;
++	if (xnack_conflict && (node->adev->gmc.xnack_flags & AMDGPU_GMC_XNACK_FLAG_CHAIN))
++		*over_subscription |= OVER_SUBSCRIPTION_XNACK_CONFLICT;
+ 
+ 	if (*over_subscription)
+ 		dev_dbg(dev, "Over subscribed runlist\n");
+@@ -96,7 +100,8 @@ static int pm_allocate_runlist_ib(struct packet_manager *pm,
+ 				unsigned int **rl_buffer,
+ 				uint64_t *rl_gpu_buffer,
+ 				unsigned int *rl_buffer_size,
+-				int *is_over_subscription)
++				int *is_over_subscription,
++				int xnack_conflict)
+ {
+ 	struct kfd_node *node = pm->dqm->dev;
+ 	struct device *dev = node->adev->dev;
+@@ -105,7 +110,8 @@ static int pm_allocate_runlist_ib(struct packet_manager *pm,
+ 	if (WARN_ON(pm->allocated))
+ 		return -EINVAL;
+ 
+-	pm_calc_rlib_size(pm, rl_buffer_size, is_over_subscription);
++	pm_calc_rlib_size(pm, rl_buffer_size, is_over_subscription,
++				xnack_conflict);
+ 
+ 	mutex_lock(&pm->lock);
+ 
+@@ -142,11 +148,27 @@ static int pm_create_runlist_ib(struct packet_manager *pm,
+ 	struct queue *q;
+ 	struct kernel_queue *kq;
+ 	int is_over_subscription;
++	int xnack_enabled = -1;
++	bool xnack_conflict = 0;
+ 
+ 	rl_wptr = retval = processes_mapped = 0;
+ 
++	/* Check if processes set different xnack modes */
++	list_for_each_entry(cur, queues, list) {
++		qpd = cur->qpd;
++		if (xnack_enabled < 0)
++			/* First process */
++			xnack_enabled = qpd->pqm->process->xnack_enabled;
++		else if (qpd->pqm->process->xnack_enabled != xnack_enabled) {
++			/* Found a process with a different xnack mode */
++			xnack_conflict = 1;
++			break;
++		}
++	}
++
+ 	retval = pm_allocate_runlist_ib(pm, &rl_buffer, rl_gpu_addr,
+-				&alloc_size_bytes, &is_over_subscription);
++				&alloc_size_bytes, &is_over_subscription,
++				xnack_conflict);
+ 	if (retval)
+ 		return retval;
+ 
+@@ -156,9 +178,13 @@ static int pm_create_runlist_ib(struct packet_manager *pm,
+ 	dev_dbg(dev, "Building runlist ib process count: %d queues count %d\n",
+ 		pm->dqm->processes_count, pm->dqm->active_queue_count);
+ 
++build_runlist_ib:
+ 	/* build the run list ib packet */
+ 	list_for_each_entry(cur, queues, list) {
+ 		qpd = cur->qpd;
++		/* group processes with the same xnack mode together */
++		if (qpd->pqm->process->xnack_enabled != xnack_enabled)
++			continue;
+ 		/* build map process packet */
+ 		if (processes_mapped >= pm->dqm->processes_count) {
+ 			dev_dbg(dev, "Not enough space left in runlist IB\n");
+@@ -215,18 +241,26 @@ static int pm_create_runlist_ib(struct packet_manager *pm,
+ 				alloc_size_bytes);
+ 		}
+ 	}
++	if (xnack_conflict) {
++		/* pick up processes with the other xnack mode */
++		xnack_enabled = !xnack_enabled;
++		xnack_conflict = 0;
++		goto build_runlist_ib;
++	}
+ 
+ 	dev_dbg(dev, "Finished map process and queues to runlist\n");
+ 
+ 	if (is_over_subscription) {
+ 		if (!pm->is_over_subscription)
+-			dev_warn(dev, "Runlist is getting oversubscribed due to%s%s%s. Expect reduced ROCm performance.\n",
+-				 is_over_subscription & OVER_SUBSCRIPTION_PROCESS_COUNT ?
+-				 " too many processes." : "",
+-				 is_over_subscription & OVER_SUBSCRIPTION_COMPUTE_QUEUE_COUNT ?
+-				 " too many queues." : "",
+-				 is_over_subscription & OVER_SUBSCRIPTION_GWS_QUEUE_COUNT ?
+-				 " multiple processes using cooperative launch." : "");
++			dev_warn(dev, "Runlist is getting oversubscribed due to%s%s%s%s. Expect reduced ROCm performance.\n",
++				is_over_subscription & OVER_SUBSCRIPTION_PROCESS_COUNT ?
++				" too many processes" : "",
++				is_over_subscription & OVER_SUBSCRIPTION_COMPUTE_QUEUE_COUNT ?
++				" too many queues" : "",
++				is_over_subscription & OVER_SUBSCRIPTION_GWS_QUEUE_COUNT ?
++				" multiple processes using cooperative launch" : "",
++				is_over_subscription & OVER_SUBSCRIPTION_XNACK_CONFLICT ?
++				" xnack on/off processes mixed on gfx9" : "");
+ 
+ 		retval = pm->pmf->runlist(pm, &rl_buffer[rl_wptr],
+ 					*rl_gpu_addr,
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_packet_manager_v9.c b/drivers/gpu/drm/amd/amdkfd/kfd_packet_manager_v9.c
+index fa28c57692b8..8fa6489b6f5d 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_packet_manager_v9.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_packet_manager_v9.c
+@@ -203,6 +203,8 @@ static int pm_set_resources_v9(struct packet_manager *pm, uint32_t *buffer,
+ 			queue_type__mes_set_resources__hsa_interface_queue_hiq;
+ 	packet->bitfields2.vmid_mask = res->vmid_mask;
+ 	packet->bitfields2.unmap_latency = KFD_UNMAP_LATENCY_MS / 100;
++	if (pm->dqm->dev->adev->gmc.xnack_flags & AMDGPU_GMC_XNACK_FLAG_CHAIN)
++		packet->bitfields2.enb_xnack_retry_disable_check = 1;
+ 	packet->bitfields7.oac_mask = res->oac_mask;
+ 	packet->bitfields8.gds_heap_base = res->gds_heap_base;
+ 	packet->bitfields8.gds_heap_size = res->gds_heap_size;
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_pm4_headers_ai.h b/drivers/gpu/drm/amd/amdkfd/kfd_pm4_headers_ai.h
+index cd8611401a66..e356a207d03c 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_pm4_headers_ai.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_pm4_headers_ai.h
+@@ -63,7 +63,8 @@ struct pm4_mes_set_resources {
+ 		struct {
+ 			uint32_t vmid_mask:16;
+ 			uint32_t unmap_latency:8;
+-			uint32_t reserved1:5;
++			uint32_t reserved1:4;
++			uint32_t enb_xnack_retry_disable_check:1;
+ 			enum mes_set_resources_queue_type_enum queue_type:3;
+ 		} bitfields2;
+ 		uint32_t ordinal2;
+-- 
+2.52.0
+
