@@ -1,0 +1,123 @@
+From f0a1ab65d90420f2817569bbf67111feb8e6821e Mon Sep 17 00:00:00 2001
+From: Matt Coster <matt.coster@imgtec.com>
+Date: Thu, 10 Apr 2025 10:55:14 +0100
+Subject: drm/imagination: Use cached memory with dma_coherent
+Git-commit: f0a1ab65d90420f2817569bbf67111feb8e6821e
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+The TI k3-j721s2 platform does not allow us to use uncached memory
+(which is what the driver currently does) without disabling cache snooping
+on the AXI ACE-Lite interface, which would be too much of a performance
+hit.
+
+Given the platform is dma-coherent, we can simply force all
+device-accessible memory allocations through the CPU cache. In fact, this
+can be done whenever the dma_coherent attribute is present.
+
+Reviewed-by: Frank Binns <frank.binns@imgtec.com>
+Link: https://lore.kernel.org/r/20250410-sets-bxs-4-64-patch-v1-v6-15-eda620c5865f@imgtec.com
+Signed-off-by: Matt Coster <matt.coster@imgtec.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/imagination/pvr_gem.c | 10 +++++++---
+ drivers/gpu/drm/imagination/pvr_gem.h |  6 ++++--
+ drivers/gpu/drm/imagination/pvr_mmu.c |  8 +++++++-
+ 3 files changed, 18 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/imagination/pvr_gem.c b/drivers/gpu/drm/imagination/pvr_gem.c
+index f692a4187550..a66cf082af24 100644
+--- a/drivers/gpu/drm/imagination/pvr_gem.c
++++ b/drivers/gpu/drm/imagination/pvr_gem.c
+@@ -19,6 +19,7 @@
+ #include <linux/log2.h>
+ #include <linux/mutex.h>
+ #include <linux/pagemap.h>
++#include <linux/property.h>
+ #include <linux/refcount.h>
+ #include <linux/scatterlist.h>
+ 
+@@ -334,6 +335,7 @@ struct drm_gem_object *pvr_gem_create_object(struct drm_device *drm_dev, size_t
+ struct pvr_gem_object *
+ pvr_gem_object_create(struct pvr_device *pvr_dev, size_t size, u64 flags)
+ {
++	struct drm_device *drm_dev = from_pvr_device(pvr_dev);
+ 	struct drm_gem_shmem_object *shmem_obj;
+ 	struct pvr_gem_object *pvr_obj;
+ 	struct sg_table *sgt;
+@@ -343,7 +345,10 @@ pvr_gem_object_create(struct pvr_device *pvr_dev, size_t size, u64 flags)
+ 	if (size == 0 || !pvr_gem_object_flags_validate(flags))
+ 		return ERR_PTR(-EINVAL);
+ 
+-	shmem_obj = drm_gem_shmem_create(from_pvr_device(pvr_dev), size);
++	if (device_get_dma_attr(drm_dev->dev) == DEV_DMA_COHERENT)
++		flags |= PVR_BO_CPU_CACHED;
++
++	shmem_obj = drm_gem_shmem_create(drm_dev, size);
+ 	if (IS_ERR(shmem_obj))
+ 		return ERR_CAST(shmem_obj);
+ 
+@@ -358,8 +363,7 @@ pvr_gem_object_create(struct pvr_device *pvr_dev, size_t size, u64 flags)
+ 		goto err_shmem_object_free;
+ 	}
+ 
+-	dma_sync_sgtable_for_device(shmem_obj->base.dev->dev, sgt,
+-				    DMA_BIDIRECTIONAL);
++	dma_sync_sgtable_for_device(drm_dev->dev, sgt, DMA_BIDIRECTIONAL);
+ 
+ 	/*
+ 	 * Do this last because pvr_gem_object_zero() requires a fully
+diff --git a/drivers/gpu/drm/imagination/pvr_gem.h b/drivers/gpu/drm/imagination/pvr_gem.h
+index e0e5ea509a2e..c99f30cc6208 100644
+--- a/drivers/gpu/drm/imagination/pvr_gem.h
++++ b/drivers/gpu/drm/imagination/pvr_gem.h
+@@ -44,8 +44,10 @@ struct pvr_file;
+  * Bits not defined anywhere are "undefined".
+  *
+  * CPU mapping options
+- *    :PVR_BO_CPU_CACHED: By default, all GEM objects are mapped write-combined on the CPU. Set this
+- *       flag to override this behaviour and map the object cached.
++ *    :PVR_BO_CPU_CACHED: By default, all GEM objects are mapped write-combined on the CPU. Set
++ *       this flag to override this behaviour and map the object cached. If the dma_coherent
++ *       property is present in devicetree, all allocations will be mapped as if this flag was set.
++ *       This does not require any additional consideration at allocation time.
+  *
+  * Firmware options
+  *    :PVR_BO_FW_NO_CLEAR_ON_RESET: By default, all FW objects are cleared and reinitialised on hard
+diff --git a/drivers/gpu/drm/imagination/pvr_mmu.c b/drivers/gpu/drm/imagination/pvr_mmu.c
+index 4fe70610ed94..450d476d183f 100644
+--- a/drivers/gpu/drm/imagination/pvr_mmu.c
++++ b/drivers/gpu/drm/imagination/pvr_mmu.c
+@@ -17,6 +17,7 @@
+ #include <linux/dma-mapping.h>
+ #include <linux/kmemleak.h>
+ #include <linux/minmax.h>
++#include <linux/property.h>
+ #include <linux/sizes.h>
+ 
+ #define PVR_SHIFT_FROM_SIZE(size_) (__builtin_ctzll(size_))
+@@ -259,6 +260,7 @@ pvr_mmu_backing_page_init(struct pvr_mmu_backing_page *page,
+ 	struct device *dev = from_pvr_device(pvr_dev)->dev;
+ 
+ 	struct page *raw_page;
++	pgprot_t prot;
+ 	int err;
+ 
+ 	dma_addr_t dma_addr;
+@@ -268,7 +270,11 @@ pvr_mmu_backing_page_init(struct pvr_mmu_backing_page *page,
+ 	if (!raw_page)
+ 		return -ENOMEM;
+ 
+-	host_ptr = vmap(&raw_page, 1, VM_MAP, pgprot_writecombine(PAGE_KERNEL));
++	prot = PAGE_KERNEL;
++	if (device_get_dma_attr(dev) != DEV_DMA_COHERENT)
++		prot = pgprot_writecombine(prot);
++
++	host_ptr = vmap(&raw_page, 1, VM_MAP, prot);
+ 	if (!host_ptr) {
+ 		err = -ENOMEM;
+ 		goto err_free_page;
+-- 
+2.52.0
+
