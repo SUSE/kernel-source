@@ -1,0 +1,130 @@
+From: Sean Christopherson <seanjc@google.com>
+Date: Thu, 30 Oct 2025 11:58:01 -0700
+Subject: KVM: x86: Unload "FPU" state on INIT if and only if its currently
+ in-use
+Patch-mainline: v6.18-rc6
+Git-commit: 8819a49f9ff8953475ba09d978d66b50368c095b
+References: jsc#PED-15123
+
+Replace the hack added by commit f958bd2314d1 ("KVM: x86: Fix potential
+put_fpu() w/o load_fpu() on MPX platform") with a more robust approach of
+unloading+reloading guest FPU state based on whether or not the vCPU's FPU
+is currently in-use, i.e. currently loaded.  This fixes a bug on hosts
+that support CET but not MPX, where kvm_arch_vcpu_ioctl_get_mpstate()
+neglects to load FPU state (it only checks for MPX support) and leads to
+KVM attempting to put FPU state due to kvm_apic_accept_events() triggering
+INIT emulation.  E.g. on a host with CET but not MPX, syzkaller+KASAN
+generates:
+
+  Oops: general protection fault, probably for non-canonical address 0xdffffc0000000004: 0000 [#1] SMP KASAN NOPTI
+  KASAN: null-ptr-deref in range [0x0000000000000020-0x0000000000000027]
+  CPU: 211 UID: 0 PID: 20451 Comm: syz.9.26 Tainted: G S                  6.18.0-smp-DEV #7 NONE
+  Tainted: [S]=CPU_OUT_OF_SPEC
+  Hardware name: Google Izumi/izumi, BIOS 0.20250729.1-0 07/29/2025
+  RIP: 0010:fpu_swap_kvm_fpstate+0x3ce/0x610 ../arch/x86/kernel/fpu/core.c:377
+  RSP: 0018:ff1100410c167cc0 EFLAGS: 00010202
+  RAX: 0000000000000004 RBX: 0000000000000020 RCX: 00000000000001aa
+  RDX: 00000000000001ab RSI: ffffffff817bb960 RDI: 0000000022600000
+  RBP: dffffc0000000000 R08: ff110040d23c8007 R09: 1fe220081a479000
+  R10: dffffc0000000000 R11: ffe21c081a479001 R12: ff110040d23c8d98
+  R13: 00000000fffdc578 R14: 0000000000000000 R15: ff110040d23c8d90
+  FS:  00007f86dd1876c0(0000) GS:ff11007fc969b000(0000) knlGS:0000000000000000
+  CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+  CR2: 00007f86dd186fa8 CR3: 00000040d1dfa003 CR4: 0000000000f73ef0
+  PKRU: 80000000
+  Call Trace:
+   <TASK>
+   kvm_vcpu_reset+0x80d/0x12c0 ../arch/x86/kvm/x86.c:11818
+   kvm_apic_accept_events+0x1cb/0x500 ../arch/x86/kvm/lapic.c:3489
+   kvm_arch_vcpu_ioctl_get_mpstate+0xd0/0x4e0 ../arch/x86/kvm/x86.c:12145
+   kvm_vcpu_ioctl+0x5e2/0xed0 ../virt/kvm/kvm_main.c:4539
+   __se_sys_ioctl+0x11d/0x1b0 ../fs/ioctl.c:51
+   do_syscall_x64 ../arch/x86/entry/syscall_64.c:63 [inline]
+   do_syscall_64+0x6e/0x940 ../arch/x86/entry/syscall_64.c:94
+   entry_SYSCALL_64_after_hwframe+0x76/0x7e
+  RIP: 0033:0x7f86de71d9c9
+   </TASK>
+
+with a very simple reproducer:
+
+  r0 = openat$kvm(0xffffffffffffff9c, &(0x7f0000000000), 0x80b00, 0x0)
+  r1 = ioctl$KVM_CREATE_VM(r0, 0xae01, 0x0)
+  ioctl$KVM_CREATE_IRQCHIP(r1, 0xae60)
+  r2 = ioctl$KVM_CREATE_VCPU(r1, 0xae41, 0x0)
+  ioctl$KVM_SET_IRQCHIP(r1, 0x8208ae63, ...)
+  ioctl$KVM_GET_MP_STATE(r2, 0x8004ae98, &(0x7f00000000c0))
+
+Alternatively, the MPX hack in GET_MP_STATE could be extended to cover CET,
+but from a "don't break existing functionality" perspective, that isn't any
+less risky than peeking at the state of in_use, and it's far less robust
+for a long term solution (as evidenced by this bug).
+
+Reported-by: Alexander Potapenko <glider@google.com>
+Fixes: 69cc3e886582 ("KVM: x86: Add XSS support for CET_KERNEL and CET_USER")
+Reviewed-by: Yao Yuan <yaoyuan@linux.alibaba.com>
+Reviewed-by: Chao Gao <chao.gao@intel.com>
+Link: https://patch.msgid.link/20251030185802.3375059-2-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Acked-by: Carlos López <clopez@suse.de>
+---
+ arch/x86/kvm/x86.c |   25 +++++++++++++++----------
+ 1 file changed, 15 insertions(+), 10 deletions(-)
+
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -12220,9 +12220,6 @@ int kvm_arch_vcpu_ioctl_get_mpstate(stru
+ 	int r;
+ 
+ 	vcpu_load(vcpu);
+-	if (kvm_mpx_supported())
+-		kvm_load_guest_fpu(vcpu);
+-
+ 	kvm_vcpu_srcu_read_lock(vcpu);
+ 
+ 	r = kvm_apic_accept_events(vcpu);
+@@ -12239,9 +12236,6 @@ int kvm_arch_vcpu_ioctl_get_mpstate(stru
+ 
+ out:
+ 	kvm_vcpu_srcu_read_unlock(vcpu);
+-
+-	if (kvm_mpx_supported())
+-		kvm_put_guest_fpu(vcpu);
+ 	vcpu_put(vcpu);
+ 	return r;
+ }
+@@ -12869,6 +12863,7 @@ static void kvm_xstate_reset(struct kvm_
+ {
+ 	struct fpstate *fpstate = vcpu->arch.guest_fpu.fpstate;
+ 	u64 xfeatures_mask;
++	bool fpu_in_use;
+ 	int i;
+ 
+ 	/*
+@@ -12892,13 +12887,23 @@ static void kvm_xstate_reset(struct kvm_
+ 	BUILD_BUG_ON(sizeof(xfeatures_mask) * BITS_PER_BYTE <= XFEATURE_MAX);
+ 
+ 	/*
+-	 * All paths that lead to INIT are required to load the guest's FPU
+-	 * state (because most paths are buried in KVM_RUN).
++	 * Unload guest FPU state (if necessary) before zeroing XSTATE fields
++	 * as the kernel can only modify the state when its resident in memory,
++	 * i.e. when it's not loaded into hardware.
++	 *
++	 * WARN if the vCPU's desire to run, i.e. whether or not its in KVM_RUN,
++	 * doesn't match the loaded/in-use state of the FPU, as KVM_RUN is the
++	 * only path that can trigger INIT emulation _and_ loads FPU state, and
++	 * KVM_RUN should _always_ load FPU state.
+ 	 */
+-	kvm_put_guest_fpu(vcpu);
++	WARN_ON_ONCE(vcpu->wants_to_run != fpstate->in_use);
++	fpu_in_use = fpstate->in_use;
++	if (fpu_in_use)
++		kvm_put_guest_fpu(vcpu);
+ 	for_each_set_bit(i, (unsigned long *)&xfeatures_mask, XFEATURE_MAX)
+ 		fpstate_clear_xstate_component(fpstate, i);
+-	kvm_load_guest_fpu(vcpu);
++	if (fpu_in_use)
++		kvm_load_guest_fpu(vcpu);
+ }
+ 
+ void kvm_vcpu_reset(struct kvm_vcpu *vcpu, bool init_event)
