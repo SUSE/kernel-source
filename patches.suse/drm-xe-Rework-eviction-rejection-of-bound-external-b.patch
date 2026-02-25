@@ -1,14 +1,14 @@
 From 5cc3325584c425069c1c3355c775314d64bf8770 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?Thomas=20Hellstr=C3=B6m?= <thomas.hellstrom@linux.intel.com>
 Date: Wed, 28 May 2025 18:41:05 +0200
-Subject: [PATCH] drm/xe: Rework eviction rejection of bound external bos
+Subject: drm/xe: Rework eviction rejection of bound external bos
 Mime-version: 1.0
 Content-type: text/plain; charset=UTF-8
 Content-transfer-encoding: 8bit
 Git-commit: 5cc3325584c425069c1c3355c775314d64bf8770
 Patch-mainline: v6.16-rc1
+References: git-fixes jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
 Alt-commit: 9d5558649f68e2e84a87a909631b30e15ca0f8ec
-References: git-fixes
 
 For preempt_fence mode VM's we're rejecting eviction of
 shared bos during VM_BIND. However, since we do this in the
@@ -35,17 +35,19 @@ Reviewed-by: Matthew Brost <matthew.brost@intel.com>
 Link: https://lore.kernel.org/r/20250528164105.234718-1-thomas.hellstrom@linux.intel.com
 (cherry picked from commit 9d5558649f68e2e84a87a909631b30e15ca0f8ec)
 
-Acked-by: Takashi Iwai <tiwai@suse.de>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
 
 ---
- drivers/gpu/drm/xe/xe_bo.c       |   44 +++++++++++++++---------
- drivers/gpu/drm/xe/xe_vm.h       |   69 +++++++++++++++++++++++++++++++++++++++
- drivers/gpu/drm/xe/xe_vm_types.h |    8 ++++
- 3 files changed, 104 insertions(+), 17 deletions(-)
+ drivers/gpu/drm/xe/xe_bo.c       | 46 ++++++++++++---------
+ drivers/gpu/drm/xe/xe_vm.h       | 69 ++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/xe/xe_vm_types.h |  8 ++++
+ 3 files changed, 105 insertions(+), 18 deletions(-)
 
+diff --git a/drivers/gpu/drm/xe/xe_bo.c b/drivers/gpu/drm/xe/xe_bo.c
+index d99d91fe8aa9..3c48a8c5f439 100644
 --- a/drivers/gpu/drm/xe/xe_bo.c
 +++ b/drivers/gpu/drm/xe/xe_bo.c
-@@ -702,21 +702,6 @@ static int xe_bo_move(struct ttm_buffer_
+@@ -841,21 +841,6 @@ static int xe_bo_move(struct ttm_buffer_object *ttm_bo, bool evict,
  		goto out;
  	}
  
@@ -67,8 +69,8 @@ Acked-by: Takashi Iwai <tiwai@suse.de>
  	/*
  	 * Failed multi-hop where the old_mem is still marked as
  	 * TTM_PL_FLAG_TEMPORARY, should just be a dummy move.
-@@ -875,6 +860,25 @@ out:
- 	return ret;
+@@ -1013,6 +998,25 @@ static long xe_bo_shrink_purge(struct ttm_operation_ctx *ctx,
+ 	return lret;
  }
  
 +static bool
@@ -91,32 +93,42 @@ Acked-by: Takashi Iwai <tiwai@suse.de>
 +}
 +
  /**
-  * xe_bo_evict_pinned() - Evict a pinned VRAM object to system memory
-  * @bo: The buffer object to move.
-@@ -1122,7 +1126,7 @@ const struct ttm_device_funcs xe_ttm_fun
- 	.io_mem_reserve = xe_ttm_io_mem_reserve,
+  * xe_bo_shrink() - Try to shrink an xe bo.
+  * @ctx: The struct ttm_operation_ctx used for shrinking.
+@@ -1047,7 +1051,7 @@ long xe_bo_shrink(struct ttm_operation_ctx *ctx, struct ttm_buffer_object *bo,
+ 	    (flags.purge && !xe_tt->purgeable))
+ 		return -EBUSY;
+ 
+-	if (!ttm_bo_eviction_valuable(bo, &place))
++	if (!xe_bo_eviction_valuable(bo, &place))
+ 		return -EBUSY;
+ 
+ 	if (!xe_bo_is_xe_bo(bo) || !xe_bo_get_unless_zero(xe_bo))
+@@ -1588,7 +1592,7 @@ const struct ttm_device_funcs xe_ttm_funcs = {
  	.io_mem_pfn = xe_ttm_io_mem_pfn,
+ 	.access_memory = xe_ttm_access_memory,
  	.release_notify = xe_ttm_bo_release_notify,
 -	.eviction_valuable = ttm_bo_eviction_valuable,
 +	.eviction_valuable = xe_bo_eviction_valuable,
  	.delete_mem_notify = xe_ttm_bo_delete_mem_notify,
+ 	.swap_notify = xe_ttm_bo_swap_notify,
  };
- 
-@@ -1877,6 +1881,8 @@ int xe_bo_validate(struct xe_bo *bo, str
- 		.interruptible = true,
+@@ -2431,6 +2435,8 @@ int xe_bo_validate(struct xe_bo *bo, struct xe_vm *vm, bool allow_res_evict)
  		.no_wait_gpu = false,
+ 		.gfp_retry_mayfail = true,
  	};
 +	struct pin_cookie cookie;
 +	int ret;
  
  	if (vm) {
  		lockdep_assert_held(&vm->lock);
-@@ -1886,7 +1892,11 @@ int xe_bo_validate(struct xe_bo *bo, str
+@@ -2440,8 +2446,12 @@ int xe_bo_validate(struct xe_bo *bo, struct xe_vm *vm, bool allow_res_evict)
  		ctx.resv = xe_vm_resv(vm);
  	}
  
--	return ttm_bo_validate(&bo->ttm, &bo->placement, &ctx);
 +	cookie = xe_vm_set_validating(vm, allow_res_evict);
+ 	trace_xe_bo_validate(bo);
+-	return ttm_bo_validate(&bo->ttm, &bo->placement, &ctx);
 +	ret = ttm_bo_validate(&bo->ttm, &bo->placement, &ctx);
 +	xe_vm_clear_validating(vm, allow_res_evict, cookie);
 +
@@ -124,9 +136,11 @@ Acked-by: Takashi Iwai <tiwai@suse.de>
  }
  
  bool xe_bo_is_xe_bo(struct ttm_buffer_object *bo)
+diff --git a/drivers/gpu/drm/xe/xe_vm.h b/drivers/gpu/drm/xe/xe_vm.h
+index 0ef811fc2bde..494af6bdc646 100644
 --- a/drivers/gpu/drm/xe/xe_vm.h
 +++ b/drivers/gpu/drm/xe/xe_vm.h
-@@ -281,6 +281,75 @@ void xe_vm_snapshot_capture_delayed(stru
+@@ -301,6 +301,75 @@ void xe_vm_snapshot_capture_delayed(struct xe_vm_snapshot *snap);
  void xe_vm_snapshot_print(struct xe_vm_snapshot *snap, struct drm_printer *p);
  void xe_vm_snapshot_free(struct xe_vm_snapshot *snap);
  
@@ -202,9 +216,11 @@ Acked-by: Takashi Iwai <tiwai@suse.de>
  #if IS_ENABLED(CONFIG_DRM_XE_USERPTR_INVAL_INJECT)
  void xe_vma_userptr_force_invalidate(struct xe_userptr_vma *uvma);
  #else
+diff --git a/drivers/gpu/drm/xe/xe_vm_types.h b/drivers/gpu/drm/xe/xe_vm_types.h
+index 1662604c4486..1979e9bdbdf3 100644
 --- a/drivers/gpu/drm/xe/xe_vm_types.h
 +++ b/drivers/gpu/drm/xe/xe_vm_types.h
-@@ -282,6 +282,14 @@ struct xe_vm {
+@@ -310,6 +310,14 @@ struct xe_vm {
  	 * protected by the vm resv.
  	 */
  	u64 tlb_flush_seqno;
@@ -219,3 +235,6 @@ Acked-by: Takashi Iwai <tiwai@suse.de>
  	/** @batch_invalidate_tlb: Always invalidate TLB before batch start */
  	bool batch_invalidate_tlb;
  	/** @xef: XE file handle for tracking this VM's drm client */
+-- 
+2.52.0
+
