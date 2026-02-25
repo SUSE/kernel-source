@@ -1,0 +1,151 @@
+From e3d4dfe91bdcb9c2f4ac07ea3885a94b863ba28e Mon Sep 17 00:00:00 2001
+From: Thomas Zimmermann <tzimmermann@suse.de>
+Date: Fri, 7 Mar 2025 09:04:01 +0100
+Subject: drm/gm12u320: Set struct drm_device.dma_dev
+Git-commit: e3d4dfe91bdcb9c2f4ac07ea3885a94b863ba28e
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Set the dma_dev field provided by the DRM device. Required for PRIME
+dma-buf import. Remove the driver's implementation.
+
+Signed-off-by: Thomas Zimmermann <tzimmermann@suse.de>
+Reviewed-by: Jani Nikula <jani.nikula@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250307080836.42848-4-tzimmermann@suse.de
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/tiny/gm12u320.c | 46 ++++++++++-----------------------
+ 1 file changed, 13 insertions(+), 33 deletions(-)
+
+diff --git a/drivers/gpu/drm/tiny/gm12u320.c b/drivers/gpu/drm/tiny/gm12u320.c
+index 41e9bfb2e2ff..fb0004166f4a 100644
+--- a/drivers/gpu/drm/tiny/gm12u320.c
++++ b/drivers/gpu/drm/tiny/gm12u320.c
+@@ -86,7 +86,6 @@ MODULE_PARM_DESC(eco_mode, "Turn on Eco mode (less bright, more silent)");
+ 
+ struct gm12u320_device {
+ 	struct drm_device	         dev;
+-	struct device                   *dmadev;
+ 	struct drm_simple_display_pipe   pipe;
+ 	struct drm_connector	         conn;
+ 	unsigned char                   *cmd_buf;
+@@ -602,22 +601,6 @@ static const uint64_t gm12u320_pipe_modifiers[] = {
+ 	DRM_FORMAT_MOD_INVALID
+ };
+ 
+-/*
+- * FIXME: Dma-buf sharing requires DMA support by the importing device.
+- *        This function is a workaround to make USB devices work as well.
+- *        See todo.rst for how to fix the issue in the dma-buf framework.
+- */
+-static struct drm_gem_object *gm12u320_gem_prime_import(struct drm_device *dev,
+-							struct dma_buf *dma_buf)
+-{
+-	struct gm12u320_device *gm12u320 = to_gm12u320(dev);
+-
+-	if (!gm12u320->dmadev)
+-		return ERR_PTR(-ENODEV);
+-
+-	return drm_gem_prime_import_dev(dev, dma_buf, gm12u320->dmadev);
+-}
+-
+ DEFINE_DRM_GEM_FOPS(gm12u320_fops);
+ 
+ static const struct drm_driver gm12u320_drm_driver = {
+@@ -630,7 +613,6 @@ static const struct drm_driver gm12u320_drm_driver = {
+ 
+ 	.fops		 = &gm12u320_fops,
+ 	DRM_GEM_SHMEM_DRIVER_OPS,
+-	.gem_prime_import = gm12u320_gem_prime_import,
+ 	DRM_FBDEV_SHMEM_DRIVER_OPS,
+ };
+ 
+@@ -645,6 +627,7 @@ static int gm12u320_usb_probe(struct usb_interface *interface,
+ {
+ 	struct gm12u320_device *gm12u320;
+ 	struct drm_device *dev;
++	struct device *dma_dev;
+ 	int ret;
+ 
+ 	/*
+@@ -660,16 +643,20 @@ static int gm12u320_usb_probe(struct usb_interface *interface,
+ 		return PTR_ERR(gm12u320);
+ 	dev = &gm12u320->dev;
+ 
+-	gm12u320->dmadev = usb_intf_get_dma_device(to_usb_interface(dev->dev));
+-	if (!gm12u320->dmadev)
++	dma_dev = usb_intf_get_dma_device(interface);
++	if (dma_dev) {
++		drm_dev_set_dma_dev(dev, dma_dev);
++		put_device(dma_dev);
++	} else {
+ 		drm_warn(dev, "buffer sharing not supported"); /* not an error */
++	}
+ 
+ 	INIT_DELAYED_WORK(&gm12u320->fb_update.work, gm12u320_fb_update_work);
+ 	mutex_init(&gm12u320->fb_update.lock);
+ 
+ 	ret = drmm_mode_config_init(dev);
+ 	if (ret)
+-		goto err_put_device;
++		return ret;
+ 
+ 	dev->mode_config.min_width = GM12U320_USER_WIDTH;
+ 	dev->mode_config.max_width = GM12U320_USER_WIDTH;
+@@ -679,15 +666,15 @@ static int gm12u320_usb_probe(struct usb_interface *interface,
+ 
+ 	ret = gm12u320_usb_alloc(gm12u320);
+ 	if (ret)
+-		goto err_put_device;
++		return ret;
+ 
+ 	ret = gm12u320_set_ecomode(gm12u320);
+ 	if (ret)
+-		goto err_put_device;
++		return ret;
+ 
+ 	ret = gm12u320_conn_init(gm12u320);
+ 	if (ret)
+-		goto err_put_device;
++		return ret;
+ 
+ 	ret = drm_simple_display_pipe_init(&gm12u320->dev,
+ 					   &gm12u320->pipe,
+@@ -697,31 +684,24 @@ static int gm12u320_usb_probe(struct usb_interface *interface,
+ 					   gm12u320_pipe_modifiers,
+ 					   &gm12u320->conn);
+ 	if (ret)
+-		goto err_put_device;
++		return ret;
+ 
+ 	drm_mode_config_reset(dev);
+ 
+ 	usb_set_intfdata(interface, dev);
+ 	ret = drm_dev_register(dev, 0);
+ 	if (ret)
+-		goto err_put_device;
++		return ret;
+ 
+ 	drm_client_setup(dev, NULL);
+ 
+ 	return 0;
+-
+-err_put_device:
+-	put_device(gm12u320->dmadev);
+-	return ret;
+ }
+ 
+ static void gm12u320_usb_disconnect(struct usb_interface *interface)
+ {
+ 	struct drm_device *dev = usb_get_intfdata(interface);
+-	struct gm12u320_device *gm12u320 = to_gm12u320(dev);
+ 
+-	put_device(gm12u320->dmadev);
+-	gm12u320->dmadev = NULL;
+ 	drm_dev_unplug(dev);
+ 	drm_atomic_helper_shutdown(dev);
+ }
+-- 
+2.52.0
+
