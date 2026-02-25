@@ -1,0 +1,104 @@
+From d8675102ba322a4ccd0dd8bc5adf799246314ddf Mon Sep 17 00:00:00 2001
+From: Arunpravin Paneer Selvam <Arunpravin.PaneerSelvam@amd.com>
+Date: Wed, 30 Oct 2024 10:56:57 +0530
+Subject: drm/amdgpu: add vm root BO lock before accessing the vm
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: d8675102ba322a4ccd0dd8bc5adf799246314ddf
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Add a vm root BO lock before accessing the userqueue VM.
+
+v1:(Christian)
+   - Keep the VM locked until you are done with the mapping.
+   - Grab a temporary BO reference, drop the VM lock and acquire the BO.
+     When you are done with everything just drop the BO lock and
+     then the temporary BO reference.
+
+Signed-off-by: Arunpravin Paneer Selvam <Arunpravin.PaneerSelvam@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../gpu/drm/amd/amdgpu/amdgpu_userq_fence.c   | 24 ++++++++++++-------
+ 1 file changed, 15 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.c
+index 969a3a75d815..6c9346f822c1 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.c
+@@ -321,7 +321,6 @@ static const struct dma_fence_ops amdgpu_userq_fence_ops = {
+ /**
+  * amdgpu_userq_fence_read_wptr - Read the userq wptr value
+  *
+- * @filp: drm file private data structure
+  * @queue: user mode queue structure pointer
+  * @wptr: write pointer value
+  *
+@@ -331,25 +330,29 @@ static const struct dma_fence_ops amdgpu_userq_fence_ops = {
+  *
+  * Returns wptr value on success, error on failure.
+  */
+-static int amdgpu_userq_fence_read_wptr(struct drm_file *filp,
+-					struct amdgpu_usermode_queue *queue,
++static int amdgpu_userq_fence_read_wptr(struct amdgpu_usermode_queue *queue,
+ 					u64 *wptr)
+ {
+-	struct amdgpu_fpriv *fpriv = filp->driver_priv;
+ 	struct amdgpu_bo_va_mapping *mapping;
+-	struct amdgpu_vm *vm = &fpriv->vm;
+ 	struct amdgpu_bo *bo;
+ 	u64 addr, *ptr;
+ 	int r;
+ 
++	r = amdgpu_bo_reserve(queue->vm->root.bo, false);
++	if (r)
++		return r;
++
+ 	addr = queue->userq_prop->wptr_gpu_addr;
+ 	addr &= AMDGPU_GMC_HOLE_MASK;
+ 
+-	mapping = amdgpu_vm_bo_lookup_mapping(vm, addr >> PAGE_SHIFT);
+-	if (!mapping)
++	mapping = amdgpu_vm_bo_lookup_mapping(queue->vm, addr >> PAGE_SHIFT);
++	if (!mapping) {
++		DRM_ERROR("Failed to lookup amdgpu_bo_va_mapping\n");
+ 		return -EINVAL;
++	}
+ 
+-	bo = mapping->bo_va->base.bo;
++	bo = amdgpu_bo_ref(mapping->bo_va->base.bo);
++	amdgpu_bo_unreserve(queue->vm->root.bo);
+ 	r = amdgpu_bo_reserve(bo, true);
+ 	if (r) {
+ 		DRM_ERROR("Failed to reserve userqueue wptr bo");
+@@ -366,11 +369,14 @@ static int amdgpu_userq_fence_read_wptr(struct drm_file *filp,
+ 
+ 	amdgpu_bo_kunmap(bo);
+ 	amdgpu_bo_unreserve(bo);
++	amdgpu_bo_unref(&bo);
+ 
+ 	return 0;
+ 
+ map_error:
+ 	amdgpu_bo_unreserve(bo);
++	amdgpu_bo_unref(&bo);
++
+ 	return r;
+ }
+ 
+@@ -449,7 +455,7 @@ int amdgpu_userq_signal_ioctl(struct drm_device *dev, void *data,
+ 		goto exec_fini;
+ 	}
+ 
+-	r = amdgpu_userq_fence_read_wptr(filp, queue, &wptr);
++	r = amdgpu_userq_fence_read_wptr(queue, &wptr);
+ 	if (r)
+ 		goto exec_fini;
+ 
+-- 
+2.52.0
+
