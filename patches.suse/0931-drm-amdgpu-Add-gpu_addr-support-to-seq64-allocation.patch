@@ -1,0 +1,140 @@
+From f7cb6a28e172bd470803d64697f7a9c708609da2 Mon Sep 17 00:00:00 2001
+From: Arunpravin Paneer Selvam <Arunpravin.PaneerSelvam@amd.com>
+Date: Wed, 30 Oct 2024 11:19:26 +0530
+Subject: drm/amdgpu: Add gpu_addr support to seq64 allocation
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: f7cb6a28e172bd470803d64697f7a9c708609da2
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Add gpu address support to seq64 alloc function.
+
+v1:(Christian)
+  - Add the user of this new interface change to the same
+    patch.
+
+Signed-off-by: Arunpravin Paneer Selvam <Arunpravin.PaneerSelvam@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_seq64.c       | 10 ++++++++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_seq64.h       |  3 ++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.c |  8 ++++----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.h |  1 +
+ 4 files changed, 15 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_seq64.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_seq64.c
+index e22cb2b5cd92..0defad71044c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_seq64.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_seq64.c
+@@ -163,7 +163,8 @@ void amdgpu_seq64_unmap(struct amdgpu_device *adev, struct amdgpu_fpriv *fpriv)
+  * Returns:
+  * 0 on success or a negative error code on failure
+  */
+-int amdgpu_seq64_alloc(struct amdgpu_device *adev, u64 *va, u64 **cpu_addr)
++int amdgpu_seq64_alloc(struct amdgpu_device *adev, u64 *va,
++		       u64 *gpu_addr, u64 **cpu_addr)
+ {
+ 	unsigned long bit_pos;
+ 
+@@ -172,7 +173,12 @@ int amdgpu_seq64_alloc(struct amdgpu_device *adev, u64 *va, u64 **cpu_addr)
+ 		return -ENOSPC;
+ 
+ 	__set_bit(bit_pos, adev->seq64.used);
++
+ 	*va = bit_pos * sizeof(u64) + amdgpu_seq64_get_va_base(adev);
++
++	if (gpu_addr)
++		*gpu_addr = bit_pos * sizeof(u64) + adev->seq64.gpu_addr;
++
+ 	*cpu_addr = bit_pos + adev->seq64.cpu_base_addr;
+ 
+ 	return 0;
+@@ -233,7 +239,7 @@ int amdgpu_seq64_init(struct amdgpu_device *adev)
+ 	 */
+ 	r = amdgpu_bo_create_kernel(adev, AMDGPU_VA_RESERVED_SEQ64_SIZE,
+ 				    PAGE_SIZE, AMDGPU_GEM_DOMAIN_GTT,
+-				    &adev->seq64.sbo, NULL,
++				    &adev->seq64.sbo, &adev->seq64.gpu_addr,
+ 				    (void **)&adev->seq64.cpu_base_addr);
+ 	if (r) {
+ 		dev_warn(adev->dev, "(%d) create seq64 failed\n", r);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_seq64.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_seq64.h
+index 4203b2ab318d..26a249aaaee1 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_seq64.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_seq64.h
+@@ -32,13 +32,14 @@
+ struct amdgpu_seq64 {
+ 	struct amdgpu_bo *sbo;
+ 	u32 num_sem;
++	u64 gpu_addr;
+ 	u64 *cpu_base_addr;
+ 	DECLARE_BITMAP(used, AMDGPU_MAX_SEQ64_SLOTS);
+ };
+ 
+ void amdgpu_seq64_fini(struct amdgpu_device *adev);
+ int amdgpu_seq64_init(struct amdgpu_device *adev);
+-int amdgpu_seq64_alloc(struct amdgpu_device *adev, u64 *gpu_addr, u64 **cpu_addr);
++int amdgpu_seq64_alloc(struct amdgpu_device *adev, u64 *va, u64 *gpu_addr, u64 **cpu_addr);
+ void amdgpu_seq64_free(struct amdgpu_device *adev, u64 gpu_addr);
+ int amdgpu_seq64_map(struct amdgpu_device *adev, struct amdgpu_vm *vm,
+ 		     struct amdgpu_bo_va **bo_va);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.c
+index 9f1ca8659335..d7697d3f55e5 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.c
+@@ -82,7 +82,7 @@ int amdgpu_userq_fence_driver_alloc(struct amdgpu_device *adev,
+ 	}
+ 
+ 	/* Acquire seq64 memory */
+-	r = amdgpu_seq64_alloc(adev, &fence_drv->gpu_addr,
++	r = amdgpu_seq64_alloc(adev, &fence_drv->va, &fence_drv->gpu_addr,
+ 			       &fence_drv->cpu_addr);
+ 	if (r) {
+ 		kfree(fence_drv);
+@@ -113,7 +113,7 @@ int amdgpu_userq_fence_driver_alloc(struct amdgpu_device *adev,
+ 	return 0;
+ 
+ free_seq64:
+-	amdgpu_seq64_free(adev, fence_drv->gpu_addr);
++	amdgpu_seq64_free(adev, fence_drv->va);
+ free_fence_drv:
+ 	kfree(fence_drv);
+ 
+@@ -183,7 +183,7 @@ void amdgpu_userq_fence_driver_destroy(struct kref *ref)
+ 	xa_unlock_irqrestore(xa, flags);
+ 
+ 	/* Free seq64 memory */
+-	amdgpu_seq64_free(adev, fence_drv->gpu_addr);
++	amdgpu_seq64_free(adev, fence_drv->va);
+ 	kfree(fence_drv);
+ }
+ 
+@@ -839,7 +839,7 @@ int amdgpu_userq_wait_ioctl(struct drm_device *dev, void *data,
+ 			}
+ 
+ 			/* Store drm syncobj's gpu va address and value */
+-			fence_info[cnt].va = fence_drv->gpu_addr;
++			fence_info[cnt].va = fence_drv->va;
+ 			fence_info[cnt].value = fences[i]->seqno;
+ 
+ 			dma_fence_put(fences[i]);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.h
+index 89c82ba38b50..f1a90840ac1f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.h
+@@ -44,6 +44,7 @@ struct amdgpu_userq_fence {
+ 
+ struct amdgpu_userq_fence_driver {
+ 	struct kref refcount;
++	u64 va;
+ 	u64 gpu_addr;
+ 	u64 *cpu_addr;
+ 	u64 context;
+-- 
+2.52.0
+
