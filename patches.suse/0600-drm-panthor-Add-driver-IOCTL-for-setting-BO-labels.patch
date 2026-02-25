@@ -1,0 +1,167 @@
+From a572dc467de241706ab92d61b3b3a0bca93450c8 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Adri=C3=A1n=20Larumbe?= <adrian.larumbe@collabora.com>
+Date: Wed, 23 Apr 2025 03:12:32 +0100
+Subject: drm/panthor: Add driver IOCTL for setting BO labels
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: a572dc467de241706ab92d61b3b3a0bca93450c8
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Allow UM to label a BO for which it possesses a DRM handle.
+
+Signed-off-by: Adrián Larumbe <adrian.larumbe@collabora.com>
+Reviewed-by: Liviu Dudau <liviu.dudau@arm.com>
+Reviewed-by: Boris Brezillon <boris.brezillon@collabora.com>
+Reviewed-by: Steven Price <steven.price@arm.com>
+Link: https://lore.kernel.org/r/20250423021238.1639175-3-adrian.larumbe@collabora.com
+Signed-off-by: Boris Brezillon <boris.brezillon@collabora.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/panthor/panthor_drv.c | 44 ++++++++++++++++++++++++++-
+ drivers/gpu/drm/panthor/panthor_gem.h |  2 ++
+ include/uapi/drm/panthor_drm.h        | 23 ++++++++++++++
+ 3 files changed, 68 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/panthor/panthor_drv.c b/drivers/gpu/drm/panthor/panthor_drv.c
+index 4ff4fc8951ec..3170f560f9c6 100644
+--- a/drivers/gpu/drm/panthor/panthor_drv.c
++++ b/drivers/gpu/drm/panthor/panthor_drv.c
+@@ -1338,6 +1338,46 @@ static int panthor_ioctl_vm_get_state(struct drm_device *ddev, void *data,
+ 	return 0;
+ }
+ 
++static int panthor_ioctl_bo_set_label(struct drm_device *ddev, void *data,
++				      struct drm_file *file)
++{
++	struct drm_panthor_bo_set_label *args = data;
++	struct drm_gem_object *obj;
++	const char *label = NULL;
++	int ret = 0;
++
++	if (args->pad)
++		return -EINVAL;
++
++	obj = drm_gem_object_lookup(file, args->handle);
++	if (!obj)
++		return -ENOENT;
++
++	if (args->label) {
++		label = strndup_user((const char __user *)(uintptr_t)args->label,
++				     PANTHOR_BO_LABEL_MAXLEN);
++		if (IS_ERR(label)) {
++			ret = PTR_ERR(label);
++			if (ret == -EINVAL)
++				ret = -E2BIG;
++			goto err_put_obj;
++		}
++	}
++
++	/*
++	 * We treat passing a label of length 0 and passing a NULL label
++	 * differently, because even though they might seem conceptually
++	 * similar, future uses of the BO label might expect a different
++	 * behaviour in each case.
++	 */
++	panthor_gem_bo_set_label(obj, label);
++
++err_put_obj:
++	drm_gem_object_put(obj);
++
++	return ret;
++}
++
+ static int
+ panthor_open(struct drm_device *ddev, struct drm_file *file)
+ {
+@@ -1407,6 +1447,7 @@ static const struct drm_ioctl_desc panthor_drm_driver_ioctls[] = {
+ 	PANTHOR_IOCTL(TILER_HEAP_CREATE, tiler_heap_create, DRM_RENDER_ALLOW),
+ 	PANTHOR_IOCTL(TILER_HEAP_DESTROY, tiler_heap_destroy, DRM_RENDER_ALLOW),
+ 	PANTHOR_IOCTL(GROUP_SUBMIT, group_submit, DRM_RENDER_ALLOW),
++	PANTHOR_IOCTL(BO_SET_LABEL, bo_set_label, DRM_RENDER_ALLOW),
+ };
+ 
+ static int panthor_mmap(struct file *filp, struct vm_area_struct *vma)
+@@ -1516,6 +1557,7 @@ static void panthor_debugfs_init(struct drm_minor *minor)
+  * - 1.2 - adds DEV_QUERY_GROUP_PRIORITIES_INFO query
+  *       - adds PANTHOR_GROUP_PRIORITY_REALTIME priority
+  * - 1.3 - adds DRM_PANTHOR_GROUP_STATE_INNOCENT flag
++ * - 1.4 - adds DRM_IOCTL_PANTHOR_BO_SET_LABEL ioctl
+  */
+ static const struct drm_driver panthor_drm_driver = {
+ 	.driver_features = DRIVER_RENDER | DRIVER_GEM | DRIVER_SYNCOBJ |
+@@ -1529,7 +1571,7 @@ static const struct drm_driver panthor_drm_driver = {
+ 	.name = "panthor",
+ 	.desc = "Panthor DRM driver",
+ 	.major = 1,
+-	.minor = 3,
++	.minor = 4,
+ 
+ 	.gem_create_object = panthor_gem_create_object,
+ 	.gem_prime_import_sg_table = drm_gem_shmem_prime_import_sg_table,
+diff --git a/drivers/gpu/drm/panthor/panthor_gem.h b/drivers/gpu/drm/panthor/panthor_gem.h
+index af0d77338860..983cc8ca264e 100644
+--- a/drivers/gpu/drm/panthor/panthor_gem.h
++++ b/drivers/gpu/drm/panthor/panthor_gem.h
+@@ -13,6 +13,8 @@
+ 
+ struct panthor_vm;
+ 
++#define PANTHOR_BO_LABEL_MAXLEN	4096
++
+ /**
+  * struct panthor_gem_object - Driver specific GEM object.
+  */
+diff --git a/include/uapi/drm/panthor_drm.h b/include/uapi/drm/panthor_drm.h
+index 97e2c4510e69..ad9a70afea6c 100644
+--- a/include/uapi/drm/panthor_drm.h
++++ b/include/uapi/drm/panthor_drm.h
+@@ -127,6 +127,9 @@ enum drm_panthor_ioctl_id {
+ 
+ 	/** @DRM_PANTHOR_TILER_HEAP_DESTROY: Destroy a tiler heap. */
+ 	DRM_PANTHOR_TILER_HEAP_DESTROY,
++
++	/** @DRM_PANTHOR_BO_SET_LABEL: Label a BO. */
++	DRM_PANTHOR_BO_SET_LABEL,
+ };
+ 
+ /**
+@@ -977,6 +980,24 @@ struct drm_panthor_tiler_heap_destroy {
+ 	__u32 pad;
+ };
+ 
++/**
++ * struct drm_panthor_bo_set_label - Arguments passed to DRM_IOCTL_PANTHOR_BO_SET_LABEL
++ */
++struct drm_panthor_bo_set_label {
++	/** @handle: Handle of the buffer object to label. */
++	__u32 handle;
++
++	/**  @pad: MBZ. */
++	__u32 pad;
++
++	/**
++	 * @label: User pointer to a NUL-terminated string
++	 *
++	 * Length cannot be greater than 4096
++	 */
++	__u64 label;
++};
++
+ /**
+  * DRM_IOCTL_PANTHOR() - Build a Panthor IOCTL number
+  * @__access: Access type. Must be R, W or RW.
+@@ -1019,6 +1040,8 @@ enum {
+ 		DRM_IOCTL_PANTHOR(WR, TILER_HEAP_CREATE, tiler_heap_create),
+ 	DRM_IOCTL_PANTHOR_TILER_HEAP_DESTROY =
+ 		DRM_IOCTL_PANTHOR(WR, TILER_HEAP_DESTROY, tiler_heap_destroy),
++	DRM_IOCTL_PANTHOR_BO_SET_LABEL =
++		DRM_IOCTL_PANTHOR(WR, BO_SET_LABEL, bo_set_label),
+ };
+ 
+ #if defined(__cplusplus)
+-- 
+2.52.0
+
