@@ -1,0 +1,113 @@
+From 4172b556fd5bdfdf9b2d1e42da39df6ce99ee989 Mon Sep 17 00:00:00 2001
+From: Eric Huang <jinhuieric.huang@amd.com>
+Date: Mon, 7 Apr 2025 15:32:33 -0400
+Subject: drm/amdkfd: add smi events for process start and end
+Git-commit: 4172b556fd5bdfdf9b2d1e42da39df6ce99ee989
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+rocm-smi will be able to show the events for KFD process
+start/end, it is the implementation of this feature.
+
+Signed-off-by: Eric Huang <jinhuieric.huang@amd.com>
+Reviewed-by: Kent Russell <kent.russell@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_process.c    |  4 ++++
+ drivers/gpu/drm/amd/amdkfd/kfd_smi_events.c | 21 +++++++++++++++++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_smi_events.h |  1 +
+ include/uapi/linux/kfd_ioctl.h              |  5 +++++
+ 4 files changed, 31 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process.c b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+index 7c0c24732481..41d7dc8c2850 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@ -1054,6 +1054,8 @@ static void kfd_process_destroy_pdds(struct kfd_process *p)
+ 	for (i = 0; i < p->n_pdds; i++) {
+ 		struct kfd_process_device *pdd = p->pdds[i];
+ 
++		kfd_smi_event_process(pdd, false);
++
+ 		pr_debug("Releasing pdd (topology id %d, for pid %d)\n",
+ 			pdd->dev->id, p->lead_thread->pid);
+ 		kfd_process_device_destroy_cwsr_dgpu(pdd);
+@@ -1715,6 +1717,8 @@ int kfd_process_device_init_vm(struct kfd_process_device *pdd,
+ 	pdd->pasid = avm->pasid;
+ 	pdd->drm_file = drm_file;
+ 
++	kfd_smi_event_process(pdd, true);
++
+ 	return 0;
+ 
+ err_get_pasid:
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_smi_events.c b/drivers/gpu/drm/amd/amdkfd/kfd_smi_events.c
+index 9b8169761ec5..727a4ce29fe6 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_smi_events.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_smi_events.c
+@@ -345,6 +345,27 @@ void kfd_smi_event_unmap_from_gpu(struct kfd_node *node, pid_t pid,
+ 			  pid, address, last - address + 1, node->id, trigger));
+ }
+ 
++void kfd_smi_event_process(struct kfd_process_device *pdd, bool start)
++{
++	struct amdgpu_task_info *task_info;
++	struct amdgpu_vm *avm;
++
++	if (pdd->drm_priv)
++		return;
++
++	avm = drm_priv_to_vm(pdd->drm_priv);
++	task_info = amdgpu_vm_get_task_info_vm(avm);
++
++	if (task_info) {
++		kfd_smi_event_add(0, pdd->dev,
++				  start ? KFD_SMI_EVENT_PROCESS_START :
++				  KFD_SMI_EVENT_PROCESS_END,
++				  KFD_EVENT_FMT_PROCESS(task_info->pid,
++				  task_info->task_name));
++		amdgpu_vm_put_task_info(task_info);
++	}
++}
++
+ int kfd_smi_event_open(struct kfd_node *dev, uint32_t *fd)
+ {
+ 	struct kfd_smi_client *client;
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_smi_events.h b/drivers/gpu/drm/amd/amdkfd/kfd_smi_events.h
+index 503bff13d815..bb4d72b57387 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_smi_events.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_smi_events.h
+@@ -53,4 +53,5 @@ void kfd_smi_event_queue_restore_rescheduled(struct mm_struct *mm);
+ void kfd_smi_event_unmap_from_gpu(struct kfd_node *node, pid_t pid,
+ 				  unsigned long address, unsigned long last,
+ 				  uint32_t trigger);
++void kfd_smi_event_process(struct kfd_process_device *pdd, bool start);
+ #endif
+diff --git a/include/uapi/linux/kfd_ioctl.h b/include/uapi/linux/kfd_ioctl.h
+index 1e59344c5673..04c7d283dc7d 100644
+--- a/include/uapi/linux/kfd_ioctl.h
++++ b/include/uapi/linux/kfd_ioctl.h
+@@ -536,6 +536,8 @@ enum kfd_smi_event {
+ 	KFD_SMI_EVENT_QUEUE_EVICTION = 9,
+ 	KFD_SMI_EVENT_QUEUE_RESTORE = 10,
+ 	KFD_SMI_EVENT_UNMAP_FROM_GPU = 11,
++	KFD_SMI_EVENT_PROCESS_START = 12,
++	KFD_SMI_EVENT_PROCESS_END = 13,
+ 
+ 	/*
+ 	 * max event number, as a flag bit to get events from all processes,
+@@ -651,6 +653,9 @@ struct kfd_ioctl_smi_events_args {
+ 		"%lld -%d @%lx(%lx) %x %d\n", (ns), (pid), (addr), (size),\
+ 		(node), (unmap_trigger)
+ 
++#define KFD_EVENT_FMT_PROCESS(pid, task_name)\
++		"%x %s\n", (pid), (task_name)
++
+ /**************************************************************************************************
+  * CRIU IOCTLs (Checkpoint Restore In Userspace)
+  *
+-- 
+2.52.0
+
