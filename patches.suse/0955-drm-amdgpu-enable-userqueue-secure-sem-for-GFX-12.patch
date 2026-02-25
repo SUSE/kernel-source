@@ -1,0 +1,188 @@
+From dd5a376cd234c3fff79667598a1e06300cf75026 Mon Sep 17 00:00:00 2001
+From: Arunpravin Paneer Selvam <Arunpravin.PaneerSelvam@amd.com>
+Date: Tue, 26 Nov 2024 15:51:08 +0100
+Subject: drm/amdgpu: enable userqueue secure sem for GFX 12
+Git-commit: dd5a376cd234c3fff79667598a1e06300cf75026
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+- Add a field in struct amdgpu_mqd_prop for userqueue
+  secure sem fence address since now we have a generic
+  file for mes_userqueue.c
+- Add secure sem fence address mqd support to gfx12 into
+  their corresponding init functions.
+- Enable secure semaphore IRQ handling
+
+V2: Address review comment from Alex:
+    Use fence_address instead of fenceaddress (Shashank)
+
+Cc: Alex Deucher <alexander.deucher@amd.com>
+Cc: Christian Koenig <christian.koenig@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Arunpravin Paneer Selvam <Arunpravin.PaneerSelvam@amd.com>
+Signed-off-by: Somalapuram Amaranath <Amaranath.Somalapuram@amd.com>
+Signed-off-by: Shashank Sharma <shashank.sharma@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h        |  1 +
+ drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c     |  2 ++
+ drivers/gpu/drm/amd/amdgpu/gfx_v12_0.c     | 27 +++++++++++-----------
+ drivers/gpu/drm/amd/amdgpu/mes_userqueue.c | 11 +--------
+ drivers/gpu/drm/amd/include/v11_structs.h  |  4 ++--
+ drivers/gpu/drm/amd/include/v12_structs.h  |  4 ++--
+ 6 files changed, 22 insertions(+), 27 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 284d678effed..6955407c2f61 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -833,6 +833,7 @@ struct amdgpu_mqd_prop {
+ 	uint64_t shadow_addr;
+ 	uint64_t gds_bkup_addr;
+ 	uint64_t csa_addr;
++	uint64_t fence_address;
+ };
+ 
+ struct amdgpu_mqd {
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c
+index 7af03769d5de..efccb02f09e6 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c
+@@ -4134,6 +4134,8 @@ static int gfx_v11_0_gfx_mqd_init(struct amdgpu_device *adev, void *m,
+ 	mqd->gds_bkup_base_hi = upper_32_bits(prop->gds_bkup_addr);
+ 	mqd->fw_work_area_base_lo = lower_32_bits(prop->csa_addr);
+ 	mqd->fw_work_area_base_hi = upper_32_bits(prop->csa_addr);
++	mqd->fence_address_lo = lower_32_bits(prop->fence_address);
++	mqd->fence_address_hi = upper_32_bits(prop->fence_address);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v12_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v12_0.c
+index a99878092fb5..d30813e1024f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v12_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v12_0.c
+@@ -45,6 +45,7 @@
+ #include "nbif_v6_3_1.h"
+ #include "mes_v12_0.h"
+ #include "mes_userqueue.h"
++#include "amdgpu_userq_fence.h"
+ 
+ #define GFX12_NUM_GFX_RINGS	1
+ #define GFX12_MEC_HPD_SIZE	2048
+@@ -3037,6 +3038,8 @@ static int gfx_v12_0_gfx_mqd_init(struct amdgpu_device *adev, void *m,
+ 	mqd->shadow_base_hi = upper_32_bits(prop->shadow_addr);
+ 	mqd->fw_work_area_base_lo = lower_32_bits(prop->csa_addr);
+ 	mqd->fw_work_area_base_hi = upper_32_bits(prop->csa_addr);
++	mqd->fence_address_lo = lower_32_bits(prop->fence_address);
++	mqd->fence_address_hi = upper_32_bits(prop->fence_address);
+ 
+ 	return 0;
+ }
+@@ -4819,25 +4822,23 @@ static int gfx_v12_0_eop_irq(struct amdgpu_device *adev,
+ 			     struct amdgpu_irq_src *source,
+ 			     struct amdgpu_iv_entry *entry)
+ {
+-	int i;
++	u32 doorbell_offset = entry->src_data[0];
+ 	u8 me_id, pipe_id, queue_id;
+ 	struct amdgpu_ring *ring;
+-	uint32_t mes_queue_id = entry->src_data[0];
++	int i;
+ 
+ 	DRM_DEBUG("IH: CP EOP\n");
+ 
+-	if (adev->enable_mes && (mes_queue_id & AMDGPU_FENCE_MES_QUEUE_FLAG)) {
+-		struct amdgpu_mes_queue *queue;
++	if (adev->enable_mes && doorbell_offset) {
++		struct amdgpu_userq_fence_driver *fence_drv = NULL;
++		struct xarray *xa = &adev->userq_xa;
++		unsigned long flags;
+ 
+-		mes_queue_id &= AMDGPU_FENCE_MES_QUEUE_ID_MASK;
+-
+-		spin_lock(&adev->mes.queue_id_lock);
+-		queue = idr_find(&adev->mes.queue_id_idr, mes_queue_id);
+-		if (queue) {
+-			DRM_DEBUG("process mes queue id = %d\n", mes_queue_id);
+-			amdgpu_fence_process(queue->ring);
+-		}
+-		spin_unlock(&adev->mes.queue_id_lock);
++		xa_lock_irqsave(xa, flags);
++		fence_drv = xa_load(xa, doorbell_offset);
++		if (fence_drv)
++			amdgpu_userq_fence_driver_process(fence_drv);
++		xa_unlock_irqrestore(xa, flags);
+ 	} else {
+ 		me_id = (entry->ring_id & 0x0c) >> 2;
+ 		pipe_id = (entry->ring_id & 0x03) >> 0;
+diff --git a/drivers/gpu/drm/amd/amdgpu/mes_userqueue.c b/drivers/gpu/drm/amd/amdgpu/mes_userqueue.c
+index 9c2fc8ae0d56..1dde099382ea 100644
+--- a/drivers/gpu/drm/amd/amdgpu/mes_userqueue.c
++++ b/drivers/gpu/drm/amd/amdgpu/mes_userqueue.c
+@@ -185,14 +185,6 @@ static int mes_userq_create_ctx_space(struct amdgpu_userq_mgr *uq_mgr,
+ 	return 0;
+ }
+ 
+-static void mes_userq_set_fence_space(struct amdgpu_usermode_queue *queue)
+-{
+-	struct v11_gfx_mqd *mqd = queue->mqd.cpu_ptr;
+-
+-	mqd->fenceaddress_lo = lower_32_bits(queue->fence_drv->gpu_addr);
+-	mqd->fenceaddress_hi = upper_32_bits(queue->fence_drv->gpu_addr);
+-}
+-
+ static int mes_userq_mqd_create(struct amdgpu_userq_mgr *uq_mgr,
+ 				struct drm_amdgpu_userq_in *args_in,
+ 				struct amdgpu_usermode_queue *queue)
+@@ -231,6 +223,7 @@ static int mes_userq_mqd_create(struct amdgpu_userq_mgr *uq_mgr,
+ 	userq_props->mqd_gpu_addr = queue->mqd.gpu_addr;
+ 	userq_props->use_doorbell = true;
+ 	userq_props->doorbell_index = queue->doorbell_index;
++	userq_props->fence_address = queue->fence_drv->gpu_addr;
+ 
+ 	if (queue->queue_type == AMDGPU_HW_IP_COMPUTE) {
+ 		struct drm_amdgpu_userq_mqd_compute_gfx11 *compute_mqd;
+@@ -307,8 +300,6 @@ static int mes_userq_mqd_create(struct amdgpu_userq_mgr *uq_mgr,
+ 		goto free_mqd;
+ 	}
+ 
+-	mes_userq_set_fence_space(queue);
+-
+ 	/* FW expects WPTR BOs to be mapped into GART */
+ 	r = mes_userq_create_wptr_mapping(uq_mgr, queue, userq_props->wptr_gpu_addr);
+ 	if (r) {
+diff --git a/drivers/gpu/drm/amd/include/v11_structs.h b/drivers/gpu/drm/amd/include/v11_structs.h
+index 797ce6a1e56e..f6d4dab849eb 100644
+--- a/drivers/gpu/drm/amd/include/v11_structs.h
++++ b/drivers/gpu/drm/amd/include/v11_structs.h
+@@ -535,8 +535,8 @@ struct v11_gfx_mqd {
+ 	uint32_t reserved_507; // offset: 507  (0x1FB)
+ 	uint32_t reserved_508; // offset: 508  (0x1FC)
+ 	uint32_t reserved_509; // offset: 509  (0x1FD)
+-	uint32_t fenceaddress_lo; // offset: 510  (0x1FE)
+-	uint32_t fenceaddress_hi; // offset: 511  (0x1FF)
++	uint32_t fence_address_lo; // offset: 510  (0x1FE)
++	uint32_t fence_address_hi; // offset: 511  (0x1FF)
+ };
+ 
+ struct v11_sdma_mqd {
+diff --git a/drivers/gpu/drm/amd/include/v12_structs.h b/drivers/gpu/drm/amd/include/v12_structs.h
+index 5eabab611b02..5787c8a51b7c 100644
+--- a/drivers/gpu/drm/amd/include/v12_structs.h
++++ b/drivers/gpu/drm/amd/include/v12_structs.h
+@@ -535,8 +535,8 @@ struct v12_gfx_mqd {
+     uint32_t reserved_507; // offset: 507  (0x1FB)
+     uint32_t reserved_508; // offset: 508  (0x1FC)
+     uint32_t reserved_509; // offset: 509  (0x1FD)
+-    uint32_t reserved_510; // offset: 510  (0x1FE)
+-    uint32_t reserved_511; // offset: 511  (0x1FF)
++    uint32_t fence_address_lo; // offset: 510  (0x1FE)
++    uint32_t fence_address_hi; // offset: 511  (0x1FF)
+ };
+ 
+ struct v12_sdma_mqd {
+-- 
+2.52.0
+
