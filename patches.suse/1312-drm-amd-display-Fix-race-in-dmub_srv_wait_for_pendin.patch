@@ -1,0 +1,168 @@
+From dd141b16b3a2979a01194615dfe87dbba9d87045 Mon Sep 17 00:00:00 2001
+From: Dillon Varone <dillon.varone@amd.com>
+Date: Mon, 28 Apr 2025 12:34:27 -0400
+Subject: drm/amd/display: Fix race in dmub_srv_wait_for_pending
+Git-commit: dd141b16b3a2979a01194615dfe87dbba9d87045
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+[WHY]
+If commands are being submitted to DMCUB while concurrently waiting for
+pending commands to complete, rptr and wptr may never match again, and
+reported command count will not update.
+
+[HOW]
+Modify dmub_srv_wait_for_pending to constantly check wptr and rptr
+match, and update inbox status whenever a message is sent to avoid the
+race and determine message completion or idle as quickly as possible.
+
+Reviewed-by: Nicholas Kazlauskas <nicholas.kazlauskas@amd.com>
+Signed-off-by: Dillon Varone <dillon.varone@amd.com>
+Signed-off-by: Ray Wu <ray.wu@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/display/dc/dc_dmub_srv.c  |  5 +-
+ drivers/gpu/drm/amd/display/dmub/dmub_srv.h   | 14 +++++
+ .../gpu/drm/amd/display/dmub/src/dmub_srv.c   | 58 ++++++++++---------
+ 3 files changed, 49 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_dmub_srv.c b/drivers/gpu/drm/amd/display/dc/dc_dmub_srv.c
+index 6115b5364394..1c6e71eaea3c 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_dmub_srv.c
++++ b/drivers/gpu/drm/amd/display/dc/dc_dmub_srv.c
+@@ -207,7 +207,7 @@ static bool dc_dmub_srv_fb_cmd_list_queue_execute(struct dc_dmub_srv *dc_dmub_sr
+ 				return false;
+ 
+ 			do {
+-				status = dmub_srv_wait_for_inbox_free(dmub, 100000, count - i);
++					status = dmub_srv_wait_for_inbox_free(dmub, 100000, count - i);
+ 			} while (dc_dmub_srv->ctx->dc->debug.disable_timeout && status != DMUB_STATUS_OK);
+ 
+ 			/* Requeue the command. */
+@@ -247,6 +247,9 @@ bool dc_dmub_srv_cmd_list_queue_execute(struct dc_dmub_srv *dc_dmub_srv,
+ 		} else {
+ 			res = dc_dmub_srv_fb_cmd_list_queue_execute(dc_dmub_srv, count, cmd_list);
+ 		}
++
++		if (res)
++			res = dmub_srv_update_inbox_status(dc_dmub_srv->dmub) == DMUB_STATUS_OK;
+ 	}
+ 
+ 	return res;
+diff --git a/drivers/gpu/drm/amd/display/dmub/dmub_srv.h b/drivers/gpu/drm/amd/display/dmub/dmub_srv.h
+index e759ce6ca700..3f3fa1b6a69e 100644
+--- a/drivers/gpu/drm/amd/display/dmub/dmub_srv.h
++++ b/drivers/gpu/drm/amd/display/dmub/dmub_srv.h
+@@ -445,6 +445,8 @@ struct dmub_srv_hw_funcs {
+ 
+ 	uint32_t (*emul_get_inbox1_rptr)(struct dmub_srv *dmub);
+ 
++	uint32_t (*emul_get_inbox1_wptr)(struct dmub_srv *dmub);
++
+ 	void (*emul_set_inbox1_wptr)(struct dmub_srv *dmub, uint32_t wptr_offset);
+ 
+ 	bool (*is_supported)(struct dmub_srv *dmub);
+@@ -1053,4 +1055,16 @@ enum dmub_status dmub_srv_wait_for_inbox_free(struct dmub_srv *dmub,
+ 		uint32_t timeout_us,
+ 		uint32_t num_free_required);
+ 
++/**
++ * dmub_srv_update_inbox_status() - Updates pending status for inbox & reg inbox0
++ * @dmub: the dmub service
++ *
++ * Return:
++ *   DMUB_STATUS_OK - success
++ *   DMUB_STATUS_TIMEOUT - wait for buffer to flush timed out
++ *   DMUB_STATUS_HW_FAILURE - issue with HW programming
++ *   DMUB_STATUS_INVALID - unspecified error
++ */
++enum dmub_status dmub_srv_update_inbox_status(struct dmub_srv *dmub);
++
+ #endif /* _DMUB_SRV_H_ */
+diff --git a/drivers/gpu/drm/amd/display/dmub/src/dmub_srv.c b/drivers/gpu/drm/amd/display/dmub/src/dmub_srv.c
+index c917a70b3c19..acca7943a8c8 100644
+--- a/drivers/gpu/drm/amd/display/dmub/src/dmub_srv.c
++++ b/drivers/gpu/drm/amd/display/dmub/src/dmub_srv.c
+@@ -952,10 +952,8 @@ enum dmub_status dmub_srv_wait_for_pending(struct dmub_srv *dmub,
+ 			!dmub->hw_funcs.get_inbox1_wptr)
+ 		return DMUB_STATUS_INVALID;
+ 
+-	/* take a snapshot of the required mailbox state */
+-	scratch_inbox1.rb.wrpt = dmub->hw_funcs.get_inbox1_wptr(dmub);
+-
+ 	for (i = 0; i <= timeout_us; i += polling_interval_us) {
++			scratch_inbox1.rb.wrpt = dmub->hw_funcs.get_inbox1_wptr(dmub);
+ 			scratch_inbox1.rb.rptr = dmub->hw_funcs.get_inbox1_rptr(dmub);
+ 
+ 		scratch_reg_inbox0.is_pending = scratch_reg_inbox0.is_pending &&
+@@ -978,30 +976,6 @@ enum dmub_status dmub_srv_wait_for_pending(struct dmub_srv *dmub,
+ 	return DMUB_STATUS_TIMEOUT;
+ }
+ 
+-static enum dmub_status dmub_srv_update_inbox_status(struct dmub_srv *dmub)
+-{
+-	uint32_t rptr;
+-
+-	/* update inbox1 state */
+-		rptr = dmub->hw_funcs.get_inbox1_rptr(dmub);
+-
+-	if (rptr > dmub->inbox1.rb.capacity)
+-		return DMUB_STATUS_HW_FAILURE;
+-
+-	if (dmub->inbox1.rb.rptr > rptr) {
+-		/* rb wrapped */
+-		dmub->inbox1.num_reported += (rptr + dmub->inbox1.rb.capacity - dmub->inbox1.rb.rptr) / DMUB_RB_CMD_SIZE;
+-	} else {
+-		dmub->inbox1.num_reported += (rptr - dmub->inbox1.rb.rptr) / DMUB_RB_CMD_SIZE;
+-	}
+-	dmub->inbox1.rb.rptr = rptr;
+-
+-	/* update reg_inbox0 */
+-	dmub_srv_update_reg_inbox0_status(dmub);
+-
+-	return DMUB_STATUS_OK;
+-}
+-
+ enum dmub_status dmub_srv_wait_for_idle(struct dmub_srv *dmub,
+ 					uint32_t timeout_us)
+ {
+@@ -1353,3 +1327,33 @@ enum dmub_status dmub_srv_wait_for_inbox_free(struct dmub_srv *dmub,
+ 
+ 	return DMUB_STATUS_TIMEOUT;
+ }
++
++enum dmub_status dmub_srv_update_inbox_status(struct dmub_srv *dmub)
++{
++	uint32_t rptr;
++
++	if (!dmub->hw_init)
++		return DMUB_STATUS_INVALID;
++
++	if (dmub->power_state != DMUB_POWER_STATE_D0)
++		return DMUB_STATUS_POWER_STATE_D3;
++
++	/* update inbox1 state */
++	rptr = dmub->hw_funcs.get_inbox1_rptr(dmub);
++
++	if (rptr > dmub->inbox1.rb.capacity)
++		return DMUB_STATUS_HW_FAILURE;
++
++	if (dmub->inbox1.rb.rptr > rptr) {
++		/* rb wrapped */
++		dmub->inbox1.num_reported += (rptr + dmub->inbox1.rb.capacity - dmub->inbox1.rb.rptr) / DMUB_RB_CMD_SIZE;
++	} else {
++		dmub->inbox1.num_reported += (rptr - dmub->inbox1.rb.rptr) / DMUB_RB_CMD_SIZE;
++	}
++	dmub->inbox1.rb.rptr = rptr;
++
++	/* update reg_inbox0 */
++	dmub_srv_update_reg_inbox0_status(dmub);
++
++	return DMUB_STATUS_OK;
++}
+-- 
+2.52.0
+
