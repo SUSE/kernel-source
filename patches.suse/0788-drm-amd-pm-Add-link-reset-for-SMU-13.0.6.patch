@@ -1,0 +1,237 @@
+From 921c040efeca35e21a836aa80fb2e3a1b8f64c97 Mon Sep 17 00:00:00 2001
+From: Ce Sun <cesun102@amd.com>
+Date: Fri, 22 Nov 2024 15:19:16 +0800
+Subject: drm/amd/pm: Add link reset for SMU 13.0.6
+Git-commit: 921c040efeca35e21a836aa80fb2e3a1b8f64c97
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Add link reset implementation
+
+Signed-off-by: Ce Sun <cesun102@amd.com>
+Reviewed-by: Hawking Zhang <Hawking.Zhang@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/pm/amdgpu_dpm.c           | 28 +++++++++++++++++++
+ drivers/gpu/drm/amd/pm/inc/amdgpu_dpm.h       |  2 ++
+ drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c     | 26 +++++++++++++++++
+ drivers/gpu/drm/amd/pm/swsmu/inc/amdgpu_smu.h | 23 +++++++++++++--
+ .../drm/amd/pm/swsmu/smu13/smu_v13_0_6_ppt.c  | 22 +++++++++++++++
+ 5 files changed, 98 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/pm/amdgpu_dpm.c b/drivers/gpu/drm/amd/pm/amdgpu_dpm.c
+index 3533d43ed1e7..a23195a09a4c 100644
+--- a/drivers/gpu/drm/amd/pm/amdgpu_dpm.c
++++ b/drivers/gpu/drm/amd/pm/amdgpu_dpm.c
+@@ -329,6 +329,34 @@ int amdgpu_dpm_mode1_reset(struct amdgpu_device *adev)
+ 	return ret;
+ }
+ 
++bool amdgpu_dpm_is_link_reset_supported(struct amdgpu_device *adev)
++{
++	struct smu_context *smu = adev->powerplay.pp_handle;
++	bool support_link_reset = false;
++
++	if (is_support_sw_smu(adev)) {
++		mutex_lock(&adev->pm.mutex);
++		support_link_reset = smu_link_reset_is_support(smu);
++		mutex_unlock(&adev->pm.mutex);
++	}
++
++	return support_link_reset;
++}
++
++int amdgpu_dpm_link_reset(struct amdgpu_device *adev)
++{
++	struct smu_context *smu = adev->powerplay.pp_handle;
++	int ret = -EOPNOTSUPP;
++
++	if (is_support_sw_smu(adev)) {
++		mutex_lock(&adev->pm.mutex);
++		ret = smu_link_reset(smu);
++		mutex_unlock(&adev->pm.mutex);
++	}
++
++	return ret;
++}
++
+ int amdgpu_dpm_switch_power_profile(struct amdgpu_device *adev,
+ 				    enum PP_SMC_POWER_PROFILE type,
+ 				    bool en)
+diff --git a/drivers/gpu/drm/amd/pm/inc/amdgpu_dpm.h b/drivers/gpu/drm/amd/pm/inc/amdgpu_dpm.h
+index 4c0f7ad14816..4c12af23d414 100644
+--- a/drivers/gpu/drm/amd/pm/inc/amdgpu_dpm.h
++++ b/drivers/gpu/drm/amd/pm/inc/amdgpu_dpm.h
+@@ -416,11 +416,13 @@ int amdgpu_dpm_pause_power_profile(struct amdgpu_device *adev,
+ int amdgpu_dpm_baco_reset(struct amdgpu_device *adev);
+ 
+ int amdgpu_dpm_mode2_reset(struct amdgpu_device *adev);
++int amdgpu_dpm_link_reset(struct amdgpu_device *adev);
+ int amdgpu_dpm_enable_gfx_features(struct amdgpu_device *adev);
+ 
+ int amdgpu_dpm_is_baco_supported(struct amdgpu_device *adev);
+ 
+ bool amdgpu_dpm_is_mode1_reset_supported(struct amdgpu_device *adev);
++bool amdgpu_dpm_is_link_reset_supported(struct amdgpu_device *adev);
+ int amdgpu_dpm_mode1_reset(struct amdgpu_device *adev);
+ 
+ int amdgpu_dpm_set_mp1_state(struct amdgpu_device *adev,
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c b/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c
+index 46cce1d2aaf3..d23cfd5ba8dc 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c
+@@ -3445,6 +3445,19 @@ bool smu_mode2_reset_is_support(struct smu_context *smu)
+ 	return ret;
+ }
+ 
++bool smu_link_reset_is_support(struct smu_context *smu)
++{
++	bool ret = false;
++
++	if (!smu->pm_enabled)
++		return false;
++
++	if (smu->ppt_funcs && smu->ppt_funcs->link_reset_is_support)
++		ret = smu->ppt_funcs->link_reset_is_support(smu);
++
++	return ret;
++}
++
+ int smu_mode1_reset(struct smu_context *smu)
+ {
+ 	int ret = 0;
+@@ -3475,6 +3488,19 @@ static int smu_mode2_reset(void *handle)
+ 	return ret;
+ }
+ 
++int smu_link_reset(struct smu_context *smu)
++{
++	int ret = 0;
++
++	if (!smu->pm_enabled)
++		return -EOPNOTSUPP;
++
++	if (smu->ppt_funcs->link_reset)
++		ret = smu->ppt_funcs->link_reset(smu);
++
++	return ret;
++}
++
+ static int smu_enable_gfx_features(void *handle)
+ {
+ 	struct smu_context *smu = handle;
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/inc/amdgpu_smu.h b/drivers/gpu/drm/amd/pm/swsmu/inc/amdgpu_smu.h
+index dd6d0e7aa242..a855ae249c73 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/inc/amdgpu_smu.h
++++ b/drivers/gpu/drm/amd/pm/swsmu/inc/amdgpu_smu.h
+@@ -438,9 +438,11 @@ struct mclock_latency_table {
+ };
+ 
+ enum smu_reset_mode {
+-    SMU_RESET_MODE_0,
+-    SMU_RESET_MODE_1,
+-    SMU_RESET_MODE_2,
++	SMU_RESET_MODE_0,
++	SMU_RESET_MODE_1,
++	SMU_RESET_MODE_2,
++	SMU_RESET_MODE_3,
++	SMU_RESET_MODE_4,
+ };
+ 
+ enum smu_baco_state {
+@@ -1229,11 +1231,17 @@ struct pptable_funcs {
+ 	 * @mode1_reset_is_support: Check if GPU supports mode1 reset.
+ 	 */
+ 	bool (*mode1_reset_is_support)(struct smu_context *smu);
++
+ 	/**
+ 	 * @mode2_reset_is_support: Check if GPU supports mode2 reset.
+ 	 */
+ 	bool (*mode2_reset_is_support)(struct smu_context *smu);
+ 
++	/**
++	 * @link_reset_is_support: Check if GPU supports link reset.
++	 */
++	bool (*link_reset_is_support)(struct smu_context *smu);
++
+ 	/**
+ 	 * @mode1_reset: Perform mode1 reset.
+ 	 *
+@@ -1251,6 +1259,13 @@ struct pptable_funcs {
+ 	/* for gfx feature enablement after mode2 reset */
+ 	int (*enable_gfx_features)(struct smu_context *smu);
+ 
++	/**
++	 * @link_reset: Perform link reset.
++	 *
++	 * The gfx device driver reset
++	 */
++	int (*link_reset)(struct smu_context *smu);
++
+ 	/**
+ 	 * @get_dpm_ultimate_freq: Get the hard frequency range of a clock
+ 	 *                         domain in MHz.
+@@ -1602,7 +1617,9 @@ int smu_get_power_limit(void *handle,
+ 
+ bool smu_mode1_reset_is_support(struct smu_context *smu);
+ bool smu_mode2_reset_is_support(struct smu_context *smu);
++bool smu_link_reset_is_support(struct smu_context *smu);
+ int smu_mode1_reset(struct smu_context *smu);
++int smu_link_reset(struct smu_context *smu);
+ 
+ extern const struct amd_ip_funcs smu_ip_funcs;
+ 
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_6_ppt.c b/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_6_ppt.c
+index c478b3be37af..9264dc33ee7e 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_6_ppt.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_6_ppt.c
+@@ -2844,6 +2844,15 @@ static int smu_v13_0_6_mode1_reset(struct smu_context *smu)
+ 	return ret;
+ }
+ 
++static int smu_v13_0_6_link_reset(struct smu_context *smu)
++{
++	int ret = 0;
++
++	ret = smu_cmn_send_smc_msg_with_param(smu, SMU_MSG_GfxDeviceDriverReset,
++					      SMU_RESET_MODE_4, NULL);
++	return ret;
++}
++
+ static bool smu_v13_0_6_is_mode1_reset_supported(struct smu_context *smu)
+ {
+ 	return true;
+@@ -2854,6 +2863,17 @@ static bool smu_v13_0_6_is_mode2_reset_supported(struct smu_context *smu)
+ 	return true;
+ }
+ 
++static inline bool smu_v13_0_6_is_link_reset_supported(struct smu_context *smu)
++{
++	struct amdgpu_device *adev = smu->adev;
++	int var = (adev->pdev->device & 0xF);
++
++	if (var == 0x1)
++		return true;
++
++	return false;
++}
++
+ static int smu_v13_0_6_smu_send_hbm_bad_page_num(struct smu_context *smu,
+ 						 uint32_t size)
+ {
+@@ -3587,8 +3607,10 @@ static const struct pptable_funcs smu_v13_0_6_ppt_funcs = {
+ 	.get_thermal_temperature_range = smu_v13_0_6_get_thermal_temperature_range,
+ 	.mode1_reset_is_support = smu_v13_0_6_is_mode1_reset_supported,
+ 	.mode2_reset_is_support = smu_v13_0_6_is_mode2_reset_supported,
++	.link_reset_is_support = smu_v13_0_6_is_link_reset_supported,
+ 	.mode1_reset = smu_v13_0_6_mode1_reset,
+ 	.mode2_reset = smu_v13_0_6_mode2_reset,
++	.link_reset = smu_v13_0_6_link_reset,
+ 	.wait_for_event = smu_v13_0_wait_for_event,
+ 	.i2c_init = smu_v13_0_6_i2c_control_init,
+ 	.i2c_fini = smu_v13_0_6_i2c_control_fini,
+-- 
+2.52.0
+
