@@ -1,0 +1,132 @@
+From 0d6dcd741c266389bbf0a8758f537b3a171ac32a Mon Sep 17 00:00:00 2001
+From: Arun R Murthy <arun.r.murthy@intel.com>
+Date: Mon, 7 Apr 2025 11:13:46 +0530
+Subject: drm/plane: modify create_in_formats to acommodate async
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 0d6dcd741c266389bbf0a8758f537b3a171ac32a
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+create_in_formats creates the list of supported format/modifiers for
+synchronous flips, modify the same function so as to take the
+format_mod_supported as argument and create list of format/modifier for
+async as well.
+
+V5: create_in_formats can return -ve value in failure case, correct the
+if condition to check the creation of blob <Chaitanya>
+Dont add the modifier for which none of the formats is not supported.
+V6: Remove the code for masking the unsupported modifiers as UMD can
+leave with it. (Naveen/Chaitanya)
+V7: Retain the unsupported modifiers, userspace should have no
+impact, return pointer to blob instead of blob_id(Ville)
+
+Signed-off-by: Arun R Murthy <arun.r.murthy@intel.com>
+Acked-by: Xaver Hugl <xaver.hugl@kde.org>
+Acked-by: Harry Wentland <harry.wentland@amd.com>
+Reviewed-by: Chaitanya Kumar Borah <chaitanya.kumar.borah@intel.com>
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Tested-by: Naveen Kumar <naveen1.kumar@intel.com>
+Signed-off-by: Suraj Kandpal <suraj.kandpal@intel.com>
+Link: https://lore.kernel.org/r/20250407-asyn-v13-2-b93ef83076c5@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/drm_plane.c | 44 ++++++++++++++++++++++++++-----------
+ 1 file changed, 31 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_plane.c b/drivers/gpu/drm/drm_plane.c
+index fe181c100217..04992dfd4c79 100644
+--- a/drivers/gpu/drm/drm_plane.c
++++ b/drivers/gpu/drm/drm_plane.c
+@@ -193,9 +193,13 @@ modifiers_ptr(struct drm_format_modifier_blob *blob)
+ 	return (struct drm_format_modifier *)(((char *)blob) + blob->modifiers_offset);
+ }
+ 
+-static int create_in_format_blob(struct drm_device *dev, struct drm_plane *plane)
++static struct drm_property_blob *create_in_format_blob(struct drm_device *dev,
++						       struct drm_plane *plane,
++						       bool (*format_mod_supported)
++						       (struct drm_plane *plane,
++							u32 format,
++							u64 modifier))
+ {
+-	const struct drm_mode_config *config = &dev->mode_config;
+ 	struct drm_property_blob *blob;
+ 	struct drm_format_modifier *mod;
+ 	size_t blob_size, formats_size, modifiers_size;
+@@ -221,7 +225,7 @@ static int create_in_format_blob(struct drm_device *dev, struct drm_plane *plane
+ 
+ 	blob = drm_property_create_blob(dev, blob_size, NULL);
+ 	if (IS_ERR(blob))
+-		return -1;
++		return NULL;
+ 
+ 	blob_data = blob->data;
+ 	blob_data->version = FORMAT_BLOB_CURRENT;
+@@ -237,10 +241,10 @@ static int create_in_format_blob(struct drm_device *dev, struct drm_plane *plane
+ 	mod = modifiers_ptr(blob_data);
+ 	for (i = 0; i < plane->modifier_count; i++) {
+ 		for (j = 0; j < plane->format_count; j++) {
+-			if (!plane->funcs->format_mod_supported ||
+-			    plane->funcs->format_mod_supported(plane,
+-							       plane->format_types[j],
+-							       plane->modifiers[i])) {
++			if (!format_mod_supported ||
++			    format_mod_supported(plane,
++						 plane->format_types[j],
++						 plane->modifiers[i])) {
+ 				mod->formats |= 1ULL << j;
+ 			}
+ 		}
+@@ -251,10 +255,7 @@ static int create_in_format_blob(struct drm_device *dev, struct drm_plane *plane
+ 		mod++;
+ 	}
+ 
+-	drm_object_attach_property(&plane->base, config->modifiers_property,
+-				   blob->base.id);
+-
+-	return 0;
++	return blob;
+ }
+ 
+ /**
+@@ -366,6 +367,7 @@ static int __drm_universal_plane_init(struct drm_device *dev,
+ 				      const char *name, va_list ap)
+ {
+ 	struct drm_mode_config *config = &dev->mode_config;
++	struct drm_property_blob *blob;
+ 	static const uint64_t default_modifiers[] = {
+ 		DRM_FORMAT_MOD_LINEAR,
+ 	};
+@@ -477,8 +479,24 @@ static int __drm_universal_plane_init(struct drm_device *dev,
+ 		drm_plane_create_hotspot_properties(plane);
+ 	}
+ 
+-	if (format_modifier_count)
+-		create_in_format_blob(dev, plane);
++	if (format_modifier_count) {
++		blob = create_in_format_blob(dev, plane,
++					     plane->funcs->format_mod_supported);
++		if (!IS_ERR(blob))
++			drm_object_attach_property(&plane->base,
++						   config->modifiers_property,
++						   blob->base.id);
++	}
++
++	if (plane->funcs->format_mod_supported_async) {
++		blob = create_in_format_blob(dev, plane,
++					     plane->funcs->format_mod_supported_async);
++		if (!IS_ERR(blob))
++			drm_object_attach_property(&plane->base,
++						   config->async_modifiers_property,
++						   blob->base.id);
++	}
++
+ 
+ 	return 0;
+ }
+-- 
+2.52.0
+
