@@ -1,0 +1,239 @@
+From 330e76d3169721a55658c3b4fed872df6b0d6239 Mon Sep 17 00:00:00 2001
+From: Matt Coster <matt.coster@imgtec.com>
+Date: Thu, 10 Apr 2025 10:55:04 +0100
+Subject: drm/imagination: Add power domain control
+Git-commit: 330e76d3169721a55658c3b4fed872df6b0d6239
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+The first supported GPU only used a single power domain so this was
+automatically handled by the device runtime.
+
+In order to support multiple power domains, they must be enumerated from
+devicetree and linked to both the GPU device and each other to ensure
+correct power sequencing at start time.
+
+For all Imagination Rogue GPUs, power domains are named "a", "b", etc. and
+the sequence A->B->... is always valid for startup with the reverse true
+for shutdown. Note this is not always the *only* valid sequence, but it's
+simple and does not require special-casing for different GPU power
+topologies.
+
+Reviewed-by: Frank Binns <frank.binns@imgtec.com>
+Link: https://lore.kernel.org/r/20250410-sets-bxs-4-64-patch-v1-v6-5-eda620c5865f@imgtec.com
+Signed-off-by: Matt Coster <matt.coster@imgtec.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/imagination/pvr_device.h |   8 ++
+ drivers/gpu/drm/imagination/pvr_drv.c    |   7 ++
+ drivers/gpu/drm/imagination/pvr_power.c  | 114 +++++++++++++++++++++++
+ drivers/gpu/drm/imagination/pvr_power.h  |   3 +
+ 4 files changed, 132 insertions(+)
+
+diff --git a/drivers/gpu/drm/imagination/pvr_device.h b/drivers/gpu/drm/imagination/pvr_device.h
+index 6d0dfacb677b..2dd8a8885fe0 100644
+--- a/drivers/gpu/drm/imagination/pvr_device.h
++++ b/drivers/gpu/drm/imagination/pvr_device.h
+@@ -18,6 +18,7 @@
+ #include <linux/bits.h>
+ #include <linux/compiler_attributes.h>
+ #include <linux/compiler_types.h>
++#include <linux/device.h>
+ #include <linux/io.h>
+ #include <linux/iopoll.h>
+ #include <linux/kernel.h>
+@@ -131,6 +132,13 @@ struct pvr_device {
+ 	 */
+ 	struct clk *mem_clk;
+ 
++	struct pvr_device_power {
++		struct device **domain_devs;
++		struct device_link **domain_links;
++
++		u32 domain_count;
++	} power;
++
+ 	/** @irq: IRQ number. */
+ 	int irq;
+ 
+diff --git a/drivers/gpu/drm/imagination/pvr_drv.c b/drivers/gpu/drm/imagination/pvr_drv.c
+index f8aaa9910414..ac195402c3a8 100644
+--- a/drivers/gpu/drm/imagination/pvr_drv.c
++++ b/drivers/gpu/drm/imagination/pvr_drv.c
+@@ -1411,6 +1411,10 @@ pvr_probe(struct platform_device *plat_dev)
+ 
+ 	platform_set_drvdata(plat_dev, drm_dev);
+ 
++	err = pvr_power_domains_init(pvr_dev);
++	if (err)
++		return err;
++
+ 	init_rwsem(&pvr_dev->reset_sem);
+ 
+ 	pvr_context_device_init(pvr_dev);
+@@ -1450,6 +1454,8 @@ pvr_probe(struct platform_device *plat_dev)
+ err_context_fini:
+ 	pvr_context_device_fini(pvr_dev);
+ 
++	pvr_power_domains_fini(pvr_dev);
++
+ 	return err;
+ }
+ 
+@@ -1470,6 +1476,7 @@ static void pvr_remove(struct platform_device *plat_dev)
+ 	pvr_watchdog_fini(pvr_dev);
+ 	pvr_queue_device_fini(pvr_dev);
+ 	pvr_context_device_fini(pvr_dev);
++	pvr_power_domains_fini(pvr_dev);
+ }
+ 
+ static const struct of_device_id dt_match[] = {
+diff --git a/drivers/gpu/drm/imagination/pvr_power.c b/drivers/gpu/drm/imagination/pvr_power.c
+index ba7816fd28ec..19b079b357df 100644
+--- a/drivers/gpu/drm/imagination/pvr_power.c
++++ b/drivers/gpu/drm/imagination/pvr_power.c
+@@ -10,10 +10,13 @@
+ 
+ #include <drm/drm_drv.h>
+ #include <drm/drm_managed.h>
++#include <linux/cleanup.h>
+ #include <linux/clk.h>
+ #include <linux/interrupt.h>
+ #include <linux/mutex.h>
++#include <linux/of.h>
+ #include <linux/platform_device.h>
++#include <linux/pm_domain.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/timer.h>
+ #include <linux/types.h>
+@@ -431,3 +434,114 @@ pvr_watchdog_fini(struct pvr_device *pvr_dev)
+ {
+ 	cancel_delayed_work_sync(&pvr_dev->watchdog.work);
+ }
++
++int pvr_power_domains_init(struct pvr_device *pvr_dev)
++{
++	struct device *dev = from_pvr_device(pvr_dev)->dev;
++
++	struct device_link **domain_links __free(kfree) = NULL;
++	struct device **domain_devs __free(kfree) = NULL;
++	int domain_count;
++	int link_count;
++
++	char dev_name[2] = "a";
++	int err;
++	int i;
++
++	domain_count = of_count_phandle_with_args(dev->of_node, "power-domains",
++						  "#power-domain-cells");
++	if (domain_count < 0)
++		return domain_count;
++
++	if (domain_count <= 1)
++		return 0;
++
++	link_count = domain_count + (domain_count - 1);
++
++	domain_devs = kcalloc(domain_count, sizeof(*domain_devs), GFP_KERNEL);
++	if (!domain_devs)
++		return -ENOMEM;
++
++	domain_links = kcalloc(link_count, sizeof(*domain_links), GFP_KERNEL);
++	if (!domain_links)
++		return -ENOMEM;
++
++	for (i = 0; i < domain_count; i++) {
++		struct device *domain_dev;
++
++		dev_name[0] = 'a' + i;
++		domain_dev = dev_pm_domain_attach_by_name(dev, dev_name);
++		if (IS_ERR_OR_NULL(domain_dev)) {
++			err = domain_dev ? PTR_ERR(domain_dev) : -ENODEV;
++			goto err_detach;
++		}
++
++		domain_devs[i] = domain_dev;
++	}
++
++	for (i = 0; i < domain_count; i++) {
++		struct device_link *link;
++
++		link = device_link_add(dev, domain_devs[i], DL_FLAG_STATELESS | DL_FLAG_PM_RUNTIME);
++		if (!link) {
++			err = -ENODEV;
++			goto err_unlink;
++		}
++
++		domain_links[i] = link;
++	}
++
++	for (i = domain_count; i < link_count; i++) {
++		struct device_link *link;
++
++		link = device_link_add(domain_devs[i - domain_count + 1],
++				       domain_devs[i - domain_count],
++				       DL_FLAG_STATELESS | DL_FLAG_PM_RUNTIME);
++		if (!link) {
++			err = -ENODEV;
++			goto err_unlink;
++		}
++
++		domain_links[i] = link;
++	}
++
++	pvr_dev->power = (struct pvr_device_power){
++		.domain_devs = no_free_ptr(domain_devs),
++		.domain_links = no_free_ptr(domain_links),
++		.domain_count = domain_count,
++	};
++
++	return 0;
++
++err_unlink:
++	while (--i >= 0)
++		device_link_del(domain_links[i]);
++
++	i = domain_count;
++
++err_detach:
++	while (--i >= 0)
++		dev_pm_domain_detach(domain_devs[i], true);
++
++	return err;
++}
++
++void pvr_power_domains_fini(struct pvr_device *pvr_dev)
++{
++	const int domain_count = pvr_dev->power.domain_count;
++
++	int i = domain_count + (domain_count - 1);
++
++	while (--i >= 0)
++		device_link_del(pvr_dev->power.domain_links[i]);
++
++	i = domain_count;
++
++	while (--i >= 0)
++		dev_pm_domain_detach(pvr_dev->power.domain_devs[i], true);
++
++	kfree(pvr_dev->power.domain_links);
++	kfree(pvr_dev->power.domain_devs);
++
++	pvr_dev->power = (struct pvr_device_power){ 0 };
++}
+diff --git a/drivers/gpu/drm/imagination/pvr_power.h b/drivers/gpu/drm/imagination/pvr_power.h
+index 9a9312dcb2da..ada85674a7ca 100644
+--- a/drivers/gpu/drm/imagination/pvr_power.h
++++ b/drivers/gpu/drm/imagination/pvr_power.h
+@@ -38,4 +38,7 @@ pvr_power_put(struct pvr_device *pvr_dev)
+ 	return pm_runtime_put(drm_dev->dev);
+ }
+ 
++int pvr_power_domains_init(struct pvr_device *pvr_dev);
++void pvr_power_domains_fini(struct pvr_device *pvr_dev);
++
+ #endif /* PVR_POWER_H */
+-- 
+2.52.0
+
