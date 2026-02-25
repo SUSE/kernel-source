@@ -1,0 +1,100 @@
+From b0db33c8c50f5e89557d4b11da94820677f0c9a2 Mon Sep 17 00:00:00 2001
+From: Alex Deucher <alexander.deucher@amd.com>
+Date: Fri, 21 Feb 2025 14:47:00 -0500
+Subject: drm/amdgpu/userq: rework front end call sequence
+Git-commit: b0db33c8c50f5e89557d4b11da94820677f0c9a2
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Split out the queue map from the mqd create call and split
+out the queue unmap from the mqd destroy call.  This splits
+the queue setup and teardown with the actual enablement
+in the firmware.
+
+Reviewed-by: Sunil Khatri <sunil.khatri@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c | 17 +++++++++++++++--
+ drivers/gpu/drm/amd/amdgpu/mes_userqueue.c    | 10 ----------
+ 2 files changed, 15 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c
+index 2be1e54b7899..c3873041ec94 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c
+@@ -263,7 +263,10 @@ amdgpu_userqueue_destroy(struct drm_file *filp, int queue_id)
+ {
+ 	struct amdgpu_fpriv *fpriv = filp->driver_priv;
+ 	struct amdgpu_userq_mgr *uq_mgr = &fpriv->userq_mgr;
++	struct amdgpu_device *adev = uq_mgr->adev;
++	const struct amdgpu_userq_funcs *uq_funcs;
+ 	struct amdgpu_usermode_queue *queue;
++	int r;
+ 
+ 	cancel_delayed_work(&uq_mgr->resume_work);
+ 	mutex_lock(&uq_mgr->userq_mutex);
+@@ -274,12 +277,13 @@ amdgpu_userqueue_destroy(struct drm_file *filp, int queue_id)
+ 		mutex_unlock(&uq_mgr->userq_mutex);
+ 		return -EINVAL;
+ 	}
+-
++	uq_funcs = adev->userq_funcs[queue->queue_type];
++	r = uq_funcs->unmap(uq_mgr, queue);
+ 	amdgpu_bo_unpin(queue->db_obj.obj);
+ 	amdgpu_bo_unref(&queue->db_obj.obj);
+ 	amdgpu_userqueue_cleanup(uq_mgr, queue, queue_id);
+ 	mutex_unlock(&uq_mgr->userq_mutex);
+-	return 0;
++	return r;
+ }
+ 
+ static int
+@@ -364,6 +368,15 @@ amdgpu_userqueue_create(struct drm_file *filp, union drm_amdgpu_userq *args)
+ 		r = -ENOMEM;
+ 		goto unlock;
+ 	}
++
++	r = uq_funcs->map(uq_mgr, queue);
++	if (r) {
++		DRM_ERROR("Failed to map Queue\n");
++		uq_funcs->mqd_destroy(uq_mgr, queue);
++		kfree(queue);
++		goto unlock;
++	}
++
+ 	args->out.queue_id = qid;
+ 
+ unlock:
+diff --git a/drivers/gpu/drm/amd/amdgpu/mes_userqueue.c b/drivers/gpu/drm/amd/amdgpu/mes_userqueue.c
+index fe6fc3e0a320..e3c3fc160b79 100644
+--- a/drivers/gpu/drm/amd/amdgpu/mes_userqueue.c
++++ b/drivers/gpu/drm/amd/amdgpu/mes_userqueue.c
+@@ -320,13 +320,6 @@ static int mes_userq_mqd_create(struct amdgpu_userq_mgr *uq_mgr,
+ 		goto free_ctx;
+ 	}
+ 
+-	/* Map userqueue into FW using MES */
+-	r = mes_userq_map(uq_mgr, queue);
+-	if (r) {
+-		DRM_ERROR("Failed to init MQD\n");
+-		goto free_ctx;
+-	}
+-
+ 	return 0;
+ 
+ free_ctx:
+@@ -350,9 +343,6 @@ mes_userq_mqd_destroy(struct amdgpu_userq_mgr *uq_mgr,
+ {
+ 	struct amdgpu_device *adev = uq_mgr->adev;
+ 
+-	if (queue->queue_active)
+-		mes_userq_unmap(uq_mgr, queue);
+-
+ 	amdgpu_userqueue_destroy_object(uq_mgr, &queue->fw_obj);
+ 	kfree(queue->userq_prop);
+ 	amdgpu_userqueue_destroy_object(uq_mgr, &queue->mqd);
+-- 
+2.52.0
+
