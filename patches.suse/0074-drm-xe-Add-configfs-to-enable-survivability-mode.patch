@@ -1,0 +1,324 @@
+From 16280ded45fba1216d1d4c6acfc20c2d5b45ef50 Mon Sep 17 00:00:00 2001
+From: Riana Tauro <riana.tauro@intel.com>
+Date: Mon, 7 Apr 2025 10:44:11 +0530
+Subject: drm/xe: Add configfs to enable survivability mode
+Git-commit: 16280ded45fba1216d1d4c6acfc20c2d5b45ef50
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Registers a configfs subsystem called 'xe' that creates a
+directory in the mounted configfs directory (/sys/kernel/config)
+Userspace can then create the device that has to be configured
+under the xe directory
+
+	mkdir /sys/kernel/config/xe/0000:03:00.0
+
+The device created will have the following attributes to be
+configured
+
+	/sys/kernel/config/xe/
+		.. 0000:03:00.0/
+			... survivability_mode
+
+V2: fix kernel-doc
+    fix return value (Lucas)
+
+V3: fix kernel-doc (Lucas)
+
+Signed-off-by: Riana Tauro <riana.tauro@intel.com>
+Reviewed-by: Lucas De Marchi <lucas.demarchi@intel.com>
+Link: https://lore.kernel.org/r/20250407051414.1651616-2-riana.tauro@intel.com
+Signed-off-by: Lucas De Marchi <lucas.demarchi@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ Documentation/gpu/xe/index.rst       |   1 +
+ Documentation/gpu/xe/xe_configfs.rst |  10 ++
+ drivers/gpu/drm/xe/Makefile          |   1 +
+ drivers/gpu/drm/xe/xe_configfs.c     | 188 +++++++++++++++++++++++++++
+ drivers/gpu/drm/xe/xe_configfs.h     |  16 +++
+ drivers/gpu/drm/xe/xe_module.c       |   5 +
+ 6 files changed, 221 insertions(+)
+ create mode 100644 Documentation/gpu/xe/xe_configfs.rst
+ create mode 100644 drivers/gpu/drm/xe/xe_configfs.c
+ create mode 100644 drivers/gpu/drm/xe/xe_configfs.h
+
+diff --git a/Documentation/gpu/xe/index.rst b/Documentation/gpu/xe/index.rst
+index 92cfb25e64d3..b2369561f24e 100644
+--- a/Documentation/gpu/xe/index.rst
++++ b/Documentation/gpu/xe/index.rst
+@@ -25,3 +25,4 @@ DG2, etc is provided to prototype the driver.
+    xe_debugging
+    xe_devcoredump
+    xe-drm-usage-stats.rst
++   xe_configfs
+diff --git a/Documentation/gpu/xe/xe_configfs.rst b/Documentation/gpu/xe/xe_configfs.rst
+new file mode 100644
+index 000000000000..9b9d941eb20e
+--- /dev/null
++++ b/Documentation/gpu/xe/xe_configfs.rst
+@@ -0,0 +1,10 @@
++.. SPDX-License-Identifier: GPL-2.0+
++
++.. _xe_configfs:
++
++============
++Xe Configfs
++============
++
++.. kernel-doc:: drivers/gpu/drm/xe/xe_configfs.c
++   :doc: Xe Configfs
+diff --git a/drivers/gpu/drm/xe/Makefile b/drivers/gpu/drm/xe/Makefile
+index e4fec90bab55..c1493ef2c12b 100644
+--- a/drivers/gpu/drm/xe/Makefile
++++ b/drivers/gpu/drm/xe/Makefile
+@@ -131,6 +131,7 @@ xe-$(CONFIG_DRM_XE_GPUSVM) += xe_svm.o
+ xe-$(CONFIG_HWMON) += xe_hwmon.o
+ 
+ xe-$(CONFIG_PERF_EVENTS) += xe_pmu.o
++xe-$(CONFIG_CONFIGFS_FS) += xe_configfs.o
+ 
+ # graphics virtualization (SR-IOV) support
+ xe-y += \
+diff --git a/drivers/gpu/drm/xe/xe_configfs.c b/drivers/gpu/drm/xe/xe_configfs.c
+new file mode 100644
+index 000000000000..48a9f428bda9
+--- /dev/null
++++ b/drivers/gpu/drm/xe/xe_configfs.c
+@@ -0,0 +1,188 @@
++// SPDX-License-Identifier: MIT
++/*
++ * Copyright © 2025 Intel Corporation
++ */
++
++#include <linux/configfs.h>
++#include <linux/init.h>
++#include <linux/module.h>
++#include <linux/pci.h>
++
++#include "xe_configfs.h"
++#include "xe_module.h"
++
++/**
++ * DOC: Xe Configfs
++ *
++ * Overview
++ * =========
++ *
++ * Configfs is a filesystem-based manager of kernel objects. XE KMD registers a
++ * configfs subsystem called ``'xe'`` that creates a directory in the mounted configfs directory
++ * The user can create devices under this directory and configure them as necessary
++ * See Documentation/filesystems/configfs.rst for more information about how configfs works.
++ *
++ * Create devices
++ * ===============
++ *
++ * In order to create a device, the user has to create a directory inside ``'xe'``::
++ *
++ *	mkdir /sys/kernel/config/xe/0000:03:00.0/
++ *
++ * Every device created is populated by the driver with entries that can be
++ * used to configure it::
++ *
++ *	/sys/kernel/config/xe/
++ *		.. 0000:03:00.0/
++ *			... survivability_mode
++ *
++ * Configure Attributes
++ * ====================
++ *
++ * Survivability mode:
++ * -------------------
++ *
++ * Enable survivability mode on supported cards. This setting only takes
++ * effect when probing the device. Example to enable it::
++ *
++ *	# echo 1 > /sys/kernel/config/xe/0000:03:00.0/survivability_mode
++ *	# echo 0000:03:00.0 > /sys/bus/pci/drivers/xe/bind  (Enters survivability mode if supported)
++ *
++ * Remove devices
++ * ==============
++ *
++ * The created device directories can be removed using ``rmdir``::
++ *
++ *	rmdir /sys/kernel/config/xe/0000:03:00.0/
++ */
++
++struct xe_config_device {
++	struct config_group group;
++
++	bool survivability_mode;
++
++	/* protects attributes */
++	struct mutex lock;
++};
++
++static struct xe_config_device *to_xe_config_device(struct config_item *item)
++{
++	return container_of(to_config_group(item), struct xe_config_device, group);
++}
++
++static ssize_t survivability_mode_show(struct config_item *item, char *page)
++{
++	struct xe_config_device *dev = to_xe_config_device(item);
++
++	return sprintf(page, "%d\n", dev->survivability_mode);
++}
++
++static ssize_t survivability_mode_store(struct config_item *item, const char *page, size_t len)
++{
++	struct xe_config_device *dev = to_xe_config_device(item);
++	bool survivability_mode;
++	int ret;
++
++	ret = kstrtobool(page, &survivability_mode);
++	if (ret)
++		return ret;
++
++	mutex_lock(&dev->lock);
++	dev->survivability_mode = survivability_mode;
++	mutex_unlock(&dev->lock);
++
++	return len;
++}
++
++CONFIGFS_ATTR(, survivability_mode);
++
++static struct configfs_attribute *xe_config_device_attrs[] = {
++	&attr_survivability_mode,
++	NULL,
++};
++
++static void xe_config_device_release(struct config_item *item)
++{
++	struct xe_config_device *dev = to_xe_config_device(item);
++
++	mutex_destroy(&dev->lock);
++	kfree(dev);
++}
++
++static struct configfs_item_operations xe_config_device_ops = {
++	.release	= xe_config_device_release,
++};
++
++static const struct config_item_type xe_config_device_type = {
++	.ct_item_ops	= &xe_config_device_ops,
++	.ct_attrs	= xe_config_device_attrs,
++	.ct_owner	= THIS_MODULE,
++};
++
++static struct config_group *xe_config_make_device_group(struct config_group *group,
++							const char *name)
++{
++	unsigned int domain, bus, slot, function;
++	struct xe_config_device *dev;
++	struct pci_dev *pdev;
++	int ret;
++
++	ret = sscanf(name, "%04x:%02x:%02x.%x", &domain, &bus, &slot, &function);
++	if (ret != 4)
++		return ERR_PTR(-EINVAL);
++
++	pdev = pci_get_domain_bus_and_slot(domain, bus, PCI_DEVFN(slot, function));
++	if (!pdev)
++		return ERR_PTR(-EINVAL);
++
++	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
++	if (!dev)
++		return ERR_PTR(-ENOMEM);
++
++	config_group_init_type_name(&dev->group, name, &xe_config_device_type);
++
++	mutex_init(&dev->lock);
++
++	return &dev->group;
++}
++
++static struct configfs_group_operations xe_config_device_group_ops = {
++	.make_group	= xe_config_make_device_group,
++};
++
++static const struct config_item_type xe_configfs_type = {
++	.ct_group_ops	= &xe_config_device_group_ops,
++	.ct_owner	= THIS_MODULE,
++};
++
++static struct configfs_subsystem xe_configfs = {
++	.su_group = {
++		.cg_item = {
++			.ci_namebuf = "xe",
++			.ci_type = &xe_configfs_type,
++		},
++	},
++};
++
++int __init xe_configfs_init(void)
++{
++	struct config_group *root = &xe_configfs.su_group;
++	int ret;
++
++	config_group_init(root);
++	mutex_init(&xe_configfs.su_mutex);
++	ret = configfs_register_subsystem(&xe_configfs);
++	if (ret) {
++		pr_err("Error %d while registering %s subsystem\n",
++		       ret, root->cg_item.ci_namebuf);
++		return ret;
++	}
++
++	return 0;
++}
++
++void __exit xe_configfs_exit(void)
++{
++	configfs_unregister_subsystem(&xe_configfs);
++}
++
+diff --git a/drivers/gpu/drm/xe/xe_configfs.h b/drivers/gpu/drm/xe/xe_configfs.h
+new file mode 100644
+index 000000000000..5532320818e4
+--- /dev/null
++++ b/drivers/gpu/drm/xe/xe_configfs.h
+@@ -0,0 +1,16 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * Copyright © 2025 Intel Corporation
++ */
++#ifndef _XE_CONFIGFS_H_
++#define _XE_CONFIGFS_H_
++
++#if IS_ENABLED(CONFIG_CONFIGFS_FS)
++int xe_configfs_init(void);
++void xe_configfs_exit(void);
++#else
++static inline int xe_configfs_init(void) { return 0; };
++static inline void xe_configfs_exit(void) {};
++#endif
++
++#endif
+diff --git a/drivers/gpu/drm/xe/xe_module.c b/drivers/gpu/drm/xe/xe_module.c
+index e861c694f336..4bdf34347027 100644
+--- a/drivers/gpu/drm/xe/xe_module.c
++++ b/drivers/gpu/drm/xe/xe_module.c
+@@ -11,6 +11,7 @@
+ #include <drm/drm_module.h>
+ 
+ #include "xe_drv.h"
++#include "xe_configfs.h"
+ #include "xe_hw_fence.h"
+ #include "xe_pci.h"
+ #include "xe_pm.h"
+@@ -85,6 +86,10 @@ static const struct init_funcs init_funcs[] = {
+ 	{
+ 		.init = xe_check_nomodeset,
+ 	},
++	{
++		.init = xe_configfs_init,
++		.exit = xe_configfs_exit,
++	},
+ 	{
+ 		.init = xe_hw_fence_module_init,
+ 		.exit = xe_hw_fence_module_exit,
+-- 
+2.52.0
+
