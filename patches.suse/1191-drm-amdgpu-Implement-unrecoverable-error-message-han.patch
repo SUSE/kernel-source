@@ -1,0 +1,212 @@
+From 086809c82c96116aed78f762e4f1d61a4e0210a7 Mon Sep 17 00:00:00 2001
+From: Ellen Pan <yunru.pan@amd.com>
+Date: Tue, 29 Apr 2025 17:18:44 -0400
+Subject: drm/amdgpu: Implement unrecoverable error message handling for VFs
+Git-commit: 086809c82c96116aed78f762e4f1d61a4e0210a7
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+This notification may arrive in VF mailbox while polling for response from
+another event.
+
+This patches covers the following scenarios:
+
+- If VF is already in RMA state, then do not attempt to contact the host.
+  Host will ignore the VF after sending the notification.
+
+- If the notification is detected during polling, then set the RMA status,
+  and return error to caller.
+
+- If the notification arrives by interrupt, then set the RMA status and
+  queue a reset.  This reset will fail and VF will stop runtime services.
+
+Reviewed-by: Shravan Kumar Gande <Shravankumar.Gande@amd.com>
+Signed-off-by: Victor Skvortsov <victor.skvortsov@amd.com>
+Signed-off-by: Ellen Pan <yunru.pan@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c |  5 ++++
+ drivers/gpu/drm/amd/amdgpu/mxgpu_ai.c      | 17 +++++++++--
+ drivers/gpu/drm/amd/amdgpu/mxgpu_ai.h      |  1 +
+ drivers/gpu/drm/amd/amdgpu/mxgpu_nv.c      | 34 ++++++++++++++++++++--
+ drivers/gpu/drm/amd/amdgpu/mxgpu_nv.h      |  1 +
+ 5 files changed, 52 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 66ffb73746d0..4d1b54f58495 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -6142,6 +6142,11 @@ static int amdgpu_device_asic_reset(struct amdgpu_device *adev,
+ 	/* Actual ASIC resets if needed.*/
+ 	/* Host driver will handle XGMI hive reset for SRIOV */
+ 	if (amdgpu_sriov_vf(adev)) {
++
++		/* Bail out of reset early */
++		if (amdgpu_ras_is_rma(adev))
++			return -ENODEV;
++
+ 		if (amdgpu_ras_get_fed_status(adev) || amdgpu_virt_rcvd_ras_interrupt(adev)) {
+ 			dev_dbg(adev->dev, "Detected RAS error, wait for FLR completion\n");
+ 			amdgpu_ras_set_fed(adev, true);
+diff --git a/drivers/gpu/drm/amd/amdgpu/mxgpu_ai.c b/drivers/gpu/drm/amd/amdgpu/mxgpu_ai.c
+index f2a74aa76b56..48101a34e049 100644
+--- a/drivers/gpu/drm/amd/amdgpu/mxgpu_ai.c
++++ b/drivers/gpu/drm/amd/amdgpu/mxgpu_ai.c
+@@ -324,6 +324,7 @@ static int xgpu_ai_mailbox_rcv_irq(struct amdgpu_device *adev,
+ 				   struct amdgpu_iv_entry *entry)
+ {
+ 	enum idh_event event = xgpu_ai_mailbox_peek_msg(adev);
++	struct amdgpu_ras *ras = amdgpu_ras_get_context(adev);
+ 
+ 	switch (event) {
+ 	case IDH_RAS_BAD_PAGES_NOTIFICATION:
+@@ -331,12 +332,22 @@ static int xgpu_ai_mailbox_rcv_irq(struct amdgpu_device *adev,
+ 		if (amdgpu_sriov_runtime(adev))
+ 			schedule_work(&adev->virt.bad_pages_work);
+ 		break;
++	case IDH_UNRECOV_ERR_NOTIFICATION:
++		xgpu_ai_mailbox_send_ack(adev);
++		ras->is_rma = true;
++		dev_err(adev->dev, "VF is in an unrecoverable state. Runtime Services are halted.\n");
++		if (amdgpu_sriov_runtime(adev))
++			WARN_ONCE(!amdgpu_reset_domain_schedule(adev->reset_domain,
++					&adev->virt.flr_work),
++					"Failed to queue work! at %s",
++					__func__);
++		break;
+ 	case IDH_FLR_NOTIFICATION:
+ 		if (amdgpu_sriov_runtime(adev))
+ 			WARN_ONCE(!amdgpu_reset_domain_schedule(adev->reset_domain,
+-								&adev->virt.flr_work),
+-				  "Failed to queue work! at %s",
+-				  __func__);
++						&adev->virt.flr_work),
++					"Failed to queue work! at %s",
++					__func__);
+ 		break;
+ 	case IDH_QUERY_ALIVE:
+ 		xgpu_ai_mailbox_send_ack(adev);
+diff --git a/drivers/gpu/drm/amd/amdgpu/mxgpu_ai.h b/drivers/gpu/drm/amd/amdgpu/mxgpu_ai.h
+index efb452ad1700..874b9f8f9804 100644
+--- a/drivers/gpu/drm/amd/amdgpu/mxgpu_ai.h
++++ b/drivers/gpu/drm/amd/amdgpu/mxgpu_ai.h
+@@ -57,6 +57,7 @@ enum idh_event {
+ 	IDH_RAS_ERROR_DETECTED,
+ 	IDH_RAS_BAD_PAGES_READY = 15,
+ 	IDH_RAS_BAD_PAGES_NOTIFICATION = 16,
++	IDH_UNRECOV_ERR_NOTIFICATION = 17,
+ 	IDH_TEXT_MESSAGE = 255,
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/mxgpu_nv.c b/drivers/gpu/drm/amd/amdgpu/mxgpu_nv.c
+index 74a50c0036ef..f6d8597452ed 100644
+--- a/drivers/gpu/drm/amd/amdgpu/mxgpu_nv.c
++++ b/drivers/gpu/drm/amd/amdgpu/mxgpu_nv.c
+@@ -67,6 +67,8 @@ static int xgpu_nv_mailbox_rcv_msg(struct amdgpu_device *adev,
+ 	reg = RREG32_NO_KIQ(mmMAILBOX_MSGBUF_RCV_DW0);
+ 	if (reg == IDH_FAIL)
+ 		r = -EINVAL;
++	if (reg == IDH_UNRECOV_ERR_NOTIFICATION)
++		r = -ENODEV;
+ 	else if (reg != event)
+ 		return -ENOENT;
+ 
+@@ -103,6 +105,7 @@ static int xgpu_nv_poll_msg(struct amdgpu_device *adev, enum idh_event event)
+ {
+ 	int r;
+ 	uint64_t timeout, now;
++	struct amdgpu_ras *ras = amdgpu_ras_get_context(adev);
+ 
+ 	now = (uint64_t)ktime_to_ms(ktime_get());
+ 	timeout = now + NV_MAILBOX_POLL_MSG_TIMEDOUT;
+@@ -110,8 +113,16 @@ static int xgpu_nv_poll_msg(struct amdgpu_device *adev, enum idh_event event)
+ 	do {
+ 		r = xgpu_nv_mailbox_rcv_msg(adev, event);
+ 		if (!r) {
+-			dev_dbg(adev->dev, "rcv_msg 0x%x after %llu ms\n", event, NV_MAILBOX_POLL_MSG_TIMEDOUT - timeout + now);
++			dev_dbg(adev->dev, "rcv_msg 0x%x after %llu ms\n",
++					event, NV_MAILBOX_POLL_MSG_TIMEDOUT - timeout + now);
+ 			return 0;
++		} else if (r == -ENODEV) {
++			if (!amdgpu_ras_is_rma(adev)) {
++				ras->is_rma = true;
++				dev_err(adev->dev, "VF is in an unrecoverable state. "
++						"Runtime Services are halted.\n");
++			}
++			return r;
+ 		}
+ 
+ 		msleep(10);
+@@ -166,6 +177,10 @@ static int xgpu_nv_send_access_requests_with_param(struct amdgpu_device *adev,
+ 	enum idh_event event = -1;
+ 
+ send_request:
++
++	if (amdgpu_ras_is_rma(adev))
++		return -ENODEV;
++
+ 	xgpu_nv_mailbox_trans_msg(adev, req, data1, data2, data3);
+ 
+ 	switch (req) {
+@@ -323,6 +338,7 @@ static void xgpu_nv_mailbox_flr_work(struct work_struct *work)
+ {
+ 	struct amdgpu_virt *virt = container_of(work, struct amdgpu_virt, flr_work);
+ 	struct amdgpu_device *adev = container_of(virt, struct amdgpu_device, virt);
++	struct amdgpu_reset_context reset_context = { 0 };
+ 
+ 	amdgpu_virt_fini_data_exchange(adev);
+ 
+@@ -333,8 +349,6 @@ static void xgpu_nv_mailbox_flr_work(struct work_struct *work)
+ 		adev->gfx_timeout == MAX_SCHEDULE_TIMEOUT ||
+ 		adev->compute_timeout == MAX_SCHEDULE_TIMEOUT ||
+ 		adev->video_timeout == MAX_SCHEDULE_TIMEOUT)) {
+-		struct amdgpu_reset_context reset_context;
+-		memset(&reset_context, 0, sizeof(reset_context));
+ 
+ 		reset_context.method = AMD_RESET_METHOD_NONE;
+ 		reset_context.reset_req_dev = adev;
+@@ -380,6 +394,7 @@ static int xgpu_nv_mailbox_rcv_irq(struct amdgpu_device *adev,
+ 				   struct amdgpu_iv_entry *entry)
+ {
+ 	enum idh_event event = xgpu_nv_mailbox_peek_msg(adev);
++	struct amdgpu_ras *ras = amdgpu_ras_get_context(adev);
+ 
+ 	switch (event) {
+ 	case IDH_RAS_BAD_PAGES_NOTIFICATION:
+@@ -387,6 +402,19 @@ static int xgpu_nv_mailbox_rcv_irq(struct amdgpu_device *adev,
+ 		if (amdgpu_sriov_runtime(adev))
+ 			schedule_work(&adev->virt.bad_pages_work);
+ 		break;
++	case IDH_UNRECOV_ERR_NOTIFICATION:
++		xgpu_nv_mailbox_send_ack(adev);
++		if (!amdgpu_ras_is_rma(adev)) {
++			ras->is_rma = true;
++			dev_err(adev->dev, "VF is in an unrecoverable state. Runtime Services are halted.\n");
++		}
++
++		if (amdgpu_sriov_runtime(adev))
++			WARN_ONCE(!amdgpu_reset_domain_schedule(adev->reset_domain,
++						&adev->virt.flr_work),
++					"Failed to queue work! at %s",
++					__func__);
++		break;
+ 	case IDH_FLR_NOTIFICATION:
+ 		if (amdgpu_sriov_runtime(adev))
+ 			WARN_ONCE(!amdgpu_reset_domain_schedule(adev->reset_domain,
+diff --git a/drivers/gpu/drm/amd/amdgpu/mxgpu_nv.h b/drivers/gpu/drm/amd/amdgpu/mxgpu_nv.h
+index 6d292a537c1b..5808689562cc 100644
+--- a/drivers/gpu/drm/amd/amdgpu/mxgpu_nv.h
++++ b/drivers/gpu/drm/amd/amdgpu/mxgpu_nv.h
+@@ -61,6 +61,7 @@ enum idh_event {
+ 	IDH_RAS_CPER_DUMP_READY = 14,
+ 	IDH_RAS_BAD_PAGES_READY = 15,
+ 	IDH_RAS_BAD_PAGES_NOTIFICATION = 16,
++	IDH_UNRECOV_ERR_NOTIFICATION = 17,
+ 
+ 	IDH_TEXT_MESSAGE = 255,
+ };
+-- 
+2.52.0
+
