@@ -1,0 +1,209 @@
+From 88c1f9a4d36de61f87cc52aac670020b13d1ccaa Mon Sep 17 00:00:00 2001
+From: Mohammed Thasleem <mohammed.thasleem@intel.com>
+Date: Fri, 21 Mar 2025 18:07:07 +0530
+Subject: drm/i915/dmc: Create debugfs entry for dc6 counter
+Git-commit: 88c1f9a4d36de61f87cc52aac670020b13d1ccaa
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Starting from MTL we don't have a platform agnostic way to validate
+DC6 state due to dc6 counter has been removed to validate DC state.
+
+The goal is to validate that the display HW can reach the DC6 power
+state. There is no HW DC6 residency counter (and there wasn't such
+a counter earlier either), so an alternative way is required. According
+to the HW team the display driver has programmed everything correctly in
+order to allow the DC6 power state if the DC5 power state is reached
+(indicated by the HW DC5 residency counter incrementing) and DC6 is
+enabled by the driver.
+
+Driver could take a snapshot of the DC5 residency counter right
+after it enables DC6 (dc5_residency_start) and increment the SW
+DC6 residency counter right before it disables DC6 or when user space
+reads the DC6 counter. So the driver would update the counter at these
+two points in the following way:
+dc6_residency_counter += dc5_current_count - dc5_start_count
+
+V2: Update the discription. (Imre)
+    Read dc5 count during dc6 enable and disable then and update
+    dc6 residency counter. (Imre)
+    Remove variable from dmc structure. (Jani)
+    Updated the subject title.
+V3: Add i915_power_domains lock to updated dc6 count in debugfs. (Imre)
+    Use flags to check dc6 enable/disable states. (Imre)
+    Move the display version check and counter read/update to
+    a helper. (Imre)
+    Resize the variable length. (Rodrigo)
+    Use old dc6 debugfs entry for every platform. (Rodrigo)
+V4: Remove superfluous whitespace. (Jani)
+    Read DMC registers in intel_dmc.c (Jani)
+    Rename dc6_en_dis to dc6_enabled and change its type to bool. (Jani)
+    Rename update_dc6_count and move it to intel_dmc.c (Jani)
+    Rename dc6_en_dis to start_tracking. (Imre)
+    Have lock for dc6 state read aswelll. (Imre)
+    Keep the existing way print 'DC5 -> DC6 count' along with
+    new 'DC6 Allowed Count' print. (Imre)
+    Add counters in intel_dmc struct. (Imre)
+    Have interface to return dc6 allowed count. (Imre)
+    Rename dc6_count to dc6_allowed_count. (Rodrigo)
+V5: Rename counters and move in to dc6_allowed structure. (Imre)
+    Order declaration lines in decreasing line length. (Imre)
+    Update start_tacking logic. (Imre)
+    Move get couner inside lock and DISPLAY_VER code to helper. (Imre)
+V6: Change intel_dmc_get_dc6_allowed_count return type to bool. (Imre)
+    Update debugfs print to better allien with old print. (Imre)
+    Remove braces at if/else for signle line statements. (Imre)
+V7: Remove in line variable declaration. (Imre)
+V8: Rebase the changes.
+
+Signed-off-by: Mohammed Thasleem <mohammed.thasleem@intel.com>
+Reviewed-by: Imre Deak <imre.deak@intel.com>
+Signed-off-by: Ankit Nautiyal <ankit.k.nautiyal@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250321123707.287745-1-mohammed.thasleem@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../i915/display/intel_display_power_well.c   | 11 +++-
+ drivers/gpu/drm/i915/display/intel_dmc.c      | 50 ++++++++++++++++++-
+ drivers/gpu/drm/i915/display/intel_dmc.h      |  1 +
+ 3 files changed, 60 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display_power_well.c b/drivers/gpu/drm/i915/display/intel_display_power_well.c
+index 751e49b880d6..b9b4359751cc 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_power_well.c
++++ b/drivers/gpu/drm/i915/display/intel_display_power_well.c
+@@ -749,8 +749,9 @@ void gen9_sanitize_dc_state(struct intel_display *display)
+ void gen9_set_dc_state(struct intel_display *display, u32 state)
+ {
+ 	struct i915_power_domains *power_domains = &display->power.domains;
+-	u32 val;
++	bool dc6_was_enabled, enable_dc6;
+ 	u32 mask;
++	u32 val;
+ 
+ 	if (!HAS_DISPLAY(display))
+ 		return;
+@@ -769,11 +770,19 @@ void gen9_set_dc_state(struct intel_display *display, u32 state)
+ 		drm_err(display->drm, "DC state mismatch (0x%x -> 0x%x)\n",
+ 			power_domains->dc_state, val & mask);
+ 
++	enable_dc6 = state & DC_STATE_EN_UPTO_DC6;
++	dc6_was_enabled = val & DC_STATE_EN_UPTO_DC6;
++	if (!dc6_was_enabled && enable_dc6)
++		intel_dmc_update_dc6_allowed_count(display, true);
++
+ 	val &= ~mask;
+ 	val |= state;
+ 
+ 	gen9_write_dc_state(display, val);
+ 
++	if (!enable_dc6 && dc6_was_enabled)
++		intel_dmc_update_dc6_allowed_count(display, false);
++
+ 	power_domains->dc_state = val & mask;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/display/intel_dmc.c b/drivers/gpu/drm/i915/display/intel_dmc.c
+index eb6b47ba0870..98f80a6c63e8 100644
+--- a/drivers/gpu/drm/i915/display/intel_dmc.c
++++ b/drivers/gpu/drm/i915/display/intel_dmc.c
+@@ -29,6 +29,7 @@
+ #include "i915_reg.h"
+ #include "intel_de.h"
+ #include "intel_display_rpm.h"
++#include "intel_display_power_well.h"
+ #include "intel_dmc.h"
+ #include "intel_dmc_regs.h"
+ #include "intel_step.h"
+@@ -58,6 +59,10 @@ struct intel_dmc {
+ 	const char *fw_path;
+ 	u32 max_fw_size; /* bytes */
+ 	u32 version;
++	struct {
++		u32 dc5_start;
++		u32 count;
++	} dc6_allowed;
+ 	struct dmc_fw_info {
+ 		u32 mmio_count;
+ 		i915_reg_t mmioaddr[20];
+@@ -1233,6 +1238,44 @@ void intel_dmc_snapshot_print(const struct intel_dmc_snapshot *snapshot, struct
+ 			   DMC_VERSION_MINOR(snapshot->version));
+ }
+ 
++void intel_dmc_update_dc6_allowed_count(struct intel_display *display,
++					bool start_tracking)
++{
++	struct intel_dmc *dmc = display_to_dmc(display);
++	u32 dc5_cur_count;
++
++	if (DISPLAY_VER(dmc->display) < 14)
++		return;
++
++	dc5_cur_count = intel_de_read(dmc->display, DG1_DMC_DEBUG_DC5_COUNT);
++
++	if (!start_tracking)
++		dmc->dc6_allowed.count += dc5_cur_count - dmc->dc6_allowed.dc5_start;
++
++	dmc->dc6_allowed.dc5_start = dc5_cur_count;
++}
++
++static bool intel_dmc_get_dc6_allowed_count(struct intel_display *display, u32 *count)
++{
++	struct i915_power_domains *power_domains = &display->power.domains;
++	struct intel_dmc *dmc = display_to_dmc(display);
++	bool dc6_enabled;
++
++	if (DISPLAY_VER(display) < 14)
++		return false;
++
++	mutex_lock(&power_domains->lock);
++	dc6_enabled = intel_de_read(display, DC_STATE_EN) &
++		      DC_STATE_EN_UPTO_DC6;
++	if (dc6_enabled)
++		intel_dmc_update_dc6_allowed_count(display, false);
++
++	*count = dmc->dc6_allowed.count;
++	mutex_unlock(&power_domains->lock);
++
++	return true;
++}
++
+ static int intel_dmc_debugfs_status_show(struct seq_file *m, void *unused)
+ {
+ 	struct intel_display *display = m->private;
+@@ -1240,6 +1283,7 @@ static int intel_dmc_debugfs_status_show(struct seq_file *m, void *unused)
+ 	struct intel_dmc *dmc = display_to_dmc(display);
+ 	struct ref_tracker *wakeref;
+ 	i915_reg_t dc5_reg, dc6_reg = INVALID_MMIO_REG;
++	u32 dc6_allowed_count;
+ 
+ 	if (!HAS_DMC(display))
+ 		return -ENODEV;
+@@ -1288,7 +1332,11 @@ static int intel_dmc_debugfs_status_show(struct seq_file *m, void *unused)
+ 	}
+ 
+ 	seq_printf(m, "DC3 -> DC5 count: %d\n", intel_de_read(display, dc5_reg));
+-	if (i915_mmio_reg_valid(dc6_reg))
++
++	if (intel_dmc_get_dc6_allowed_count(display, &dc6_allowed_count))
++		seq_printf(m, "DC5 -> DC6 allowed count: %d\n",
++			   dc6_allowed_count);
++	else if (i915_mmio_reg_valid(dc6_reg))
+ 		seq_printf(m, "DC5 -> DC6 count: %d\n",
+ 			   intel_de_read(display, dc6_reg));
+ 
+diff --git a/drivers/gpu/drm/i915/display/intel_dmc.h b/drivers/gpu/drm/i915/display/intel_dmc.h
+index 44cecef98e73..c78426eb4cd5 100644
+--- a/drivers/gpu/drm/i915/display/intel_dmc.h
++++ b/drivers/gpu/drm/i915/display/intel_dmc.h
+@@ -26,6 +26,7 @@ void intel_dmc_debugfs_register(struct intel_display *display);
+ 
+ struct intel_dmc_snapshot *intel_dmc_snapshot_capture(struct intel_display *display);
+ void intel_dmc_snapshot_print(const struct intel_dmc_snapshot *snapshot, struct drm_printer *p);
++void intel_dmc_update_dc6_allowed_count(struct intel_display *display, bool start_tracking);
+ 
+ void assert_dmc_loaded(struct intel_display *display);
+ 
+-- 
+2.52.0
+
