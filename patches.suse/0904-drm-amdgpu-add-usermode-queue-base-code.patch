@@ -1,0 +1,259 @@
+From bf33cb6551a8c5b9d68d2983678e1a05c89428c5 Mon Sep 17 00:00:00 2001
+From: Shashank Sharma <shashank.sharma@amd.com>
+Date: Mon, 26 Aug 2024 23:04:13 +0530
+Subject: drm/amdgpu: add usermode queue base code
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: bf33cb6551a8c5b9d68d2983678e1a05c89428c5
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+This patch adds IP independent skeleton code for amdgpu
+usermode queue. It contains:
+- A new files with init functions of usermode queues.
+- A queue context manager in driver private data.
+
+V1: Worked on design review comments from RFC patch series:
+(https://patchwork.freedesktop.org/series/112214/)
+- Alex: Keep a list of queues, instead of single queue per process.
+- Christian: Use the queue manager instead of global ptrs,
+           Don't keep the queue structure in amdgpu_ctx
+
+V2: - Reformatted code, split the big patch into two
+
+V3: 
+- Integration with doorbell manager
+
+V4: 
+- Align the structure member names to the largest member's column
+  (Luben)
+- Added SPDX license (Luben)
+
+V5: 
+- Do not add amdgpu.h in amdgpu_userqueue.h (Christian).
+- Move struct amdgpu_userq_mgr into amdgpu_userqueue.h (Christian).
+
+V6: Rebase
+V9: Rebase
+V10: Rebase + Alex's R-B
+
+Cc: Alex Deucher <alexander.deucher@amd.com>
+Cc: Christian Koenig <christian.koenig@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Shashank Sharma <shashank.sharma@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/Makefile           |  2 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h           |  3 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c       |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c       |  6 ++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c | 40 ++++++++++++
+ .../gpu/drm/amd/include/amdgpu_userqueue.h    | 61 +++++++++++++++++++
+ 6 files changed, 113 insertions(+)
+ create mode 100644 drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c
+ create mode 100644 drivers/gpu/drm/amd/include/amdgpu_userqueue.h
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/Makefile b/drivers/gpu/drm/amd/amdgpu/Makefile
+index aacc810cabb3..69b56faa2d71 100644
+--- a/drivers/gpu/drm/amd/amdgpu/Makefile
++++ b/drivers/gpu/drm/amd/amdgpu/Makefile
+@@ -253,6 +253,8 @@ amdgpu-y += \
+ # add amdkfd interfaces
+ amdgpu-y += amdgpu_amdkfd.o
+ 
++# add gfx usermode queue
++amdgpu-y += amdgpu_userqueue.o
+ 
+ ifneq ($(CONFIG_HSA_AMD),)
+ AMDKFD_PATH := ../amdkfd
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index f787967f09b7..e94ad6611f6f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -113,6 +113,7 @@
+ #include "amdgpu_xcp.h"
+ #include "amdgpu_seq64.h"
+ #include "amdgpu_reg_state.h"
++#include "amdgpu_userqueue.h"
+ #if defined(CONFIG_DRM_AMD_ISP)
+ #include "amdgpu_isp.h"
+ #endif
+@@ -502,6 +503,7 @@ struct amdgpu_fpriv {
+ 	struct mutex		bo_list_lock;
+ 	struct idr		bo_list_handles;
+ 	struct amdgpu_ctx_mgr	ctx_mgr;
++	struct amdgpu_userq_mgr	userq_mgr;
+ 	/** GPU partition selection */
+ 	uint32_t		xcp_id;
+ };
+@@ -1090,6 +1092,7 @@ struct amdgpu_device {
+ 	bool                            enable_uni_mes;
+ 	struct amdgpu_mes               mes;
+ 	struct amdgpu_mqd               mqds[AMDGPU_HW_IP_NUM];
++	const struct amdgpu_userq_funcs *userq_funcs[AMDGPU_HW_IP_NUM];
+ 
+ 	/* df */
+ 	struct amdgpu_df                df;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+index 35f4e1eb2fba..8bf7ca9ddc90 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+@@ -51,6 +51,7 @@
+ #include "amdgpu_reset.h"
+ #include "amdgpu_sched.h"
+ #include "amdgpu_xgmi.h"
++#include "amdgpu_userqueue.h"
+ #include "../amdxcp/amdgpu_xcp_drv.h"
+ 
+ /*
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+index 27bfe9c8af06..1fcf0ef06315 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+@@ -45,6 +45,7 @@
+ #include "amdgpu_ras.h"
+ #include "amdgpu_reset.h"
+ #include "amd_pcie.h"
++#include "amdgpu_userqueue.h"
+ 
+ void amdgpu_unregister_gpu_instance(struct amdgpu_device *adev)
+ {
+@@ -1378,6 +1379,10 @@ int amdgpu_driver_open_kms(struct drm_device *dev, struct drm_file *file_priv)
+ 
+ 	amdgpu_ctx_mgr_init(&fpriv->ctx_mgr, adev);
+ 
++	r = amdgpu_userq_mgr_init(&fpriv->userq_mgr, adev);
++	if (r)
++		DRM_WARN("Can't setup usermode queues, use legacy workload submission only\n");
++
+ 	file_priv->driver_priv = fpriv;
+ 	goto out_suspend;
+ 
+@@ -1447,6 +1452,7 @@ void amdgpu_driver_postclose_kms(struct drm_device *dev,
+ 
+ 	amdgpu_ctx_mgr_fini(&fpriv->ctx_mgr);
+ 	amdgpu_vm_fini(adev, &fpriv->vm);
++	amdgpu_userq_mgr_fini(&fpriv->userq_mgr);
+ 
+ 	if (pasid)
+ 		amdgpu_pasid_free_delayed(pd->tbo.base.resv, pasid);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c
+new file mode 100644
+index 000000000000..effc0c7c02cf
+--- /dev/null
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_userqueue.c
+@@ -0,0 +1,40 @@
++// SPDX-License-Identifier: MIT
++/*
++ * Copyright 2023 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++
++#include "amdgpu.h"
++
++int amdgpu_userq_mgr_init(struct amdgpu_userq_mgr *userq_mgr, struct amdgpu_device *adev)
++{
++	mutex_init(&userq_mgr->userq_mutex);
++	idr_init_base(&userq_mgr->userq_idr, 1);
++	userq_mgr->adev = adev;
++
++	return 0;
++}
++
++void amdgpu_userq_mgr_fini(struct amdgpu_userq_mgr *userq_mgr)
++{
++	idr_destroy(&userq_mgr->userq_idr);
++	mutex_destroy(&userq_mgr->userq_mutex);
++}
+diff --git a/drivers/gpu/drm/amd/include/amdgpu_userqueue.h b/drivers/gpu/drm/amd/include/amdgpu_userqueue.h
+new file mode 100644
+index 000000000000..93ebe4b61682
+--- /dev/null
++++ b/drivers/gpu/drm/amd/include/amdgpu_userqueue.h
+@@ -0,0 +1,61 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * Copyright 2023 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++
++#ifndef AMDGPU_USERQUEUE_H_
++#define AMDGPU_USERQUEUE_H_
++
++#define AMDGPU_MAX_USERQ_COUNT 512
++
++struct amdgpu_mqd_prop;
++
++struct amdgpu_usermode_queue {
++	int			queue_type;
++	uint64_t		doorbell_handle;
++	uint64_t		doorbell_index;
++	uint64_t		flags;
++	struct amdgpu_mqd_prop	*userq_prop;
++	struct amdgpu_userq_mgr *userq_mgr;
++	struct amdgpu_vm	*vm;
++};
++
++struct amdgpu_userq_funcs {
++	int (*mqd_create)(struct amdgpu_userq_mgr *uq_mgr,
++			  struct drm_amdgpu_userq_in *args,
++			  struct amdgpu_usermode_queue *queue);
++	void (*mqd_destroy)(struct amdgpu_userq_mgr *uq_mgr,
++			    struct amdgpu_usermode_queue *uq);
++};
++
++/* Usermode queues for gfx */
++struct amdgpu_userq_mgr {
++	struct idr			userq_idr;
++	struct mutex			userq_mutex;
++	struct amdgpu_device		*adev;
++};
++
++int amdgpu_userq_mgr_init(struct amdgpu_userq_mgr *userq_mgr, struct amdgpu_device *adev);
++
++void amdgpu_userq_mgr_fini(struct amdgpu_userq_mgr *userq_mgr);
++
++#endif
+-- 
+2.52.0
+
