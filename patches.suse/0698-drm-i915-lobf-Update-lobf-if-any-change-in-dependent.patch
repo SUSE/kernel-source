@@ -1,0 +1,123 @@
+From 64a5dd770d35cb2b14f929eb13fb7863d1bedb1c Mon Sep 17 00:00:00 2001
+From: Animesh Manna <animesh.manna@intel.com>
+Date: Wed, 23 Apr 2025 14:53:29 +0530
+Subject: drm/i915/lobf: Update lobf if any change in dependent parameters
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 64a5dd770d35cb2b14f929eb13fb7863d1bedb1c
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+For every commit the dependent condition for LOBF is checked
+and accordingly update has_lobf flag which will be used
+to update the ALPM_CTL register during commit.
+
+V1: Initial version.
+V2: Avoid reading h/w register without has_lobf check. [Jani]
+V3: Update LOBF in post plane update instead of separate function. [Jouni]
+V4: 
+- Add lobf disable print. [Jouni]
+- Simplify condition check for enabling/disabling lobf. [Jouni]
+V5: Disable LOBF in pre_plane_update(). [Jouni]
+V6: use lobf flag of old_crtc_state and write 0 into ALPM_CTL. [Jouni]
+
+Signed-off-by: Animesh Manna <animesh.manna@intel.com>
+Reviewed-by: Jouni Högander <jouni.hogander@intel.com>
+Link: https://lore.kernel.org/r/20250423092334.2294483-7-animesh.manna@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/intel_alpm.c    | 41 +++++++++++++++++++-
+ drivers/gpu/drm/i915/display/intel_alpm.h    |  2 +
+ drivers/gpu/drm/i915/display/intel_display.c |  1 +
+ 3 files changed, 43 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_alpm.c b/drivers/gpu/drm/i915/display/intel_alpm.c
+index 01949b90c0c3..d38e729682ce 100644
+--- a/drivers/gpu/drm/i915/display/intel_alpm.c
++++ b/drivers/gpu/drm/i915/display/intel_alpm.c
+@@ -376,15 +376,54 @@ void intel_alpm_configure(struct intel_dp *intel_dp,
+ 	intel_dp->alpm_parameters.transcoder = crtc_state->cpu_transcoder;
+ }
+ 
++void intel_alpm_pre_plane_update(struct intel_atomic_state *state,
++				 struct intel_crtc *crtc)
++{
++	struct intel_display *display = to_intel_display(state);
++	const struct intel_crtc_state *crtc_state =
++		intel_atomic_get_new_crtc_state(state, crtc);
++	const struct intel_crtc_state *old_crtc_state =
++		intel_atomic_get_old_crtc_state(state, crtc);
++	enum transcoder cpu_transcoder = crtc_state->cpu_transcoder;
++	struct intel_encoder *encoder;
++
++	if (DISPLAY_VER(display) < 20)
++		return;
++
++	if (crtc_state->has_lobf || crtc_state->has_lobf == old_crtc_state->has_lobf)
++		return;
++
++	for_each_intel_encoder_mask(display->drm, encoder,
++				    crtc_state->uapi.encoder_mask) {
++		struct intel_dp *intel_dp;
++
++		if (!intel_encoder_is_dp(encoder))
++			continue;
++
++		intel_dp = enc_to_intel_dp(encoder);
++
++		if (!intel_dp_is_edp(intel_dp))
++			continue;
++
++		if (old_crtc_state->has_lobf) {
++			intel_de_write(display, ALPM_CTL(display, cpu_transcoder), 0);
++			drm_dbg_kms(display->drm, "Link off between frames (LOBF) disabled\n");
++		}
++	}
++}
++
+ void intel_alpm_post_plane_update(struct intel_atomic_state *state,
+ 				  struct intel_crtc *crtc)
+ {
+ 	struct intel_display *display = to_intel_display(state);
+ 	const struct intel_crtc_state *crtc_state =
+ 		intel_atomic_get_new_crtc_state(state, crtc);
++	const struct intel_crtc_state *old_crtc_state =
++		intel_atomic_get_old_crtc_state(state, crtc);
+ 	struct intel_encoder *encoder;
+ 
+-	if (!crtc_state->has_lobf && !crtc_state->has_psr)
++	if ((!crtc_state->has_lobf ||
++	     crtc_state->has_lobf == old_crtc_state->has_lobf) && !crtc_state->has_psr)
+ 		return;
+ 
+ 	for_each_intel_encoder_mask(display->drm, encoder,
+diff --git a/drivers/gpu/drm/i915/display/intel_alpm.h b/drivers/gpu/drm/i915/display/intel_alpm.h
+index 91f51fb24f98..77bae022a0ea 100644
+--- a/drivers/gpu/drm/i915/display/intel_alpm.h
++++ b/drivers/gpu/drm/i915/display/intel_alpm.h
+@@ -23,6 +23,8 @@ void intel_alpm_lobf_compute_config(struct intel_dp *intel_dp,
+ 				    struct drm_connector_state *conn_state);
+ void intel_alpm_configure(struct intel_dp *intel_dp,
+ 			  const struct intel_crtc_state *crtc_state);
++void intel_alpm_pre_plane_update(struct intel_atomic_state *state,
++				 struct intel_crtc *crtc);
+ void intel_alpm_post_plane_update(struct intel_atomic_state *state,
+ 				  struct intel_crtc *crtc);
+ void intel_alpm_lobf_debugfs_add(struct intel_connector *connector);
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index b91a52e9909a..58845b74f17d 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -1176,6 +1176,7 @@ static void intel_pre_plane_update(struct intel_atomic_state *state,
+ 		intel_atomic_get_new_crtc_state(state, crtc);
+ 	enum pipe pipe = crtc->pipe;
+ 
++	intel_alpm_pre_plane_update(state, crtc);
+ 	intel_psr_pre_plane_update(state, crtc);
+ 
+ 	if (intel_crtc_vrr_disabling(state, crtc)) {
+-- 
+2.52.0
+
