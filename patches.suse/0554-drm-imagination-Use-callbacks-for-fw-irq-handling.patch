@@ -1,0 +1,197 @@
+From 89b3c4a5cc1b95f09f5fa5c183aa9d7a65309eac Mon Sep 17 00:00:00 2001
+From: Matt Coster <matt.coster@imgtec.com>
+Date: Thu, 10 Apr 2025 10:55:11 +0100
+Subject: drm/imagination: Use callbacks for fw irq handling
+Git-commit: 89b3c4a5cc1b95f09f5fa5c183aa9d7a65309eac
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+This allows for more versatility in checking and clearing firmware
+registers used for interrupt handling.
+
+Reviewed-by: Frank Binns <frank.binns@imgtec.com>
+Link: https://lore.kernel.org/r/20250410-sets-bxs-4-64-patch-v1-v6-12-eda620c5865f@imgtec.com
+Signed-off-by: Matt Coster <matt.coster@imgtec.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/imagination/pvr_device.h  | 18 +++++++++
+ drivers/gpu/drm/imagination/pvr_fw.h      | 45 +++++++----------------
+ drivers/gpu/drm/imagination/pvr_fw_meta.c | 22 ++++++++---
+ drivers/gpu/drm/imagination/pvr_fw_mips.c | 22 ++++++++---
+ 4 files changed, 63 insertions(+), 44 deletions(-)
+
+diff --git a/drivers/gpu/drm/imagination/pvr_device.h b/drivers/gpu/drm/imagination/pvr_device.h
+index 12bf0b9e5bfb..eb5da8c7040f 100644
+--- a/drivers/gpu/drm/imagination/pvr_device.h
++++ b/drivers/gpu/drm/imagination/pvr_device.h
+@@ -739,4 +739,22 @@ pvr_ioctl_union_padding_check(void *instance, size_t union_offset,
+ 					      __union_size, __member_size);  \
+ 	})
+ 
++/*
++ * These utility functions should more properly be placed in pvr_fw.h, but that
++ * would cause a dependency cycle between that header and this one. Since
++ * they're primarily used in pvr_device.c, let's put them in here for now.
++ */
++
++static __always_inline bool
++pvr_fw_irq_pending(struct pvr_device *pvr_dev)
++{
++	return pvr_dev->fw_dev.defs->irq_pending(pvr_dev);
++}
++
++static __always_inline void
++pvr_fw_irq_clear(struct pvr_device *pvr_dev)
++{
++	pvr_dev->fw_dev.defs->irq_clear(pvr_dev);
++}
++
+ #endif /* PVR_DEVICE_H */
+diff --git a/drivers/gpu/drm/imagination/pvr_fw.h b/drivers/gpu/drm/imagination/pvr_fw.h
+index 88ad713468ce..ab69f40a7fbc 100644
+--- a/drivers/gpu/drm/imagination/pvr_fw.h
++++ b/drivers/gpu/drm/imagination/pvr_fw.h
+@@ -167,29 +167,22 @@ struct pvr_fw_defs {
+ 	int (*wrapper_init)(struct pvr_device *pvr_dev);
+ 
+ 	/**
+-	 * @irq: FW Interrupt information.
++	 * @irq_pending: Check interrupt status register for pending interrupts.
+ 	 *
+-	 * Those are processor dependent, and should be initialized by the
+-	 * processor backend in pvr_fw_funcs::init().
++	 * @pvr_dev: Target PowerVR device.
++	 *
++	 * This function is mandatory.
+ 	 */
+-	struct {
+-		/** @status_reg: FW interrupt status register. */
+-		u32 status_reg;
++	bool (*irq_pending)(struct pvr_device *pvr_dev);
+ 
+-		/**
+-		 * @clear_reg: FW interrupt clear register.
+-		 *
+-		 * If @status_reg == @clear_reg, we clear by write a bit to zero,
+-		 * otherwise we clear by writing a bit to one.
+-		 */
+-		u32 clear_reg;
+-
+-		/** @status_mask: Bitmask of events to listen for in the status_reg. */
+-		u32 status_mask;
+-
+-		/** @clear_mask: Value to write to the clear_reg in order to clear FW IRQs. */
+-		u32 clear_mask;
+-	} irq;
++	/**
++	 * @irq_clear: Clear pending interrupts.
++	 *
++	 * @pvr_dev: Target PowerVR device.
++	 *
++	 * This function is mandatory.
++	 */
++	void (*irq_clear)(struct pvr_device *pvr_dev);
+ 
+ 	/**
+ 	 * @has_fixed_data_addr: Specify whether the firmware fixed data must be loaded at the
+@@ -390,18 +383,6 @@ struct pvr_fw_device {
+ 	} fw_objs;
+ };
+ 
+-#define pvr_fw_irq_read_reg(pvr_dev, name) \
+-	pvr_cr_read32((pvr_dev), (pvr_dev)->fw_dev.defs->irq.name ## _reg)
+-
+-#define pvr_fw_irq_write_reg(pvr_dev, name, value) \
+-	pvr_cr_write32((pvr_dev), (pvr_dev)->fw_dev.defs->irq.name ## _reg, value)
+-
+-#define pvr_fw_irq_pending(pvr_dev) \
+-	(pvr_fw_irq_read_reg(pvr_dev, status) & (pvr_dev)->fw_dev.defs->irq.status_mask)
+-
+-#define pvr_fw_irq_clear(pvr_dev) \
+-	pvr_fw_irq_write_reg(pvr_dev, clear, (pvr_dev)->fw_dev.defs->irq.clear_mask)
+-
+ enum pvr_fw_processor_type {
+ 	PVR_FW_PROCESSOR_TYPE_META = 0,
+ 	PVR_FW_PROCESSOR_TYPE_MIPS,
+diff --git a/drivers/gpu/drm/imagination/pvr_fw_meta.c b/drivers/gpu/drm/imagination/pvr_fw_meta.c
+index 41485769fc7c..60db3668ad3c 100644
+--- a/drivers/gpu/drm/imagination/pvr_fw_meta.c
++++ b/drivers/gpu/drm/imagination/pvr_fw_meta.c
+@@ -532,6 +532,20 @@ pvr_meta_vm_unmap(struct pvr_device *pvr_dev, struct pvr_fw_object *fw_obj)
+ 			 fw_obj->fw_mm_node.start, fw_obj->fw_mm_node.size);
+ }
+ 
++static bool
++pvr_meta_irq_pending(struct pvr_device *pvr_dev)
++{
++	return pvr_cr_read32(pvr_dev, ROGUE_CR_META_SP_MSLVIRQSTATUS) &
++	       ROGUE_CR_META_SP_MSLVIRQSTATUS_TRIGVECT2_EN;
++}
++
++static void
++pvr_meta_irq_clear(struct pvr_device *pvr_dev)
++{
++	pvr_cr_write32(pvr_dev, ROGUE_CR_META_SP_MSLVIRQSTATUS,
++		       ROGUE_CR_META_SP_MSLVIRQSTATUS_TRIGVECT2_CLRMSK);
++}
++
+ const struct pvr_fw_defs pvr_fw_defs_meta = {
+ 	.init = pvr_meta_init,
+ 	.fw_process = pvr_meta_fw_process,
+@@ -539,11 +553,7 @@ const struct pvr_fw_defs pvr_fw_defs_meta = {
+ 	.vm_unmap = pvr_meta_vm_unmap,
+ 	.get_fw_addr_with_offset = pvr_meta_get_fw_addr_with_offset,
+ 	.wrapper_init = pvr_meta_wrapper_init,
+-	.irq = {
+-		.status_reg = ROGUE_CR_META_SP_MSLVIRQSTATUS,
+-		.clear_reg = ROGUE_CR_META_SP_MSLVIRQSTATUS,
+-		.status_mask = ROGUE_CR_META_SP_MSLVIRQSTATUS_TRIGVECT2_EN,
+-		.clear_mask = ROGUE_CR_META_SP_MSLVIRQSTATUS_TRIGVECT2_CLRMSK,
+-	},
++	.irq_pending = pvr_meta_irq_pending,
++	.irq_clear = pvr_meta_irq_clear,
+ 	.has_fixed_data_addr = false,
+ };
+diff --git a/drivers/gpu/drm/imagination/pvr_fw_mips.c b/drivers/gpu/drm/imagination/pvr_fw_mips.c
+index 5feae0dc85ab..7526dddbf520 100644
+--- a/drivers/gpu/drm/imagination/pvr_fw_mips.c
++++ b/drivers/gpu/drm/imagination/pvr_fw_mips.c
+@@ -225,6 +225,20 @@ pvr_mips_get_fw_addr_with_offset(struct pvr_fw_object *fw_obj, u32 offset)
+ 	       ROGUE_FW_HEAP_MIPS_BASE;
+ }
+ 
++static bool
++pvr_mips_irq_pending(struct pvr_device *pvr_dev)
++{
++	return pvr_cr_read32(pvr_dev, ROGUE_CR_MIPS_WRAPPER_IRQ_STATUS) &
++	       ROGUE_CR_MIPS_WRAPPER_IRQ_STATUS_EVENT_EN;
++}
++
++static void
++pvr_mips_irq_clear(struct pvr_device *pvr_dev)
++{
++	pvr_cr_write32(pvr_dev, ROGUE_CR_MIPS_WRAPPER_IRQ_CLEAR,
++		       ROGUE_CR_MIPS_WRAPPER_IRQ_CLEAR_EVENT_EN);
++}
++
+ const struct pvr_fw_defs pvr_fw_defs_mips = {
+ 	.init = pvr_mips_init,
+ 	.fini = pvr_mips_fini,
+@@ -233,11 +247,7 @@ const struct pvr_fw_defs pvr_fw_defs_mips = {
+ 	.vm_unmap = pvr_vm_mips_unmap,
+ 	.get_fw_addr_with_offset = pvr_mips_get_fw_addr_with_offset,
+ 	.wrapper_init = pvr_mips_wrapper_init,
+-	.irq = {
+-		.status_reg = ROGUE_CR_MIPS_WRAPPER_IRQ_STATUS,
+-		.clear_reg = ROGUE_CR_MIPS_WRAPPER_IRQ_CLEAR,
+-		.status_mask = ROGUE_CR_MIPS_WRAPPER_IRQ_STATUS_EVENT_EN,
+-		.clear_mask = ROGUE_CR_MIPS_WRAPPER_IRQ_CLEAR_EVENT_EN,
+-	},
++	.irq_pending = pvr_mips_irq_pending,
++	.irq_clear = pvr_mips_irq_clear,
+ 	.has_fixed_data_addr = true,
+ };
+-- 
+2.52.0
+
