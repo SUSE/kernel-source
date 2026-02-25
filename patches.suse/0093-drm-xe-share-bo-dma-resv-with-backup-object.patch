@@ -1,0 +1,127 @@
+From e28647b677789b51b2de3e7934bb86dbd8e67fdf Mon Sep 17 00:00:00 2001
+From: Matthew Auld <matthew.auld@intel.com>
+Date: Wed, 16 Apr 2025 16:09:16 +0100
+Subject: drm/xe: share bo dma-resv with backup object
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: e28647b677789b51b2de3e7934bb86dbd8e67fdf
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+We end up needing to grab both locks together anyway and keep them held
+until we complete the copy or add the fence. Plus the backup_obj is
+short lived and tied to the parent object, so seems reasonable to share
+the same dma-resv. This will simplify the locking here, and in follow
+up patches.
+
+V2: - Hold reference to the parent bo to be sure the shared dma-resv can't
+    go out of scope too soon. (Thomas)
+
+Signed-off-by: Matthew Auld <matthew.auld@intel.com>
+Cc: Thomas Hellström <thomas.hellstrom@linux.intel.com>
+Reviewed-by: Thomas Hellström <thomas.hellstrom@linux.intel.com>
+Link: https://lore.kernel.org/r/20250416150913.434369-7-matthew.auld@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/xe/xe_bo.c       | 28 +++++++++++++---------------
+ drivers/gpu/drm/xe/xe_bo_types.h |  2 ++
+ 2 files changed, 15 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_bo.c b/drivers/gpu/drm/xe/xe_bo.c
+index c337790c81ae..79adaee5a0e9 100644
+--- a/drivers/gpu/drm/xe/xe_bo.c
++++ b/drivers/gpu/drm/xe/xe_bo.c
+@@ -1120,13 +1120,15 @@ int xe_bo_evict_pinned(struct xe_bo *bo)
+ 	if (bo->flags & XE_BO_FLAG_PINNED_NORESTORE)
+ 		goto out_unlock_bo;
+ 
+-	backup = xe_bo_create_locked(xe, NULL, NULL, bo->size, ttm_bo_type_kernel,
+-				     XE_BO_FLAG_SYSTEM | XE_BO_FLAG_NEEDS_CPU_ACCESS |
+-				     XE_BO_FLAG_PINNED);
++	backup = ___xe_bo_create_locked(xe, NULL, NULL, bo->ttm.base.resv, NULL, bo->size,
++					DRM_XE_GEM_CPU_CACHING_WB, ttm_bo_type_kernel,
++					XE_BO_FLAG_SYSTEM | XE_BO_FLAG_NEEDS_CPU_ACCESS |
++					XE_BO_FLAG_PINNED);
+ 	if (IS_ERR(backup)) {
+ 		ret = PTR_ERR(backup);
+ 		goto out_unlock_bo;
+ 	}
++	backup->parent_obj = xe_bo_get(bo); /* Released by bo_destroy */
+ 
+ 	if (xe_bo_is_user(bo) || (bo->flags & XE_BO_FLAG_PINNED_LATE_RESTORE)) {
+ 		struct xe_migrate *migrate;
+@@ -1177,7 +1179,6 @@ int xe_bo_evict_pinned(struct xe_bo *bo)
+ 
+ out_backup:
+ 	xe_bo_vunmap(backup);
+-	xe_bo_unlock(backup);
+ 	if (ret)
+ 		xe_bo_put(backup);
+ out_unlock_bo:
+@@ -1212,17 +1213,12 @@ int xe_bo_restore_pinned(struct xe_bo *bo)
+ 	if (!backup)
+ 		return 0;
+ 
+-	xe_bo_lock(backup, false);
++	xe_bo_lock(bo, false);
+ 
+ 	ret = ttm_bo_validate(&backup->ttm, &backup->placement, &ctx);
+ 	if (ret)
+ 		goto out_backup;
+ 
+-	if (WARN_ON(!dma_resv_trylock(bo->ttm.base.resv))) {
+-		ret = -EBUSY;
+-		goto out_backup;
+-	}
+-
+ 	if (xe_bo_is_user(bo) || (bo->flags & XE_BO_FLAG_PINNED_LATE_RESTORE)) {
+ 		struct xe_migrate *migrate;
+ 		struct dma_fence *fence;
+@@ -1271,15 +1267,14 @@ int xe_bo_restore_pinned(struct xe_bo *bo)
+ 
+ 	bo->backup_obj = NULL;
+ 
+-out_unlock_bo:
+-	if (unmap)
+-		xe_bo_vunmap(bo);
+-	xe_bo_unlock(bo);
+ out_backup:
+ 	xe_bo_vunmap(backup);
+-	xe_bo_unlock(backup);
+ 	if (!bo->backup_obj)
+ 		xe_bo_put(backup);
++out_unlock_bo:
++	if (unmap)
++		xe_bo_vunmap(bo);
++	xe_bo_unlock(bo);
+ 	return ret;
+ }
+ 
+@@ -1532,6 +1527,9 @@ static void xe_ttm_bo_destroy(struct ttm_buffer_object *ttm_bo)
+ 	if (bo->vm && xe_bo_is_user(bo))
+ 		xe_vm_put(bo->vm);
+ 
++	if (bo->parent_obj)
++		xe_bo_put(bo->parent_obj);
++
+ 	mutex_lock(&xe->mem_access.vram_userfault.lock);
+ 	if (!list_empty(&bo->vram_userfault_link))
+ 		list_del(&bo->vram_userfault_link);
+diff --git a/drivers/gpu/drm/xe/xe_bo_types.h b/drivers/gpu/drm/xe/xe_bo_types.h
+index 81396181aaea..eb5e83c5f233 100644
+--- a/drivers/gpu/drm/xe/xe_bo_types.h
++++ b/drivers/gpu/drm/xe/xe_bo_types.h
+@@ -30,6 +30,8 @@ struct xe_bo {
+ 	struct ttm_buffer_object ttm;
+ 	/** @backup_obj: The backup object when pinned and suspended (vram only) */
+ 	struct xe_bo *backup_obj;
++	/** @parent_obj: Ref to parent bo if this a backup_obj */
++	struct xe_bo *parent_obj;
+ 	/** @size: Size of this buffer object */
+ 	size_t size;
+ 	/** @flags: flags for this buffer object */
+-- 
+2.52.0
+
