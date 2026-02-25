@@ -1,0 +1,306 @@
+From bc7849720b5275297b58db73a20d9a15dda5f353 Mon Sep 17 00:00:00 2001
+From: Ben Skeggs <bskeggs@nvidia.com>
+Date: Thu, 8 May 2025 10:02:49 +1000
+Subject: drm/nouveau/gsp: init client VMMs with
+ NV0080_CTRL_DMA_SET_PAGE_DIRECTORY
+Git-commit: bc7849720b5275297b58db73a20d9a15dda5f353
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+The current code using NV90F1_CTRL_CMD_VASPACE_COPY_SERVER_RESERVED_PDES
+not only requires changes to support the new page table layout used on
+Hopper/Blackwell GPUs, but is also broken in that it always mirrors the
+PDEs used for virtual address 0, rather than the area reserved for RM.
+
+This works fine for the non-NVK case where the kernel has full control
+of the VMM layout and things end up in the right place, but NVK puts
+its kernel reserved area much higher in the address space.
+
+Fixing the code to work at any VA is not enough as some parts of RM want
+the reserved area in a specific location, and NVK would then hit other
+assertions in RM instead.
+
+Fortunately, it appears that RM never needs to allocate anything within
+its reserved area for DRM clients, and the COPY_SERVER_RESERVED_PDES
+control call primarily serves to allow RM to locate the root page table
+when initialising a channel's instance block.
+
+Flag VMMs allocated by the DRM driver as externally owned, and use
+NV0080_CTRL_CMD_DMA_SET_PAGE_DIRECTORY to inform RM of the root page
+table in a similar way to NVIDIA's UVM driver.
+
+The COPY_SERVER_RESERVED_PDES paths are kept for the golden context
+image and gr scrubber channel, where RM needs the reserved area.
+
+Signed-off-by: Ben Skeggs <bskeggs@nvidia.com>
+Reviewed-by: Dave Airlie <airlied@redhat.com>
+Reviewed-by: Timur Tabi <ttabi@nvidia.com>
+Tested-by: Timur Tabi <ttabi@nvidia.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../gpu/drm/nouveau/include/nvkm/subdev/mmu.h |  1 +
+ .../drm/nouveau/nvkm/subdev/gsp/rm/r535/gr.c  |  3 +-
+ .../nvkm/subdev/gsp/rm/r535/nvrm/vmm.h        | 42 ++++++++++++
+ .../drm/nouveau/nvkm/subdev/gsp/rm/r535/vmm.c | 66 ++++++++++++++++---
+ .../drm/nouveau/nvkm/subdev/gsp/rm/r570/gr.c  |  2 +-
+ .../gpu/drm/nouveau/nvkm/subdev/gsp/rm/rm.h   |  3 +-
+ drivers/gpu/drm/nouveau/nvkm/subdev/mmu/vmm.c |  8 +--
+ 7 files changed, 106 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/subdev/mmu.h b/drivers/gpu/drm/nouveau/include/nvkm/subdev/mmu.h
+index 7188e3eb2d07..4cab139f3236 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/subdev/mmu.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/subdev/mmu.h
+@@ -73,6 +73,7 @@ struct nvkm_vmm {
+ 		struct nvkm_gsp_object object;
+ 
+ 		struct nvkm_vma *rsvd;
++		bool external;
+ 	} rm;
+ };
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gr.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gr.c
+index 1f5cf21f3f61..ddb57d5e73d6 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gr.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gr.c
+@@ -276,7 +276,6 @@ r535_gr_oneinit(struct nvkm_gr *base)
+ 	struct nvkm_device *device = subdev->device;
+ 	struct nvkm_gsp *gsp = device->gsp;
+ 	struct nvkm_rm *rm = gsp->rm;
+-	struct nvkm_mmu *mmu = device->mmu;
+ 	struct {
+ 		struct nvkm_memory *inst;
+ 		struct nvkm_vmm *vmm;
+@@ -295,7 +294,7 @@ r535_gr_oneinit(struct nvkm_gr *base)
+ 	if (ret)
+ 		goto done;
+ 
+-	ret = mmu->func->promote_vmm(golden.vmm);
++	ret = r535_mmu_vaspace_new(golden.vmm, NVKM_RM_VASPACE, false);
+ 	if (ret)
+ 		goto done;
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/nvrm/vmm.h b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/nvrm/vmm.h
+index f58edf62e4ae..f6ec04efd119 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/nvrm/vmm.h
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/nvrm/vmm.h
+@@ -23,6 +23,11 @@ typedef struct
+ 
+ #define NV_VASPACE_ALLOCATION_INDEX_GPU_NEW                                 0x00 //<! Create new VASpace, by default
+ 
++#define NV_VASPACE_ALLOCATION_FLAGS_IS_EXTERNALLY_OWNED                   BIT(3)
++
++#define SPLIT_VAS_SERVER_RM_MANAGED_VA_START   0x100000000ULL  // 4GB
++#define SPLIT_VAS_SERVER_RM_MANAGED_VA_SIZE     0x20000000ULL  // 512MB
++
+ #define GMMU_FMT_MAX_LEVELS  6U
+ 
+ #define NV90F1_CTRL_CMD_VASPACE_COPY_SERVER_RESERVED_PDES (0x90f10106U) /* finn: Evaluated from "(FINN_FERMI_VASPACE_A_VASPACE_INTERFACE_ID << 8) | NV90F1_CTRL_VASPACE_COPY_SERVER_RESERVED_PDES_PARAMS_MESSAGE_ID" */
+@@ -87,4 +92,41 @@ typedef struct NV90F1_CTRL_VASPACE_COPY_SERVER_RESERVED_PDES_PARAMS {
+         NvU8  pageShift;
+     } levels[GMMU_FMT_MAX_LEVELS];
+ } NV90F1_CTRL_VASPACE_COPY_SERVER_RESERVED_PDES_PARAMS;
++
++#define NV0080_CTRL_CMD_DMA_SET_PAGE_DIRECTORY (0x801813U) /* finn: Evaluated from "(FINN_NV01_DEVICE_0_DMA_INTERFACE_
++ID << 8) | NV0080_CTRL_DMA_SET_PAGE_DIRECTORY_PARAMS_MESSAGE_ID" */
++
++typedef struct NV0080_CTRL_DMA_SET_PAGE_DIRECTORY_PARAMS {
++    NV_DECLARE_ALIGNED(NvU64 physAddress, 8);
++    NvU32    numEntries;
++    NvU32    flags;
++    NvHandle hVASpace;
++    NvU32    chId;
++    NvU32    subDeviceId; // ID+1, 0 for BC
++    NvU32    pasid;
++} NV0080_CTRL_DMA_SET_PAGE_DIRECTORY_PARAMS;
++
++#define NV0080_CTRL_DMA_SET_PAGE_DIRECTORY_FLAGS_APERTURE                  1:0
++#define NV0080_CTRL_DMA_SET_PAGE_DIRECTORY_FLAGS_APERTURE_VIDMEM           (0x00000000U)
++#define NV0080_CTRL_DMA_SET_PAGE_DIRECTORY_FLAGS_APERTURE_SYSMEM_COH       (0x00000001U)
++#define NV0080_CTRL_DMA_SET_PAGE_DIRECTORY_FLAGS_APERTURE_SYSMEM_NONCOH    (0x00000002U)
++#define NV0080_CTRL_DMA_SET_PAGE_DIRECTORY_FLAGS_PRESERVE_PDES             2:2
++#define NV0080_CTRL_DMA_SET_PAGE_DIRECTORY_FLAGS_PRESERVE_PDES_FALSE       (0x00000000U)
++#define NV0080_CTRL_DMA_SET_PAGE_DIRECTORY_FLAGS_PRESERVE_PDES_TRUE        (0x00000001U)
++#define NV0080_CTRL_DMA_SET_PAGE_DIRECTORY_FLAGS_ALL_CHANNELS              3:3
++#define NV0080_CTRL_DMA_SET_PAGE_DIRECTORY_FLAGS_ALL_CHANNELS_FALSE        (0x00000000U)
++#define NV0080_CTRL_DMA_SET_PAGE_DIRECTORY_FLAGS_ALL_CHANNELS_TRUE         (0x00000001U)
++#define NV0080_CTRL_DMA_SET_PAGE_DIRECTORY_FLAGS_IGNORE_CHANNEL_BUSY       4:4
++#define NV0080_CTRL_DMA_SET_PAGE_DIRECTORY_FLAGS_IGNORE_CHANNEL_BUSY_FALSE (0x00000000U)
++#define NV0080_CTRL_DMA_SET_PAGE_DIRECTORY_FLAGS_IGNORE_CHANNEL_BUSY_TRUE  (0x00000001U)
++#define NV0080_CTRL_DMA_SET_PAGE_DIRECTORY_FLAGS_EXTEND_VASPACE            5:5
++#define NV0080_CTRL_DMA_SET_PAGE_DIRECTORY_FLAGS_EXTEND_VASPACE_FALSE      (0x00000000U)
++#define NV0080_CTRL_DMA_SET_PAGE_DIRECTORY_FLAGS_EXTEND_VASPACE_TRUE       (0x00000001U)
++
++#define NV0080_CTRL_CMD_DMA_UNSET_PAGE_DIRECTORY                           (0x801814U) /* finn: Evaluated from "(FINN_NV01_DEVICE_0_DMA_INTERFACE_ID << 8) | NV0080_CTRL_DMA_UNSET_PAGE_DIRECTORY_PARAMS_MESSAGE_ID" */
++
++typedef struct NV0080_CTRL_DMA_UNSET_PAGE_DIRECTORY_PARAMS {
++    NvHandle hVASpace;
++    NvU32    subDeviceId; // ID+1, 0 for BC
++} NV0080_CTRL_DMA_UNSET_PAGE_DIRECTORY_PARAMS;
+ #endif
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/vmm.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/vmm.c
+index 05690f745bb4..dbddc5cc333d 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/vmm.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/vmm.c
+@@ -21,10 +21,36 @@
+  */
+ #include <subdev/mmu/vmm.h>
+ 
++#include <nvhw/drf.h>
+ #include "nvrm/vmm.h"
+ 
++void
++r535_mmu_vaspace_del(struct nvkm_vmm *vmm)
++{
++	if (vmm->rm.external) {
++		NV0080_CTRL_DMA_UNSET_PAGE_DIRECTORY_PARAMS *ctrl;
++
++		ctrl = nvkm_gsp_rm_ctrl_get(&vmm->rm.device.object,
++					    NV0080_CTRL_CMD_DMA_UNSET_PAGE_DIRECTORY,
++					    sizeof(*ctrl));
++		if (!IS_ERR(ctrl)) {
++			ctrl->hVASpace = vmm->rm.object.handle;
++
++			WARN_ON(nvkm_gsp_rm_ctrl_wr(&vmm->rm.device.object, ctrl));
++		}
++
++		vmm->rm.external = false;
++	}
++
++	nvkm_gsp_rm_free(&vmm->rm.object);
++	nvkm_gsp_device_dtor(&vmm->rm.device);
++	nvkm_gsp_client_dtor(&vmm->rm.client);
++
++	nvkm_vmm_put(vmm, &vmm->rm.rsvd);
++}
++
+ int
+-r535_mmu_vaspace_new(struct nvkm_vmm *vmm, u32 handle)
++r535_mmu_vaspace_new(struct nvkm_vmm *vmm, u32 handle, bool external)
+ {
+ 	NV_VASPACE_ALLOCATION_PARAMETERS *args;
+ 	int ret;
+@@ -40,12 +66,14 @@ r535_mmu_vaspace_new(struct nvkm_vmm *vmm, u32 handle)
+ 		return PTR_ERR(args);
+ 
+ 	args->index = NV_VASPACE_ALLOCATION_INDEX_GPU_NEW;
++	if (external)
++		args->flags = NV_VASPACE_ALLOCATION_FLAGS_IS_EXTERNALLY_OWNED;
+ 
+ 	ret = nvkm_gsp_rm_alloc_wr(&vmm->rm.object, args);
+ 	if (ret)
+ 		return ret;
+ 
+-	{
++	if (!external) {
+ 		NV90F1_CTRL_VASPACE_COPY_SERVER_RESERVED_PDES_PARAMS *ctrl;
+ 
+ 		mutex_lock(&vmm->mutex.vmm);
+@@ -55,6 +83,11 @@ r535_mmu_vaspace_new(struct nvkm_vmm *vmm, u32 handle)
+ 		if (ret)
+ 			return ret;
+ 
++		/* Some parts of RM expect the server-reserved area to be in a specific location. */
++		if (WARN_ON(vmm->rm.rsvd->addr != SPLIT_VAS_SERVER_RM_MANAGED_VA_START ||
++			    vmm->rm.rsvd->size != SPLIT_VAS_SERVER_RM_MANAGED_VA_SIZE))
++			return -EINVAL;
++
+ 		ctrl = nvkm_gsp_rm_ctrl_get(&vmm->rm.object,
+ 					    NV90F1_CTRL_CMD_VASPACE_COPY_SERVER_RESERVED_PDES,
+ 					    sizeof(*ctrl));
+@@ -73,14 +106,29 @@ r535_mmu_vaspace_new(struct nvkm_vmm *vmm, u32 handle)
+ 		ctrl->levels[1].size = 0x1000;
+ 		ctrl->levels[1].aperture = 1;
+ 		ctrl->levels[1].pageShift = 0x26;
+-		if (vmm->pd->pde[0]->pde[0]) {
+-			ctrl->levels[2].physAddress = vmm->pd->pde[0]->pde[0]->pt[0]->addr;
+-			ctrl->levels[2].size = 0x1000;
+-			ctrl->levels[2].aperture = 1;
+-			ctrl->levels[2].pageShift = 0x1d;
+-		}
++		ctrl->levels[2].physAddress = vmm->pd->pde[0]->pde[0]->pt[0]->addr;
++		ctrl->levels[2].size = 0x1000;
++		ctrl->levels[2].aperture = 1;
++		ctrl->levels[2].pageShift = 0x1d;
+ 
+ 		ret = nvkm_gsp_rm_ctrl_wr(&vmm->rm.object, ctrl);
++	} else {
++		NV0080_CTRL_DMA_SET_PAGE_DIRECTORY_PARAMS *ctrl;
++
++		ctrl = nvkm_gsp_rm_ctrl_get(&vmm->rm.device.object,
++					    NV0080_CTRL_CMD_DMA_SET_PAGE_DIRECTORY,
++					    sizeof(*ctrl));
++		if (IS_ERR(ctrl))
++			return PTR_ERR(ctrl);
++
++		ctrl->physAddress = vmm->pd->pt[0]->addr;
++		ctrl->numEntries = 1 << vmm->func->page[0].desc->bits;
++		ctrl->flags = NVDEF(NV0080_CTRL_DMA_SET_PAGE_DIRECTORY, FLAGS, APERTURE, VIDMEM);
++		ctrl->hVASpace = vmm->rm.object.handle;
++
++		ret = nvkm_gsp_rm_ctrl_wr(&vmm->rm.device.object, ctrl);
++		if (ret == 0)
++			vmm->rm.external = true;
+ 	}
+ 
+ 	return ret;
+@@ -89,7 +137,7 @@ r535_mmu_vaspace_new(struct nvkm_vmm *vmm, u32 handle)
+ static int
+ r535_mmu_promote_vmm(struct nvkm_vmm *vmm)
+ {
+-	return r535_mmu_vaspace_new(vmm, NVKM_RM_VASPACE);
++	return r535_mmu_vaspace_new(vmm, NVKM_RM_VASPACE, true);
+ }
+ 
+ static void
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/gr.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/gr.c
+index c92ec231f09a..b6cced9b8aa1 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/gr.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/gr.c
+@@ -126,7 +126,7 @@ r570_gr_scrubber_init(struct r535_gr *gr)
+ 	if (ret)
+ 		goto done;
+ 
+-	ret = r535_mmu_vaspace_new(gr->scrubber.vmm, KGRAPHICS_SCRUBBER_HANDLE_VAS);
++	ret = r535_mmu_vaspace_new(gr->scrubber.vmm, KGRAPHICS_SCRUBBER_HANDLE_VAS, false);
+ 	if (ret)
+ 		goto done;
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/rm.h b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/rm.h
+index fc63ac61a9d1..ead48c106bb6 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/rm.h
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/rm.h
+@@ -147,7 +147,8 @@ extern const struct nvkm_rm_api_alloc r535_alloc;
+ extern const struct nvkm_rm_api_client r535_client;
+ void r535_gsp_client_dtor(struct nvkm_gsp_client *);
+ extern const struct nvkm_rm_api_device r535_device;
+-int r535_mmu_vaspace_new(struct nvkm_vmm *, u32 handle);
++int r535_mmu_vaspace_new(struct nvkm_vmm *, u32 handle, bool external);
++void r535_mmu_vaspace_del(struct nvkm_vmm *);
+ extern const struct nvkm_rm_api_fbsr r535_fbsr;
+ void r535_fbsr_resume(struct nvkm_gsp *);
+ int r535_fbsr_memlist(struct nvkm_gsp_device *, u32 handle, enum nvkm_memory_target,
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/vmm.c b/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/vmm.c
+index b54397e5364c..f95c58b67633 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/vmm.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/vmm.c
+@@ -1030,12 +1030,8 @@ nvkm_vmm_dtor(struct nvkm_vmm *vmm)
+ 	struct nvkm_vma *vma;
+ 	struct rb_node *node;
+ 
+-	if (vmm->rm.client.gsp) {
+-		nvkm_gsp_rm_free(&vmm->rm.object);
+-		nvkm_gsp_device_dtor(&vmm->rm.device);
+-		nvkm_gsp_client_dtor(&vmm->rm.client);
+-		nvkm_vmm_put(vmm, &vmm->rm.rsvd);
+-	}
++	if (vmm->rm.client.gsp)
++		r535_mmu_vaspace_del(vmm);
+ 
+ 	if (0)
+ 		nvkm_vmm_dump(vmm);
+-- 
+2.52.0
+
