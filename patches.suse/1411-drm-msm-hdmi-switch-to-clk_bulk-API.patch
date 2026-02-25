@@ -1,0 +1,144 @@
+From 15a5223dc6553c583a00e4f4afb106fa80b15f01 Mon Sep 17 00:00:00 2001
+From: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Date: Mon, 5 May 2025 03:14:50 +0300
+Subject: drm/msm/hdmi: switch to clk_bulk API
+Git-commit: 15a5223dc6553c583a00e4f4afb106fa80b15f01
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+The last platform using legacy clock names for HDMI block (APQ8064)
+switched to new clock names in 5.16. It's time to stop caring about old
+DT, drop hand-coded helpers and switch to clk_bulk_* API.
+
+Reviewed-by: Jessica Zhang <quic_jesszhan@quicinc.com>
+Signed-off-by: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Patchwork: https://patchwork.freedesktop.org/patch/651716/
+Link: https://lore.kernel.org/r/20250505-fd-hdmi-hpd-v5-6-48541f76318c@oss.qualcomm.com
+Signed-off-by: Dmitry Baryshkov <dmitry.baryshkov@oss.qualcomm.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/msm/hdmi/hdmi.c     | 15 ++++-------
+ drivers/gpu/drm/msm/hdmi/hdmi.h     |  2 +-
+ drivers/gpu/drm/msm/hdmi/hdmi_hpd.c | 39 ++++++++++-------------------
+ 3 files changed, 19 insertions(+), 37 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/hdmi/hdmi.c b/drivers/gpu/drm/msm/hdmi/hdmi.c
+index c9fe001c92cd..603f056012c2 100644
+--- a/drivers/gpu/drm/msm/hdmi/hdmi.c
++++ b/drivers/gpu/drm/msm/hdmi/hdmi.c
+@@ -353,17 +353,12 @@ static int msm_hdmi_dev_probe(struct platform_device *pdev)
+ 	if (!hdmi->hpd_clks)
+ 		return -ENOMEM;
+ 
+-	for (i = 0; i < config->hpd_clk_cnt; i++) {
+-		struct clk *clk;
++	for (i = 0; i < config->hpd_clk_cnt; i++)
++		hdmi->hpd_clks[i].id = config->hpd_clk_names[i];
+ 
+-		clk = msm_clk_get(pdev, config->hpd_clk_names[i]);
+-		if (IS_ERR(clk))
+-			return dev_err_probe(dev, PTR_ERR(clk),
+-					     "failed to get hpd clk: %s\n",
+-					     config->hpd_clk_names[i]);
+-
+-		hdmi->hpd_clks[i] = clk;
+-	}
++	ret = devm_clk_bulk_get(&pdev->dev, config->hpd_clk_cnt, hdmi->hpd_clks);
++	if (ret)
++		return ret;
+ 
+ 	hdmi->extp_clk = devm_clk_get_optional(&pdev->dev, "extp");
+ 	if (IS_ERR(hdmi->extp_clk))
+diff --git a/drivers/gpu/drm/msm/hdmi/hdmi.h b/drivers/gpu/drm/msm/hdmi/hdmi.h
+index e93d49d9e869..3f87535bcf43 100644
+--- a/drivers/gpu/drm/msm/hdmi/hdmi.h
++++ b/drivers/gpu/drm/msm/hdmi/hdmi.h
+@@ -49,7 +49,7 @@ struct hdmi {
+ 
+ 	struct regulator_bulk_data *hpd_regs;
+ 	struct regulator_bulk_data *pwr_regs;
+-	struct clk **hpd_clks;
++	struct clk_bulk_data *hpd_clks;
+ 	struct clk *extp_clk;
+ 
+ 	struct gpio_desc *hpd_gpiod;
+diff --git a/drivers/gpu/drm/msm/hdmi/hdmi_hpd.c b/drivers/gpu/drm/msm/hdmi/hdmi_hpd.c
+index 7ae69b14e953..e253c1408dd1 100644
+--- a/drivers/gpu/drm/msm/hdmi/hdmi_hpd.c
++++ b/drivers/gpu/drm/msm/hdmi/hdmi_hpd.c
+@@ -60,27 +60,6 @@ static void msm_hdmi_phy_reset(struct hdmi *hdmi)
+ 	}
+ }
+ 
+-static void enable_hpd_clocks(struct hdmi *hdmi, bool enable)
+-{
+-	const struct hdmi_platform_config *config = hdmi->config;
+-	struct device *dev = &hdmi->pdev->dev;
+-	int i, ret;
+-
+-	if (enable) {
+-		for (i = 0; i < config->hpd_clk_cnt; i++) {
+-			ret = clk_prepare_enable(hdmi->hpd_clks[i]);
+-			if (ret) {
+-				DRM_DEV_ERROR(dev,
+-					"failed to enable hpd clk: %s (%d)\n",
+-					config->hpd_clk_names[i], ret);
+-			}
+-		}
+-	} else {
+-		for (i = config->hpd_clk_cnt - 1; i >= 0; i--)
+-			clk_disable_unprepare(hdmi->hpd_clks[i]);
+-	}
+-}
+-
+ int msm_hdmi_hpd_enable(struct drm_bridge *bridge)
+ {
+ 	struct hdmi_bridge *hdmi_bridge = to_hdmi_bridge(bridge);
+@@ -107,7 +86,9 @@ int msm_hdmi_hpd_enable(struct drm_bridge *bridge)
+ 		gpiod_set_value_cansleep(hdmi->hpd_gpiod, 1);
+ 
+ 	pm_runtime_get_sync(dev);
+-	enable_hpd_clocks(hdmi, true);
++	ret = clk_bulk_prepare_enable(config->hpd_clk_cnt, hdmi->hpd_clks);
++	if (ret)
++		goto fail;
+ 
+ 	msm_hdmi_set_mode(hdmi, false);
+ 	msm_hdmi_phy_reset(hdmi);
+@@ -149,7 +130,7 @@ void msm_hdmi_hpd_disable(struct hdmi *hdmi)
+ 
+ 	msm_hdmi_set_mode(hdmi, false);
+ 
+-	enable_hpd_clocks(hdmi, false);
++	clk_bulk_disable_unprepare(config->hpd_clk_cnt, hdmi->hpd_clks);
+ 	pm_runtime_put(dev);
+ 
+ 	ret = pinctrl_pm_select_sleep_state(dev);
+@@ -193,14 +174,20 @@ void msm_hdmi_hpd_irq(struct drm_bridge *bridge)
+ 
+ static enum drm_connector_status detect_reg(struct hdmi *hdmi)
+ {
+-	uint32_t hpd_int_status;
++	const struct hdmi_platform_config *config = hdmi->config;
++	u32 hpd_int_status = 0;
++	int ret;
+ 
+ 	pm_runtime_get_sync(&hdmi->pdev->dev);
+-	enable_hpd_clocks(hdmi, true);
++	ret = clk_bulk_prepare_enable(config->hpd_clk_cnt, hdmi->hpd_clks);
++	if (ret)
++		goto out;
+ 
+ 	hpd_int_status = hdmi_read(hdmi, REG_HDMI_HPD_INT_STATUS);
+ 
+-	enable_hpd_clocks(hdmi, false);
++	clk_bulk_disable_unprepare(config->hpd_clk_cnt, hdmi->hpd_clks);
++
++out:
+ 	pm_runtime_put(&hdmi->pdev->dev);
+ 
+ 	return (hpd_int_status & HDMI_HPD_INT_STATUS_CABLE_DETECTED) ?
+-- 
+2.52.0
+
