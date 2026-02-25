@@ -1,0 +1,119 @@
+From b7effa3238c705135515687c8b055a0ac2c221e0 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jouni=20H=C3=B6gander?= <jouni.hogander@intel.com>
+Date: Mon, 14 Apr 2025 13:05:03 +0300
+Subject: drm/i915/psr: Add mechanism to notify PSR of DC5/6 enable disable
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: b7effa3238c705135515687c8b055a0ac2c221e0
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+We need to apply/remove workaround for underrun on idle PSR HW issue
+(Wa_16025596647) when DC5/6 is enabled/disabled. This patch implements
+mechanism to notify PSR about DC5/6 enable/disable and applies/removes the
+workaround using this notification.
+
+Bspec: 74115
+
+Signed-off-by: Jouni Högander <jouni.hogander@intel.com>
+Reviewed-by: Mika Kahola <mika.kahola@intel.com>
+Link: https://lore.kernel.org/r/20250414100508.1208774-9-jouni.hogander@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../gpu/drm/i915/display/intel_display_core.h |  2 +
+ drivers/gpu/drm/i915/display/intel_psr.c      | 50 +++++++++++++++++++
+ drivers/gpu/drm/i915/display/intel_psr.h      |  2 +
+ 3 files changed, 54 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display_core.h b/drivers/gpu/drm/i915/display/intel_display_core.h
+index 48e47f0fd8b7..650ab055e148 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_core.h
++++ b/drivers/gpu/drm/i915/display/intel_display_core.h
+@@ -579,6 +579,8 @@ struct intel_display {
+ 	struct intel_vbt_data vbt;
+ 	struct intel_dmc_wl wl;
+ 	struct intel_wm wm;
++
++	struct work_struct psr_dc5_dc6_wa_work;
+ };
+ 
+ #endif /* __INTEL_DISPLAY_CORE_H__ */
+diff --git a/drivers/gpu/drm/i915/display/intel_psr.c b/drivers/gpu/drm/i915/display/intel_psr.c
+index 9a79a16268cb..cc69a5b6463d 100644
+--- a/drivers/gpu/drm/i915/display/intel_psr.c
++++ b/drivers/gpu/drm/i915/display/intel_psr.c
+@@ -3695,6 +3695,56 @@ static void intel_psr_apply_underrun_on_idle_wa_locked(struct intel_dp *intel_dp
+ 		psr1_apply_underrun_on_idle_wa_locked(intel_dp, dc5_dc6_blocked);
+ }
+ 
++static void psr_dc5_dc6_wa_work(struct work_struct *work)
++{
++	struct intel_display *display = container_of(work, typeof(*display),
++						     psr_dc5_dc6_wa_work);
++	struct intel_encoder *encoder;
++
++	for_each_intel_encoder_with_psr(display->drm, encoder) {
++		struct intel_dp *intel_dp = enc_to_intel_dp(encoder);
++
++		mutex_lock(&intel_dp->psr.lock);
++
++		if (intel_dp->psr.enabled && !intel_dp->psr.panel_replay_enabled)
++			intel_psr_apply_underrun_on_idle_wa_locked(intel_dp);
++
++		mutex_unlock(&intel_dp->psr.lock);
++	}
++}
++
++/**
++ * intel_psr_notify_dc5_dc6 - Notify PSR about enable/disable dc5/dc6
++ * @display: intel atomic state
++ *
++ * This is targeted for underrun on idle PSR HW bug (Wa_16025596647) to schedule
++ * psr_dc5_dc6_wa_work used for applying/removing the workaround.
++ */
++void intel_psr_notify_dc5_dc6(struct intel_display *display)
++{
++	if (DISPLAY_VER(display) != 20 &&
++	    !IS_DISPLAY_VERx100_STEP(display, 3000, STEP_A0, STEP_B0))
++		return;
++
++	schedule_work(&display->psr_dc5_dc6_wa_work);
++}
++
++/**
++ * intel_psr_dc5_dc6_wa_init - Init work for underrun on idle PSR HW bug wa
++ * @display: intel atomic state
++ *
++ * This is targeted for underrun on idle PSR HW bug (Wa_16025596647) to init
++ * psr_dc5_dc6_wa_work used for applying the workaround.
++ */
++void intel_psr_dc5_dc6_wa_init(struct intel_display *display)
++{
++	if (DISPLAY_VER(display) != 20 &&
++	    !IS_DISPLAY_VERx100_STEP(display, 3000, STEP_A0, STEP_B0))
++		return;
++
++	INIT_WORK(&display->psr_dc5_dc6_wa_work, psr_dc5_dc6_wa_work);
++}
++
+ /**
+  * intel_psr_notify_pipe_change - Notify PSR about enable/disable of a pipe
+  * @state: intel atomic state
+diff --git a/drivers/gpu/drm/i915/display/intel_psr.h b/drivers/gpu/drm/i915/display/intel_psr.h
+index 273e70a50915..bfe368239bc2 100644
+--- a/drivers/gpu/drm/i915/display/intel_psr.h
++++ b/drivers/gpu/drm/i915/display/intel_psr.h
+@@ -62,6 +62,8 @@ void intel_psr_resume(struct intel_dp *intel_dp);
+ bool intel_psr_needs_block_dc_vblank(const struct intel_crtc_state *crtc_state);
+ void intel_psr_notify_pipe_change(struct intel_atomic_state *state,
+ 				  struct intel_crtc *crtc, bool enable);
++void intel_psr_notify_dc5_dc6(struct intel_display *display);
++void intel_psr_dc5_dc6_wa_init(struct intel_display *display);
+ bool intel_psr_link_ok(struct intel_dp *intel_dp);
+ 
+ void intel_psr_lock(const struct intel_crtc_state *crtc_state);
+-- 
+2.52.0
+
