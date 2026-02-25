@@ -1,0 +1,314 @@
+From 72ea78335e782d7991934e39f2a998a3d134e4fd Mon Sep 17 00:00:00 2001
+From: Shiwu Zhang <shiwu.zhang@amd.com>
+Date: Fri, 21 Mar 2025 21:48:16 +0800
+Subject: drm/amdgpu: add debugfs for spirom IFWI dump
+Git-commit: 72ea78335e782d7991934e39f2a998a3d134e4fd
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Expose the debugfs file node for user space to dump the IFWI image
+on spirom.
+
+For one transaction between PSP and host, it will read out the
+images on both active and inactive partitions so a buffer with two
+times the size of maximum IFWI image (currently 16MByte) is needed.
+
+V2: move the vbios gfl macros to the common header and rename the
+    bo triplet struct to spirom_bo for this specific usage (Hawking)
+
+V3: return directly the result of last command execution (Lijo)
+
+Signed-off-by: Shiwu Zhang <shiwu.zhang@amd.com>
+Reviewed-by: Hawking Zhang <Hawking.Zhang@amd.com>
+Reviewed-by: Lijo Lazar <lijo.lazar@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_debugfs.c |   1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c     | 104 ++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h     |  29 ++++++
+ drivers/gpu/drm/amd/amdgpu/psp_v13_0.c      |  44 +++++++--
+ 4 files changed, 168 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_debugfs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_debugfs.c
+index a1450f13d963..8e626f50b362 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_debugfs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_debugfs.c
+@@ -2105,6 +2105,7 @@ int amdgpu_debugfs_init(struct amdgpu_device *adev)
+ 	amdgpu_rap_debugfs_init(adev);
+ 	amdgpu_securedisplay_debugfs_init(adev);
+ 	amdgpu_fw_attestation_debugfs_init(adev);
++	amdgpu_psp_debugfs_init(adev);
+ 
+ 	debugfs_create_file("amdgpu_evict_vram", 0400, root, adev,
+ 			    &amdgpu_evict_vram_fops);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
+index 3aed7361ec8f..4c8d2cbf4a5c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
+@@ -4186,6 +4186,110 @@ const struct attribute_group amdgpu_flash_attr_group = {
+ 	.is_visible = amdgpu_flash_attr_is_visible,
+ };
+ 
++#if defined(CONFIG_DEBUG_FS)
++static int psp_read_spirom_debugfs_open(struct inode *inode, struct file *filp)
++{
++	struct amdgpu_device *adev = filp->f_inode->i_private;
++	struct spirom_bo *bo_triplet;
++	int ret;
++
++	/* serialize the open() file calling */
++	if (!mutex_trylock(&adev->psp.mutex))
++		return -EBUSY;
++
++	/*
++	 * make sure only one userpace process is alive for dumping so that
++	 * only one memory buffer of AMD_VBIOS_FILE_MAX_SIZE * 2 is consumed.
++	 * let's say the case where one process try opening the file while
++	 * another one has proceeded to read or release. In this way, eliminate
++	 * the use of mutex for read() or release() callback as well.
++	 */
++	if (adev->psp.spirom_dump_trip) {
++		mutex_unlock(&adev->psp.mutex);
++		return -EBUSY;
++	}
++
++	bo_triplet = kzalloc(sizeof(struct spirom_bo), GFP_KERNEL);
++	if (!bo_triplet) {
++		mutex_unlock(&adev->psp.mutex);
++		return -ENOMEM;
++	}
++
++	ret = amdgpu_bo_create_kernel(adev, AMD_VBIOS_FILE_MAX_SIZE_B * 2,
++				      AMDGPU_GPU_PAGE_SIZE,
++				      AMDGPU_GEM_DOMAIN_GTT,
++				      &bo_triplet->bo,
++				      &bo_triplet->mc_addr,
++				      &bo_triplet->cpu_addr);
++	if (ret)
++		goto rel_trip;
++
++	ret = psp_dump_spirom(&adev->psp, bo_triplet->mc_addr);
++	if (ret)
++		goto rel_bo;
++
++	adev->psp.spirom_dump_trip = bo_triplet;
++	mutex_unlock(&adev->psp.mutex);
++	return 0;
++rel_bo:
++	amdgpu_bo_free_kernel(&bo_triplet->bo, &bo_triplet->mc_addr,
++			      &bo_triplet->cpu_addr);
++rel_trip:
++	kfree(bo_triplet);
++	mutex_unlock(&adev->psp.mutex);
++	dev_err(adev->dev, "Trying IFWI dump fails, err = %d\n", ret);
++	return ret;
++}
++
++static ssize_t psp_read_spirom_debugfs_read(struct file *filp, char __user *buf, size_t size,
++					    loff_t *pos)
++{
++	struct amdgpu_device *adev = filp->f_inode->i_private;
++	struct spirom_bo *bo_triplet = adev->psp.spirom_dump_trip;
++
++	if (!bo_triplet)
++		return -EINVAL;
++
++	return simple_read_from_buffer(buf,
++				       size,
++				       pos, bo_triplet->cpu_addr,
++				       AMD_VBIOS_FILE_MAX_SIZE_B * 2);
++}
++
++static int psp_read_spirom_debugfs_release(struct inode *inode, struct file *filp)
++{
++	struct amdgpu_device *adev = filp->f_inode->i_private;
++	struct spirom_bo *bo_triplet = adev->psp.spirom_dump_trip;
++
++	if (bo_triplet) {
++		amdgpu_bo_free_kernel(&bo_triplet->bo, &bo_triplet->mc_addr,
++				      &bo_triplet->cpu_addr);
++		kfree(bo_triplet);
++	}
++
++	adev->psp.spirom_dump_trip = NULL;
++	return 0;
++}
++
++static const struct file_operations psp_dump_spirom_debugfs_ops = {
++	.owner = THIS_MODULE,
++	.open = psp_read_spirom_debugfs_open,
++	.read = psp_read_spirom_debugfs_read,
++	.release = psp_read_spirom_debugfs_release,
++	.llseek = default_llseek,
++};
++#endif
++
++void amdgpu_psp_debugfs_init(struct amdgpu_device *adev)
++{
++#if defined(CONFIG_DEBUG_FS)
++	struct drm_minor *minor = adev_to_drm(adev)->primary;
++
++	debugfs_create_file_size("psp_spirom_dump", 0444, minor->debugfs_root,
++				 adev, &psp_dump_spirom_debugfs_ops, AMD_VBIOS_FILE_MAX_SIZE_B * 2);
++#endif
++}
++
+ const struct amd_ip_funcs psp_ip_funcs = {
+ 	.name = "psp",
+ 	.early_init = psp_early_init,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h
+index dcf5e8e0b9e3..428adc7f741d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h
+@@ -39,6 +39,18 @@
+ #define PSP_TMR_ALIGNMENT	0x100000
+ #define PSP_FW_NAME_LEN		0x24
+ 
++/* VBIOS gfl defines */
++#define MBOX_READY_MASK 0x80000000
++#define MBOX_STATUS_MASK 0x0000FFFF
++#define MBOX_COMMAND_MASK 0x00FF0000
++#define MBOX_READY_FLAG 0x80000000
++#define C2PMSG_CMD_SPI_UPDATE_ROM_IMAGE_ADDR_LO 0x2
++#define C2PMSG_CMD_SPI_UPDATE_ROM_IMAGE_ADDR_HI 0x3
++#define C2PMSG_CMD_SPI_UPDATE_FLASH_IMAGE 0x4
++#define C2PMSG_CMD_SPI_GET_ROM_IMAGE_ADDR_LO 0xf
++#define C2PMSG_CMD_SPI_GET_ROM_IMAGE_ADDR_HI 0x10
++#define C2PMSG_CMD_SPI_GET_FLASH_IMAGE 0x11
++
+ extern const struct attribute_group amdgpu_flash_attr_group;
+ 
+ enum psp_shared_mem_size {
+@@ -138,6 +150,7 @@ struct psp_funcs {
+ 	int (*load_usbc_pd_fw)(struct psp_context *psp, uint64_t fw_pri_mc_addr);
+ 	int (*read_usbc_pd_fw)(struct psp_context *psp, uint32_t *fw_ver);
+ 	int (*update_spirom)(struct psp_context *psp, uint64_t fw_pri_mc_addr);
++	int (*dump_spirom)(struct psp_context *psp, uint64_t fw_pri_mc_addr);
+ 	int (*vbflash_stat)(struct psp_context *psp);
+ 	int (*fatal_error_recovery_quirk)(struct psp_context *psp);
+ 	bool (*get_ras_capability)(struct psp_context *psp);
+@@ -322,6 +335,14 @@ struct psp_runtime_scpm_entry {
+ 	enum psp_runtime_scpm_authentication scpm_status;
+ };
+ 
++#if defined(CONFIG_DEBUG_FS)
++struct spirom_bo {
++	struct amdgpu_bo *bo;
++	uint64_t mc_addr;
++	void *cpu_addr;
++};
++#endif
++
+ struct psp_context {
+ 	struct amdgpu_device		*adev;
+ 	struct psp_ring			km_ring;
+@@ -409,6 +430,9 @@ struct psp_context {
+ 	char				*vbflash_tmp_buf;
+ 	size_t				vbflash_image_size;
+ 	bool				vbflash_done;
++#if defined(CONFIG_DEBUG_FS)
++	struct spirom_bo *spirom_dump_trip;
++#endif
+ };
+ 
+ struct amdgpu_psp_funcs {
+@@ -467,6 +491,10 @@ struct amdgpu_psp_funcs {
+ 	((psp)->funcs->update_spirom ? \
+ 	(psp)->funcs->update_spirom((psp), fw_pri_mc_addr) : -EINVAL)
+ 
++#define psp_dump_spirom(psp, fw_pri_mc_addr) \
++	((psp)->funcs->dump_spirom ? \
++	(psp)->funcs->dump_spirom((psp), fw_pri_mc_addr) : -EINVAL)
++
+ #define psp_vbflash_status(psp) \
+ 	((psp)->funcs->vbflash_stat ? \
+ 	(psp)->funcs->vbflash_stat((psp)) : -EINVAL)
+@@ -578,6 +606,7 @@ int psp_config_sq_perfmon(struct psp_context *psp, uint32_t xcp_id,
+ bool amdgpu_psp_tos_reload_needed(struct amdgpu_device *adev);
+ int amdgpu_psp_reg_program_no_ring(struct psp_context *psp, uint32_t val,
+ 				   enum psp_reg_prog_id id);
++void amdgpu_psp_debugfs_init(struct amdgpu_device *adev);
+ 
+ 
+ #endif
+diff --git a/drivers/gpu/drm/amd/amdgpu/psp_v13_0.c b/drivers/gpu/drm/amd/amdgpu/psp_v13_0.c
+index f8af2cc63446..df612fd9cc50 100644
+--- a/drivers/gpu/drm/amd/amdgpu/psp_v13_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/psp_v13_0.c
+@@ -71,15 +71,6 @@ MODULE_FIRMWARE("amdgpu/psp_14_0_4_ta.bin");
+ /* Retry times for vmbx ready wait */
+ #define PSP_VMBX_POLLING_LIMIT 3000
+ 
+-/* VBIOS gfl defines */
+-#define MBOX_READY_MASK 0x80000000
+-#define MBOX_STATUS_MASK 0x0000FFFF
+-#define MBOX_COMMAND_MASK 0x00FF0000
+-#define MBOX_READY_FLAG 0x80000000
+-#define C2PMSG_CMD_SPI_UPDATE_ROM_IMAGE_ADDR_LO 0x2
+-#define C2PMSG_CMD_SPI_UPDATE_ROM_IMAGE_ADDR_HI 0x3
+-#define C2PMSG_CMD_SPI_UPDATE_FLASH_IMAGE 0x4
+-
+ /* memory training timeout define */
+ #define MEM_TRAIN_SEND_MSG_TIMEOUT_US	3000000
+ 
+@@ -741,7 +732,8 @@ static int psp_v13_0_exec_spi_cmd(struct psp_context *psp, int cmd)
+ 	/* Ring the doorbell */
+ 	WREG32_SOC15(MP0, 0, regMP0_SMN_C2PMSG_73, 1);
+ 
+-	if (cmd == C2PMSG_CMD_SPI_UPDATE_FLASH_IMAGE)
++	if (cmd == C2PMSG_CMD_SPI_UPDATE_FLASH_IMAGE ||
++	    cmd == C2PMSG_CMD_SPI_GET_FLASH_IMAGE)
+ 		ret = psp_wait_for_spirom_update(psp, SOC15_REG_OFFSET(MP0, 0, regMP0_SMN_C2PMSG_115),
+ 						 MBOX_READY_FLAG, MBOX_READY_MASK, PSP_SPIROM_UPDATE_TIMEOUT);
+ 	else
+@@ -797,6 +789,37 @@ static int psp_v13_0_update_spirom(struct psp_context *psp,
+ 	return 0;
+ }
+ 
++static int psp_v13_0_dump_spirom(struct psp_context *psp,
++				 uint64_t fw_pri_mc_addr)
++{
++	struct amdgpu_device *adev = psp->adev;
++	int ret;
++
++	/* Confirm PSP is ready to start */
++	ret = psp_wait_for(psp, SOC15_REG_OFFSET(MP0, 0, regMP0_SMN_C2PMSG_115),
++			   MBOX_READY_FLAG, MBOX_READY_MASK, false);
++	if (ret) {
++		dev_err(adev->dev, "PSP Not ready to start processing, ret = %d", ret);
++		return ret;
++	}
++
++	WREG32_SOC15(MP0, 0, regMP0_SMN_C2PMSG_116, lower_32_bits(fw_pri_mc_addr));
++
++	ret = psp_v13_0_exec_spi_cmd(psp, C2PMSG_CMD_SPI_GET_ROM_IMAGE_ADDR_LO);
++	if (ret)
++		return ret;
++
++	WREG32_SOC15(MP0, 0, regMP0_SMN_C2PMSG_116, upper_32_bits(fw_pri_mc_addr));
++
++	ret = psp_v13_0_exec_spi_cmd(psp, C2PMSG_CMD_SPI_GET_ROM_IMAGE_ADDR_HI);
++	if (ret)
++		return ret;
++
++	ret = psp_v13_0_exec_spi_cmd(psp, C2PMSG_CMD_SPI_GET_FLASH_IMAGE);
++
++	return ret;
++}
++
+ static int psp_v13_0_vbflash_status(struct psp_context *psp)
+ {
+ 	struct amdgpu_device *adev = psp->adev;
+@@ -929,6 +952,7 @@ static const struct psp_funcs psp_v13_0_funcs = {
+ 	.load_usbc_pd_fw = psp_v13_0_load_usbc_pd_fw,
+ 	.read_usbc_pd_fw = psp_v13_0_read_usbc_pd_fw,
+ 	.update_spirom = psp_v13_0_update_spirom,
++	.dump_spirom = psp_v13_0_dump_spirom,
+ 	.vbflash_stat = psp_v13_0_vbflash_status,
+ 	.fatal_error_recovery_quirk = psp_v13_0_fatal_error_recovery_quirk,
+ 	.get_ras_capability = psp_v13_0_get_ras_capability,
+-- 
+2.52.0
+
