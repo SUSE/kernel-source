@@ -1,0 +1,312 @@
+From d3ae1e394bdc267a1699f7ac2ff3d3a990e791b9 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jos=C3=A9=20Exp=C3=B3sito?= <jose.exposito89@gmail.com>
+Date: Tue, 18 Feb 2025 11:12:04 +0100
+Subject: drm/vkms: Extract vkms_config header
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: d3ae1e394bdc267a1699f7ac2ff3d3a990e791b9
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Creating a new vkms_config structure will be more complex once we
+start adding more options.
+
+Extract the vkms_config structure to its own header and source files
+and add functions to create and delete a vkms_config and to initialize
+debugfs.
+
+Refactor, no functional changes.
+
+Reviewed-by: Louis Chauvet <louis.chauvet@bootlin.com>
+Co-developed-by: Louis Chauvet <louis.chauvet@bootlin.com>
+Signed-off-by: Louis Chauvet <louis.chauvet@bootlin.com>
+Signed-off-by: José Expósito <jose.exposito89@gmail.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250218101214.5790-5-jose.exposito89@gmail.com
+Signed-off-by: Maxime Ripard <mripard@kernel.org>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/vkms/Makefile                 |  3 +-
+ drivers/gpu/drm/vkms/tests/vkms_config_test.c | 13 +++++
+ drivers/gpu/drm/vkms/vkms_config.c            | 50 +++++++++++++++++++
+ drivers/gpu/drm/vkms/vkms_config.h            | 47 +++++++++++++++++
+ drivers/gpu/drm/vkms/vkms_drv.c               | 34 +++----------
+ drivers/gpu/drm/vkms/vkms_drv.h               | 15 +-----
+ drivers/gpu/drm/vkms/vkms_output.c            |  1 +
+ 7 files changed, 121 insertions(+), 42 deletions(-)
+ create mode 100644 drivers/gpu/drm/vkms/vkms_config.c
+ create mode 100644 drivers/gpu/drm/vkms/vkms_config.h
+
+diff --git a/drivers/gpu/drm/vkms/Makefile b/drivers/gpu/drm/vkms/Makefile
+index c23eee2f3df4..d657865e573f 100644
+--- a/drivers/gpu/drm/vkms/Makefile
++++ b/drivers/gpu/drm/vkms/Makefile
+@@ -7,7 +7,8 @@ vkms-y := \
+ 	vkms_crtc.o \
+ 	vkms_composer.o \
+ 	vkms_writeback.o \
+-	vkms_connector.o
++	vkms_connector.o \
++	vkms_config.o
+ 
+ obj-$(CONFIG_DRM_VKMS) += vkms.o
+ obj-$(CONFIG_DRM_VKMS_KUNIT_TEST) += tests/
+diff --git a/drivers/gpu/drm/vkms/tests/vkms_config_test.c b/drivers/gpu/drm/vkms/tests/vkms_config_test.c
+index 931a5c475e58..ca36fd9a417b 100644
+--- a/drivers/gpu/drm/vkms/tests/vkms_config_test.c
++++ b/drivers/gpu/drm/vkms/tests/vkms_config_test.c
+@@ -2,9 +2,22 @@
+ 
+ #include <kunit/test.h>
+ 
++#include "../vkms_config.h"
++
+ MODULE_IMPORT_NS(EXPORTED_FOR_KUNIT_TESTING);
+ 
++static void vkms_config_test_empty_config(struct kunit *test)
++{
++	struct vkms_config *config;
++
++	config = vkms_config_create();
++	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, config);
++
++	vkms_config_destroy(config);
++}
++
+ static struct kunit_case vkms_config_test_cases[] = {
++	KUNIT_CASE(vkms_config_test_empty_config),
+ 	{}
+ };
+ 
+diff --git a/drivers/gpu/drm/vkms/vkms_config.c b/drivers/gpu/drm/vkms/vkms_config.c
+new file mode 100644
+index 000000000000..42caa421876e
+--- /dev/null
++++ b/drivers/gpu/drm/vkms/vkms_config.c
+@@ -0,0 +1,50 @@
++// SPDX-License-Identifier: GPL-2.0+
++
++#include <linux/slab.h>
++
++#include <drm/drm_print.h>
++#include <drm/drm_debugfs.h>
++#include <kunit/visibility.h>
++
++#include "vkms_config.h"
++
++struct vkms_config *vkms_config_create(void)
++{
++	struct vkms_config *config;
++
++	config = kzalloc(sizeof(*config), GFP_KERNEL);
++	if (!config)
++		return ERR_PTR(-ENOMEM);
++
++	return config;
++}
++EXPORT_SYMBOL_IF_KUNIT(vkms_config_create);
++
++void vkms_config_destroy(struct vkms_config *config)
++{
++	kfree(config);
++}
++EXPORT_SYMBOL_IF_KUNIT(vkms_config_destroy);
++
++static int vkms_config_show(struct seq_file *m, void *data)
++{
++	struct drm_debugfs_entry *entry = m->private;
++	struct drm_device *dev = entry->dev;
++	struct vkms_device *vkmsdev = drm_device_to_vkms_device(dev);
++
++	seq_printf(m, "writeback=%d\n", vkmsdev->config->writeback);
++	seq_printf(m, "cursor=%d\n", vkmsdev->config->cursor);
++	seq_printf(m, "overlay=%d\n", vkmsdev->config->overlay);
++
++	return 0;
++}
++
++static const struct drm_debugfs_info vkms_config_debugfs_list[] = {
++	{ "vkms_config", vkms_config_show, 0 },
++};
++
++void vkms_config_register_debugfs(struct vkms_device *vkms_device)
++{
++	drm_debugfs_add_files(&vkms_device->drm, vkms_config_debugfs_list,
++			      ARRAY_SIZE(vkms_config_debugfs_list));
++}
+diff --git a/drivers/gpu/drm/vkms/vkms_config.h b/drivers/gpu/drm/vkms/vkms_config.h
+new file mode 100644
+index 000000000000..ced10f56a812
+--- /dev/null
++++ b/drivers/gpu/drm/vkms/vkms_config.h
+@@ -0,0 +1,47 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++
++#ifndef _VKMS_CONFIG_H_
++#define _VKMS_CONFIG_H_
++
++#include <linux/types.h>
++
++#include "vkms_drv.h"
++
++/**
++ * struct vkms_config - General configuration for VKMS driver
++ *
++ * @writeback: If true, a writeback buffer can be attached to the CRTC
++ * @cursor: If true, a cursor plane is created in the VKMS device
++ * @overlay: If true, NUM_OVERLAY_PLANES will be created for the VKMS device
++ * @dev: Used to store the current VKMS device. Only set when the device is instantiated.
++ */
++struct vkms_config {
++	bool writeback;
++	bool cursor;
++	bool overlay;
++	struct vkms_device *dev;
++};
++
++/**
++ * vkms_config_create() - Create a new VKMS configuration
++ *
++ * Returns:
++ * The new vkms_config or an error. Call vkms_config_destroy() to free the
++ * returned configuration.
++ */
++struct vkms_config *vkms_config_create(void);
++
++/**
++ * vkms_config_destroy() - Free a VKMS configuration
++ * @config: vkms_config to free
++ */
++void vkms_config_destroy(struct vkms_config *config);
++
++/**
++ * vkms_config_register_debugfs() - Register a debugfs file to show the device's
++ * configuration
++ * @vkms_device: Device to register
++ */
++void vkms_config_register_debugfs(struct vkms_device *vkms_device);
++
++#endif /* _VKMS_CONFIG_H_ */
+diff --git a/drivers/gpu/drm/vkms/vkms_drv.c b/drivers/gpu/drm/vkms/vkms_drv.c
+index b6de91134a22..37de0658e6ee 100644
+--- a/drivers/gpu/drm/vkms/vkms_drv.c
++++ b/drivers/gpu/drm/vkms/vkms_drv.c
+@@ -27,11 +27,9 @@
+ #include <drm/drm_gem_shmem_helper.h>
+ #include <drm/drm_vblank.h>
+ 
++#include "vkms_config.h"
+ #include "vkms_drv.h"
+ 
+-#include <drm/drm_print.h>
+-#include <drm/drm_debugfs.h>
+-
+ #define DRIVER_NAME	"vkms"
+ #define DRIVER_DESC	"Virtual Kernel Mode Setting"
+ #define DRIVER_MAJOR	1
+@@ -81,23 +79,6 @@ static void vkms_atomic_commit_tail(struct drm_atomic_state *old_state)
+ 	drm_atomic_helper_cleanup_planes(dev, old_state);
+ }
+ 
+-static int vkms_config_show(struct seq_file *m, void *data)
+-{
+-	struct drm_debugfs_entry *entry = m->private;
+-	struct drm_device *dev = entry->dev;
+-	struct vkms_device *vkmsdev = drm_device_to_vkms_device(dev);
+-
+-	seq_printf(m, "writeback=%d\n", vkmsdev->config->writeback);
+-	seq_printf(m, "cursor=%d\n", vkmsdev->config->cursor);
+-	seq_printf(m, "overlay=%d\n", vkmsdev->config->overlay);
+-
+-	return 0;
+-}
+-
+-static const struct drm_debugfs_info vkms_config_debugfs_list[] = {
+-	{ "vkms_config", vkms_config_show, 0 },
+-};
+-
+ static const struct drm_driver vkms_driver = {
+ 	.driver_features	= DRIVER_MODESET | DRIVER_ATOMIC | DRIVER_GEM,
+ 	.fops			= &vkms_driver_fops,
+@@ -208,8 +189,7 @@ static int vkms_create(struct vkms_config *config)
+ 	if (ret)
+ 		goto out_devres;
+ 
+-	drm_debugfs_add_files(&vkms_device->drm, vkms_config_debugfs_list,
+-			      ARRAY_SIZE(vkms_config_debugfs_list));
++	vkms_config_register_debugfs(vkms_device);
+ 
+ 	ret = drm_dev_register(&vkms_device->drm, 0);
+ 	if (ret)
+@@ -231,9 +211,9 @@ static int __init vkms_init(void)
+ 	int ret;
+ 	struct vkms_config *config;
+ 
+-	config = kmalloc(sizeof(*config), GFP_KERNEL);
+-	if (!config)
+-		return -ENOMEM;
++	config = vkms_config_create();
++	if (IS_ERR(config))
++		return PTR_ERR(config);
+ 
+ 	config->cursor = enable_cursor;
+ 	config->writeback = enable_writeback;
+@@ -241,7 +221,7 @@ static int __init vkms_init(void)
+ 
+ 	ret = vkms_create(config);
+ 	if (ret) {
+-		kfree(config);
++		vkms_config_destroy(config);
+ 		return ret;
+ 	}
+ 
+@@ -275,7 +255,7 @@ static void __exit vkms_exit(void)
+ 		return;
+ 
+ 	vkms_destroy(default_config);
+-	kfree(default_config);
++	vkms_config_destroy(default_config);
+ }
+ 
+ module_init(vkms_init);
+diff --git a/drivers/gpu/drm/vkms/vkms_drv.h b/drivers/gpu/drm/vkms/vkms_drv.h
+index abbb652be2b5..af7081c940d6 100644
+--- a/drivers/gpu/drm/vkms/vkms_drv.h
++++ b/drivers/gpu/drm/vkms/vkms_drv.h
+@@ -189,20 +189,7 @@ struct vkms_output {
+ 	spinlock_t composer_lock;
+ };
+ 
+-/**
+- * struct vkms_config - General configuration for VKMS driver
+- *
+- * @writeback: If true, a writeback buffer can be attached to the CRTC
+- * @cursor: If true, a cursor plane is created in the VKMS device
+- * @overlay: If true, NUM_OVERLAY_PLANES will be created for the VKMS device
+- * @dev: Used to store the current VKMS device. Only set when the device is instantiated.
+- */
+-struct vkms_config {
+-	bool writeback;
+-	bool cursor;
+-	bool overlay;
+-	struct vkms_device *dev;
+-};
++struct vkms_config;
+ 
+ /**
+  * struct vkms_device - Description of a VKMS device
+diff --git a/drivers/gpu/drm/vkms/vkms_output.c b/drivers/gpu/drm/vkms/vkms_output.c
+index 4b5abe159add..068a7f87ecec 100644
+--- a/drivers/gpu/drm/vkms/vkms_output.c
++++ b/drivers/gpu/drm/vkms/vkms_output.c
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0+
+ 
++#include "vkms_config.h"
+ #include "vkms_connector.h"
+ #include "vkms_drv.h"
+ #include <drm/drm_managed.h>
+-- 
+2.52.0
+
