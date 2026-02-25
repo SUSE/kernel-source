@@ -1,0 +1,895 @@
+From 6ca37b86f6c9784f514231c871effb1a4a5c3db9 Mon Sep 17 00:00:00 2001
+From: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Date: Fri, 11 Apr 2025 12:54:11 +0300
+Subject: drm/{i915,xe}: Move intel_pch under display
+Git-commit: 6ca37b86f6c9784f514231c871effb1a4a5c3db9
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+The only usage of the "PCH" infra is to detect which South Display
+Engine we should be using. Move it under display so we can convert
+all its callers towards intel_display struct later.
+
+No functional or code change.
+
+Signed-off-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Reviewed-by: Jani Nikula <jani.nikula@intel.com>
+Reviewed-by: Lucas De Marchi <lucas.demarchi@intel.com>
+Link: https://lore.kernel.org/r/041e3dee494aa15c22172360f2bdd9b15e4acb00.1744364975.git.jani.nikula@intel.com
+Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/Makefile                 |   2 +-
+ drivers/gpu/drm/i915/display/intel_pch.c      | 316 ++++++++++++++++++
+ drivers/gpu/drm/i915/display/intel_pch.h      |  56 ++++
+ drivers/gpu/drm/i915/i915_drv.h               |   3 +-
+ drivers/gpu/drm/i915/soc/intel_pch.c          | 316 ------------------
+ drivers/gpu/drm/i915/soc/intel_pch.h          |  56 ----
+ drivers/gpu/drm/xe/Makefile                   |   2 +-
+ .../xe/compat-i915-headers/soc/intel_pch.h    |   6 -
+ drivers/gpu/drm/xe/xe_device_types.h          |   2 +-
+ 9 files changed, 376 insertions(+), 383 deletions(-)
+ create mode 100644 drivers/gpu/drm/i915/display/intel_pch.c
+ create mode 100644 drivers/gpu/drm/i915/display/intel_pch.h
+ delete mode 100644 drivers/gpu/drm/i915/soc/intel_pch.c
+ delete mode 100644 drivers/gpu/drm/i915/soc/intel_pch.h
+ delete mode 100644 drivers/gpu/drm/xe/compat-i915-headers/soc/intel_pch.h
+
+diff --git a/drivers/gpu/drm/i915/Makefile b/drivers/gpu/drm/i915/Makefile
+index 3e55e2656b90..e153686256c9 100644
+--- a/drivers/gpu/drm/i915/Makefile
++++ b/drivers/gpu/drm/i915/Makefile
+@@ -52,7 +52,6 @@ i915-y += \
+ i915-y += \
+ 	soc/intel_dram.o \
+ 	soc/intel_gmch.o \
+-	soc/intel_pch.o \
+ 	soc/intel_rom.o
+ 
+ # core library code
+@@ -282,6 +281,7 @@ i915-y += \
+ 	display/intel_modeset_setup.o \
+ 	display/intel_modeset_verify.o \
+ 	display/intel_overlay.o \
++	display/intel_pch.o \
+ 	display/intel_pch_display.o \
+ 	display/intel_pch_refclk.o \
+ 	display/intel_plane_initial.o \
+diff --git a/drivers/gpu/drm/i915/display/intel_pch.c b/drivers/gpu/drm/i915/display/intel_pch.c
+new file mode 100644
+index 000000000000..37766e40fd1c
+--- /dev/null
++++ b/drivers/gpu/drm/i915/display/intel_pch.c
+@@ -0,0 +1,316 @@
++// SPDX-License-Identifier: MIT
++/*
++ * Copyright 2025 Intel Corporation.
++ */
++
++#include "i915_drv.h"
++#include "i915_utils.h"
++#include "intel_pch.h"
++
++#define INTEL_PCH_DEVICE_ID_MASK		0xff80
++#define INTEL_PCH_IBX_DEVICE_ID_TYPE		0x3b00
++#define INTEL_PCH_CPT_DEVICE_ID_TYPE		0x1c00
++#define INTEL_PCH_PPT_DEVICE_ID_TYPE		0x1e00
++#define INTEL_PCH_LPT_DEVICE_ID_TYPE		0x8c00
++#define INTEL_PCH_LPT_LP_DEVICE_ID_TYPE		0x9c00
++#define INTEL_PCH_WPT_DEVICE_ID_TYPE		0x8c80
++#define INTEL_PCH_WPT_LP_DEVICE_ID_TYPE		0x9c80
++#define INTEL_PCH_SPT_DEVICE_ID_TYPE		0xA100
++#define INTEL_PCH_SPT_LP_DEVICE_ID_TYPE		0x9D00
++#define INTEL_PCH_KBP_DEVICE_ID_TYPE		0xA280
++#define INTEL_PCH_CNP_DEVICE_ID_TYPE		0xA300
++#define INTEL_PCH_CNP_LP_DEVICE_ID_TYPE		0x9D80
++#define INTEL_PCH_CMP_DEVICE_ID_TYPE		0x0280
++#define INTEL_PCH_CMP2_DEVICE_ID_TYPE		0x0680
++#define INTEL_PCH_CMP_V_DEVICE_ID_TYPE		0xA380
++#define INTEL_PCH_ICP_DEVICE_ID_TYPE		0x3480
++#define INTEL_PCH_ICP2_DEVICE_ID_TYPE		0x3880
++#define INTEL_PCH_MCC_DEVICE_ID_TYPE		0x4B00
++#define INTEL_PCH_TGP_DEVICE_ID_TYPE		0xA080
++#define INTEL_PCH_TGP2_DEVICE_ID_TYPE		0x4380
++#define INTEL_PCH_JSP_DEVICE_ID_TYPE		0x4D80
++#define INTEL_PCH_ADP_DEVICE_ID_TYPE		0x7A80
++#define INTEL_PCH_ADP2_DEVICE_ID_TYPE		0x5180
++#define INTEL_PCH_ADP3_DEVICE_ID_TYPE		0x7A00
++#define INTEL_PCH_ADP4_DEVICE_ID_TYPE		0x5480
++#define INTEL_PCH_P2X_DEVICE_ID_TYPE		0x7100
++#define INTEL_PCH_P3X_DEVICE_ID_TYPE		0x7000
++#define INTEL_PCH_QEMU_DEVICE_ID_TYPE		0x2900 /* qemu q35 has 2918 */
++
++/* Map PCH device id to PCH type, or PCH_NONE if unknown. */
++static enum intel_pch
++intel_pch_type(const struct drm_i915_private *dev_priv, unsigned short id)
++{
++	switch (id) {
++	case INTEL_PCH_IBX_DEVICE_ID_TYPE:
++		drm_dbg_kms(&dev_priv->drm, "Found Ibex Peak PCH\n");
++		drm_WARN_ON(&dev_priv->drm, GRAPHICS_VER(dev_priv) != 5);
++		return PCH_IBX;
++	case INTEL_PCH_CPT_DEVICE_ID_TYPE:
++		drm_dbg_kms(&dev_priv->drm, "Found CougarPoint PCH\n");
++		drm_WARN_ON(&dev_priv->drm,
++			    GRAPHICS_VER(dev_priv) != 6 && !IS_IVYBRIDGE(dev_priv));
++		return PCH_CPT;
++	case INTEL_PCH_PPT_DEVICE_ID_TYPE:
++		drm_dbg_kms(&dev_priv->drm, "Found PantherPoint PCH\n");
++		drm_WARN_ON(&dev_priv->drm,
++			    GRAPHICS_VER(dev_priv) != 6 && !IS_IVYBRIDGE(dev_priv));
++		/* PPT is CPT compatible */
++		return PCH_CPT;
++	case INTEL_PCH_LPT_DEVICE_ID_TYPE:
++		drm_dbg_kms(&dev_priv->drm, "Found LynxPoint PCH\n");
++		drm_WARN_ON(&dev_priv->drm,
++			    !IS_HASWELL(dev_priv) && !IS_BROADWELL(dev_priv));
++		drm_WARN_ON(&dev_priv->drm,
++			    IS_HASWELL_ULT(dev_priv) || IS_BROADWELL_ULT(dev_priv));
++		return PCH_LPT_H;
++	case INTEL_PCH_LPT_LP_DEVICE_ID_TYPE:
++		drm_dbg_kms(&dev_priv->drm, "Found LynxPoint LP PCH\n");
++		drm_WARN_ON(&dev_priv->drm,
++			    !IS_HASWELL(dev_priv) && !IS_BROADWELL(dev_priv));
++		drm_WARN_ON(&dev_priv->drm,
++			    !IS_HASWELL_ULT(dev_priv) && !IS_BROADWELL_ULT(dev_priv));
++		return PCH_LPT_LP;
++	case INTEL_PCH_WPT_DEVICE_ID_TYPE:
++		drm_dbg_kms(&dev_priv->drm, "Found WildcatPoint PCH\n");
++		drm_WARN_ON(&dev_priv->drm,
++			    !IS_HASWELL(dev_priv) && !IS_BROADWELL(dev_priv));
++		drm_WARN_ON(&dev_priv->drm,
++			    IS_HASWELL_ULT(dev_priv) || IS_BROADWELL_ULT(dev_priv));
++		/* WPT is LPT compatible */
++		return PCH_LPT_H;
++	case INTEL_PCH_WPT_LP_DEVICE_ID_TYPE:
++		drm_dbg_kms(&dev_priv->drm, "Found WildcatPoint LP PCH\n");
++		drm_WARN_ON(&dev_priv->drm,
++			    !IS_HASWELL(dev_priv) && !IS_BROADWELL(dev_priv));
++		drm_WARN_ON(&dev_priv->drm,
++			    !IS_HASWELL_ULT(dev_priv) && !IS_BROADWELL_ULT(dev_priv));
++		/* WPT is LPT compatible */
++		return PCH_LPT_LP;
++	case INTEL_PCH_SPT_DEVICE_ID_TYPE:
++		drm_dbg_kms(&dev_priv->drm, "Found SunrisePoint PCH\n");
++		drm_WARN_ON(&dev_priv->drm,
++			    !IS_SKYLAKE(dev_priv) && !IS_KABYLAKE(dev_priv));
++		return PCH_SPT;
++	case INTEL_PCH_SPT_LP_DEVICE_ID_TYPE:
++		drm_dbg_kms(&dev_priv->drm, "Found SunrisePoint LP PCH\n");
++		drm_WARN_ON(&dev_priv->drm,
++			    !IS_SKYLAKE(dev_priv) &&
++			    !IS_KABYLAKE(dev_priv) &&
++			    !IS_COFFEELAKE(dev_priv) &&
++			    !IS_COMETLAKE(dev_priv));
++		return PCH_SPT;
++	case INTEL_PCH_KBP_DEVICE_ID_TYPE:
++		drm_dbg_kms(&dev_priv->drm, "Found Kaby Lake PCH (KBP)\n");
++		drm_WARN_ON(&dev_priv->drm,
++			    !IS_SKYLAKE(dev_priv) &&
++			    !IS_KABYLAKE(dev_priv) &&
++			    !IS_COFFEELAKE(dev_priv) &&
++			    !IS_COMETLAKE(dev_priv));
++		/* KBP is SPT compatible */
++		return PCH_SPT;
++	case INTEL_PCH_CNP_DEVICE_ID_TYPE:
++		drm_dbg_kms(&dev_priv->drm, "Found Cannon Lake PCH (CNP)\n");
++		drm_WARN_ON(&dev_priv->drm,
++			    !IS_COFFEELAKE(dev_priv) &&
++			    !IS_COMETLAKE(dev_priv));
++		return PCH_CNP;
++	case INTEL_PCH_CNP_LP_DEVICE_ID_TYPE:
++		drm_dbg_kms(&dev_priv->drm,
++			    "Found Cannon Lake LP PCH (CNP-LP)\n");
++		drm_WARN_ON(&dev_priv->drm,
++			    !IS_COFFEELAKE(dev_priv) &&
++			    !IS_COMETLAKE(dev_priv));
++		return PCH_CNP;
++	case INTEL_PCH_CMP_DEVICE_ID_TYPE:
++	case INTEL_PCH_CMP2_DEVICE_ID_TYPE:
++		drm_dbg_kms(&dev_priv->drm, "Found Comet Lake PCH (CMP)\n");
++		drm_WARN_ON(&dev_priv->drm,
++			    !IS_COFFEELAKE(dev_priv) &&
++			    !IS_COMETLAKE(dev_priv) &&
++			    !IS_ROCKETLAKE(dev_priv));
++		/* CMP is CNP compatible */
++		return PCH_CNP;
++	case INTEL_PCH_CMP_V_DEVICE_ID_TYPE:
++		drm_dbg_kms(&dev_priv->drm, "Found Comet Lake V PCH (CMP-V)\n");
++		drm_WARN_ON(&dev_priv->drm,
++			    !IS_COFFEELAKE(dev_priv) &&
++			    !IS_COMETLAKE(dev_priv));
++		/* CMP-V is based on KBP, which is SPT compatible */
++		return PCH_SPT;
++	case INTEL_PCH_ICP_DEVICE_ID_TYPE:
++	case INTEL_PCH_ICP2_DEVICE_ID_TYPE:
++		drm_dbg_kms(&dev_priv->drm, "Found Ice Lake PCH\n");
++		drm_WARN_ON(&dev_priv->drm, !IS_ICELAKE(dev_priv));
++		return PCH_ICP;
++	case INTEL_PCH_MCC_DEVICE_ID_TYPE:
++		drm_dbg_kms(&dev_priv->drm, "Found Mule Creek Canyon PCH\n");
++		drm_WARN_ON(&dev_priv->drm, !(IS_JASPERLAKE(dev_priv) ||
++					      IS_ELKHARTLAKE(dev_priv)));
++		/* MCC is TGP compatible */
++		return PCH_TGP;
++	case INTEL_PCH_TGP_DEVICE_ID_TYPE:
++	case INTEL_PCH_TGP2_DEVICE_ID_TYPE:
++		drm_dbg_kms(&dev_priv->drm, "Found Tiger Lake LP PCH\n");
++		drm_WARN_ON(&dev_priv->drm, !IS_TIGERLAKE(dev_priv) &&
++			    !IS_ROCKETLAKE(dev_priv) &&
++			    !IS_SKYLAKE(dev_priv) &&
++			    !IS_KABYLAKE(dev_priv) &&
++			    !IS_COFFEELAKE(dev_priv) &&
++			    !IS_COMETLAKE(dev_priv));
++		return PCH_TGP;
++	case INTEL_PCH_JSP_DEVICE_ID_TYPE:
++		drm_dbg_kms(&dev_priv->drm, "Found Jasper Lake PCH\n");
++		drm_WARN_ON(&dev_priv->drm, !(IS_JASPERLAKE(dev_priv) ||
++					      IS_ELKHARTLAKE(dev_priv)));
++		/* JSP is ICP compatible */
++		return PCH_ICP;
++	case INTEL_PCH_ADP_DEVICE_ID_TYPE:
++	case INTEL_PCH_ADP2_DEVICE_ID_TYPE:
++	case INTEL_PCH_ADP3_DEVICE_ID_TYPE:
++	case INTEL_PCH_ADP4_DEVICE_ID_TYPE:
++		drm_dbg_kms(&dev_priv->drm, "Found Alder Lake PCH\n");
++		drm_WARN_ON(&dev_priv->drm, !IS_ALDERLAKE_S(dev_priv) &&
++			    !IS_ALDERLAKE_P(dev_priv));
++		return PCH_ADP;
++	default:
++		return PCH_NONE;
++	}
++}
++
++static bool intel_is_virt_pch(unsigned short id,
++			      unsigned short svendor, unsigned short sdevice)
++{
++	return (id == INTEL_PCH_P2X_DEVICE_ID_TYPE ||
++		id == INTEL_PCH_P3X_DEVICE_ID_TYPE ||
++		(id == INTEL_PCH_QEMU_DEVICE_ID_TYPE &&
++		 svendor == PCI_SUBVENDOR_ID_REDHAT_QUMRANET &&
++		 sdevice == PCI_SUBDEVICE_ID_QEMU));
++}
++
++static void
++intel_virt_detect_pch(const struct drm_i915_private *dev_priv,
++		      unsigned short *pch_id, enum intel_pch *pch_type)
++{
++	unsigned short id = 0;
++
++	/*
++	 * In a virtualized passthrough environment we can be in a
++	 * setup where the ISA bridge is not able to be passed through.
++	 * In this case, a south bridge can be emulated and we have to
++	 * make an educated guess as to which PCH is really there.
++	 */
++
++	if (IS_ALDERLAKE_S(dev_priv) || IS_ALDERLAKE_P(dev_priv))
++		id = INTEL_PCH_ADP_DEVICE_ID_TYPE;
++	else if (IS_TIGERLAKE(dev_priv) || IS_ROCKETLAKE(dev_priv))
++		id = INTEL_PCH_TGP_DEVICE_ID_TYPE;
++	else if (IS_JASPERLAKE(dev_priv) || IS_ELKHARTLAKE(dev_priv))
++		id = INTEL_PCH_MCC_DEVICE_ID_TYPE;
++	else if (IS_ICELAKE(dev_priv))
++		id = INTEL_PCH_ICP_DEVICE_ID_TYPE;
++	else if (IS_COFFEELAKE(dev_priv) ||
++		 IS_COMETLAKE(dev_priv))
++		id = INTEL_PCH_CNP_DEVICE_ID_TYPE;
++	else if (IS_KABYLAKE(dev_priv) || IS_SKYLAKE(dev_priv))
++		id = INTEL_PCH_SPT_DEVICE_ID_TYPE;
++	else if (IS_HASWELL_ULT(dev_priv) || IS_BROADWELL_ULT(dev_priv))
++		id = INTEL_PCH_LPT_LP_DEVICE_ID_TYPE;
++	else if (IS_HASWELL(dev_priv) || IS_BROADWELL(dev_priv))
++		id = INTEL_PCH_LPT_DEVICE_ID_TYPE;
++	else if (GRAPHICS_VER(dev_priv) == 6 || IS_IVYBRIDGE(dev_priv))
++		id = INTEL_PCH_CPT_DEVICE_ID_TYPE;
++	else if (GRAPHICS_VER(dev_priv) == 5)
++		id = INTEL_PCH_IBX_DEVICE_ID_TYPE;
++
++	if (id)
++		drm_dbg_kms(&dev_priv->drm, "Assuming PCH ID %04x\n", id);
++	else
++		drm_dbg_kms(&dev_priv->drm, "Assuming no PCH\n");
++
++	*pch_type = intel_pch_type(dev_priv, id);
++
++	/* Sanity check virtual PCH id */
++	if (drm_WARN_ON(&dev_priv->drm,
++			id && *pch_type == PCH_NONE))
++		id = 0;
++
++	*pch_id = id;
++}
++
++void intel_detect_pch(struct drm_i915_private *dev_priv)
++{
++	struct pci_dev *pch = NULL;
++	unsigned short id;
++	enum intel_pch pch_type;
++
++	/*
++	 * South display engine on the same PCI device: just assign the fake
++	 * PCH.
++	 */
++	if (DISPLAY_VER(dev_priv) >= 20) {
++		dev_priv->pch_type = PCH_LNL;
++		return;
++	} else if (IS_BATTLEMAGE(dev_priv) || IS_METEORLAKE(dev_priv)) {
++		/*
++		 * Both north display and south display are on the SoC die.
++		 * The real PCH (if it even exists) is uninvolved in display.
++		 */
++		dev_priv->pch_type = PCH_MTL;
++		return;
++	} else if (IS_DG2(dev_priv)) {
++		dev_priv->pch_type = PCH_DG2;
++		return;
++	} else if (IS_DG1(dev_priv)) {
++		dev_priv->pch_type = PCH_DG1;
++		return;
++	}
++
++	/*
++	 * The reason to probe ISA bridge instead of Dev31:Fun0 is to
++	 * make graphics device passthrough work easy for VMM, that only
++	 * need to expose ISA bridge to let driver know the real hardware
++	 * underneath. This is a requirement from virtualization team.
++	 *
++	 * In some virtualized environments (e.g. XEN), there is irrelevant
++	 * ISA bridge in the system. To work reliably, we should scan through
++	 * all the ISA bridge devices and check for the first match, instead
++	 * of only checking the first one.
++	 */
++	while ((pch = pci_get_class(PCI_CLASS_BRIDGE_ISA << 8, pch))) {
++		if (pch->vendor != PCI_VENDOR_ID_INTEL)
++			continue;
++
++		id = pch->device & INTEL_PCH_DEVICE_ID_MASK;
++
++		pch_type = intel_pch_type(dev_priv, id);
++		if (pch_type != PCH_NONE) {
++			dev_priv->pch_type = pch_type;
++			break;
++		} else if (intel_is_virt_pch(id, pch->subsystem_vendor,
++					     pch->subsystem_device)) {
++			intel_virt_detect_pch(dev_priv, &id, &pch_type);
++			dev_priv->pch_type = pch_type;
++			break;
++		}
++	}
++
++	/*
++	 * Use PCH_NOP (PCH but no South Display) for PCH platforms without
++	 * display.
++	 */
++	if (pch && !HAS_DISPLAY(dev_priv)) {
++		drm_dbg_kms(&dev_priv->drm,
++			    "Display disabled, reverting to NOP PCH\n");
++		dev_priv->pch_type = PCH_NOP;
++	} else if (!pch) {
++		if (i915_run_as_guest() && HAS_DISPLAY(dev_priv)) {
++			intel_virt_detect_pch(dev_priv, &id, &pch_type);
++			dev_priv->pch_type = pch_type;
++		} else {
++			drm_dbg_kms(&dev_priv->drm, "No PCH found.\n");
++		}
++	}
++
++	pci_dev_put(pch);
++}
+diff --git a/drivers/gpu/drm/i915/display/intel_pch.h b/drivers/gpu/drm/i915/display/intel_pch.h
+new file mode 100644
+index 000000000000..b9fa2b2f07bc
+--- /dev/null
++++ b/drivers/gpu/drm/i915/display/intel_pch.h
+@@ -0,0 +1,56 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * Copyright 2025 Intel Corporation.
++ */
++
++#ifndef __INTEL_PCH__
++#define __INTEL_PCH__
++
++struct drm_i915_private;
++
++/*
++ * Sorted by south display engine compatibility.
++ * If the new PCH comes with a south display engine that is not
++ * inherited from the latest item, please do not add it to the
++ * end. Instead, add it right after its "parent" PCH.
++ */
++enum intel_pch {
++	PCH_NOP = -1,	/* PCH without south display */
++	PCH_NONE = 0,	/* No PCH present */
++	PCH_IBX,	/* Ibexpeak PCH */
++	PCH_CPT,	/* Cougarpoint/Pantherpoint PCH */
++	PCH_LPT_H,	/* Lynxpoint/Wildcatpoint H PCH */
++	PCH_LPT_LP,	/* Lynxpoint/Wildcatpoint LP PCH */
++	PCH_SPT,        /* Sunrisepoint/Kaby Lake PCH */
++	PCH_CNP,        /* Cannon/Comet Lake PCH */
++	PCH_ICP,	/* Ice Lake/Jasper Lake PCH */
++	PCH_TGP,	/* Tiger Lake/Mule Creek Canyon PCH */
++	PCH_ADP,	/* Alder Lake PCH */
++
++	/* Fake PCHs, functionality handled on the same PCI dev */
++	PCH_DG1 = 1024,
++	PCH_DG2,
++	PCH_MTL,
++	PCH_LNL,
++};
++
++#define INTEL_PCH_TYPE(dev_priv)		((dev_priv)->pch_type)
++#define HAS_PCH_DG2(dev_priv)			(INTEL_PCH_TYPE(dev_priv) == PCH_DG2)
++#define HAS_PCH_ADP(dev_priv)			(INTEL_PCH_TYPE(dev_priv) == PCH_ADP)
++#define HAS_PCH_DG1(dev_priv)			(INTEL_PCH_TYPE(dev_priv) == PCH_DG1)
++#define HAS_PCH_TGP(dev_priv)			(INTEL_PCH_TYPE(dev_priv) == PCH_TGP)
++#define HAS_PCH_ICP(dev_priv)			(INTEL_PCH_TYPE(dev_priv) == PCH_ICP)
++#define HAS_PCH_CNP(dev_priv)			(INTEL_PCH_TYPE(dev_priv) == PCH_CNP)
++#define HAS_PCH_SPT(dev_priv)			(INTEL_PCH_TYPE(dev_priv) == PCH_SPT)
++#define HAS_PCH_LPT_H(dev_priv)			(INTEL_PCH_TYPE(dev_priv) == PCH_LPT_H)
++#define HAS_PCH_LPT_LP(dev_priv)		(INTEL_PCH_TYPE(dev_priv) == PCH_LPT_LP)
++#define HAS_PCH_LPT(dev_priv)			(INTEL_PCH_TYPE(dev_priv) == PCH_LPT_H || \
++						 INTEL_PCH_TYPE(dev_priv) == PCH_LPT_LP)
++#define HAS_PCH_CPT(dev_priv)			(INTEL_PCH_TYPE(dev_priv) == PCH_CPT)
++#define HAS_PCH_IBX(dev_priv)			(INTEL_PCH_TYPE(dev_priv) == PCH_IBX)
++#define HAS_PCH_NOP(dev_priv)			(INTEL_PCH_TYPE(dev_priv) == PCH_NOP)
++#define HAS_PCH_SPLIT(dev_priv)			(INTEL_PCH_TYPE(dev_priv) != PCH_NONE)
++
++void intel_detect_pch(struct drm_i915_private *dev_priv);
++
++#endif /* __INTEL_PCH__ */
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 236c48d282e4..65e795a4ecba 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -38,6 +38,7 @@
+ 
+ #include "display/intel_display_limits.h"
+ #include "display/intel_display_core.h"
++#include "display/intel_pch.h"
+ 
+ #include "gem/i915_gem_context_types.h"
+ #include "gem/i915_gem_shrinker.h"
+@@ -49,8 +50,6 @@
+ #include "gt/intel_workarounds.h"
+ #include "gt/uc/intel_uc.h"
+ 
+-#include "soc/intel_pch.h"
+-
+ #include "i915_drm_client.h"
+ #include "i915_gem.h"
+ #include "i915_gpu_error.h"
+diff --git a/drivers/gpu/drm/i915/soc/intel_pch.c b/drivers/gpu/drm/i915/soc/intel_pch.c
+deleted file mode 100644
+index 82dc7fbd1a3e..000000000000
+--- a/drivers/gpu/drm/i915/soc/intel_pch.c
++++ /dev/null
+@@ -1,316 +0,0 @@
+-// SPDX-License-Identifier: MIT
+-/*
+- * Copyright 2019 Intel Corporation.
+- */
+-
+-#include "i915_drv.h"
+-#include "i915_utils.h"
+-#include "intel_pch.h"
+-
+-#define INTEL_PCH_DEVICE_ID_MASK		0xff80
+-#define INTEL_PCH_IBX_DEVICE_ID_TYPE		0x3b00
+-#define INTEL_PCH_CPT_DEVICE_ID_TYPE		0x1c00
+-#define INTEL_PCH_PPT_DEVICE_ID_TYPE		0x1e00
+-#define INTEL_PCH_LPT_DEVICE_ID_TYPE		0x8c00
+-#define INTEL_PCH_LPT_LP_DEVICE_ID_TYPE		0x9c00
+-#define INTEL_PCH_WPT_DEVICE_ID_TYPE		0x8c80
+-#define INTEL_PCH_WPT_LP_DEVICE_ID_TYPE		0x9c80
+-#define INTEL_PCH_SPT_DEVICE_ID_TYPE		0xA100
+-#define INTEL_PCH_SPT_LP_DEVICE_ID_TYPE		0x9D00
+-#define INTEL_PCH_KBP_DEVICE_ID_TYPE		0xA280
+-#define INTEL_PCH_CNP_DEVICE_ID_TYPE		0xA300
+-#define INTEL_PCH_CNP_LP_DEVICE_ID_TYPE		0x9D80
+-#define INTEL_PCH_CMP_DEVICE_ID_TYPE		0x0280
+-#define INTEL_PCH_CMP2_DEVICE_ID_TYPE		0x0680
+-#define INTEL_PCH_CMP_V_DEVICE_ID_TYPE		0xA380
+-#define INTEL_PCH_ICP_DEVICE_ID_TYPE		0x3480
+-#define INTEL_PCH_ICP2_DEVICE_ID_TYPE		0x3880
+-#define INTEL_PCH_MCC_DEVICE_ID_TYPE		0x4B00
+-#define INTEL_PCH_TGP_DEVICE_ID_TYPE		0xA080
+-#define INTEL_PCH_TGP2_DEVICE_ID_TYPE		0x4380
+-#define INTEL_PCH_JSP_DEVICE_ID_TYPE		0x4D80
+-#define INTEL_PCH_ADP_DEVICE_ID_TYPE		0x7A80
+-#define INTEL_PCH_ADP2_DEVICE_ID_TYPE		0x5180
+-#define INTEL_PCH_ADP3_DEVICE_ID_TYPE		0x7A00
+-#define INTEL_PCH_ADP4_DEVICE_ID_TYPE		0x5480
+-#define INTEL_PCH_P2X_DEVICE_ID_TYPE		0x7100
+-#define INTEL_PCH_P3X_DEVICE_ID_TYPE		0x7000
+-#define INTEL_PCH_QEMU_DEVICE_ID_TYPE		0x2900 /* qemu q35 has 2918 */
+-
+-/* Map PCH device id to PCH type, or PCH_NONE if unknown. */
+-static enum intel_pch
+-intel_pch_type(const struct drm_i915_private *dev_priv, unsigned short id)
+-{
+-	switch (id) {
+-	case INTEL_PCH_IBX_DEVICE_ID_TYPE:
+-		drm_dbg_kms(&dev_priv->drm, "Found Ibex Peak PCH\n");
+-		drm_WARN_ON(&dev_priv->drm, GRAPHICS_VER(dev_priv) != 5);
+-		return PCH_IBX;
+-	case INTEL_PCH_CPT_DEVICE_ID_TYPE:
+-		drm_dbg_kms(&dev_priv->drm, "Found CougarPoint PCH\n");
+-		drm_WARN_ON(&dev_priv->drm,
+-			    GRAPHICS_VER(dev_priv) != 6 && !IS_IVYBRIDGE(dev_priv));
+-		return PCH_CPT;
+-	case INTEL_PCH_PPT_DEVICE_ID_TYPE:
+-		drm_dbg_kms(&dev_priv->drm, "Found PantherPoint PCH\n");
+-		drm_WARN_ON(&dev_priv->drm,
+-			    GRAPHICS_VER(dev_priv) != 6 && !IS_IVYBRIDGE(dev_priv));
+-		/* PPT is CPT compatible */
+-		return PCH_CPT;
+-	case INTEL_PCH_LPT_DEVICE_ID_TYPE:
+-		drm_dbg_kms(&dev_priv->drm, "Found LynxPoint PCH\n");
+-		drm_WARN_ON(&dev_priv->drm,
+-			    !IS_HASWELL(dev_priv) && !IS_BROADWELL(dev_priv));
+-		drm_WARN_ON(&dev_priv->drm,
+-			    IS_HASWELL_ULT(dev_priv) || IS_BROADWELL_ULT(dev_priv));
+-		return PCH_LPT_H;
+-	case INTEL_PCH_LPT_LP_DEVICE_ID_TYPE:
+-		drm_dbg_kms(&dev_priv->drm, "Found LynxPoint LP PCH\n");
+-		drm_WARN_ON(&dev_priv->drm,
+-			    !IS_HASWELL(dev_priv) && !IS_BROADWELL(dev_priv));
+-		drm_WARN_ON(&dev_priv->drm,
+-			    !IS_HASWELL_ULT(dev_priv) && !IS_BROADWELL_ULT(dev_priv));
+-		return PCH_LPT_LP;
+-	case INTEL_PCH_WPT_DEVICE_ID_TYPE:
+-		drm_dbg_kms(&dev_priv->drm, "Found WildcatPoint PCH\n");
+-		drm_WARN_ON(&dev_priv->drm,
+-			    !IS_HASWELL(dev_priv) && !IS_BROADWELL(dev_priv));
+-		drm_WARN_ON(&dev_priv->drm,
+-			    IS_HASWELL_ULT(dev_priv) || IS_BROADWELL_ULT(dev_priv));
+-		/* WPT is LPT compatible */
+-		return PCH_LPT_H;
+-	case INTEL_PCH_WPT_LP_DEVICE_ID_TYPE:
+-		drm_dbg_kms(&dev_priv->drm, "Found WildcatPoint LP PCH\n");
+-		drm_WARN_ON(&dev_priv->drm,
+-			    !IS_HASWELL(dev_priv) && !IS_BROADWELL(dev_priv));
+-		drm_WARN_ON(&dev_priv->drm,
+-			    !IS_HASWELL_ULT(dev_priv) && !IS_BROADWELL_ULT(dev_priv));
+-		/* WPT is LPT compatible */
+-		return PCH_LPT_LP;
+-	case INTEL_PCH_SPT_DEVICE_ID_TYPE:
+-		drm_dbg_kms(&dev_priv->drm, "Found SunrisePoint PCH\n");
+-		drm_WARN_ON(&dev_priv->drm,
+-			    !IS_SKYLAKE(dev_priv) && !IS_KABYLAKE(dev_priv));
+-		return PCH_SPT;
+-	case INTEL_PCH_SPT_LP_DEVICE_ID_TYPE:
+-		drm_dbg_kms(&dev_priv->drm, "Found SunrisePoint LP PCH\n");
+-		drm_WARN_ON(&dev_priv->drm,
+-			    !IS_SKYLAKE(dev_priv) &&
+-			    !IS_KABYLAKE(dev_priv) &&
+-			    !IS_COFFEELAKE(dev_priv) &&
+-			    !IS_COMETLAKE(dev_priv));
+-		return PCH_SPT;
+-	case INTEL_PCH_KBP_DEVICE_ID_TYPE:
+-		drm_dbg_kms(&dev_priv->drm, "Found Kaby Lake PCH (KBP)\n");
+-		drm_WARN_ON(&dev_priv->drm,
+-			    !IS_SKYLAKE(dev_priv) &&
+-			    !IS_KABYLAKE(dev_priv) &&
+-			    !IS_COFFEELAKE(dev_priv) &&
+-			    !IS_COMETLAKE(dev_priv));
+-		/* KBP is SPT compatible */
+-		return PCH_SPT;
+-	case INTEL_PCH_CNP_DEVICE_ID_TYPE:
+-		drm_dbg_kms(&dev_priv->drm, "Found Cannon Lake PCH (CNP)\n");
+-		drm_WARN_ON(&dev_priv->drm,
+-			    !IS_COFFEELAKE(dev_priv) &&
+-			    !IS_COMETLAKE(dev_priv));
+-		return PCH_CNP;
+-	case INTEL_PCH_CNP_LP_DEVICE_ID_TYPE:
+-		drm_dbg_kms(&dev_priv->drm,
+-			    "Found Cannon Lake LP PCH (CNP-LP)\n");
+-		drm_WARN_ON(&dev_priv->drm,
+-			    !IS_COFFEELAKE(dev_priv) &&
+-			    !IS_COMETLAKE(dev_priv));
+-		return PCH_CNP;
+-	case INTEL_PCH_CMP_DEVICE_ID_TYPE:
+-	case INTEL_PCH_CMP2_DEVICE_ID_TYPE:
+-		drm_dbg_kms(&dev_priv->drm, "Found Comet Lake PCH (CMP)\n");
+-		drm_WARN_ON(&dev_priv->drm,
+-			    !IS_COFFEELAKE(dev_priv) &&
+-			    !IS_COMETLAKE(dev_priv) &&
+-			    !IS_ROCKETLAKE(dev_priv));
+-		/* CMP is CNP compatible */
+-		return PCH_CNP;
+-	case INTEL_PCH_CMP_V_DEVICE_ID_TYPE:
+-		drm_dbg_kms(&dev_priv->drm, "Found Comet Lake V PCH (CMP-V)\n");
+-		drm_WARN_ON(&dev_priv->drm,
+-			    !IS_COFFEELAKE(dev_priv) &&
+-			    !IS_COMETLAKE(dev_priv));
+-		/* CMP-V is based on KBP, which is SPT compatible */
+-		return PCH_SPT;
+-	case INTEL_PCH_ICP_DEVICE_ID_TYPE:
+-	case INTEL_PCH_ICP2_DEVICE_ID_TYPE:
+-		drm_dbg_kms(&dev_priv->drm, "Found Ice Lake PCH\n");
+-		drm_WARN_ON(&dev_priv->drm, !IS_ICELAKE(dev_priv));
+-		return PCH_ICP;
+-	case INTEL_PCH_MCC_DEVICE_ID_TYPE:
+-		drm_dbg_kms(&dev_priv->drm, "Found Mule Creek Canyon PCH\n");
+-		drm_WARN_ON(&dev_priv->drm, !(IS_JASPERLAKE(dev_priv) ||
+-					      IS_ELKHARTLAKE(dev_priv)));
+-		/* MCC is TGP compatible */
+-		return PCH_TGP;
+-	case INTEL_PCH_TGP_DEVICE_ID_TYPE:
+-	case INTEL_PCH_TGP2_DEVICE_ID_TYPE:
+-		drm_dbg_kms(&dev_priv->drm, "Found Tiger Lake LP PCH\n");
+-		drm_WARN_ON(&dev_priv->drm, !IS_TIGERLAKE(dev_priv) &&
+-			    !IS_ROCKETLAKE(dev_priv) &&
+-			    !IS_SKYLAKE(dev_priv) &&
+-			    !IS_KABYLAKE(dev_priv) &&
+-			    !IS_COFFEELAKE(dev_priv) &&
+-			    !IS_COMETLAKE(dev_priv));
+-		return PCH_TGP;
+-	case INTEL_PCH_JSP_DEVICE_ID_TYPE:
+-		drm_dbg_kms(&dev_priv->drm, "Found Jasper Lake PCH\n");
+-		drm_WARN_ON(&dev_priv->drm, !(IS_JASPERLAKE(dev_priv) ||
+-					      IS_ELKHARTLAKE(dev_priv)));
+-		/* JSP is ICP compatible */
+-		return PCH_ICP;
+-	case INTEL_PCH_ADP_DEVICE_ID_TYPE:
+-	case INTEL_PCH_ADP2_DEVICE_ID_TYPE:
+-	case INTEL_PCH_ADP3_DEVICE_ID_TYPE:
+-	case INTEL_PCH_ADP4_DEVICE_ID_TYPE:
+-		drm_dbg_kms(&dev_priv->drm, "Found Alder Lake PCH\n");
+-		drm_WARN_ON(&dev_priv->drm, !IS_ALDERLAKE_S(dev_priv) &&
+-			    !IS_ALDERLAKE_P(dev_priv));
+-		return PCH_ADP;
+-	default:
+-		return PCH_NONE;
+-	}
+-}
+-
+-static bool intel_is_virt_pch(unsigned short id,
+-			      unsigned short svendor, unsigned short sdevice)
+-{
+-	return (id == INTEL_PCH_P2X_DEVICE_ID_TYPE ||
+-		id == INTEL_PCH_P3X_DEVICE_ID_TYPE ||
+-		(id == INTEL_PCH_QEMU_DEVICE_ID_TYPE &&
+-		 svendor == PCI_SUBVENDOR_ID_REDHAT_QUMRANET &&
+-		 sdevice == PCI_SUBDEVICE_ID_QEMU));
+-}
+-
+-static void
+-intel_virt_detect_pch(const struct drm_i915_private *dev_priv,
+-		      unsigned short *pch_id, enum intel_pch *pch_type)
+-{
+-	unsigned short id = 0;
+-
+-	/*
+-	 * In a virtualized passthrough environment we can be in a
+-	 * setup where the ISA bridge is not able to be passed through.
+-	 * In this case, a south bridge can be emulated and we have to
+-	 * make an educated guess as to which PCH is really there.
+-	 */
+-
+-	if (IS_ALDERLAKE_S(dev_priv) || IS_ALDERLAKE_P(dev_priv))
+-		id = INTEL_PCH_ADP_DEVICE_ID_TYPE;
+-	else if (IS_TIGERLAKE(dev_priv) || IS_ROCKETLAKE(dev_priv))
+-		id = INTEL_PCH_TGP_DEVICE_ID_TYPE;
+-	else if (IS_JASPERLAKE(dev_priv) || IS_ELKHARTLAKE(dev_priv))
+-		id = INTEL_PCH_MCC_DEVICE_ID_TYPE;
+-	else if (IS_ICELAKE(dev_priv))
+-		id = INTEL_PCH_ICP_DEVICE_ID_TYPE;
+-	else if (IS_COFFEELAKE(dev_priv) ||
+-		 IS_COMETLAKE(dev_priv))
+-		id = INTEL_PCH_CNP_DEVICE_ID_TYPE;
+-	else if (IS_KABYLAKE(dev_priv) || IS_SKYLAKE(dev_priv))
+-		id = INTEL_PCH_SPT_DEVICE_ID_TYPE;
+-	else if (IS_HASWELL_ULT(dev_priv) || IS_BROADWELL_ULT(dev_priv))
+-		id = INTEL_PCH_LPT_LP_DEVICE_ID_TYPE;
+-	else if (IS_HASWELL(dev_priv) || IS_BROADWELL(dev_priv))
+-		id = INTEL_PCH_LPT_DEVICE_ID_TYPE;
+-	else if (GRAPHICS_VER(dev_priv) == 6 || IS_IVYBRIDGE(dev_priv))
+-		id = INTEL_PCH_CPT_DEVICE_ID_TYPE;
+-	else if (GRAPHICS_VER(dev_priv) == 5)
+-		id = INTEL_PCH_IBX_DEVICE_ID_TYPE;
+-
+-	if (id)
+-		drm_dbg_kms(&dev_priv->drm, "Assuming PCH ID %04x\n", id);
+-	else
+-		drm_dbg_kms(&dev_priv->drm, "Assuming no PCH\n");
+-
+-	*pch_type = intel_pch_type(dev_priv, id);
+-
+-	/* Sanity check virtual PCH id */
+-	if (drm_WARN_ON(&dev_priv->drm,
+-			id && *pch_type == PCH_NONE))
+-		id = 0;
+-
+-	*pch_id = id;
+-}
+-
+-void intel_detect_pch(struct drm_i915_private *dev_priv)
+-{
+-	struct pci_dev *pch = NULL;
+-	unsigned short id;
+-	enum intel_pch pch_type;
+-
+-	/*
+-	 * South display engine on the same PCI device: just assign the fake
+-	 * PCH.
+-	 */
+-	if (DISPLAY_VER(dev_priv) >= 20) {
+-		dev_priv->pch_type = PCH_LNL;
+-		return;
+-	} else if (IS_BATTLEMAGE(dev_priv) || IS_METEORLAKE(dev_priv)) {
+-		/*
+-		 * Both north display and south display are on the SoC die.
+-		 * The real PCH (if it even exists) is uninvolved in display.
+-		 */
+-		dev_priv->pch_type = PCH_MTL;
+-		return;
+-	} else if (IS_DG2(dev_priv)) {
+-		dev_priv->pch_type = PCH_DG2;
+-		return;
+-	} else if (IS_DG1(dev_priv)) {
+-		dev_priv->pch_type = PCH_DG1;
+-		return;
+-	}
+-
+-	/*
+-	 * The reason to probe ISA bridge instead of Dev31:Fun0 is to
+-	 * make graphics device passthrough work easy for VMM, that only
+-	 * need to expose ISA bridge to let driver know the real hardware
+-	 * underneath. This is a requirement from virtualization team.
+-	 *
+-	 * In some virtualized environments (e.g. XEN), there is irrelevant
+-	 * ISA bridge in the system. To work reliably, we should scan through
+-	 * all the ISA bridge devices and check for the first match, instead
+-	 * of only checking the first one.
+-	 */
+-	while ((pch = pci_get_class(PCI_CLASS_BRIDGE_ISA << 8, pch))) {
+-		if (pch->vendor != PCI_VENDOR_ID_INTEL)
+-			continue;
+-
+-		id = pch->device & INTEL_PCH_DEVICE_ID_MASK;
+-
+-		pch_type = intel_pch_type(dev_priv, id);
+-		if (pch_type != PCH_NONE) {
+-			dev_priv->pch_type = pch_type;
+-			break;
+-		} else if (intel_is_virt_pch(id, pch->subsystem_vendor,
+-					     pch->subsystem_device)) {
+-			intel_virt_detect_pch(dev_priv, &id, &pch_type);
+-			dev_priv->pch_type = pch_type;
+-			break;
+-		}
+-	}
+-
+-	/*
+-	 * Use PCH_NOP (PCH but no South Display) for PCH platforms without
+-	 * display.
+-	 */
+-	if (pch && !HAS_DISPLAY(dev_priv)) {
+-		drm_dbg_kms(&dev_priv->drm,
+-			    "Display disabled, reverting to NOP PCH\n");
+-		dev_priv->pch_type = PCH_NOP;
+-	} else if (!pch) {
+-		if (i915_run_as_guest() && HAS_DISPLAY(dev_priv)) {
+-			intel_virt_detect_pch(dev_priv, &id, &pch_type);
+-			dev_priv->pch_type = pch_type;
+-		} else {
+-			drm_dbg_kms(&dev_priv->drm, "No PCH found.\n");
+-		}
+-	}
+-
+-	pci_dev_put(pch);
+-}
+diff --git a/drivers/gpu/drm/i915/soc/intel_pch.h b/drivers/gpu/drm/i915/soc/intel_pch.h
+deleted file mode 100644
+index 635aea7a5539..000000000000
+--- a/drivers/gpu/drm/i915/soc/intel_pch.h
++++ /dev/null
+@@ -1,56 +0,0 @@
+-/* SPDX-License-Identifier: MIT */
+-/*
+- * Copyright 2019 Intel Corporation.
+- */
+-
+-#ifndef __INTEL_PCH__
+-#define __INTEL_PCH__
+-
+-struct drm_i915_private;
+-
+-/*
+- * Sorted by south display engine compatibility.
+- * If the new PCH comes with a south display engine that is not
+- * inherited from the latest item, please do not add it to the
+- * end. Instead, add it right after its "parent" PCH.
+- */
+-enum intel_pch {
+-	PCH_NOP = -1,	/* PCH without south display */
+-	PCH_NONE = 0,	/* No PCH present */
+-	PCH_IBX,	/* Ibexpeak PCH */
+-	PCH_CPT,	/* Cougarpoint/Pantherpoint PCH */
+-	PCH_LPT_H,	/* Lynxpoint/Wildcatpoint H PCH */
+-	PCH_LPT_LP,	/* Lynxpoint/Wildcatpoint LP PCH */
+-	PCH_SPT,        /* Sunrisepoint/Kaby Lake PCH */
+-	PCH_CNP,        /* Cannon/Comet Lake PCH */
+-	PCH_ICP,	/* Ice Lake/Jasper Lake PCH */
+-	PCH_TGP,	/* Tiger Lake/Mule Creek Canyon PCH */
+-	PCH_ADP,	/* Alder Lake PCH */
+-
+-	/* Fake PCHs, functionality handled on the same PCI dev */
+-	PCH_DG1 = 1024,
+-	PCH_DG2,
+-	PCH_MTL,
+-	PCH_LNL,
+-};
+-
+-#define INTEL_PCH_TYPE(dev_priv)		((dev_priv)->pch_type)
+-#define HAS_PCH_DG2(dev_priv)			(INTEL_PCH_TYPE(dev_priv) == PCH_DG2)
+-#define HAS_PCH_ADP(dev_priv)			(INTEL_PCH_TYPE(dev_priv) == PCH_ADP)
+-#define HAS_PCH_DG1(dev_priv)			(INTEL_PCH_TYPE(dev_priv) == PCH_DG1)
+-#define HAS_PCH_TGP(dev_priv)			(INTEL_PCH_TYPE(dev_priv) == PCH_TGP)
+-#define HAS_PCH_ICP(dev_priv)			(INTEL_PCH_TYPE(dev_priv) == PCH_ICP)
+-#define HAS_PCH_CNP(dev_priv)			(INTEL_PCH_TYPE(dev_priv) == PCH_CNP)
+-#define HAS_PCH_SPT(dev_priv)			(INTEL_PCH_TYPE(dev_priv) == PCH_SPT)
+-#define HAS_PCH_LPT_H(dev_priv)			(INTEL_PCH_TYPE(dev_priv) == PCH_LPT_H)
+-#define HAS_PCH_LPT_LP(dev_priv)		(INTEL_PCH_TYPE(dev_priv) == PCH_LPT_LP)
+-#define HAS_PCH_LPT(dev_priv)			(INTEL_PCH_TYPE(dev_priv) == PCH_LPT_H || \
+-						 INTEL_PCH_TYPE(dev_priv) == PCH_LPT_LP)
+-#define HAS_PCH_CPT(dev_priv)			(INTEL_PCH_TYPE(dev_priv) == PCH_CPT)
+-#define HAS_PCH_IBX(dev_priv)			(INTEL_PCH_TYPE(dev_priv) == PCH_IBX)
+-#define HAS_PCH_NOP(dev_priv)			(INTEL_PCH_TYPE(dev_priv) == PCH_NOP)
+-#define HAS_PCH_SPLIT(dev_priv)			(INTEL_PCH_TYPE(dev_priv) != PCH_NONE)
+-
+-void intel_detect_pch(struct drm_i915_private *dev_priv);
+-
+-#endif /* __INTEL_PCH__ */
+diff --git a/drivers/gpu/drm/xe/Makefile b/drivers/gpu/drm/xe/Makefile
+index c5d6681645ed..3ecac0a38b82 100644
+--- a/drivers/gpu/drm/xe/Makefile
++++ b/drivers/gpu/drm/xe/Makefile
+@@ -198,7 +198,6 @@ xe-$(CONFIG_DRM_XE_DISPLAY) += \
+ # SOC code shared with i915
+ xe-$(CONFIG_DRM_XE_DISPLAY) += \
+ 	i915-soc/intel_dram.o \
+-	i915-soc/intel_pch.o \
+ 	i915-soc/intel_rom.o
+ 
+ # Display code shared with i915
+@@ -273,6 +272,7 @@ xe-$(CONFIG_DRM_XE_DISPLAY) += \
+ 	i915-display/intel_panel.o \
+ 	i915-display/intel_pfit.o \
+ 	i915-display/intel_pmdemand.o \
++	i915-display/intel_pch.o \
+ 	i915-display/intel_pps.o \
+ 	i915-display/intel_psr.o \
+ 	i915-display/intel_qp_tables.o \
+diff --git a/drivers/gpu/drm/xe/compat-i915-headers/soc/intel_pch.h b/drivers/gpu/drm/xe/compat-i915-headers/soc/intel_pch.h
+deleted file mode 100644
+index 9c46556d33a4..000000000000
+--- a/drivers/gpu/drm/xe/compat-i915-headers/soc/intel_pch.h
++++ /dev/null
+@@ -1,6 +0,0 @@
+-/* SPDX-License-Identifier: MIT */
+-/*
+- * Copyright © 2023 Intel Corporation
+- */
+-
+-#include "../../../i915/soc/intel_pch.h"
+diff --git a/drivers/gpu/drm/xe/xe_device_types.h b/drivers/gpu/drm/xe/xe_device_types.h
+index 9446a739948c..711e809e962c 100644
+--- a/drivers/gpu/drm/xe/xe_device_types.h
++++ b/drivers/gpu/drm/xe/xe_device_types.h
+@@ -31,7 +31,7 @@
+ #endif
+ 
+ #if IS_ENABLED(CONFIG_DRM_XE_DISPLAY)
+-#include "soc/intel_pch.h"
++#include "intel_pch.h"
+ #include "intel_display_core.h"
+ #include "intel_display_device.h"
+ #endif
+-- 
+2.52.0
+
