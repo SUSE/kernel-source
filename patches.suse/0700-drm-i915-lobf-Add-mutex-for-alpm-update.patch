@@ -1,0 +1,131 @@
+From acff6d6bded31d98698693827860adc5befdd854 Mon Sep 17 00:00:00 2001
+From: Animesh Manna <animesh.manna@intel.com>
+Date: Wed, 23 Apr 2025 14:53:31 +0530
+Subject: drm/i915/lobf: Add mutex for alpm update
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: acff6d6bded31d98698693827860adc5befdd854
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+The ALPM_CTL can be updated from different context, so
+add mutex to sychonize the update.
+
+Signed-off-by: Animesh Manna <animesh.manna@intel.com>
+Reviewed-by: Jouni Högander <jouni.hogander@intel.com>
+Link: https://lore.kernel.org/r/20250423092334.2294483-9-animesh.manna@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/intel_alpm.c          | 11 ++++++++++-
+ drivers/gpu/drm/i915/display/intel_alpm.h          |  2 +-
+ drivers/gpu/drm/i915/display/intel_display_types.h |  1 +
+ drivers/gpu/drm/i915/display/intel_dp.c            |  2 +-
+ 4 files changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_alpm.c b/drivers/gpu/drm/i915/display/intel_alpm.c
+index 269768c95a3d..606cb3e5f30d 100644
+--- a/drivers/gpu/drm/i915/display/intel_alpm.c
++++ b/drivers/gpu/drm/i915/display/intel_alpm.c
+@@ -25,7 +25,7 @@ bool intel_alpm_aux_less_wake_supported(struct intel_dp *intel_dp)
+ 	return intel_dp->alpm_dpcd & DP_ALPM_AUX_LESS_CAP;
+ }
+ 
+-void intel_alpm_init_dpcd(struct intel_dp *intel_dp)
++void intel_alpm_init(struct intel_dp *intel_dp)
+ {
+ 	u8 dpcd;
+ 
+@@ -33,6 +33,7 @@ void intel_alpm_init_dpcd(struct intel_dp *intel_dp)
+ 		return;
+ 
+ 	intel_dp->alpm_dpcd = dpcd;
++	mutex_init(&intel_dp->alpm_parameters.lock);
+ }
+ 
+ /*
+@@ -331,6 +332,7 @@ static void lnl_alpm_configure(struct intel_dp *intel_dp,
+ 	    (!crtc_state->has_sel_update && !intel_dp_is_edp(intel_dp)))
+ 		return;
+ 
++	mutex_lock(&intel_dp->alpm_parameters.lock);
+ 	/*
+ 	 * Panel Replay on eDP is always using ALPM aux less. I.e. no need to
+ 	 * check panel support at this point.
+@@ -372,6 +374,7 @@ static void lnl_alpm_configure(struct intel_dp *intel_dp,
+ 	alpm_ctl |= ALPM_CTL_ALPM_ENTRY_CHECK(intel_dp->alpm_parameters.check_entry_lines);
+ 
+ 	intel_de_write(display, ALPM_CTL(display, cpu_transcoder), alpm_ctl);
++	mutex_unlock(&intel_dp->alpm_parameters.lock);
+ }
+ 
+ void intel_alpm_configure(struct intel_dp *intel_dp,
+@@ -411,8 +414,10 @@ void intel_alpm_pre_plane_update(struct intel_atomic_state *state,
+ 			continue;
+ 
+ 		if (old_crtc_state->has_lobf) {
++			mutex_lock(&intel_dp->alpm_parameters.lock);
+ 			intel_de_write(display, ALPM_CTL(display, cpu_transcoder), 0);
+ 			drm_dbg_kms(display->drm, "Link off between frames (LOBF) disabled\n");
++			mutex_unlock(&intel_dp->alpm_parameters.lock);
+ 		}
+ 	}
+ }
+@@ -531,6 +536,8 @@ void intel_alpm_disable(struct intel_dp *intel_dp)
+ 	if (DISPLAY_VER(display) < 20)
+ 		return;
+ 
++	mutex_lock(&intel_dp->alpm_parameters.lock);
++
+ 	intel_de_rmw(display, ALPM_CTL(display, cpu_transcoder),
+ 		     ALPM_CTL_ALPM_ENABLE | ALPM_CTL_LOBF_ENABLE |
+ 		     ALPM_CTL_ALPM_AUX_LESS_ENABLE, 0);
+@@ -538,4 +545,6 @@ void intel_alpm_disable(struct intel_dp *intel_dp)
+ 	intel_de_rmw(display,
+ 		     PORT_ALPM_CTL(cpu_transcoder),
+ 		     PORT_ALPM_CTL_ALPM_AUX_LESS_ENABLE, 0);
++
++	mutex_unlock(&intel_dp->alpm_parameters.lock);
+ }
+diff --git a/drivers/gpu/drm/i915/display/intel_alpm.h b/drivers/gpu/drm/i915/display/intel_alpm.h
+index 77bae022a0ea..c043a071f84f 100644
+--- a/drivers/gpu/drm/i915/display/intel_alpm.h
++++ b/drivers/gpu/drm/i915/display/intel_alpm.h
+@@ -15,7 +15,7 @@ struct intel_connector;
+ struct intel_atomic_state;
+ struct intel_crtc;
+ 
+-void intel_alpm_init_dpcd(struct intel_dp *intel_dp);
++void intel_alpm_init(struct intel_dp *intel_dp);
+ bool intel_alpm_compute_params(struct intel_dp *intel_dp,
+ 			       const struct intel_crtc_state *crtc_state);
+ void intel_alpm_lobf_compute_config(struct intel_dp *intel_dp,
+diff --git a/drivers/gpu/drm/i915/display/intel_display_types.h b/drivers/gpu/drm/i915/display/intel_display_types.h
+index 457a2fb9efa8..878f378577ab 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_types.h
++++ b/drivers/gpu/drm/i915/display/intel_display_types.h
+@@ -1809,6 +1809,7 @@ struct intel_dp {
+ 		u8 io_wake_lines;
+ 		u8 fast_wake_lines;
+ 		enum transcoder transcoder;
++		struct mutex lock;
+ 
+ 		/* LNL and beyond */
+ 		u8 check_entry_lines;
+diff --git a/drivers/gpu/drm/i915/display/intel_dp.c b/drivers/gpu/drm/i915/display/intel_dp.c
+index 660b1a8c39a4..ece787bb3335 100644
+--- a/drivers/gpu/drm/i915/display/intel_dp.c
++++ b/drivers/gpu/drm/i915/display/intel_dp.c
+@@ -6391,7 +6391,7 @@ static bool intel_edp_init_connector(struct intel_dp *intel_dp,
+ 	 */
+ 	intel_hpd_enable_detection(encoder);
+ 
+-	intel_alpm_init_dpcd(intel_dp);
++	intel_alpm_init(intel_dp);
+ 
+ 	/* Cache DPCD and EDID for edp. */
+ 	has_dpcd = intel_edp_init_dpcd(intel_dp, connector);
+-- 
+2.52.0
+
