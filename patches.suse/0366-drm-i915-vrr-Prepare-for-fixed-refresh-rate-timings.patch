@@ -1,0 +1,162 @@
+From bef1e60c7087418eea26f85a19dca7e6360857a9 Mon Sep 17 00:00:00 2001
+From: Ankit Nautiyal <ankit.k.nautiyal@intel.com>
+Date: Tue, 11 Mar 2025 15:07:50 +0530
+Subject: drm/i915/vrr: Prepare for fixed refresh rate timings
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: bef1e60c7087418eea26f85a19dca7e6360857a9
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Currently we always compute the timings as if vrr is enabled.
+With this approach the state checker becomes complicated when we
+introduce fixed refresh rate mode with vrr timing generator.
+
+To avoid the complications, instead of always computing vrr timings, we
+compute vrr timings based on uapi.vrr_enable knob.
+So when the knob is disabled we always compute vmin=flipline=vmax.
+
+V2: Use actual timings without any adjustments while preparing for
+fixed timings in compute_config. (Ville)
+V3: Avoid setting fixed timings if !vrr_possible().
+V4: Move vmin adjustement after all other timings are complete. (Ville)
+
+Signed-off-by: Ankit Nautiyal <ankit.k.nautiyal@intel.com>
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com> (#v2)
+Link: https://patchwork.freedesktop.org/patch/msgid/20250311093751.1329043-8-ankit.k.nautiyal@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/intel_vrr.c | 87 ++++++++++++++++++++++--
+ 1 file changed, 82 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_vrr.c b/drivers/gpu/drm/i915/display/intel_vrr.c
+index e0573e28014b..622a70e21737 100644
+--- a/drivers/gpu/drm/i915/display/intel_vrr.c
++++ b/drivers/gpu/drm/i915/display/intel_vrr.c
+@@ -246,6 +246,72 @@ void intel_vrr_compute_vrr_timings(struct intel_crtc_state *crtc_state)
+ 	crtc_state->mode_flags |= I915_MODE_FLAG_VRR;
+ }
+ 
++/*
++ * For fixed refresh rate mode Vmin, Vmax and Flipline all are set to
++ * Vtotal value.
++ */
++static
++int intel_vrr_fixed_rr_vtotal(const struct intel_crtc_state *crtc_state)
++{
++	struct intel_display *display = to_intel_display(crtc_state);
++	int crtc_vtotal = crtc_state->hw.adjusted_mode.crtc_vtotal;
++
++	if (DISPLAY_VER(display) >= 13)
++		return crtc_vtotal;
++	else
++		return crtc_vtotal -
++			intel_vrr_real_vblank_delay(crtc_state);
++}
++
++static
++int intel_vrr_fixed_rr_vmax(const struct intel_crtc_state *crtc_state)
++{
++	return intel_vrr_fixed_rr_vtotal(crtc_state);
++}
++
++static
++int intel_vrr_fixed_rr_vmin(const struct intel_crtc_state *crtc_state)
++{
++	struct intel_display *display = to_intel_display(crtc_state);
++
++	return intel_vrr_fixed_rr_vtotal(crtc_state) -
++		intel_vrr_flipline_offset(display);
++}
++
++static
++int intel_vrr_fixed_rr_flipline(const struct intel_crtc_state *crtc_state)
++{
++	return intel_vrr_fixed_rr_vtotal(crtc_state);
++}
++
++static
++void intel_vrr_set_fixed_rr_timings(const struct intel_crtc_state *crtc_state)
++{
++	struct intel_display *display = to_intel_display(crtc_state);
++	enum transcoder cpu_transcoder = crtc_state->cpu_transcoder;
++
++	if (!intel_vrr_possible(crtc_state))
++		return;
++
++	intel_de_write(display, TRANS_VRR_VMIN(display, cpu_transcoder),
++		       intel_vrr_fixed_rr_vmin(crtc_state) - 1);
++	intel_de_write(display, TRANS_VRR_VMAX(display, cpu_transcoder),
++		       intel_vrr_fixed_rr_vmax(crtc_state) - 1);
++	intel_de_write(display, TRANS_VRR_FLIPLINE(display, cpu_transcoder),
++		       intel_vrr_fixed_rr_flipline(crtc_state) - 1);
++}
++
++static
++void intel_vrr_compute_fixed_rr_timings(struct intel_crtc_state *crtc_state)
++{
++	/*
++	 * For fixed rr,  vmin = vmax = flipline.
++	 * vmin is already set to crtc_vtotal set vmax and flipline the same.
++	 */
++	crtc_state->vrr.vmax = crtc_state->hw.adjusted_mode.crtc_vtotal;
++	crtc_state->vrr.flipline = crtc_state->hw.adjusted_mode.crtc_vtotal;
++}
++
+ static
+ int intel_vrr_compute_vmin(struct intel_crtc_state *crtc_state)
+ {
+@@ -314,6 +380,13 @@ intel_vrr_compute_config(struct intel_crtc_state *crtc_state,
+ 
+ 	crtc_state->vrr.flipline = crtc_state->vrr.vmin;
+ 
++	if (crtc_state->uapi.vrr_enabled)
++		intel_vrr_compute_vrr_timings(crtc_state);
++	else if (is_cmrr_frac_required(crtc_state) && is_edp)
++		intel_vrr_compute_cmrr_timings(crtc_state);
++	else
++		intel_vrr_compute_fixed_rr_timings(crtc_state);
++
+ 	/*
+ 	 * flipline determines the min vblank length the hardware will
+ 	 * generate, and on ICL/TGL flipline>=vmin+1, hence we reduce
+@@ -321,11 +394,6 @@ intel_vrr_compute_config(struct intel_crtc_state *crtc_state,
+ 	 */
+ 	crtc_state->vrr.vmin -= intel_vrr_flipline_offset(display);
+ 
+-	if (crtc_state->uapi.vrr_enabled)
+-		intel_vrr_compute_vrr_timings(crtc_state);
+-	else if (is_cmrr_frac_required(crtc_state) && is_edp)
+-		intel_vrr_compute_cmrr_timings(crtc_state);
+-
+ 	if (HAS_AS_SDP(display)) {
+ 		crtc_state->vrr.vsync_start =
+ 			(crtc_state->hw.adjusted_mode.crtc_vtotal -
+@@ -496,6 +564,13 @@ void intel_vrr_enable(const struct intel_crtc_state *crtc_state)
+ 	if (!crtc_state->vrr.enable)
+ 		return;
+ 
++	intel_de_write(display, TRANS_VRR_VMIN(display, cpu_transcoder),
++		       crtc_state->vrr.vmin - 1);
++	intel_de_write(display, TRANS_VRR_VMAX(display, cpu_transcoder),
++		       crtc_state->vrr.vmax - 1);
++	intel_de_write(display, TRANS_VRR_FLIPLINE(display, cpu_transcoder),
++		       crtc_state->vrr.flipline - 1);
++
+ 	intel_de_write(display, TRANS_PUSH(display, cpu_transcoder),
+ 		       TRANS_PUSH_EN);
+ 
+@@ -523,6 +598,8 @@ void intel_vrr_disable(const struct intel_crtc_state *old_crtc_state)
+ 				TRANS_VRR_STATUS(display, cpu_transcoder),
+ 				VRR_STATUS_VRR_EN_LIVE, 1000);
+ 	intel_de_write(display, TRANS_PUSH(display, cpu_transcoder), 0);
++
++	intel_vrr_set_fixed_rr_timings(old_crtc_state);
+ }
+ 
+ static
+-- 
+2.52.0
+
