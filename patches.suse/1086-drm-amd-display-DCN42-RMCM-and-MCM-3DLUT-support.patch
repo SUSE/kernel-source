@@ -1,0 +1,579 @@
+From 652968d996d70105423f82536e137a07e1d947c1 Mon Sep 17 00:00:00 2001
+From: Yihan Zhu <Yihan.Zhu@amd.com>
+Date: Tue, 1 Apr 2025 10:28:36 -0400
+Subject: drm/amd/display: DCN42 RMCM and MCM 3DLUT support
+Git-commit: 652968d996d70105423f82536e137a07e1d947c1
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+[WHY & HOW]
+Providing hardware programming for the RMCM and MCM IPs for 3DLUT in DCN42.
+
+Reviewed-by: Charlene Liu <charlene.liu@amd.com>
+Signed-off-by: Yihan Zhu <Yihan.Zhu@amd.com>
+Signed-off-by: Zaeem Mohamed <zaeem.mohamed@amd.com>
+Tested-by: Mark Broadworth <mark.broadworth@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/display/dc/dc_types.h     |   9 +-
+ .../dc/dml2/dml21/dml21_translation_helper.c  |   3 +
+ .../amd/display/dc/hwss/dcn401/dcn401_hwseq.c | 351 ++++++++++++++++--
+ .../amd/display/dc/hwss/dcn401/dcn401_hwseq.h |   8 +
+ drivers/gpu/drm/amd/display/dc/inc/hw/mpc.h   |  29 ++
+ 5 files changed, 363 insertions(+), 37 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_types.h b/drivers/gpu/drm/amd/display/dc/dc_types.h
+index ab1adc836018..a4cd0eb39a3a 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_types.h
++++ b/drivers/gpu/drm/amd/display/dc/dc_types.h
+@@ -1255,6 +1255,7 @@ enum dc_cm2_gpu_mem_layout {
+ 
+ enum dc_cm2_gpu_mem_pixel_component_order {
+ 	DC_CM2_GPU_MEM_PIXEL_COMPONENT_ORDER_RGBA,
++	DC_CM2_GPU_MEM_PIXEL_COMPONENT_ORDER_BGRA
+ };
+ 
+ enum dc_cm2_gpu_mem_format {
+@@ -1276,7 +1277,8 @@ struct dc_cm2_gpu_mem_format_parameters {
+ 
+ enum dc_cm2_gpu_mem_size {
+ 	DC_CM2_GPU_MEM_SIZE_171717,
+-	DC_CM2_GPU_MEM_SIZE_TRANSFORMED
++	DC_CM2_GPU_MEM_SIZE_333333,
++	DC_CM2_GPU_MEM_SIZE_TRANSFORMED,
+ };
+ 
+ struct dc_cm2_gpu_mem_parameters {
+@@ -1285,6 +1287,7 @@ struct dc_cm2_gpu_mem_parameters {
+ 	struct dc_cm2_gpu_mem_format_parameters format_params;
+ 	enum dc_cm2_gpu_mem_pixel_component_order component_order;
+ 	enum dc_cm2_gpu_mem_size  size;
++	uint16_t bit_depth;
+ };
+ 
+ enum dc_cm2_transfer_func_source {
+@@ -1308,6 +1311,10 @@ struct dc_cm2_func_luts {
+ 			const struct dc_3dlut *lut3d_func;
+ 			struct dc_cm2_gpu_mem_parameters gpu_mem_params;
+ 		};
++		bool rmcm_3dlut_shaper_select;
++		bool mpc_3dlut_enable;
++		bool rmcm_3dlut_enable;
++		bool mpc_mcm_post_blend;
+ 	} lut3d_data;
+ 	const struct dc_transfer_func *lut1d_func;
+ };
+diff --git a/drivers/gpu/drm/amd/display/dc/dml2/dml21/dml21_translation_helper.c b/drivers/gpu/drm/amd/display/dc/dml2/dml21/dml21_translation_helper.c
+index 731fbd4bc600..7772283dfd1d 100644
+--- a/drivers/gpu/drm/amd/display/dc/dml2/dml21/dml21_translation_helper.c
++++ b/drivers/gpu/drm/amd/display/dc/dml2/dml21/dml21_translation_helper.c
+@@ -885,6 +885,9 @@ static void populate_dml21_plane_config_from_plane_state(struct dml2_context *dm
+ 		case DC_CM2_GPU_MEM_SIZE_171717:
+ 			plane->tdlut.tdlut_width_mode = dml2_tdlut_width_17_cube;
+ 			break;
++		case DC_CM2_GPU_MEM_SIZE_333333:
++			plane->tdlut.tdlut_width_mode = dml2_tdlut_width_33_cube;
++			break;
+ 		case DC_CM2_GPU_MEM_SIZE_TRANSFORMED:
+ 			//plane->tdlut.tdlut_width_mode = dml2_tdlut_width_flatten; // dml2_tdlut_width_flatten undefined
+ 			break;
+diff --git a/drivers/gpu/drm/amd/display/dc/hwss/dcn401/dcn401_hwseq.c b/drivers/gpu/drm/amd/display/dc/hwss/dcn401/dcn401_hwseq.c
+index 3af6a3402b89..41c28386105a 100644
+--- a/drivers/gpu/drm/amd/display/dc/hwss/dcn401/dcn401_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/hwss/dcn401/dcn401_hwseq.c
+@@ -396,6 +396,249 @@ static void dcn401_get_mcm_lut_xable_from_pipe_ctx(struct dc *dc, struct pipe_ct
+ 	}
+ }
+ 
++static void dcn401_set_mcm_location_post_blend(struct dc *dc, struct pipe_ctx *pipe_ctx, bool bPostBlend)
++{
++	struct mpc *mpc = dc->res_pool->mpc;
++	int mpcc_id = pipe_ctx->plane_res.hubp->inst;
++
++	if (!pipe_ctx->plane_state)
++		return;
++
++	mpc->funcs->set_movable_cm_location(mpc, MPCC_MOVABLE_CM_LOCATION_BEFORE, mpcc_id);
++	pipe_ctx->plane_state->mcm_location = (bPostBlend) ?
++											MPCC_MOVABLE_CM_LOCATION_AFTER :
++											MPCC_MOVABLE_CM_LOCATION_BEFORE;
++}
++
++static void dc_get_lut_mode(
++	enum dc_cm2_gpu_mem_layout layout,
++	enum hubp_3dlut_fl_mode *mode,
++	enum hubp_3dlut_fl_addressing_mode *addr_mode)
++{
++	switch (layout) {
++	case DC_CM2_GPU_MEM_LAYOUT_3D_SWIZZLE_LINEAR_RGB:
++		*mode = hubp_3dlut_fl_mode_native_1;
++		*addr_mode = hubp_3dlut_fl_addressing_mode_sw_linear;
++		break;
++	case DC_CM2_GPU_MEM_LAYOUT_3D_SWIZZLE_LINEAR_BGR:
++		*mode = hubp_3dlut_fl_mode_native_2;
++		*addr_mode = hubp_3dlut_fl_addressing_mode_sw_linear;
++		break;
++	case DC_CM2_GPU_MEM_LAYOUT_1D_PACKED_LINEAR:
++		*mode = hubp_3dlut_fl_mode_transform;
++		*addr_mode = hubp_3dlut_fl_addressing_mode_simple_linear;
++		break;
++	default:
++		*mode = hubp_3dlut_fl_mode_disable;
++		*addr_mode = hubp_3dlut_fl_addressing_mode_sw_linear;
++		break;
++	}
++}
++
++static void dc_get_lut_format(
++	enum dc_cm2_gpu_mem_format dc_format,
++	enum hubp_3dlut_fl_format *format)
++{
++	switch (dc_format) {
++	case DC_CM2_GPU_MEM_FORMAT_16161616_UNORM_12MSB:
++		*format = hubp_3dlut_fl_format_unorm_12msb_bitslice;
++		break;
++	case DC_CM2_GPU_MEM_FORMAT_16161616_UNORM_12LSB:
++		*format = hubp_3dlut_fl_format_unorm_12lsb_bitslice;
++		break;
++	case DC_CM2_GPU_MEM_FORMAT_16161616_FLOAT_FP1_5_10:
++		*format = hubp_3dlut_fl_format_float_fp1_5_10;
++		break;
++	}
++}
++
++static void dc_get_lut_xbar(
++	enum dc_cm2_gpu_mem_pixel_component_order order,
++	enum hubp_3dlut_fl_crossbar_bit_slice *cr_r,
++	enum hubp_3dlut_fl_crossbar_bit_slice *y_g,
++	enum hubp_3dlut_fl_crossbar_bit_slice *cb_b)
++{
++	switch (order) {
++	case DC_CM2_GPU_MEM_PIXEL_COMPONENT_ORDER_RGBA:
++		*cr_r = hubp_3dlut_fl_crossbar_bit_slice_32_47;
++		*y_g = hubp_3dlut_fl_crossbar_bit_slice_16_31;
++		*cb_b =  hubp_3dlut_fl_crossbar_bit_slice_0_15;
++		break;
++	case DC_CM2_GPU_MEM_PIXEL_COMPONENT_ORDER_BGRA:
++		*cr_r = hubp_3dlut_fl_crossbar_bit_slice_0_15;
++		*y_g = hubp_3dlut_fl_crossbar_bit_slice_16_31;
++		*cb_b = hubp_3dlut_fl_crossbar_bit_slice_32_47;
++		break;
++	}
++}
++
++static void dc_get_lut_width(
++	enum dc_cm2_gpu_mem_size  size,
++	enum hubp_3dlut_fl_width *width)
++{
++	switch (size) {
++	case DC_CM2_GPU_MEM_SIZE_333333:
++		*width = hubp_3dlut_fl_width_33;
++		break;
++	case DC_CM2_GPU_MEM_SIZE_171717:
++		*width = hubp_3dlut_fl_width_17;
++		break;
++	case DC_CM2_GPU_MEM_SIZE_TRANSFORMED:
++		*width = hubp_3dlut_fl_width_transformed;
++		break;
++	}
++}
++static bool dc_is_rmcm_3dlut_supported(struct hubp *hubp, struct mpc *mpc)
++{
++	if (mpc->funcs->rmcm.update_3dlut_fast_load_select &&
++		mpc->funcs->rmcm.program_lut_read_write_control &&
++		hubp->funcs->hubp_program_3dlut_fl_addr &&
++		mpc->funcs->rmcm.program_bit_depth &&
++		hubp->funcs->hubp_program_3dlut_fl_mode &&
++		hubp->funcs->hubp_program_3dlut_fl_addressing_mode &&
++		hubp->funcs->hubp_program_3dlut_fl_format &&
++		hubp->funcs->hubp_update_3dlut_fl_bias_scale &&
++		mpc->funcs->rmcm.program_bias_scale &&
++		hubp->funcs->hubp_program_3dlut_fl_crossbar &&
++		hubp->funcs->hubp_program_3dlut_fl_width &&
++		mpc->funcs->rmcm.update_3dlut_fast_load_select &&
++		mpc->funcs->rmcm.populate_lut &&
++		mpc->funcs->rmcm.program_lut_mode &&
++		hubp->funcs->hubp_enable_3dlut_fl &&
++		mpc->funcs->rmcm.enable_3dlut_fl)
++		return true;
++
++	return false;
++}
++
++bool dcn401_program_rmcm_luts(
++	struct hubp *hubp,
++	struct pipe_ctx *pipe_ctx,
++	enum dc_cm2_transfer_func_source lut3d_src,
++	struct dc_cm2_func_luts *mcm_luts,
++	struct mpc *mpc,
++	bool lut_bank_a,
++	int mpcc_id)
++{
++	struct dpp *dpp_base = pipe_ctx->plane_res.dpp;
++	union mcm_lut_params m_lut_params;
++	enum MCM_LUT_XABLE shaper_xable, lut3d_xable = MCM_LUT_DISABLE, lut1d_xable;
++	enum hubp_3dlut_fl_mode mode;
++	enum hubp_3dlut_fl_addressing_mode addr_mode;
++	enum hubp_3dlut_fl_format format;
++	enum hubp_3dlut_fl_crossbar_bit_slice crossbar_bit_slice_y_g;
++	enum hubp_3dlut_fl_crossbar_bit_slice crossbar_bit_slice_cb_b;
++	enum hubp_3dlut_fl_crossbar_bit_slice crossbar_bit_slice_cr_r;
++	enum hubp_3dlut_fl_width width;
++	struct dc *dc = hubp->ctx->dc;
++
++	bool bypass_rmcm_3dlut  = false;
++	bool bypass_rmcm_shaper = false;
++
++	dcn401_get_mcm_lut_xable_from_pipe_ctx(dc, pipe_ctx, &shaper_xable, &lut3d_xable, &lut1d_xable);
++
++	/* 3DLUT */
++	switch (lut3d_src) {
++	case DC_CM2_TRANSFER_FUNC_SOURCE_SYSMEM:
++		memset(&m_lut_params, 0, sizeof(m_lut_params));
++		// Don't know what to do in this case.
++		//case DC_CM2_TRANSFER_FUNC_SOURCE_SYSMEM:
++		break;
++	case DC_CM2_TRANSFER_FUNC_SOURCE_VIDMEM:
++		dc_get_lut_width(mcm_luts->lut3d_data.gpu_mem_params.size, &width);
++		if (!dc_is_rmcm_3dlut_supported(hubp, mpc) ||
++			!mpc->funcs->rmcm.is_config_supported(width))
++			return false;
++
++		//0. disable fl on mpc
++		mpc->funcs->update_3dlut_fast_load_select(mpc, mpcc_id, 0xF);
++
++		//1. power down the block
++		mpc->funcs->rmcm.power_on_shaper_3dlut(mpc, mpcc_id, false);
++
++		//2. program RMCM
++		//2a. 3dlut reg programming
++		mpc->funcs->rmcm.program_lut_read_write_control(mpc, MCM_LUT_3DLUT, lut_bank_a,
++				(!bypass_rmcm_3dlut) && lut3d_xable != MCM_LUT_DISABLE, mpcc_id);
++
++		hubp->funcs->hubp_program_3dlut_fl_addr(hubp,
++				mcm_luts->lut3d_data.gpu_mem_params.addr);
++
++		mpc->funcs->rmcm.program_bit_depth(mpc,
++				mcm_luts->lut3d_data.gpu_mem_params.bit_depth, mpcc_id);
++
++		// setting native or transformed mode,
++		dc_get_lut_mode(mcm_luts->lut3d_data.gpu_mem_params.layout, &mode, &addr_mode);
++
++		//these program the mcm 3dlut
++		hubp->funcs->hubp_program_3dlut_fl_mode(hubp, mode);
++
++		hubp->funcs->hubp_program_3dlut_fl_addressing_mode(hubp, addr_mode);
++
++		//seems to be only for the MCM
++		dc_get_lut_format(mcm_luts->lut3d_data.gpu_mem_params.format_params.format, &format);
++		hubp->funcs->hubp_program_3dlut_fl_format(hubp, format);
++
++		mpc->funcs->rmcm.program_bias_scale(mpc,
++			mcm_luts->lut3d_data.gpu_mem_params.format_params.float_params.bias,
++			mcm_luts->lut3d_data.gpu_mem_params.format_params.float_params.scale,
++			mpcc_id);
++		hubp->funcs->hubp_update_3dlut_fl_bias_scale(hubp,
++					mcm_luts->lut3d_data.gpu_mem_params.format_params.float_params.bias,
++					mcm_luts->lut3d_data.gpu_mem_params.format_params.float_params.scale);
++
++		dc_get_lut_xbar(
++			mcm_luts->lut3d_data.gpu_mem_params.component_order,
++			&crossbar_bit_slice_cr_r,
++			&crossbar_bit_slice_y_g,
++			&crossbar_bit_slice_cb_b);
++
++		hubp->funcs->hubp_program_3dlut_fl_crossbar(hubp,
++			crossbar_bit_slice_cr_r,
++			crossbar_bit_slice_y_g,
++			crossbar_bit_slice_cb_b);
++
++		mpc->funcs->rmcm.program_3dlut_size(mpc, width, mpcc_id);
++
++		mpc->funcs->update_3dlut_fast_load_select(mpc, mpcc_id, hubp->inst);
++
++		//2b. shaper reg programming
++		memset(&m_lut_params, 0, sizeof(m_lut_params));
++
++		if (mcm_luts->shaper->type == TF_TYPE_HWPWL) {
++			m_lut_params.pwl = &mcm_luts->shaper->pwl;
++		} else if (mcm_luts->shaper->type == TF_TYPE_DISTRIBUTED_POINTS) {
++			ASSERT(false);
++			cm_helper_translate_curve_to_hw_format(
++					dc->ctx,
++					mcm_luts->shaper,
++					&dpp_base->regamma_params, true);
++			m_lut_params.pwl = &dpp_base->regamma_params;
++		}
++		if (m_lut_params.pwl) {
++			mpc->funcs->rmcm.populate_lut(mpc, m_lut_params, lut_bank_a, mpcc_id);
++			mpc->funcs->rmcm.program_lut_mode(mpc, !bypass_rmcm_shaper, lut_bank_a, mpcc_id);
++		} else {
++			//RMCM 3dlut won't work without its shaper
++			return false;
++		}
++
++		//3. Select the hubp connected to this RMCM
++		hubp->funcs->hubp_enable_3dlut_fl(hubp, true);
++		mpc->funcs->rmcm.enable_3dlut_fl(mpc, true, mpcc_id);
++
++		//4. power on the block
++		if (m_lut_params.pwl)
++			mpc->funcs->rmcm.power_on_shaper_3dlut(mpc, mpcc_id, true);
++
++		break;
++	default:
++		return false;
++	}
++
++	return true;
++}
++
+ void dcn401_populate_mcm_luts(struct dc *dc,
+ 		struct pipe_ctx *pipe_ctx,
+ 		struct dc_cm2_func_luts mcm_luts,
+@@ -407,9 +650,9 @@ void dcn401_populate_mcm_luts(struct dc *dc,
+ 	struct mpc *mpc = dc->res_pool->mpc;
+ 	union mcm_lut_params m_lut_params;
+ 	enum dc_cm2_transfer_func_source lut3d_src = mcm_luts.lut3d_data.lut3d_src;
+-	enum hubp_3dlut_fl_format format;
++	enum hubp_3dlut_fl_format format = 0;
+ 	enum hubp_3dlut_fl_mode mode;
+-	enum hubp_3dlut_fl_width width;
++	enum hubp_3dlut_fl_width width = 0;
+ 	enum hubp_3dlut_fl_addressing_mode addr_mode;
+ 	enum hubp_3dlut_fl_crossbar_bit_slice crossbar_bit_slice_y_g;
+ 	enum hubp_3dlut_fl_crossbar_bit_slice crossbar_bit_slice_cb_b;
+@@ -417,11 +660,29 @@ void dcn401_populate_mcm_luts(struct dc *dc,
+ 	enum MCM_LUT_XABLE shaper_xable = MCM_LUT_DISABLE;
+ 	enum MCM_LUT_XABLE lut3d_xable = MCM_LUT_DISABLE;
+ 	enum MCM_LUT_XABLE lut1d_xable = MCM_LUT_DISABLE;
+-	bool is_17x17x17 = true;
+ 	bool rval;
+ 
+ 	dcn401_get_mcm_lut_xable_from_pipe_ctx(dc, pipe_ctx, &shaper_xable, &lut3d_xable, &lut1d_xable);
+ 
++	//MCM - setting its location (Before/After) blender
++	//set to post blend (true)
++	dcn401_set_mcm_location_post_blend(
++		dc,
++		pipe_ctx,
++		mcm_luts.lut3d_data.mpc_mcm_post_blend);
++
++	//RMCM - 3dLUT+Shaper
++	if (mcm_luts.lut3d_data.rmcm_3dlut_enable) {
++		dcn401_program_rmcm_luts(
++			hubp,
++			pipe_ctx,
++			lut3d_src,
++			&mcm_luts,
++			mpc,
++			lut_bank_a,
++			mpcc_id);
++	}
++
+ 	/* 1D LUT */
+ 	if (mcm_luts.lut1d_func) {
+ 		memset(&m_lut_params, 0, sizeof(m_lut_params));
+@@ -442,7 +703,7 @@ void dcn401_populate_mcm_luts(struct dc *dc,
+ 	}
+ 
+ 	/* Shaper */
+-	if (mcm_luts.shaper) {
++	if (mcm_luts.shaper && mcm_luts.lut3d_data.mpc_3dlut_enable) {
+ 		memset(&m_lut_params, 0, sizeof(m_lut_params));
+ 		if (mcm_luts.shaper->type == TF_TYPE_HWPWL)
+ 			m_lut_params.pwl = &mcm_luts.shaper->pwl;
+@@ -454,11 +715,10 @@ void dcn401_populate_mcm_luts(struct dc *dc,
+ 			m_lut_params.pwl = rval ? &dpp_base->regamma_params : NULL;
+ 		}
+ 		if (m_lut_params.pwl) {
+-			if (mpc->funcs->populate_lut)
+-				mpc->funcs->populate_lut(mpc, MCM_LUT_SHAPER, m_lut_params, lut_bank_a, mpcc_id);
++			if (mpc->funcs->mcm.populate_lut)
++				mpc->funcs->mcm.populate_lut(mpc, m_lut_params, lut_bank_a, mpcc_id);
++			mpc->funcs->program_lut_mode(mpc, MCM_LUT_SHAPER, MCM_LUT_ENABLE, lut_bank_a, mpcc_id);
+ 		}
+-		if (mpc->funcs->program_lut_mode)
+-			mpc->funcs->program_lut_mode(mpc, MCM_LUT_SHAPER, shaper_xable, lut_bank_a, mpcc_id);
+ 	}
+ 
+ 	/* 3DLUT */
+@@ -467,6 +727,7 @@ void dcn401_populate_mcm_luts(struct dc *dc,
+ 		memset(&m_lut_params, 0, sizeof(m_lut_params));
+ 		if (hubp->funcs->hubp_enable_3dlut_fl)
+ 			hubp->funcs->hubp_enable_3dlut_fl(hubp, false);
++
+ 		if (mcm_luts.lut3d_data.lut3d_func && mcm_luts.lut3d_data.lut3d_func->state.bits.initialized) {
+ 			m_lut_params.lut3d = &mcm_luts.lut3d_data.lut3d_func->lut_3d;
+ 			if (mpc->funcs->populate_lut)
+@@ -476,16 +737,35 @@ void dcn401_populate_mcm_luts(struct dc *dc,
+ 						mpcc_id);
+ 		}
+ 		break;
+-	case DC_CM2_TRANSFER_FUNC_SOURCE_VIDMEM:
++		case DC_CM2_TRANSFER_FUNC_SOURCE_VIDMEM:
++		switch (mcm_luts.lut3d_data.gpu_mem_params.size) {
++		case DC_CM2_GPU_MEM_SIZE_333333:
++			width = hubp_3dlut_fl_width_33;
++			break;
++		case DC_CM2_GPU_MEM_SIZE_171717:
++			width = hubp_3dlut_fl_width_17;
++			break;
++		case DC_CM2_GPU_MEM_SIZE_TRANSFORMED:
++			width = hubp_3dlut_fl_width_transformed;
++			break;
++		}
++
++		//check for support
++		if (mpc->funcs->mcm.is_config_supported &&
++			!mpc->funcs->mcm.is_config_supported(width))
++			break;
+ 
+ 		if (mpc->funcs->program_lut_read_write_control)
+ 			mpc->funcs->program_lut_read_write_control(mpc, MCM_LUT_3DLUT, lut_bank_a, mpcc_id);
+ 		if (mpc->funcs->program_lut_mode)
+ 			mpc->funcs->program_lut_mode(mpc, MCM_LUT_3DLUT, lut3d_xable, lut_bank_a, mpcc_id);
+-		if (mpc->funcs->program_3dlut_size)
+-			mpc->funcs->program_3dlut_size(mpc, is_17x17x17, mpcc_id);
++
+ 		if (hubp->funcs->hubp_program_3dlut_fl_addr)
+ 			hubp->funcs->hubp_program_3dlut_fl_addr(hubp, mcm_luts.lut3d_data.gpu_mem_params.addr);
++
++		if (mpc->funcs->mcm.program_bit_depth)
++			mpc->funcs->mcm.program_bit_depth(mpc, mcm_luts.lut3d_data.gpu_mem_params.bit_depth, mpcc_id);
++
+ 		switch (mcm_luts.lut3d_data.gpu_mem_params.layout) {
+ 		case DC_CM2_GPU_MEM_LAYOUT_3D_SWIZZLE_LINEAR_RGB:
+ 			mode = hubp_3dlut_fl_mode_native_1;
+@@ -512,7 +792,6 @@ void dcn401_populate_mcm_luts(struct dc *dc,
+ 
+ 		switch (mcm_luts.lut3d_data.gpu_mem_params.format_params.format) {
+ 		case DC_CM2_GPU_MEM_FORMAT_16161616_UNORM_12MSB:
+-		default:
+ 			format = hubp_3dlut_fl_format_unorm_12msb_bitslice;
+ 			break;
+ 		case DC_CM2_GPU_MEM_FORMAT_16161616_UNORM_12LSB:
+@@ -524,37 +803,37 @@ void dcn401_populate_mcm_luts(struct dc *dc,
+ 		}
+ 		if (hubp->funcs->hubp_program_3dlut_fl_format)
+ 			hubp->funcs->hubp_program_3dlut_fl_format(hubp, format);
+-		if (hubp->funcs->hubp_update_3dlut_fl_bias_scale)
++		if (hubp->funcs->hubp_update_3dlut_fl_bias_scale &&
++				mpc->funcs->mcm.program_bias_scale) {
++			mpc->funcs->mcm.program_bias_scale(mpc,
++				mcm_luts.lut3d_data.gpu_mem_params.format_params.float_params.bias,
++				mcm_luts.lut3d_data.gpu_mem_params.format_params.float_params.scale,
++				mpcc_id);
+ 			hubp->funcs->hubp_update_3dlut_fl_bias_scale(hubp,
+-					mcm_luts.lut3d_data.gpu_mem_params.format_params.float_params.bias,
+-					mcm_luts.lut3d_data.gpu_mem_params.format_params.float_params.scale);
+-
+-		switch (mcm_luts.lut3d_data.gpu_mem_params.component_order) {
+-		case DC_CM2_GPU_MEM_PIXEL_COMPONENT_ORDER_RGBA:
+-		default:
+-			crossbar_bit_slice_cr_r = hubp_3dlut_fl_crossbar_bit_slice_0_15;
+-			crossbar_bit_slice_y_g = hubp_3dlut_fl_crossbar_bit_slice_16_31;
+-			crossbar_bit_slice_cb_b = hubp_3dlut_fl_crossbar_bit_slice_32_47;
+-			break;
++						mcm_luts.lut3d_data.gpu_mem_params.format_params.float_params.bias,
++						mcm_luts.lut3d_data.gpu_mem_params.format_params.float_params.scale);
+ 		}
+ 
++		//navi 4x has a bug and r and blue are swapped and need to be worked around here in
++		//TODO: need to make a method for get_xbar per asic OR do the workaround in program_crossbar for 4x
++		dc_get_lut_xbar(
++			mcm_luts.lut3d_data.gpu_mem_params.component_order,
++			&crossbar_bit_slice_cr_r,
++			&crossbar_bit_slice_y_g,
++			&crossbar_bit_slice_cb_b);
++
+ 		if (hubp->funcs->hubp_program_3dlut_fl_crossbar)
+ 			hubp->funcs->hubp_program_3dlut_fl_crossbar(hubp,
++					crossbar_bit_slice_cr_r,
+ 					crossbar_bit_slice_y_g,
+-					crossbar_bit_slice_cb_b,
+-					crossbar_bit_slice_cr_r);
++					crossbar_bit_slice_cb_b);
++
++		if (mpc->funcs->mcm.program_lut_read_write_control)
++			mpc->funcs->mcm.program_lut_read_write_control(mpc, MCM_LUT_3DLUT, lut_bank_a, true, mpcc_id);
++
++		if (mpc->funcs->mcm.program_3dlut_size)
++			mpc->funcs->mcm.program_3dlut_size(mpc, width, mpcc_id);
+ 
+-		switch (mcm_luts.lut3d_data.gpu_mem_params.size) {
+-		case DC_CM2_GPU_MEM_SIZE_171717:
+-		default:
+-			width = hubp_3dlut_fl_width_17;
+-			break;
+-		case DC_CM2_GPU_MEM_SIZE_TRANSFORMED:
+-			width = hubp_3dlut_fl_width_transformed;
+-			break;
+-		}
+-		if (hubp->funcs->hubp_program_3dlut_fl_width)
+-			hubp->funcs->hubp_program_3dlut_fl_width(hubp, width);
+ 		if (mpc->funcs->update_3dlut_fast_load_select)
+ 			mpc->funcs->update_3dlut_fast_load_select(mpc, mpcc_id, hubp->inst);
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/hwss/dcn401/dcn401_hwseq.h b/drivers/gpu/drm/amd/display/dc/hwss/dcn401/dcn401_hwseq.h
+index 781cf0efccc6..ce65b4f6c672 100644
+--- a/drivers/gpu/drm/amd/display/dc/hwss/dcn401/dcn401_hwseq.h
++++ b/drivers/gpu/drm/amd/display/dc/hwss/dcn401/dcn401_hwseq.h
+@@ -109,4 +109,12 @@ void dcn401_detect_pipe_changes(
+ void dcn401_plane_atomic_power_down(struct dc *dc,
+ 		struct dpp *dpp,
+ 		struct hubp *hubp);
++bool dcn401_program_rmcm_luts(
++	struct hubp *hubp,
++	struct pipe_ctx *pipe_ctx,
++	enum dc_cm2_transfer_func_source lut3d_src,
++	struct dc_cm2_func_luts *mcm_luts,
++	struct mpc *mpc,
++	bool lut_bank_a,
++	int mpcc_id);
+ #endif /* __DC_HWSS_DCN401_H__ */
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/mpc.h b/drivers/gpu/drm/amd/display/dc/inc/hw/mpc.h
+index eaef3899da7b..6e303b81bfb0 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/mpc.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/mpc.h
+@@ -1037,6 +1037,35 @@ struct mpc_funcs {
+ 	* void
+ 	*/
+ 	void (*program_3dlut_size)(struct mpc *mpc, bool is_17x17x17, int mpcc_id);
++
++	struct {
++		void (*program_3dlut_size)(struct mpc *mpc, uint32_t width, int mpcc_id);
++		void (*program_bias_scale)(struct mpc *mpc, uint16_t bias, uint16_t scale, int mpcc_id);
++		void (*program_bit_depth)(struct mpc *mpc, uint16_t bit_depth, int mpcc_id);
++		bool (*is_config_supported)(uint32_t width);
++		void (*program_lut_read_write_control)(struct mpc *mpc, const enum MCM_LUT_ID id,
++			bool lut_bank_a, bool enabled, int mpcc_id);
++
++		void (*populate_lut)(struct mpc *mpc, const union mcm_lut_params params,
++			bool lut_bank_a, int mpcc_id);
++	} mcm;
++
++	struct {
++		void (*enable_3dlut_fl)(struct mpc *mpc, bool enable, int mpcc_id);
++		void (*update_3dlut_fast_load_select)(struct mpc *mpc, int mpcc_id, int hubp_idx);
++		void (*program_lut_read_write_control)(struct mpc *mpc, const enum MCM_LUT_ID id,
++			bool lut_bank_a, bool enabled, int mpcc_id);
++		void (*program_lut_mode)(struct mpc *mpc, const enum MCM_LUT_XABLE xable,
++			bool lut_bank_a, int mpcc_id);
++		void (*program_3dlut_size)(struct mpc *mpc, uint32_t width, int mpcc_id);
++		void (*program_bias_scale)(struct mpc *mpc, uint16_t bias, uint16_t scale, int mpcc_id);
++		void (*program_bit_depth)(struct mpc *mpc, uint16_t bit_depth, int mpcc_id);
++		bool (*is_config_supported)(uint32_t width);
++
++		void (*power_on_shaper_3dlut)(struct mpc *mpc, uint32_t mpcc_id, bool power_on);
++		void (*populate_lut)(struct mpc *mpc, const union mcm_lut_params params,
++			bool lut_bank_a, int mpcc_id);
++	} rmcm;
+ };
+ 
+ #endif
+-- 
+2.52.0
+
