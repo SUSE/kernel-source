@@ -1,0 +1,160 @@
+From 90c448fef3120d79bd8031665213981c966dbaf4 Mon Sep 17 00:00:00 2001
+From: Shashank Sharma <shashank.sharma@amd.com>
+Date: Wed, 30 Oct 2024 15:39:42 +0100
+Subject: drm/amdgpu: add new AMDGPU_INFO subquery for userq objects
+Git-commit: 90c448fef3120d79bd8031665213981c966dbaf4
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+This patch adds a new subquery (AMDGPU_INFO_UQ_FW_AREAS) in
+AMDGPU_INFO_IOCTL to get the size and alignment of shadow
+and csa objects from the FW setup. This information is
+required for the userqueue consumers.
+
+V2: Added Alex's suggestions and addressed review comments:
+- make this query IP specific (GFX/SDMA etc)
+- give a better title (AMDGPU_INFO_UQ_METADATA)
+- restructured the code as per sample code shared by Alex
+
+V3: Split the UAPI patch from shadow_size_fn modifications
+V4: Addressed review comments from UAPI review (Marek/Pierre-Eric)
+    - Change the query name to AMDGPU_INFO_UQ_FW_AREAS
+    - remove unused inpur parameter for AMDGPU_HW_IP*
+
+UAPI link: https://gitlab.freedesktop.org/mesa/drm/-/merge_requests/400/
+
+Cc: Alex Deucher <alexander.deucher@amd.com>
+Cc: Christian Koenig <christian.koenig@amd.com>
+Cc: Arvind Yadav <arvind.yadav@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Shashank Sharma <shashank.sharma@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c | 36 ++++++++++++++++++++++
+ include/uapi/drm/amdgpu_drm.h           | 40 +++++++++++++++++++++++++
+ 2 files changed, 76 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+index 1fcf0ef06315..2e07776dd408 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+@@ -371,6 +371,26 @@ static int amdgpu_firmware_info(struct drm_amdgpu_info_firmware *fw_info,
+ 	return 0;
+ }
+ 
++static int amdgpu_userq_metadata_info_gfx(struct amdgpu_device *adev,
++					  struct drm_amdgpu_info *info,
++					  struct drm_amdgpu_info_uq_metadata_gfx *meta)
++{
++	int ret = -EOPNOTSUPP;
++
++	if (adev->gfx.funcs->get_gfx_shadow_info) {
++		struct amdgpu_gfx_shadow_info shadow = {};
++
++		adev->gfx.funcs->get_gfx_shadow_info(adev, &shadow, true);
++		meta->shadow_size = shadow.shadow_size;
++		meta->shadow_alignment = shadow.shadow_alignment;
++		meta->csa_size = shadow.csa_size;
++		meta->csa_alignment = shadow.csa_alignment;
++		ret = 0;
++	}
++
++	return ret;
++}
++
+ static int amdgpu_hw_ip_info(struct amdgpu_device *adev,
+ 			     struct drm_amdgpu_info *info,
+ 			     struct drm_amdgpu_info_hw_ip *result)
+@@ -1294,6 +1314,22 @@ int amdgpu_info_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+ 		return copy_to_user(out, &gpuvm_fault,
+ 				    min((size_t)size, sizeof(gpuvm_fault))) ? -EFAULT : 0;
+ 	}
++	case AMDGPU_INFO_UQ_FW_AREAS: {
++		struct drm_amdgpu_info_uq_metadata meta_info = {};
++
++		switch (info->query_hw_ip.type) {
++		case AMDGPU_HW_IP_GFX:
++			ret = amdgpu_userq_metadata_info_gfx(adev, info, &meta_info.gfx);
++			if (ret)
++				return ret;
++
++			ret = copy_to_user(out, &meta_info,
++						min((size_t)size, sizeof(meta_info))) ? -EFAULT : 0;
++			return 0;
++		default:
++			return -EINVAL;
++		}
++	}
+ 	default:
+ 		DRM_DEBUG_KMS("Invalid request %d\n", info->query);
+ 		return -EINVAL;
+diff --git a/include/uapi/drm/amdgpu_drm.h b/include/uapi/drm/amdgpu_drm.h
+index 72dc16dbca7f..5dbd9037afe7 100644
+--- a/include/uapi/drm/amdgpu_drm.h
++++ b/include/uapi/drm/amdgpu_drm.h
+@@ -1193,6 +1193,8 @@ struct drm_amdgpu_cs_chunk_cp_gfx_shadow {
+ #define AMDGPU_INFO_MAX_IBS			0x22
+ /* query last page fault info */
+ #define AMDGPU_INFO_GPUVM_FAULT			0x23
++/* query FW object size and alignment */
++#define AMDGPU_INFO_UQ_FW_AREAS			0x24
+ 
+ #define AMDGPU_INFO_MMR_SE_INDEX_SHIFT	0
+ #define AMDGPU_INFO_MMR_SE_INDEX_MASK	0xff
+@@ -1469,6 +1471,27 @@ struct drm_amdgpu_info_hw_ip {
+ 	__u32  ip_discovery_version;
+ };
+ 
++/* GFX metadata BO sizes and alignment info (in bytes) */
++struct drm_amdgpu_info_uq_fw_areas_gfx {
++	/* shadow area size */
++	__u32 shadow_size;
++	/* shadow area base virtual mem alignment */
++	__u32 shadow_alignment;
++	/* context save area size */
++	__u32 csa_size;
++	/* context save area base virtual mem alignment */
++	__u32 csa_alignment;
++};
++
++/* IP specific fw related information used in the
++ * subquery AMDGPU_INFO_UQ_FW_AREAS
++ */
++struct drm_amdgpu_info_uq_fw_areas {
++	union {
++		struct drm_amdgpu_info_uq_fw_areas_gfx gfx;
++	};
++};
++
+ struct drm_amdgpu_info_num_handles {
+ 	/** Max handles as supported by firmware for UVD */
+ 	__u32  uvd_max_handles;
+@@ -1532,6 +1555,23 @@ struct drm_amdgpu_info_gpuvm_fault {
+ 	__u32 vmhub;
+ };
+ 
++struct drm_amdgpu_info_uq_metadata_gfx {
++	/* shadow area size for gfx11 */
++	__u32 shadow_size;
++	/* shadow area base virtual alignment for gfx11 */
++	__u32 shadow_alignment;
++	/* context save area size for gfx11 */
++	__u32 csa_size;
++	/* context save area base virtual alignment for gfx11 */
++	__u32 csa_alignment;
++};
++
++struct drm_amdgpu_info_uq_metadata {
++	union {
++		struct drm_amdgpu_info_uq_metadata_gfx gfx;
++	};
++};
++
+ /*
+  * Supported GPU families
+  */
+-- 
+2.52.0
+
