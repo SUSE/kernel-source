@@ -1,0 +1,125 @@
+From 8949843762631d9d0fc526dfb61a272dca29fc6f Mon Sep 17 00:00:00 2001
+From: Arunpravin Paneer Selvam <Arunpravin.PaneerSelvam@amd.com>
+Date: Wed, 30 Oct 2024 10:38:46 +0530
+Subject: drm/amdgpu: Enable userq fence interrupt support
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 8949843762631d9d0fc526dfb61a272dca29fc6f
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Add support to handle the userqueue protected fence signal hardware
+interrupt.
+
+Create a xarray which maps the doorbell index to the fence driver address.
+This would help to retrieve the fence driver information when an userq fence
+interrupt is triggered. Firmware sends the doorbell offset value and
+this info is compared with the queue's mqd doorbell offset value.
+If they are same, we process the userq fence interrupt.
+
+v1:(Christian):
+  - use xa_load to extract the fence driver.
+  - move the amdgpu_userq_fence_driver_process call within the xa_lock
+    as there is a chance that fence_drv might be freed.
+
+Signed-off-by: Arunpravin Paneer Selvam <Arunpravin.PaneerSelvam@amd.com>
+Acked-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c    |  2 ++
+ .../gpu/drm/amd/amdgpu/amdgpu_userq_fence.c   |  6 +++++
+ drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c        | 25 +++++++++----------
+ 3 files changed, 20 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index ecbfc7fbd4e5..13c5b6f68d48 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -4337,6 +4337,8 @@ int amdgpu_device_init(struct amdgpu_device *adev,
+ 	spin_lock_init(&adev->virt.rlcg_reg_lock);
+ 	spin_lock_init(&adev->wb.lock);
+ 
++	xa_init_flags(&adev->userq_xa, XA_FLAGS_LOCK_IRQ);
++
+ 	INIT_LIST_HEAD(&adev->reset_list);
+ 
+ 	INIT_LIST_HEAD(&adev->ras_list);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.c
+index 1a9565b61266..cd473c985e36 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.c
+@@ -71,6 +71,7 @@ int amdgpu_userq_fence_driver_alloc(struct amdgpu_device *adev,
+ 				    struct amdgpu_usermode_queue *userq)
+ {
+ 	struct amdgpu_userq_fence_driver *fence_drv;
++	unsigned long flags;
+ 	int r;
+ 
+ 	fence_drv = kzalloc(sizeof(*fence_drv), GFP_KERNEL);
+@@ -98,6 +99,11 @@ int amdgpu_userq_fence_driver_alloc(struct amdgpu_device *adev,
+ 	fence_drv->context = dma_fence_context_alloc(1);
+ 	get_task_comm(fence_drv->timeline_name, current);
+ 
++	xa_lock_irqsave(&adev->userq_xa, flags);
++	__xa_store(&adev->userq_xa, userq->doorbell_index,
++		   fence_drv, GFP_KERNEL);
++	xa_unlock_irqrestore(&adev->userq_xa, flags);
++
+ 	userq->fence_drv = fence_drv;
+ 
+ 	return 0;
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c
+index bbc9cd9140b1..cbe5516c3f7b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c
+@@ -49,6 +49,7 @@
+ #include "nbio_v4_3.h"
+ #include "mes_v11_0.h"
+ #include "mes_v11_0_userqueue.h"
++#include "amdgpu_userq_fence.h"
+ 
+ #define GFX11_NUM_GFX_RINGS		1
+ #define GFX11_MEC_HPD_SIZE	2048
+@@ -6334,25 +6335,23 @@ static int gfx_v11_0_eop_irq(struct amdgpu_device *adev,
+ 			     struct amdgpu_irq_src *source,
+ 			     struct amdgpu_iv_entry *entry)
+ {
+-	int i;
++	u32 doorbell_offset = entry->src_data[0];
+ 	u8 me_id, pipe_id, queue_id;
+ 	struct amdgpu_ring *ring;
+-	uint32_t mes_queue_id = entry->src_data[0];
++	int i;
+ 
+ 	DRM_DEBUG("IH: CP EOP\n");
+ 
+-	if (adev->enable_mes && (mes_queue_id & AMDGPU_FENCE_MES_QUEUE_FLAG)) {
+-		struct amdgpu_mes_queue *queue;
++	if (adev->enable_mes && doorbell_offset) {
++		struct amdgpu_userq_fence_driver *fence_drv = NULL;
++		struct xarray *xa = &adev->userq_xa;
++		unsigned long flags;
+ 
+-		mes_queue_id &= AMDGPU_FENCE_MES_QUEUE_ID_MASK;
+-
+-		spin_lock(&adev->mes.queue_id_lock);
+-		queue = idr_find(&adev->mes.queue_id_idr, mes_queue_id);
+-		if (queue) {
+-			DRM_DEBUG("process mes queue id = %d\n", mes_queue_id);
+-			amdgpu_fence_process(queue->ring);
+-		}
+-		spin_unlock(&adev->mes.queue_id_lock);
++		xa_lock_irqsave(xa, flags);
++		fence_drv = xa_load(xa, doorbell_offset);
++		if (fence_drv)
++			amdgpu_userq_fence_driver_process(fence_drv);
++		xa_unlock_irqrestore(xa, flags);
+ 	} else {
+ 		me_id = (entry->ring_id & 0x0c) >> 2;
+ 		pipe_id = (entry->ring_id & 0x03) >> 0;
+-- 
+2.52.0
+
