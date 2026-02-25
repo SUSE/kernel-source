@@ -1,0 +1,247 @@
+From 15e30a6e479282fef4365bd586159911c8cf140d Mon Sep 17 00:00:00 2001
+From: Arunpravin Paneer Selvam <Arunpravin.PaneerSelvam@amd.com>
+Date: Wed, 30 Oct 2024 10:33:28 +0530
+Subject: drm/amdgpu: Add wait IOCTL timeline syncobj support
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 15e30a6e479282fef4365bd586159911c8cf140d
+Patch-mainline: v6.16-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Add user fence wait IOCTL timeline syncobj support.
+
+v2:(Christian)
+  - handle dma_fence_wait() return value.
+  - shorten the variable name syncobj_timeline_points a bit.
+  - move num_points up to avoid padding issues.
+
+v3:(Christian)
+  - Handle timeline drm_syncobj_find_fence() call error
+    handling
+  - Use dma_fence_unwrap_for_each() in timeline fence as
+    there could be more than one fence.
+
+v4:(Christian)
+  - Drop the first num_fences since fence is always included in
+    the dma_fence_unwrap_for_each() iteration, when fence != f
+    then fence is most likely just a container.
+
+V5: Added Alex RB to merge the kernel UAPI changes since he has
+    already approved the amdgpu_drm.h changes.
+
+Signed-off-by: Arunpravin Paneer Selvam <Arunpravin.PaneerSelvam@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../gpu/drm/amd/amdgpu/amdgpu_userq_fence.c   | 91 +++++++++++++++++--
+ include/uapi/drm/amdgpu_drm.h                 | 16 +++-
+ 2 files changed, 99 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.c
+index 8f9d2427d380..1a9565b61266 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.c
+@@ -24,6 +24,7 @@
+ 
+ #include <linux/kref.h>
+ #include <linux/slab.h>
++#include <linux/dma-fence-unwrap.h>
+ 
+ #include <drm/drm_exec.h>
+ #include <drm/drm_syncobj.h>
+@@ -474,11 +475,11 @@ int amdgpu_userq_signal_ioctl(struct drm_device *dev, void *data,
+ int amdgpu_userq_wait_ioctl(struct drm_device *dev, void *data,
+ 			    struct drm_file *filp)
+ {
++	u32 *syncobj_handles, *timeline_points, *timeline_handles, *bo_handles;
++	u32 num_syncobj, num_bo_handles, num_points;
+ 	struct drm_amdgpu_userq_fence_info *fence_info = NULL;
+ 	struct drm_amdgpu_userq_wait *wait_info = data;
+-	u32 *syncobj_handles, *bo_handles;
+ 	struct dma_fence **fences = NULL;
+-	u32 num_syncobj, num_bo_handles;
+ 	struct drm_gem_object **gobj;
+ 	struct drm_exec exec;
+ 	int r, i, entry, cnt;
+@@ -498,11 +499,26 @@ int amdgpu_userq_wait_ioctl(struct drm_device *dev, void *data,
+ 		goto free_bo_handles;
+ 	}
+ 
++	num_points = wait_info->num_points;
++	timeline_handles = memdup_user(u64_to_user_ptr(wait_info->syncobj_timeline_handles),
++				       sizeof(u32) * num_points);
++	if (IS_ERR(timeline_handles)) {
++		r = PTR_ERR(timeline_handles);
++		goto free_syncobj_handles;
++	}
++
++	timeline_points = memdup_user(u64_to_user_ptr(wait_info->syncobj_timeline_points),
++				      sizeof(u32) * num_points);
++	if (IS_ERR(timeline_points)) {
++		r = PTR_ERR(timeline_points);
++		goto free_timeline_handles;
++	}
++
+ 	/* Array of GEM object handles */
+ 	gobj = kmalloc_array(num_bo_handles, sizeof(*gobj), GFP_KERNEL);
+ 	if (!gobj) {
+ 		r = -ENOMEM;
+-		goto free_syncobj_handles;
++		goto free_timeline_points;
+ 	}
+ 
+ 	for (entry = 0; entry < num_bo_handles; entry++) {
+@@ -524,12 +540,34 @@ int amdgpu_userq_wait_ioctl(struct drm_device *dev, void *data,
+ 	}
+ 
+ 	if (!wait_info->num_fences) {
++		if (num_points) {
++			struct dma_fence_unwrap iter;
++			struct dma_fence *fence;
++			struct dma_fence *f;
++
++			for (i = 0; i < num_points; i++) {
++				r = drm_syncobj_find_fence(filp, timeline_handles[i],
++							   timeline_points[i],
++							   DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
++							   &fence);
++				if (r)
++					goto exec_fini;
++
++				dma_fence_unwrap_for_each(f, &iter, fence)
++					num_fences++;
++
++				dma_fence_put(fence);
++			}
++		}
++
+ 		/* Count syncobj's fence */
+ 		for (i = 0; i < num_syncobj; i++) {
+ 			struct dma_fence *fence;
+ 
+ 			r = drm_syncobj_find_fence(filp, syncobj_handles[i],
+-						   0, 0, &fence);
++						   0,
++						   DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
++						   &fence);
+ 			if (r)
+ 				goto exec_fini;
+ 
+@@ -588,12 +626,41 @@ int amdgpu_userq_wait_ioctl(struct drm_device *dev, void *data,
+ 			}
+ 		}
+ 
++		if (num_points) {
++			struct dma_fence_unwrap iter;
++			struct dma_fence *fence;
++			struct dma_fence *f;
++
++			for (i = 0; i < num_points; i++) {
++				r = drm_syncobj_find_fence(filp, timeline_handles[i],
++							   timeline_points[i],
++							   DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
++							   &fence);
++				if (r)
++					goto free_fences;
++
++				dma_fence_unwrap_for_each(f, &iter, fence) {
++					if (WARN_ON_ONCE(num_fences >= wait_info->num_fences)) {
++						r = -EINVAL;
++						goto free_fences;
++					}
++
++					dma_fence_get(f);
++					fences[num_fences++] = f;
++				}
++
++				dma_fence_put(fence);
++			}
++		}
++
+ 		/* Retrieve syncobj's fence */
+ 		for (i = 0; i < num_syncobj; i++) {
+ 			struct dma_fence *fence;
+ 
+ 			r = drm_syncobj_find_fence(filp, syncobj_handles[i],
+-						   0, 0, &fence);
++						   0,
++						   DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
++						   &fence);
+ 			if (r)
+ 				goto free_fences;
+ 
+@@ -616,9 +683,13 @@ int amdgpu_userq_wait_ioctl(struct drm_device *dev, void *data,
+ 				 * Just waiting on other driver fences should
+ 				 * be good for now
+ 				 */
+-				dma_fence_wait(fences[i], false);
+-				dma_fence_put(fences[i]);
++				r = dma_fence_wait(fences[i], true);
++				if (r) {
++					dma_fence_put(fences[i]);
++					goto free_fences;
++				}
+ 
++				dma_fence_put(fences[i]);
+ 				continue;
+ 			}
+ 
+@@ -664,6 +735,8 @@ int amdgpu_userq_wait_ioctl(struct drm_device *dev, void *data,
+ 		drm_gem_object_put(gobj[i]);
+ 	kfree(gobj);
+ 
++	kfree(timeline_points);
++	kfree(timeline_handles);
+ 	kfree(syncobj_handles);
+ 	kfree(bo_handles);
+ 
+@@ -681,6 +754,10 @@ int amdgpu_userq_wait_ioctl(struct drm_device *dev, void *data,
+ 	while (entry-- > 0)
+ 		drm_gem_object_put(gobj[entry]);
+ 	kfree(gobj);
++free_timeline_points:
++	kfree(timeline_points);
++free_timeline_handles:
++	kfree(timeline_handles);
+ free_syncobj_handles:
+ 	kfree(syncobj_handles);
+ free_bo_handles:
+diff --git a/include/uapi/drm/amdgpu_drm.h b/include/uapi/drm/amdgpu_drm.h
+index 4e9414c0f924..1a21259cb8c4 100644
+--- a/include/uapi/drm/amdgpu_drm.h
++++ b/include/uapi/drm/amdgpu_drm.h
+@@ -530,12 +530,26 @@ struct drm_amdgpu_userq_wait {
+ 	 * matching fence wait info pair in @userq_fence_info.
+ 	 */
+ 	__u32	bo_wait_flags;
+-	__u32	pad;
++	/**
++	 * @num_points: A count that represents the number of timeline syncobj handles in
++	 * syncobj_handles_array.
++	 */
++	__u32	num_points;
+ 	/**
+ 	 * @syncobj_handles_array: An array of syncobj handles defined to get the
+ 	 * fence wait information of every syncobj handles in the array.
+ 	 */
+ 	__u64	syncobj_handles_array;
++	/**
++	 * @syncobj_timeline_handles: An array of timeline syncobj handles defined to get the
++	 * fence wait information of every timeline syncobj handles in the array.
++	 */
++	__u64   syncobj_timeline_handles;
++	/**
++	 * @syncobj_timeline_points: An array of timeline syncobj points defined to get the
++	 * fence wait points of every timeline syncobj handles in the syncobj_handles_array.
++	 */
++	__u64	syncobj_timeline_points;
+ 	/**
+ 	 * @bo_handles_array: An array of GEM BO handles defined to fetch the fence
+ 	 * wait information of every BO handles in the array.
+-- 
+2.52.0
+
