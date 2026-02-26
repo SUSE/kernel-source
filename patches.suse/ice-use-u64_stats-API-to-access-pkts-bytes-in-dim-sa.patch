@@ -1,0 +1,190 @@
+From: Jacob Keller <jacob.e.keller@intel.com>
+Date: Thu, 20 Nov 2025 12:20:44 -0800
+Subject: ice: use u64_stats API to access pkts/bytes in dim sample
+Patch-mainline: v7.0-rc1
+Git-commit: b1c16d9cb21ed7ae0f01f5991adabc4c5ae002fd
+References: jsc#PED-14404 jsc#PED-15079
+
+The __ice_update_sample and __ice_get_ethtool_stats functions directly
+accesses the pkts and bytes counters from the ring stats. A following
+change is going to update the fields to be u64_stats_t type, and will need
+to be accessed appropriately. This will ensure that the accesses do not
+cause load/store tearing.
+
+Add helper functions similar to the ones used for updating the stats
+values, and use them. This ensures use of the syncp pointer on 32-bit
+architectures. Once the fields are updated to u64_stats_t, it will then
+properly avoid tears on all architectures.
+
+Reviewed-by: Aleksandr Loktionov <aleksandr.loktionov@intel.com>
+Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Tested-by: Rinitha S <sx.rinitha@intel.com> (A Contingent worker at Intel)
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/ice/ice_ethtool.c |   26 +++++++++++++------
+ drivers/net/ethernet/intel/ice/ice_lib.c     |   36 +++++++++++++++++++++++++++
+ drivers/net/ethernet/intel/ice/ice_lib.h     |    6 ++++
+ drivers/net/ethernet/intel/ice/ice_txrx.c    |   29 +++++++++++----------
+ 4 files changed, 75 insertions(+), 22 deletions(-)
+
+--- a/drivers/net/ethernet/intel/ice/ice_ethtool.c
++++ b/drivers/net/ethernet/intel/ice/ice_ethtool.c
+@@ -1942,25 +1942,35 @@ __ice_get_ethtool_stats(struct net_devic
+ 	rcu_read_lock();
+ 
+ 	ice_for_each_alloc_txq(vsi, j) {
++		u64 pkts, bytes;
++
+ 		tx_ring = READ_ONCE(vsi->tx_rings[j]);
+-		if (tx_ring && tx_ring->ring_stats) {
+-			data[i++] = tx_ring->ring_stats->stats.pkts;
+-			data[i++] = tx_ring->ring_stats->stats.bytes;
+-		} else {
++		if (!tx_ring || !tx_ring->ring_stats) {
+ 			data[i++] = 0;
+ 			data[i++] = 0;
++			continue;
+ 		}
++
++		ice_fetch_tx_ring_stats(tx_ring, &pkts, &bytes);
++
++		data[i++] = pkts;
++		data[i++] = bytes;
+ 	}
+ 
+ 	ice_for_each_alloc_rxq(vsi, j) {
++		u64 pkts, bytes;
++
+ 		rx_ring = READ_ONCE(vsi->rx_rings[j]);
+-		if (rx_ring && rx_ring->ring_stats) {
+-			data[i++] = rx_ring->ring_stats->stats.pkts;
+-			data[i++] = rx_ring->ring_stats->stats.bytes;
+-		} else {
++		if (!rx_ring || !rx_ring->ring_stats) {
+ 			data[i++] = 0;
+ 			data[i++] = 0;
++			continue;
+ 		}
++
++		ice_fetch_rx_ring_stats(rx_ring, &pkts, &bytes);
++
++		data[i++] = pkts;
++		data[i++] = bytes;
+ 	}
+ 
+ 	rcu_read_unlock();
+--- a/drivers/net/ethernet/intel/ice/ice_lib.c
++++ b/drivers/net/ethernet/intel/ice/ice_lib.c
+@@ -3476,6 +3476,42 @@ void ice_update_rx_ring_stats(struct ice
+ }
+ 
+ /**
++ * ice_fetch_tx_ring_stats - Fetch Tx ring packet and byte counters
++ * @ring: ring to update
++ * @pkts: number of processed packets
++ * @bytes: number of processed bytes
++ */
++void ice_fetch_tx_ring_stats(const struct ice_tx_ring *ring,
++			     u64 *pkts, u64 *bytes)
++{
++	unsigned int start;
++
++	do  {
++		start = u64_stats_fetch_begin(&ring->ring_stats->syncp);
++		*pkts = ring->ring_stats->pkts;
++		*bytes = ring->ring_stats->bytes;
++	} while (u64_stats_fetch_retry(&ring->ring_stats->syncp, start));
++}
++
++/**
++ * ice_fetch_rx_ring_stats - Fetch Rx ring packet and byte counters
++ * @ring: ring to read
++ * @pkts: number of processed packets
++ * @bytes: number of processed bytes
++ */
++void ice_fetch_rx_ring_stats(const struct ice_rx_ring *ring,
++			     u64 *pkts, u64 *bytes)
++{
++	unsigned int start;
++
++	do  {
++		start = u64_stats_fetch_begin(&ring->ring_stats->syncp);
++		*pkts = ring->ring_stats->pkts;
++		*bytes = ring->ring_stats->bytes;
++	} while (u64_stats_fetch_retry(&ring->ring_stats->syncp, start));
++}
++
++/**
+  * ice_is_dflt_vsi_in_use - check if the default forwarding VSI is being used
+  * @pi: port info of the switch with default VSI
+  *
+--- a/drivers/net/ethernet/intel/ice/ice_lib.h
++++ b/drivers/net/ethernet/intel/ice/ice_lib.h
+@@ -92,6 +92,12 @@ void ice_update_tx_ring_stats(struct ice
+ 
+ void ice_update_rx_ring_stats(struct ice_rx_ring *ring, u64 pkts, u64 bytes);
+ 
++void ice_fetch_tx_ring_stats(const struct ice_tx_ring *ring,
++			     u64 *pkts, u64 *bytes);
++
++void ice_fetch_rx_ring_stats(const struct ice_rx_ring *ring,
++			     u64 *pkts, u64 *bytes);
++
+ void ice_write_intrl(struct ice_q_vector *q_vector, u8 intrl);
+ void ice_write_itr(struct ice_ring_container *rc, u16 itr);
+ void ice_set_q_vector_intrl(struct ice_q_vector *q_vector);
+--- a/drivers/net/ethernet/intel/ice/ice_txrx.c
++++ b/drivers/net/ethernet/intel/ice/ice_txrx.c
+@@ -1034,35 +1034,36 @@ static void __ice_update_sample(struct i
+ 				struct dim_sample *sample,
+ 				bool is_tx)
+ {
+-	u64 packets = 0, bytes = 0;
++	u64 total_packets = 0, total_bytes = 0, pkts, bytes;
+ 
+ 	if (is_tx) {
+ 		struct ice_tx_ring *tx_ring;
+ 
+ 		ice_for_each_tx_ring(tx_ring, *rc) {
+-			struct ice_ring_stats *ring_stats;
+-
+-			ring_stats = tx_ring->ring_stats;
+-			if (!ring_stats)
++			if (!tx_ring->ring_stats)
+ 				continue;
+-			packets += ring_stats->stats.pkts;
+-			bytes += ring_stats->stats.bytes;
++
++			ice_fetch_tx_ring_stats(tx_ring, &pkts, &bytes);
++
++			total_packets += pkts;
++			total_bytes += bytes;
+ 		}
+ 	} else {
+ 		struct ice_rx_ring *rx_ring;
+ 
+ 		ice_for_each_rx_ring(rx_ring, *rc) {
+-			struct ice_ring_stats *ring_stats;
+-
+-			ring_stats = rx_ring->ring_stats;
+-			if (!ring_stats)
++			if (!rx_ring->ring_stats)
+ 				continue;
+-			packets += ring_stats->stats.pkts;
+-			bytes += ring_stats->stats.bytes;
++
++			ice_fetch_rx_ring_stats(rx_ring, &pkts, &bytes);
++
++			total_packets += pkts;
++			total_bytes += bytes;
+ 		}
+ 	}
+ 
+-	dim_update_sample(q_vector->total_events, packets, bytes, sample);
++	dim_update_sample(q_vector->total_events,
++			  total_packets, total_bytes, sample);
+ 	sample->comp_ctr = 0;
+ 
+ 	/* if dim settings get stale, like when not updated for 1
