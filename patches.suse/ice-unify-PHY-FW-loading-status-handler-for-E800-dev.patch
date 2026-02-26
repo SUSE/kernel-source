@@ -1,0 +1,139 @@
+From: Grzegorz Nitka <grzegorz.nitka@intel.com>
+Date: Fri, 17 Oct 2025 10:42:28 +0200
+Subject: ice: unify PHY FW loading status handler for E800 devices
+Patch-mainline: v7.0-rc1
+Git-commit: 2769e6c3a1bdf9b4d0c30809a9e4361ab32ad414
+References: jsc#PED-14404 jsc#PED-15079
+
+Unify handling of PHY firmware load delays across all E800 family
+devices. There is an existing mechanism to poll GL_MNG_FWSM_FW_LOADING_M
+bit of GL_MNG_FWSM register in order to verify whether PHY FW loading
+completed or not. Previously, this logic was limited to E827 variants
+only.
+
+Also, inform a user of possible delay in initialization process, by
+dumping informational message in dmesg log ("Link initialization is
+blocked by PHY FW initialization. Link initialization will continue
+after PHY FW initialization completes.").
+
+Signed-off-by: Grzegorz Nitka <grzegorz.nitka@intel.com>
+Reviewed-by: Aleksandr Loktionov <aleksandr.loktionov@intel.com>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Reviewed-by: Paul Menzel <pmenzel@molgen.mpg.de>
+Tested-by: Rinitha S <sx.rinitha@intel.com> (A Contingent worker at Intel)
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/ice/ice_common.c |   79 +++++++---------------------
+ 1 file changed, 21 insertions(+), 58 deletions(-)
+
+--- a/drivers/net/ethernet/intel/ice/ice_common.c
++++ b/drivers/net/ethernet/intel/ice/ice_common.c
+@@ -204,42 +204,6 @@ bool ice_is_generic_mac(struct ice_hw *h
+ }
+ 
+ /**
+- * ice_is_pf_c827 - check if pf contains c827 phy
+- * @hw: pointer to the hw struct
+- *
+- * Return: true if the device has c827 phy.
+- */
+-static bool ice_is_pf_c827(struct ice_hw *hw)
+-{
+-	struct ice_aqc_get_link_topo cmd = {};
+-	u8 node_part_number;
+-	u16 node_handle;
+-	int status;
+-
+-	if (hw->mac_type != ICE_MAC_E810)
+-		return false;
+-
+-	if (hw->device_id != ICE_DEV_ID_E810C_QSFP)
+-		return true;
+-
+-	cmd.addr.topo_params.node_type_ctx =
+-		FIELD_PREP(ICE_AQC_LINK_TOPO_NODE_TYPE_M, ICE_AQC_LINK_TOPO_NODE_TYPE_PHY) |
+-		FIELD_PREP(ICE_AQC_LINK_TOPO_NODE_CTX_M, ICE_AQC_LINK_TOPO_NODE_CTX_PORT);
+-	cmd.addr.topo_params.index = 0;
+-
+-	status = ice_aq_get_netlist_node(hw, &cmd, &node_part_number,
+-					 &node_handle);
+-
+-	if (status || node_part_number != ICE_AQC_GET_LINK_TOPO_NODE_NR_C827)
+-		return false;
+-
+-	if (node_handle == E810C_QSFP_C827_0_HANDLE || node_handle == E810C_QSFP_C827_1_HANDLE)
+-		return true;
+-
+-	return false;
+-}
+-
+-/**
+  * ice_clear_pf_cfg - Clear PF configuration
+  * @hw: pointer to the hardware structure
+  *
+@@ -958,30 +922,31 @@ static void ice_get_itr_intrl_gran(struc
+ }
+ 
+ /**
+- * ice_wait_for_fw - wait for full FW readiness
++ * ice_wait_fw_load - wait for PHY firmware loading to complete
+  * @hw: pointer to the hardware structure
+- * @timeout: milliseconds that can elapse before timing out
++ * @timeout: milliseconds that can elapse before timing out, 0 to bypass waiting
+  *
+- * Return: 0 on success, -ETIMEDOUT on timeout.
++ * Return:
++ * * 0 on success
++ * * negative on timeout
+  */
+-static int ice_wait_for_fw(struct ice_hw *hw, u32 timeout)
++static int ice_wait_fw_load(struct ice_hw *hw, u32 timeout)
+ {
+-	int fw_loading;
+-	u32 elapsed = 0;
++	int fw_loading_reg;
+ 
+-	while (elapsed <= timeout) {
+-		fw_loading = rd32(hw, GL_MNG_FWSM) & GL_MNG_FWSM_FW_LOADING_M;
++	if (!timeout)
++		return 0;
+ 
+-		/* firmware was not yet loaded, we have to wait more */
+-		if (fw_loading) {
+-			elapsed += 100;
+-			msleep(100);
+-			continue;
+-		}
++	fw_loading_reg = rd32(hw, GL_MNG_FWSM) & GL_MNG_FWSM_FW_LOADING_M;
++	/* notify the user only once if PHY FW is still loading */
++	if (fw_loading_reg)
++		dev_info(ice_hw_to_dev(hw), "Link initialization is blocked by PHY FW initialization. Link initialization will continue after PHY FW initialization completes.\n");
++	else
+ 		return 0;
+-	}
+ 
+-	return -ETIMEDOUT;
++	return rd32_poll_timeout(hw, GL_MNG_FWSM, fw_loading_reg,
++				 !(fw_loading_reg & GL_MNG_FWSM_FW_LOADING_M),
++				 10000, timeout * 1000);
+ }
+ 
+ static int __fwlog_send_cmd(void *priv, struct libie_aq_desc *desc, void *buf,
+@@ -1168,12 +1133,10 @@ int ice_init_hw(struct ice_hw *hw)
+ 	 * due to necessity of loading FW from an external source.
+ 	 * This can take even half a minute.
+ 	 */
+-	if (ice_is_pf_c827(hw)) {
+-		status = ice_wait_for_fw(hw, 30000);
+-		if (status) {
+-			dev_err(ice_hw_to_dev(hw), "ice_wait_for_fw timed out");
+-			goto err_unroll_fltr_mgmt_struct;
+-		}
++	status = ice_wait_fw_load(hw, 30000);
++	if (status) {
++		dev_err(ice_hw_to_dev(hw), "ice_wait_fw_load timed out");
++		goto err_unroll_fltr_mgmt_struct;
+ 	}
+ 
+ 	hw->lane_num = ice_get_phy_lane_number(hw);
