@@ -1,0 +1,190 @@
+From: Sean Christopherson <seanjc@google.com>
+Date: Fri, 2 Aug 2024 11:55:11 -0700
+Subject: KVM: selftests: Add a testcase for disabling feature MSRs init quirk
+Patch-mainline: v6.13-rc1
+Git-commit: 0581dfbad9542061406c40eccab9037e59ea62c8
+References: jsc#PED-15123
+
+Expand and rename the feature MSRs test to verify KVM's ABI and quirk
+for initializing feature MSRs.
+
+Exempt VM_CR{0,4}_FIXED1 from most tests as KVM intentionally takes full
+control of the MSRs, e.g. to prevent L1 from running L2 with bogus CR0
+and/or CR4 values.
+
+Link: https://lore.kernel.org/r/20240802185511.305849-10-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Acked-by: Carlos López <clopez@suse.de>
+---
+ tools/testing/selftests/kvm/Makefile                        |    2 
+ tools/testing/selftests/kvm/x86_64/feature_msrs_test.c      |  113 ++++++++++++
+ tools/testing/selftests/kvm/x86_64/get_msr_index_features.c |   35 ---
+ 3 files changed, 114 insertions(+), 36 deletions(-)
+ create mode 100644 tools/testing/selftests/kvm/x86_64/feature_msrs_test.c
+ delete mode 100644 tools/testing/selftests/kvm/x86_64/get_msr_index_features.c
+
+--- a/tools/testing/selftests/kvm/Makefile
++++ b/tools/testing/selftests/kvm/Makefile
+@@ -67,7 +67,7 @@ TEST_PROGS_x86_64 += x86_64/nx_huge_page
+ TEST_GEN_PROGS_x86_64 = x86_64/cpuid_test
+ TEST_GEN_PROGS_x86_64 += x86_64/cr4_cpuid_sync_test
+ TEST_GEN_PROGS_x86_64 += x86_64/dirty_log_page_splitting_test
+-TEST_GEN_PROGS_x86_64 += x86_64/get_msr_index_features
++TEST_GEN_PROGS_x86_64 += x86_64/feature_msrs_test
+ TEST_GEN_PROGS_x86_64 += x86_64/exit_on_emulation_failure_test
+ TEST_GEN_PROGS_x86_64 += x86_64/fix_hypercall_test
+ TEST_GEN_PROGS_x86_64 += x86_64/hwcr_msr_test
+--- /dev/null
++++ b/tools/testing/selftests/kvm/x86_64/feature_msrs_test.c
+@@ -0,0 +1,113 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (C) 2020, Red Hat, Inc.
++ */
++#include <fcntl.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/ioctl.h>
++
++#include "test_util.h"
++#include "kvm_util.h"
++#include "processor.h"
++
++static bool is_kvm_controlled_msr(uint32_t msr)
++{
++	return msr == MSR_IA32_VMX_CR0_FIXED1 || msr == MSR_IA32_VMX_CR4_FIXED1;
++}
++
++/*
++ * For VMX MSRs with a "true" variant, KVM requires userspace to set the "true"
++ * MSR, and doesn't allow setting the hidden version.
++ */
++static bool is_hidden_vmx_msr(uint32_t msr)
++{
++	switch (msr) {
++	case MSR_IA32_VMX_PINBASED_CTLS:
++	case MSR_IA32_VMX_PROCBASED_CTLS:
++	case MSR_IA32_VMX_EXIT_CTLS:
++	case MSR_IA32_VMX_ENTRY_CTLS:
++		return true;
++	default:
++		return false;
++	}
++}
++
++static bool is_quirked_msr(uint32_t msr)
++{
++	return msr != MSR_AMD64_DE_CFG;
++}
++
++static void test_feature_msr(uint32_t msr)
++{
++	const uint64_t supported_mask = kvm_get_feature_msr(msr);
++	uint64_t reset_value = is_quirked_msr(msr) ? supported_mask : 0;
++	struct kvm_vcpu *vcpu;
++	struct kvm_vm *vm;
++
++	/*
++	 * Don't bother testing KVM-controlled MSRs beyond verifying that the
++	 * MSR can be read from userspace.  Any value is effectively legal, as
++	 * KVM is bound by x86 architecture, not by ABI.
++	 */
++	if (is_kvm_controlled_msr(msr))
++		return;
++
++	/*
++	 * More goofy behavior.  KVM reports the host CPU's actual revision ID,
++	 * but initializes the vCPU's revision ID to an arbitrary value.
++	 */
++	if (msr == MSR_IA32_UCODE_REV)
++		reset_value = host_cpu_is_intel ? 0x100000000ULL : 0x01000065;
++
++	/*
++	 * For quirked MSRs, KVM's ABI is to initialize the vCPU's value to the
++	 * full set of features supported by KVM.  For non-quirked MSRs, and
++	 * when the quirk is disabled, KVM must zero-initialize the MSR and let
++	 * userspace do the configuration.
++	 */
++	vm = vm_create_with_one_vcpu(&vcpu, NULL);
++	TEST_ASSERT(vcpu_get_msr(vcpu, msr) == reset_value,
++		    "Wanted 0x%lx for %squirked MSR 0x%x, got 0x%lx",
++		    reset_value, is_quirked_msr(msr) ? "" : "non-", msr,
++		    vcpu_get_msr(vcpu, msr));
++	if (!is_hidden_vmx_msr(msr))
++		vcpu_set_msr(vcpu, msr, supported_mask);
++	kvm_vm_free(vm);
++
++	if (is_hidden_vmx_msr(msr))
++		return;
++
++	if (!kvm_has_cap(KVM_CAP_DISABLE_QUIRKS2) ||
++	    !(kvm_check_cap(KVM_CAP_DISABLE_QUIRKS2) & KVM_X86_QUIRK_STUFF_FEATURE_MSRS))
++		return;
++
++	vm = vm_create(1);
++	vm_enable_cap(vm, KVM_CAP_DISABLE_QUIRKS2, KVM_X86_QUIRK_STUFF_FEATURE_MSRS);
++
++	vcpu = vm_vcpu_add(vm, 0, NULL);
++	TEST_ASSERT(!vcpu_get_msr(vcpu, msr),
++		    "Quirk disabled, wanted '0' for MSR 0x%x, got 0x%lx",
++		    msr, vcpu_get_msr(vcpu, msr));
++	kvm_vm_free(vm);
++}
++
++int main(int argc, char *argv[])
++{
++	const struct kvm_msr_list *feature_list;
++	int i;
++
++	/*
++	 * Skip the entire test if MSR_FEATURES isn't supported, other tests
++	 * will cover the "regular" list of MSRs, the coverage here is purely
++	 * opportunistic and not interesting on its own.
++	 */
++	TEST_REQUIRE(kvm_has_cap(KVM_CAP_GET_MSR_FEATURES));
++
++	(void)kvm_get_msr_index_list();
++
++	feature_list = kvm_get_feature_msr_index_list();
++	for (i = 0; i < feature_list->nmsrs; i++)
++		test_feature_msr(feature_list->indices[i]);
++}
+--- a/tools/testing/selftests/kvm/x86_64/get_msr_index_features.c
++++ /dev/null
+@@ -1,35 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0
+-/*
+- * Test that KVM_GET_MSR_INDEX_LIST and
+- * KVM_GET_MSR_FEATURE_INDEX_LIST work as intended
+- *
+- * Copyright (C) 2020, Red Hat, Inc.
+- */
+-#include <fcntl.h>
+-#include <stdio.h>
+-#include <stdlib.h>
+-#include <string.h>
+-#include <sys/ioctl.h>
+-
+-#include "test_util.h"
+-#include "kvm_util.h"
+-#include "processor.h"
+-
+-int main(int argc, char *argv[])
+-{
+-	const struct kvm_msr_list *feature_list;
+-	int i;
+-
+-	/*
+-	 * Skip the entire test if MSR_FEATURES isn't supported, other tests
+-	 * will cover the "regular" list of MSRs, the coverage here is purely
+-	 * opportunistic and not interesting on its own.
+-	 */
+-	TEST_REQUIRE(kvm_has_cap(KVM_CAP_GET_MSR_FEATURES));
+-
+-	(void)kvm_get_msr_index_list();
+-
+-	feature_list = kvm_get_feature_msr_index_list();
+-	for (i = 0; i < feature_list->nmsrs; i++)
+-		kvm_get_feature_msr(feature_list->indices[i]);
+-}
