@@ -1,0 +1,134 @@
+From: YiFei Zhu <zhuyifei@google.com>
+Date: Tue, 23 Dec 2025 19:46:46 +0000
+Subject: idpf: export RX hardware timestamping information to XDP
+Patch-mainline: v7.0-rc1
+Git-commit: 13a4be41261f7ab8d705f20d9f10652ac1e087c0
+References: jsc#PED-14403
+
+The logic is similar to idpf_rx_hwtstamp, but the data is exported
+as a BPF kfunc instead of appended to an skb to support grabbing
+timestamps in xsk packets.
+
+A idpf_queue_has(PTP, rxq) condition is added to check the queue
+supports PTP similar to idpf_rx_process_skb_fields.
+
+Tested using an xsk connection and checking xdp timestamps are
+retrievable in received packets.
+
+Cc: intel-wired-lan@lists.osuosl.org
+Signed-off-by: YiFei Zhu <zhuyifei@google.com>
+Signed-off-by: Mina Almasry <almasrymina@google.com>
+Reviewed-by: Aleksandr Loktionov <aleksandr.loktionov@intel.com>
+Reviewed-by: Alexander Lobakin <aleksander.lobakin@intel.com>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/idpf/xdp.c |   31 +++++++++++++++++++++++++++++++
+ drivers/net/ethernet/intel/idpf/xdp.h |   20 ++++++++++++++++++++
+ 2 files changed, 51 insertions(+)
+
+--- a/drivers/net/ethernet/intel/idpf/xdp.c
++++ b/drivers/net/ethernet/intel/idpf/xdp.c
+@@ -2,6 +2,7 @@
+ /* Copyright (C) 2025 Intel Corporation */
+ 
+ #include "idpf.h"
++#include "idpf_ptp.h"
+ #include "idpf_virtchnl.h"
+ #include "xdp.h"
+ #include "xsk.h"
+@@ -398,8 +399,38 @@ static int idpf_xdpmo_rx_hash(const stru
+ 				    pt);
+ }
+ 
++static int idpf_xdpmo_rx_timestamp(const struct xdp_md *ctx, u64 *timestamp)
++{
++	const struct libeth_xdp_buff *xdp = (typeof(xdp))ctx;
++	struct idpf_xdp_rx_desc desc __uninitialized;
++	const struct idpf_rx_queue *rxq;
++	u64 cached_time, ts_ns;
++	u32 ts_high;
++
++	rxq = libeth_xdp_buff_to_rq(xdp, typeof(*rxq), xdp_rxq);
++
++	if (!idpf_queue_has(PTP, rxq))
++		return -ENODATA;
++
++	idpf_xdp_get_qw1(&desc, xdp->desc);
++
++	if (!(idpf_xdp_rx_ts_low(&desc) & VIRTCHNL2_RX_FLEX_TSTAMP_VALID))
++		return -ENODATA;
++
++	cached_time = READ_ONCE(rxq->cached_phc_time);
++
++	idpf_xdp_get_qw3(&desc, xdp->desc);
++
++	ts_high = idpf_xdp_rx_ts_high(&desc);
++	ts_ns = idpf_ptp_tstamp_extend_32b_to_64b(cached_time, ts_high);
++
++	*timestamp = ts_ns;
++	return 0;
++}
++
+ static const struct xdp_metadata_ops idpf_xdpmo = {
+ 	.xmo_rx_hash		= idpf_xdpmo_rx_hash,
++	.xmo_rx_timestamp	= idpf_xdpmo_rx_timestamp,
+ };
+ 
+ void idpf_xdp_set_features(const struct idpf_vport *vport)
+--- a/drivers/net/ethernet/intel/idpf/xdp.h
++++ b/drivers/net/ethernet/intel/idpf/xdp.h
+@@ -112,11 +112,13 @@ struct idpf_xdp_rx_desc {
+ 	aligned_u64		qw1;
+ #define IDPF_XDP_RX_BUF		GENMASK_ULL(47, 32)
+ #define IDPF_XDP_RX_EOP		BIT_ULL(1)
++#define IDPF_XDP_RX_TS_LOW	GENMASK_ULL(31, 24)
+ 
+ 	aligned_u64		qw2;
+ #define IDPF_XDP_RX_HASH	GENMASK_ULL(31, 0)
+ 
+ 	aligned_u64		qw3;
++#define IDPF_XDP_RX_TS_HIGH	GENMASK_ULL(63, 32)
+ } __aligned(4 * sizeof(u64));
+ static_assert(sizeof(struct idpf_xdp_rx_desc) ==
+ 	      sizeof(struct virtchnl2_rx_flex_desc_adv_nic_3));
+@@ -128,6 +130,8 @@ static_assert(sizeof(struct idpf_xdp_rx_
+ #define idpf_xdp_rx_buf(desc)	FIELD_GET(IDPF_XDP_RX_BUF, (desc)->qw1)
+ #define idpf_xdp_rx_eop(desc)	!!((desc)->qw1 & IDPF_XDP_RX_EOP)
+ #define idpf_xdp_rx_hash(desc)	FIELD_GET(IDPF_XDP_RX_HASH, (desc)->qw2)
++#define idpf_xdp_rx_ts_low(desc)	FIELD_GET(IDPF_XDP_RX_TS_LOW, (desc)->qw1)
++#define idpf_xdp_rx_ts_high(desc)	FIELD_GET(IDPF_XDP_RX_TS_HIGH, (desc)->qw3)
+ 
+ static inline void
+ idpf_xdp_get_qw0(struct idpf_xdp_rx_desc *desc,
+@@ -149,6 +153,9 @@ idpf_xdp_get_qw1(struct idpf_xdp_rx_desc
+ 	desc->qw1 = ((const typeof(desc))rxd)->qw1;
+ #else
+ 	desc->qw1 = ((u64)le16_to_cpu(rxd->buf_id) << 32) |
++		    ((u64)rxd->ts_low << 24) |
++		    ((u64)rxd->fflags1 << 16) |
++		    ((u64)rxd->status_err1 << 8) |
+ 		    rxd->status_err0_qw1;
+ #endif
+ }
+@@ -166,6 +173,19 @@ idpf_xdp_get_qw2(struct idpf_xdp_rx_desc
+ #endif
+ }
+ 
++static inline void
++idpf_xdp_get_qw3(struct idpf_xdp_rx_desc *desc,
++		 const struct virtchnl2_rx_flex_desc_adv_nic_3 *rxd)
++{
++#ifdef __LIBETH_WORD_ACCESS
++	desc->qw3 = ((const typeof(desc))rxd)->qw3;
++#else
++	desc->qw3 = ((u64)le32_to_cpu(rxd->ts_high) << 32) |
++		    ((u64)le16_to_cpu(rxd->fmd6) << 16) |
++		    le16_to_cpu(rxd->l2tag1);
++#endif
++}
++
+ void idpf_xdp_set_features(const struct idpf_vport *vport);
+ 
+ int idpf_xdp(struct net_device *dev, struct netdev_bpf *xdp);

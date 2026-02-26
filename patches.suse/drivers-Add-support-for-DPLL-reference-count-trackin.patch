@@ -1,0 +1,352 @@
+From: Ivan Vecera <ivecera@redhat.com>
+Date: Tue, 3 Feb 2026 18:40:01 +0100
+Subject: drivers: Add support for DPLL reference count tracking
+Patch-mainline: v7.0-rc1
+Git-commit: 085ca5d2017116ce3102eafa760ee8eb91fb1eeb
+References: jsc#PED-13387 jsc#PED-15027
+
+Update existing DPLL drivers to utilize the DPLL reference count
+tracking infrastructure.
+
+Add dpll_tracker fields to the drivers' internal device and pin
+structures. Pass pointers to these trackers when calling
+dpll_device_get/put() and dpll_pin_get/put().
+
+This allows developers to inspect the specific references held by this
+driver via debugfs when CONFIG_DPLL_REFCNT_TRACKER is enabled, aiding
+in the debugging of resource leaks.
+
+Reviewed-by: Aleksandr Loktionov <aleksandr.loktionov@intel.com>
+Signed-off-by: Ivan Vecera <ivecera@redhat.com>
+Reviewed-by: Arkadiusz Kubalewski <arkadiusz.kubalewski@intel.com>
+Link: https://patch.msgid.link/20260203174002.705176-9-ivecera@redhat.com
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/dpll/zl3073x/dpll.c                    |   14 ++++++++------
+ drivers/dpll/zl3073x/dpll.h                    |    2 ++
+ drivers/net/ethernet/intel/ice/ice_dpll.c      |   15 ++++++++-------
+ drivers/net/ethernet/intel/ice/ice_dpll.h      |    4 ++++
+ drivers/net/ethernet/mellanox/mlx5/core/dpll.c |   15 +++++++++------
+ drivers/ptp/ptp_ocp.c                          |   17 ++++++++++-------
+ 6 files changed, 41 insertions(+), 26 deletions(-)
+
+--- a/drivers/dpll/zl3073x/dpll.c
++++ b/drivers/dpll/zl3073x/dpll.c
+@@ -29,6 +29,7 @@
+  * @list: this DPLL pin list entry
+  * @dpll: DPLL the pin is registered to
+  * @dpll_pin: pointer to registered dpll_pin
++ * @tracker: tracking object for the acquired reference
+  * @label: package label
+  * @dir: pin direction
+  * @id: pin id
+@@ -44,6 +45,7 @@ struct zl3073x_dpll_pin {
+ 	struct list_head	list;
+ 	struct zl3073x_dpll	*dpll;
+ 	struct dpll_pin		*dpll_pin;
++	dpll_tracker		tracker;
+ 	char			label[8];
+ 	enum dpll_pin_direction	dir;
+ 	u8			id;
+@@ -1480,7 +1482,7 @@ zl3073x_dpll_pin_register(struct zl3073x
+ 
+ 	/* Create or get existing DPLL pin */
+ 	pin->dpll_pin = dpll_pin_get(zldpll->dev->clock_id, index, THIS_MODULE,
+-				     &props->dpll_props, NULL);
++				     &props->dpll_props, &pin->tracker);
+ 	if (IS_ERR(pin->dpll_pin)) {
+ 		rc = PTR_ERR(pin->dpll_pin);
+ 		goto err_pin_get;
+@@ -1503,7 +1505,7 @@ zl3073x_dpll_pin_register(struct zl3073x
+ 	return 0;
+ 
+ err_register:
+-	dpll_pin_put(pin->dpll_pin, NULL);
++	dpll_pin_put(pin->dpll_pin, &pin->tracker);
+ err_prio_get:
+ 	pin->dpll_pin = NULL;
+ err_pin_get:
+@@ -1534,7 +1536,7 @@ zl3073x_dpll_pin_unregister(struct zl307
+ 	/* Unregister the pin */
+ 	dpll_pin_unregister(zldpll->dpll_dev, pin->dpll_pin, ops, pin);
+ 
+-	dpll_pin_put(pin->dpll_pin, NULL);
++	dpll_pin_put(pin->dpll_pin, &pin->tracker);
+ 	pin->dpll_pin = NULL;
+ }
+ 
+@@ -1708,7 +1710,7 @@ zl3073x_dpll_device_register(struct zl30
+ 				       dpll_mode_refsel);
+ 
+ 	zldpll->dpll_dev = dpll_device_get(zldev->clock_id, zldpll->id,
+-					   THIS_MODULE, NULL);
++					   THIS_MODULE, &zldpll->tracker);
+ 	if (IS_ERR(zldpll->dpll_dev)) {
+ 		rc = PTR_ERR(zldpll->dpll_dev);
+ 		zldpll->dpll_dev = NULL;
+@@ -1720,7 +1722,7 @@ zl3073x_dpll_device_register(struct zl30
+ 				  zl3073x_prop_dpll_type_get(zldev, zldpll->id),
+ 				  &zl3073x_dpll_device_ops, zldpll);
+ 	if (rc) {
+-		dpll_device_put(zldpll->dpll_dev, NULL);
++		dpll_device_put(zldpll->dpll_dev, &zldpll->tracker);
+ 		zldpll->dpll_dev = NULL;
+ 	}
+ 
+@@ -1743,7 +1745,7 @@ zl3073x_dpll_device_unregister(struct zl
+ 
+ 	dpll_device_unregister(zldpll->dpll_dev, &zl3073x_dpll_device_ops,
+ 			       zldpll);
+-	dpll_device_put(zldpll->dpll_dev, NULL);
++	dpll_device_put(zldpll->dpll_dev, &zldpll->tracker);
+ 	zldpll->dpll_dev = NULL;
+ }
+ 
+--- a/drivers/dpll/zl3073x/dpll.h
++++ b/drivers/dpll/zl3073x/dpll.h
+@@ -18,6 +18,7 @@
+  * @check_count: periodic check counter
+  * @phase_monitor: is phase offset monitor enabled
+  * @dpll_dev: pointer to registered DPLL device
++ * @tracker: tracking object for the acquired reference
+  * @lock_status: last saved DPLL lock status
+  * @pins: list of pins
+  * @change_work: device change notification work
+@@ -31,6 +32,7 @@ struct zl3073x_dpll {
+ 	u8				check_count;
+ 	bool				phase_monitor;
+ 	struct dpll_device		*dpll_dev;
++	dpll_tracker			tracker;
+ 	enum dpll_lock_status		lock_status;
+ 	struct list_head		pins;
+ 	struct work_struct		change_work;
+--- a/drivers/net/ethernet/intel/ice/ice_dpll.c
++++ b/drivers/net/ethernet/intel/ice/ice_dpll.c
+@@ -2814,7 +2814,7 @@ static void ice_dpll_release_pins(struct
+ 	int i;
+ 
+ 	for (i = 0; i < count; i++)
+-		dpll_pin_put(pins[i].pin, NULL);
++		dpll_pin_put(pins[i].pin, &pins[i].tracker);
+ }
+ 
+ /**
+@@ -2840,7 +2840,7 @@ ice_dpll_get_pins(struct ice_pf *pf, str
+ 
+ 	for (i = 0; i < count; i++) {
+ 		pins[i].pin = dpll_pin_get(clock_id, i + start_idx, THIS_MODULE,
+-					   &pins[i].prop, NULL);
++					   &pins[i].prop, &pins[i].tracker);
+ 		if (IS_ERR(pins[i].pin)) {
+ 			ret = PTR_ERR(pins[i].pin);
+ 			goto release_pins;
+@@ -2851,7 +2851,7 @@ ice_dpll_get_pins(struct ice_pf *pf, str
+ 
+ release_pins:
+ 	while (--i >= 0)
+-		dpll_pin_put(pins[i].pin, NULL);
++		dpll_pin_put(pins[i].pin, &pins[i].tracker);
+ 	return ret;
+ }
+ 
+@@ -3037,7 +3037,7 @@ static void ice_dpll_deinit_rclk_pin(str
+ 	if (WARN_ON_ONCE(!vsi || !vsi->netdev))
+ 		return;
+ 	dpll_netdev_pin_clear(vsi->netdev);
+-	dpll_pin_put(rclk->pin, NULL);
++	dpll_pin_put(rclk->pin, &rclk->tracker);
+ }
+ 
+ /**
+@@ -3247,7 +3247,7 @@ ice_dpll_deinit_dpll(struct ice_pf *pf,
+ {
+ 	if (cgu)
+ 		dpll_device_unregister(d->dpll, d->ops, d);
+-	dpll_device_put(d->dpll, NULL);
++	dpll_device_put(d->dpll, &d->tracker);
+ }
+ 
+ /**
+@@ -3271,7 +3271,8 @@ ice_dpll_init_dpll(struct ice_pf *pf, st
+ 	u64 clock_id = pf->dplls.clock_id;
+ 	int ret;
+ 
+-	d->dpll = dpll_device_get(clock_id, d->dpll_idx, THIS_MODULE, NULL);
++	d->dpll = dpll_device_get(clock_id, d->dpll_idx, THIS_MODULE,
++				  &d->tracker);
+ 	if (IS_ERR(d->dpll)) {
+ 		ret = PTR_ERR(d->dpll);
+ 		dev_err(ice_pf_to_dev(pf),
+@@ -3287,7 +3288,7 @@ ice_dpll_init_dpll(struct ice_pf *pf, st
+ 		ice_dpll_update_state(pf, d, true);
+ 		ret = dpll_device_register(d->dpll, type, ops, d);
+ 		if (ret) {
+-			dpll_device_put(d->dpll, NULL);
++			dpll_device_put(d->dpll, &d->tracker);
+ 			return ret;
+ 		}
+ 		d->ops = ops;
+--- a/drivers/net/ethernet/intel/ice/ice_dpll.h
++++ b/drivers/net/ethernet/intel/ice/ice_dpll.h
+@@ -23,6 +23,7 @@ enum ice_dpll_pin_sw {
+ /** ice_dpll_pin - store info about pins
+  * @pin: dpll pin structure
+  * @pf: pointer to pf, which has registered the dpll_pin
++ * @tracker: reference count tracker
+  * @idx: ice pin private idx
+  * @num_parents: hols number of parent pins
+  * @parent_idx: hold indexes of parent pins
+@@ -37,6 +38,7 @@ enum ice_dpll_pin_sw {
+ struct ice_dpll_pin {
+ 	struct dpll_pin *pin;
+ 	struct ice_pf *pf;
++	dpll_tracker tracker;
+ 	u8 idx;
+ 	u8 num_parents;
+ 	u8 parent_idx[ICE_DPLL_RCLK_NUM_MAX];
+@@ -58,6 +60,7 @@ struct ice_dpll_pin {
+ /** ice_dpll - store info required for DPLL control
+  * @dpll: pointer to dpll dev
+  * @pf: pointer to pf, which has registered the dpll_device
++ * @tracker: reference count tracker
+  * @dpll_idx: index of dpll on the NIC
+  * @input_idx: currently selected input index
+  * @prev_input_idx: previously selected input index
+@@ -76,6 +79,7 @@ struct ice_dpll_pin {
+ struct ice_dpll {
+ 	struct dpll_device *dpll;
+ 	struct ice_pf *pf;
++	dpll_tracker tracker;
+ 	u8 dpll_idx;
+ 	u8 input_idx;
+ 	u8 prev_input_idx;
+--- a/drivers/net/ethernet/mellanox/mlx5/core/dpll.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/dpll.c
+@@ -9,7 +9,9 @@
+  */
+ struct mlx5_dpll {
+ 	struct dpll_device *dpll;
++	dpll_tracker dpll_tracker;
+ 	struct dpll_pin *dpll_pin;
++	dpll_tracker pin_tracker;
+ 	struct mlx5_core_dev *mdev;
+ 	struct workqueue_struct *wq;
+ 	struct delayed_work work;
+@@ -438,7 +440,8 @@ static int mlx5_dpll_probe(struct auxili
+ 	auxiliary_set_drvdata(adev, mdpll);
+ 
+ 	/* Multiple mdev instances might share one DPLL device. */
+-	mdpll->dpll = dpll_device_get(clock_id, 0, THIS_MODULE, NULL);
++	mdpll->dpll = dpll_device_get(clock_id, 0, THIS_MODULE,
++				      &mdpll->dpll_tracker);
+ 	if (IS_ERR(mdpll->dpll)) {
+ 		err = PTR_ERR(mdpll->dpll);
+ 		goto err_free_mdpll;
+@@ -452,7 +455,7 @@ static int mlx5_dpll_probe(struct auxili
+ 	/* Multiple mdev instances might share one DPLL pin. */
+ 	mdpll->dpll_pin = dpll_pin_get(clock_id, mlx5_get_dev_index(mdev),
+ 				       THIS_MODULE, &mlx5_dpll_pin_properties,
+-				       NULL);
++				       &mdpll->pin_tracker);
+ 	if (IS_ERR(mdpll->dpll_pin)) {
+ 		err = PTR_ERR(mdpll->dpll_pin);
+ 		goto err_unregister_dpll_device;
+@@ -480,11 +483,11 @@ err_unregister_dpll_pin:
+ 	dpll_pin_unregister(mdpll->dpll, mdpll->dpll_pin,
+ 			    &mlx5_dpll_pins_ops, mdpll);
+ err_put_dpll_pin:
+-	dpll_pin_put(mdpll->dpll_pin, NULL);
++	dpll_pin_put(mdpll->dpll_pin, &mdpll->pin_tracker);
+ err_unregister_dpll_device:
+ 	dpll_device_unregister(mdpll->dpll, &mlx5_dpll_device_ops, mdpll);
+ err_put_dpll_device:
+-	dpll_device_put(mdpll->dpll, NULL);
++	dpll_device_put(mdpll->dpll, &mdpll->dpll_tracker);
+ err_free_mdpll:
+ 	kfree(mdpll);
+ 	return err;
+@@ -500,9 +503,9 @@ static void mlx5_dpll_remove(struct auxi
+ 	destroy_workqueue(mdpll->wq);
+ 	dpll_pin_unregister(mdpll->dpll, mdpll->dpll_pin,
+ 			    &mlx5_dpll_pins_ops, mdpll);
+-	dpll_pin_put(mdpll->dpll_pin, NULL);
++	dpll_pin_put(mdpll->dpll_pin, &mdpll->pin_tracker);
+ 	dpll_device_unregister(mdpll->dpll, &mlx5_dpll_device_ops, mdpll);
+-	dpll_device_put(mdpll->dpll, NULL);
++	dpll_device_put(mdpll->dpll, &mdpll->dpll_tracker);
+ 	kfree(mdpll);
+ 
+ 	mlx5_dpll_synce_status_set(mdev,
+--- a/drivers/ptp/ptp_ocp.c
++++ b/drivers/ptp/ptp_ocp.c
+@@ -286,6 +286,7 @@ struct ptp_ocp_sma_connector {
+ 	u8	default_fcn;
+ 	struct dpll_pin		   *dpll_pin;
+ 	struct dpll_pin_properties dpll_prop;
++	dpll_tracker		   tracker;
+ };
+ 
+ struct ocp_attr_group {
+@@ -384,6 +385,7 @@ struct ptp_ocp {
+ 	struct ptp_ocp_sma_connector sma[OCP_SMA_NUM];
+ 	const struct ocp_sma_op *sma_op;
+ 	struct dpll_device *dpll;
++	dpll_tracker tracker;
+ 	int signals_nr;
+ 	int freq_in_nr;
+ };
+@@ -4799,7 +4801,7 @@ ptp_ocp_probe(struct pci_dev *pdev, cons
+ 	devlink_register(devlink);
+ 
+ 	clkid = pci_get_dsn(pdev);
+-	bp->dpll = dpll_device_get(clkid, 0, THIS_MODULE, NULL);
++	bp->dpll = dpll_device_get(clkid, 0, THIS_MODULE, &bp->tracker);
+ 	if (IS_ERR(bp->dpll)) {
+ 		err = PTR_ERR(bp->dpll);
+ 		dev_err(&pdev->dev, "dpll_device_alloc failed\n");
+@@ -4812,7 +4814,8 @@ ptp_ocp_probe(struct pci_dev *pdev, cons
+ 
+ 	for (i = 0; i < OCP_SMA_NUM; i++) {
+ 		bp->sma[i].dpll_pin = dpll_pin_get(clkid, i, THIS_MODULE,
+-						   &bp->sma[i].dpll_prop, NULL);
++						   &bp->sma[i].dpll_prop,
++						   &bp->sma[i].tracker);
+ 		if (IS_ERR(bp->sma[i].dpll_pin)) {
+ 			err = PTR_ERR(bp->sma[i].dpll_pin);
+ 			goto out_dpll;
+@@ -4821,7 +4824,7 @@ ptp_ocp_probe(struct pci_dev *pdev, cons
+ 		err = dpll_pin_register(bp->dpll, bp->sma[i].dpll_pin, &dpll_pins_ops,
+ 					&bp->sma[i]);
+ 		if (err) {
+-			dpll_pin_put(bp->sma[i].dpll_pin, NULL);
++			dpll_pin_put(bp->sma[i].dpll_pin, &bp->sma[i].tracker);
+ 			goto out_dpll;
+ 		}
+ 	}
+@@ -4832,9 +4835,9 @@ out_dpll:
+ 	while (i) {
+ 		--i;
+ 		dpll_pin_unregister(bp->dpll, bp->sma[i].dpll_pin, &dpll_pins_ops, &bp->sma[i]);
+-		dpll_pin_put(bp->sma[i].dpll_pin, NULL);
++		dpll_pin_put(bp->sma[i].dpll_pin, &bp->sma[i].tracker);
+ 	}
+-	dpll_device_put(bp->dpll, NULL);
++	dpll_device_put(bp->dpll, &bp->tracker);
+ out:
+ 	ptp_ocp_detach(bp);
+ out_disable:
+@@ -4855,11 +4858,11 @@ ptp_ocp_remove(struct pci_dev *pdev)
+ 	for (i = 0; i < OCP_SMA_NUM; i++) {
+ 		if (bp->sma[i].dpll_pin) {
+ 			dpll_pin_unregister(bp->dpll, bp->sma[i].dpll_pin, &dpll_pins_ops, &bp->sma[i]);
+-			dpll_pin_put(bp->sma[i].dpll_pin, NULL);
++			dpll_pin_put(bp->sma[i].dpll_pin, &bp->sma[i].tracker);
+ 		}
+ 	}
+ 	dpll_device_unregister(bp->dpll, &dpll_ops, bp);
+-	dpll_device_put(bp->dpll, NULL);
++	dpll_device_put(bp->dpll, &bp->tracker);
+ 	devlink_unregister(devlink);
+ 	ptp_ocp_detach(bp);
+ 	pci_disable_device(pdev);

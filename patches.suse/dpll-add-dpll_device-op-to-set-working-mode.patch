@@ -1,0 +1,119 @@
+From: Ivan Vecera <ivecera@redhat.com>
+Date: Wed, 14 Jan 2026 13:27:25 +0100
+Subject: dpll: add dpll_device op to set working mode
+Patch-mainline: v7.0-rc1
+Git-commit: e3f6c65192fe484ab16f0be2b495ceef5ca3b85c
+References: jsc#PED-13387 jsc#PED-15027
+
+Currently, userspace can retrieve the DPLL working mode but cannot
+configure it. This prevents changing the device operation, such as
+switching from manual to automatic mode and vice versa.
+
+Add a new callback .mode_set() to struct dpll_device_ops. Extend
+the netlink policy and device-set command handling to process
+the DPLL_A_MODE attribute.  Update the netlink YAML specification
+to include the mode attribute in the device-set operation.
+
+Reviewed-by: Vadim Fedorenko <vadim.fedorenko@linux.dev>
+Signed-off-by: Ivan Vecera <ivecera@redhat.com>
+Link: https://patch.msgid.link/20260114122726.120303-3-ivecera@redhat.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ Documentation/netlink/specs/dpll.yaml |    1 
+ drivers/dpll/dpll_netlink.c           |   44 ++++++++++++++++++++++++++++++++++
+ drivers/dpll/dpll_nl.c                |    1 
+ include/linux/dpll.h                  |    2 +
+ 4 files changed, 48 insertions(+)
+
+--- a/Documentation/netlink/specs/dpll.yaml
++++ b/Documentation/netlink/specs/dpll.yaml
+@@ -550,6 +550,7 @@ operations:
+         request:
+           attributes:
+             - id
++            - mode
+             - phase-offset-monitor
+             - phase-offset-avg-factor
+     -
+--- a/drivers/dpll/dpll_netlink.c
++++ b/drivers/dpll/dpll_netlink.c
+@@ -854,6 +854,45 @@ int dpll_pin_change_ntf(struct dpll_pin
+ EXPORT_SYMBOL_GPL(dpll_pin_change_ntf);
+ 
+ static int
++dpll_mode_set(struct dpll_device *dpll, struct nlattr *a,
++	      struct netlink_ext_ack *extack)
++{
++	const struct dpll_device_ops *ops = dpll_device_ops(dpll);
++	DECLARE_BITMAP(modes, DPLL_MODE_MAX + 1) = { 0 };
++	enum dpll_mode mode = nla_get_u32(a), old_mode;
++	int ret;
++
++	if (!(ops->mode_set && ops->supported_modes_get)) {
++		NL_SET_ERR_MSG_ATTR(extack, a,
++				    "dpll device does not support mode switch");
++		return -EOPNOTSUPP;
++	}
++
++	ret = ops->mode_get(dpll, dpll_priv(dpll), &old_mode, extack);
++	if (ret) {
++		NL_SET_ERR_MSG(extack, "unable to get current mode");
++		return ret;
++	}
++
++	if (mode == old_mode)
++		return 0;
++
++	ret = ops->supported_modes_get(dpll, dpll_priv(dpll), modes, extack);
++	if (ret) {
++		NL_SET_ERR_MSG(extack, "unable to get supported modes");
++		return ret;
++	}
++
++	if (!test_bit(mode, modes)) {
++		NL_SET_ERR_MSG(extack,
++			       "dpll device does not support requested mode");
++		return -EINVAL;
++	}
++
++	return ops->mode_set(dpll, dpll_priv(dpll), mode, extack);
++}
++
++static int
+ dpll_phase_offset_monitor_set(struct dpll_device *dpll, struct nlattr *a,
+ 			      struct netlink_ext_ack *extack)
+ {
+@@ -1808,6 +1847,11 @@ dpll_set_from_nlattr(struct dpll_device
+ 	nla_for_each_attr(a, genlmsg_data(info->genlhdr),
+ 			  genlmsg_len(info->genlhdr), rem) {
+ 		switch (nla_type(a)) {
++		case DPLL_A_MODE:
++			ret = dpll_mode_set(dpll, a, info->extack);
++			if (ret)
++				return ret;
++			break;
+ 		case DPLL_A_PHASE_OFFSET_MONITOR:
+ 			ret = dpll_phase_offset_monitor_set(dpll, a,
+ 							    info->extack);
+--- a/drivers/dpll/dpll_nl.c
++++ b/drivers/dpll/dpll_nl.c
+@@ -44,6 +44,7 @@ static const struct nla_policy dpll_devi
+ /* DPLL_CMD_DEVICE_SET - do */
+ static const struct nla_policy dpll_device_set_nl_policy[DPLL_A_PHASE_OFFSET_AVG_FACTOR + 1] = {
+ 	[DPLL_A_ID] = { .type = NLA_U32, },
++	[DPLL_A_MODE] = NLA_POLICY_RANGE(NLA_U32, 1, 2),
+ 	[DPLL_A_PHASE_OFFSET_MONITOR] = NLA_POLICY_MAX(NLA_U32, 1),
+ 	[DPLL_A_PHASE_OFFSET_AVG_FACTOR] = { .type = NLA_U32, },
+ };
+--- a/include/linux/dpll.h
++++ b/include/linux/dpll.h
+@@ -20,6 +20,8 @@ struct dpll_pin_esync;
+ struct dpll_device_ops {
+ 	int (*mode_get)(const struct dpll_device *dpll, void *dpll_priv,
+ 			enum dpll_mode *mode, struct netlink_ext_ack *extack);
++	int (*mode_set)(const struct dpll_device *dpll, void *dpll_priv,
++			enum dpll_mode mode, struct netlink_ext_ack *extack);
+ 	int (*supported_modes_get)(const struct dpll_device *dpll,
+ 				   void *dpll_priv, unsigned long *modes,
+ 				   struct netlink_ext_ack *extack);
