@@ -1,0 +1,414 @@
+From: Jacob Keller <jacob.e.keller@intel.com>
+Date: Thu, 20 Nov 2025 12:20:46 -0800
+Subject: ice: convert all ring stats to u64_stats_t
+Patch-mainline: v7.0-rc1
+Git-commit: b38a418db3660d3c9b36bbeb54cbffe096123573
+References: jsc#PED-14404 jsc#PED-15079
+
+After several cleanups, the ice driver is now finally ready to convert all
+Tx and Rx ring stats to the u64_stats_t and proper use of the u64 stats
+APIs.
+
+The final remaining part to cleanup is the VSI stats accumulation logic in
+ice_update_vsi_ring_stats().
+
+Refactor the function and its helpers so that all stat values (and not
+just pkts and bytes) use the u64_stats APIs. The
+ice_fetch_u64_(tx|rx)_stats functions read the stat values using
+u64_stats_read and then copy them into local ice_vsi_(tx|rx)_stats
+structures. This does require making a new struct with the stat fields as
+u64.
+
+The ice_update_vsi_(tx|rx)_ring_stats functions call the fetch functions
+per ring and accumulate the result into one copy of the struct. This
+accumulated total is then used to update the relevant VSI fields.
+
+Since these are relatively small, the contents are all stored on the stack
+rather than allocating and freeing memory.
+
+Once the accumulator side is updated, the helper ice_stats_read and
+ice_stats_inc and other related helper functions all easily translate to
+use of u64_stats_read and u64_stats_inc. This completes the refactor and
+ensures that all stats accesses now make proper use of the API.
+
+Reviewed-by: Aleksandr Loktionov <aleksandr.loktionov@intel.com>
+Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Tested-by: Rinitha S <sx.rinitha@intel.com> (A Contingent worker at Intel)
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/ice/ice_lib.c  |   29 +---
+ drivers/net/ethernet/intel/ice/ice_main.c |  180 ++++++++++++++++++++----------
+ drivers/net/ethernet/intel/ice/ice_txrx.h |   28 +++-
+ 3 files changed, 147 insertions(+), 90 deletions(-)
+
+--- a/drivers/net/ethernet/intel/ice/ice_lib.c
++++ b/drivers/net/ethernet/intel/ice/ice_lib.c
+@@ -3435,21 +3435,6 @@ out:
+ }
+ 
+ /**
+- * ice_update_ring_stats - Update ring statistics
+- * @stats: stats to be updated
+- * @pkts: number of processed packets
+- * @bytes: number of processed bytes
+- *
+- * This function assumes that caller has acquired a u64_stats_sync lock.
+- */
+-static void ice_update_ring_stats(struct ice_ring_stats *stats,
+-				  u64 pkts, u64 bytes)
+-{
+-	stats->bytes += bytes;
+-	stats->pkts += pkts;
+-}
+-
+-/**
+  * ice_update_tx_ring_stats - Update Tx ring specific counters
+  * @tx_ring: ring to update
+  * @pkts: number of processed packets
+@@ -3458,7 +3443,8 @@ static void ice_update_ring_stats(struct
+ void ice_update_tx_ring_stats(struct ice_tx_ring *tx_ring, u64 pkts, u64 bytes)
+ {
+ 	u64_stats_update_begin(&tx_ring->ring_stats->syncp);
+-	ice_update_ring_stats(tx_ring->ring_stats, pkts, bytes);
++	u64_stats_add(&tx_ring->ring_stats->pkts, pkts);
++	u64_stats_add(&tx_ring->ring_stats->bytes, bytes);
+ 	u64_stats_update_end(&tx_ring->ring_stats->syncp);
+ }
+ 
+@@ -3471,7 +3457,8 @@ void ice_update_tx_ring_stats(struct ice
+ void ice_update_rx_ring_stats(struct ice_rx_ring *rx_ring, u64 pkts, u64 bytes)
+ {
+ 	u64_stats_update_begin(&rx_ring->ring_stats->syncp);
+-	ice_update_ring_stats(rx_ring->ring_stats, pkts, bytes);
++	u64_stats_add(&rx_ring->ring_stats->pkts, pkts);
++	u64_stats_add(&rx_ring->ring_stats->bytes, bytes);
+ 	u64_stats_update_end(&rx_ring->ring_stats->syncp);
+ }
+ 
+@@ -3488,8 +3475,8 @@ void ice_fetch_tx_ring_stats(const struc
+ 
+ 	do  {
+ 		start = u64_stats_fetch_begin(&ring->ring_stats->syncp);
+-		*pkts = ring->ring_stats->pkts;
+-		*bytes = ring->ring_stats->bytes;
++		*pkts = u64_stats_read(&ring->ring_stats->pkts);
++		*bytes = u64_stats_read(&ring->ring_stats->bytes);
+ 	} while (u64_stats_fetch_retry(&ring->ring_stats->syncp, start));
+ }
+ 
+@@ -3506,8 +3493,8 @@ void ice_fetch_rx_ring_stats(const struc
+ 
+ 	do  {
+ 		start = u64_stats_fetch_begin(&ring->ring_stats->syncp);
+-		*pkts = ring->ring_stats->pkts;
+-		*bytes = ring->ring_stats->bytes;
++		*pkts = u64_stats_read(&ring->ring_stats->pkts);
++		*bytes = u64_stats_read(&ring->ring_stats->bytes);
+ 	} while (u64_stats_fetch_retry(&ring->ring_stats->syncp, start));
+ }
+ 
+--- a/drivers/net/ethernet/intel/ice/ice_main.c
++++ b/drivers/net/ethernet/intel/ice/ice_main.c
+@@ -6863,54 +6863,132 @@ int ice_up(struct ice_vsi *vsi)
+ 	return err;
+ }
+ 
++struct ice_vsi_tx_stats {
++	u64 pkts;
++	u64 bytes;
++	u64 tx_restart_q;
++	u64 tx_busy;
++	u64 tx_linearize;
++};
++
++struct ice_vsi_rx_stats {
++	u64 pkts;
++	u64 bytes;
++	u64 rx_non_eop_descs;
++	u64 rx_page_failed;
++	u64 rx_buf_failed;
++};
++
++/**
++ * ice_fetch_u64_tx_stats - get Tx stats from a ring
++ * @ring: the Tx ring to copy stats from
++ * @copy: temporary storage for the ring statistics
++ *
++ * Fetch the u64 stats from the ring using u64_stats_fetch. This ensures each
++ * stat value is self-consistent, though not necessarily consistent w.r.t
++ * other stats.
++ */
++static void ice_fetch_u64_tx_stats(struct ice_tx_ring *ring,
++				   struct ice_vsi_tx_stats *copy)
++{
++	struct ice_ring_stats *stats = ring->ring_stats;
++	unsigned int start;
++
++	do {
++		start = u64_stats_fetch_begin(&stats->syncp);
++		copy->pkts = u64_stats_read(&stats->pkts);
++		copy->bytes = u64_stats_read(&stats->bytes);
++		copy->tx_restart_q = u64_stats_read(&stats->tx_restart_q);
++		copy->tx_busy = u64_stats_read(&stats->tx_busy);
++		copy->tx_linearize = u64_stats_read(&stats->tx_linearize);
++	} while (u64_stats_fetch_retry(&stats->syncp, start));
++}
++
+ /**
+- * ice_fetch_u64_stats_per_ring - get packets and bytes stats per ring
+- * @stats: pointer to ring stats structure
+- * @pkts: packets stats counter
+- * @bytes: bytes stats counter
++ * ice_fetch_u64_rx_stats - get Rx stats from a ring
++ * @ring: the Rx ring to copy stats from
++ * @copy: temporary storage for the ring statistics
+  *
+- * This function fetches stats from the ring considering the atomic operations
+- * that needs to be performed to read u64 values in 32 bit machine.
++ * Fetch the u64 stats from the ring using u64_stats_fetch. This ensures each
++ * stat value is self-consistent, though not necessarily consistent w.r.t
++ * other stats.
+  */
+-static void ice_fetch_u64_stats_per_ring(struct ice_ring_stats *stats,
+-					 u64 *pkts, u64 *bytes)
++static void ice_fetch_u64_rx_stats(struct ice_rx_ring *ring,
++				   struct ice_vsi_rx_stats *copy)
+ {
++	struct ice_ring_stats *stats = ring->ring_stats;
+ 	unsigned int start;
+ 
+ 	do {
+ 		start = u64_stats_fetch_begin(&stats->syncp);
+-		*pkts = stats->stats.pkts;
+-		*bytes = stats->stats.bytes;
++		copy->pkts = u64_stats_read(&stats->pkts);
++		copy->bytes = u64_stats_read(&stats->bytes);
++		copy->rx_non_eop_descs =
++			u64_stats_read(&stats->rx_non_eop_descs);
++		copy->rx_page_failed = u64_stats_read(&stats->rx_page_failed);
++		copy->rx_buf_failed = u64_stats_read(&stats->rx_buf_failed);
+ 	} while (u64_stats_fetch_retry(&stats->syncp, start));
+ }
+ 
+ /**
+  * ice_update_vsi_tx_ring_stats - Update VSI Tx ring stats counters
+  * @vsi: the VSI to be updated
+- * @vsi_stats: the stats struct to be updated
++ * @vsi_stats: accumulated stats for this VSI
+  * @rings: rings to work on
+  * @count: number of rings
+  */
+-static void
+-ice_update_vsi_tx_ring_stats(struct ice_vsi *vsi,
+-			     struct rtnl_link_stats64 *vsi_stats,
+-			     struct ice_tx_ring **rings, u16 count)
++static void ice_update_vsi_tx_ring_stats(struct ice_vsi *vsi,
++					 struct ice_vsi_tx_stats *vsi_stats,
++					 struct ice_tx_ring **rings, u16 count)
+ {
++	struct ice_vsi_tx_stats copy = {};
+ 	u16 i;
+ 
+ 	for (i = 0; i < count; i++) {
+ 		struct ice_tx_ring *ring;
+-		u64 pkts = 0, bytes = 0;
+ 
+ 		ring = READ_ONCE(rings[i]);
+ 		if (!ring || !ring->ring_stats)
+ 			continue;
+-		ice_fetch_u64_stats_per_ring(ring->ring_stats, &pkts, &bytes);
+-		vsi_stats->tx_packets += pkts;
+-		vsi_stats->tx_bytes += bytes;
+-		vsi->tx_restart += ring->ring_stats->tx_restart_q;
+-		vsi->tx_busy += ring->ring_stats->tx_busy;
+-		vsi->tx_linearize += ring->ring_stats->tx_linearize;
++
++		ice_fetch_u64_tx_stats(ring, &copy);
++
++		vsi_stats->pkts += copy.pkts;
++		vsi_stats->bytes += copy.bytes;
++		vsi_stats->tx_restart_q += copy.tx_restart_q;
++		vsi_stats->tx_busy += copy.tx_busy;
++		vsi_stats->tx_linearize += copy.tx_linearize;
++	}
++}
++
++/**
++ * ice_update_vsi_rx_ring_stats - Update VSI Rx ring stats counters
++ * @vsi: the VSI to be updated
++ * @vsi_stats: accumulated stats for this VSI
++ * @rings: rings to work on
++ * @count: number of rings
++ */
++static void ice_update_vsi_rx_ring_stats(struct ice_vsi *vsi,
++					 struct ice_vsi_rx_stats *vsi_stats,
++					 struct ice_rx_ring **rings, u16 count)
++{
++	struct ice_vsi_rx_stats copy = {};
++	u16 i;
++
++	for (i = 0; i < count; i++) {
++		struct ice_rx_ring *ring;
++
++		ring = READ_ONCE(rings[i]);
++		if (!ring || !ring->ring_stats)
++			continue;
++
++		ice_fetch_u64_rx_stats(ring, &copy);
++
++		vsi_stats->pkts += copy.pkts;
++		vsi_stats->bytes += copy.bytes;
++		vsi_stats->rx_non_eop_descs += copy.rx_non_eop_descs;
++		vsi_stats->rx_page_failed += copy.rx_page_failed;
++		vsi_stats->rx_buf_failed += copy.rx_buf_failed;
+ 	}
+ }
+ 
+@@ -6921,48 +6999,34 @@ ice_update_vsi_tx_ring_stats(struct ice_
+ static void ice_update_vsi_ring_stats(struct ice_vsi *vsi)
+ {
+ 	struct rtnl_link_stats64 *net_stats, *stats_prev;
+-	struct rtnl_link_stats64 *vsi_stats;
++	struct ice_vsi_tx_stats tx_stats = {};
++	struct ice_vsi_rx_stats rx_stats = {};
+ 	struct ice_pf *pf = vsi->back;
+-	u64 pkts, bytes;
+-	int i;
+-
+-	vsi_stats = kzalloc(sizeof(*vsi_stats), GFP_ATOMIC);
+-	if (!vsi_stats)
+-		return;
+-
+-	/* reset non-netdev (extended) stats */
+-	vsi->tx_restart = 0;
+-	vsi->tx_busy = 0;
+-	vsi->tx_linearize = 0;
+-	vsi->rx_buf_failed = 0;
+-	vsi->rx_page_failed = 0;
+ 
+ 	rcu_read_lock();
+ 
+ 	/* update Tx rings counters */
+-	ice_update_vsi_tx_ring_stats(vsi, vsi_stats, vsi->tx_rings,
++	ice_update_vsi_tx_ring_stats(vsi, &tx_stats, vsi->tx_rings,
+ 				     vsi->num_txq);
+ 
+ 	/* update Rx rings counters */
+-	ice_for_each_rxq(vsi, i) {
+-		struct ice_rx_ring *ring = READ_ONCE(vsi->rx_rings[i]);
+-		struct ice_ring_stats *ring_stats;
+-
+-		ring_stats = ring->ring_stats;
+-		ice_fetch_u64_stats_per_ring(ring_stats, &pkts, &bytes);
+-		vsi_stats->rx_packets += pkts;
+-		vsi_stats->rx_bytes += bytes;
+-		vsi->rx_buf_failed += ring_stats->rx_buf_failed;
+-		vsi->rx_page_failed += ring_stats->rx_page_failed;
+-	}
++	ice_update_vsi_rx_ring_stats(vsi, &rx_stats, vsi->rx_rings,
++				     vsi->num_rxq);
+ 
+ 	/* update XDP Tx rings counters */
+ 	if (ice_is_xdp_ena_vsi(vsi))
+-		ice_update_vsi_tx_ring_stats(vsi, vsi_stats, vsi->xdp_rings,
++		ice_update_vsi_tx_ring_stats(vsi, &tx_stats, vsi->xdp_rings,
+ 					     vsi->num_xdp_txq);
+ 
+ 	rcu_read_unlock();
+ 
++	/* Save non-netdev (extended) stats */
++	vsi->tx_restart = tx_stats.tx_restart_q;
++	vsi->tx_busy = tx_stats.tx_busy;
++	vsi->tx_linearize = tx_stats.tx_linearize;
++	vsi->rx_buf_failed = rx_stats.rx_buf_failed;
++	vsi->rx_page_failed = rx_stats.rx_page_failed;
++
+ 	net_stats = &vsi->net_stats;
+ 	stats_prev = &vsi->net_stats_prev;
+ 
+@@ -6972,18 +7036,16 @@ static void ice_update_vsi_ring_stats(st
+ 	 * let's skip this round.
+ 	 */
+ 	if (likely(pf->stat_prev_loaded)) {
+-		net_stats->tx_packets += vsi_stats->tx_packets - stats_prev->tx_packets;
+-		net_stats->tx_bytes += vsi_stats->tx_bytes - stats_prev->tx_bytes;
+-		net_stats->rx_packets += vsi_stats->rx_packets - stats_prev->rx_packets;
+-		net_stats->rx_bytes += vsi_stats->rx_bytes - stats_prev->rx_bytes;
++		net_stats->tx_packets += tx_stats.pkts - stats_prev->tx_packets;
++		net_stats->tx_bytes += tx_stats.bytes - stats_prev->tx_bytes;
++		net_stats->rx_packets += rx_stats.pkts - stats_prev->rx_packets;
++		net_stats->rx_bytes += rx_stats.bytes - stats_prev->rx_bytes;
+ 	}
+ 
+-	stats_prev->tx_packets = vsi_stats->tx_packets;
+-	stats_prev->tx_bytes = vsi_stats->tx_bytes;
+-	stats_prev->rx_packets = vsi_stats->rx_packets;
+-	stats_prev->rx_bytes = vsi_stats->rx_bytes;
+-
+-	kfree(vsi_stats);
++	stats_prev->tx_packets = tx_stats.pkts;
++	stats_prev->tx_bytes = tx_stats.bytes;
++	stats_prev->rx_packets = rx_stats.pkts;
++	stats_prev->rx_bytes = rx_stats.bytes;
+ }
+ 
+ /**
+--- a/drivers/net/ethernet/intel/ice/ice_txrx.h
++++ b/drivers/net/ethernet/intel/ice/ice_txrx.h
+@@ -133,20 +133,20 @@ struct ice_ring_stats {
+ 	struct rcu_head rcu;	/* to avoid race on free */
+ 	struct u64_stats_sync syncp;
+ 	struct_group(stats,
+-		u64 pkts;
+-		u64 bytes;
++		u64_stats_t pkts;
++		u64_stats_t bytes;
+ 		union {
+ 			struct_group(tx,
+-				u64 tx_restart_q;
+-				u64 tx_busy;
+-				u64 tx_linearize;
++				u64_stats_t tx_restart_q;
++				u64_stats_t tx_busy;
++				u64_stats_t tx_linearize;
+ 				/* negative if no pending Tx descriptors */
+ 				int prev_pkt;
+ 			);
+ 			struct_group(rx,
+-				u64 rx_non_eop_descs;
+-				u64 rx_page_failed;
+-				u64 rx_buf_failed;
++				u64_stats_t rx_non_eop_descs;
++				u64_stats_t rx_page_failed;
++				u64_stats_t rx_buf_failed;
+ 			);
+ 		};
+ 	);
+@@ -164,7 +164,13 @@ struct ice_ring_stats {
+  */
+ #define ice_stats_read(stats, member) ({				\
+ 	struct ice_ring_stats *__stats = (stats);			\
+-	__stats->member;						\
++	unsigned int start;						\
++	u64 val;							\
++	do {								\
++		start = u64_stats_fetch_begin(&__stats->syncp);		\
++		val = u64_stats_read(&__stats->member);			\
++	} while (u64_stats_fetch_retry(&__stats->syncp, start));	\
++	val;								\
+ })
+ 
+ /**
+@@ -177,7 +183,9 @@ struct ice_ring_stats {
+  */
+ #define ice_stats_inc(stats, member) do {				\
+ 	struct ice_ring_stats *__stats = (stats);			\
+-	__stats->member++;						\
++	u64_stats_update_begin(&__stats->syncp);			\
++	u64_stats_inc(&__stats->member);				\
++	u64_stats_update_end(&__stats->syncp);				\
+ } while (0)
+ 
+ enum ice_ring_state_t {
