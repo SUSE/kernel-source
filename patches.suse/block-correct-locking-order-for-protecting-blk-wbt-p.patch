@@ -1,0 +1,275 @@
+From: Nilay Shroff <nilay@linux.ibm.com>
+Date: Wed, 19 Mar 2025 16:23:46 +0530
+Subject: [PATCH] block: correct locking order for protecting blk-wbt
+ parameters
+Git-commit: 9730763f4756e32520cb86778331465e8d063a8f
+Patch-mainline: v6.15
+References: jsc#PED-14161
+
+The commit '245618f8e45f ("block: protect wbt_lat_usec using q->
+elevator_lock")' introduced q->elevator_lock to protect updates
+to blk-wbt parameters when writing to the sysfs attribute wbt_
+lat_usec and the cgroup attribute io.cost.qos.  However, both
+these attributes also acquire q->rq_qos_mutex, leading to the
+following lockdep warning:
+
+======================================================
+WARNING: possible circular locking dependency detected
+6.14.0-rc5+ #138 Not tainted
+Acked-by: Hannes Reinecke <hare@suse.com>
+------------------------------------------------------
+bash/5902 is trying to acquire lock:
+c000000085d495a0 (&q->rq_qos_mutex){+.+.}-{4:4}, at: wbt_init+0x164/0x238
+
+but task is already holding lock:
+c000000085d498c8 (&q->elevator_lock){+.+.}-{4:4}, at: queue_wb_lat_store+0xb0/0x20c
+
+which lock already depends on the new lock.
+
+the existing dependency chain (in reverse order) is:
+
+-> #1 (&q->elevator_lock){+.+.}-{4:4}:
+        __mutex_lock+0xf0/0xa58
+        ioc_qos_write+0x16c/0x85c
+        cgroup_file_write+0xc4/0x32c
+        kernfs_fop_write_iter+0x1b8/0x29c
+        vfs_write+0x410/0x584
+        ksys_write+0x84/0x140
+        system_call_exception+0x134/0x360
+        system_call_vectored_common+0x15c/0x2ec
+
+-> #0 (&q->rq_qos_mutex){+.+.}-{4:4}:
+        __lock_acquire+0x1b6c/0x2ae0
+        lock_acquire+0x140/0x430
+        __mutex_lock+0xf0/0xa58
+        wbt_init+0x164/0x238
+        queue_wb_lat_store+0x1dc/0x20c
+        queue_attr_store+0x12c/0x164
+        sysfs_kf_write+0x6c/0xb0
+        kernfs_fop_write_iter+0x1b8/0x29c
+        vfs_write+0x410/0x584
+        ksys_write+0x84/0x140
+        system_call_exception+0x134/0x360
+        system_call_vectored_common+0x15c/0x2ec
+
+other info that might help us debug this:
+
+    Possible unsafe locking scenario:
+
+        CPU0                    CPU1
+        ----                    ----
+    lock(&q->elevator_lock);
+                                lock(&q->rq_qos_mutex);
+                                lock(&q->elevator_lock);
+    lock(&q->rq_qos_mutex);
+
+    *** DEADLOCK ***
+
+6 locks held by bash/5902:
+    #0: c000000051122400 (sb_writers#3){.+.+}-{0:0}, at: ksys_write+0x84/0x140
+    #1: c00000007383f088 (&of->mutex#2){+.+.}-{4:4}, at: kernfs_fop_write_iter+0x174/0x29c
+    #2: c000000008550428 (kn->active#182){.+.+}-{0:0}, at: kernfs_fop_write_iter+0x180/0x29c
+    #3: c000000085d493a8 (&q->q_usage_counter(io)#5){++++}-{0:0}, at: blk_mq_freeze_queue_nomemsave+0x28/0x40
+    #4: c000000085d493e0 (&q->q_usage_counter(queue)#5){++++}-{0:0}, at: blk_mq_freeze_queue_nomemsave+0x28/0x40
+    #5: c000000085d498c8 (&q->elevator_lock){+.+.}-{4:4}, at: queue_wb_lat_store+0xb0/0x20c
+
+stack backtrace:
+CPU: 17 UID: 0 PID: 5902 Comm: bash Kdump: loaded Not tainted 6.14.0-rc5+ #138
+Hardware name: IBM,9043-MRX POWER10 (architected) 0x800200 0xf000006 of:IBM,FW1060.00 (NM1060_028) hv:phyp pSeries
+Call Trace:
+[c0000000721ef590] [c00000000118f8a8] dump_stack_lvl+0x108/0x18c (unreliable)
+[c0000000721ef5c0] [c00000000022563c] print_circular_bug+0x448/0x604
+[c0000000721ef670] [c000000000225a44] check_noncircular+0x24c/0x26c
+[c0000000721ef740] [c00000000022bf28] __lock_acquire+0x1b6c/0x2ae0
+[c0000000721ef870] [c000000000229240] lock_acquire+0x140/0x430
+[c0000000721ef970] [c0000000011cfbec] __mutex_lock+0xf0/0xa58
+[c0000000721efaa0] [c00000000096c46c] wbt_init+0x164/0x238
+[c0000000721efaf0] [c0000000008f8cd8] queue_wb_lat_store+0x1dc/0x20c
+[c0000000721efb50] [c0000000008f8fa0] queue_attr_store+0x12c/0x164
+[c0000000721efc60] [c0000000007c11cc] sysfs_kf_write+0x6c/0xb0
+[c0000000721efca0] [c0000000007bfa4c] kernfs_fop_write_iter+0x1b8/0x29c
+[c0000000721efcf0] [c0000000006a281c] vfs_write+0x410/0x584
+[c0000000721efdc0] [c0000000006a2cc8] ksys_write+0x84/0x140
+[c0000000721efe10] [c000000000031b64] system_call_exception+0x134/0x360
+[c0000000721efe50] [c00000000000cedc] system_call_vectored_common+0x15c/0x2ec
+
+>From the above log it's apparent that method which writes to sysfs attr
+wbt_lat_usec acquires q->elevator_lock first, and then acquires q->rq_
+qos_mutex. However the another method which writes to io.cost.qos,
+acquires q->rq_qos_mutex first, and then acquires q->rq_qos_mutex. So
+this could potentially cause the deadlock.
+
+A closer look at ioc_qos_write shows that correcting the lock order is
+non-trivial because q->rq_qos_mutex is acquired in blkg_conf_open_bdev
+and released in blkg_conf_exit. The function blkg_conf_open_bdev is
+responsible for parsing user input and finding the corresponding block
+device (bdev) from the user provided major:minor number.
+
+Since we do not know the bdev until blkg_conf_open_bdev completes, we
+cannot simply move q->elevator_lock acquisition before blkg_conf_open_
+bdev. So to address this, we intoduce new helpers blkg_conf_open_bdev_
+frozen and blkg_conf_exit_frozen which are just wrappers around blkg_
+conf_open_bdev and blkg_conf_exit respectively. The helper blkg_conf_
+open_bdev_frozen is similar to blkg_conf_open_bdev, but additionally
+freezes the queue, acquires q->elevator_lock and ensures the correct
+locking order is followed between q->elevator_lock and q->rq_qos_mutex.
+Similarly another helper blkg_conf_exit_frozen in addition to unfreezing
+the queue ensures that we release the locks in correct order.
+
+By using these helpers, now we maintain the same locking order in all
+code paths where we update blk-wbt parameters.
+
+Fixes: 245618f8e45f ("block: protect wbt_lat_usec using q->elevator_lock")
+Reported-by: kernel test robot <oliver.sang@intel.com>
+Closes: https://lore.kernel.org/oe-lkp/202503171650.cc082b66-lkp@intel.com
+Signed-off-by: Nilay Shroff <nilay@linux.ibm.com>
+Link: https://lore.kernel.org/r/20250319105518.468941-3-nilay@linux.ibm.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ block/blk-cgroup.c | 51 ++++++++++++++++++++++++++++++++++++++++++++++
+ block/blk-cgroup.h |  2 ++
+ block/blk-iocost.c | 18 +++++-----------
+ 3 files changed, 58 insertions(+), 13 deletions(-)
+
+diff --git a/block/blk-cgroup.c b/block/blk-cgroup.c
+index 2609f7294427..88ff27697380 100644
+--- a/block/blk-cgroup.c
++++ b/block/blk-cgroup.c
+@@ -815,6 +815,41 @@ int blkg_conf_open_bdev(struct blkg_conf_ctx *ctx)
+ 	ctx->bdev = bdev;
+ 	return 0;
+ }
++/*
++ * Similar to blkg_conf_open_bdev, but additionally freezes the queue,
++ * acquires q->elevator_lock, and ensures the correct locking order
++ * between q->elevator_lock and q->rq_qos_mutex.
++ *
++ * This function returns negative error on failure. On success it returns
++ * memflags which must be saved and later passed to blkg_conf_exit_frozen
++ * for restoring the memalloc scope.
++ */
++unsigned long __must_check blkg_conf_open_bdev_frozen(struct blkg_conf_ctx *ctx)
++{
++	int ret;
++	unsigned long memflags;
++
++	if (ctx->bdev)
++		return -EINVAL;
++
++	ret = blkg_conf_open_bdev(ctx);
++	if (ret < 0)
++		return ret;
++	/*
++	 * At this point, we haven’t started protecting anything related to QoS,
++	 * so we release q->rq_qos_mutex here, which was first acquired in blkg_
++	 * conf_open_bdev. Later, we re-acquire q->rq_qos_mutex after freezing
++	 * the queue and acquiring q->elevator_lock to maintain the correct
++	 * locking order.
++	 */
++	mutex_unlock(&ctx->bdev->bd_queue->rq_qos_mutex);
++
++	memflags = blk_mq_freeze_queue(ctx->bdev->bd_queue);
++	mutex_lock(&ctx->bdev->bd_queue->elevator_lock);
++	mutex_lock(&ctx->bdev->bd_queue->rq_qos_mutex);
++
++	return memflags;
++}
+ 
+ /**
+  * blkg_conf_prep - parse and prepare for per-blkg config update
+@@ -971,6 +1006,22 @@ void blkg_conf_exit(struct blkg_conf_ctx *ctx)
+ }
+ EXPORT_SYMBOL_GPL(blkg_conf_exit);
+ 
++/*
++ * Similar to blkg_conf_exit, but also unfreezes the queue and releases
++ * q->elevator_lock. Should be used when blkg_conf_open_bdev_frozen
++ * is used to open the bdev.
++ */
++void blkg_conf_exit_frozen(struct blkg_conf_ctx *ctx, unsigned long memflags)
++{
++	if (ctx->bdev) {
++		struct request_queue *q = ctx->bdev->bd_queue;
++
++		blkg_conf_exit(ctx);
++		mutex_unlock(&q->elevator_lock);
++		blk_mq_unfreeze_queue(q, memflags);
++	}
++}
++
+ static void blkg_iostat_add(struct blkg_iostat *dst, struct blkg_iostat *src)
+ {
+ 	int i;
+diff --git a/block/blk-cgroup.h b/block/blk-cgroup.h
+index 2c4663bd993a..81868ad86330 100644
+--- a/block/blk-cgroup.h
++++ b/block/blk-cgroup.h
+@@ -219,9 +219,11 @@ struct blkg_conf_ctx {
+ 
+ void blkg_conf_init(struct blkg_conf_ctx *ctx, char *input);
+ int blkg_conf_open_bdev(struct blkg_conf_ctx *ctx);
++unsigned long blkg_conf_open_bdev_frozen(struct blkg_conf_ctx *ctx);
+ int blkg_conf_prep(struct blkcg *blkcg, const struct blkcg_policy *pol,
+ 		   struct blkg_conf_ctx *ctx);
+ void blkg_conf_exit(struct blkg_conf_ctx *ctx);
++void blkg_conf_exit_frozen(struct blkg_conf_ctx *ctx, unsigned long memflags);
+ 
+ /**
+  * bio_issue_as_root_blkg - see if this bio needs to be issued as root blkg
+diff --git a/block/blk-iocost.c b/block/blk-iocost.c
+index 56e6fb51316d..3724b0308cd8 100644
+--- a/block/blk-iocost.c
++++ b/block/blk-iocost.c
+@@ -3223,13 +3223,13 @@ static ssize_t ioc_qos_write(struct kernfs_open_file *of, char *input,
+ 	u32 qos[NR_QOS_PARAMS];
+ 	bool enable, user;
+ 	char *body, *p;
+-	unsigned int memflags;
++	unsigned long memflags;
+ 	int ret;
+ 
+ 	blkg_conf_init(&ctx, input);
+ 
+-	ret = blkg_conf_open_bdev(&ctx);
+-	if (ret)
++	memflags = blkg_conf_open_bdev_frozen(&ctx);
++	if (IS_ERR_VALUE(memflags))
+ 		goto err;
+ 
+ 	body = ctx.body;
+@@ -3247,8 +3247,6 @@ static ssize_t ioc_qos_write(struct kernfs_open_file *of, char *input,
+ 		ioc = q_to_ioc(disk->queue);
+ 	}
+ 
+-	memflags = blk_mq_freeze_queue(disk->queue);
+-	mutex_lock(&disk->queue->elevator_lock);
+ 	blk_mq_quiesce_queue(disk->queue);
+ 
+ 	spin_lock_irq(&ioc->lock);
+@@ -3348,21 +3346,15 @@ static ssize_t ioc_qos_write(struct kernfs_open_file *of, char *input,
+ 		wbt_enable_default(disk);
+ 
+ 	blk_mq_unquiesce_queue(disk->queue);
+-	mutex_unlock(&disk->queue->elevator_lock);
+-	blk_mq_unfreeze_queue(disk->queue, memflags);
+ 
+-	blkg_conf_exit(&ctx);
++	blkg_conf_exit_frozen(&ctx, memflags);
+ 	return nbytes;
+ einval:
+ 	spin_unlock_irq(&ioc->lock);
+-
+ 	blk_mq_unquiesce_queue(disk->queue);
+-	mutex_unlock(&disk->queue->elevator_lock);
+-	blk_mq_unfreeze_queue(disk->queue, memflags);
+-
+ 	ret = -EINVAL;
+ err:
+-	blkg_conf_exit(&ctx);
++	blkg_conf_exit_frozen(&ctx, memflags);
+ 	return ret;
+ }
+ 
+-- 
+2.43.0
+
