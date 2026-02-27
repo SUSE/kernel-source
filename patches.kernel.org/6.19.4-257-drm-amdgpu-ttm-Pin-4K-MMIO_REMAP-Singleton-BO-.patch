@@ -1,0 +1,101 @@
+From: Srinivasan Shanmugam <srinivasan.shanmugam@amd.com>
+Date: Mon, 6 Oct 2025 19:46:53 +0530
+Subject: [PATCH] drm/amdgpu/ttm: Pin 4K MMIO_REMAP Singleton BO at Init v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+References: bsc#1012628
+Patch-mainline: 6.19.4
+Git-commit: de8955508b72f8a88afc3f2cbb62334d5f79ccc3
+
+[ Upstream commit de8955508b72f8a88afc3f2cbb62334d5f79ccc3 ]
+
+MMIO_REMAP (HDP flush page) is a hardware I/O window exposed via a PCI
+BAR.  It must not migrate or be evicted.
+
+Allocate a single 4 KB GEM BO in AMDGPU_GEM_DOMAIN_MMIO_REMAP during TTM
+initialization when the hardware exposes a remap bus address and the
+host page size is <= 4 KiB. Reserve the BO and pin it at the TTM level
+so it remains fixed for its lifetime. No CPU mapping is established
+here.
+
+On teardown, reserve, unpin, and free the BO if present.
+
+This prepares the object to be shared (e.g., via dma-buf) without
+triggering placement changes or no CPU-access migration
+
+v2: Added extra NULL checks
+
+Suggested-by: Christian König <christian.koenig@amd.com>
+Suggested-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Srinivasan Shanmugam <srinivasan.shanmugam@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Stable-dep-of: 96e97a562d06 ("drm/amdgpu: Drop MMIO_REMAP domain bit and keep it Internal")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c | 32 +++++++++++++++++++++++++
+ 1 file changed, 32 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index 2b931e855abd..ac67886acaa2 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -1820,6 +1820,10 @@ static void amdgpu_ttm_pools_fini(struct amdgpu_device *adev)
+  * PAGE_SIZE is <= AMDGPU_GPU_PAGE_SIZE (4K). The BO is created as a regular
+  * GEM object (amdgpu_bo_create).
+  *
++ * The BO is created as a normal GEM object via amdgpu_bo_create(), then
++ * reserved and pinned at the TTM level (ttm_bo_pin()) so it can never be
++ * migrated or evicted. No CPU mapping is established here.
++ *
+  * Return:
+  *  * 0 on success or intentional skip (feature not present/unsupported)
+  *  * negative errno on allocation failure
+@@ -1848,7 +1852,26 @@ static int amdgpu_ttm_mmio_remap_bo_init(struct amdgpu_device *adev)
+ 	if (r)
+ 		return r;
+ 
++	r = amdgpu_bo_reserve(adev->rmmio_remap.bo, true);
++	if (r)
++		goto err_unref;
++
++	/*
++	 * MMIO_REMAP is a fixed I/O placement (AMDGPU_PL_MMIO_REMAP).
++	 * Use TTM-level pin so the BO cannot be evicted/migrated,
++	 * independent of GEM domains. This
++	 * enforces the “fixed I/O window”
++	 */
++	ttm_bo_pin(&adev->rmmio_remap.bo->tbo);
++
++	amdgpu_bo_unreserve(adev->rmmio_remap.bo);
+ 	return 0;
++
++err_unref:
++	if (adev->rmmio_remap.bo)
++		amdgpu_bo_unref(&adev->rmmio_remap.bo);
++	adev->rmmio_remap.bo = NULL;
++	return r;
+ }
+ 
+ /**
+@@ -1860,6 +1883,15 @@ static int amdgpu_ttm_mmio_remap_bo_init(struct amdgpu_device *adev)
+  */
+ static void amdgpu_ttm_mmio_remap_bo_fini(struct amdgpu_device *adev)
+ {
++	struct amdgpu_bo *bo = adev->rmmio_remap.bo;
++
++	if (!bo)
++		return;   /* <-- safest early exit */
++
++	if (!amdgpu_bo_reserve(adev->rmmio_remap.bo, true)) {
++		ttm_bo_unpin(&adev->rmmio_remap.bo->tbo);
++		amdgpu_bo_unreserve(adev->rmmio_remap.bo);
++	}
+ 	amdgpu_bo_unref(&adev->rmmio_remap.bo);
+ 	adev->rmmio_remap.bo = NULL;
+ }
+-- 
+2.53.0
+

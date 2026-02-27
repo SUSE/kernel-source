@@ -1,0 +1,129 @@
+From: Daniel Baluta <daniel.baluta@nxp.com>
+Date: Wed, 10 Dec 2025 17:49:06 +0200
+Subject: [PATCH] remoteproc: imx_dsp_rproc: Fix multiple start/stop operations
+References: bsc#1012628
+Patch-mainline: 6.19.4
+Git-commit: a84a1e21c0678032f1185173f816cbb500a87877
+
+[ Upstream commit a84a1e21c0678032f1185173f816cbb500a87877 ]
+
+After commit 67a7bc7f0358 ("remoteproc: Use of reserved_mem_region_*
+functions for "memory-region"") following commands with
+imx-dsp-rproc started to fail:
+
+$ echo zephyr.elf > /sys/class/remoteproc/remoteproc0/firmware
+$ echo start > /sys/class/remoteproc/remoteproc0/state
+$ echo stop > /sys/class/remoteproc/remoteproc0/state
+$ echo start > /sys/class/remoteproc/remoteproc0/state #! This fails
+-sh: echo: write error: Device or resource busy
+
+This happens because aforementioned commit replaced devm_ioremap_wc with
+devm_ioremap_resource_wc which will "reserve" the memory region with the
+first start and then will fail at the second start if the memory
+region is already reserved.
+
+Even partially reverting the faulty commit won't fix the
+underlying issue because we map the address in prepare() but we never
+unmap it at unprepare(), so we will keep leaking memory regions.
+
+So, lets use alloc() and release() callbacks for memory carveout
+handling. This will nicely map() the memory region at prepare() time
+and unmap() it at unprepare().
+
+Fixes: 67a7bc7f0358 ("remoteproc: Use of_reserved_mem_region_* functions for "memory-region"")
+Signed-off-by: Daniel Baluta <daniel.baluta@nxp.com>
+Link: https://lore.kernel.org/r/20251210154906.99210-1-daniel.baluta@nxp.com
+Signed-off-by: Mathieu Poirier <mathieu.poirier@linaro.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/remoteproc/imx_dsp_rproc.c | 50 ++++++++++++++++++++----------
+ 1 file changed, 33 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/remoteproc/imx_dsp_rproc.c b/drivers/remoteproc/imx_dsp_rproc.c
+index 5130a35214c9..83468558e634 100644
+--- a/drivers/remoteproc/imx_dsp_rproc.c
++++ b/drivers/remoteproc/imx_dsp_rproc.c
+@@ -644,6 +644,32 @@ static void imx_dsp_rproc_free_mbox(struct imx_dsp_rproc *priv)
+ 	mbox_free_channel(priv->rxdb_ch);
+ }
+ 
++static int imx_dsp_rproc_mem_alloc(struct rproc *rproc,
++				   struct rproc_mem_entry *mem)
++{
++	struct device *dev = rproc->dev.parent;
++	void *va;
++
++	va = ioremap_wc(mem->dma, mem->len);
++	if (!va) {
++		dev_err(dev, "Unable to map memory region: %pa+%zx\n",
++			&mem->dma, mem->len);
++		return -ENOMEM;
++	}
++
++	mem->va = va;
++
++	return 0;
++}
++
++static int imx_dsp_rproc_mem_release(struct rproc *rproc,
++				     struct rproc_mem_entry *mem)
++{
++	iounmap(mem->va);
++
++	return 0;
++}
++
+ /**
+  * imx_dsp_rproc_add_carveout() - request mailbox channels
+  * @priv: private data pointer
+@@ -659,7 +685,6 @@ static int imx_dsp_rproc_add_carveout(struct imx_dsp_rproc *priv)
+ 	struct device *dev = rproc->dev.parent;
+ 	struct device_node *np = dev->of_node;
+ 	struct rproc_mem_entry *mem;
+-	void __iomem *cpu_addr;
+ 	int a, i = 0;
+ 	u64 da;
+ 
+@@ -673,15 +698,10 @@ static int imx_dsp_rproc_add_carveout(struct imx_dsp_rproc *priv)
+ 		if (imx_dsp_rproc_sys_to_da(priv, att->sa, att->size, &da))
+ 			return -EINVAL;
+ 
+-		cpu_addr = devm_ioremap_wc(dev, att->sa, att->size);
+-		if (!cpu_addr) {
+-			dev_err(dev, "failed to map memory %p\n", &att->sa);
+-			return -ENOMEM;
+-		}
+-
+ 		/* Register memory region */
+-		mem = rproc_mem_entry_init(dev, (void __force *)cpu_addr, (dma_addr_t)att->sa,
+-					   att->size, da, NULL, NULL, "dsp_mem");
++		mem = rproc_mem_entry_init(dev, NULL, (dma_addr_t)att->sa,
++					   att->size, da, imx_dsp_rproc_mem_alloc,
++					   imx_dsp_rproc_mem_release, "dsp_mem");
+ 
+ 		if (mem)
+ 			rproc_coredump_add_segment(rproc, da, att->size);
+@@ -709,15 +729,11 @@ static int imx_dsp_rproc_add_carveout(struct imx_dsp_rproc *priv)
+ 		if (imx_dsp_rproc_sys_to_da(priv, res.start, resource_size(&res), &da))
+ 			return -EINVAL;
+ 
+-		cpu_addr = devm_ioremap_resource_wc(dev, &res);
+-		if (IS_ERR(cpu_addr)) {
+-			dev_err(dev, "failed to map memory %pR\n", &res);
+-			return PTR_ERR(cpu_addr);
+-		}
+-
+ 		/* Register memory region */
+-		mem = rproc_mem_entry_init(dev, (void __force *)cpu_addr, (dma_addr_t)res.start,
+-					   resource_size(&res), da, NULL, NULL,
++		mem = rproc_mem_entry_init(dev, NULL, (dma_addr_t)res.start,
++					   resource_size(&res), da,
++					    imx_dsp_rproc_mem_alloc,
++					    imx_dsp_rproc_mem_release,
+ 					   "%.*s", strchrnul(res.name, '@') - res.name, res.name);
+ 		if (!mem)
+ 			return -ENOMEM;
+-- 
+2.53.0
+

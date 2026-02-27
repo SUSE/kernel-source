@@ -1,0 +1,96 @@
+From: Waqar Hameed <waqar.hameed@axis.com>
+Date: Sat, 20 Dec 2025 23:36:01 +0100
+Subject: [PATCH] power: supply: pf1550: Fix use-after-free in
+ power_supply_changed()
+References: bsc#1012628
+Patch-mainline: 6.19.4
+Git-commit: 838767f5074700552d3f006d867caed65edc7328
+
+[ Upstream commit 838767f5074700552d3f006d867caed65edc7328 ]
+
+Using the `devm_` variant for requesting IRQ _before_ the `devm_`
+variant for allocating/registering the `power_supply` handle, means that
+the `power_supply` handle will be deallocated/unregistered _before_ the
+interrupt handler (since `devm_` naturally deallocates in reverse
+allocation order). This means that during removal, there is a race
+condition where an interrupt can fire just _after_ the `power_supply`
+handle has been freed, *but* just _before_ the corresponding
+unregistration of the IRQ handler has run.
+
+This will lead to the IRQ handler calling `power_supply_changed()` with
+a freed `power_supply` handle. Which usually crashes the system or
+otherwise silently corrupts the memory...
+
+Note that there is a similar situation which can also happen during
+`probe()`; the possibility of an interrupt firing _before_ registering
+the `power_supply` handle. This would then lead to the nasty situation
+of using the `power_supply` handle *uninitialized* in
+`power_supply_changed()`.
+
+Fix this racy use-after-free by making sure the IRQ is requested _after_
+the registration of the `power_supply` handle.
+
+Fixes: 4b6b6433a97d ("power: supply: pf1550: add battery charger support")
+Signed-off-by: Waqar Hameed <waqar.hameed@axis.com>
+Reviewed-by: Samuel Kayode <samkay014@gmail.com>
+Link: https://patch.msgid.link/ae5a71b7e4dd2967d8fdcc531065cc71b17c86f5.1766268280.git.waqar.hameed@axis.com
+Signed-off-by: Sebastian Reichel <sebastian.reichel@collabora.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/power/supply/pf1550-charger.c | 32 +++++++++++++--------------
+ 1 file changed, 16 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/power/supply/pf1550-charger.c b/drivers/power/supply/pf1550-charger.c
+index 98f1ee8eca3b..a457862ef461 100644
+--- a/drivers/power/supply/pf1550-charger.c
++++ b/drivers/power/supply/pf1550-charger.c
+@@ -584,22 +584,6 @@ static int pf1550_charger_probe(struct platform_device *pdev)
+ 		return dev_err_probe(chg->dev, ret,
+ 				     "failed to add battery sense work\n");
+ 
+-	for (i = 0; i < PF1550_CHARGER_IRQ_NR; i++) {
+-		irq = platform_get_irq(pdev, i);
+-		if (irq < 0)
+-			return irq;
+-
+-		chg->virqs[i] = irq;
+-
+-		ret = devm_request_threaded_irq(&pdev->dev, irq, NULL,
+-						pf1550_charger_irq_handler,
+-						IRQF_NO_SUSPEND,
+-						"pf1550-charger", chg);
+-		if (ret)
+-			return dev_err_probe(&pdev->dev, ret,
+-					     "failed irq request\n");
+-	}
+-
+ 	psy_cfg.drv_data = chg;
+ 
+ 	chg->charger = devm_power_supply_register(&pdev->dev,
+@@ -616,6 +600,22 @@ static int pf1550_charger_probe(struct platform_device *pdev)
+ 		return dev_err_probe(&pdev->dev, PTR_ERR(chg->battery),
+ 				     "failed: power supply register\n");
+ 
++	for (i = 0; i < PF1550_CHARGER_IRQ_NR; i++) {
++		irq = platform_get_irq(pdev, i);
++		if (irq < 0)
++			return irq;
++
++		chg->virqs[i] = irq;
++
++		ret = devm_request_threaded_irq(&pdev->dev, irq, NULL,
++						pf1550_charger_irq_handler,
++						IRQF_NO_SUSPEND,
++						"pf1550-charger", chg);
++		if (ret)
++			return dev_err_probe(&pdev->dev, ret,
++					     "failed irq request\n");
++	}
++
+ 	pf1550_dt_parse_dev_info(chg);
+ 
+ 	return pf1550_reg_init(chg);
+-- 
+2.53.0
+

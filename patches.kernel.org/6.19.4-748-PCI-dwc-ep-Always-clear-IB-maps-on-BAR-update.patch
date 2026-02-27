@@ -1,0 +1,83 @@
+From: Koichiro Den <den@valinux.co.jp>
+Date: Mon, 2 Feb 2026 23:54:07 +0900
+Subject: [PATCH] PCI: dwc: ep: Always clear IB maps on BAR update
+References: bsc#1012628
+Patch-mainline: 6.19.4
+Git-commit: 8c746e22096579897d1f8f74dbb6b17a6862fb6d
+
+[ Upstream commit 8c746e22096579897d1f8f74dbb6b17a6862fb6d ]
+
+dw_pcie_ep_set_bar() currently tears down existing inbound mappings only
+when either the previous or the new struct pci_epf_bar uses submaps
+(num_submap != 0). If both the old and new mappings are BAR Match Mode,
+reprogramming the same ATU index is sufficient, so no explicit teardown
+was needed.
+
+However, some callers may reuse the same struct pci_epf_bar instance and
+update it in place before calling set_bar() again. In that case
+ep_func->epf_bar[bar] and the passed-in epf_bar can point to the same
+object, so we cannot reliably distinguish BAR Match Mode -> BAR Match Mode
+from Address Match Mode -> BAR Match Mode. As a result, the conditional
+teardown based on num_submap becomes unreliable and existing inbound maps
+may be left active.
+
+Call dw_pcie_ep_clear_ib_maps() unconditionally before reprogramming the
+BAR so that in-place updates are handled correctly.
+
+This introduces a behavioral change in a corner case: if a BAR
+reprogramming attempt fails (especially for the long-standing BAR Match
+Mode -> BAR Match Mode update case), the previously programmed inbound
+mapping will already have been torn down. This should be acceptable, since
+the caller observes the error and should not use the BAR for any real
+transactions in that case.
+
+While at it, document that the existing update parameter check is
+best-effort for in-place updates.
+
+Fixes: cc839bef7727 ("PCI: dwc: ep: Support BAR subrange inbound mapping via Address Match Mode iATU")
+Signed-off-by: Koichiro Den <den@valinux.co.jp>
+Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+Reviewed-by: Niklas Cassel <cassel@kernel.org>
+Link: https://patch.msgid.link/20260202145407.503348-3-den@valinux.co.jp
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/pci/controller/dwc/pcie-designware-ep.c | 14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/pci/controller/dwc/pcie-designware-ep.c b/drivers/pci/controller/dwc/pcie-designware-ep.c
+index 6d3c35dd280f..59fd6ebf0148 100644
+--- a/drivers/pci/controller/dwc/pcie-designware-ep.c
++++ b/drivers/pci/controller/dwc/pcie-designware-ep.c
+@@ -518,6 +518,12 @@ static int dw_pcie_ep_set_bar(struct pci_epc *epc, u8 func_no, u8 vfunc_no,
+ 		/*
+ 		 * We can only dynamically change a BAR if the new BAR size and
+ 		 * BAR flags do not differ from the existing configuration.
++		 *
++		 * Note: this safety check only works when the caller uses
++		 * a new struct pci_epf_bar in the second set_bar() call.
++		 * If the same instance is updated in place and passed in,
++		 * we cannot reliably detect invalid barno/size/flags
++		 * changes here.
+ 		 */
+ 		if (ep_func->epf_bar[bar]->barno != bar ||
+ 		    ep_func->epf_bar[bar]->size != size ||
+@@ -526,10 +532,12 @@ static int dw_pcie_ep_set_bar(struct pci_epc *epc, u8 func_no, u8 vfunc_no,
+ 
+ 		/*
+ 		 * When dynamically changing a BAR, tear down any existing
+-		 * mappings before re-programming.
++		 * mappings before re-programming. This is redundant when
++		 * both the old and new mappings are BAR Match Mode, but
++		 * required to handle in-place updates and match-mode
++		 * changes reliably.
+ 		 */
+-		if (ep_func->epf_bar[bar]->num_submap || epf_bar->num_submap)
+-			dw_pcie_ep_clear_ib_maps(ep, func_no, bar);
++		dw_pcie_ep_clear_ib_maps(ep, func_no, bar);
+ 
+ 		/*
+ 		 * When dynamically changing a BAR, skip writing the BAR reg, as
+-- 
+2.53.0
+

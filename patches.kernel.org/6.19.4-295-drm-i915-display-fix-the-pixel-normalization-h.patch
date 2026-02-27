@@ -1,0 +1,163 @@
+From: Vinod Govindapillai <vinod.govindapillai@intel.com>
+Date: Fri, 30 Jan 2026 11:59:19 +0200
+Subject: [PATCH] drm/i915/display: fix the pixel normalization handling for
+ xe3p_lpd
+References: bsc#1012628
+Patch-mainline: 6.19.4
+Git-commit: 3e28a67a85f9b569066f6dfcddadb39294c0c9d4
+
+[ Upstream commit 3e28a67a85f9b569066f6dfcddadb39294c0c9d4 ]
+
+Pixel normalizer is enabled with normalization factor as 1.0 for
+FP16 formats in order to support FBC for those formats in xe3p_lpd.
+Previously pixel normalizer gets disabled during the plane disable
+routine. But there could be plane format settings without explicitly
+calling the plane disable in-between and we could endup keeping the
+pixel normalizer enabled for formats which we don't require that.
+This is causing crc mismatches in yuv formats and FIFO underruns in
+planar formats like NV12. Fix this by updating the pixel normalizer
+configuration based on the pixel formats explicitly during the plane
+settings arm calls itself - enable it for FP16 and disable it for
+other formats in HDR capable planes.
+
+v2: avoid redundant pixel normalization setting updates
+
+v3: moved the normalization factor definition to intel_fbc.c and some
+    updates to comments
+
+v4: simplified the pixel normalizer setting handling
+
+Fixes: 5298eea7ed20 ("drm/i915/xe3p_lpd: use pixel normalizer for fp16 formats for FBC")
+Signed-off-by: Vinod Govindapillai <vinod.govindapillai@intel.com>
+Reviewed-by: Uma Shankar <uma.shankar@intel.com>
+Link: https://patch.msgid.link/20260130095919.107805-1-vinod.govindapillai@intel.com
+(cherry picked from commit c0dc68f4e2aa7eddb9ec6d95931f9576d8fe7334)
+Signed-off-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ .../drm/i915/display/intel_display_device.h   |  1 +
+ drivers/gpu/drm/i915/display/intel_fbc.c      | 10 +++---
+ drivers/gpu/drm/i915/display/intel_fbc.h      |  3 +-
+ .../drm/i915/display/skl_universal_plane.c    | 36 +++++++++----------
+ 4 files changed, 26 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display_device.h b/drivers/gpu/drm/i915/display/intel_display_device.h
+index b559ef43d547..6944d081f0ad 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_device.h
++++ b/drivers/gpu/drm/i915/display/intel_display_device.h
+@@ -189,6 +189,7 @@ struct intel_display_platforms {
+ #define HAS_MSO(__display)		(DISPLAY_VER(__display) >= 12)
+ #define HAS_OVERLAY(__display)		(DISPLAY_INFO(__display)->has_overlay)
+ #define HAS_PIPEDMC(__display)		(DISPLAY_VER(__display) >= 12)
++#define HAS_PIXEL_NORMALIZER(__display)	(DISPLAY_VER(__display) >= 35)
+ #define HAS_PSR(__display)		(DISPLAY_INFO(__display)->has_psr)
+ #define HAS_PSR_HW_TRACKING(__display)	(DISPLAY_INFO(__display)->has_psr_hw_tracking)
+ #define HAS_PSR2_SEL_FETCH(__display)	(DISPLAY_VER(__display) >= 12)
+diff --git a/drivers/gpu/drm/i915/display/intel_fbc.c b/drivers/gpu/drm/i915/display/intel_fbc.c
+index 437d2fda20a7..8d387709f25c 100644
+--- a/drivers/gpu/drm/i915/display/intel_fbc.c
++++ b/drivers/gpu/drm/i915/display/intel_fbc.c
+@@ -1120,13 +1120,15 @@ static bool xe3p_lpd_fbc_pixel_format_is_valid(const struct intel_plane_state *p
+ 	}
+ }
+ 
+-bool
+-intel_fbc_is_enable_pixel_normalizer(const struct intel_plane_state *plane_state)
++bool intel_fbc_need_pixel_normalizer(const struct intel_plane_state *plane_state)
+ {
+ 	struct intel_display *display = to_intel_display(plane_state);
+ 
+-	return DISPLAY_VER(display) >= 35 &&
+-	       xe3p_lpd_fbc_fp16_format_is_valid(plane_state);
++	if (HAS_PIXEL_NORMALIZER(display) &&
++	    xe3p_lpd_fbc_fp16_format_is_valid(plane_state))
++		return true;
++
++	return false;
+ }
+ 
+ static bool pixel_format_is_valid(const struct intel_plane_state *plane_state)
+diff --git a/drivers/gpu/drm/i915/display/intel_fbc.h b/drivers/gpu/drm/i915/display/intel_fbc.h
+index 91424563206a..7e2416b29a0e 100644
+--- a/drivers/gpu/drm/i915/display/intel_fbc.h
++++ b/drivers/gpu/drm/i915/display/intel_fbc.h
+@@ -53,7 +53,6 @@ void intel_fbc_prepare_dirty_rect(struct intel_atomic_state *state,
+ 				  struct intel_crtc *crtc);
+ void intel_fbc_dirty_rect_update_noarm(struct intel_dsb *dsb,
+ 				       struct intel_plane *plane);
+-bool
+-intel_fbc_is_enable_pixel_normalizer(const struct intel_plane_state *plane_state);
++bool intel_fbc_need_pixel_normalizer(const struct intel_plane_state *plane_state);
+ 
+ #endif /* __INTEL_FBC_H__ */
+diff --git a/drivers/gpu/drm/i915/display/skl_universal_plane.c b/drivers/gpu/drm/i915/display/skl_universal_plane.c
+index ee8e24497d2c..ed14b9ea2ad2 100644
+--- a/drivers/gpu/drm/i915/display/skl_universal_plane.c
++++ b/drivers/gpu/drm/i915/display/skl_universal_plane.c
+@@ -892,23 +892,20 @@ static void icl_plane_disable_sel_fetch_arm(struct intel_dsb *dsb,
+ 	intel_de_write_dsb(display, dsb, SEL_FETCH_PLANE_CTL(pipe, plane->id), 0);
+ }
+ 
+-static void x3p_lpd_plane_update_pixel_normalizer(struct intel_dsb *dsb,
+-						  struct intel_plane *plane,
+-						  bool enable)
++static bool plane_has_normalizer(struct intel_plane *plane)
+ {
+ 	struct intel_display *display = to_intel_display(plane);
+-	enum intel_fbc_id fbc_id = skl_fbc_id_for_pipe(plane->pipe);
+-	u32 val;
+ 
+-	/* Only HDR planes have pixel normalizer and don't matter if no FBC */
+-	if (!skl_plane_has_fbc(display, fbc_id, plane->id))
+-		return;
++	return HAS_PIXEL_NORMALIZER(display) && icl_is_hdr_plane(display, plane->id);
++}
+ 
+-	val = enable ? PLANE_PIXEL_NORMALIZE_NORM_FACTOR(PLANE_PIXEL_NORMALIZE_NORM_FACTOR_1_0) |
+-		       PLANE_PIXEL_NORMALIZE_ENABLE : 0;
++static u32 pixel_normalizer_value(const struct intel_plane_state *plane_state)
++{
++	if (!intel_fbc_need_pixel_normalizer(plane_state))
++		return 0;
+ 
+-	intel_de_write_dsb(display, dsb,
+-			   PLANE_PIXEL_NORMALIZE(plane->pipe, plane->id), val);
++	return PLANE_PIXEL_NORMALIZE_ENABLE |
++	       PLANE_PIXEL_NORMALIZE_NORM_FACTOR(PLANE_PIXEL_NORMALIZE_NORM_FACTOR_1_0);
+ }
+ 
+ static void
+@@ -927,8 +924,9 @@ icl_plane_disable_arm(struct intel_dsb *dsb,
+ 
+ 	icl_plane_disable_sel_fetch_arm(dsb, plane, crtc_state);
+ 
+-	if (DISPLAY_VER(display) >= 35)
+-		x3p_lpd_plane_update_pixel_normalizer(dsb, plane, false);
++	if (plane_has_normalizer(plane))
++		intel_de_write_dsb(display, dsb,
++				   PLANE_PIXEL_NORMALIZE(plane->pipe, plane->id), 0);
+ 
+ 	intel_de_write_dsb(display, dsb, PLANE_CTL(pipe, plane_id), 0);
+ 	intel_de_write_dsb(display, dsb, PLANE_SURF(pipe, plane_id), 0);
+@@ -1677,11 +1675,13 @@ icl_plane_update_arm(struct intel_dsb *dsb,
+ 
+ 	/*
+ 	 * In order to have FBC for fp16 formats pixel normalizer block must be
+-	 * active. Check if pixel normalizer block need to be enabled for FBC.
+-	 * If needed, use normalization factor as 1.0 and enable the block.
++	 * active. For FP16 formats, use normalization factor as 1.0 and enable
++	 * the block.
+ 	 */
+-	if (intel_fbc_is_enable_pixel_normalizer(plane_state))
+-		x3p_lpd_plane_update_pixel_normalizer(dsb, plane, true);
++	if (plane_has_normalizer(plane))
++		intel_de_write_dsb(display, dsb,
++				   PLANE_PIXEL_NORMALIZE(plane->pipe, plane->id),
++				   pixel_normalizer_value(plane_state));
+ 
+ 	/*
+ 	 * The control register self-arms if the plane was previously
+-- 
+2.53.0
+

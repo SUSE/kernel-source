@@ -1,0 +1,213 @@
+From: =?UTF-8?q?Timur=20Krist=C3=B3f?= <timur.kristof@gmail.com>
+Date: Mon, 2 Feb 2026 12:25:07 +0100
+Subject: [PATCH] drm/amd/display: Enable DAC in DCE link encoder
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+References: bsc#1012628
+Patch-mainline: 6.19.4
+Git-commit: 4bd8b5f8bcb57b430c35494d8a2471ce5fd7661d
+
+[ Upstream commit 4bd8b5f8bcb57b430c35494d8a2471ce5fd7661d ]
+
+Ensure that the DAC output is enabled at the correct time by
+moving it to the DCE link encoder similarly to how digital
+outputs are enabled.
+
+This also removes the call to DAC1EncoderControl from the DCE
+HWSS, which always felt like it was a hacky solution.
+
+Fixes: 0fbe321a93ce ("drm/amd/display: Implement DCE analog link encoders (v2)")
+Signed-off-by: Timur Kristóf <timur.kristof@gmail.com>
+Tested-by: Mauro Rossi <issor.oruam@gmail.com>
+Reviewed-by: Alex Hung <alex.hung@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ .../drm/amd/display/dc/dce/dce_link_encoder.c | 18 +++++++++++++
+ .../drm/amd/display/dc/dce/dce_link_encoder.h |  5 ++++
+ .../amd/display/dc/hwss/dce110/dce110_hwseq.c | 26 +++++++------------
+ .../drm/amd/display/dc/hwss/hw_sequencer.h    |  2 ++
+ .../drm/amd/display/dc/inc/hw/link_encoder.h  |  2 ++
+ .../gpu/drm/amd/display/dc/link/link_dpms.c   | 14 +++++++++-
+ 6 files changed, 50 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.c b/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.c
+index 48a1b3b492e7..bec8dab156ee 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.c
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.c
+@@ -102,6 +102,7 @@ static const struct link_encoder_funcs dce110_lnk_enc_funcs = {
+ 	.enable_dp_output = dce110_link_encoder_enable_dp_output,
+ 	.enable_dp_mst_output = dce110_link_encoder_enable_dp_mst_output,
+ 	.enable_lvds_output = dce110_link_encoder_enable_lvds_output,
++	.enable_analog_output = dce110_link_encoder_enable_analog_output,
+ 	.disable_output = dce110_link_encoder_disable_output,
+ 	.dp_set_lane_settings = dce110_link_encoder_dp_set_lane_settings,
+ 	.dp_set_phy_pattern = dce110_link_encoder_dp_set_phy_pattern,
+@@ -1192,6 +1193,22 @@ void dce110_link_encoder_enable_lvds_output(
+ 	}
+ }
+ 
++void dce110_link_encoder_enable_analog_output(
++	struct link_encoder *enc,
++	uint32_t pixel_clock)
++{
++	struct dce110_link_encoder *enc110 = TO_DCE110_LINK_ENC(enc);
++	enum bp_result result;
++
++	result = link_dac_encoder_control(enc110, ENCODER_CONTROL_ENABLE, pixel_clock);
++
++	if (result != BP_RESULT_OK) {
++		DC_LOG_ERROR("%s: Failed to execute VBIOS command table!\n",
++			__func__);
++		BREAK_TO_DEBUGGER();
++	}
++}
++
+ /* enables DP PHY output */
+ void dce110_link_encoder_enable_dp_output(
+ 	struct link_encoder *enc,
+@@ -1776,6 +1793,7 @@ static const struct link_encoder_funcs dce60_lnk_enc_funcs = {
+ 	.enable_dp_output = dce60_link_encoder_enable_dp_output,
+ 	.enable_dp_mst_output = dce60_link_encoder_enable_dp_mst_output,
+ 	.enable_lvds_output = dce110_link_encoder_enable_lvds_output,
++	.enable_analog_output = dce110_link_encoder_enable_analog_output,
+ 	.disable_output = dce110_link_encoder_disable_output,
+ 	.dp_set_lane_settings = dce110_link_encoder_dp_set_lane_settings,
+ 	.dp_set_phy_pattern = dce60_link_encoder_dp_set_phy_pattern,
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.h b/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.h
+index c58b69bc319b..6870cb619d20 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.h
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.h
+@@ -273,6 +273,11 @@ void dce110_link_encoder_enable_lvds_output(
+ 	enum clock_source_id clock_source,
+ 	uint32_t pixel_clock);
+ 
++/* enables analog output from the DAC */
++void dce110_link_encoder_enable_analog_output(
++	struct link_encoder *enc,
++	uint32_t pixel_clock);
++
+ /* disable PHY output */
+ void dce110_link_encoder_disable_output(
+ 	struct link_encoder *enc,
+diff --git a/drivers/gpu/drm/amd/display/dc/hwss/dce110/dce110_hwseq.c b/drivers/gpu/drm/amd/display/dc/hwss/dce110/dce110_hwseq.c
+index c47230327667..5896ce5511ab 100644
+--- a/drivers/gpu/drm/amd/display/dc/hwss/dce110/dce110_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/hwss/dce110/dce110_hwseq.c
+@@ -659,20 +659,6 @@ void dce110_update_info_frame(struct pipe_ctx *pipe_ctx)
+ 	}
+ }
+ 
+-static void
+-dce110_dac_encoder_control(struct pipe_ctx *pipe_ctx, bool enable)
+-{
+-	struct dc_link *link = pipe_ctx->stream->link;
+-	struct dc_bios *bios = link->ctx->dc_bios;
+-	struct bp_encoder_control encoder_control = {0};
+-
+-	encoder_control.action = enable ? ENCODER_CONTROL_ENABLE : ENCODER_CONTROL_DISABLE;
+-	encoder_control.engine_id = link->link_enc->analog_engine;
+-	encoder_control.pixel_clock = pipe_ctx->stream->timing.pix_clk_100hz / 10;
+-
+-	bios->funcs->encoder_control(bios, &encoder_control);
+-}
+-
+ void dce110_enable_stream(struct pipe_ctx *pipe_ctx)
+ {
+ 	enum dc_lane_count lane_count =
+@@ -703,8 +689,6 @@ void dce110_enable_stream(struct pipe_ctx *pipe_ctx)
+ 
+ 	tg->funcs->set_early_control(tg, early_control);
+ 
+-	if (dc_is_rgb_signal(pipe_ctx->stream->signal))
+-		dce110_dac_encoder_control(pipe_ctx, true);
+ }
+ 
+ static enum bp_result link_transmitter_control(
+@@ -3285,6 +3269,15 @@ void dce110_enable_tmds_link_output(struct dc_link *link,
+ 	link->phy_state.symclk_state = SYMCLK_ON_TX_ON;
+ }
+ 
++static void dce110_enable_analog_link_output(
++		struct dc_link *link,
++		uint32_t pix_clk_100hz)
++{
++	link->link_enc->funcs->enable_analog_output(
++			link->link_enc,
++			pix_clk_100hz);
++}
++
+ void dce110_enable_dp_link_output(
+ 		struct dc_link *link,
+ 		const struct link_resource *link_res,
+@@ -3422,6 +3415,7 @@ static const struct hw_sequencer_funcs dce110_funcs = {
+ 	.enable_lvds_link_output = dce110_enable_lvds_link_output,
+ 	.enable_tmds_link_output = dce110_enable_tmds_link_output,
+ 	.enable_dp_link_output = dce110_enable_dp_link_output,
++	.enable_analog_link_output = dce110_enable_analog_link_output,
+ 	.disable_link_output = dce110_disable_link_output,
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/hwss/hw_sequencer.h b/drivers/gpu/drm/amd/display/dc/hwss/hw_sequencer.h
+index 8ed9eea40c56..4f6bd365e055 100644
+--- a/drivers/gpu/drm/amd/display/dc/hwss/hw_sequencer.h
++++ b/drivers/gpu/drm/amd/display/dc/hwss/hw_sequencer.h
+@@ -1184,6 +1184,8 @@ struct hw_sequencer_funcs {
+ 			const struct link_resource *link_res,
+ 			enum clock_source_id clock_source,
+ 			uint32_t pixel_clock);
++	void (*enable_analog_link_output)(struct dc_link *link,
++			uint32_t pixel_clock);
+ 	void (*disable_link_output)(struct dc_link *link,
+ 			const struct link_resource *link_res,
+ 			enum signal_type signal);
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/link_encoder.h b/drivers/gpu/drm/amd/display/dc/inc/hw/link_encoder.h
+index e638325e35ec..b1a88618c5bf 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/link_encoder.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/link_encoder.h
+@@ -130,6 +130,8 @@ struct link_encoder_funcs {
+ 	void (*enable_lvds_output)(struct link_encoder *enc,
+ 		enum clock_source_id clock_source,
+ 		uint32_t pixel_clock);
++	void (*enable_analog_output)(struct link_encoder *enc,
++		uint32_t pixel_clock);
+ 	void (*disable_output)(struct link_encoder *link_enc,
+ 		enum signal_type signal);
+ 	void (*dp_set_lane_settings)(struct link_encoder *enc,
+diff --git a/drivers/gpu/drm/amd/display/dc/link/link_dpms.c b/drivers/gpu/drm/amd/display/dc/link/link_dpms.c
+index 6ae134147617..635f614c0673 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/link_dpms.c
++++ b/drivers/gpu/drm/amd/display/dc/link/link_dpms.c
+@@ -2208,6 +2208,18 @@ static enum dc_status enable_link_dp_mst(
+ 	return enable_link_dp(state, pipe_ctx);
+ }
+ 
++static enum dc_status enable_link_analog(
++		struct dc_state *state,
++		struct pipe_ctx *pipe_ctx)
++{
++	struct dc_link *link = pipe_ctx->stream->link;
++
++	link->dc->hwss.enable_analog_link_output(
++		link, pipe_ctx->stream->timing.pix_clk_100hz);
++
++	return DC_OK;
++}
++
+ static enum dc_status enable_link_virtual(struct pipe_ctx *pipe_ctx)
+ {
+ 	struct dc_link *link = pipe_ctx->stream->link;
+@@ -2263,7 +2275,7 @@ static enum dc_status enable_link(
+ 		status = DC_OK;
+ 		break;
+ 	case SIGNAL_TYPE_RGB:
+-		status = DC_OK;
++		status = enable_link_analog(state, pipe_ctx);
+ 		break;
+ 	case SIGNAL_TYPE_VIRTUAL:
+ 		status = enable_link_virtual(pipe_ctx);
+-- 
+2.53.0
+

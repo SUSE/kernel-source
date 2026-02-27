@@ -1,0 +1,104 @@
+From: Lizhi Hou <lizhi.hou@amd.com>
+Date: Wed, 4 Feb 2026 09:11:17 -0800
+Subject: [PATCH] accel/amdxdna: Move RPM resume into job run function
+References: bsc#1012628
+Patch-mainline: 6.19.4
+Git-commit: 69674c1c704c0199ca7a3947f3cdcd575973175d
+
+[ Upstream commit 69674c1c704c0199ca7a3947f3cdcd575973175d ]
+
+Currently, amdxdna_pm_resume_get() is called during job creation, and
+amdxdna_pm_suspend_put() is called when the hardware notifies job
+completion. If a job is canceled before it is run, no hardware
+completion notification is generated, resulting in an unbalanced
+runtime PM resume/suspend pair.
+
+Fix this by moving amdxdna_pm_resume_get() to the job run path, ensuring
+runtime PM is only resumed for jobs that are actually executed.
+
+Fixes: 063db451832b ("accel/amdxdna: Enhance runtime power management")
+Reviewed-by: Mario Limonciello (AMD) <superm1@kernel.org>
+Signed-off-by: Lizhi Hou <lizhi.hou@amd.com>
+Link: https://patch.msgid.link/20260204171118.3165607-1-lizhi.hou@amd.com
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/accel/amdxdna/aie2_ctx.c | 19 +++++++++----------
+ 1 file changed, 9 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/accel/amdxdna/aie2_ctx.c b/drivers/accel/amdxdna/aie2_ctx.c
+index fe8f9783a73c..37d05f2e986f 100644
+--- a/drivers/accel/amdxdna/aie2_ctx.c
++++ b/drivers/accel/amdxdna/aie2_ctx.c
+@@ -306,6 +306,10 @@ aie2_sched_job_run(struct drm_sched_job *sched_job)
+ 	kref_get(&job->refcnt);
+ 	fence = dma_fence_get(job->fence);
+ 
++	ret = amdxdna_pm_resume_get(hwctx->client->xdna);
++	if (ret)
++		goto out;
++
+ 	if (job->drv_cmd) {
+ 		switch (job->drv_cmd->opcode) {
+ 		case SYNC_DEBUG_BO:
+@@ -332,6 +336,7 @@ aie2_sched_job_run(struct drm_sched_job *sched_job)
+ 
+ out:
+ 	if (ret) {
++		amdxdna_pm_suspend_put(hwctx->client->xdna);
+ 		dma_fence_put(job->fence);
+ 		aie2_job_put(job);
+ 		mmput(job->mm);
+@@ -988,15 +993,11 @@ int aie2_cmd_submit(struct amdxdna_hwctx *hwctx, struct amdxdna_sched_job *job,
+ 		goto free_chain;
+ 	}
+ 
+-	ret = amdxdna_pm_resume_get(xdna);
+-	if (ret)
+-		goto cleanup_job;
+-
+ retry:
+ 	ret = drm_gem_lock_reservations(job->bos, job->bo_cnt, &acquire_ctx);
+ 	if (ret) {
+ 		XDNA_WARN(xdna, "Failed to lock BOs, ret %d", ret);
+-		goto suspend_put;
++		goto cleanup_job;
+ 	}
+ 
+ 	for (i = 0; i < job->bo_cnt; i++) {
+@@ -1004,7 +1005,7 @@ int aie2_cmd_submit(struct amdxdna_hwctx *hwctx, struct amdxdna_sched_job *job,
+ 		if (ret) {
+ 			XDNA_WARN(xdna, "Failed to reserve fences %d", ret);
+ 			drm_gem_unlock_reservations(job->bos, job->bo_cnt, &acquire_ctx);
+-			goto suspend_put;
++			goto cleanup_job;
+ 		}
+ 	}
+ 
+@@ -1019,12 +1020,12 @@ int aie2_cmd_submit(struct amdxdna_hwctx *hwctx, struct amdxdna_sched_job *job,
+ 					msecs_to_jiffies(HMM_RANGE_DEFAULT_TIMEOUT);
+ 			} else if (time_after(jiffies, timeout)) {
+ 				ret = -ETIME;
+-				goto suspend_put;
++				goto cleanup_job;
+ 			}
+ 
+ 			ret = aie2_populate_range(abo);
+ 			if (ret)
+-				goto suspend_put;
++				goto cleanup_job;
+ 			goto retry;
+ 		}
+ 	}
+@@ -1050,8 +1051,6 @@ int aie2_cmd_submit(struct amdxdna_hwctx *hwctx, struct amdxdna_sched_job *job,
+ 
+ 	return 0;
+ 
+-suspend_put:
+-	amdxdna_pm_suspend_put(xdna);
+ cleanup_job:
+ 	drm_sched_job_cleanup(&job->base);
+ free_chain:
+-- 
+2.53.0
+

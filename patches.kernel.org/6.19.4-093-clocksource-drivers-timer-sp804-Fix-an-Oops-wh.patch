@@ -1,0 +1,91 @@
+From: Stephen Eta Zhou <stephen.eta.zhou@gmail.com>
+Date: Thu, 25 Dec 2025 16:16:31 +0800
+Subject: [PATCH] clocksource/drivers/timer-sp804: Fix an Oops when
+ read_current_timer is called on ARM32 platforms where the SP804 is not
+ registered as the sched_clock.
+References: bsc#1012628
+Patch-mainline: 6.19.4
+Git-commit: 694921a93f3e3621e067afc545cedf6fe3b234a9
+
+[ Upstream commit 694921a93f3e3621e067afc545cedf6fe3b234a9 ]
+
+On SP804, the delay timer shares the same clkevt instance with
+sched_clock. On some platforms, when
+sp804_clocksource_and_sched_clock_init is called with use_sched_clock
+not set to 1, sched_clkevt is not properly initialized. However,
+sp804_register_delay_timer is invoked unconditionally, and
+read_current_timer() subsequently calls sp804_read on an uninitialized
+sched_clkevt, leading to a kernel Oops when accessing
+sched_clkevt->value.
+
+Declare a dedicated clkevt instance exclusively for delay timer,
+instead of sharing the same clkevt with sched_clock.  This ensures
+that read_current_timer continues to work correctly regardless of
+whether SP804 is selected as the sched_clock.
+
+Fixes: 640594a04f11 ("clocksource/drivers/timer-sp804: Fix read_current_timer() issue when clock source is not registered")
+Reported-by: kernel test robot <lkp@intel.com>
+Closes: https://lore.kernel.org/oe-kbuild-all/202512250520.APOMkYRQ-lkp@intel.com/
+Signed-off-by: Stephen Eta Zhou <stephen.eta.zhou@gmail.com>
+Signed-off-by: Daniel Lezcano <daniel.lezcano@linaro.org>
+Link: https://patch.msgid.link/20251225-fix_timersp804-v2-1-a366d7157f58@gmail.com
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/clocksource/timer-sp804.c | 14 +++++++++-----
+ 1 file changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/clocksource/timer-sp804.c b/drivers/clocksource/timer-sp804.c
+index e82a95ea4724..d69858427359 100644
+--- a/drivers/clocksource/timer-sp804.c
++++ b/drivers/clocksource/timer-sp804.c
+@@ -106,21 +106,25 @@ static u64 notrace sp804_read(void)
+ 	return ~readl_relaxed(sched_clkevt->value);
+ }
+ 
++/* Register delay timer backed by the hardware counter */
+ #ifdef CONFIG_ARM
+ static struct delay_timer delay;
++static struct sp804_clkevt *delay_clkevt;
++
+ static unsigned long sp804_read_delay_timer_read(void)
+ {
+-	return sp804_read();
++	return ~readl_relaxed(delay_clkevt->value);
+ }
+ 
+-static void sp804_register_delay_timer(int freq)
++static void sp804_register_delay_timer(struct sp804_clkevt *clk, int freq)
+ {
++	delay_clkevt = clk;
+ 	delay.freq = freq;
+ 	delay.read_current_timer = sp804_read_delay_timer_read;
+ 	register_current_timer_delay(&delay);
+ }
+ #else
+-static inline void sp804_register_delay_timer(int freq) {}
++static inline void sp804_register_delay_timer(struct sp804_clkevt *clk, int freq) {}
+ #endif
+ 
+ static int __init sp804_clocksource_and_sched_clock_init(void __iomem *base,
+@@ -135,8 +139,6 @@ static int __init sp804_clocksource_and_sched_clock_init(void __iomem *base,
+ 	if (rate < 0)
+ 		return -EINVAL;
+ 
+-	sp804_register_delay_timer(rate);
+-
+ 	clkevt = sp804_clkevt_get(base);
+ 
+ 	writel(0, clkevt->ctrl);
+@@ -152,6 +154,8 @@ static int __init sp804_clocksource_and_sched_clock_init(void __iomem *base,
+ 	clocksource_mmio_init(clkevt->value, name,
+ 		rate, 200, 32, clocksource_mmio_readl_down);
+ 
++	sp804_register_delay_timer(clkevt, rate);
++
+ 	if (use_sched_clock) {
+ 		sched_clkevt = clkevt;
+ 		sched_clock_register(sp804_read, 32, rate);
+-- 
+2.53.0
+
