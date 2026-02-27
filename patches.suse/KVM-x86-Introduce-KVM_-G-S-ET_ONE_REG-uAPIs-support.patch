@@ -1,0 +1,235 @@
+From: Yang Weijiang <weijiang.yang@intel.com>
+Date: Fri, 19 Sep 2025 15:32:11 -0700
+Subject: KVM: x86: Introduce KVM_{G,S}ET_ONE_REG uAPIs support
+Patch-mainline: v6.18-rc1
+Git-commit: 06f2969c6a1237f05f8ba4324b6ddc2570a808d0
+References: jsc#PED-15123
+
+Enable KVM_{G,S}ET_ONE_REG uAPIs so that userspace can access MSRs and
+other non-MSR registers through them, along with support for
+KVM_GET_REG_LIST to enumerate support for KVM-defined registers.
+
+This is in preparation for allowing userspace to read/write the guest SSP
+register, which is needed for the upcoming CET virtualization support.
+
+Currently, two types of registers are supported: KVM_X86_REG_TYPE_MSR and
+KVM_X86_REG_TYPE_KVM. All MSRs are in the former type; the latter type is
+added for registers that lack existing KVM uAPIs to access them. The "KVM"
+in the name is intended to be vague to give KVM flexibility to include
+other potential registers.  More precise names like "SYNTHETIC" and
+"SYNTHETIC_MSR" were considered, but were deemed too confusing (e.g. can
+be conflated with synthetic guest-visible MSRs) and may put KVM into a
+corner (e.g. if KVM wants to change how a KVM-defined register is modeled
+internally).
+
+Enumerate only KVM-defined registers in KVM_GET_REG_LIST to avoid
+duplicating KVM_GET_MSR_INDEX_LIST, and so that KVM can return _only_
+registers that are fully supported (KVM_GET_REG_LIST is vCPU-scoped, i.e.
+can be precise, whereas KVM_GET_MSR_INDEX_LIST is system-scoped).
+
+Suggested-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Yang Weijiang <weijiang.yang@intel.com>
+Link: https://lore.kernel.org/all/20240219074733.122080-18-weijiang.yang@intel.com [1]
+Tested-by: Mathias Krause <minipli@grsecurity.net>
+Tested-by: John Allen <john.allen@amd.com>
+Tested-by: Rick Edgecombe <rick.p.edgecombe@intel.com>
+Signed-off-by: Chao Gao <chao.gao@intel.com>
+Reviewed-by: Binbin Wu <binbin.wu@linux.intel.com>
+Reviewed-by: Xiaoyao Li <xiaoyao.li@intel.com>
+Co-developed-by: Sean Christopherson <seanjc@google.com>
+Link: https://lore.kernel.org/r/20250919223258.1604852-5-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Acked-by: Carlos López <clopez@suse.de>
+---
+ Documentation/virt/kvm/api.rst  |    6 ++
+ arch/x86/include/uapi/asm/kvm.h |   26 ++++++++++
+ arch/x86/kvm/x86.c              |  100 ++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 131 insertions(+), 1 deletion(-)
+
+--- a/Documentation/virt/kvm/api.rst
++++ b/Documentation/virt/kvm/api.rst
+@@ -2889,6 +2889,8 @@ such as set vcpu counter or reset vcpu,
+ 
+   0x9030 0000 0002 <reg:16>
+ 
++x86 MSR registers have the following id bit patterns::
++  0x2030 0002 <msr number:32>
+ 
+ 4.69 KVM_GET_ONE_REG
+ --------------------
+@@ -3551,7 +3553,7 @@ VCPU matching underlying host.
+ ---------------------
+ 
+ :Capability: basic
+-:Architectures: arm64, mips, riscv
++:Architectures: arm64, mips, riscv, x86 (if KVM_CAP_ONE_REG)
+ :Type: vcpu ioctl
+ :Parameters: struct kvm_reg_list (in/out)
+ :Returns: 0 on success; -1 on error
+@@ -3573,6 +3575,8 @@ Errors:
+ This ioctl returns the guest registers that are supported for the
+ KVM_GET_ONE_REG/KVM_SET_ONE_REG calls.
+ 
++Note, for x86, all MSRs enumerated by KVM_GET_MSR_INDEX_LIST are supported as
++type KVM_X86_REG_TYPE_MSR, but are NOT enumerated via KVM_GET_REG_LIST.
+ 
+ 4.85 KVM_ARM_SET_DEVICE_ADDR (deprecated)
+ -----------------------------------------
+--- a/arch/x86/include/uapi/asm/kvm.h
++++ b/arch/x86/include/uapi/asm/kvm.h
+@@ -411,6 +411,32 @@ struct kvm_xcrs {
+ 	__u64 padding[16];
+ };
+ 
++#define KVM_X86_REG_TYPE_MSR		2
++#define KVM_X86_REG_TYPE_KVM		3
++
++#define KVM_X86_KVM_REG_SIZE(reg)						\
++({										\
++	reg == KVM_REG_GUEST_SSP ? KVM_REG_SIZE_U64 : 0;			\
++})
++
++#define KVM_X86_REG_TYPE_SIZE(type, reg)					\
++({										\
++	__u64 type_size = (__u64)type << 32;					\
++										\
++	type_size |= type == KVM_X86_REG_TYPE_MSR ? KVM_REG_SIZE_U64 :		\
++		     type == KVM_X86_REG_TYPE_KVM ? KVM_X86_KVM_REG_SIZE(reg) :	\
++		     0;								\
++	type_size;								\
++})
++
++#define KVM_X86_REG_ID(type, index)				\
++	(KVM_REG_X86 | KVM_X86_REG_TYPE_SIZE(type, index) | index)
++
++#define KVM_X86_REG_MSR(index)					\
++	KVM_X86_REG_ID(KVM_X86_REG_TYPE_MSR, index)
++#define KVM_X86_REG_KVM(index)					\
++	KVM_X86_REG_ID(KVM_X86_REG_TYPE_KVM, index)
++
+ #define KVM_SYNC_X86_REGS      (1UL << 0)
+ #define KVM_SYNC_X86_SREGS     (1UL << 1)
+ #define KVM_SYNC_X86_EVENTS    (1UL << 2)
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -4710,6 +4710,7 @@ int kvm_vm_ioctl_check_extension(struct
+ 	case KVM_CAP_IRQFD_RESAMPLE:
+ 	case KVM_CAP_MEMORY_FAULT_INFO:
+ 	case KVM_CAP_X86_GUEST_MODE:
++	case KVM_CAP_ONE_REG:
+ 		r = 1;
+ 		break;
+ 	case KVM_CAP_PRE_FAULT_MEMORY:
+@@ -5885,6 +5886,98 @@ static int kvm_vcpu_ioctl_enable_cap(str
+ 	}
+ }
+ 
++struct kvm_x86_reg_id {
++	__u32 index;
++	__u8  type;
++	__u8  rsvd1;
++	__u8  rsvd2:4;
++	__u8  size:4;
++	__u8  x86;
++};
++
++static int kvm_translate_kvm_reg(struct kvm_x86_reg_id *reg)
++{
++	return -EINVAL;
++}
++
++static int kvm_get_one_msr(struct kvm_vcpu *vcpu, u32 msr, u64 __user *user_val)
++{
++	u64 val;
++
++	if (do_get_msr(vcpu, msr, &val))
++		return -EINVAL;
++
++	if (put_user(val, user_val))
++		return -EFAULT;
++
++	return 0;
++}
++
++static int kvm_set_one_msr(struct kvm_vcpu *vcpu, u32 msr, u64 __user *user_val)
++{
++	u64 val;
++
++	if (get_user(val, user_val))
++		return -EFAULT;
++
++	if (do_set_msr(vcpu, msr, &val))
++		return -EINVAL;
++
++	return 0;
++}
++
++static int kvm_get_set_one_reg(struct kvm_vcpu *vcpu, unsigned int ioctl,
++			       void __user *argp)
++{
++	struct kvm_one_reg one_reg;
++	struct kvm_x86_reg_id *reg;
++	u64 __user *user_val;
++	int r;
++
++	if (copy_from_user(&one_reg, argp, sizeof(one_reg)))
++		return -EFAULT;
++
++	if ((one_reg.id & KVM_REG_ARCH_MASK) != KVM_REG_X86)
++		return -EINVAL;
++
++	reg = (struct kvm_x86_reg_id *)&one_reg.id;
++	if (reg->rsvd1 || reg->rsvd2)
++		return -EINVAL;
++
++	if (reg->type == KVM_X86_REG_TYPE_KVM) {
++		r = kvm_translate_kvm_reg(reg);
++		if (r)
++			return r;
++	}
++
++	if (reg->type != KVM_X86_REG_TYPE_MSR)
++		return -EINVAL;
++
++	if ((one_reg.id & KVM_REG_SIZE_MASK) != KVM_REG_SIZE_U64)
++		return -EINVAL;
++
++	guard(srcu)(&vcpu->kvm->srcu);
++
++	user_val = u64_to_user_ptr(one_reg.addr);
++	if (ioctl == KVM_GET_ONE_REG)
++		r = kvm_get_one_msr(vcpu, reg->index, user_val);
++	else
++		r = kvm_set_one_msr(vcpu, reg->index, user_val);
++
++	return r;
++}
++
++static int kvm_get_reg_list(struct kvm_vcpu *vcpu,
++			    struct kvm_reg_list __user *user_list)
++{
++	u64 nr_regs = 0;
++
++	if (put_user(nr_regs, &user_list->n))
++		return -EFAULT;
++
++	return 0;
++}
++
+ long kvm_arch_vcpu_ioctl(struct file *filp,
+ 			 unsigned int ioctl, unsigned long arg)
+ {
+@@ -6001,6 +6094,13 @@ long kvm_arch_vcpu_ioctl(struct file *fi
+ 		srcu_read_unlock(&vcpu->kvm->srcu, idx);
+ 		break;
+ 	}
++	case KVM_GET_ONE_REG:
++	case KVM_SET_ONE_REG:
++		r = kvm_get_set_one_reg(vcpu, ioctl, argp);
++		break;
++	case KVM_GET_REG_LIST:
++		r = kvm_get_reg_list(vcpu, argp);
++		break;
+ 	case KVM_TPR_ACCESS_REPORTING: {
+ 		struct kvm_tpr_access_ctl tac;
+ 

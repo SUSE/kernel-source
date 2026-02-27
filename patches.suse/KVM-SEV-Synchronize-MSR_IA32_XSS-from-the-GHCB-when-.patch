@@ -1,0 +1,76 @@
+From: Sean Christopherson <seanjc@google.com>
+Date: Fri, 19 Sep 2025 15:32:46 -0700
+Subject: KVM: SEV: Synchronize MSR_IA32_XSS from the GHCB when it's valid
+Patch-mainline: v6.18-rc1
+Git-commit: b5fa221f7b08ca145b0357b77b90dcc998278967
+References: jsc#PED-15123
+
+Synchronize XSS from the GHCB to KVM's internal tracking if the guest
+marks XSS as valid on a #VMGEXIT.  Like XCR0, KVM needs an up-to-date copy
+of XSS in order to compute the required XSTATE size when emulating
+CPUID.0xD.0x1 for the guest.
+
+Treat the incoming XSS change as an emulated write, i.e. validatate the
+guest-provided value, to avoid letting the guest load garbage into KVM's
+tracking.  Simply ignore bad values, as either the guest managed to get an
+unsupported value into hardware, or the guest is misbehaving and providing
+pure garbage.  In either case, KVM can't fix the broken guest.
+
+Explicitly allow access to XSS at all times, as KVM needs to ensure its
+copy of XSS stays up-to-date.  E.g. KVM supports migration of SEV-ES guests
+and so needs to allow the host to save/restore XSS, otherwise a guest
+that *knows* its XSS hasn't change could get stale/bad CPUID emulation if
+the guest doesn't provide XSS in the GHCB on every exit.  This creates a
+hypothetical problem where a guest could request emulation of RDMSR or
+WRMSR on XSS, but arguably that's not even a problem, e.g. it would be
+entirely reasonable for a guest to request "emulation" as a way to inform
+the hypervisor that its XSS value has been modified.
+
+Note, emulating the change as an MSR write also takes care of side effects,
+e.g. marking dynamic CPUID bits as dirty.
+
+Suggested-by: John Allen <john.allen@amd.com>
+base-commit: 14298d819d5a6b7180a4089e7d2121ca3551dc6c
+Link: https://lore.kernel.org/r/20250919223258.1604852-40-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Acked-by: Carlos López <clopez@suse.de>
+---
+ arch/x86/kvm/svm/sev.c |    3 +++
+ arch/x86/kvm/svm/svm.c |    4 ++--
+ arch/x86/kvm/svm/svm.h |    1 +
+ 3 files changed, 6 insertions(+), 2 deletions(-)
+
+--- a/arch/x86/kvm/svm/sev.c
++++ b/arch/x86/kvm/svm/sev.c
+@@ -3226,6 +3226,9 @@ static void sev_es_sync_from_ghcb(struct
+ 	if (kvm_ghcb_xcr0_is_valid(svm))
+ 		__kvm_set_xcr(vcpu, 0, kvm_ghcb_get_xcr0(svm));
+ 
++	if (kvm_ghcb_xss_is_valid(svm))
++		__kvm_emulate_msr_write(vcpu, MSR_IA32_XSS, kvm_ghcb_get_xss(svm));
++
+ 	/* Copy the GHCB exit information into the VMCB fields */
+ 	exit_code = kvm_ghcb_get_sw_exit_code(svm);
+ 	control->exit_code = lower_32_bits(exit_code);
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -2763,8 +2763,8 @@ static int svm_get_feature_msr(u32 msr,
+ static bool sev_es_prevent_msr_access(struct kvm_vcpu *vcpu,
+ 				      struct msr_data *msr_info)
+ {
+-	return sev_es_guest(vcpu->kvm) &&
+-	       vcpu->arch.guest_state_protected &&
++	return sev_es_guest(vcpu->kvm) && vcpu->arch.guest_state_protected &&
++	       msr_info->index != MSR_IA32_XSS &&
+ 	       !msr_write_intercepted(vcpu, msr_info->index);
+ }
+ 
+--- a/arch/x86/kvm/svm/svm.h
++++ b/arch/x86/kvm/svm/svm.h
+@@ -897,5 +897,6 @@ DEFINE_KVM_GHCB_ACCESSORS(sw_exit_info_1
+ DEFINE_KVM_GHCB_ACCESSORS(sw_exit_info_2)
+ DEFINE_KVM_GHCB_ACCESSORS(sw_scratch)
+ DEFINE_KVM_GHCB_ACCESSORS(xcr0)
++DEFINE_KVM_GHCB_ACCESSORS(xss)
+ 
+ #endif

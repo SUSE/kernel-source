@@ -1,0 +1,204 @@
+From: Yang Weijiang <weijiang.yang@intel.com>
+Date: Fri, 19 Sep 2025 15:32:21 -0700
+Subject: KVM: VMX: Emulate read and write to CET MSRs
+Patch-mainline: v6.18-rc1
+Git-commit: 8b59d0275c964bcbe573dde46bd3c1f20ed2d2bd
+References: jsc#PED-15123
+
+Add emulation interface for CET MSR access. The emulation code is split
+into common part and vendor specific part. The former does common checks
+for MSRs, e.g., accessibility, data validity etc., then passes operation
+to either XSAVE-managed MSRs via the helpers or CET VMCS fields.
+
+SSP can only be read via RDSSP. Writing even requires destructive and
+potentially faulting operations such as SAVEPREVSSP/RSTORSSP or
+SETSSBSY/CLRSSBSY. Let the host use a pseudo-MSR that is just a wrapper
+for the GUEST_SSP field of the VMCS.
+
+Suggested-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Yang Weijiang <weijiang.yang@intel.com>
+Tested-by: Mathias Krause <minipli@grsecurity.net>
+Tested-by: John Allen <john.allen@amd.com>
+Tested-by: Rick Edgecombe <rick.p.edgecombe@intel.com>
+Signed-off-by: Chao Gao <chao.gao@intel.com>
+[sean: drop call to kvm_set_xstate_msr() for S_CET, consolidate code]
+Reviewed-by: Binbin Wu <binbin.wu@linux.intel.com>
+Reviewed-by: Xiaoyao Li <xiaoyao.li@intel.com>
+Link: https://lore.kernel.org/r/20250919223258.1604852-15-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Acked-by: Carlos López <clopez@suse.de>
+---
+ arch/x86/kvm/vmx/vmx.c |   18 +++++++++++++
+ arch/x86/kvm/x86.c     |   64 +++++++++++++++++++++++++++++++++++++++++++++++--
+ arch/x86/kvm/x86.h     |   23 +++++++++++++++++
+ 3 files changed, 103 insertions(+), 2 deletions(-)
+
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -2104,6 +2104,15 @@ int vmx_get_msr(struct kvm_vcpu *vcpu, s
+ 		else
+ 			msr_info->data = vmx->pt_desc.guest.addr_a[index / 2];
+ 		break;
++	case MSR_IA32_S_CET:
++		msr_info->data = vmcs_readl(GUEST_S_CET);
++		break;
++	case MSR_KVM_INTERNAL_GUEST_SSP:
++		msr_info->data = vmcs_readl(GUEST_SSP);
++		break;
++	case MSR_IA32_INT_SSP_TAB:
++		msr_info->data = vmcs_readl(GUEST_INTR_SSP_TABLE);
++		break;
+ 	case MSR_IA32_DEBUGCTLMSR:
+ 		msr_info->data = vmx_guest_debugctl_read();
+ 		break;
+@@ -2422,6 +2431,15 @@ int vmx_set_msr(struct kvm_vcpu *vcpu, s
+ 		else
+ 			vmx->pt_desc.guest.addr_a[index / 2] = data;
+ 		break;
++	case MSR_IA32_S_CET:
++		vmcs_writel(GUEST_S_CET, data);
++		break;
++	case MSR_KVM_INTERNAL_GUEST_SSP:
++		vmcs_writel(GUEST_SSP, data);
++		break;
++	case MSR_IA32_INT_SSP_TAB:
++		vmcs_writel(GUEST_INTR_SSP_TABLE, data);
++		break;
+ 	case MSR_IA32_PERF_CAPABILITIES:
+ 		if (data & PMU_CAP_LBR_FMT) {
+ 			if ((data & PMU_CAP_LBR_FMT) !=
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -1898,6 +1898,44 @@ static int __kvm_set_msr(struct kvm_vcpu
+ 
+ 		data = (u32)data;
+ 		break;
++	case MSR_IA32_U_CET:
++	case MSR_IA32_S_CET:
++		if (!guest_cpu_cap_has(vcpu, X86_FEATURE_SHSTK) &&
++		    !guest_cpu_cap_has(vcpu, X86_FEATURE_IBT))
++			return KVM_MSR_RET_UNSUPPORTED;
++		if (!kvm_is_valid_u_s_cet(vcpu, data))
++			return 1;
++		break;
++	case MSR_KVM_INTERNAL_GUEST_SSP:
++		if (!host_initiated)
++			return 1;
++		fallthrough;
++		/*
++		 * Note that the MSR emulation here is flawed when a vCPU
++		 * doesn't support the Intel 64 architecture. The expected
++		 * architectural behavior in this case is that the upper 32
++		 * bits do not exist and should always read '0'. However,
++		 * because the actual hardware on which the virtual CPU is
++		 * running does support Intel 64, XRSTORS/XSAVES in the
++		 * guest could observe behavior that violates the
++		 * architecture. Intercepting XRSTORS/XSAVES for this
++		 * special case isn't deemed worthwhile.
++		 */
++	case MSR_IA32_PL0_SSP ... MSR_IA32_INT_SSP_TAB:
++		if (!guest_cpu_cap_has(vcpu, X86_FEATURE_SHSTK))
++			return KVM_MSR_RET_UNSUPPORTED;
++		/*
++		 * MSR_IA32_INT_SSP_TAB is not present on processors that do
++		 * not support Intel 64 architecture.
++		 */
++		if (index == MSR_IA32_INT_SSP_TAB && !guest_cpu_cap_has(vcpu, X86_FEATURE_LM))
++			return KVM_MSR_RET_UNSUPPORTED;
++		if (is_noncanonical_msr_address(data, vcpu))
++			return 1;
++		/* All SSP MSRs except MSR_IA32_INT_SSP_TAB must be 4-byte aligned */
++		if (index != MSR_IA32_INT_SSP_TAB && !IS_ALIGNED(data, 4))
++			return 1;
++		break;
+ 	}
+ 
+ 	msr.data = data;
+@@ -1942,6 +1980,20 @@ static int __kvm_get_msr(struct kvm_vcpu
+ 		    !guest_cpu_cap_has(vcpu, X86_FEATURE_RDPID))
+ 			return 1;
+ 		break;
++	case MSR_IA32_U_CET:
++	case MSR_IA32_S_CET:
++		if (!guest_cpu_cap_has(vcpu, X86_FEATURE_SHSTK) &&
++		    !guest_cpu_cap_has(vcpu, X86_FEATURE_IBT))
++			return KVM_MSR_RET_UNSUPPORTED;
++		break;
++	case MSR_KVM_INTERNAL_GUEST_SSP:
++		if (!host_initiated)
++			return 1;
++		fallthrough;
++	case MSR_IA32_PL0_SSP ... MSR_IA32_INT_SSP_TAB:
++		if (!guest_cpu_cap_has(vcpu, X86_FEATURE_SHSTK))
++			return KVM_MSR_RET_UNSUPPORTED;
++		break;
+ 	}
+ 
+ 	msr.index = index;
+@@ -3852,12 +3904,12 @@ static __always_inline void kvm_access_x
+ 	kvm_fpu_put();
+ }
+ 
+-static __maybe_unused void kvm_set_xstate_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
++static void kvm_set_xstate_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ {
+ 	kvm_access_xstate_msr(vcpu, msr_info, MSR_TYPE_W);
+ }
+ 
+-static __maybe_unused void kvm_get_xstate_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
++static void kvm_get_xstate_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ {
+ 	kvm_access_xstate_msr(vcpu, msr_info, MSR_TYPE_R);
+ }
+@@ -4237,6 +4289,10 @@ int kvm_set_msr_common(struct kvm_vcpu *
+ 		vcpu->arch.guest_fpu.xfd_err = data;
+ 		break;
+ #endif
++	case MSR_IA32_U_CET:
++	case MSR_IA32_PL0_SSP ... MSR_IA32_PL3_SSP:
++		kvm_set_xstate_msr(vcpu, msr_info);
++		break;
+ 	default:
+ 		if (kvm_pmu_is_valid_msr(vcpu, msr))
+ 			return kvm_pmu_set_msr(vcpu, msr_info);
+@@ -4586,6 +4642,10 @@ int kvm_get_msr_common(struct kvm_vcpu *
+ 		msr_info->data = vcpu->arch.guest_fpu.xfd_err;
+ 		break;
+ #endif
++	case MSR_IA32_U_CET:
++	case MSR_IA32_PL0_SSP ... MSR_IA32_PL3_SSP:
++		kvm_get_xstate_msr(vcpu, msr_info);
++		break;
+ 	default:
+ 		if (kvm_pmu_is_valid_msr(vcpu, msr_info->index))
+ 			return kvm_pmu_get_msr(vcpu, msr_info);
+--- a/arch/x86/kvm/x86.h
++++ b/arch/x86/kvm/x86.h
+@@ -658,4 +658,27 @@ int ____kvm_emulate_hypercall(struct kvm
+ 
+ int kvm_emulate_hypercall(struct kvm_vcpu *vcpu);
+ 
++#define CET_US_RESERVED_BITS		GENMASK(9, 6)
++#define CET_US_SHSTK_MASK_BITS		GENMASK(1, 0)
++#define CET_US_IBT_MASK_BITS		(GENMASK_ULL(5, 2) | GENMASK_ULL(63, 10))
++#define CET_US_LEGACY_BITMAP_BASE(data)	((data) >> 12)
++
++static inline bool kvm_is_valid_u_s_cet(struct kvm_vcpu *vcpu, u64 data)
++{
++	if (data & CET_US_RESERVED_BITS)
++		return false;
++	if (!guest_cpu_cap_has(vcpu, X86_FEATURE_SHSTK) &&
++	    (data & CET_US_SHSTK_MASK_BITS))
++		return false;
++	if (!guest_cpu_cap_has(vcpu, X86_FEATURE_IBT) &&
++	    (data & CET_US_IBT_MASK_BITS))
++		return false;
++	if (!IS_ALIGNED(CET_US_LEGACY_BITMAP_BASE(data), 4))
++		return false;
++	/* IBT can be suppressed iff the TRACKER isn't WAIT_ENDBR. */
++	if ((data & CET_SUPPRESS) && (data & CET_WAIT_ENDBR))
++		return false;
++
++	return true;
++}
+ #endif

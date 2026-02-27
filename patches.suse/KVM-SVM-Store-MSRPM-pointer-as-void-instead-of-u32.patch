@@ -1,0 +1,113 @@
+From: Sean Christopherson <seanjc@google.com>
+Date: Tue, 10 Jun 2025 15:57:31 -0700
+Subject: KVM: SVM: Store MSRPM pointer as "void *" instead of "u32 *"
+Patch-mainline: v6.17-rc1
+Git-commit: 7fe0578041188d63207f17335e8c0d10e19c7515
+References: jsc#PED-15123
+
+Store KVM's MSRPM pointers as "void *" instead of "u32 *" to guard against
+directly accessing the bitmaps outside of code that is explicitly written
+to access the bitmaps with a specific type.
+
+Opportunistically use svm_vcpu_free_msrpm() in svm_vcpu_free() instead of
+open coding an equivalent.
+
+Link: https://lore.kernel.org/r/20250610225737.156318-27-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Acked-by: Carlos López <clopez@suse.de>
+---
+ arch/x86/kvm/svm/nested.c |    4 +++-
+ arch/x86/kvm/svm/svm.c    |    8 ++++----
+ arch/x86/kvm/svm/svm.h    |   13 ++++++++-----
+ 3 files changed, 15 insertions(+), 10 deletions(-)
+
+--- a/arch/x86/kvm/svm/nested.c
++++ b/arch/x86/kvm/svm/nested.c
+@@ -277,6 +277,8 @@ int __init nested_svm_init_msrpm_merge_o
+ static bool nested_svm_merge_msrpm(struct kvm_vcpu *vcpu)
+ {
+ 	struct vcpu_svm *svm = to_svm(vcpu);
++	u32 *msrpm02 = svm->nested.msrpm;
++	u32 *msrpm01 = svm->msrpm;
+ 	int i;
+ 
+ 	/*
+@@ -311,7 +313,7 @@ static bool nested_svm_merge_msrpm(struc
+ 		if (kvm_vcpu_read_guest(vcpu, offset, &value, 4))
+ 			return false;
+ 
+-		svm->nested.msrpm[p] = svm->msrpm[p] | value;
++		msrpm02[p] = msrpm01[p] | value;
+ 	}
+ 
+ 	svm->nested.force_msr_bitmap_recalc = false;
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -723,11 +723,11 @@ void svm_enable_intercept_for_msr(struct
+ 	svm->nested.force_msr_bitmap_recalc = true;
+ }
+ 
+-u32 *svm_vcpu_alloc_msrpm(void)
++void *svm_vcpu_alloc_msrpm(void)
+ {
+ 	unsigned int order = get_order(MSRPM_SIZE);
+ 	struct page *pages = alloc_pages(GFP_KERNEL_ACCOUNT, order);
+-	u32 *msrpm;
++	void *msrpm;
+ 
+ 	if (!pages)
+ 		return NULL;
+@@ -800,7 +800,7 @@ void svm_set_x2apic_msr_interception(str
+ 	svm->x2avic_msrs_intercepted = intercept;
+ }
+ 
+-void svm_vcpu_free_msrpm(u32 *msrpm)
++void svm_vcpu_free_msrpm(void *msrpm)
+ {
+ 	__free_pages(virt_to_page(msrpm), get_order(MSRPM_SIZE));
+ }
+@@ -1360,7 +1360,7 @@ static void svm_vcpu_free(struct kvm_vcp
+ 	sev_free_vcpu(vcpu);
+ 
+ 	__free_page(__sme_pa_to_page(svm->vmcb01.pa));
+-	__free_pages(virt_to_page(svm->msrpm), get_order(MSRPM_SIZE));
++	svm_vcpu_free_msrpm(svm->msrpm);
+ }
+ 
+ #ifdef CONFIG_CPU_MITIGATIONS
+--- a/arch/x86/kvm/svm/svm.h
++++ b/arch/x86/kvm/svm/svm.h
+@@ -181,8 +181,11 @@ struct svm_nested_state {
+ 	u64 vmcb12_gpa;
+ 	u64 last_vmcb12_gpa;
+ 
+-	/* These are the merged vectors */
+-	u32 *msrpm;
++	/*
++	 * The MSR permissions map used for vmcb02, which is the merge result
++	 * of vmcb01 and vmcb12
++	 */
++	void *msrpm;
+ 
+ 	/* A VMRUN has started but has not yet been performed, so
+ 	 * we cannot inject a nested vmexit yet.  */
+@@ -263,7 +266,7 @@ struct vcpu_svm {
+ 	 */
+ 	u64 virt_spec_ctrl;
+ 
+-	u32 *msrpm;
++	void *msrpm;
+ 
+ 	ulong nmi_iret_rip;
+ 
+@@ -638,8 +641,8 @@ BUILD_SVM_MSR_BITMAP_HELPERS(void, set,
+ /* svm.c */
+ extern bool dump_invalid_vmcb;
+ 
+-u32 *svm_vcpu_alloc_msrpm(void);
+-void svm_vcpu_free_msrpm(u32 *msrpm);
++void *svm_vcpu_alloc_msrpm(void);
++void svm_vcpu_free_msrpm(void *msrpm);
+ void svm_copy_lbrs(struct vmcb *to_vmcb, struct vmcb *from_vmcb);
+ void svm_enable_lbrv(struct kvm_vcpu *vcpu);
+ void svm_update_lbrv(struct kvm_vcpu *vcpu);

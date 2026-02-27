@@ -1,0 +1,89 @@
+From: Sean Christopherson <seanjc@google.com>
+Date: Mon, 11 Aug 2025 19:55:12 -0700
+Subject: KVM: x86: Manually clear MPX state only on INIT
+Patch-mainline: v6.18-rc1
+Git-commit: 41f6710f99f4337924e3929e8e7a51c74f800b91
+References: jsc#PED-15123
+
+Don't manually clear/zero MPX state on RESET, as the guest FPU state is
+zero allocated and KVM only does RESET during vCPU creation, i.e. the
+relevant state is guaranteed to be all zeroes.
+
+Opportunistically move the relevant code into a helper in anticipation of
+adding support for CET shadow stacks, which also has state that is zeroed
+on INIT.
+
+Signed-off-by: Yang Weijiang <weijiang.yang@intel.com>
+Tested-by: Mathias Krause <minipli@grsecurity.net>
+Tested-by: John Allen <john.allen@amd.com>
+Signed-off-by: Chao Gao <chao.gao@intel.com>
+Tested-by: Rick Edgecombe <rick.p.edgecombe@intel.com>
+Link: https://lore.kernel.org/r/20250812025606.74625-5-chao.gao@intel.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Acked-by: Carlos López <clopez@suse.de>
+---
+ arch/x86/kvm/x86.c |   46 ++++++++++++++++++++++++++++++----------------
+ 1 file changed, 30 insertions(+), 16 deletions(-)
+
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -12502,6 +12502,35 @@ void kvm_arch_vcpu_destroy(struct kvm_vc
+ 	kvfree(vcpu->arch.cpuid_entries);
+ }
+ 
++static void kvm_xstate_reset(struct kvm_vcpu *vcpu, bool init_event)
++{
++	struct fpstate *fpstate = vcpu->arch.guest_fpu.fpstate;
++
++	/*
++	 * Guest FPU state is zero allocated and so doesn't need to be manually
++	 * cleared on RESET, i.e. during vCPU creation.
++	 */
++	if (!init_event || !fpstate)
++		return;
++
++	/*
++	 * On INIT, only select XSTATE components are zeroed, most components
++	 * are unchanged.  Currently, the only components that are zeroed and
++	 * supported by KVM are MPX related.
++	 */
++	if (!kvm_mpx_supported())
++		return;
++
++	/*
++	 * All paths that lead to INIT are required to load the guest's FPU
++	 * state (because most paths are buried in KVM_RUN).
++	 */
++	kvm_put_guest_fpu(vcpu);
++	fpstate_clear_xstate_component(fpstate, XFEATURE_BNDREGS);
++	fpstate_clear_xstate_component(fpstate, XFEATURE_BNDCSR);
++	kvm_load_guest_fpu(vcpu);
++}
++
+ void kvm_vcpu_reset(struct kvm_vcpu *vcpu, bool init_event)
+ {
+ 	struct kvm_cpuid_entry2 *cpuid_0x1;
+@@ -12559,22 +12588,7 @@ void kvm_vcpu_reset(struct kvm_vcpu *vcp
+ 	kvm_async_pf_hash_reset(vcpu);
+ 	vcpu->arch.apf.halted = false;
+ 
+-	if (vcpu->arch.guest_fpu.fpstate && kvm_mpx_supported()) {
+-		struct fpstate *fpstate = vcpu->arch.guest_fpu.fpstate;
+-
+-		/*
+-		 * All paths that lead to INIT are required to load the guest's
+-		 * FPU state (because most paths are buried in KVM_RUN).
+-		 */
+-		if (init_event)
+-			kvm_put_guest_fpu(vcpu);
+-
+-		fpstate_clear_xstate_component(fpstate, XFEATURE_BNDREGS);
+-		fpstate_clear_xstate_component(fpstate, XFEATURE_BNDCSR);
+-
+-		if (init_event)
+-			kvm_load_guest_fpu(vcpu);
+-	}
++	kvm_xstate_reset(vcpu, init_event);
+ 
+ 	if (!init_event) {
+ 		vcpu->arch.smbase = 0x30000;

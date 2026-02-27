@@ -1,0 +1,175 @@
+From: Chao Gao <chao.gao@intel.com>
+Date: Thu, 22 May 2025 08:10:04 -0700
+Subject: x86/fpu/xstate: Differentiate default features for host and guest
+ FPUs
+Patch-mainline: v6.17-rc1
+Git-commit: 7bc4ed75f2d664c5a96d1f0874c41431a84c62b2
+References: jsc#PED-15123
+
+Currently, guest and host FPUs share the same default features. However,
+the CET supervisor xstate is the first feature that needs to be enabled
+exclusively for guest FPUs. Enabling it for host FPUs leads to a waste of
+24 bytes in the XSAVE buffer.
+
+To support "guest-only" features, add a new structure to hold the
+default features and sizes for guest FPUs to clearly differentiate them
+from those for host FPUs.
+
+Add two helpers to provide the default feature masks for guest and host
+FPUs. Default features are derived by applying the masks to the maximum
+supported features.
+
+Note that,
+1) for now, guest_default_mask() and host_default_mask() are identical.
+This will change in a follow-up patch once guest permissions, default
+xfeatures, and fpstate size are all converted to use the guest defaults.
+
+2) only supervisor features will diverge between guest FPUs and host
+FPUs, while user features will remain the same [1][2]. So, the new
+vcpu_fpu_config struct does not include default user features and size
+for the UABI buffer.
+
+An alternative approach is adding a guest_only_xfeatures member to
+fpu_kernel_cfg and adding two helper functions to calculate the guest
+default xfeatures and size. However, calculating these defaults at runtime
+would introduce unnecessary overhead.
+
+Suggested-by: Chang S. Bae <chang.seok.bae@intel.com>
+Suggested-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Chao Gao <chao.gao@intel.com>
+Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+Reviewed-by: John Allen <john.allen@amd.com>
+Link: https://lore.kernel.org/kvm/aAwdQ759Y6V7SGhv@google.com/ [1]
+Link: https://lore.kernel.org/kvm/9ca17e1169805f35168eb722734fbf3579187886.camel@intel.com/ [2]
+Link: https://lore.kernel.org/all/20250522151031.426788-2-chao.gao%40intel.com
+Acked-by: Carlos López <clopez@suse.de>
+---
+ arch/x86/include/asm/fpu/types.h |   26 ++++++++++++++++++++++++++
+ arch/x86/kernel/fpu/core.c       |    1 +
+ arch/x86/kernel/fpu/init.c       |    1 +
+ arch/x86/kernel/fpu/xstate.c     |   32 ++++++++++++++++++++++++++------
+ 4 files changed, 54 insertions(+), 6 deletions(-)
+
+--- a/arch/x86/include/asm/fpu/types.h
++++ b/arch/x86/include/asm/fpu/types.h
+@@ -557,6 +557,31 @@ struct fpu_guest {
+ };
+ 
+ /*
++ * FPU state configuration data for fpu_guest.
++ * Initialized at boot time. Read only after init.
++ */
++struct vcpu_fpu_config {
++	/*
++	 * @size:
++	 *
++	 * The default size of the register state buffer in guest FPUs.
++	 * Includes all supported features except independent managed
++	 * features and features which have to be requested by user space
++	 * before usage.
++	 */
++	unsigned int size;
++
++	/*
++	 * @features:
++	 *
++	 * The default supported features bitmap in guest FPUs. Does not
++	 * include independent managed features and features which have to
++	 * be requested by user space before usage.
++	 */
++	u64 features;
++};
++
++/*
+  * FPU state configuration data. Initialized at boot time. Read only after init.
+  */
+ struct fpu_state_config {
+@@ -611,5 +636,6 @@ struct fpu_state_config {
+ 
+ /* FPU state configuration information */
+ extern struct fpu_state_config fpu_kernel_cfg, fpu_user_cfg;
++extern struct vcpu_fpu_config guest_default_cfg;
+ 
+ #endif /* _ASM_X86_FPU_TYPES_H */
+--- a/arch/x86/kernel/fpu/core.c
++++ b/arch/x86/kernel/fpu/core.c
+@@ -36,6 +36,7 @@ DEFINE_PER_CPU(u64, xfd_state);
+ /* The FPU state configuration data for kernel and user space */
+ struct fpu_state_config	fpu_kernel_cfg __ro_after_init;
+ struct fpu_state_config fpu_user_cfg __ro_after_init;
++struct vcpu_fpu_config guest_default_cfg __ro_after_init;
+ 
+ /*
+  * Represents the initial FPU state. It's mostly (but not completely) zeroes,
+--- a/arch/x86/kernel/fpu/init.c
++++ b/arch/x86/kernel/fpu/init.c
+@@ -204,6 +204,7 @@ static void __init fpu__init_system_xsta
+ 	fpu_kernel_cfg.default_size = size;
+ 	fpu_user_cfg.max_size = size;
+ 	fpu_user_cfg.default_size = size;
++	guest_default_cfg.size = size;
+ 	fpstate_reset(&current->thread.fpu);
+ }
+ 
+--- a/arch/x86/kernel/fpu/xstate.c
++++ b/arch/x86/kernel/fpu/xstate.c
+@@ -717,6 +717,9 @@ static int __init init_xstate_size(void)
+ 	fpu_user_cfg.default_size =
+ 		xstate_calculate_size(fpu_user_cfg.default_features, false);
+ 
++	guest_default_cfg.size =
++		xstate_calculate_size(guest_default_cfg.features, compacted);
++
+ 	return 0;
+ }
+ 
+@@ -735,6 +738,7 @@ static void __init fpu__init_disable_sys
+ 	fpu_kernel_cfg.default_size = legacy_size;
+ 	fpu_user_cfg.max_size = legacy_size;
+ 	fpu_user_cfg.default_size = legacy_size;
++	guest_default_cfg.size = legacy_size;
+ 
+ 	/*
+ 	 * Prevent enabling the static branch which enables writes to the
+@@ -745,6 +749,21 @@ static void __init fpu__init_disable_sys
+ 	fpstate_reset(&current->thread.fpu);
+ }
+ 
++static u64 __init host_default_mask(void)
++{
++	/* Exclude dynamic features, which require userspace opt-in. */
++	return ~(u64)XFEATURE_MASK_USER_DYNAMIC;
++}
++
++static u64 __init guest_default_mask(void)
++{
++	/*
++	 * Exclude dynamic features, which require userspace opt-in even
++	 * for KVM guests.
++	 */
++	return ~(u64)XFEATURE_MASK_USER_DYNAMIC;
++}
++
+ /*
+  * Enable and initialize the xsave feature.
+  * Called once per system bootup.
+@@ -832,12 +851,13 @@ void __init fpu__init_system_xstate(unsi
+ 	fpu_user_cfg.max_features = fpu_kernel_cfg.max_features;
+ 	fpu_user_cfg.max_features &= XFEATURE_MASK_USER_SUPPORTED;
+ 
+-	/* Clean out dynamic features from default */
+-	fpu_kernel_cfg.default_features = fpu_kernel_cfg.max_features;
+-	fpu_kernel_cfg.default_features &= ~XFEATURE_MASK_USER_DYNAMIC;
+-
+-	fpu_user_cfg.default_features = fpu_user_cfg.max_features;
+-	fpu_user_cfg.default_features &= ~XFEATURE_MASK_USER_DYNAMIC;
++	/*
++	 * Now, given maximum feature set, determine default values by
++	 * applying default masks.
++	 */
++	fpu_kernel_cfg.default_features = fpu_kernel_cfg.max_features & host_default_mask();
++	fpu_user_cfg.default_features   = fpu_user_cfg.max_features & host_default_mask();
++	guest_default_cfg.features      = fpu_kernel_cfg.max_features & guest_default_mask();
+ 
+ 	/* Store it for paranoia check at the end */
+ 	xfeatures = fpu_kernel_cfg.max_features;

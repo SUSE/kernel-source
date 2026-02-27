@@ -1,0 +1,96 @@
+From: Chao Gao <chao.gao@intel.com>
+Date: Fri, 19 Sep 2025 15:32:13 -0700
+Subject: KVM: x86: Check XSS validity against guest CPUIDs
+Patch-mainline: v6.18-rc1
+Git-commit: 338543cbe033e56dcc8c13adcdf6c228953c0829
+References: jsc#PED-15123
+
+Maintain per-guest valid XSS bits and check XSS validity against them
+rather than against KVM capabilities. This is to prevent bits that are
+supported by KVM but not supported for a guest from being set.
+
+Opportunistically return KVM_MSR_RET_UNSUPPORTED on IA32_XSS MSR accesses
+if guest CPUID doesn't enumerate X86_FEATURE_XSAVES. Since
+KVM_MSR_RET_UNSUPPORTED takes care of host_initiated cases, drop the
+host_initiated check.
+
+Signed-off-by: Chao Gao <chao.gao@intel.com>
+Reviewed-by: Xiaoyao Li <xiaoyao.li@intel.com>
+Reviewed-by: Binbin Wu <binbin.wu@linux.intel.com>
+Link: https://lore.kernel.org/r/20250919223258.1604852-7-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Acked-by: Carlos López <clopez@suse.de>
+---
+ arch/x86/include/asm/kvm_host.h |    3 ++-
+ arch/x86/kvm/cpuid.c            |   12 ++++++++++++
+ arch/x86/kvm/x86.c              |    7 +++----
+ 3 files changed, 17 insertions(+), 5 deletions(-)
+
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -804,7 +804,6 @@ struct kvm_vcpu_arch {
+ 	bool at_instruction_boundary;
+ 	bool tpr_access_reporting;
+ 	bool xfd_no_write_intercept;
+-	u64 ia32_xss;
+ 	u64 microcode_version;
+ 	u64 arch_capabilities;
+ 	u64 perf_capabilities;
+@@ -865,6 +864,8 @@ struct kvm_vcpu_arch {
+ 
+ 	u64 xcr0;
+ 	u64 guest_supported_xcr0;
++	u64 ia32_xss;
++	u64 guest_supported_xss;
+ 
+ 	struct kvm_pio_request pio;
+ 	void *pio_data;
+--- a/arch/x86/kvm/cpuid.c
++++ b/arch/x86/kvm/cpuid.c
+@@ -263,6 +263,17 @@ static u64 cpuid_get_supported_xcr0(stru
+ 	return (best->eax | ((u64)best->edx << 32)) & kvm_caps.supported_xcr0;
+ }
+ 
++static u64 cpuid_get_supported_xss(struct kvm_vcpu *vcpu)
++{
++	struct kvm_cpuid_entry2 *best;
++
++	best = kvm_find_cpuid_entry_index(vcpu, 0xd, 1);
++	if (!best)
++		return 0;
++
++	return (best->ecx | ((u64)best->edx << 32)) & kvm_caps.supported_xss;
++}
++
+ static __always_inline void kvm_update_feature_runtime(struct kvm_vcpu *vcpu,
+ 						       struct kvm_cpuid_entry2 *entry,
+ 						       unsigned int x86_feature,
+@@ -423,6 +434,7 @@ void kvm_vcpu_after_set_cpuid(struct kvm
+ 	}
+ 
+ 	vcpu->arch.guest_supported_xcr0 = cpuid_get_supported_xcr0(vcpu);
++	vcpu->arch.guest_supported_xss = cpuid_get_supported_xss(vcpu);
+ 
+ 	vcpu->arch.pv_cpuid.features = kvm_apply_cpuid_pv_features_quirk(vcpu);
+ 
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -3965,15 +3965,14 @@ int kvm_set_msr_common(struct kvm_vcpu *
+ 		}
+ 		break;
+ 	case MSR_IA32_XSS:
+-		if (!msr_info->host_initiated &&
+-		    !guest_cpuid_has(vcpu, X86_FEATURE_XSAVES))
+-			return 1;
++		if (!guest_cpuid_has(vcpu, X86_FEATURE_XSAVES))
++			return KVM_MSR_RET_UNSUPPORTED;
+ 		/*
+ 		 * KVM supports exposing PT to the guest, but does not support
+ 		 * IA32_XSS[bit 8]. Guests have to use RDMSR/WRMSR rather than
+ 		 * XSAVES/XRSTORS to save/restore PT MSRs.
+ 		 */
+-		if (data & ~kvm_caps.supported_xss)
++		if (data & ~vcpu->arch.guest_supported_xss)
+ 			return 1;
+ 		vcpu->arch.ia32_xss = data;
+ 		kvm_update_cpuid_runtime(vcpu);
