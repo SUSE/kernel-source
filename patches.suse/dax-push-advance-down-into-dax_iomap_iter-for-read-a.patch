@@ -1,0 +1,116 @@
+From: Brian Foster <bfoster@redhat.com>
+Date: Mon, 24 Feb 2025 09:47:50 -0500
+Subject: [PATCH] dax: push advance down into dax_iomap_iter() for read and
+ write
+Git-commit: e1dae77b50e31bf89236937c35eb891a2974cfae
+Patch-mainline: v6.15-rc1
+References: jsc#PED-14161
+
+DAX read and write currently advances the iter after the
+dax_iomap_iter() returns the number of bytes processed rather than
+internally within the iter handler itself, as most other iomap
+operations do. Push the advance down into dax_iomap_iter() and
+update the function to return op status instead of bytes processed.
+
+dax_iomap_iter() shortcuts reads from a hole or unwritten mapping by
+directly zeroing the iov_iter, so advance the iomap_iter similarly
+in that case.
+
+The DAX processing loop can operate on a range slightly different
+than defined by the iomap_iter depending on circumstances. For
+example, a read may be truncated by inode size, a read or write
+range can be increased due to page alignment, etc. Therefore, this
+patch aims to retain as much of the existing logic as possible.
+
+The loop control logic remains pos based, but is sampled from the
+iomap_iter on each iteration after the advance instead of being
+updated manually. Similarly, length is updated based on the output
+of the advance instead of being updated manually. The advance itself
+is based on the number of bytes transferred, which was previously
+used to update the local copies of pos and length.
+
+Signed-off-by: Brian Foster <bfoster@redhat.com>
+Link: https://lore.kernel.org/r/20250224144757.237706-6-bfoster@redhat.com
+Reviewed-by: "Darrick J. Wong" <djwong@kernel.org>
+Signed-off-by: Christian Brauner <brauner@kernel.org>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ fs/dax.c | 27 +++++++++++----------------
+ 1 file changed, 11 insertions(+), 16 deletions(-)
+
+diff --git a/fs/dax.c b/fs/dax.c
+index 296f5aa18640..139e299e53e6 100644
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@ -1431,8 +1431,7 @@ int dax_truncate_page(struct inode *inode, loff_t pos, bool *did_zero,
+ }
+ EXPORT_SYMBOL_GPL(dax_truncate_page);
+ 
+-static loff_t dax_iomap_iter(const struct iomap_iter *iomi,
+-		struct iov_iter *iter)
++static int dax_iomap_iter(struct iomap_iter *iomi, struct iov_iter *iter)
+ {
+ 	const struct iomap *iomap = &iomi->iomap;
+ 	const struct iomap *srcmap = iomap_iter_srcmap(iomi);
+@@ -1451,8 +1450,10 @@ static loff_t dax_iomap_iter(const struct iomap_iter *iomi,
+ 		if (pos >= end)
+ 			return 0;
+ 
+-		if (iomap->type == IOMAP_HOLE || iomap->type == IOMAP_UNWRITTEN)
+-			return iov_iter_zero(min(length, end - pos), iter);
++		if (iomap->type == IOMAP_HOLE || iomap->type == IOMAP_UNWRITTEN) {
++			done = iov_iter_zero(min(length, end - pos), iter);
++			return iomap_iter_advance(iomi, &done);
++		}
+ 	}
+ 
+ 	/*
+@@ -1485,7 +1486,7 @@ static loff_t dax_iomap_iter(const struct iomap_iter *iomi,
+ 	}
+ 
+ 	id = dax_read_lock();
+-	while (pos < end) {
++	while ((pos = iomi->pos) < end) {
+ 		unsigned offset = pos & (PAGE_SIZE - 1);
+ 		const size_t size = ALIGN(length + offset, PAGE_SIZE);
+ 		pgoff_t pgoff = dax_iomap_pgoff(iomap, pos);
+@@ -1535,18 +1536,16 @@ static loff_t dax_iomap_iter(const struct iomap_iter *iomi,
+ 			xfer = dax_copy_to_iter(dax_dev, pgoff, kaddr,
+ 					map_len, iter);
+ 
+-		pos += xfer;
+-		length -= xfer;
+-		done += xfer;
+-
+-		if (xfer == 0)
++		length = xfer;
++		ret = iomap_iter_advance(iomi, &length);
++		if (!ret && xfer == 0)
+ 			ret = -EFAULT;
+ 		if (xfer < map_len)
+ 			break;
+ 	}
+ 	dax_read_unlock(id);
+ 
+-	return done ? done : ret;
++	return ret;
+ }
+ 
+ /**
+@@ -1585,12 +1584,8 @@ dax_iomap_rw(struct kiocb *iocb, struct iov_iter *iter,
+ 	if (iocb->ki_flags & IOCB_NOWAIT)
+ 		iomi.flags |= IOMAP_NOWAIT;
+ 
+-	while ((ret = iomap_iter(&iomi, ops)) > 0) {
++	while ((ret = iomap_iter(&iomi, ops)) > 0)
+ 		iomi.processed = dax_iomap_iter(&iomi, iter);
+-		if (iomi.processed > 0)
+-			iomi.processed = iomap_iter_advance(&iomi,
+-							    &iomi.processed);
+-	}
+ 
+ 	done = iomi.pos - iocb->ki_pos;
+ 	iocb->ki_pos = iomi.pos;
+-- 
+2.43.0
+

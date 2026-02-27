@@ -1,0 +1,147 @@
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Tue, 6 May 2025 20:48:58 +0800
+Subject: [PATCH] block: clean up blk_mq_in_flight_rw()
+Git-commit: 6b6c3a97abdebfafa25ef0f4b6b0b8b412b57bbb
+Patch-mainline: v6.16-rc1
+References: jsc#PED-14161
+
+Also add comment for part_inflight_show() for the difference between
+bio-based and rq-based device.
+
+Link: https://lore.kernel.org/linux-raid/20250506124903.2540268-4-yukuai1@huaweicloud.com
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/blk-mq.c | 12 ++++++------
+ block/blk-mq.h |  3 +--
+ block/genhd.c  | 43 +++++++++++++++++++++++++------------------
+ 3 files changed, 32 insertions(+), 26 deletions(-)
+
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 7d87e893999b..0ceb28989aee 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -89,7 +89,7 @@ struct mq_inflight {
+ 	unsigned int inflight[2];
+ };
+ 
+-static bool blk_mq_check_inflight(struct request *rq, void *priv)
++static bool blk_mq_check_in_driver(struct request *rq, void *priv)
+ {
+ 	struct mq_inflight *mi = priv;
+ 
+@@ -101,14 +101,14 @@ static bool blk_mq_check_inflight(struct request *rq, void *priv)
+ 	return true;
+ }
+ 
+-void blk_mq_in_flight_rw(struct request_queue *q, struct block_device *part,
+-		unsigned int inflight[2])
++void blk_mq_in_driver_rw(struct block_device *part, unsigned int inflight[2])
+ {
+ 	struct mq_inflight mi = { .part = part };
+ 
+-	blk_mq_queue_tag_busy_iter(q, blk_mq_check_inflight, &mi);
+-	inflight[0] = mi.inflight[0];
+-	inflight[1] = mi.inflight[1];
++	blk_mq_queue_tag_busy_iter(bdev_get_queue(part), blk_mq_check_in_driver,
++				   &mi);
++	inflight[READ] = mi.inflight[READ];
++	inflight[WRITE] = mi.inflight[WRITE];
+ }
+ 
+ #ifdef CONFIG_LOCKDEP
+diff --git a/block/blk-mq.h b/block/blk-mq.h
+index eeac0d47c878..affb2e14b56e 100644
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@ -246,8 +246,7 @@ static inline bool blk_mq_hw_queue_mapped(struct blk_mq_hw_ctx *hctx)
+ 	return hctx->nr_ctx && hctx->tags;
+ }
+ 
+-void blk_mq_in_flight_rw(struct request_queue *q, struct block_device *part,
+-		unsigned int inflight[2]);
++void blk_mq_in_driver_rw(struct block_device *part, unsigned int inflight[2]);
+ 
+ static inline void blk_mq_put_dispatch_budget(struct request_queue *q,
+ 					      int budget_token)
+diff --git a/block/genhd.c b/block/genhd.c
+index 6d133061ea3d..1c1a642b321e 100644
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@ -126,27 +126,32 @@ static void part_stat_read_all(struct block_device *part,
+ }
+ 
+ static void part_in_flight_rw(struct block_device *part,
+-		unsigned int inflight[2])
++		unsigned int inflight[2], bool mq_driver)
+ {
+ 	int cpu;
+ 
+-	inflight[0] = 0;
+-	inflight[1] = 0;
+-	for_each_possible_cpu(cpu) {
+-		inflight[0] += part_stat_local_read_cpu(part, in_flight[0], cpu);
+-		inflight[1] += part_stat_local_read_cpu(part, in_flight[1], cpu);
++	if (mq_driver) {
++		blk_mq_in_driver_rw(part, inflight);
++	} else {
++		for_each_possible_cpu(cpu) {
++			inflight[READ] += part_stat_local_read_cpu(
++						part, in_flight[READ], cpu);
++			inflight[WRITE] += part_stat_local_read_cpu(
++						part, in_flight[WRITE], cpu);
++		}
+ 	}
+-	if (WARN_ON_ONCE((int)inflight[0] < 0))
+-		inflight[0] = 0;
+-	if (WARN_ON_ONCE((int)inflight[1] < 0))
+-		inflight[1] = 0;
++
++	if (WARN_ON_ONCE((int)inflight[READ] < 0))
++		inflight[READ] = 0;
++	if (WARN_ON_ONCE((int)inflight[WRITE] < 0))
++		inflight[WRITE] = 0;
+ }
+ 
+ unsigned int part_in_flight(struct block_device *part)
+ {
+-	unsigned int inflight[2];
++	unsigned int inflight[2] = {0};
+ 
+-	part_in_flight_rw(part, inflight);
++	part_in_flight_rw(part, inflight, false);
+ 
+ 	return inflight[READ] + inflight[WRITE];
+ }
+@@ -1084,19 +1089,21 @@ ssize_t part_stat_show(struct device *dev,
+ 		(unsigned int)div_u64(stat.nsecs[STAT_FLUSH], NSEC_PER_MSEC));
+ }
+ 
++/*
++ * Show the number of IOs issued to driver.
++ * For bio-based device, started from bdev_start_io_acct();
++ * For rq-based device, started from blk_mq_start_request();
++ */
+ ssize_t part_inflight_show(struct device *dev, struct device_attribute *attr,
+ 			   char *buf)
+ {
+ 	struct block_device *bdev = dev_to_bdev(dev);
+ 	struct request_queue *q = bdev_get_queue(bdev);
+-	unsigned int inflight[2];
++	unsigned int inflight[2] = {0};
+ 
+-	if (queue_is_mq(q))
+-		blk_mq_in_flight_rw(q, bdev, inflight);
+-	else
+-		part_in_flight_rw(bdev, inflight);
++	part_in_flight_rw(bdev, inflight, queue_is_mq(q));
+ 
+-	return sysfs_emit(buf, "%8u %8u\n", inflight[0], inflight[1]);
++	return sysfs_emit(buf, "%8u %8u\n", inflight[READ], inflight[WRITE]);
+ }
+ 
+ static ssize_t disk_capability_show(struct device *dev,
+-- 
+2.43.0
+

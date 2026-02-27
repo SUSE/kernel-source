@@ -1,0 +1,99 @@
+From: Brian Foster <bfoster@redhat.com>
+Date: Fri, 7 Feb 2025 09:32:51 -0500
+Subject: [PATCH] iomap: advance the iter directly on buffered writes
+Git-commit: 1a1a3b574b979912882f19d655ddac73f5cbc159
+Patch-mainline: v6.15-rc1
+References: jsc#PED-14161
+
+Modify the buffered write path to advance the iter directly. Replace
+the local pos and length calculations with direct advances and loop
+based on iter state instead.
+
+Also remove the -EAGAIN return hack as it is no longer necessary now
+that separate return channels exist for processing progress and error
+returns. For example, the existing write handler must return either a
+count of bytes written or error if the write is interrupted, but
+presumably wants to return -EAGAIN directly in order to break the higher
+level iomap_iter() loop.
+
+Since the current iteration may have made some progress, it unwinds the
+iter on the way out to return the error while ensuring that portion of
+the write can be retried. If -EAGAIN occurs at any point beyond the
+first iteration, iomap_file_buffered_write() will then observe progress
+based on iter->pos to return a short write.
+
+With incremental advances on the iomap_iter, iomap_write_iter() can
+simply return the error. iomap_iter() completes whatever progress was
+made based on iomap_iter position and still breaks out of the iter loop
+based on the error code in iter.processed. The end result of the write
+is similar in terms of being a short write if progress was made or error
+return otherwise.
+
+Signed-off-by: Brian Foster <bfoster@redhat.com>
+Link: https://lore.kernel.org/r/20250207143253.314068-9-bfoster@redhat.com
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: "Darrick J. Wong" <djwong@kernel.org>
+Signed-off-by: Christian Brauner <brauner@kernel.org>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ fs/iomap/buffered-io.c | 20 +++++++-------------
+ 1 file changed, 7 insertions(+), 13 deletions(-)
+
+diff --git a/fs/iomap/buffered-io.c b/fs/iomap/buffered-io.c
+index 3458f97d1b1e..93a7e8bdd15b 100644
+--- a/fs/iomap/buffered-io.c
++++ b/fs/iomap/buffered-io.c
+@@ -905,8 +905,6 @@ static bool iomap_write_end(struct iomap_iter *iter, loff_t pos, size_t len,
+ 
+ static loff_t iomap_write_iter(struct iomap_iter *iter, struct iov_iter *i)
+ {
+-	loff_t length = iomap_length(iter);
+-	loff_t pos = iter->pos;
+ 	ssize_t total_written = 0;
+ 	long status = 0;
+ 	struct address_space *mapping = iter->inode->i_mapping;
+@@ -919,7 +917,8 @@ static loff_t iomap_write_iter(struct iomap_iter *iter, struct iov_iter *i)
+ 		size_t offset;		/* Offset into folio */
+ 		size_t bytes;		/* Bytes to write to folio */
+ 		size_t copied;		/* Bytes copied from user */
+-		size_t written;		/* Bytes have been written */
++		u64 written;		/* Bytes have been written */
++		loff_t pos = iter->pos;
+ 
+ 		bytes = iov_iter_count(i);
+ retry:
+@@ -930,8 +929,8 @@ static loff_t iomap_write_iter(struct iomap_iter *iter, struct iov_iter *i)
+ 		if (unlikely(status))
+ 			break;
+ 
+-		if (bytes > length)
+-			bytes = length;
++		if (bytes > iomap_length(iter))
++			bytes = iomap_length(iter);
+ 
+ 		/*
+ 		 * Bring in the user page that we'll copy from _first_.
+@@ -1002,17 +1001,12 @@ static loff_t iomap_write_iter(struct iomap_iter *iter, struct iov_iter *i)
+ 				goto retry;
+ 			}
+ 		} else {
+-			pos += written;
+ 			total_written += written;
+-			length -= written;
++			iomap_iter_advance(iter, &written);
+ 		}
+-	} while (iov_iter_count(i) && length);
++	} while (iov_iter_count(i) && iomap_length(iter));
+ 
+-	if (status == -EAGAIN) {
+-		iov_iter_revert(i, total_written);
+-		return -EAGAIN;
+-	}
+-	return total_written ? total_written : status;
++	return total_written ? 0 : status;
+ }
+ 
+ ssize_t
+-- 
+2.43.0
+

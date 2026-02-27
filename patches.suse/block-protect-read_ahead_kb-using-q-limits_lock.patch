@@ -1,0 +1,86 @@
+From: Nilay Shroff <nilay@linux.ibm.com>
+Date: Tue, 4 Mar 2025 15:52:36 +0530
+Subject: [PATCH] block: protect read_ahead_kb using q->limits_lock
+Git-commit: 5e40f4452dc9a3fb44d13bb6bc7032f3911a2675
+Patch-mainline: v6.15-rc1
+References: jsc#PED-14161
+
+The bdi->ra_pages could be updated under q->limits_lock because it's
+usually calculated from the queue limits by queue_limits_commit_update.
+So protect reading/writing the sysfs attribute read_ahead_kb using
+q->limits_lock instead of q->sysfs_lock.
+
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Hannes Reinecke <hare@suse.de>
+Reviewed-by: Ming Lei <ming.lei@redhat.com>
+Signed-off-by: Nilay Shroff <nilay@linux.ibm.com>
+Link: https://lore.kernel.org/r/20250304102551.2533767-8-nilay@linux.ibm.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/blk-sysfs.c      | 16 ++++++++++------
+ include/linux/blkdev.h |  3 +++
+ 2 files changed, 13 insertions(+), 6 deletions(-)
+
+diff --git a/block/blk-sysfs.c b/block/blk-sysfs.c
+index 223da196a548..d584461a1d84 100644
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@ -93,9 +93,9 @@ static ssize_t queue_ra_show(struct gendisk *disk, char *page)
+ {
+ 	ssize_t ret;
+ 
+-	mutex_lock(&disk->queue->sysfs_lock);
++	mutex_lock(&disk->queue->limits_lock);
+ 	ret = queue_var_show(disk->bdi->ra_pages << (PAGE_SHIFT - 10), page);
+-	mutex_unlock(&disk->queue->sysfs_lock);
++	mutex_unlock(&disk->queue->limits_lock);
+ 
+ 	return ret;
+ }
+@@ -111,12 +111,15 @@ queue_ra_store(struct gendisk *disk, const char *page, size_t count)
+ 	ret = queue_var_store(&ra_kb, page, count);
+ 	if (ret < 0)
+ 		return ret;
+-
+-	mutex_lock(&q->sysfs_lock);
++	/*
++	 * ->ra_pages is protected by ->limits_lock because it is usually
++	 * calculated from the queue limits by queue_limits_commit_update.
++	 */
++	mutex_lock(&q->limits_lock);
+ 	memflags = blk_mq_freeze_queue(q);
+ 	disk->bdi->ra_pages = ra_kb >> (PAGE_SHIFT - 10);
++	mutex_unlock(&q->limits_lock);
+ 	blk_mq_unfreeze_queue(q, memflags);
+-	mutex_unlock(&q->sysfs_lock);
+ 
+ 	return ret;
+ }
+@@ -670,7 +673,8 @@ static struct attribute *queue_attrs[] = {
+ 	&queue_dma_alignment_entry.attr,
+ 
+ 	/*
+-	 * Attributes which are protected with q->sysfs_lock.
++	 * Attributes which require some form of locking other than
++	 * q->sysfs_lock.
+ 	 */
+ 	&queue_ra_entry.attr,
+ 
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 0ee3b5c9388e..3bee1b4858b6 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -571,6 +571,9 @@ struct request_queue {
+ 	struct mutex		elevator_lock;
+ 
+ 	struct mutex		sysfs_lock;
++	/*
++	 * Protects queue limits and also sysfs attribute read_ahead_kb.
++	 */
+ 	struct mutex		limits_lock;
+ 
+ 	/*
+-- 
+2.43.0
+

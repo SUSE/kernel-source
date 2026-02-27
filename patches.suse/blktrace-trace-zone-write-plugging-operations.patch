@@ -1,0 +1,114 @@
+From: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+Date: Wed, 22 Oct 2025 13:41:14 +0200
+Subject: [PATCH] blktrace: trace zone write plugging operations
+Git-commit: 3f6722816a73e2017599d965683dbe71833afd7a
+Patch-mainline: v6.19-rc1
+References: jsc#PED-14161
+
+Trace zone write plugging operations on block devices.
+
+As tracing of zoned block commands needs the upper 32bit of the widened
+64bit action, only add traces to blktrace if user-space has requested
+version 2 of the blktrace protocol.
+
+Reviewed-by: Damien Le Moal <dlemoal@kernel.org>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ include/uapi/linux/blktrace_api.h |  5 ++++
+ kernel/trace/blktrace.c           | 39 +++++++++++++++++++++++++++++++
+ 2 files changed, 44 insertions(+)
+
+diff --git a/include/uapi/linux/blktrace_api.h b/include/uapi/linux/blktrace_api.h
+index 289872e51fc5..30f3d2589365 100644
+--- a/include/uapi/linux/blktrace_api.h
++++ b/include/uapi/linux/blktrace_api.h
+@@ -62,6 +62,8 @@ enum blktrace_act {
+ 	__BLK_TA_REMAP,			/* bio was remapped */
+ 	__BLK_TA_ABORT,			/* request aborted */
+ 	__BLK_TA_DRV_DATA,		/* driver-specific binary data */
++	__BLK_TA_ZONE_PLUG,		/* zone write plug was plugged */
++	__BLK_TA_ZONE_UNPLUG,		/* zone write plug was unplugged */
+ 	__BLK_TA_CGROUP = 1 << 8,	/* from a cgroup*/
+ };
+ 
+@@ -99,6 +101,9 @@ enum blktrace_notify {
+ 
+ #define BLK_TA_ZONE_APPEND	(__BLK_TA_COMPLETE |\
+ 				 BLK_TC_ACT(BLK_TC_ZONE_APPEND))
++#define BLK_TA_ZONE_PLUG	(__BLK_TA_ZONE_PLUG | BLK_TC_ACT(BLK_TC_QUEUE))
++#define BLK_TA_ZONE_UNPLUG	(__BLK_TA_ZONE_UNPLUG |\
++				 BLK_TC_ACT(BLK_TC_QUEUE))
+ 
+ #define BLK_TN_PROCESS		(__BLK_TN_PROCESS | BLK_TC_ACT(BLK_TC_NOTIFY))
+ #define BLK_TN_TIMESTAMP	(__BLK_TN_TIMESTAMP | BLK_TC_ACT(BLK_TC_NOTIFY))
+diff --git a/kernel/trace/blktrace.c b/kernel/trace/blktrace.c
+index c83577096607..6bfe1b36a1d3 100644
+--- a/kernel/trace/blktrace.c
++++ b/kernel/trace/blktrace.c
+@@ -1084,6 +1084,37 @@ static void blk_add_trace_unplug(void *ignore, struct request_queue *q,
+ 	rcu_read_unlock();
+ }
+ 
++static void blk_add_trace_zone_plug(void *ignore, struct request_queue *q,
++				    unsigned int zno, sector_t sector,
++				    unsigned int sectors)
++{
++	struct blk_trace *bt;
++
++	rcu_read_lock();
++	bt = rcu_dereference(q->blk_trace);
++	if (bt && bt->version >= 2)
++		__blk_add_trace(bt, sector, sectors << SECTOR_SHIFT, 0,
++				BLK_TA_ZONE_PLUG, 0, 0, NULL, 0);
++	rcu_read_unlock();
++
++	return;
++}
++
++static void blk_add_trace_zone_unplug(void *ignore, struct request_queue *q,
++				      unsigned int zno, sector_t sector,
++				      unsigned int sectors)
++{
++	struct blk_trace *bt;
++
++	rcu_read_lock();
++	bt = rcu_dereference(q->blk_trace);
++	if (bt && bt->version >= 2)
++		__blk_add_trace(bt, sector, sectors << SECTOR_SHIFT, 0,
++				BLK_TA_ZONE_UNPLUG, 0, 0, NULL, 0);
++	rcu_read_unlock();
++	return;
++}
++
+ static void blk_add_trace_split(void *ignore, struct bio *bio, unsigned int pdu)
+ {
+ 	struct request_queue *q = bio->bi_bdev->bd_disk->queue;
+@@ -1227,6 +1258,12 @@ static void blk_register_tracepoints(void)
+ 	ret = register_trace_blk_zone_append_update_request_bio(
+ 		blk_add_trace_zone_update_request, NULL);
+ 	WARN_ON(ret);
++	ret = register_trace_disk_zone_wplug_add_bio(blk_add_trace_zone_plug,
++						     NULL);
++	WARN_ON(ret);
++	ret = register_trace_blk_zone_wplug_bio(blk_add_trace_zone_unplug,
++						NULL);
++	WARN_ON(ret);
+ 	ret = register_trace_block_plug(blk_add_trace_plug, NULL);
+ 	WARN_ON(ret);
+ 	ret = register_trace_block_unplug(blk_add_trace_unplug, NULL);
+@@ -1246,6 +1283,8 @@ static void blk_unregister_tracepoints(void)
+ 	unregister_trace_block_split(blk_add_trace_split, NULL);
+ 	unregister_trace_block_unplug(blk_add_trace_unplug, NULL);
+ 	unregister_trace_block_plug(blk_add_trace_plug, NULL);
++	unregister_trace_blk_zone_wplug_bio(blk_add_trace_zone_unplug, NULL);
++	unregister_trace_disk_zone_wplug_add_bio(blk_add_trace_zone_plug, NULL);
+ 	unregister_trace_blk_zone_append_update_request_bio(
+ 		blk_add_trace_zone_update_request, NULL);
+ 	unregister_trace_block_getrq(blk_add_trace_getrq, NULL);
+-- 
+2.43.0
+

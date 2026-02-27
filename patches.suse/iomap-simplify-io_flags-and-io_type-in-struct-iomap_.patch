@@ -1,0 +1,194 @@
+From: Christoph Hellwig <hch@lst.de>
+Date: Thu, 6 Feb 2025 07:40:00 +0100
+Subject: [PATCH] iomap: simplify io_flags and io_type in struct iomap_ioend
+Git-commit: 710273330663241d9ca5fbed51909e65807556ad
+Patch-mainline: v6.15-rc1
+References: jsc#PED-14161
+
+The ioend fields for distinct types of I/O are a bit complicated.
+Consolidate them into a single io_flag field with it's own flags
+decoupled from the iomap flags.  This also prepares for adding a new
+flag that is unrelated to both of the iomap namespaces.
+
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Link: https://lore.kernel.org/r/20250206064035.2323428-3-hch@lst.de
+Reviewed-by: "Darrick J. Wong" <djwong@kernel.org>
+Signed-off-by: Christian Brauner <brauner@kernel.org>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ fs/iomap/buffered-io.c | 39 ++++++++++++++++++++++-----------------
+ fs/xfs/xfs_aops.c      | 12 ++++++------
+ include/linux/iomap.h  | 20 ++++++++++++++++++--
+ 3 files changed, 46 insertions(+), 25 deletions(-)
+
+diff --git a/fs/iomap/buffered-io.c b/fs/iomap/buffered-io.c
+index 7952bf004bdb..d8d271107e60 100644
+--- a/fs/iomap/buffered-io.c
++++ b/fs/iomap/buffered-io.c
+@@ -1605,13 +1605,10 @@ iomap_ioend_can_merge(struct iomap_ioend *ioend, struct iomap_ioend *next)
+ {
+ 	if (ioend->io_bio.bi_status != next->io_bio.bi_status)
+ 		return false;
+-	if (next->io_flags & IOMAP_F_BOUNDARY)
++	if (next->io_flags & IOMAP_IOEND_BOUNDARY)
+ 		return false;
+-	if ((ioend->io_flags & IOMAP_F_SHARED) ^
+-	    (next->io_flags & IOMAP_F_SHARED))
+-		return false;
+-	if ((ioend->io_type == IOMAP_UNWRITTEN) ^
+-	    (next->io_type == IOMAP_UNWRITTEN))
++	if ((ioend->io_flags & IOMAP_IOEND_NOMERGE_FLAGS) !=
++	    (next->io_flags & IOMAP_IOEND_NOMERGE_FLAGS))
+ 		return false;
+ 	if (ioend->io_offset + ioend->io_size != next->io_offset)
+ 		return false;
+@@ -1709,7 +1706,8 @@ static int iomap_submit_ioend(struct iomap_writepage_ctx *wpc, int error)
+ }
+ 
+ static struct iomap_ioend *iomap_alloc_ioend(struct iomap_writepage_ctx *wpc,
+-		struct writeback_control *wbc, struct inode *inode, loff_t pos)
++		struct writeback_control *wbc, struct inode *inode, loff_t pos,
++		u16 ioend_flags)
+ {
+ 	struct iomap_ioend *ioend;
+ 	struct bio *bio;
+@@ -1724,8 +1722,7 @@ static struct iomap_ioend *iomap_alloc_ioend(struct iomap_writepage_ctx *wpc,
+ 
+ 	ioend = iomap_ioend_from_bio(bio);
+ 	INIT_LIST_HEAD(&ioend->io_list);
+-	ioend->io_type = wpc->iomap.type;
+-	ioend->io_flags = wpc->iomap.flags;
++	ioend->io_flags = ioend_flags;
+ 	if (pos > wpc->iomap.offset)
+ 		wpc->iomap.flags &= ~IOMAP_F_BOUNDARY;
+ 	ioend->io_inode = inode;
+@@ -1737,14 +1734,13 @@ static struct iomap_ioend *iomap_alloc_ioend(struct iomap_writepage_ctx *wpc,
+ 	return ioend;
+ }
+ 
+-static bool iomap_can_add_to_ioend(struct iomap_writepage_ctx *wpc, loff_t pos)
++static bool iomap_can_add_to_ioend(struct iomap_writepage_ctx *wpc, loff_t pos,
++		u16 ioend_flags)
+ {
+-	if (wpc->iomap.offset == pos && (wpc->iomap.flags & IOMAP_F_BOUNDARY))
+-		return false;
+-	if ((wpc->iomap.flags & IOMAP_F_SHARED) !=
+-	    (wpc->ioend->io_flags & IOMAP_F_SHARED))
++	if (ioend_flags & IOMAP_IOEND_BOUNDARY)
+ 		return false;
+-	if (wpc->iomap.type != wpc->ioend->io_type)
++	if ((ioend_flags & IOMAP_IOEND_NOMERGE_FLAGS) !=
++	    (wpc->ioend->io_flags & IOMAP_IOEND_NOMERGE_FLAGS))
+ 		return false;
+ 	if (pos != wpc->ioend->io_offset + wpc->ioend->io_size)
+ 		return false;
+@@ -1779,14 +1775,23 @@ static int iomap_add_to_ioend(struct iomap_writepage_ctx *wpc,
+ {
+ 	struct iomap_folio_state *ifs = folio->private;
+ 	size_t poff = offset_in_folio(folio, pos);
++	unsigned int ioend_flags = 0;
+ 	int error;
+ 
+-	if (!wpc->ioend || !iomap_can_add_to_ioend(wpc, pos)) {
++	if (wpc->iomap.type == IOMAP_UNWRITTEN)
++		ioend_flags |= IOMAP_IOEND_UNWRITTEN;
++	if (wpc->iomap.flags & IOMAP_F_SHARED)
++		ioend_flags |= IOMAP_IOEND_SHARED;
++	if (pos == wpc->iomap.offset && (wpc->iomap.flags & IOMAP_F_BOUNDARY))
++		ioend_flags |= IOMAP_IOEND_BOUNDARY;
++
++	if (!wpc->ioend || !iomap_can_add_to_ioend(wpc, pos, ioend_flags)) {
+ new_ioend:
+ 		error = iomap_submit_ioend(wpc, 0);
+ 		if (error)
+ 			return error;
+-		wpc->ioend = iomap_alloc_ioend(wpc, wbc, inode, pos);
++		wpc->ioend = iomap_alloc_ioend(wpc, wbc, inode, pos,
++				ioend_flags);
+ 	}
+ 
+ 	if (!bio_add_folio(&wpc->ioend->io_bio, folio, len, poff))
+diff --git a/fs/xfs/xfs_aops.c b/fs/xfs/xfs_aops.c
+index aa88895673d8..8e60ceeb1520 100644
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@ -114,7 +114,7 @@ xfs_end_ioend(
+ 	 */
+ 	error = blk_status_to_errno(ioend->io_bio.bi_status);
+ 	if (unlikely(error)) {
+-		if (ioend->io_flags & IOMAP_F_SHARED) {
++		if (ioend->io_flags & IOMAP_IOEND_SHARED) {
+ 			xfs_reflink_cancel_cow_range(ip, offset, size, true);
+ 			xfs_bmap_punch_delalloc_range(ip, XFS_DATA_FORK, offset,
+ 					offset + size);
+@@ -125,9 +125,9 @@ xfs_end_ioend(
+ 	/*
+ 	 * Success: commit the COW or unwritten blocks if needed.
+ 	 */
+-	if (ioend->io_flags & IOMAP_F_SHARED)
++	if (ioend->io_flags & IOMAP_IOEND_SHARED)
+ 		error = xfs_reflink_end_cow(ip, offset, size);
+-	else if (ioend->io_type == IOMAP_UNWRITTEN)
++	else if (ioend->io_flags & IOMAP_IOEND_UNWRITTEN)
+ 		error = xfs_iomap_write_unwritten(ip, offset, size, false);
+ 
+ 	if (!error && xfs_ioend_is_append(ioend))
+@@ -410,7 +410,7 @@ xfs_submit_ioend(
+ 	nofs_flag = memalloc_nofs_save();
+ 
+ 	/* Convert CoW extents to regular */
+-	if (!status && (ioend->io_flags & IOMAP_F_SHARED)) {
++	if (!status && (ioend->io_flags & IOMAP_IOEND_SHARED)) {
+ 		status = xfs_reflink_convert_cow(XFS_I(ioend->io_inode),
+ 				ioend->io_offset, ioend->io_size);
+ 	}
+@@ -418,8 +418,8 @@ xfs_submit_ioend(
+ 	memalloc_nofs_restore(nofs_flag);
+ 
+ 	/* send ioends that might require a transaction to the completion wq */
+-	if (xfs_ioend_is_append(ioend) || ioend->io_type == IOMAP_UNWRITTEN ||
+-	    (ioend->io_flags & IOMAP_F_SHARED))
++	if (xfs_ioend_is_append(ioend) ||
++	    (ioend->io_flags & (IOMAP_IOEND_UNWRITTEN | IOMAP_IOEND_SHARED)))
+ 		ioend->io_bio.bi_end_io = xfs_end_bio;
+ 
+ 	if (status)
+diff --git a/include/linux/iomap.h b/include/linux/iomap.h
+index dc8df4f779d4..9583f6456165 100644
+--- a/include/linux/iomap.h
++++ b/include/linux/iomap.h
+@@ -327,13 +327,29 @@ loff_t iomap_seek_data(struct inode *inode, loff_t offset,
+ sector_t iomap_bmap(struct address_space *mapping, sector_t bno,
+ 		const struct iomap_ops *ops);
+ 
++/*
++ * Flags for iomap_ioend->io_flags.
++ */
++/* shared COW extent */
++#define IOMAP_IOEND_SHARED		(1U << 0)
++/* unwritten extent */
++#define IOMAP_IOEND_UNWRITTEN		(1U << 1)
++/* don't merge into previous ioend */
++#define IOMAP_IOEND_BOUNDARY		(1U << 2)
++
++/*
++ * Flags that if set on either ioend prevent the merge of two ioends.
++ * (IOMAP_IOEND_BOUNDARY also prevents merges, but only one-way)
++ */
++#define IOMAP_IOEND_NOMERGE_FLAGS \
++	(IOMAP_IOEND_SHARED | IOMAP_IOEND_UNWRITTEN)
++
+ /*
+  * Structure for writeback I/O completions.
+  */
+ struct iomap_ioend {
+ 	struct list_head	io_list;	/* next ioend in chain */
+-	u16			io_type;
+-	u16			io_flags;	/* IOMAP_F_* */
++	u16			io_flags;	/* IOMAP_IOEND_* */
+ 	struct inode		*io_inode;	/* file being written to */
+ 	size_t			io_size;	/* size of the extent */
+ 	loff_t			io_offset;	/* offset in the file */
+-- 
+2.43.0
+

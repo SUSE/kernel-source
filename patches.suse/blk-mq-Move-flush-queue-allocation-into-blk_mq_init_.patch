@@ -1,0 +1,106 @@
+From: Ming Lei <ming.lei@redhat.com>
+Date: Sat, 30 Aug 2025 10:18:19 +0800
+Subject: [PATCH] blk-mq: Move flush queue allocation into blk_mq_init_hctx()
+Git-commit: aba19ee71cd7c0253612d6a2a0b3a828ba9ece29
+Patch-mainline: v6.18-rc1
+References: jsc#PED-14161
+
+Move flush queue allocation into blk_mq_init_hctx() and its release into
+blk_mq_exit_hctx(), and prepare for replacing tags->lock with SRCU to
+draining inflight request walking. blk_mq_exit_hctx() is the last chance
+for us to get valid `tag_set` reference, and we need to add one SRCU to
+`tag_set` for freeing flush request via call_srcu().
+
+It is safe to move flush queue & request release into blk_mq_exit_hctx(),
+because blk_mq_clear_flush_rq_mapping() clears the flush request
+reference int driver tags inflight request table, meantime inflight
+request walking is drained.
+
+Reviewed-by: Hannes Reinecke <hare@suse.de>
+Reviewed-by: Yu Kuai <yukuai3@huawei.com>
+Signed-off-by: Ming Lei <ming.lei@redhat.com>
+Reviewed-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/blk-mq-sysfs.c |  1 -
+ block/blk-mq.c       | 20 +++++++++++++-------
+ 2 files changed, 13 insertions(+), 8 deletions(-)
+
+diff --git a/block/blk-mq-sysfs.c b/block/blk-mq-sysfs.c
+index 5c399ac562ea..58ec293373c6 100644
+--- a/block/blk-mq-sysfs.c
++++ b/block/blk-mq-sysfs.c
+@@ -34,7 +34,6 @@ static void blk_mq_hw_sysfs_release(struct kobject *kobj)
+ 	struct blk_mq_hw_ctx *hctx = container_of(kobj, struct blk_mq_hw_ctx,
+ 						  kobj);
+ 
+-	blk_free_flush_queue(hctx->fq);
+ 	sbitmap_free(&hctx->ctx_map);
+ 	free_cpumask_var(hctx->cpumask);
+ 	kfree(hctx->ctxs);
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 9055cd624700..72f9274315f1 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -3939,6 +3939,9 @@ static void blk_mq_exit_hctx(struct request_queue *q,
+ 	if (set->ops->exit_hctx)
+ 		set->ops->exit_hctx(hctx, hctx_idx);
+ 
++	blk_free_flush_queue(hctx->fq);
++	hctx->fq = NULL;
++
+ 	xa_erase(&q->hctx_table, hctx_idx);
+ 
+ 	spin_lock(&q->unused_hctx_lock);
+@@ -3964,13 +3967,19 @@ static int blk_mq_init_hctx(struct request_queue *q,
+ 		struct blk_mq_tag_set *set,
+ 		struct blk_mq_hw_ctx *hctx, unsigned hctx_idx)
+ {
++	gfp_t gfp = GFP_NOIO | __GFP_NOWARN | __GFP_NORETRY;
++
++	hctx->fq = blk_alloc_flush_queue(hctx->numa_node, set->cmd_size, gfp);
++	if (!hctx->fq)
++		goto fail;
++
+ 	hctx->queue_num = hctx_idx;
+ 
+ 	hctx->tags = set->tags[hctx_idx];
+ 
+ 	if (set->ops->init_hctx &&
+ 	    set->ops->init_hctx(hctx, set->driver_data, hctx_idx))
+-		goto fail;
++		goto fail_free_fq;
+ 
+ 	if (blk_mq_init_request(set, hctx->fq->flush_rq, hctx_idx,
+ 				hctx->numa_node))
+@@ -3987,6 +3996,9 @@ static int blk_mq_init_hctx(struct request_queue *q,
+  exit_hctx:
+ 	if (set->ops->exit_hctx)
+ 		set->ops->exit_hctx(hctx, hctx_idx);
++ fail_free_fq:
++	blk_free_flush_queue(hctx->fq);
++	hctx->fq = NULL;
+  fail:
+ 	return -1;
+ }
+@@ -4038,16 +4050,10 @@ blk_mq_alloc_hctx(struct request_queue *q, struct blk_mq_tag_set *set,
+ 	init_waitqueue_func_entry(&hctx->dispatch_wait, blk_mq_dispatch_wake);
+ 	INIT_LIST_HEAD(&hctx->dispatch_wait.entry);
+ 
+-	hctx->fq = blk_alloc_flush_queue(hctx->numa_node, set->cmd_size, gfp);
+-	if (!hctx->fq)
+-		goto free_bitmap;
+-
+ 	blk_mq_hctx_kobj_init(hctx);
+ 
+ 	return hctx;
+ 
+- free_bitmap:
+-	sbitmap_free(&hctx->ctx_map);
+  free_ctxs:
+ 	kfree(hctx->ctxs);
+  free_cpumask:
+-- 
+2.43.0
+

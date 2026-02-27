@@ -1,0 +1,85 @@
+From: Ming Lei <ming.lei@redhat.com>
+Date: Mon, 5 May 2025 22:18:00 +0800
+Subject: [PATCH] block: move hctx debugfs/sysfs registering out of freezing
+ queue
+Git-commit: 9dc7a882ce96482bfff3dba51dadcbe68daeac6c
+Patch-mainline: v6.16-rc1
+References: jsc#PED-14161
+
+Move hctx debugfs/sysfs register out of freezing queue in
+__blk_mq_update_nr_hw_queues(), so that the following lockdep dependency
+can be killed:
+
+	#2 (&q->q_usage_counter(io)#16){++++}-{0:0}:
+	#1 (fs_reclaim){+.+.}-{0:0}:
+	#0 (&sb->s_type->i_mutex_key#3){+.+.}-{4:4}: //debugfs
+
+And registering/un-registering hctx debugfs/sysfs does not require queue to
+be frozen:
+
+- hctx sysfs attributes show() are drained when removing kobject, and
+  there isn't store() implementation for hctx sysfs attributes
+
+- debugfs entry read() is drained too when removing debugfs directory,
+  and there isn't write() implementation for hctx debugfs too
+
+- so it is safe to register/unregister hctx sysfs/debugfs without
+  freezing queue because the cod paths changes nothing, and we just
+  need to keep hctx live
+
+Reviewed-by: Hannes Reinecke <hare@suse.de>
+Reviewed-by: Nilay Shroff <nilay@linux.ibm.com>
+Signed-off-by: Ming Lei <ming.lei@redhat.com>
+Link: https://lore.kernel.org/r/20250505141805.2751237-23-ming.lei@redhat.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/blk-mq.c | 15 +++++++--------
+ 1 file changed, 7 insertions(+), 8 deletions(-)
+
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 263bbe34d3f0..a4ab7779e020 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -5005,14 +5005,14 @@ static void __blk_mq_update_nr_hw_queues(struct blk_mq_tag_set *set,
+ 		return;
+ 
+ 	memflags = memalloc_noio_save();
+-	list_for_each_entry(q, &set->tag_list, tag_set_list)
+-		blk_mq_freeze_queue_nomemsave(q);
+-
+ 	list_for_each_entry(q, &set->tag_list, tag_set_list) {
+ 		blk_mq_debugfs_unregister_hctxs(q);
+ 		blk_mq_sysfs_unregister_hctxs(q);
+ 	}
+ 
++	list_for_each_entry(q, &set->tag_list, tag_set_list)
++		blk_mq_freeze_queue_nomemsave(q);
++
+ 	if (blk_mq_realloc_tag_set_tags(set, nr_hw_queues) < 0)
+ 		goto reregister;
+ 
+@@ -5035,16 +5035,15 @@ static void __blk_mq_update_nr_hw_queues(struct blk_mq_tag_set *set,
+ 		blk_mq_map_swqueue(q);
+ 	}
+ 
++	/* elv_update_nr_hw_queues() unfreeze queue for us */
++	list_for_each_entry(q, &set->tag_list, tag_set_list)
++		elv_update_nr_hw_queues(q);
++
+ reregister:
+ 	list_for_each_entry(q, &set->tag_list, tag_set_list) {
+ 		blk_mq_sysfs_register_hctxs(q);
+ 		blk_mq_debugfs_register_hctxs(q);
+ 	}
+-
+-	/* elv_update_nr_hw_queues() unfreeze queue for us */
+-	list_for_each_entry(q, &set->tag_list, tag_set_list)
+-		elv_update_nr_hw_queues(q);
+-
+ 	memalloc_noio_restore(memflags);
+ 
+ 	/* Free the excess tags when nr_hw_queues shrink. */
+-- 
+2.43.0
+

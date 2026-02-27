@@ -1,0 +1,100 @@
+From: Keith Busch <kbusch@kernel.org>
+Date: Tue, 6 May 2025 17:47:32 +0530
+Subject: [PATCH] nvme: use fdp streams if write stream is provided
+Git-commit: 38e8397dde6338c76593ddb17ccf3118fc3f5203
+Patch-mainline: v6.16-rc1
+References: jsc#PED-14161
+
+Maps a user requested write stream to an FDP placement ID if possible.
+
+Reviewed-by: Hannes Reinecke <hare@suse.de>
+Reviewed-by: Nitesh Shetty <nj.shetty@samsung.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Keith Busch <kbusch@kernel.org>
+Signed-off-by: Kanchan Joshi <joshi.k@samsung.com>
+Link: https://lore.kernel.org/r/20250506121732.8211-12-joshi.k@samsung.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/nvme/host/core.c | 31 ++++++++++++++++++++++++++++++-
+ drivers/nvme/host/nvme.h |  1 +
+ 2 files changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index f25e03ff03df..52331a14bce1 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -672,6 +672,7 @@ static void nvme_free_ns_head(struct kref *ref)
+ 	ida_free(&head->subsys->ns_ida, head->instance);
+ 	cleanup_srcu_struct(&head->srcu);
+ 	nvme_put_subsystem(head->subsys);
++	kfree(head->plids);
+ 	kfree(head);
+ }
+ 
+@@ -995,6 +996,18 @@ static inline blk_status_t nvme_setup_rw(struct nvme_ns *ns,
+ 	if (req->cmd_flags & REQ_RAHEAD)
+ 		dsmgmt |= NVME_RW_DSM_FREQ_PREFETCH;
+ 
++	if (op == nvme_cmd_write && ns->head->nr_plids) {
++		u16 write_stream = req->bio->bi_write_stream;
++
++		if (WARN_ON_ONCE(write_stream > ns->head->nr_plids))
++			return BLK_STS_INVAL;
++
++		if (write_stream) {
++			dsmgmt |= ns->head->plids[write_stream - 1] << 16;
++			control |= NVME_RW_DTYPE_DPLCMT;
++		}
++	}
++
+ 	if (req->cmd_flags & REQ_ATOMIC && !nvme_valid_atomic_write(req))
+ 		return BLK_STS_INVAL;
+ 
+@@ -2240,7 +2253,7 @@ static int nvme_query_fdp_info(struct nvme_ns *ns, struct nvme_ns_info *info)
+ 	struct nvme_fdp_config fdp;
+ 	struct nvme_command c = {};
+ 	size_t size;
+-	int ret;
++	int i, ret;
+ 
+ 	/*
+ 	 * The FDP configuration is static for the lifetime of the namespace,
+@@ -2280,6 +2293,22 @@ static int nvme_query_fdp_info(struct nvme_ns *ns, struct nvme_ns_info *info)
+ 	}
+ 
+ 	head->nr_plids = le16_to_cpu(ruhs->nruhsd);
++	if (!head->nr_plids)
++		goto free;
++
++	head->plids = kcalloc(head->nr_plids, sizeof(head->plids),
++			      GFP_KERNEL);
++	if (!head->plids) {
++		dev_warn(ctrl->device,
++			 "failed to allocate %u FDP placement IDs\n",
++			 head->nr_plids);
++		head->nr_plids = 0;
++		ret = -ENOMEM;
++		goto free;
++	}
++
++	for (i = 0; i < head->nr_plids; i++)
++		head->plids[i] = le16_to_cpu(ruhs->ruhsd[i].pid);
+ free:
+ 	kfree(ruhs);
+ 	return ret;
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index 3e14daa4ed3e..7aad581271c7 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -498,6 +498,7 @@ struct nvme_ns_head {
+ 	struct gendisk		*disk;
+ 
+ 	u16			nr_plids;
++	u16			*plids;
+ #ifdef CONFIG_NVME_MULTIPATH
+ 	struct bio_list		requeue_list;
+ 	spinlock_t		requeue_lock;
+-- 
+2.43.0
+

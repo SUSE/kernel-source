@@ -1,0 +1,75 @@
+From: Mikulas Patocka <mpatocka@redhat.com>
+Date: Tue, 6 Jan 2026 16:56:07 +0100
+Subject: [PATCH] blk-mq: avoid stall during boot due to
+ synchronize_rcu_expedited
+Git-commit: 9670db22e7ab4aefe2b2619589a47fef9d3e0c7e
+Patch-mainline: v6.19-rc5
+References: jsc#PED-14161
+
+On the kernel 6.19-rc, I am experiencing 15-second boot stall in a
+virtual machine when probing a virtio-scsi disk:
+[    1.011641] SCSI subsystem initialized
+[    1.013972] virtio_scsi virtio6: 16/0/0 default/read/poll queues
+[    1.015983] scsi host0: Virtio SCSI HBA
+[    1.019578] ACPI: \_SB_.GSIA: Enabled at IRQ 16
+[    1.020225] ahci 0000:00:1f.2: AHCI vers 0001.0000, 32 command slots, 1.5 Gbps, SATA mode
+[    1.020228] ahci 0000:00:1f.2: 6/6 ports implemented (port mask 0x3f)
+[    1.020230] ahci 0000:00:1f.2: flags: 64bit ncq only
+[    1.024688] scsi host1: ahci
+[    1.025432] scsi host2: ahci
+[    1.025966] scsi host3: ahci
+[    1.026511] scsi host4: ahci
+[    1.028371] scsi host5: ahci
+[    1.028918] scsi host6: ahci
+[    1.029266] ata1: SATA max UDMA/133 abar m4096@0xfea23000 port 0xfea23100 irq 16 lpm-pol 1
+[    1.029305] ata2: SATA max UDMA/133 abar m4096@0xfea23000 port 0xfea23180 irq 16 lpm-pol 1
+[    1.029316] ata3: SATA max UDMA/133 abar m4096@0xfea23000 port 0xfea23200 irq 16 lpm-pol 1
+[    1.029327] ata4: SATA max UDMA/133 abar m4096@0xfea23000 port 0xfea23280 irq 16 lpm-pol 1
+[    1.029341] ata5: SATA max UDMA/133 abar m4096@0xfea23000 port 0xfea23300 irq 16 lpm-pol 1
+[    1.029356] ata6: SATA max UDMA/133 abar m4096@0xfea23000 port 0xfea23380 irq 16 lpm-pol 1
+[    1.118111] scsi 0:0:0:0: Direct-Access     QEMU     QEMU HARDDISK 2.5+ PQ: 0 ANSI: 5
+[    1.348916] ata1: SATA link down (SStatus 0 SControl 300)
+[    1.350713] ata2: SATA link down (SStatus 0 SControl 300)
+[    1.351025] ata6: SATA link down (SStatus 0 SControl 300)
+[    1.351160] ata5: SATA link down (SStatus 0 SControl 300)
+[    1.351326] ata3: SATA link down (SStatus 0 SControl 300)
+[    1.351536] ata4: SATA link down (SStatus 0 SControl 300)
+[    1.449153] input: ImExPS/2 Generic Explorer Mouse as /devices/platform/i8042/serio1/input/input2
+[   16.483477] sd 0:0:0:0: Power-on or device reset occurred
+[   16.483691] sd 0:0:0:0: [sda] 2097152 512-byte logical blocks: (1.07 GB/1.00 GiB)
+[   16.483762] sd 0:0:0:0: [sda] Write Protect is off
+[   16.483877] sd 0:0:0:0: [sda] Write cache: enabled, read cache: enabled, doesn't support DPO or FUA
+[   16.569225] sd 0:0:0:0: [sda] Attached SCSI disk
+
+I bisected it and it is caused by the commit 89e1fb7ceffd which
+introduces calls to synchronize_rcu_expedited.
+
+This commit replaces synchronize_rcu_expedited and kfree with a call to
+kfree_rcu_mightsleep, avoiding the 15-second delay.
+
+Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+Fixes: 89e1fb7ceffd ("blk-mq: fix potential uaf for 'queue_hw_ctx'")
+Reviewed-by: Uladzislau Rezki (Sony) <urezki@gmail.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/blk-mq.c | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index eff4f72ce83b..a29d8ac9d3e3 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -4553,8 +4553,7 @@ static void __blk_mq_realloc_hw_ctxs(struct blk_mq_tag_set *set,
+ 		 * Make sure reading the old queue_hw_ctx from other
+ 		 * context concurrently won't trigger uaf.
+ 		 */
+-		synchronize_rcu_expedited();
+-		kfree(hctxs);
++		kfree_rcu_mightsleep(hctxs);
+ 		hctxs = new_hctxs;
+ 	}
+ 
+-- 
+2.43.0
+

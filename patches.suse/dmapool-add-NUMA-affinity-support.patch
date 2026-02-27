@@ -1,0 +1,155 @@
+From: Keith Busch <kbusch@kernel.org>
+Date: Fri, 25 Apr 2025 20:06:34 -0600
+Subject: [PATCH] dmapool: add NUMA affinity support
+Git-commit: 1c9a93bf1d01729c54e9acbaa538db81f16563b2
+Patch-mainline: v6.16-rc1
+References: jsc#PED-14161
+
+Introduce dma_pool_create_node(), like dma_pool_create() but taking an
+additional NUMA node argument. Allocate struct dma_pool on the desired
+node, and store the node on dma_pool for allocating struct dma_page.
+Make dma_pool_create() an alias for dma_pool_create_node() with node set
+to NUMA_NO_NODE.
+
+Signed-off-by: Keith Busch <kbusch@kernel.org>
+Signed-off-by: Caleb Sander Mateos <csander@purestorage.com>
+Reviewed-by: Jens Axboe <axboe@kernel.dk>
+Reviewed-by: John Garry <john.g.garry@oracle.com>
+Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+Reviewed-by: Kanchan Joshi <joshi.k@samsung.com>
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ include/linux/dmapool.h | 21 ++++++++++++++++-----
+ mm/dmapool.c            | 15 +++++++++------
+ 2 files changed, 25 insertions(+), 11 deletions(-)
+
+diff --git a/include/linux/dmapool.h b/include/linux/dmapool.h
+index f632ecfb4238..06c4de602b2f 100644
+--- a/include/linux/dmapool.h
++++ b/include/linux/dmapool.h
+@@ -11,6 +11,7 @@
+ #ifndef LINUX_DMAPOOL_H
+ #define	LINUX_DMAPOOL_H
+ 
++#include <linux/nodemask_types.h>
+ #include <linux/scatterlist.h>
+ #include <asm/io.h>
+ 
+@@ -18,8 +19,8 @@ struct device;
+ 
+ #ifdef CONFIG_HAS_DMA
+ 
+-struct dma_pool *dma_pool_create(const char *name, struct device *dev, 
+-			size_t size, size_t align, size_t allocation);
++struct dma_pool *dma_pool_create_node(const char *name, struct device *dev,
++		size_t size, size_t align, size_t boundary, int node);
+ 
+ void dma_pool_destroy(struct dma_pool *pool);
+ 
+@@ -35,9 +36,12 @@ struct dma_pool *dmam_pool_create(const char *name, struct device *dev,
+ void dmam_pool_destroy(struct dma_pool *pool);
+ 
+ #else /* !CONFIG_HAS_DMA */
+-static inline struct dma_pool *dma_pool_create(const char *name,
+-	struct device *dev, size_t size, size_t align, size_t allocation)
+-{ return NULL; }
++static inline struct dma_pool *dma_pool_create_node(const char *name,
++		struct device *dev, size_t size, size_t align, size_t boundary,
++		int node)
++{
++	return NULL;
++}
+ static inline void dma_pool_destroy(struct dma_pool *pool) { }
+ static inline void *dma_pool_alloc(struct dma_pool *pool, gfp_t mem_flags,
+ 				   dma_addr_t *handle) { return NULL; }
+@@ -49,6 +53,13 @@ static inline struct dma_pool *dmam_pool_create(const char *name,
+ static inline void dmam_pool_destroy(struct dma_pool *pool) { }
+ #endif /* !CONFIG_HAS_DMA */
+ 
++static inline struct dma_pool *dma_pool_create(const char *name,
++		struct device *dev, size_t size, size_t align, size_t boundary)
++{
++	return dma_pool_create_node(name, dev, size, align, boundary,
++				    NUMA_NO_NODE);
++}
++
+ static inline void *dma_pool_zalloc(struct dma_pool *pool, gfp_t mem_flags,
+ 				    dma_addr_t *handle)
+ {
+diff --git a/mm/dmapool.c b/mm/dmapool.c
+index f0bfc6c490f4..5be8cc1c6529 100644
+--- a/mm/dmapool.c
++++ b/mm/dmapool.c
+@@ -56,6 +56,7 @@ struct dma_pool {		/* the pool */
+ 	unsigned int size;
+ 	unsigned int allocation;
+ 	unsigned int boundary;
++	int node;
+ 	char name[32];
+ 	struct list_head pools;
+ };
+@@ -199,12 +200,13 @@ static void pool_block_push(struct dma_pool *pool, struct dma_block *block,
+ 
+ 
+ /**
+- * dma_pool_create - Creates a pool of consistent memory blocks, for dma.
++ * dma_pool_create_node - Creates a pool of consistent memory blocks, for dma.
+  * @name: name of pool, for diagnostics
+  * @dev: device that will be doing the DMA
+  * @size: size of the blocks in this pool.
+  * @align: alignment requirement for blocks; must be a power of two
+  * @boundary: returned blocks won't cross this power of two boundary
++ * @node: optional NUMA node to allocate structs 'dma_pool' and 'dma_page' on
+  * Context: not in_interrupt()
+  *
+  * Given one of these pools, dma_pool_alloc()
+@@ -221,8 +223,8 @@ static void pool_block_push(struct dma_pool *pool, struct dma_block *block,
+  * Return: a dma allocation pool with the requested characteristics, or
+  * %NULL if one can't be created.
+  */
+-struct dma_pool *dma_pool_create(const char *name, struct device *dev,
+-				 size_t size, size_t align, size_t boundary)
++struct dma_pool *dma_pool_create_node(const char *name, struct device *dev,
++		size_t size, size_t align, size_t boundary, int node)
+ {
+ 	struct dma_pool *retval;
+ 	size_t allocation;
+@@ -251,7 +253,7 @@ struct dma_pool *dma_pool_create(const char *name, struct device *dev,
+ 
+ 	boundary = min(boundary, allocation);
+ 
+-	retval = kzalloc(sizeof(*retval), GFP_KERNEL);
++	retval = kzalloc_node(sizeof(*retval), GFP_KERNEL, node);
+ 	if (!retval)
+ 		return retval;
+ 
+@@ -264,6 +266,7 @@ struct dma_pool *dma_pool_create(const char *name, struct device *dev,
+ 	retval->size = size;
+ 	retval->boundary = boundary;
+ 	retval->allocation = allocation;
++	retval->node = node;
+ 	INIT_LIST_HEAD(&retval->pools);
+ 
+ 	/*
+@@ -295,7 +298,7 @@ struct dma_pool *dma_pool_create(const char *name, struct device *dev,
+ 	mutex_unlock(&pools_reg_lock);
+ 	return retval;
+ }
+-EXPORT_SYMBOL(dma_pool_create);
++EXPORT_SYMBOL(dma_pool_create_node);
+ 
+ static void pool_initialise_page(struct dma_pool *pool, struct dma_page *page)
+ {
+@@ -335,7 +338,7 @@ static struct dma_page *pool_alloc_page(struct dma_pool *pool, gfp_t mem_flags)
+ {
+ 	struct dma_page *page;
+ 
+-	page = kmalloc(sizeof(*page), mem_flags);
++	page = kmalloc_node(sizeof(*page), mem_flags, pool->node);
+ 	if (!page)
+ 		return NULL;
+ 
+-- 
+2.43.0
+

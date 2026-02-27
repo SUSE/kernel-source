@@ -1,0 +1,129 @@
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Tue, 6 May 2025 20:48:59 +0800
+Subject: [PATCH] block: export API to get the number of bdev inflight IO
+Git-commit: f2987c5816bda01a8ffdd4eb5dfaaa2b41b67039
+Patch-mainline: v6.16-rc1
+References: jsc#PED-14161
+
+- rename part_in_{flight, flight_rw} to bdev_count_{inflight, inflight_rw}
+- export bdev_count_inflight, to fix a problem in mdraid that foreground
+  IO can be starved by background sync IO in later patches
+
+Link: https://lore.kernel.org/linux-raid/20250506124903.2540268-6-yukuai1@huaweicloud.com
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Hannes Reinecke <hare@suse.de>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/blk-core.c          |  2 +-
+ block/blk.h               |  1 -
+ block/genhd.c             | 22 ++++++++++++++++------
+ include/linux/part_stat.h |  2 ++
+ 4 files changed, 19 insertions(+), 8 deletions(-)
+
+diff --git a/block/blk-core.c b/block/blk-core.c
+index e8cc270a453f..b862c66018f2 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -1018,7 +1018,7 @@ void update_io_ticks(struct block_device *part, unsigned long now, bool end)
+ 	stamp = READ_ONCE(part->bd_stamp);
+ 	if (unlikely(time_after(now, stamp)) &&
+ 	    likely(try_cmpxchg(&part->bd_stamp, &stamp, now)) &&
+-	    (end || part_in_flight(part)))
++	    (end || bdev_count_inflight(part)))
+ 		__part_stat_add(part, io_ticks, now - stamp);
+ 
+ 	if (bdev_is_partition(part)) {
+diff --git a/block/blk.h b/block/blk.h
+index 665b3d1fb504..21af4f0c4c00 100644
+--- a/block/blk.h
++++ b/block/blk.h
+@@ -419,7 +419,6 @@ void blk_apply_bdi_limits(struct backing_dev_info *bdi,
+ int blk_dev_init(void);
+ 
+ void update_io_ticks(struct block_device *part, unsigned long now, bool end);
+-unsigned int part_in_flight(struct block_device *part);
+ 
+ static inline void req_set_nomerge(struct request_queue *q, struct request *req)
+ {
+diff --git a/block/genhd.c b/block/genhd.c
+index 1c1a642b321e..8171a6bc3210 100644
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@ -125,7 +125,7 @@ static void part_stat_read_all(struct block_device *part,
+ 	}
+ }
+ 
+-static void part_in_flight_rw(struct block_device *part,
++static void bdev_count_inflight_rw(struct block_device *part,
+ 		unsigned int inflight[2], bool mq_driver)
+ {
+ 	int cpu;
+@@ -147,14 +147,24 @@ static void part_in_flight_rw(struct block_device *part,
+ 		inflight[WRITE] = 0;
+ }
+ 
+-unsigned int part_in_flight(struct block_device *part)
++/**
++ * bdev_count_inflight - get the number of inflight IOs for a block device.
++ *
++ * @part: the block device.
++ *
++ * Inflight here means started IO accounting, from bdev_start_io_acct() for
++ * bio-based block device, and from blk_account_io_start() for rq-based block
++ * device.
++ */
++unsigned int bdev_count_inflight(struct block_device *part)
+ {
+ 	unsigned int inflight[2] = {0};
+ 
+-	part_in_flight_rw(part, inflight, false);
++	bdev_count_inflight_rw(part, inflight, false);
+ 
+ 	return inflight[READ] + inflight[WRITE];
+ }
++EXPORT_SYMBOL_GPL(bdev_count_inflight);
+ 
+ /*
+  * Can be deleted altogether. Later.
+@@ -1052,7 +1062,7 @@ ssize_t part_stat_show(struct device *dev,
+ 	struct disk_stats stat;
+ 	unsigned int inflight;
+ 
+-	inflight = part_in_flight(bdev);
++	inflight = bdev_count_inflight(bdev);
+ 	if (inflight) {
+ 		part_stat_lock();
+ 		update_io_ticks(bdev, jiffies, true);
+@@ -1101,7 +1111,7 @@ ssize_t part_inflight_show(struct device *dev, struct device_attribute *attr,
+ 	struct request_queue *q = bdev_get_queue(bdev);
+ 	unsigned int inflight[2] = {0};
+ 
+-	part_in_flight_rw(bdev, inflight, queue_is_mq(q));
++	bdev_count_inflight_rw(bdev, inflight, queue_is_mq(q));
+ 
+ 	return sysfs_emit(buf, "%8u %8u\n", inflight[READ], inflight[WRITE]);
+ }
+@@ -1356,7 +1366,7 @@ static int diskstats_show(struct seq_file *seqf, void *v)
+ 		if (bdev_is_partition(hd) && !bdev_nr_sectors(hd))
+ 			continue;
+ 
+-		inflight = part_in_flight(hd);
++		inflight = bdev_count_inflight(hd);
+ 		if (inflight) {
+ 			part_stat_lock();
+ 			update_io_ticks(hd, jiffies, true);
+diff --git a/include/linux/part_stat.h b/include/linux/part_stat.h
+index c5e9cac0575e..eeeff2a04529 100644
+--- a/include/linux/part_stat.h
++++ b/include/linux/part_stat.h
+@@ -79,4 +79,6 @@ static inline void part_stat_set_all(struct block_device *part, int value)
+ #define part_stat_local_read_cpu(part, field, cpu)			\
+ 	local_read(&(part_stat_get_cpu(part, field, cpu)))
+ 
++unsigned int bdev_count_inflight(struct block_device *part);
++
+ #endif /* _LINUX_PART_STAT_H */
+-- 
+2.43.0
+

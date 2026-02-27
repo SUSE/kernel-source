@@ -1,0 +1,113 @@
+From: Muchun Song <songmuchun@bytedance.com>
+Date: Sat, 8 Feb 2025 17:04:15 +0800
+Subject: [PATCH] block: introduce init_wait_func()
+Git-commit: 36d03cb3277e29beedb87b8efb1e4da02b26e0c0
+Patch-mainline: v6.15-rc1
+References: jsc#PED-14161
+
+There is already a macro DEFINE_WAIT_FUNC() to declare a wait_queue_entry
+with a specified waking function. But there is not a counterpart for
+initializing one wait_queue_entry with a specified waking function. So
+introducing init_wait_func() for this, which also could be used in iocost
+and rq-qos. Using default_wake_function() in rq_qos_wait() to wake up
+waiters, which could remove ->task field from rq_qos_wait_data.
+
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Signed-off-by: Muchun Song <songmuchun@bytedance.com>
+Acked-by: Tejun Heo <tj@kernel.org>
+Link: https://lore.kernel.org/r/20250208090416.38642-1-songmuchun@bytedance.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/blk-iocost.c   |  3 +--
+ block/blk-rq-qos.c   | 14 +++++++-------
+ include/linux/wait.h |  6 ++++--
+ 3 files changed, 12 insertions(+), 11 deletions(-)
+
+diff --git a/block/blk-iocost.c b/block/blk-iocost.c
+index 65a1d4427ccf..6be46e28459b 100644
+--- a/block/blk-iocost.c
++++ b/block/blk-iocost.c
+@@ -2718,8 +2718,7 @@ static void ioc_rqos_throttle(struct rq_qos *rqos, struct bio *bio)
+ 	 * All waiters are on iocg->waitq and the wait states are
+ 	 * synchronized using waitq.lock.
+ 	 */
+-	init_waitqueue_func_entry(&wait.wait, iocg_wake_fn);
+-	wait.wait.private = current;
++	init_wait_func(&wait.wait, iocg_wake_fn);
+ 	wait.bio = bio;
+ 	wait.abs_cost = abs_cost;
+ 	wait.committed = false;	/* will be set true by waker */
+diff --git a/block/blk-rq-qos.c b/block/blk-rq-qos.c
+index d4d4f4dc0e23..0ed3c81723bb 100644
+--- a/block/blk-rq-qos.c
++++ b/block/blk-rq-qos.c
+@@ -196,7 +196,6 @@ bool rq_depth_scale_down(struct rq_depth *rqd, bool hard_throttle)
+ 
+ struct rq_qos_wait_data {
+ 	struct wait_queue_entry wq;
+-	struct task_struct *task;
+ 	struct rq_wait *rqw;
+ 	acquire_inflight_cb_t *cb;
+ 	void *private_data;
+@@ -218,7 +217,12 @@ static int rq_qos_wake_function(struct wait_queue_entry *curr,
+ 		return -1;
+ 
+ 	data->got_token = true;
+-	wake_up_process(data->task);
++	/*
++	 * autoremove_wake_function() removes the wait entry only when it
++	 * actually changed the task state. We want the wait always removed.
++	 * Remove explicitly and use default_wake_function().
++	 */
++	default_wake_function(curr, mode, wake_flags, key);
+ 	list_del_init_careful(&curr->entry);
+ 	return 1;
+ }
+@@ -244,11 +248,6 @@ void rq_qos_wait(struct rq_wait *rqw, void *private_data,
+ 		 cleanup_cb_t *cleanup_cb)
+ {
+ 	struct rq_qos_wait_data data = {
+-		.wq = {
+-			.func	= rq_qos_wake_function,
+-			.entry	= LIST_HEAD_INIT(data.wq.entry),
+-		},
+-		.task = current,
+ 		.rqw = rqw,
+ 		.cb = acquire_inflight_cb,
+ 		.private_data = private_data,
+@@ -259,6 +258,7 @@ void rq_qos_wait(struct rq_wait *rqw, void *private_data,
+ 	if (!has_sleeper && acquire_inflight_cb(rqw, private_data))
+ 		return;
+ 
++	init_wait_func(&data.wq, rq_qos_wake_function);
+ 	has_sleeper = !prepare_to_wait_exclusive(&rqw->wait, &data.wq,
+ 						 TASK_UNINTERRUPTIBLE);
+ 	do {
+diff --git a/include/linux/wait.h b/include/linux/wait.h
+index 6d90ad974408..2bdc8f47963b 100644
+--- a/include/linux/wait.h
++++ b/include/linux/wait.h
+@@ -1207,14 +1207,16 @@ int autoremove_wake_function(struct wait_queue_entry *wq_entry, unsigned mode, i
+ 
+ #define DEFINE_WAIT(name) DEFINE_WAIT_FUNC(name, autoremove_wake_function)
+ 
+-#define init_wait(wait)								\
++#define init_wait_func(wait, function)						\
+ 	do {									\
+ 		(wait)->private = current;					\
+-		(wait)->func = autoremove_wake_function;			\
++		(wait)->func = function;					\
+ 		INIT_LIST_HEAD(&(wait)->entry);					\
+ 		(wait)->flags = 0;						\
+ 	} while (0)
+ 
++#define init_wait(wait)	init_wait_func(wait, autoremove_wake_function)
++
+ typedef int (*task_call_f)(struct task_struct *p, void *arg);
+ extern int task_call_func(struct task_struct *p, task_call_f func, void *arg);
+ 
+-- 
+2.43.0
+

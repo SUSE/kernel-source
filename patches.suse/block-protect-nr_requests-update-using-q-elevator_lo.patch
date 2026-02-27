@@ -1,0 +1,100 @@
+From: Nilay Shroff <nilay@linux.ibm.com>
+Date: Tue, 4 Mar 2025 15:52:34 +0530
+Subject: [PATCH] block: protect nr_requests update using q->elevator_lock
+Git-commit: 3efe7571c3ae2b6481253a2616c2bb3fbadd503b
+Patch-mainline: v6.15-rc1
+References: jsc#PED-14161
+
+The sysfs attribute nr_requests could be simultaneously updated from
+elevator switch/update or nr_hw_queue update code path. The update to
+nr_requests for each of those code paths runs holding q->elevator_lock.
+So we should protect access to sysfs attribute nr_requests using q->
+elevator_lock instead of q->sysfs_lock.
+
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Hannes Reinecke <hare@suse.de>
+Reviewed-by: Ming Lei <ming.lei@redhat.com>
+Signed-off-by: Nilay Shroff <nilay@linux.ibm.com>
+Link: https://lore.kernel.org/r/20250304102551.2533767-6-nilay@linux.ibm.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/blk-sysfs.c      | 10 +++++-----
+ include/linux/blkdev.h | 10 ++++++----
+ 2 files changed, 11 insertions(+), 9 deletions(-)
+
+diff --git a/block/blk-sysfs.c b/block/blk-sysfs.c
+index 1562e22877e1..f1fa57de29ed 100644
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@ -55,9 +55,9 @@ static ssize_t queue_requests_show(struct gendisk *disk, char *page)
+ {
+ 	ssize_t ret;
+ 
+-	mutex_lock(&disk->queue->sysfs_lock);
++	mutex_lock(&disk->queue->elevator_lock);
+ 	ret = queue_var_show(disk->queue->nr_requests, page);
+-	mutex_unlock(&disk->queue->sysfs_lock);
++	mutex_unlock(&disk->queue->elevator_lock);
+ 	return ret;
+ }
+ 
+@@ -76,16 +76,16 @@ queue_requests_store(struct gendisk *disk, const char *page, size_t count)
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	mutex_lock(&q->sysfs_lock);
+ 	memflags = blk_mq_freeze_queue(q);
++	mutex_lock(&q->elevator_lock);
+ 	if (nr < BLKDEV_MIN_RQ)
+ 		nr = BLKDEV_MIN_RQ;
+ 
+ 	err = blk_mq_update_nr_requests(disk->queue, nr);
+ 	if (err)
+ 		ret = err;
++	mutex_unlock(&q->elevator_lock);
+ 	blk_mq_unfreeze_queue(q, memflags);
+-	mutex_unlock(&q->sysfs_lock);
+ 	return ret;
+ }
+ 
+@@ -692,7 +692,6 @@ static struct attribute *blk_mq_queue_attrs[] = {
+ 	/*
+ 	 * Attributes which are protected with q->sysfs_lock.
+ 	 */
+-	&queue_requests_entry.attr,
+ #ifdef CONFIG_BLK_WBT
+ 	&queue_wb_lat_entry.attr,
+ #endif
+@@ -701,6 +700,7 @@ static struct attribute *blk_mq_queue_attrs[] = {
+ 	 * q->sysfs_lock.
+ 	 */
+ 	&elv_iosched_entry.attr,
++	&queue_requests_entry.attr,
+ 
+ 	/*
+ 	 * Attributes which don't require locking.
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 31b1b635c710..3e66ad016a23 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -561,10 +561,12 @@ struct request_queue {
+ 	struct list_head	flush_list;
+ 
+ 	/*
+-	 * Protects against I/O scheduler switching, specifically when
+-	 * updating q->elevator. To ensure proper locking order during
+-	 * an elevator update, first freeze the queue, then acquire
+-	 * ->elevator_lock.
++	 * Protects against I/O scheduler switching, particularly when
++	 * updating q->elevator. Since the elevator update code path may
++	 * also modify q->nr_requests, this lock also protects the sysfs
++	 * attribute nr_requests.
++	 * To ensure proper locking order during an elevator update, first
++	 * freeze the queue, then acquire ->elevator_lock.
+ 	 */
+ 	struct mutex		elevator_lock;
+ 
+-- 
+2.43.0
+

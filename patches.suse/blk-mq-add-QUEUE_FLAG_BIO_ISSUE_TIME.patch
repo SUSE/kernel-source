@@ -1,0 +1,97 @@
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Wed, 10 Sep 2025 14:30:43 +0800
+Subject: [PATCH] blk-mq: add QUEUE_FLAG_BIO_ISSUE_TIME
+Git-commit: ea3d1f104db60f9d5074b33819ccea3c216e0bee
+Patch-mainline: v6.18-rc1
+References: jsc#PED-14161
+
+bio->issue_time_ns is initialized for every bio, however, it's only used
+by blk-iolatency. Add a new queue_flag and only set this flag when
+blk-iolatency is enabled, so that extra blk_time_get_ns() can be saved
+for disks that blk-iolatency is not enabled.
+
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/blk-iolatency.c  | 5 +++++
+ block/blk-mq-debugfs.c | 1 +
+ block/blk-mq.c         | 8 +++++---
+ include/linux/blkdev.h | 1 +
+ 4 files changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/block/blk-iolatency.c b/block/blk-iolatency.c
+index 554b191a6892..45bd18f68541 100644
+--- a/block/blk-iolatency.c
++++ b/block/blk-iolatency.c
+@@ -742,10 +742,15 @@ static void blkiolatency_enable_work_fn(struct work_struct *work)
+ 	 */
+ 	enabled = atomic_read(&blkiolat->enable_cnt);
+ 	if (enabled != blkiolat->enabled) {
++		struct request_queue *q = blkiolat->rqos.disk->queue;
+ 		unsigned int memflags;
+ 
+ 		memflags = blk_mq_freeze_queue(blkiolat->rqos.disk->queue);
+ 		blkiolat->enabled = enabled;
++		if (enabled)
++			blk_queue_flag_set(QUEUE_FLAG_BIO_ISSUE_TIME, q);
++		else
++			blk_queue_flag_clear(QUEUE_FLAG_BIO_ISSUE_TIME, q);
+ 		blk_mq_unfreeze_queue(blkiolat->rqos.disk->queue, memflags);
+ 	}
+ }
+diff --git a/block/blk-mq-debugfs.c b/block/blk-mq-debugfs.c
+index 32c65efdda46..4896525b1c05 100644
+--- a/block/blk-mq-debugfs.c
++++ b/block/blk-mq-debugfs.c
+@@ -96,6 +96,7 @@ static const char *const blk_queue_flag_name[] = {
+ 	QUEUE_FLAG_NAME(DISABLE_WBT_DEF),
+ 	QUEUE_FLAG_NAME(NO_ELV_SWITCH),
+ 	QUEUE_FLAG_NAME(QOS_ENABLED),
++	QUEUE_FLAG_NAME(BIO_ISSUE_TIME),
+ };
+ #undef QUEUE_FLAG_NAME
+ 
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 2c0c8ead7080..31cc743ffad7 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -396,10 +396,12 @@ static inline void blk_mq_rq_time_init(struct request *rq, u64 alloc_time_ns)
+ #endif
+ }
+ 
+-static inline void blk_mq_bio_issue_init(struct bio *bio)
++static inline void blk_mq_bio_issue_init(struct request_queue *q,
++					 struct bio *bio)
+ {
+ #ifdef CONFIG_BLK_CGROUP
+-	bio->issue_time_ns = blk_time_get_ns();
++	if (test_bit(QUEUE_FLAG_BIO_ISSUE_TIME, &q->queue_flags))
++		bio->issue_time_ns = blk_time_get_ns();
+ #endif
+ }
+ 
+@@ -3175,7 +3177,7 @@ void blk_mq_submit_bio(struct bio *bio)
+ 	if (!bio_integrity_prep(bio))
+ 		goto queue_exit;
+ 
+-	blk_mq_bio_issue_init(bio);
++	blk_mq_bio_issue_init(q, bio);
+ 	if (blk_mq_attempt_bio_merge(q, bio, nr_segs))
+ 		goto queue_exit;
+ 
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index c8cb08b2ed29..7c542b1851fa 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -657,6 +657,7 @@ enum {
+ 	QUEUE_FLAG_DISABLE_WBT_DEF,	/* for sched to disable/enable wbt */
+ 	QUEUE_FLAG_NO_ELV_SWITCH,	/* can't switch elevator any more */
+ 	QUEUE_FLAG_QOS_ENABLED,		/* qos is enabled */
++	QUEUE_FLAG_BIO_ISSUE_TIME,	/* record bio->issue_time_ns */
+ 	QUEUE_FLAG_MAX
+ };
+ 
+-- 
+2.43.0
+

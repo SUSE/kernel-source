@@ -1,0 +1,79 @@
+From: Deepanshu Kartikey <kartikey406@gmail.com>
+Date: Wed, 17 Dec 2025 07:17:12 +0530
+Subject: [PATCH] block: add allocation size check in blkdev_pr_read_keys()
+Git-commit: a58383fa45c706bda3bf4a1955c3a0327dbec7e7
+Patch-mainline: v6.19-rc2
+References: jsc#PED-14161
+
+blkdev_pr_read_keys() takes num_keys from userspace and uses it to
+calculate the allocation size for keys_info via struct_size(). While
+there is a check for SIZE_MAX (integer overflow), there is no upper
+bound validation on the allocation size itself.
+
+A malicious or buggy userspace can pass a large num_keys value that
+doesn't trigger overflow but still results in an excessive allocation
+attempt, causing a warning in the page allocator when the order exceeds
+MAX_PAGE_ORDER.
+
+Fix this by introducing PR_KEYS_MAX to limit the number of keys to
+a sane value. This makes the SIZE_MAX check redundant, so remove it.
+Also switch to kvzalloc/kvfree to handle larger allocations gracefully.
+
+Fixes: 22a1ffea5f80 ("block: add IOC_PR_READ_KEYS ioctl")
+Tested-by: syzbot+660d079d90f8a1baf54d@syzkaller.appspotmail.com
+Reported-by: syzbot+660d079d90f8a1baf54d@syzkaller.appspotmail.com
+Closes: https://syzkaller.appspot.com/bug?extid=660d079d90f8a1baf54d
+Link: https://lore.kernel.org/all/20251212013510.3576091-1-kartikey406@gmail.com/T/ [v1]
+Signed-off-by: Deepanshu Kartikey <kartikey406@gmail.com>
+Reviewed-by: Martin K. Petersen <martin.petersen@oracle.com>
+Reviewed-by: Stefan Hajnoczi <stefanha@redhat.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/ioctl.c           | 9 +++++----
+ include/uapi/linux/pr.h | 2 ++
+ 2 files changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/block/ioctl.c b/block/ioctl.c
+index 61feed686418..344478348a54 100644
+--- a/block/ioctl.c
++++ b/block/ioctl.c
+@@ -442,11 +442,12 @@ static int blkdev_pr_read_keys(struct block_device *bdev, blk_mode_t mode,
+ 	if (copy_from_user(&read_keys, arg, sizeof(read_keys)))
+ 		return -EFAULT;
+ 
+-	keys_info_len = struct_size(keys_info, keys, read_keys.num_keys);
+-	if (keys_info_len == SIZE_MAX)
++	if (read_keys.num_keys > PR_KEYS_MAX)
+ 		return -EINVAL;
+ 
+-	keys_info = kzalloc(keys_info_len, GFP_KERNEL);
++	keys_info_len = struct_size(keys_info, keys, read_keys.num_keys);
++
++	keys_info = kvzalloc(keys_info_len, GFP_KERNEL);
+ 	if (!keys_info)
+ 		return -ENOMEM;
+ 
+@@ -473,7 +474,7 @@ static int blkdev_pr_read_keys(struct block_device *bdev, blk_mode_t mode,
+ 	if (copy_to_user(arg, &read_keys, sizeof(read_keys)))
+ 		ret = -EFAULT;
+ out:
+-	kfree(keys_info);
++	kvfree(keys_info);
+ 	return ret;
+ }
+ 
+diff --git a/include/uapi/linux/pr.h b/include/uapi/linux/pr.h
+index 847f3051057a..f0ecb1677317 100644
+--- a/include/uapi/linux/pr.h
++++ b/include/uapi/linux/pr.h
+@@ -79,4 +79,6 @@ struct pr_read_reservation {
+ #define IOC_PR_READ_KEYS	_IOWR('p', 206, struct pr_read_keys)
+ #define IOC_PR_READ_RESERVATION	_IOR('p', 207, struct pr_read_reservation)
+ 
++#define PR_KEYS_MAX		(1u << 16)
++
+ #endif /* _UAPI_PR_H */
+-- 
+2.43.0
+

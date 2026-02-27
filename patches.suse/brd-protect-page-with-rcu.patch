@@ -1,0 +1,93 @@
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Tue, 6 May 2025 14:17:54 +0800
+Subject: [PATCH] brd: protect page with rcu
+Git-commit: 0e8acffc1be10d53e909b3aa43831d6c2d25a579
+Patch-mainline: v6.16-rc1
+References: jsc#PED-14161
+
+Currently, after fetching the page by xa_load() in IO path, there is no
+protection and page can be freed concurrently by discard:
+
+cpu0
+brd_submit_bio
+ brd_do_bvec
+  page = brd_lookup_page
+                          cpu1
+                          brd_submit_bio
+                           brd_do_discard
+                            page = __xa_erase()
+                            __free_page()
+  // page UAF
+
+Fix the problem by protecting page with rcu.
+
+Meanwhile, if page is already freed, also prevent BUG_ON() by skipping
+the write, and user will get zero data later if there is no page.
+
+Fixes: 9ead7efc6f3f ("brd: implement discard support")
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Link: https://lore.kernel.org/r/20250506061756.2970934-2-yukuai1@huaweicloud.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/block/brd.c | 20 +++++++++++++++++---
+ 1 file changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/block/brd.c b/drivers/block/brd.c
+index fa1290992a7f..fc793d48a9c6 100644
+--- a/drivers/block/brd.c
++++ b/drivers/block/brd.c
+@@ -132,12 +132,18 @@ static bool brd_rw_bvec(struct brd_device *brd, struct bio *bio)
+ 		}
+ 	}
+ 
++	rcu_read_lock();
+ 	page = brd_lookup_page(brd, sector);
+ 
+ 	kaddr = bvec_kmap_local(&bv);
+ 	if (op_is_write(opf)) {
+-		BUG_ON(!page);
+-		memcpy_to_page(page, offset, kaddr, bv.bv_len);
++		/*
++		 * Page can be removed by concurrent discard, it's fine to skip
++		 * the write and user will read zero data if page does not
++		 * exist.
++		 */
++		if (page)
++			memcpy_to_page(page, offset, kaddr, bv.bv_len);
+ 	} else {
+ 		if (page)
+ 			memcpy_from_page(kaddr, page, offset, bv.bv_len);
+@@ -145,11 +151,19 @@ static bool brd_rw_bvec(struct brd_device *brd, struct bio *bio)
+ 			memset(kaddr, 0, bv.bv_len);
+ 	}
+ 	kunmap_local(kaddr);
++	rcu_read_unlock();
+ 
+ 	bio_advance_iter_single(bio, &bio->bi_iter, bv.bv_len);
+ 	return true;
+ }
+ 
++static void brd_free_one_page(struct rcu_head *head)
++{
++	struct page *page = container_of(head, struct page, rcu_head);
++
++	__free_page(page);
++}
++
+ static void brd_do_discard(struct brd_device *brd, sector_t sector, u32 size)
+ {
+ 	sector_t aligned_sector = (sector + PAGE_SECTORS) & ~PAGE_SECTORS;
+@@ -160,7 +174,7 @@ static void brd_do_discard(struct brd_device *brd, sector_t sector, u32 size)
+ 	while (size >= PAGE_SIZE && aligned_sector < rd_size * 2) {
+ 		page = __xa_erase(&brd->brd_pages, aligned_sector >> PAGE_SECTORS_SHIFT);
+ 		if (page) {
+-			__free_page(page);
++			call_rcu(&page->rcu_head, brd_free_one_page);
+ 			brd->brd_nr_pages--;
+ 		}
+ 		aligned_sector += PAGE_SECTORS;
+-- 
+2.43.0
+

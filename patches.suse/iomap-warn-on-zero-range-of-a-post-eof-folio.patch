@@ -1,0 +1,57 @@
+From: Brian Foster <bfoster@redhat.com>
+Date: Fri, 15 Nov 2024 09:59:31 -0500
+Subject: [PATCH] iomap: warn on zero range of a post-eof folio
+Git-commit: eb65540aa9fc828e9f3f8b30d6dc37f1ed35263d
+Patch-mainline: v6.13-rc1
+References: jsc#PED-14161
+
+iomap_zero_range() uses buffered writes for manual zeroing, no
+longer updates i_size for such writes, but is still explicitly
+called for post-eof ranges. The historical use case for this is
+zeroing post-eof speculative preallocation on extending writes from
+XFS. However, XFS also recently changed to convert all post-eof
+delalloc mappings to unwritten in the iomap_begin() handler, which
+means it now never expects manual zeroing of post-eof mappings. In
+other words, all post-eof mappings should be reported as holes or
+unwritten.
+
+This is a subtle dependency that can be hard to detect if violated
+because associated codepaths are likely to update i_size after folio
+locks are dropped, but before writeback happens to occur. For
+example, if XFS reverts back to some form of manual zeroing of
+post-eof blocks on write extension, writeback of those zeroed folios
+will now race with the presumed i_size update from the subsequent
+buffered write.
+
+Since iomap_zero_range() can't correctly zero post-eof mappings
+beyond EOF without updating i_size, warn if this ever occurs. This
+serves as minimal indication that if this use case is reintroduced
+by a filesystem, iomap_zero_range() might need to reconsider i_size
+updates for write extending use cases.
+
+Signed-off-by: Brian Foster <bfoster@redhat.com>
+Link: https://lore.kernel.org/r/20241115145931.535207-1-bfoster@redhat.com
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Signed-off-by: Christian Brauner <brauner@kernel.org>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ fs/iomap/buffered-io.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/fs/iomap/buffered-io.c b/fs/iomap/buffered-io.c
+index ce73d2a48c1e..9ae71b9dafde 100644
+--- a/fs/iomap/buffered-io.c
++++ b/fs/iomap/buffered-io.c
+@@ -1397,6 +1397,8 @@ static loff_t iomap_zero_iter(struct iomap_iter *iter, bool *did_zero,
+ 		if (iter->iomap.flags & IOMAP_F_STALE)
+ 			break;
+ 
++		/* warn about zeroing folios beyond eof that won't write back */
++		WARN_ON_ONCE(folio_pos(folio) > iter->inode->i_size);
+ 		offset = offset_in_folio(folio, pos);
+ 		if (bytes > folio_size(folio) - offset)
+ 			bytes = folio_size(folio) - offset;
+-- 
+2.43.0
+

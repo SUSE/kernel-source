@@ -1,0 +1,137 @@
+From: Ming Lei <ming.lei@redhat.com>
+Date: Mon, 5 May 2025 22:17:58 +0800
+Subject: [PATCH] block: add new helper for disabling elevator switch when
+ deleting disk
+Git-commit: 21eed794ab4bd1a6c82a55df4416d18fb4d21da9
+Patch-mainline: v6.16-rc1
+References: jsc#PED-14161
+
+Add new helper disable_elv_switch() and new flag QUEUE_FLAG_NO_ELV_SWITCH
+for disabling elevator switch before deleting disk:
+
+- originally flag QUEUE_FLAG_REGISTERED is added for preventing elevator
+switch during removing disk, but this flag has been used widely for
+other purposes, so add one new flag for disabling elevator switch only
+
+- for avoiding deadlock risk, we have to move elevator queue
+register/unregister out of elevator lock and queue freeze, which will be
+done in next patch. However, this way adds small race window between elevator
+switch and deleting ->queue_kobj, in which elevator queue register/unregister
+could be run concurrently. The added helper will be used for avoiding the race
+in the following patch.
+
+- drain in-progress elevator switch before deleting disk
+
+Suggested-by: Nilay Shroff <nilay@linux.ibm.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Hannes Reinecke <hare@suse.de>
+Signed-off-by: Ming Lei <ming.lei@redhat.com>
+Reviewed-by: Nilay Shroff <nilay@linux.ibm.com>
+Link: https://lore.kernel.org/r/20250505141805.2751237-21-ming.lei@redhat.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/blk-mq-debugfs.c |  1 +
+ block/elevator.c       | 13 ++++++++++---
+ block/genhd.c          | 13 +++++++++++++
+ include/linux/blkdev.h |  3 +++
+ 4 files changed, 27 insertions(+), 3 deletions(-)
+
+diff --git a/block/blk-mq-debugfs.c b/block/blk-mq-debugfs.c
+index 2837a8ce8054..29b3540dd180 100644
+--- a/block/blk-mq-debugfs.c
++++ b/block/blk-mq-debugfs.c
+@@ -94,6 +94,7 @@ static const char *const blk_queue_flag_name[] = {
+ 	QUEUE_FLAG_NAME(HCTX_ACTIVE),
+ 	QUEUE_FLAG_NAME(SQ_SCHED),
+ 	QUEUE_FLAG_NAME(DISABLE_WBT_DEF),
++	QUEUE_FLAG_NAME(NO_ELV_SWITCH),
+ };
+ #undef QUEUE_FLAG_NAME
+ 
+diff --git a/block/elevator.c b/block/elevator.c
+index 2edaf84900fc..f7e333abefe3 100644
+--- a/block/elevator.c
++++ b/block/elevator.c
+@@ -680,6 +680,9 @@ void elevator_set_default(struct request_queue *q)
+ 	};
+ 	int err = 0;
+ 
++	/* now we allow to switch elevator */
++	blk_queue_flag_clear(QUEUE_FLAG_NO_ELV_SWITCH, q);
++
+ 	if (q->tag_set->flags & BLK_MQ_F_NO_SCHED_BY_DEFAULT)
+ 		return;
+ 
+@@ -744,9 +747,13 @@ ssize_t elv_iosched_store(struct gendisk *disk, const char *buf,
+ 	elv_iosched_load_module(ctx.name);
+ 
+ 	down_read(&set->update_nr_hwq_lock);
+-	ret = elevator_change(q, &ctx);
+-	if (!ret)
+-		ret = count;
++	if (!blk_queue_no_elv_switch(q)) {
++		ret = elevator_change(q, &ctx);
++		if (!ret)
++			ret = count;
++	} else {
++		ret = -ENOENT;
++	}
+ 	up_read(&set->update_nr_hwq_lock);
+ 	return ret;
+ }
+diff --git a/block/genhd.c b/block/genhd.c
+index f192fe4808b9..a8cb5607b6e3 100644
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@ -764,6 +764,16 @@ static void __del_gendisk(struct gendisk *disk)
+ 		blk_unfreeze_release_lock(q);
+ }
+ 
++static void disable_elv_switch(struct request_queue *q)
++{
++	struct blk_mq_tag_set *set = q->tag_set;
++	WARN_ON_ONCE(!queue_is_mq(q));
++
++	down_write(&set->update_nr_hwq_lock);
++	blk_queue_flag_set(QUEUE_FLAG_NO_ELV_SWITCH, q);
++	up_write(&set->update_nr_hwq_lock);
++}
++
+ /**
+  * del_gendisk - remove the gendisk
+  * @disk: the struct gendisk to remove
+@@ -792,6 +802,9 @@ void del_gendisk(struct gendisk *disk)
+ 		__del_gendisk(disk);
+ 	} else {
+ 		set = disk->queue->tag_set;
++
++		disable_elv_switch(disk->queue);
++
+ 		memflags = memalloc_noio_save();
+ 		down_read(&set->update_nr_hwq_lock);
+ 		__del_gendisk(disk);
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index c36d7a1c2cc0..3aa1fd637d57 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -642,6 +642,7 @@ enum {
+ 	QUEUE_FLAG_HCTX_ACTIVE,		/* at least one blk-mq hctx is active */
+ 	QUEUE_FLAG_SQ_SCHED,		/* single queue style io dispatch */
+ 	QUEUE_FLAG_DISABLE_WBT_DEF,	/* for sched to disable/enable wbt */
++	QUEUE_FLAG_NO_ELV_SWITCH,	/* can't switch elevator any more */
+ 	QUEUE_FLAG_MAX
+ };
+ 
+@@ -679,6 +680,8 @@ void blk_queue_flag_clear(unsigned int flag, struct request_queue *q);
+ 	((q)->limits.features & BLK_FEAT_SKIP_TAGSET_QUIESCE)
+ #define blk_queue_disable_wbt(q)	\
+ 	test_bit(QUEUE_FLAG_DISABLE_WBT_DEF, &(q)->queue_flags)
++#define blk_queue_no_elv_switch(q)	\
++	test_bit(QUEUE_FLAG_NO_ELV_SWITCH, &(q)->queue_flags)
+ 
+ extern void blk_set_pm_only(struct request_queue *q);
+ extern void blk_clear_pm_only(struct request_queue *q);
+-- 
+2.43.0
+

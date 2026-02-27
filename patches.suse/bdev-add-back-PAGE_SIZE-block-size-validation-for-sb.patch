@@ -1,0 +1,100 @@
+From: Luis Chamberlain <mcgrof@kernel.org>
+Date: Thu, 6 Mar 2025 18:04:03 -0800
+Subject: [PATCH] bdev: add back PAGE_SIZE block size validation for
+ sb_set_blocksize()
+Git-commit: a64e5a596067bddba87fcc2ce37e56c3fca831b7
+Patch-mainline: v6.15-rc1
+References: jsc#PED-14161
+
+The commit titled "block/bdev: lift block size restrictions to 64k"
+lifted the block layer's max supported block size to 64k inside the
+helper blk_validate_block_size() now that we support large folios.
+However in lifting the block size we also removed the silly use
+cases many filesystems have to use sb_set_blocksize() to *verify*
+that the block size <= PAGE_SIZE. The call to sb_set_blocksize() was
+used to check the block size <= PAGE_SIZE since historically we've
+always supported userspace to create for example 64k block size
+filesystems even on 4k page size systems, but what we didn't allow
+was mounting them. Older filesystems have been using the check with
+sb_set_blocksize() for years.
+
+While, we could argue that such checks should be filesystem specific,
+there are much more users of sb_set_blocksize() than LBS enabled
+filesystem on upstream, so just do the easier thing and bring back
+the PAGE_SIZE check for sb_set_blocksize() users and only skip it
+for LBS enabled filesystems.
+
+This will ensure that tests such as generic/466 when run in a loop
+against say, ext4, won't try to try to actually mount a filesystem with
+a block size larger than your filesystem supports given your PAGE_SIZE
+and in the worst case crash.
+
+Cc: Kent Overstreet <kent.overstreet@linux.dev>
+Signed-off-by: Luis Chamberlain <mcgrof@kernel.org>
+Link: https://lore.kernel.org/r/20250307020403.3068567-1-mcgrof@kernel.org
+Reviewed-by: Kent Overstreet <kent.overstreet@linux.dev>
+Reviewed-by: "Darrick J. Wong" <djwong@kernel.org>
+Signed-off-by: Christian Brauner <brauner@kernel.org>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/bdev.c       | 2 ++
+ fs/bcachefs/fs.c   | 2 +-
+ fs/xfs/xfs_super.c | 3 ++-
+ include/linux/fs.h | 1 +
+ 4 files changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/block/bdev.c b/block/bdev.c
+index 3bd948e6438d..4844d1e27b6f 100644
+--- a/block/bdev.c
++++ b/block/bdev.c
+@@ -181,6 +181,8 @@ EXPORT_SYMBOL(set_blocksize);
+ 
+ int sb_set_blocksize(struct super_block *sb, int size)
+ {
++	if (!(sb->s_type->fs_flags & FS_LBS) && size > PAGE_SIZE)
++		return 0;
+ 	if (set_blocksize(sb->s_bdev_file, size))
+ 		return 0;
+ 	/* If we get here, we know size is validated */
+diff --git a/fs/bcachefs/fs.c b/fs/bcachefs/fs.c
+index 90ade8f648d9..e99e378d68ea 100644
+--- a/fs/bcachefs/fs.c
++++ b/fs/bcachefs/fs.c
+@@ -2396,7 +2396,7 @@ static struct file_system_type bcache_fs_type = {
+ 	.name			= "bcachefs",
+ 	.init_fs_context	= bch2_init_fs_context,
+ 	.kill_sb		= bch2_kill_sb,
+-	.fs_flags		= FS_REQUIRES_DEV | FS_ALLOW_IDMAP,
++	.fs_flags		= FS_REQUIRES_DEV | FS_ALLOW_IDMAP | FS_LBS,
+ };
+ 
+ MODULE_ALIAS_FS("bcachefs");
+diff --git a/fs/xfs/xfs_super.c b/fs/xfs/xfs_super.c
+index d92d7a07ea89..3d8b80165d48 100644
+--- a/fs/xfs/xfs_super.c
++++ b/fs/xfs/xfs_super.c
+@@ -2118,7 +2118,8 @@ static struct file_system_type xfs_fs_type = {
+ 	.init_fs_context	= xfs_init_fs_context,
+ 	.parameters		= xfs_fs_parameters,
+ 	.kill_sb		= xfs_kill_sb,
+-	.fs_flags		= FS_REQUIRES_DEV | FS_ALLOW_IDMAP,
++	.fs_flags		= FS_REQUIRES_DEV | FS_ALLOW_IDMAP |
++				  FS_LBS,
+ };
+ MODULE_ALIAS_FS("xfs");
+ 
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index be3ad155ec9f..f47fbe16b101 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -2604,6 +2604,7 @@ struct file_system_type {
+ #define FS_USERNS_MOUNT		8	/* Can be mounted by userns root */
+ #define FS_DISALLOW_NOTIFY_PERM	16	/* Disable fanotify permission events */
+ #define FS_ALLOW_IDMAP         32      /* FS has been updated to handle vfs idmappings. */
++#define FS_LBS			128	/* FS supports LBS */
+ #define FS_RENAME_DOES_D_MOVE	32768	/* FS will handle d_move() during rename() internally. */
+ 	int (*init_fs_context)(struct fs_context *);
+ 	const struct fs_parameter_spec *parameters;
+-- 
+2.43.0
+

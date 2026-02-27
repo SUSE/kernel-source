@@ -1,0 +1,83 @@
+From: Zizhi Wo <wozizhi@huawei.com>
+Date: Tue, 6 May 2025 10:09:31 +0800
+Subject: [PATCH] blk-throttle: Introduce flag "BIO_TG_BPS_THROTTLED"
+Git-commit: c4da7bf54b1f76e7c5c8cc6d1c4db8b19af67c5d
+Patch-mainline: v6.16-rc1
+References: jsc#PED-14161
+
+Subsequent patches will split the single queue into separate bps and iops
+queues. To prevent IO that has already passed through the bps queue at a
+single tg level from being counted toward bps wait time again, we introduce
+"BIO_TG_BPS_THROTTLED" flag. Since throttle and QoS operate at different
+levels, we reuse the value as "BIO_QOS_THROTTLED".
+
+We set this flag when charge bps and clear it when charge iops, as the bio
+will move to the upper-level tg or be dispatched.
+
+This patch does not involve functional changes.
+
+Signed-off-by: Zizhi Wo <wozizhi@huawei.com>
+Reviewed-by: Yu Kuai <yukuai3@huawei.com>
+Signed-off-by: Zizhi Wo <wozizhi@huaweicloud.com>
+Link: https://lore.kernel.org/r/20250506020935.655574-5-wozizhi@huaweicloud.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/blk-throttle.c      | 9 +++++++--
+ include/linux/blk_types.h | 8 ++++++++
+ 2 files changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/block/blk-throttle.c b/block/blk-throttle.c
+index fea09a91c20b..ee4eeee8f21f 100644
+--- a/block/blk-throttle.c
++++ b/block/blk-throttle.c
+@@ -792,12 +792,16 @@ static void throtl_charge_bps_bio(struct throtl_grp *tg, struct bio *bio)
+ 	unsigned int bio_size = throtl_bio_data_size(bio);
+ 
+ 	/* Charge the bio to the group */
+-	if (!bio_flagged(bio, BIO_BPS_THROTTLED))
++	if (!bio_flagged(bio, BIO_BPS_THROTTLED) &&
++	    !bio_flagged(bio, BIO_TG_BPS_THROTTLED)) {
++		bio_set_flag(bio, BIO_TG_BPS_THROTTLED);
+ 		tg->bytes_disp[bio_data_dir(bio)] += bio_size;
++	}
+ }
+ 
+ static void throtl_charge_iops_bio(struct throtl_grp *tg, struct bio *bio)
+ {
++	bio_clear_flag(bio, BIO_TG_BPS_THROTTLED);
+ 	tg->io_disp[bio_data_dir(bio)]++;
+ }
+ 
+@@ -823,7 +827,8 @@ static unsigned long tg_dispatch_bps_time(struct throtl_grp *tg, struct bio *bio
+ 
+ 	/* no need to throttle if this bio's bytes have been accounted */
+ 	if (bps_limit == U64_MAX || tg->flags & THROTL_TG_CANCELING ||
+-	    bio_flagged(bio, BIO_BPS_THROTTLED))
++	    bio_flagged(bio, BIO_BPS_THROTTLED) ||
++	    bio_flagged(bio, BIO_TG_BPS_THROTTLED))
+ 		return 0;
+ 
+ 	tg_update_slice(tg, rw);
+diff --git a/include/linux/blk_types.h b/include/linux/blk_types.h
+index f38425338c3f..3d1577f07c1c 100644
+--- a/include/linux/blk_types.h
++++ b/include/linux/blk_types.h
+@@ -296,6 +296,14 @@ enum {
+ 				 * of this bio. */
+ 	BIO_CGROUP_ACCT,	/* has been accounted to a cgroup */
+ 	BIO_QOS_THROTTLED,	/* bio went through rq_qos throttle path */
++	/*
++	 * This bio has completed bps throttling at the single tg granularity,
++	 * which is different from BIO_BPS_THROTTLED. When the bio is enqueued
++	 * into the sq->queued of the upper tg, or is about to be dispatched,
++	 * this flag needs to be cleared. Since blk-throttle and rq_qos are not
++	 * on the same hierarchical level, reuse the value.
++	 */
++	BIO_TG_BPS_THROTTLED = BIO_QOS_THROTTLED,
+ 	BIO_QOS_MERGED,		/* but went through rq_qos merge path */
+ 	BIO_REMAPPED,
+ 	BIO_ZONE_WRITE_PLUGGING, /* bio handled through zone write plugging */
+-- 
+2.43.0
+

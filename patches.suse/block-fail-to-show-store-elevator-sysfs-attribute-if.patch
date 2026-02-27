@@ -1,0 +1,96 @@
+From: Ming Lei <ming.lei@redhat.com>
+Date: Mon, 5 May 2025 22:17:57 +0800
+Subject: [PATCH] block: fail to show/store elevator sysfs attribute if
+ elevator is dying
+Git-commit: 5c3d858cdc57196e6d438e5ad47a732216e81a9c
+Patch-mainline: v6.16-rc1
+References: jsc#PED-14161
+
+Prepare for moving elv_register[unregister]_queue out of elevator_lock
+& queue freezing, so we may have to call elv_unregister_queue() after
+elevator ->exit() is called, then there is small window for user to
+call into ->show()/store(), and user-after-free can be caused.
+
+Fail to show/store elevator sysfs attribute if elevator is dying by
+adding one new flag of ELEVATOR_FLAG_DYNG, which is protected by
+elevator ->sysfs_lock.
+
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Nilay Shroff <nilay@linux.ibm.com>
+Signed-off-by: Ming Lei <ming.lei@redhat.com>
+Reviewed-by: Hannes Reinecke <hare@suse.de>
+Link: https://lore.kernel.org/r/20250505141805.2751237-20-ming.lei@redhat.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/blk-mq-sched.c |  1 +
+ block/elevator.c     | 10 ++++++----
+ block/elevator.h     |  1 +
+ 3 files changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/block/blk-mq-sched.c b/block/blk-mq-sched.c
+index 336a15ffecfa..55a0fd105147 100644
+--- a/block/blk-mq-sched.c
++++ b/block/blk-mq-sched.c
+@@ -551,5 +551,6 @@ void blk_mq_exit_sched(struct request_queue *q, struct elevator_queue *e)
+ 	if (e->type->ops.exit_sched)
+ 		e->type->ops.exit_sched(e);
+ 	blk_mq_sched_tags_teardown(q, flags);
++	set_bit(ELEVATOR_FLAG_DYING, &q->elevator->flags);
+ 	q->elevator = NULL;
+ }
+diff --git a/block/elevator.c b/block/elevator.c
+index fa436417da3b..2edaf84900fc 100644
+--- a/block/elevator.c
++++ b/block/elevator.c
+@@ -418,14 +418,15 @@ elv_attr_show(struct kobject *kobj, struct attribute *attr, char *page)
+ {
+ 	const struct elv_fs_entry *entry = to_elv(attr);
+ 	struct elevator_queue *e;
+-	ssize_t error;
++	ssize_t error = -ENODEV;
+ 
+ 	if (!entry->show)
+ 		return -EIO;
+ 
+ 	e = container_of(kobj, struct elevator_queue, kobj);
+ 	mutex_lock(&e->sysfs_lock);
+-	error = entry->show(e, page);
++	if (!test_bit(ELEVATOR_FLAG_DYING, &e->flags))
++		error = entry->show(e, page);
+ 	mutex_unlock(&e->sysfs_lock);
+ 	return error;
+ }
+@@ -436,14 +437,15 @@ elv_attr_store(struct kobject *kobj, struct attribute *attr,
+ {
+ 	const struct elv_fs_entry *entry = to_elv(attr);
+ 	struct elevator_queue *e;
+-	ssize_t error;
++	ssize_t error = -ENODEV;
+ 
+ 	if (!entry->store)
+ 		return -EIO;
+ 
+ 	e = container_of(kobj, struct elevator_queue, kobj);
+ 	mutex_lock(&e->sysfs_lock);
+-	error = entry->store(e, page, length);
++	if (!test_bit(ELEVATOR_FLAG_DYING, &e->flags))
++		error = entry->store(e, page, length);
+ 	mutex_unlock(&e->sysfs_lock);
+ 	return error;
+ }
+diff --git a/block/elevator.h b/block/elevator.h
+index 9198676644a9..76a90a1b7ed6 100644
+--- a/block/elevator.h
++++ b/block/elevator.h
+@@ -121,6 +121,7 @@ struct elevator_queue
+ };
+ 
+ #define ELEVATOR_FLAG_REGISTERED	0
++#define ELEVATOR_FLAG_DYING		1
+ 
+ /*
+  * block elevator interface
+-- 
+2.43.0
+

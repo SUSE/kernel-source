@@ -1,0 +1,98 @@
+From: "Ritesh Harjani (IBM)" <ritesh.list@gmail.com>
+Date: Mon, 4 Nov 2024 16:22:59 -0800
+Subject: [PATCH] ext4: Do not fallback to buffered-io for DIO atomic write
+Git-commit: 299537e9dfac2ecd08e7dae87a6437b92612568a
+Patch-mainline: v6.13-rc1
+References: jsc#PED-14161
+
+atomic writes is currently only supported for single fsblock and only
+for direct-io. We should not return -ENOTBLK for atomic writes since we
+want the atomic write request to either complete fully or fail
+otherwise. Hence, we should never fallback to buffered-io in case of
+DIO atomic write requests.
+Let's also catch if this ever happens by adding some WARN_ON_ONCE before
+buffered-io handling for direct-io atomic writes. More details of the
+discussion [1].
+
+While at it let's add an inline helper ext4_want_directio_fallback() which
+simplifies the logic checks and inherently fixes condition on when to return
+-ENOTBLK which otherwise was always returning true for any write or directio in
+ext4_iomap_end(). It was ok since ext4 only supports direct-io via iomap.
+
+[1]: https://lore.kernel.org/linux-xfs/cover.1729825985.git.ritesh.list@gmail.com/T/#m9dbecc11bed713ed0d7a486432c56b105b555f04
+Suggested-by: Darrick J. Wong <djwong@kernel.org> # inline helper
+Signed-off-by: Ritesh Harjani (IBM) <ritesh.list@gmail.com>
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ fs/ext4/file.c  |  7 +++++++
+ fs/ext4/inode.c | 27 ++++++++++++++++++++++-----
+ 2 files changed, 29 insertions(+), 5 deletions(-)
+
+diff --git a/fs/ext4/file.c b/fs/ext4/file.c
+index 96d936f5584b..a7de03e47db0 100644
+--- a/fs/ext4/file.c
++++ b/fs/ext4/file.c
+@@ -599,6 +599,13 @@ static ssize_t ext4_dio_write_iter(struct kiocb *iocb, struct iov_iter *from)
+ 		ssize_t err;
+ 		loff_t endbyte;
+ 
++		/*
++		 * There is no support for atomic writes on buffered-io yet,
++		 * we should never fallback to buffered-io for DIO atomic
++		 * writes.
++		 */
++		WARN_ON_ONCE(iocb->ki_flags & IOCB_ATOMIC);
++
+ 		offset = iocb->ki_pos;
+ 		err = ext4_buffered_write_iter(iocb, from);
+ 		if (err < 0)
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 3e827cfa762e..5b9eeb74ce47 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -3444,17 +3444,34 @@ static int ext4_iomap_overwrite_begin(struct inode *inode, loff_t offset,
+ 	return ret;
+ }
+ 
++static inline bool ext4_want_directio_fallback(unsigned flags, ssize_t written)
++{
++	/* must be a directio to fall back to buffered */
++	if ((flags & (IOMAP_WRITE | IOMAP_DIRECT)) !=
++		    (IOMAP_WRITE | IOMAP_DIRECT))
++		return false;
++
++	/* atomic writes are all-or-nothing */
++	if (flags & IOMAP_ATOMIC)
++		return false;
++
++	/* can only try again if we wrote nothing */
++	return written == 0;
++}
++
+ static int ext4_iomap_end(struct inode *inode, loff_t offset, loff_t length,
+ 			  ssize_t written, unsigned flags, struct iomap *iomap)
+ {
+ 	/*
+ 	 * Check to see whether an error occurred while writing out the data to
+-	 * the allocated blocks. If so, return the magic error code so that we
+-	 * fallback to buffered I/O and attempt to complete the remainder of
+-	 * the I/O. Any blocks that may have been allocated in preparation for
+-	 * the direct I/O will be reused during buffered I/O.
++	 * the allocated blocks. If so, return the magic error code for
++	 * non-atomic write so that we fallback to buffered I/O and attempt to
++	 * complete the remainder of the I/O.
++	 * For non-atomic writes, any blocks that may have been
++	 * allocated in preparation for the direct I/O will be reused during
++	 * buffered I/O. For atomic write, we never fallback to buffered-io.
+ 	 */
+-	if (flags & (IOMAP_WRITE | IOMAP_DIRECT) && written == 0)
++	if (ext4_want_directio_fallback(flags, written))
+ 		return -ENOTBLK;
+ 
+ 	return 0;
+-- 
+2.43.0
+

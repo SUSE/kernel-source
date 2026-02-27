@@ -1,0 +1,85 @@
+From: Brian Foster <bfoster@redhat.com>
+Date: Fri, 7 Feb 2025 09:32:48 -0500
+Subject: [PATCH] iomap: lift iter termination logic from iomap_iter_advance()
+Git-commit: b26f2ea1cd068b0b902e3bb735d05398d8c05aba
+Patch-mainline: v6.15-rc1
+References: jsc#PED-14161
+
+The iter termination logic in iomap_iter_advance() is only needed by
+iomap_iter() to determine whether to proceed with the next mapping
+for an ongoing operation. The old logic sets ret to 1 and then
+terminates if the operation is complete (iter->len == 0) or the
+previous iteration performed no work and the mapping has not been
+marked stale. The stale check exists to allow operations to
+retry the current mapping if an inconsistency has been detected.
+
+To further genericize iomap_iter_advance(), lift the termination
+logic into iomap_iter() and update the former to return success (0)
+or an error code. iomap_iter() continues on successful advance and
+non-zero iter->len or otherwise terminates in the no progress (and
+not stale) or error cases.
+
+Signed-off-by: Brian Foster <bfoster@redhat.com>
+Link: https://lore.kernel.org/r/20250207143253.314068-6-bfoster@redhat.com
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: "Darrick J. Wong" <djwong@kernel.org>
+Signed-off-by: Christian Brauner <brauner@kernel.org>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ fs/iomap/iter.c | 21 +++++++++++++--------
+ 1 file changed, 13 insertions(+), 8 deletions(-)
+
+diff --git a/fs/iomap/iter.c b/fs/iomap/iter.c
+index 1db16be7b9f0..8e0746ad80bd 100644
+--- a/fs/iomap/iter.c
++++ b/fs/iomap/iter.c
+@@ -27,17 +27,11 @@ static inline void iomap_iter_reset_iomap(struct iomap_iter *iter)
+  */
+ static inline int iomap_iter_advance(struct iomap_iter *iter, s64 count)
+ {
+-	bool stale = iter->iomap.flags & IOMAP_F_STALE;
+-	int ret = 1;
+-
+ 	if (WARN_ON_ONCE(count > iomap_length(iter)))
+ 		return -EIO;
+ 	iter->pos += count;
+ 	iter->len -= count;
+-	if (!iter->len || (!count && !stale))
+-		ret = 0;
+-
+-	return ret;
++	return 0;
+ }
+ 
+ static inline void iomap_iter_done(struct iomap_iter *iter)
+@@ -69,6 +63,7 @@ static inline void iomap_iter_done(struct iomap_iter *iter)
+  */
+ int iomap_iter(struct iomap_iter *iter, const struct iomap_ops *ops)
+ {
++	bool stale = iter->iomap.flags & IOMAP_F_STALE;
+ 	s64 processed;
+ 	int ret;
+ 
+@@ -91,8 +86,18 @@ int iomap_iter(struct iomap_iter *iter, const struct iomap_ops *ops)
+ 		return processed;
+ 	}
+ 
+-	/* advance and clear state from the previous iteration */
++	/*
++	 * Advance the iter and clear state from the previous iteration. Use
++	 * iter->len to determine whether to continue onto the next mapping.
++	 * Explicitly terminate in the case where the current iter has not
++	 * advanced at all (i.e. no work was done for some reason) unless the
++	 * mapping has been marked stale and needs to be reprocessed.
++	 */
+ 	ret = iomap_iter_advance(iter, processed);
++	if (!ret && iter->len > 0)
++		ret = 1;
++	if (ret > 0 && !iter->processed && !stale)
++		ret = 0;
+ 	iomap_iter_reset_iomap(iter);
+ 	if (ret <= 0)
+ 		return ret;
+-- 
+2.43.0
+

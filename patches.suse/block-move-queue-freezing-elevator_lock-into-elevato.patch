@@ -1,0 +1,78 @@
+From: Ming Lei <ming.lei@redhat.com>
+Date: Mon, 5 May 2025 22:17:52 +0800
+Subject: [PATCH] block: move queue freezing & elevator_lock into
+ elevator_change()
+Git-commit: 20117b5a4b9c6dbb9414f0451111c3f13a37874a
+Patch-mainline: v6.16-rc1
+References: jsc#PED-14161
+
+Move queue freezing & elevator_lock into elevator_change(), and prepare
+for using elevator_change() for setting up & tearing down default elevator
+too.
+
+Also add lockdep_assert_held() in __elevator_change() because either
+read or write lock is required for changing elevator.
+
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Hannes Reinecke <hare@suse.de>
+Reviewed-by: Nilay Shroff <nilay@linux.ibm.com>
+Signed-off-by: Ming Lei <ming.lei@redhat.com>
+Link: https://lore.kernel.org/r/20250505141805.2751237-15-ming.lei@redhat.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/elevator.c | 20 ++++++++++++--------
+ 1 file changed, 12 insertions(+), 8 deletions(-)
+
+diff --git a/block/elevator.c b/block/elevator.c
+index cabd7a8bb76c..cb54a3791fe5 100644
+--- a/block/elevator.c
++++ b/block/elevator.c
+@@ -676,10 +676,19 @@ static int elevator_switch(struct request_queue *q, const char *name)
+  */
+ static int elevator_change(struct request_queue *q, const char *elevator_name)
+ {
+-	if (q->elevator && elevator_match(q->elevator->type, elevator_name))
+-		return 0;
++	unsigned int memflags;
++	int ret = 0;
+ 
+-	return elevator_switch(q, elevator_name);
++	lockdep_assert_held(&q->tag_set->update_nr_hwq_lock);
++
++	memflags = blk_mq_freeze_queue(q);
++	mutex_lock(&q->elevator_lock);
++	if (!(q->elevator && elevator_match(q->elevator->type,
++				elevator_name)))
++		ret = elevator_switch(q, elevator_name);
++	mutex_unlock(&q->elevator_lock);
++	blk_mq_unfreeze_queue(q, memflags);
++	return ret;
+ }
+ 
+ /*
+@@ -718,7 +727,6 @@ ssize_t elv_iosched_store(struct gendisk *disk, const char *buf,
+ 	char elevator_name[ELV_NAME_MAX];
+ 	char *name;
+ 	int ret;
+-	unsigned int memflags;
+ 	struct request_queue *q = disk->queue;
+ 	struct blk_mq_tag_set *set = q->tag_set;
+ 
+@@ -737,13 +745,9 @@ ssize_t elv_iosched_store(struct gendisk *disk, const char *buf,
+ 	elv_iosched_load_module(name);
+ 
+ 	down_read(&set->update_nr_hwq_lock);
+-	memflags = blk_mq_freeze_queue(q);
+-	mutex_lock(&q->elevator_lock);
+ 	ret = elevator_change(q, name);
+ 	if (!ret)
+ 		ret = count;
+-	mutex_unlock(&q->elevator_lock);
+-	blk_mq_unfreeze_queue(q, memflags);
+ 	up_read(&set->update_nr_hwq_lock);
+ 	return ret;
+ }
+-- 
+2.43.0
+

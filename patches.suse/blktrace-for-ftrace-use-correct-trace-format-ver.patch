@@ -1,0 +1,143 @@
+From: Chaitanya Kulkarni <ckulkarnilinux@gmail.com>
+Date: Mon, 27 Oct 2025 22:50:42 -0700
+Subject: [PATCH] blktrace: for ftrace use correct trace format ver
+Git-commit: e48886b9d668d80be24e37345bd0904e9138473c
+Patch-mainline: v6.19-rc1
+References: jsc#PED-14161
+
+The ftrace blktrace path allocates buffers and writes trace events but
+was using the wrong recording function. After
+commit 4d8bc7bd4f73 ("blktrace: move ftrace blk_io_tracer to blk_io_trace2"),
+the ftrace interface was moved to use blk_io_trace2 format, but
+__blk_add_trace() still called record_blktrace_event() which writes in
+blk_io_trace (v1) format.
+
+This causes critical data corruption:
+
+- blk_io_trace (v1) has 32-bit 'action' field at offset 28
+- blk_io_trace2 (v2) has 32-bit 'pid' at offset 28 and 64-bit 'action'
+  at offset 32
+- When record_blktrace_event() writes to a v2 buffer:
+  * Writing pid (offset 32 in v1) corrupts the v2 action field
+  * Writing action (offset 28 in v1) corrupts the v2 pid field
+  * The 64-bit action is truncated to 32-bit via lower_32_bits()
+
+Fix by:
+1. Adding version switch to select correct format (v1 vs v2)
+2. Calling appropriate recording function based on version
+3. Defaulting to v2 for ftrace (as intended by commit 4d8bc7bd4f73)
+4. Adding WARN_ONCE for unexpected version values
+
+Without this patch :-
+linux-block (for-next) # sh reproduce_blktrace_bug.sh
+              dd-14242   [033] d..1.  3903.022308: Unknown action 36a2
+              dd-14242   [033] d..1.  3903.022333: Unknown action 36a2
+              dd-14242   [033] d..1.  3903.022365: Unknown action 36a2
+              dd-14242   [033] d..1.  3903.022366: Unknown action 36a2
+              dd-14242   [033] d..1.  3903.022369: Unknown action 36a2
+
+The action field is corrupted because:
+  - ftrace allocated blk_io_trace2 buffer (64 bytes)
+  - But called record_blktrace_event() (writes v1, 48 bytes)
+  - Field offsets don't match, causing corruption
+
+The hex value shown 0x30e3 is actually a PID, not an action code!
+
+linux-block (for-next) #
+linux-block (for-next) #
+linux-block (for-next) # sh reproduce_blktrace_bug.sh
+Trace output looks correct:
+
+              dd-2420    [019] d..1.    59.641742: 251,0    Q  RS 0 + 8 [dd]
+              dd-2420    [019] d..1.    59.641775: 251,0    G  RS 0 + 8 [dd]
+              dd-2420    [019] d..1.    59.641784: 251,0    P   N [dd]
+              dd-2420    [019] d..1.    59.641785: 251,0    U   N [dd] 1
+              dd-2420    [019] d..1.    59.641788: 251,0    D  RS 0 + 8 [dd]
+
+Fixes: 4d8bc7bd4f73 ("blktrace: move ftrace blk_io_tracer to blk_io_trace2")
+Signed-off-by: Chaitanya Kulkarni <ckulkarnilinux@gmail.com>
+Reviewed-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ kernel/trace/blktrace.c | 59 +++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 54 insertions(+), 5 deletions(-)
+
+diff --git a/kernel/trace/blktrace.c b/kernel/trace/blktrace.c
+index 776ae4190f36..e4f26ddb7ee2 100644
+--- a/kernel/trace/blktrace.c
++++ b/kernel/trace/blktrace.c
+@@ -384,16 +384,65 @@ static void __blk_add_trace(struct blk_trace *bt, sector_t sector, int bytes,
+ 
+ 		buffer = blk_tr->array_buffer.buffer;
+ 		trace_ctx = tracing_gen_ctx_flags(0);
+-		trace_len = sizeof(struct blk_io_trace2) + pdu_len + cgid_len;
++		switch (bt->version) {
++		case 1:
++			trace_len = sizeof(struct blk_io_trace);
++			break;
++		case 2:
++		default:
++			/*
++			 * ftrace always uses v2 (blk_io_trace2) format.
++			 *
++			 * For sysfs-enabled tracing path (enabled via
++			 * /sys/block/DEV/trace/enable), blk_trace_setup_queue()
++			 * never initializes bt->version, leaving it 0 from
++			 * kzalloc(). We must handle version==0 safely here.
++			 *
++			 * Fall through to default to ensure we never hit the
++			 * old bug where default set trace_len=0, causing
++			 * buffer underflow and memory corruption.
++			 *
++			 * Always use v2 format for ftrace and normalize
++			 * bt->version to 2 when uninitialized.
++			 */
++			trace_len = sizeof(struct blk_io_trace2);
++			if (bt->version == 0)
++				bt->version = 2;
++			break;
++		}
++		trace_len += pdu_len + cgid_len;
+ 		event = trace_buffer_lock_reserve(buffer, TRACE_BLK,
+ 						  trace_len, trace_ctx);
+ 		if (!event)
+ 			return;
+ 
+-		record_blktrace_event(ring_buffer_event_data(event),
+-				      pid, cpu, sector, bytes,
+-				      what, bt->dev, error, cgid, cgid_len,
+-				      pdu_data, pdu_len);
++		switch (bt->version) {
++		case 1:
++			record_blktrace_event(ring_buffer_event_data(event),
++					      pid, cpu, sector, bytes,
++					      what, bt->dev, error, cgid, cgid_len,
++					      pdu_data, pdu_len);
++			break;
++		case 2:
++		default:
++			/*
++			 * Use v2 recording function (record_blktrace_event2)
++			 * which writes blk_io_trace2 structure with correct
++			 * field layout:
++			 *   - 32-bit pid at offset 28
++			 *   - 64-bit action at offset 32
++			 *
++			 * Fall through to default handles version==0 case
++			 * (from sysfs path), ensuring we always use correct
++			 * v2 recording function to match the v2 buffer
++			 * allocated above.
++			 */
++			record_blktrace_event2(ring_buffer_event_data(event),
++					       pid, cpu, sector, bytes,
++					       what, bt->dev, error, cgid, cgid_len,
++					       pdu_data, pdu_len);
++			break;
++		}
+ 
+ 		trace_buffer_unlock_commit(blk_tr, buffer, event, trace_ctx);
+ 		return;
+-- 
+2.43.0
+
