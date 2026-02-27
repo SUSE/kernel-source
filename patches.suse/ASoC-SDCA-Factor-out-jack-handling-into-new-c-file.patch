@@ -1,0 +1,341 @@
+From 3addd63d1fba8d9013e00b06d9420e39271c0c4e Mon Sep 17 00:00:00 2001
+From: Charles Keepax <ckeepax@opensource.cirrus.com>
+Date: Mon, 15 Dec 2025 15:36:47 +0000
+Subject: [PATCH] ASoC: SDCA: Factor out jack handling into new c file
+Git-commit: 3addd63d1fba8d9013e00b06d9420e39271c0c4e
+Patch-mainline: v7.0-rc1
+References: stable-fixes
+
+The jack code is perhaps a bit large for being in the interrupt
+code directly. Improve the encapsulation by factoring out the
+jack handling code into a new c file, as is already done for HID
+and FDL. Whilst doing so also add a jack_state structure to hold
+the jack state for improved expandability in the future.
+
+Signed-off-by: Charles Keepax <ckeepax@opensource.cirrus.com>
+Link: https://patch.msgid.link/20251215153650.3913117-2-ckeepax@opensource.cirrus.com
+Reviewed-by: Bard Liao <yung-chuan.liao@linux.intel.com>
+Signed-off-by: Mark Brown <broonie@kernel.org>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ include/sound/sdca_jack.h        |  27 ++++++
+ sound/soc/sdca/Makefile          |   2 +-
+ sound/soc/sdca/sdca_interrupts.c |  83 ++----------------
+ sound/soc/sdca/sdca_jack.c       | 140 +++++++++++++++++++++++++++++++
+ 4 files changed, 175 insertions(+), 77 deletions(-)
+ create mode 100644 include/sound/sdca_jack.h
+ create mode 100644 sound/soc/sdca/sdca_jack.c
+
+diff --git a/include/sound/sdca_jack.h b/include/sound/sdca_jack.h
+new file mode 100644
+index 000000000000..9fad5f22cbb9
+--- /dev/null
++++ b/include/sound/sdca_jack.h
+@@ -0,0 +1,27 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * The MIPI SDCA specification is available for public downloads at
++ * https://www.mipi.org/mipi-sdca-v1-0-download
++ *
++ * Copyright (C) 2025 Cirrus Logic, Inc. and
++ *                    Cirrus Logic International Semiconductor Ltd.
++ */
++
++#ifndef __SDCA_JACK_H__
++#define __SDCA_JACK_H__
++
++struct sdca_interrupt;
++struct snd_kcontrol;
++
++/**
++ * struct jack_state - Jack state structure to keep data between interrupts
++ * @kctl: Pointer to the ALSA control attached to this jack
++ */
++struct jack_state {
++	struct snd_kcontrol *kctl;
++};
++
++int sdca_jack_alloc_state(struct sdca_interrupt *interrupt);
++int sdca_jack_process(struct sdca_interrupt *interrupt);
++
++#endif // __SDCA_JACK_H__
+diff --git a/sound/soc/sdca/Makefile b/sound/soc/sdca/Makefile
+index f6b73275d964..b3b0f5d94c8d 100644
+--- a/sound/soc/sdca/Makefile
++++ b/sound/soc/sdca/Makefile
+@@ -3,7 +3,7 @@
+ snd-soc-sdca-y := sdca_functions.o sdca_device.o sdca_function_device.o \
+ 		  sdca_regmap.o sdca_asoc.o sdca_ump.o
+ snd-soc-sdca-$(CONFIG_SND_SOC_SDCA_HID) += sdca_hid.o
+-snd-soc-sdca-$(CONFIG_SND_SOC_SDCA_IRQ) += sdca_interrupts.o
++snd-soc-sdca-$(CONFIG_SND_SOC_SDCA_IRQ) += sdca_interrupts.o sdca_jack.o
+ snd-soc-sdca-$(CONFIG_SND_SOC_SDCA_FDL) += sdca_fdl.o
+ 
+ snd-soc-sdca-class-y := sdca_class.o
+diff --git a/sound/soc/sdca/sdca_interrupts.c b/sound/soc/sdca/sdca_interrupts.c
+index 8f6a2adfb6fb..ff3a7e405fdc 100644
+--- a/sound/soc/sdca/sdca_interrupts.c
++++ b/sound/soc/sdca/sdca_interrupts.c
+@@ -22,6 +22,7 @@
+ #include <sound/sdca_function.h>
+ #include <sound/sdca_hid.h>
+ #include <sound/sdca_interrupts.h>
++#include <sound/sdca_jack.h>
+ #include <sound/sdca_ump.h>
+ #include <sound/soc-component.h>
+ #include <sound/soc.h>
+@@ -155,14 +156,7 @@ static irqreturn_t detected_mode_handler(int irq, void *data)
+ {
+ 	struct sdca_interrupt *interrupt = data;
+ 	struct device *dev = interrupt->dev;
+-	struct snd_soc_component *component = interrupt->component;
+-	struct snd_soc_card *card = component->card;
+-	struct rw_semaphore *rwsem = &card->snd_card->controls_rwsem;
+-	struct snd_kcontrol *kctl = interrupt->priv;
+-	struct snd_ctl_elem_value *ucontrol __free(kfree) = NULL;
+-	struct soc_enum *soc_enum;
+ 	irqreturn_t irqret = IRQ_NONE;
+-	unsigned int reg, val;
+ 	int ret;
+ 
+ 	ret = pm_runtime_get_sync(dev);
+@@ -171,76 +165,9 @@ static irqreturn_t detected_mode_handler(int irq, void *data)
+ 		goto error;
+ 	}
+ 
+-	if (!kctl) {
+-		const char *name __free(kfree) = kasprintf(GFP_KERNEL, "%s %s",
+-							   interrupt->entity->label,
+-							   SDCA_CTL_SELECTED_MODE_NAME);
+-
+-		if (!name)
+-			goto error;
+-
+-		kctl = snd_soc_component_get_kcontrol(component, name);
+-		if (!kctl) {
+-			dev_dbg(dev, "control not found: %s\n", name);
+-			goto error;
+-		}
+-
+-		interrupt->priv = kctl;
+-	}
+-
+-	soc_enum = (struct soc_enum *)kctl->private_value;
+-
+-	reg = SDW_SDCA_CTL(interrupt->function->desc->adr, interrupt->entity->id,
+-			   interrupt->control->sel, 0);
+-
+-	ret = regmap_read(interrupt->function_regmap, reg, &val);
+-	if (ret < 0) {
+-		dev_err(dev, "failed to read detected mode: %d\n", ret);
++	ret = sdca_jack_process(interrupt);
++	if (ret)
+ 		goto error;
+-	}
+-
+-	switch (val) {
+-	case SDCA_DETECTED_MODE_DETECTION_IN_PROGRESS:
+-	case SDCA_DETECTED_MODE_JACK_UNKNOWN:
+-		reg = SDW_SDCA_CTL(interrupt->function->desc->adr,
+-				   interrupt->entity->id,
+-				   SDCA_CTL_GE_SELECTED_MODE, 0);
+-
+-		/*
+-		 * Selected mode is not normally marked as volatile register
+-		 * (RW), but here force a read from the hardware. If the
+-		 * detected mode is unknown we need to see what the device
+-		 * selected as a "safe" option.
+-		 */
+-		regcache_drop_region(interrupt->function_regmap, reg, reg);
+-
+-		ret = regmap_read(interrupt->function_regmap, reg, &val);
+-		if (ret) {
+-			dev_err(dev, "failed to re-check selected mode: %d\n", ret);
+-			goto error;
+-		}
+-		break;
+-	default:
+-		break;
+-	}
+-
+-	dev_dbg(dev, "%s: %#x\n", interrupt->name, val);
+-
+-	ucontrol = kzalloc(sizeof(*ucontrol), GFP_KERNEL);
+-	if (!ucontrol)
+-		goto error;
+-
+-	ucontrol->value.enumerated.item[0] = snd_soc_enum_val_to_item(soc_enum, val);
+-
+-	down_write(rwsem);
+-	ret = kctl->put(kctl, ucontrol);
+-	up_write(rwsem);
+-	if (ret < 0) {
+-		dev_err(dev, "failed to update selected mode: %d\n", ret);
+-		goto error;
+-	}
+-
+-	snd_ctl_notify(card->snd_card, SNDRV_CTL_EVENT_MASK_VALUE, &kctl->id);
+ 
+ 	irqret = IRQ_HANDLED;
+ error:
+@@ -536,6 +463,10 @@ int sdca_irq_populate(struct sdca_function_data *function,
+ 				handler = function_status_handler;
+ 				break;
+ 			case SDCA_CTL_TYPE_S(GE, DETECTED_MODE):
++				ret = sdca_jack_alloc_state(interrupt);
++				if (ret)
++					return ret;
++
+ 				handler = detected_mode_handler;
+ 				break;
+ 			case SDCA_CTL_TYPE_S(XU, FDL_CURRENTOWNER):
+diff --git a/sound/soc/sdca/sdca_jack.c b/sound/soc/sdca/sdca_jack.c
+new file mode 100644
+index 000000000000..83b2b9cc81f0
+--- /dev/null
++++ b/sound/soc/sdca/sdca_jack.c
+@@ -0,0 +1,140 @@
++// SPDX-License-Identifier: GPL-2.0
++// Copyright (C) 2025 Cirrus Logic, Inc. and
++//                    Cirrus Logic International Semiconductor Ltd.
++
++/*
++ * The MIPI SDCA specification is available for public downloads at
++ * https://www.mipi.org/mipi-sdca-v1-0-download
++ */
++
++#include <linux/cleanup.h>
++#include <linux/device.h>
++#include <linux/dev_printk.h>
++#include <linux/soundwire/sdw.h>
++#include <linux/soundwire/sdw_registers.h>
++#include <linux/sprintf.h>
++#include <linux/regmap.h>
++#include <linux/rwsem.h>
++#include <sound/asound.h>
++#include <sound/control.h>
++#include <sound/sdca.h>
++#include <sound/sdca_function.h>
++#include <sound/sdca_interrupts.h>
++#include <sound/sdca_jack.h>
++#include <sound/soc-component.h>
++#include <sound/soc.h>
++
++/**
++ * sdca_jack_process - Process an SDCA jack event
++ * @interrupt: SDCA interrupt structure
++ *
++ * Return: Zero on success or a negative error code.
++ */
++int sdca_jack_process(struct sdca_interrupt *interrupt)
++{
++	struct device *dev = interrupt->dev;
++	struct snd_soc_component *component = interrupt->component;
++	struct snd_soc_card *card = component->card;
++	struct rw_semaphore *rwsem = &card->snd_card->controls_rwsem;
++	struct jack_state *state = interrupt->priv;
++	struct snd_kcontrol *kctl = state->kctl;
++	struct snd_ctl_elem_value *ucontrol __free(kfree) = NULL;
++	struct soc_enum *soc_enum;
++	unsigned int reg, val;
++	int ret;
++
++	if (!kctl) {
++		const char *name __free(kfree) = kasprintf(GFP_KERNEL, "%s %s",
++							   interrupt->entity->label,
++							   SDCA_CTL_SELECTED_MODE_NAME);
++
++		if (!name)
++			return -ENOMEM;
++
++		kctl = snd_soc_component_get_kcontrol(component, name);
++		if (!kctl) {
++			dev_dbg(dev, "control not found: %s\n", name);
++			return -ENOENT;
++		}
++
++		state->kctl = kctl;
++	}
++
++	soc_enum = (struct soc_enum *)kctl->private_value;
++
++	reg = SDW_SDCA_CTL(interrupt->function->desc->adr, interrupt->entity->id,
++			   interrupt->control->sel, 0);
++
++	ret = regmap_read(interrupt->function_regmap, reg, &val);
++	if (ret < 0) {
++		dev_err(dev, "failed to read detected mode: %d\n", ret);
++		return ret;
++	}
++
++	switch (val) {
++	case SDCA_DETECTED_MODE_DETECTION_IN_PROGRESS:
++	case SDCA_DETECTED_MODE_JACK_UNKNOWN:
++		reg = SDW_SDCA_CTL(interrupt->function->desc->adr,
++				   interrupt->entity->id,
++				   SDCA_CTL_GE_SELECTED_MODE, 0);
++
++		/*
++		 * Selected mode is not normally marked as volatile register
++		 * (RW), but here force a read from the hardware. If the
++		 * detected mode is unknown we need to see what the device
++		 * selected as a "safe" option.
++		 */
++		regcache_drop_region(interrupt->function_regmap, reg, reg);
++
++		ret = regmap_read(interrupt->function_regmap, reg, &val);
++		if (ret) {
++			dev_err(dev, "failed to re-check selected mode: %d\n", ret);
++			return ret;
++		}
++		break;
++	default:
++		break;
++	}
++
++	dev_dbg(dev, "%s: %#x\n", interrupt->name, val);
++
++	ucontrol = kzalloc(sizeof(*ucontrol), GFP_KERNEL);
++	if (!ucontrol)
++		return -ENOMEM;
++
++	ucontrol->value.enumerated.item[0] = snd_soc_enum_val_to_item(soc_enum, val);
++
++	down_write(rwsem);
++	ret = kctl->put(kctl, ucontrol);
++	up_write(rwsem);
++	if (ret < 0) {
++		dev_err(dev, "failed to update selected mode: %d\n", ret);
++		return ret;
++	}
++
++	snd_ctl_notify(card->snd_card, SNDRV_CTL_EVENT_MASK_VALUE, &kctl->id);
++
++	return 0;
++}
++EXPORT_SYMBOL_NS_GPL(sdca_jack_process, SND_SOC_SDCA);
++
++/**
++ * sdca_jack_alloc_state - allocate state for a jack interrupt
++ * @interrupt: SDCA interrupt structure.
++ *
++ * Return: Zero on success or a negative error code.
++ */
++int sdca_jack_alloc_state(struct sdca_interrupt *interrupt)
++{
++	struct device *dev = interrupt->dev;
++	struct jack_state *jack_state;
++
++	jack_state = devm_kzalloc(dev, sizeof(*jack_state), GFP_KERNEL);
++	if (!jack_state)
++		return -ENOMEM;
++
++	interrupt->priv = jack_state;
++
++	return 0;
++}
++EXPORT_SYMBOL_NS_GPL(sdca_jack_alloc_state, SND_SOC_SDCA);
+-- 
+2.53.0
+
