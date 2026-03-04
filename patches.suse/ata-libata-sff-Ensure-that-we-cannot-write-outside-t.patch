@@ -1,0 +1,82 @@
+From: Niklas Cassel <cassel@kernel.org>
+Date: Mon, 27 Jan 2025 16:43:04 +0100
+Subject: ata: libata-sff: Ensure that we cannot write outside the allocated
+ buffer
+Patch-mainline: v6.14-rc1
+Git-commit: 6e74e53b34b6dec5a50e1404e2680852ec6768d2
+References: bsc#1238917 CVE-2025-21738
+
+reveliofuzzing reported that a SCSI_IOCTL_SEND_COMMAND ioctl with out_len
+set to 0xd42, SCSI command set to ATA_16 PASS-THROUGH, ATA command set to
+ATA_NOP, and protocol set to ATA_PROT_PIO, can cause ata_pio_sector() to
+write outside the allocated buffer, overwriting random memory.
+
+While a ATA device is supposed to abort a ATA_NOP command, there does seem
+to be a bug either in libata-sff or QEMU, where either this status is not
+set, or the status is cleared before read by ata_sff_hsm_move().
+Anyway, that is most likely a separate bug.
+
+Looking at __atapi_pio_bytes(), it already has a safety check to ensure
+that __atapi_pio_bytes() cannot write outside the allocated buffer.
+
+Add a similar check to ata_pio_sector(), such that also ata_pio_sector()
+cannot write outside the allocated buffer.
+
+Cc: stable@vger.kernel.org
+Reported-by: reveliofuzzing <reveliofuzzing@gmail.com>
+Closes: https://lore.kernel.org/linux-ide/CA+-ZZ_jTgxh3bS7m+KX07_EWckSnW3N2adX3KV63y4g7M4CZ2A@mail.gmail.com/
+Link: https://lore.kernel.org/r/20250127154303.15567-2-cassel@kernel.org
+Signed-off-by: Niklas Cassel <cassel@kernel.org>
+Acked-by: Chun-Yi Lee <jlee@suse.com>
+---
+ drivers/ata/libata-sff.c |   13 ++++++++-----
+ 1 file changed, 8 insertions(+), 5 deletions(-)
+
+--- a/drivers/ata/libata-sff.c
++++ b/drivers/ata/libata-sff.c
+@@ -701,7 +701,7 @@ static void ata_pio_sector(struct ata_qu
+ 	int do_write = (qc->tf.flags & ATA_TFLAG_WRITE);
+ 	struct ata_port *ap = qc->ap;
+ 	struct page *page;
+-	unsigned int offset;
++	unsigned int offset, count;
+ 	unsigned char *buf;
+ 
+ 	if (!qc->cursg) {
+@@ -718,6 +718,9 @@ static void ata_pio_sector(struct ata_qu
+ 	page = nth_page(page, (offset >> PAGE_SHIFT));
+ 	offset %= PAGE_SIZE;
+ 
++	/* don't overrun current sg */
++	count = min(qc->cursg->length - qc->cursg_ofs, qc->sect_size);
++
+ 	DPRINTK("data %s\n", qc->tf.flags & ATA_TFLAG_WRITE ? "write" : "read");
+ 
+ 	if (PageHighMem(page)) {
+@@ -728,22 +731,22 @@ static void ata_pio_sector(struct ata_qu
+ 		buf = kmap_atomic(page);
+ 
+ 		/* do the actual data transfer */
+-		ap->ops->sff_data_xfer(qc, buf + offset, qc->sect_size,
++		ap->ops->sff_data_xfer(qc, buf + offset, count,
+ 				       do_write);
+ 
+ 		kunmap_atomic(buf);
+ 		local_irq_restore(flags);
+ 	} else {
+ 		buf = page_address(page);
+-		ap->ops->sff_data_xfer(qc, buf + offset, qc->sect_size,
++		ap->ops->sff_data_xfer(qc, buf + offset, count,
+ 				       do_write);
+ 	}
+ 
+ 	if (!do_write && !PageSlab(page))
+ 		flush_dcache_page(page);
+ 
+-	qc->curbytes += qc->sect_size;
+-	qc->cursg_ofs += qc->sect_size;
++	qc->curbytes += count;
++	qc->cursg_ofs += count;
+ 
+ 	if (qc->cursg_ofs == qc->cursg->length) {
+ 		qc->cursg = sg_next(qc->cursg);
