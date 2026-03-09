@@ -1,0 +1,185 @@
+From: Tony Luck <tony.luck@intel.com>
+Date: Wed, 17 Dec 2025 09:21:06 -0800
+Subject: x86/resctrl: Find and enable usable telemetry events
+Git-commit: 7e6df9614546ae7eb1f1b2074d7b6039bb01540d
+Patch-mainline: v7.0-rc1
+References: jsc#PED-13854
+
+Every event group has a private copy of the data of all telemetry event
+aggregators (aka "telemetry regions") tracking its feature type. Included
+may be regions that have the same feature type but tracking different GUID
+from the event group's.
+
+Traverse the event group's telemetry region data and mark all regions that
+are not usable by the event group as unusable by clearing those regions'
+MMIO addresses. A region is considered unusable if:
+1) GUID does not match the GUID of the event group.
+2) Package ID is invalid.
+3) The enumerated size of the MMIO region does not match the expected
+   value from the XML description file.
+
+Hereafter any telemetry region with an MMIO address is considered valid for
+the event group it is associated with.
+
+Enable all the event group's events as long as there is at least one usable
+region from where data for its events can be read. Enabling of an event can
+fail if the same event has already been enabled as part of another event
+group. It should never happen that the same event is described by different
+GUID supported by the same system so just WARN (via resctrl_enable_mon_event())
+and skip the event.
+
+Note that it is architecturally possible that some telemetry events are only
+supported by a subset of the packages in the system. It is not expected that
+systems will ever do this. If they do the user will see event files in resctrl
+that always return "Unavailable".
+
+Signed-off-by: Tony Luck <tony.luck@intel.com>
+Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+Reviewed-by: Reinette Chatre <reinette.chatre@intel.com>
+Link: https://lore.kernel.org/20251217172121.12030-1-tony.luck@intel.com
+
+Acked-by: Nikolay Borisov <nik.borisov@suse.com>
+---
+ arch/x86/kernel/cpu/resctrl/intel_aet.c | 63 +++++++++++++++++++++++++++++++--
+ fs/resctrl/monitor.c                    | 10 +++---
+ include/linux/resctrl.h                 |  2 +-
+ 3 files changed, 68 insertions(+), 7 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/resctrl/intel_aet.c b/arch/x86/kernel/cpu/resctrl/intel_aet.c
+index 8e042b530c91..7d0bd7b070a7 100644
+--- a/arch/x86/kernel/cpu/resctrl/intel_aet.c
++++ b/arch/x86/kernel/cpu/resctrl/intel_aet.c
+@@ -16,9 +16,11 @@
+ #include <linux/init.h>
+ #include <linux/intel_pmt_features.h>
+ #include <linux/intel_vsec.h>
++#include <linux/printk.h>
+ #include <linux/resctrl.h>
+ #include <linux/resctrl_types.h>
+ #include <linux/stddef.h>
++#include <linux/topology.h>
+ #include <linux/types.h>
+ 
+ #include "internal.h"
+@@ -110,12 +112,69 @@ static struct event_group *known_event_groups[] = {
+ 	     _peg < &known_event_groups[ARRAY_SIZE(known_event_groups)];	\
+ 	     _peg++)
+ 
+-/* Stub for now */
+-static bool enable_events(struct event_group *e, struct pmt_feature_group *p)
++static bool skip_telem_region(struct telemetry_region *tr, struct event_group *e)
+ {
++	if (tr->guid != e->guid)
++		return true;
++	if (tr->plat_info.package_id >= topology_max_packages()) {
++		pr_warn("Bad package %u in guid 0x%x\n", tr->plat_info.package_id,
++			tr->guid);
++		return true;
++	}
++	if (tr->size != e->mmio_size) {
++		pr_warn("MMIO space wrong size (%zu bytes) for guid 0x%x. Expected %zu bytes.\n",
++			tr->size, e->guid, e->mmio_size);
++		return true;
++	}
++
+ 	return false;
+ }
+ 
++static bool group_has_usable_regions(struct event_group *e, struct pmt_feature_group *p)
++{
++	bool usable_regions = false;
++
++	for (int i = 0; i < p->count; i++) {
++		if (skip_telem_region(&p->regions[i], e)) {
++			/*
++			 * Clear the address field of regions that did not pass the checks in
++			 * skip_telem_region() so they will not be used by intel_aet_read_event().
++			 * This is safe to do because intel_pmt_get_regions_by_feature() allocates
++			 * a new pmt_feature_group structure to return to each caller and only makes
++			 * use of the pmt_feature_group::kref field when intel_pmt_put_feature_group()
++			 * returns the structure.
++			 */
++			p->regions[i].addr = NULL;
++
++			continue;
++		}
++		usable_regions = true;
++	}
++
++	return usable_regions;
++}
++
++static bool enable_events(struct event_group *e, struct pmt_feature_group *p)
++{
++	struct rdt_resource *r = &rdt_resources_all[RDT_RESOURCE_PERF_PKG].r_resctrl;
++	int skipped_events = 0;
++
++	if (!group_has_usable_regions(e, p))
++		return false;
++
++	for (int j = 0; j < e->num_events; j++) {
++		if (!resctrl_enable_mon_event(e->evts[j].id, true,
++					      e->evts[j].bin_bits, &e->evts[j]))
++			skipped_events++;
++	}
++	if (e->num_events == skipped_events) {
++		pr_info("No events enabled in %s %s:0x%x\n", r->name, e->pfname, e->guid);
++		return false;
++	}
++
++	return true;
++}
++
+ static enum pmt_feature_id lookup_pfid(const char *pfname)
+ {
+ 	if (!strcmp(pfname, "energy"))
+diff --git a/fs/resctrl/monitor.c b/fs/resctrl/monitor.c
+index af43a33ce4cb..9af08b673e39 100644
+--- a/fs/resctrl/monitor.c
++++ b/fs/resctrl/monitor.c
+@@ -997,25 +997,27 @@ struct mon_evt mon_event_all[QOS_NUM_EVENTS] = {
+ 	MON_EVENT(PMT_EVENT_UOPS_RETIRED,		"uops_retired",		RDT_RESOURCE_PERF_PKG,	false),
+ };
+ 
+-void resctrl_enable_mon_event(enum resctrl_event_id eventid, bool any_cpu,
++bool resctrl_enable_mon_event(enum resctrl_event_id eventid, bool any_cpu,
+ 			      unsigned int binary_bits, void *arch_priv)
+ {
+ 	if (WARN_ON_ONCE(eventid < QOS_FIRST_EVENT || eventid >= QOS_NUM_EVENTS ||
+ 			 binary_bits > MAX_BINARY_BITS))
+-		return;
++		return false;
+ 	if (mon_event_all[eventid].enabled) {
+ 		pr_warn("Duplicate enable for event %d\n", eventid);
+-		return;
++		return false;
+ 	}
+ 	if (binary_bits && !mon_event_all[eventid].is_floating_point) {
+ 		pr_warn("Event %d may not be floating point\n", eventid);
+-		return;
++		return false;
+ 	}
+ 
+ 	mon_event_all[eventid].any_cpu = any_cpu;
+ 	mon_event_all[eventid].binary_bits = binary_bits;
+ 	mon_event_all[eventid].arch_priv = arch_priv;
+ 	mon_event_all[eventid].enabled = true;
++
++	return true;
+ }
+ 
+ bool resctrl_is_mon_event_enabled(enum resctrl_event_id eventid)
+diff --git a/include/linux/resctrl.h b/include/linux/resctrl.h
+index 2c64a43a36db..451eb45e44f8 100644
+--- a/include/linux/resctrl.h
++++ b/include/linux/resctrl.h
+@@ -414,7 +414,7 @@ u32 resctrl_arch_get_num_closid(struct rdt_resource *r);
+ u32 resctrl_arch_system_num_rmid_idx(void);
+ int resctrl_arch_update_domains(struct rdt_resource *r, u32 closid);
+ 
+-void resctrl_enable_mon_event(enum resctrl_event_id eventid, bool any_cpu,
++bool resctrl_enable_mon_event(enum resctrl_event_id eventid, bool any_cpu,
+ 			      unsigned int binary_bits, void *arch_priv);
+ 
+ bool resctrl_is_mon_event_enabled(enum resctrl_event_id eventid);
+
