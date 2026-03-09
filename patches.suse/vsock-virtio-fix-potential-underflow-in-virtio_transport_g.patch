@@ -1,0 +1,93 @@
+From: Melbin K Mathew <mlbnkm1@gmail.com>
+Date: Wed, 21 Jan 2026 10:36:25 +0100
+Subject: vsock/virtio: fix potential underflow in
+ virtio_transport_get_credit()
+Git-commit: 3ef3d52a1a9860d094395c7a3e593f3aa26ff012
+Patch-mainline: v6.19-rc7
+References: bsc#1257755, CVE-2026-23069
+
+The credit calculation in virtio_transport_get_credit() uses unsigned
+arithmetic:
+
+  ret = vvs->peer_buf_alloc - (vvs->tx_cnt - vvs->peer_fwd_cnt);
+
+If the peer shrinks its advertised buffer (peer_buf_alloc) while bytes
+are in flight, the subtraction can underflow and produce a large
+positive value, potentially allowing more data to be queued than the
+peer can handle.
+
+Reuse virtio_transport_has_space() which already handles this case and
+add a comment to make it clear why we are doing that.
+
+Fixes: 06a8fc78367d ("VSOCK: Introduce virtio_vsock_common.ko")
+Suggested-by: Stefano Garzarella <sgarzare@redhat.com>
+Signed-off-by: Melbin K Mathew <mlbnkm1@gmail.com>
+[Stefano: use virtio_transport_has_space() instead of duplicating the code]
+[Stefano: tweak the commit message]
+Signed-off-by: Stefano Garzarella <sgarzare@redhat.com>
+Reviewed-by: Luigi Leonardi <leonardi@redhat.com>
+Link: https://patch.msgid.link/20260121093628.9941-2-sgarzare@redhat.com
+Acked-by: Michael S. Tsirkin <mst@redhat.com>
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Acked-by: Dario Faggioli <dfaggioli@suse.com>
+---
+ net/vmw_vsock/virtio_transport_common.c | 16 +++++++++-------
+ 1 file changed, 9 insertions(+), 7 deletions(-)
+
+--- a/net/vmw_vsock/virtio_transport_common.c
++++ b/net/vmw_vsock/virtio_transport_common.c
+@@ -27,6 +27,8 @@
+ /* How long to wait for graceful shutdown of a connection */
+ #define VSOCK_CLOSE_TIMEOUT (8 * HZ)
+ 
++static s64 virtio_transport_has_space(struct virtio_vsock_sock *vvs);
++
+ static const struct virtio_transport *virtio_transport_get_ops(void)
+ {
+ 	const struct vsock_transport *t = vsock_core_get_transport();
+@@ -226,9 +228,7 @@
+ 	u32 ret;
+ 
+ 	spin_lock_bh(&vvs->tx_lock);
+-	ret = vvs->peer_buf_alloc - (vvs->tx_cnt - vvs->peer_fwd_cnt);
+-	if (ret > credit)
+-		ret = credit;
++	ret = min_t(u32, credit, virtio_transport_has_space(vvs));
+ 	vvs->tx_cnt += ret;
+ 	spin_unlock_bh(&vvs->tx_lock);
+ 
+@@ -343,11 +343,14 @@
+ }
+ EXPORT_SYMBOL_GPL(virtio_transport_stream_has_data);
+ 
+-static s64 virtio_transport_has_space(struct vsock_sock *vsk)
++static s64 virtio_transport_has_space(struct virtio_vsock_sock *vvs)
+ {
+-	struct virtio_vsock_sock *vvs = vsk->trans;
+ 	s64 bytes;
+ 
++	/* Use s64 arithmetic so if the peer shrinks peer_buf_alloc while
++	 * we have bytes in flight (tx_cnt - peer_fwd_cnt), the subtraction
++	 * does not underflow.
++	 */
+ 	bytes = vvs->peer_buf_alloc - (vvs->tx_cnt - vvs->peer_fwd_cnt);
+ 	if (bytes < 0)
+ 		bytes = 0;
+@@ -361,7 +364,7 @@
+ 	s64 bytes;
+ 
+ 	spin_lock_bh(&vvs->tx_lock);
+-	bytes = virtio_transport_has_space(vsk);
++	bytes = virtio_transport_has_space(vvs);
+ 	spin_unlock_bh(&vvs->tx_lock);
+ 
+ 	return bytes;
+@@ -999,7 +1002,7 @@
+ 	spin_lock_bh(&vvs->tx_lock);
+ 	vvs->peer_buf_alloc = le32_to_cpu(pkt->hdr.buf_alloc);
+ 	vvs->peer_fwd_cnt = le32_to_cpu(pkt->hdr.fwd_cnt);
+-	space_available = virtio_transport_has_space(vsk);
++	space_available = virtio_transport_has_space(vvs);
+ 	spin_unlock_bh(&vvs->tx_lock);
+ 	return space_available;
+ }
