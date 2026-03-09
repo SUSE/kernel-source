@@ -1,0 +1,174 @@
+From: Tony Luck <tony.luck@intel.com>
+Date: Wed, 17 Dec 2025 09:21:07 -0800
+Subject: x86/resctrl: Read telemetry events
+Git-commit: 51541f6ca7718d8278e12fe80af80033268743b2
+Patch-mainline: v7.0-rc1
+References: jsc#PED-13854
+
+Introduce intel_aet_read_event() to read telemetry events for resource
+RDT_RESOURCE_PERF_PKG. There may be multiple aggregators tracking each
+package, so scan all of them and add up all counters. Aggregators may return
+an invalid data indication if they have received no records for a given RMID.
+The user will see "Unavailable" if none of the aggregators on a package
+provide valid counts.
+
+Resctrl now uses readq() so depends on X86_64. Update Kconfig.
+
+Signed-off-by: Tony Luck <tony.luck@intel.com>
+Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+Reviewed-by: Reinette Chatre <reinette.chatre@intel.com>
+Link: https://lore.kernel.org/20251217172121.12030-1-tony.luck@intel.com
+
+Acked-by: Nikolay Borisov <nik.borisov@suse.com>
+---
+ arch/x86/Kconfig                        |  2 +-
+ arch/x86/kernel/cpu/resctrl/intel_aet.c | 51 +++++++++++++++++++++++++++++++++
+ arch/x86/kernel/cpu/resctrl/internal.h  |  5 ++++
+ arch/x86/kernel/cpu/resctrl/monitor.c   |  4 +++
+ fs/resctrl/monitor.c                    | 14 +++++++++
+ 5 files changed, 75 insertions(+), 1 deletion(-)
+
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index 0d874a92daed..c25ea0f139ca 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -542,7 +542,7 @@ config X86_CPU_RESCTRL
+ 
+ config X86_CPU_RESCTRL_INTEL_AET
+ 	bool "Intel Application Energy Telemetry"
+-	depends on X86_CPU_RESCTRL && CPU_SUP_INTEL && INTEL_PMT_TELEMETRY=y && INTEL_TPMI=y
++	depends on X86_64 && X86_CPU_RESCTRL && CPU_SUP_INTEL && INTEL_PMT_TELEMETRY=y && INTEL_TPMI=y
+ 	help
+ 	  Enable per-RMID telemetry events in resctrl.
+ 
+diff --git a/arch/x86/kernel/cpu/resctrl/intel_aet.c b/arch/x86/kernel/cpu/resctrl/intel_aet.c
+index 7d0bd7b070a7..96d627e2c52d 100644
+--- a/arch/x86/kernel/cpu/resctrl/intel_aet.c
++++ b/arch/x86/kernel/cpu/resctrl/intel_aet.c
+@@ -11,11 +11,15 @@
+ 
+ #define pr_fmt(fmt)   "resctrl: " fmt
+ 
++#include <linux/bits.h>
+ #include <linux/compiler_types.h>
++#include <linux/container_of.h>
+ #include <linux/err.h>
++#include <linux/errno.h>
+ #include <linux/init.h>
+ #include <linux/intel_pmt_features.h>
+ #include <linux/intel_vsec.h>
++#include <linux/io.h>
+ #include <linux/printk.h>
+ #include <linux/resctrl.h>
+ #include <linux/resctrl_types.h>
+@@ -232,3 +236,50 @@ void __exit intel_aet_exit(void)
+ 		}
+ 	}
+ }
++
++#define DATA_VALID	BIT_ULL(63)
++#define DATA_BITS	GENMASK_ULL(62, 0)
++
++/*
++ * Read counter for an event on a domain (summing all aggregators on the
++ * domain). If an aggregator hasn't received any data for a specific RMID,
++ * the MMIO read indicates that data is not valid.  Return success if at
++ * least one aggregator has valid data.
++ */
++int intel_aet_read_event(int domid, u32 rmid, void *arch_priv, u64 *val)
++{
++	struct pmt_event *pevt = arch_priv;
++	struct event_group *e;
++	bool valid = false;
++	u64 total = 0;
++	u64 evtcount;
++	void *pevt0;
++	u32 idx;
++
++	pevt0 = pevt - pevt->idx;
++	e = container_of(pevt0, struct event_group, evts);
++	idx = rmid * e->num_events;
++	idx += pevt->idx;
++
++	if (idx * sizeof(u64) + sizeof(u64) > e->mmio_size) {
++		pr_warn_once("MMIO index %u out of range\n", idx);
++		return -EIO;
++	}
++
++	for (int i = 0; i < e->pfg->count; i++) {
++		if (!e->pfg->regions[i].addr)
++			continue;
++		if (e->pfg->regions[i].plat_info.package_id != domid)
++			continue;
++		evtcount = readq(e->pfg->regions[i].addr + idx * sizeof(u64));
++		if (!(evtcount & DATA_VALID))
++			continue;
++		total += evtcount & DATA_BITS;
++		valid = true;
++	}
++
++	if (valid)
++		*val = total;
++
++	return valid ? 0 : -EINVAL;
++}
+diff --git a/arch/x86/kernel/cpu/resctrl/internal.h b/arch/x86/kernel/cpu/resctrl/internal.h
+index f2e6e3577df0..10743f5d5fd4 100644
+--- a/arch/x86/kernel/cpu/resctrl/internal.h
++++ b/arch/x86/kernel/cpu/resctrl/internal.h
+@@ -225,9 +225,14 @@ void resctrl_arch_mbm_cntr_assign_set_one(struct rdt_resource *r);
+ #ifdef CONFIG_X86_CPU_RESCTRL_INTEL_AET
+ bool intel_aet_get_events(void);
+ void __exit intel_aet_exit(void);
++int intel_aet_read_event(int domid, u32 rmid, void *arch_priv, u64 *val);
+ #else
+ static inline bool intel_aet_get_events(void) { return false; }
+ static inline void __exit intel_aet_exit(void) { }
++static inline int intel_aet_read_event(int domid, u32 rmid, void *arch_priv, u64 *val)
++{
++	return -EINVAL;
++}
+ #endif
+ 
+ #endif /* _ASM_X86_RESCTRL_INTERNAL_H */
+diff --git a/arch/x86/kernel/cpu/resctrl/monitor.c b/arch/x86/kernel/cpu/resctrl/monitor.c
+index 6929614ba6e6..e6a154240b8d 100644
+--- a/arch/x86/kernel/cpu/resctrl/monitor.c
++++ b/arch/x86/kernel/cpu/resctrl/monitor.c
+@@ -251,6 +251,10 @@ int resctrl_arch_rmid_read(struct rdt_resource *r, struct rdt_domain_hdr *hdr,
+ 	int ret;
+ 
+ 	resctrl_arch_rmid_read_context_check();
++
++	if (r->rid == RDT_RESOURCE_PERF_PKG)
++		return intel_aet_read_event(hdr->id, rmid, arch_priv, val);
++
+ 	if (!domain_header_is_valid(hdr, RESCTRL_MON_DOMAIN, RDT_RESOURCE_L3))
+ 		return -EINVAL;
+ 
+diff --git a/fs/resctrl/monitor.c b/fs/resctrl/monitor.c
+index 9af08b673e39..8a4c2ae72740 100644
+--- a/fs/resctrl/monitor.c
++++ b/fs/resctrl/monitor.c
+@@ -527,6 +527,20 @@ static int __mon_event_count(struct rdtgroup *rdtgrp, struct rmid_read *rr)
+ 			return __l3_mon_event_count(rdtgrp, rr);
+ 		else
+ 			return __l3_mon_event_count_sum(rdtgrp, rr);
++	case RDT_RESOURCE_PERF_PKG: {
++		u64 tval = 0;
++
++		rr->err = resctrl_arch_rmid_read(rr->r, rr->hdr, rdtgrp->closid,
++						 rdtgrp->mon.rmid, rr->evt->evtid,
++						 rr->evt->arch_priv,
++						 &tval, rr->arch_mon_ctx);
++		if (rr->err)
++			return rr->err;
++
++		rr->val += tval;
++
++		return 0;
++	}
+ 	default:
+ 		rr->err = -EINVAL;
+ 		return -EINVAL;
+
