@@ -1,0 +1,167 @@
+From: Tony Luck <tony.luck@intel.com>
+Date: Wed, 17 Dec 2025 09:21:11 -0800
+Subject: x86/resctrl: Add energy/perf choices to rdt boot option
+Git-commit: 842e7f97d71a4116a650ec0045d6444b4377b512
+Patch-mainline: v7.0-rc1
+References: jsc#PED-13854
+
+Legacy resctrl features are enumerated by X86_FEATURE_* flags. These may be
+overridden by quirks to disable features in the case of errata.  Users can use
+kernel command line options to either disable a feature, or to force enable
+a feature that was disabled by a quirk.
+
+A different approach is needed for hardware features that do not have an
+X86_FEATURE_* flag.
+
+Update parsing of the "rdt=" boot parameter to call the telemetry driver
+directly to handle new "perf" and "energy" options that controls activation of
+telemetry monitoring of the named type. By itself a "perf" or "energy" option
+controls the forced enabling or disabling (with ! prefix) of all event groups
+of the named type. A ":guid" suffix allows for fine grained control per event
+group.
+
+  [ bp: s/intel_aet_option/intel_handle_aet_option/g ]
+
+Signed-off-by: Tony Luck <tony.luck@intel.com>
+Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+Reviewed-by: Reinette Chatre <reinette.chatre@intel.com>
+Link: https://lore.kernel.org/20251217172121.12030-1-tony.luck@intel.com
+
+Acked-by: Nikolay Borisov <nik.borisov@suse.com>
+---
+ Documentation/admin-guide/kernel-parameters.txt |  7 ++++-
+ arch/x86/kernel/cpu/resctrl/core.c              |  2 ++
+ arch/x86/kernel/cpu/resctrl/intel_aet.c         | 38 +++++++++++++++++++++++++
+ arch/x86/kernel/cpu/resctrl/internal.h          |  2 ++
+ 4 files changed, 48 insertions(+), 1 deletion(-)
+
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index a8d0afde7f85..abd77f39c783 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -6325,9 +6325,14 @@ Kernel parameters
+ 	rdt=		[HW,X86,RDT]
+ 			Turn on/off individual RDT features. List is:
+ 			cmt, mbmtotal, mbmlocal, l3cat, l3cdp, l2cat, l2cdp,
+-			mba, smba, bmec, abmc, sdciae.
++			mba, smba, bmec, abmc, sdciae, energy[:guid],
++			perf[:guid].
+ 			E.g. to turn on cmt and turn off mba use:
+ 				rdt=cmt,!mba
++			To turn off all energy telemetry monitoring and ensure that
++			perf telemetry monitoring associated with guid 0x12345
++			is enabled use:
++				rdt=!energy,perf:0x12345
+ 
+ 	reboot=		[KNL]
+ 			Format (x86 or x86_64):
+diff --git a/arch/x86/kernel/cpu/resctrl/core.c b/arch/x86/kernel/cpu/resctrl/core.c
+index 2514f15cd9a4..e38d7fc4f427 100644
+--- a/arch/x86/kernel/cpu/resctrl/core.c
++++ b/arch/x86/kernel/cpu/resctrl/core.c
+@@ -814,6 +814,8 @@ static int __init set_rdt_options(char *str)
+ 		force_off = *tok == '!';
+ 		if (force_off)
+ 			tok++;
++		if (intel_handle_aet_option(force_off, tok))
++			continue;
+ 		for (o = rdt_options; o < &rdt_options[NUM_RDT_OPTIONS]; o++) {
+ 			if (strcmp(tok, o->name) == 0) {
+ 				if (force_off)
+diff --git a/arch/x86/kernel/cpu/resctrl/intel_aet.c b/arch/x86/kernel/cpu/resctrl/intel_aet.c
+index 9351fe5b645a..dc25e8d2527d 100644
+--- a/arch/x86/kernel/cpu/resctrl/intel_aet.c
++++ b/arch/x86/kernel/cpu/resctrl/intel_aet.c
+@@ -52,12 +52,17 @@ struct pmt_event {
+ /**
+  * struct event_group - Events with the same feature type ("energy" or "perf") and GUID.
+  * @pfname:		PMT feature name ("energy" or "perf") of this event group.
++ *			Used by boot rdt= option.
+  * @pfg:		Points to the aggregated telemetry space information
+  *			returned by the intel_pmt_get_regions_by_feature()
+  *			call to the INTEL_PMT_TELEMETRY driver that contains
+  *			data for all telemetry regions of type @pfname.
+  *			Valid if the system supports the event group,
+  *			NULL otherwise.
++ * @force_off:		True when "rdt" command line or architecture code disables
++ *			this event group.
++ * @force_on:		True when "rdt" command line overrides disable of this
++ *			event group.
+  * @guid:		Unique number per XML description file.
+  * @mmio_size:		Number of bytes of MMIO registers for this group.
+  * @num_events:		Number of events in this group.
+@@ -67,6 +72,7 @@ struct event_group {
+ 	/* Data fields for additional structures to manage this group. */
+ 	const char			*pfname;
+ 	struct pmt_feature_group	*pfg;
++	bool				force_off, force_on;
+ 
+ 	/* Remaining fields initialized from XML file. */
+ 	u32				guid;
+@@ -121,6 +127,35 @@ static struct event_group *known_event_groups[] = {
+ 	     _peg < &known_event_groups[ARRAY_SIZE(known_event_groups)];	\
+ 	     _peg++)
+ 
++bool intel_handle_aet_option(bool force_off, char *tok)
++{
++	struct event_group **peg;
++	bool ret = false;
++	u32 guid = 0;
++	char *name;
++
++	if (!tok)
++		return false;
++
++	name = strsep(&tok, ":");
++	if (tok && kstrtou32(tok, 16, &guid))
++		return false;
++
++	for_each_event_group(peg) {
++		if (strcmp(name, (*peg)->pfname))
++			continue;
++		if (guid && (*peg)->guid != guid)
++			continue;
++		if (force_off)
++			(*peg)->force_off = true;
++		else
++			(*peg)->force_on = true;
++		ret = true;
++	}
++
++	return ret;
++}
++
+ static bool skip_telem_region(struct telemetry_region *tr, struct event_group *e)
+ {
+ 	if (tr->guid != e->guid)
+@@ -168,6 +203,9 @@ static bool enable_events(struct event_group *e, struct pmt_feature_group *p)
+ 	struct rdt_resource *r = &rdt_resources_all[RDT_RESOURCE_PERF_PKG].r_resctrl;
+ 	int skipped_events = 0;
+ 
++	if (e->force_off)
++		return false;
++
+ 	if (!group_has_usable_regions(e, p))
+ 		return false;
+ 
+diff --git a/arch/x86/kernel/cpu/resctrl/internal.h b/arch/x86/kernel/cpu/resctrl/internal.h
+index 3b228b241fb2..61a283652d39 100644
+--- a/arch/x86/kernel/cpu/resctrl/internal.h
++++ b/arch/x86/kernel/cpu/resctrl/internal.h
+@@ -236,6 +236,7 @@ void __exit intel_aet_exit(void);
+ int intel_aet_read_event(int domid, u32 rmid, void *arch_priv, u64 *val);
+ void intel_aet_mon_domain_setup(int cpu, int id, struct rdt_resource *r,
+ 				struct list_head *add_pos);
++bool intel_handle_aet_option(bool force_off, char *tok);
+ #else
+ static inline bool intel_aet_get_events(void) { return false; }
+ static inline void __exit intel_aet_exit(void) { }
+@@ -246,6 +247,7 @@ static inline int intel_aet_read_event(int domid, u32 rmid, void *arch_priv, u64
+ 
+ static inline void intel_aet_mon_domain_setup(int cpu, int id, struct rdt_resource *r,
+ 					      struct list_head *add_pos) { }
++static inline bool intel_handle_aet_option(bool force_off, char *tok) { return false; }
+ #endif
+ 
+ #endif /* _ASM_X86_RESCTRL_INTERNAL_H */
+
