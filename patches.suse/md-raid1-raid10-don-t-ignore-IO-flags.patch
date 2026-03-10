@@ -1,0 +1,95 @@
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Thu, 27 Feb 2025 20:16:57 +0800
+Subject: md/raid1,raid10: don't ignore IO flags
+Git-commit: e879a0d9cb086c8e52ce6c04e5bfa63825a6213c
+Patch-mainline: v6.15-rc1
+References: CVE-2025-22125 bsc#1241596
+
+If blk-wbt is enabled by default, it's found that raid write performance
+is quite bad because all IO are throttled by wbt of underlying disks,
+due to flag REQ_IDLE is ignored. And turns out this behaviour exist since
+blk-wbt is introduced.
+
+Other than REQ_IDLE, other flags should not be ignored as well, for
+example REQ_META can be set for filesystems, clearing it can cause priority
+reverse problems; And REQ_NOWAIT should not be cleared as well, because
+io will wait instead of failing directly in underlying disks.
+
+Fix those problems by keep IO flags from master bio.
+
+Fises: f51d46d0e7cb ("md: add support for REQ_NOWAIT")
+Fixes: e34cbd307477 ("blk-wbt: add general throttling mechanism")
+Fixes: 5404bc7a87b9 ("[PATCH] Allow file systems to differentiate between data and meta reads")
+Link: https://lore.kernel.org/linux-raid/20250227121657.832356-1-yukuai1@huaweicloud.com
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+[lduncan: hand-applied all hunks: this code base is much older than the patch]
+Acked-by: Lee Duncan <lduncan@suse.com>
+---
+ drivers/md/raid1.c  |    4 ----
+ drivers/md/raid10.c |    7 -------
+ 2 files changed, 11 deletions(-)
+
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@ -1256,8 +1256,6 @@ static void raid1_read_request(struct md
+ 	struct raid1_info *mirror;
+ 	struct bio *read_bio;
+ 	struct bitmap *bitmap = mddev->bitmap;
+-	const int op = bio_op(bio);
+-	const unsigned long do_sync = (bio->bi_opf & REQ_SYNC);
+ 	int max_sectors;
+ 	int rdisk;
+ 	bool print_msg = !!r1_bio;
+@@ -1350,7 +1348,6 @@ static void raid1_read_request(struct md
+ 		mirror->rdev->data_offset;
+ 	bio_set_dev(read_bio, mirror->rdev->bdev);
+ 	read_bio->bi_end_io = raid1_end_read_request;
+-	bio_set_op_attrs(read_bio, op, do_sync);
+ 	if (test_bit(FailFast, &mirror->rdev->flags) &&
+ 	    test_bit(R1BIO_FailFast, &r1_bio->state))
+ 	        read_bio->bi_opf |= MD_FAILFAST;
+@@ -1565,7 +1562,6 @@ static void raid1_write_request(struct m
+ 				   conf->mirrors[i].rdev->data_offset);
+ 		bio_set_dev(mbio, conf->mirrors[i].rdev->bdev);
+ 		mbio->bi_end_io	= raid1_end_write_request;
+-		mbio->bi_opf = bio_op(bio) | (bio->bi_opf & (REQ_SYNC | REQ_FUA));
+ 		if (test_bit(FailFast, &conf->mirrors[i].rdev->flags) &&
+ 		    !test_bit(WriteMostly, &conf->mirrors[i].rdev->flags) &&
+ 		    conf->raid_disks - mddev->degraded > 1)
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@ -1185,8 +1185,6 @@ static void raid10_read_request(struct m
+ {
+ 	struct r10conf *conf = mddev->private;
+ 	struct bio *read_bio;
+-	const int op = bio_op(bio);
+-	const unsigned long do_sync = (bio->bi_opf & REQ_SYNC);
+ 	int max_sectors;
+ 	struct md_rdev *rdev;
+ 	char b[BDEVNAME_SIZE];
+@@ -1260,7 +1258,6 @@ static void raid10_read_request(struct m
+ 		choose_data_offset(r10_bio, rdev);
+ 	bio_set_dev(read_bio, rdev->bdev);
+ 	read_bio->bi_end_io = raid10_end_read_request;
+-	bio_set_op_attrs(read_bio, op, do_sync);
+ 	if (test_bit(FailFast, &rdev->flags) &&
+ 	    test_bit(R10BIO_FailFast, &r10_bio->state))
+ 	        read_bio->bi_opf |= MD_FAILFAST;
+@@ -1278,9 +1275,6 @@ static void raid10_write_one_disk(struct
+ 				  struct bio *bio, bool replacement,
+ 				  int n_copy)
+ {
+-	const int op = bio_op(bio);
+-	const unsigned long do_sync = (bio->bi_opf & REQ_SYNC);
+-	const unsigned long do_fua = (bio->bi_opf & REQ_FUA);
+ 	unsigned long flags;
+ 	struct blk_plug_cb *cb;
+ 	struct raid10_plug_cb *plug = NULL;
+@@ -1309,7 +1303,6 @@ static void raid10_write_one_disk(struct
+ 				   choose_data_offset(r10_bio, rdev));
+ 	bio_set_dev(mbio, rdev->bdev);
+ 	mbio->bi_end_io	= raid10_end_write_request;
+-	bio_set_op_attrs(mbio, op, do_sync | do_fua);
+ 	if (!replacement && test_bit(FailFast,
+ 				     &conf->mirrors[devnum].rdev->flags)
+ 			 && enough(conf, devnum))
