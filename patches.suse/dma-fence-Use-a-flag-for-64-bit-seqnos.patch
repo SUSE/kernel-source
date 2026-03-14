@@ -1,0 +1,253 @@
+From bf33a0003d9e3b0546f2d7e91bebfd67af59f275 Mon Sep 17 00:00:00 2001
+From: Tvrtko Ursulin <tvrtko.ursulin@igalia.com>
+Date: Thu, 15 May 2025 10:49:57 +0100
+Subject: dma-fence: Use a flag for 64-bit seqnos
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: bf33a0003d9e3b0546f2d7e91bebfd67af59f275
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+With the goal of reducing the need for drivers to touch (and dereference)
+fence->ops, we move the 64-bit seqnos flag from struct dma_fence_ops to
+the fence->flags.
+
+Drivers which were setting this flag are changed to use new
+dma_fence_init64() instead of dma_fence_init().
+
+V2: * Streamlined init and added kerneldoc.
+ * Rebase for amdgpu userq which landed since.
+
+Signed-off-by: Tvrtko Ursulin <tvrtko.ursulin@igalia.com>
+Reviewed-by: Christian König <christian.koenig@amd.com> # v1
+Signed-off-by: Tvrtko Ursulin <tursulin@ursulin.net>
+Link: https://lore.kernel.org/r/20250515095004.28318-3-tvrtko.ursulin@igalia.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/dma-buf/dma-fence-chain.c             |  5 +-
+ drivers/dma-buf/dma-fence.c                   | 57 ++++++++++++++-----
+ .../drm/amd/amdgpu/amdgpu_eviction_fence.c    |  7 +--
+ .../gpu/drm/amd/amdgpu/amdgpu_userq_fence.c   |  5 +-
+ .../gpu/drm/amd/amdgpu/amdgpu_vm_tlb_fence.c  |  5 +-
+ include/linux/dma-fence.h                     | 14 ++---
+ 6 files changed, 58 insertions(+), 35 deletions(-)
+
+diff --git a/drivers/dma-buf/dma-fence-chain.c b/drivers/dma-buf/dma-fence-chain.c
+index 90424f23fd73..a8a90acf4f34 100644
+--- a/drivers/dma-buf/dma-fence-chain.c
++++ b/drivers/dma-buf/dma-fence-chain.c
+@@ -218,7 +218,6 @@ static void dma_fence_chain_set_deadline(struct dma_fence *fence,
+ }
+ 
+ const struct dma_fence_ops dma_fence_chain_ops = {
+-	.use_64bit_seqno = true,
+ 	.get_driver_name = dma_fence_chain_get_driver_name,
+ 	.get_timeline_name = dma_fence_chain_get_timeline_name,
+ 	.enable_signaling = dma_fence_chain_enable_signaling,
+@@ -262,8 +261,8 @@ void dma_fence_chain_init(struct dma_fence_chain *chain,
+ 			seqno = max(prev->seqno, seqno);
+ 	}
+ 
+-	dma_fence_init(&chain->base, &dma_fence_chain_ops,
+-		       &chain->lock, context, seqno);
++	dma_fence_init64(&chain->base, &dma_fence_chain_ops, &chain->lock,
++			 context, seqno);
+ 
+ 	/*
+ 	 * Chaining dma_fence_chain container together is only allowed through
+diff --git a/drivers/dma-buf/dma-fence.c b/drivers/dma-buf/dma-fence.c
+index f0cdd3e99d36..705b59787731 100644
+--- a/drivers/dma-buf/dma-fence.c
++++ b/drivers/dma-buf/dma-fence.c
+@@ -989,6 +989,25 @@ void dma_fence_describe(struct dma_fence *fence, struct seq_file *seq)
+ }
+ EXPORT_SYMBOL(dma_fence_describe);
+ 
++static void
++__dma_fence_init(struct dma_fence *fence, const struct dma_fence_ops *ops,
++	         spinlock_t *lock, u64 context, u64 seqno, unsigned long flags)
++{
++	BUG_ON(!lock);
++	BUG_ON(!ops || !ops->get_driver_name || !ops->get_timeline_name);
++
++	kref_init(&fence->refcount);
++	fence->ops = ops;
++	INIT_LIST_HEAD(&fence->cb_list);
++	fence->lock = lock;
++	fence->context = context;
++	fence->seqno = seqno;
++	fence->flags = flags;
++	fence->error = 0;
++
++	trace_dma_fence_init(fence);
++}
++
+ /**
+  * dma_fence_init - Initialize a custom fence.
+  * @fence: the fence to initialize
+@@ -1008,18 +1027,30 @@ void
+ dma_fence_init(struct dma_fence *fence, const struct dma_fence_ops *ops,
+ 	       spinlock_t *lock, u64 context, u64 seqno)
+ {
+-	BUG_ON(!lock);
+-	BUG_ON(!ops || !ops->get_driver_name || !ops->get_timeline_name);
+-
+-	kref_init(&fence->refcount);
+-	fence->ops = ops;
+-	INIT_LIST_HEAD(&fence->cb_list);
+-	fence->lock = lock;
+-	fence->context = context;
+-	fence->seqno = seqno;
+-	fence->flags = 0UL;
+-	fence->error = 0;
+-
+-	trace_dma_fence_init(fence);
++	__dma_fence_init(fence, ops, lock, context, seqno, 0UL);
+ }
+ EXPORT_SYMBOL(dma_fence_init);
++
++/**
++ * dma_fence_init64 - Initialize a custom fence with 64-bit seqno support.
++ * @fence: the fence to initialize
++ * @ops: the dma_fence_ops for operations on this fence
++ * @lock: the irqsafe spinlock to use for locking this fence
++ * @context: the execution context this fence is run on
++ * @seqno: a linear increasing sequence number for this context
++ *
++ * Initializes an allocated fence, the caller doesn't have to keep its
++ * refcount after committing with this fence, but it will need to hold a
++ * refcount again if &dma_fence_ops.enable_signaling gets called.
++ *
++ * Context and seqno are used for easy comparison between fences, allowing
++ * to check which fence is later by simply using dma_fence_later().
++ */
++void
++dma_fence_init64(struct dma_fence *fence, const struct dma_fence_ops *ops,
++		 spinlock_t *lock, u64 context, u64 seqno)
++{
++	__dma_fence_init(fence, ops, lock, context, seqno,
++			 BIT(DMA_FENCE_FLAG_SEQNO64_BIT));
++}
++EXPORT_SYMBOL(dma_fence_init64);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_eviction_fence.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_eviction_fence.c
+index 8b919ad3af29..23d7d0b0d625 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_eviction_fence.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_eviction_fence.c
+@@ -143,7 +143,6 @@ static bool amdgpu_eviction_fence_enable_signaling(struct dma_fence *f)
+ }
+ 
+ static const struct dma_fence_ops amdgpu_eviction_fence_ops = {
+-	.use_64bit_seqno = true,
+ 	.get_driver_name = amdgpu_eviction_fence_get_driver_name,
+ 	.get_timeline_name = amdgpu_eviction_fence_get_timeline_name,
+ 	.enable_signaling = amdgpu_eviction_fence_enable_signaling,
+@@ -169,9 +168,9 @@ amdgpu_eviction_fence_create(struct amdgpu_eviction_fence_mgr *evf_mgr)
+ 	ev_fence->evf_mgr = evf_mgr;
+ 	get_task_comm(ev_fence->timeline_name, current);
+ 	spin_lock_init(&ev_fence->lock);
+-	dma_fence_init(&ev_fence->base, &amdgpu_eviction_fence_ops,
+-		       &ev_fence->lock, evf_mgr->ev_fence_ctx,
+-		       atomic_inc_return(&evf_mgr->ev_fence_seq));
++	dma_fence_init64(&ev_fence->base, &amdgpu_eviction_fence_ops,
++			 &ev_fence->lock, evf_mgr->ev_fence_ctx,
++			 atomic_inc_return(&evf_mgr->ev_fence_seq));
+ 	return ev_fence;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.c
+index a86616c6deef..c2a983ff23c9 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_userq_fence.c
+@@ -239,8 +239,8 @@ static int amdgpu_userq_fence_create(struct amdgpu_usermode_queue *userq,
+ 	fence = &userq_fence->base;
+ 	userq_fence->fence_drv = fence_drv;
+ 
+-	dma_fence_init(fence, &amdgpu_userq_fence_ops, &userq_fence->lock,
+-		       fence_drv->context, seq);
++	dma_fence_init64(fence, &amdgpu_userq_fence_ops, &userq_fence->lock,
++			 fence_drv->context, seq);
+ 
+ 	amdgpu_userq_fence_driver_get(fence_drv);
+ 	dma_fence_get(fence);
+@@ -334,7 +334,6 @@ static void amdgpu_userq_fence_release(struct dma_fence *f)
+ }
+ 
+ static const struct dma_fence_ops amdgpu_userq_fence_ops = {
+-	.use_64bit_seqno = true,
+ 	.get_driver_name = amdgpu_userq_fence_get_driver_name,
+ 	.get_timeline_name = amdgpu_userq_fence_get_timeline_name,
+ 	.signaled = amdgpu_userq_fence_signaled,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm_tlb_fence.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm_tlb_fence.c
+index 51cddfa3f1e8..5d26797356a3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm_tlb_fence.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm_tlb_fence.c
+@@ -71,7 +71,6 @@ static void amdgpu_tlb_fence_work(struct work_struct *work)
+ }
+ 
+ static const struct dma_fence_ops amdgpu_tlb_fence_ops = {
+-	.use_64bit_seqno = true,
+ 	.get_driver_name = amdgpu_tlb_fence_get_driver_name,
+ 	.get_timeline_name = amdgpu_tlb_fence_get_timeline_name
+ };
+@@ -101,8 +100,8 @@ void amdgpu_vm_tlb_fence_create(struct amdgpu_device *adev, struct amdgpu_vm *vm
+ 	INIT_WORK(&f->work, amdgpu_tlb_fence_work);
+ 	spin_lock_init(&f->lock);
+ 
+-	dma_fence_init(&f->base, &amdgpu_tlb_fence_ops, &f->lock,
+-		       vm->tlb_fence_context, atomic64_read(&vm->tlb_seq));
++	dma_fence_init64(&f->base, &amdgpu_tlb_fence_ops, &f->lock,
++			 vm->tlb_fence_context, atomic64_read(&vm->tlb_seq));
+ 
+ 	/* TODO: We probably need a separate wq here */
+ 	dma_fence_get(&f->base);
+diff --git a/include/linux/dma-fence.h b/include/linux/dma-fence.h
+index c841af28b706..926c01b5b29d 100644
+--- a/include/linux/dma-fence.h
++++ b/include/linux/dma-fence.h
+@@ -98,6 +98,7 @@ struct dma_fence {
+ };
+ 
+ enum dma_fence_flag_bits {
++	DMA_FENCE_FLAG_SEQNO64_BIT,
+ 	DMA_FENCE_FLAG_SIGNALED_BIT,
+ 	DMA_FENCE_FLAG_TIMESTAMP_BIT,
+ 	DMA_FENCE_FLAG_ENABLE_SIGNAL_BIT,
+@@ -125,14 +126,6 @@ struct dma_fence_cb {
+  *
+  */
+ struct dma_fence_ops {
+-	/**
+-	 * @use_64bit_seqno:
+-	 *
+-	 * True if this dma_fence implementation uses 64bit seqno, false
+-	 * otherwise.
+-	 */
+-	bool use_64bit_seqno;
+-
+ 	/**
+ 	 * @get_driver_name:
+ 	 *
+@@ -263,6 +256,9 @@ struct dma_fence_ops {
+ void dma_fence_init(struct dma_fence *fence, const struct dma_fence_ops *ops,
+ 		    spinlock_t *lock, u64 context, u64 seqno);
+ 
++void dma_fence_init64(struct dma_fence *fence, const struct dma_fence_ops *ops,
++		      spinlock_t *lock, u64 context, u64 seqno);
++
+ void dma_fence_release(struct kref *kref);
+ void dma_fence_free(struct dma_fence *fence);
+ void dma_fence_describe(struct dma_fence *fence, struct seq_file *seq);
+@@ -455,7 +451,7 @@ static inline bool __dma_fence_is_later(struct dma_fence *fence, u64 f1, u64 f2)
+ 	 * 32bit sequence numbers. Use a 64bit compare when the driver says to
+ 	 * do so.
+ 	 */
+-	if (fence->ops->use_64bit_seqno)
++	if (test_bit(DMA_FENCE_FLAG_SEQNO64_BIT, &fence->flags))
+ 		return f1 > f2;
+ 
+ 	return (int)(lower_32_bits(f1) - lower_32_bits(f2)) > 0;
+-- 
+2.52.0
+
