@@ -1,0 +1,223 @@
+From 2f405eb45c5523aadf6faea1ca465cf3e6ad7866 Mon Sep 17 00:00:00 2001
+From: Samuel Zhang <guoqing.zhang@amd.com>
+Date: Fri, 11 Apr 2025 16:19:09 +0800
+Subject: drm/amdgpu: enable pdb0 for hibernation on SRIOV
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 2f405eb45c5523aadf6faea1ca465cf3e6ad7866
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+When switching to new GPU index after hibernation and then resume,
+VRAM offset of each VRAM BO will be changed, and the cached gpu
+addresses needed to updated.
+
+This is to enable pdb0 and switch to use pdb0-based virtual gpu
+address by default in amdgpu_bo_create_reserved(). since the virtual
+addresses do not change, this can avoid the need to update all
+cached gpu addresses all over the codebase.
+
+Signed-off-by: Emily Deng <Emily.Deng@amd.com>
+Signed-off-by: Samuel Zhang <guoqing.zhang@amd.com>
+Acked-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c  | 33 +++++++++++++++++++-----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h  |  1 +
+ drivers/gpu/drm/amd/amdgpu/gfxhub_v1_2.c |  8 +++---
+ drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c    |  8 +++---
+ drivers/gpu/drm/amd/amdgpu/mmhub_v1_8.c  |  6 +++--
+ 5 files changed, 40 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
+index 6b0fbbb91e57..c5f06142e892 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c
+@@ -38,6 +38,13 @@
+ #include <drm/drm_drv.h>
+ #include <drm/ttm/ttm_tt.h>
+ 
++static const u64 four_gb = 0x100000000ULL;
++
++bool amdgpu_gmc_is_pdb0_enabled(struct amdgpu_device *adev)
++{
++	return adev->gmc.xgmi.connected_to_cpu || amdgpu_virt_xgmi_migrate_enabled(adev);
++}
++
+ /**
+  * amdgpu_gmc_pdb0_alloc - allocate vram for pdb0
+  *
+@@ -251,10 +258,20 @@ void amdgpu_gmc_sysvm_location(struct amdgpu_device *adev, struct amdgpu_gmc *mc
+ 	u64 hive_vram_end = mc->xgmi.node_segment_size * mc->xgmi.num_physical_nodes - 1;
+ 	mc->vram_start = mc->xgmi.node_segment_size * mc->xgmi.physical_node_id;
+ 	mc->vram_end = mc->vram_start + mc->xgmi.node_segment_size - 1;
+-	mc->gart_start = hive_vram_end + 1;
++	/* node_segment_size may not 4GB aligned on SRIOV, align up is needed. */
++	mc->gart_start = ALIGN(hive_vram_end + 1, four_gb);
+ 	mc->gart_end = mc->gart_start + mc->gart_size - 1;
+-	mc->fb_start = hive_vram_start;
+-	mc->fb_end = hive_vram_end;
++	if (amdgpu_virt_xgmi_migrate_enabled(adev)) {
++		/* set mc->vram_start to 0 to switch the returned GPU address of
++		 * amdgpu_bo_create_reserved() from FB aperture to GART aperture.
++		 */
++		mc->vram_start = 0;
++		mc->vram_end = mc->vram_start + mc->mc_vram_size - 1;
++		mc->visible_vram_size = min(mc->visible_vram_size, mc->real_vram_size);
++	} else {
++		mc->fb_start = hive_vram_start;
++		mc->fb_end = hive_vram_end;
++	}
+ 	dev_info(adev->dev, "VRAM: %lluM 0x%016llX - 0x%016llX (%lluM used)\n",
+ 			mc->mc_vram_size >> 20, mc->vram_start,
+ 			mc->vram_end, mc->real_vram_size >> 20);
+@@ -276,7 +293,6 @@ void amdgpu_gmc_sysvm_location(struct amdgpu_device *adev, struct amdgpu_gmc *mc
+ void amdgpu_gmc_gart_location(struct amdgpu_device *adev, struct amdgpu_gmc *mc,
+ 			      enum amdgpu_gart_placement gart_placement)
+ {
+-	const uint64_t four_gb = 0x100000000ULL;
+ 	u64 size_af, size_bf;
+ 	/*To avoid the hole, limit the max mc address to AMDGPU_GMC_HOLE_START*/
+ 	u64 max_mc_address = min(adev->gmc.mc_mask, AMDGPU_GMC_HOLE_START - 1);
+@@ -1041,9 +1057,7 @@ void amdgpu_gmc_init_pdb0(struct amdgpu_device *adev)
+ 	 */
+ 	u64 vram_size = adev->gmc.xgmi.node_segment_size * adev->gmc.xgmi.num_physical_nodes;
+ 	u64 pde0_page_size = (1ULL<<adev->gmc.vmid0_page_table_block_size)<<21;
+-	u64 vram_addr = adev->vm_manager.vram_base_offset -
+-		adev->gmc.xgmi.physical_node_id * adev->gmc.xgmi.node_segment_size;
+-	u64 vram_end = vram_addr + vram_size;
++	u64 vram_addr, vram_end;
+ 	u64 gart_ptb_gpu_pa = amdgpu_gmc_vram_pa(adev, adev->gart.bo);
+ 	int idx;
+ 
+@@ -1056,6 +1070,11 @@ void amdgpu_gmc_init_pdb0(struct amdgpu_device *adev)
+ 	flags |= AMDGPU_PTE_FRAG((adev->gmc.vmid0_page_table_block_size + 9*1));
+ 	flags |= AMDGPU_PDE_PTE_FLAG(adev);
+ 
++	vram_addr = adev->vm_manager.vram_base_offset;
++	if (!amdgpu_virt_xgmi_migrate_enabled(adev))
++		vram_addr -= adev->gmc.xgmi.physical_node_id * adev->gmc.xgmi.node_segment_size;
++	vram_end = vram_addr + vram_size;
++
+ 	/* The first n PDE0 entries are used as PTE,
+ 	 * pointing to vram
+ 	 */
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h
+index 80fa29c26e9e..46b2bcbd5025 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h
+@@ -394,6 +394,7 @@ static inline uint64_t amdgpu_gmc_sign_extend(uint64_t addr)
+ 	return addr;
+ }
+ 
++bool amdgpu_gmc_is_pdb0_enabled(struct amdgpu_device *adev);
+ int amdgpu_gmc_pdb0_alloc(struct amdgpu_device *adev);
+ void amdgpu_gmc_get_pde_for_bo(struct amdgpu_bo *bo, int level,
+ 			       uint64_t *addr, uint64_t *flags);
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfxhub_v1_2.c b/drivers/gpu/drm/amd/amdgpu/gfxhub_v1_2.c
+index cb25f7f0dfc1..6c03bf9f1ae8 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfxhub_v1_2.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfxhub_v1_2.c
+@@ -74,6 +74,8 @@ static void gfxhub_v1_2_setup_vm_pt_regs(struct amdgpu_device *adev,
+ static void gfxhub_v1_2_xcc_init_gart_aperture_regs(struct amdgpu_device *adev,
+ 						    uint32_t xcc_mask)
+ {
++	uint64_t gart_start = amdgpu_virt_xgmi_migrate_enabled(adev) ?
++			adev->gmc.vram_start : adev->gmc.fb_start;
+ 	uint64_t pt_base;
+ 	int i;
+ 
+@@ -91,10 +93,10 @@ static void gfxhub_v1_2_xcc_init_gart_aperture_regs(struct amdgpu_device *adev,
+ 		if (adev->gmc.pdb0_bo) {
+ 			WREG32_SOC15(GC, GET_INST(GC, i),
+ 				     regVM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32,
+-				     (u32)(adev->gmc.fb_start >> 12));
++				     (u32)(gart_start >> 12));
+ 			WREG32_SOC15(GC, GET_INST(GC, i),
+ 				     regVM_CONTEXT0_PAGE_TABLE_START_ADDR_HI32,
+-				     (u32)(adev->gmc.fb_start >> 44));
++				     (u32)(gart_start >> 44));
+ 
+ 			WREG32_SOC15(GC, GET_INST(GC, i),
+ 				     regVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32,
+@@ -180,7 +182,7 @@ gfxhub_v1_2_xcc_init_system_aperture_regs(struct amdgpu_device *adev,
+ 		/* In the case squeezing vram into GART aperture, we don't use
+ 		 * FB aperture and AGP aperture. Disable them.
+ 		 */
+-		if (adev->gmc.pdb0_bo) {
++		if (adev->gmc.pdb0_bo && adev->gmc.xgmi.connected_to_cpu) {
+ 			WREG32_SOC15(GC, GET_INST(GC, i), regMC_VM_FB_LOCATION_TOP, 0);
+ 			WREG32_SOC15(GC, GET_INST(GC, i), regMC_VM_FB_LOCATION_BASE, 0x00FFFFFF);
+ 			WREG32_SOC15(GC, GET_INST(GC, i), regMC_VM_AGP_TOP, 0);
+diff --git a/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c b/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
+index 78f65aea03f8..fb4676b8cf18 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
+@@ -1719,7 +1719,7 @@ static void gmc_v9_0_vram_gtt_location(struct amdgpu_device *adev,
+ 
+ 	/* add the xgmi offset of the physical node */
+ 	base += adev->gmc.xgmi.physical_node_id * adev->gmc.xgmi.node_segment_size;
+-	if (adev->gmc.xgmi.connected_to_cpu) {
++	if (amdgpu_gmc_is_pdb0_enabled(adev)) {
+ 		amdgpu_gmc_sysvm_location(adev, mc);
+ 	} else {
+ 		amdgpu_gmc_vram_location(adev, mc, base);
+@@ -1834,7 +1834,7 @@ static int gmc_v9_0_gart_init(struct amdgpu_device *adev)
+ 		return 0;
+ 	}
+ 
+-	if (adev->gmc.xgmi.connected_to_cpu) {
++	if (amdgpu_gmc_is_pdb0_enabled(adev)) {
+ 		adev->gmc.vmid0_page_table_depth = 1;
+ 		adev->gmc.vmid0_page_table_block_size = 12;
+ 	} else {
+@@ -1860,7 +1860,7 @@ static int gmc_v9_0_gart_init(struct amdgpu_device *adev)
+ 		if (r)
+ 			return r;
+ 
+-		if (adev->gmc.xgmi.connected_to_cpu)
++		if (amdgpu_gmc_is_pdb0_enabled(adev))
+ 			r = amdgpu_gmc_pdb0_alloc(adev);
+ 	}
+ 
+@@ -2360,7 +2360,7 @@ static int gmc_v9_0_gart_enable(struct amdgpu_device *adev)
+ {
+ 	int r;
+ 
+-	if (adev->gmc.xgmi.connected_to_cpu)
++	if (amdgpu_gmc_is_pdb0_enabled(adev))
+ 		amdgpu_gmc_init_pdb0(adev);
+ 
+ 	if (adev->gart.bo == NULL) {
+diff --git a/drivers/gpu/drm/amd/amdgpu/mmhub_v1_8.c b/drivers/gpu/drm/amd/amdgpu/mmhub_v1_8.c
+index 76167fadb292..cc688ae79e84 100644
+--- a/drivers/gpu/drm/amd/amdgpu/mmhub_v1_8.c
++++ b/drivers/gpu/drm/amd/amdgpu/mmhub_v1_8.c
+@@ -76,6 +76,8 @@ static void mmhub_v1_8_setup_vm_pt_regs(struct amdgpu_device *adev, uint32_t vmi
+ 
+ static void mmhub_v1_8_init_gart_aperture_regs(struct amdgpu_device *adev)
+ {
++	uint64_t gart_start = amdgpu_virt_xgmi_migrate_enabled(adev) ?
++			adev->gmc.vram_start : adev->gmc.fb_start;
+ 	uint64_t pt_base;
+ 	u32 inst_mask;
+ 	int i;
+@@ -95,10 +97,10 @@ static void mmhub_v1_8_init_gart_aperture_regs(struct amdgpu_device *adev)
+ 		if (adev->gmc.pdb0_bo) {
+ 			WREG32_SOC15(MMHUB, i,
+ 				     regVM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32,
+-				     (u32)(adev->gmc.fb_start >> 12));
++				     (u32)(gart_start >> 12));
+ 			WREG32_SOC15(MMHUB, i,
+ 				     regVM_CONTEXT0_PAGE_TABLE_START_ADDR_HI32,
+-				     (u32)(adev->gmc.fb_start >> 44));
++				     (u32)(gart_start >> 44));
+ 
+ 			WREG32_SOC15(MMHUB, i,
+ 				     regVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32,
+-- 
+2.52.0
+
