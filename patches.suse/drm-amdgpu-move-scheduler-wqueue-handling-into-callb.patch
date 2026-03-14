@@ -1,0 +1,505 @@
+From 38b20968f3d8a603a979ac50ff6cf3553e0b3daf Mon Sep 17 00:00:00 2001
+From: Alex Deucher <alexander.deucher@amd.com>
+Date: Mon, 16 Jun 2025 17:45:05 -0400
+Subject: drm/amdgpu: move scheduler wqueue handling into callbacks
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 38b20968f3d8a603a979ac50ff6cf3553e0b3daf
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Move the scheduler wqueue stopping and starting into
+the ring reset callbacks.  On some IPs we have to reset
+an engine which may have multiple queues.  Move the wqueue
+handling into the backend so we can handle them as needed
+based on the type of reset available.
+
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_job.c  |  8 --------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.c | 17 ++++-------------
+ drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c   |  6 ++++++
+ drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c   |  6 ++++++
+ drivers/gpu/drm/amd/amdgpu/gfx_v12_0.c   |  6 ++++++
+ drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c    |  3 +++
+ drivers/gpu/drm/amd/amdgpu/gfx_v9_4_3.c  |  3 +++
+ drivers/gpu/drm/amd/amdgpu/jpeg_v2_0.c   |  2 ++
+ drivers/gpu/drm/amd/amdgpu/jpeg_v2_5.c   |  2 ++
+ drivers/gpu/drm/amd/amdgpu/jpeg_v3_0.c   |  2 ++
+ drivers/gpu/drm/amd/amdgpu/jpeg_v4_0.c   |  2 ++
+ drivers/gpu/drm/amd/amdgpu/jpeg_v4_0_3.c |  2 ++
+ drivers/gpu/drm/amd/amdgpu/jpeg_v5_0_1.c |  2 ++
+ drivers/gpu/drm/amd/amdgpu/sdma_v6_0.c   |  3 +++
+ drivers/gpu/drm/amd/amdgpu/sdma_v7_0.c   |  3 +++
+ drivers/gpu/drm/amd/amdgpu/vcn_v4_0.c    |  2 ++
+ drivers/gpu/drm/amd/amdgpu/vcn_v4_0_3.c  |  3 +++
+ drivers/gpu/drm/amd/amdgpu/vcn_v4_0_5.c  |  2 ++
+ drivers/gpu/drm/amd/amdgpu/vcn_v5_0_0.c  |  2 ++
+ 19 files changed, 55 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
+index 6d53d62bffba..2b58e353cca1 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
+@@ -134,17 +134,9 @@ static enum drm_gpu_sched_stat amdgpu_job_timedout(struct drm_sched_job *s_job)
+ 	} else if (amdgpu_gpu_recovery && ring->funcs->reset) {
+ 		dev_err(adev->dev, "Starting %s ring reset\n",
+ 			s_job->sched->name);
+-
+-		/*
+-		 * Stop the scheduler to prevent anybody else from touching the
+-		 * ring buffer.
+-		 */
+-		drm_sched_wqueue_stop(&ring->sched);
+-
+ 		r = amdgpu_ring_reset(ring, job->vmid, NULL);
+ 		if (!r) {
+ 			atomic_inc(&ring->adev->gpu_reset_counter);
+-			drm_sched_wqueue_start(&ring->sched);
+ 			dev_err(adev->dev, "Ring %s reset succeeded\n",
+ 				ring->sched.name);
+ 			drm_dev_wedged_event(adev_to_drm(adev),
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.c
+index cf5733d5d26d..7e26a44dcc1f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.c
+@@ -554,22 +554,16 @@ int amdgpu_sdma_reset_engine(struct amdgpu_device *adev, uint32_t instance_id)
+ 	struct amdgpu_sdma_instance *sdma_instance = &adev->sdma.instance[instance_id];
+ 	struct amdgpu_ring *gfx_ring = &sdma_instance->ring;
+ 	struct amdgpu_ring *page_ring = &sdma_instance->page;
+-	bool gfx_sched_stopped = false, page_sched_stopped = false;
+ 
+ 	mutex_lock(&sdma_instance->engine_reset_mutex);
+ 	/* Stop the scheduler's work queue for the GFX and page rings if they are running.
+ 	* This ensures that no new tasks are submitted to the queues while
+ 	* the reset is in progress.
+ 	*/
+-	if (!amdgpu_ring_sched_ready(gfx_ring)) {
+-		drm_sched_wqueue_stop(&gfx_ring->sched);
+-		gfx_sched_stopped = true;
+-	}
++	drm_sched_wqueue_stop(&gfx_ring->sched);
+ 
+-	if (adev->sdma.has_page_queue && !amdgpu_ring_sched_ready(page_ring)) {
++	if (adev->sdma.has_page_queue)
+ 		drm_sched_wqueue_stop(&page_ring->sched);
+-		page_sched_stopped = true;
+-	}
+ 
+ 	if (sdma_instance->funcs->stop_kernel_queue) {
+ 		sdma_instance->funcs->stop_kernel_queue(gfx_ring);
+@@ -596,12 +590,9 @@ int amdgpu_sdma_reset_engine(struct amdgpu_device *adev, uint32_t instance_id)
+ 	 * to be submitted to the queues after the reset is complete.
+ 	 */
+ 	if (!ret) {
+-		if (gfx_sched_stopped && amdgpu_ring_sched_ready(gfx_ring)) {
+-			drm_sched_wqueue_start(&gfx_ring->sched);
+-		}
+-		if (page_sched_stopped && amdgpu_ring_sched_ready(page_ring)) {
++		drm_sched_wqueue_start(&gfx_ring->sched);
++		if (adev->sdma.has_page_queue)
+ 			drm_sched_wqueue_start(&page_ring->sched);
+-		}
+ 	}
+ 	mutex_unlock(&sdma_instance->engine_reset_mutex);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c
+index 4d0ee3ffe985..8c377ecbb8a7 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c
+@@ -9540,6 +9540,8 @@ static int gfx_v10_0_reset_kgq(struct amdgpu_ring *ring,
+ 	if (!kiq->pmf || !kiq->pmf->kiq_unmap_queues)
+ 		return -EINVAL;
+ 
++	drm_sched_wqueue_stop(&ring->sched);
++
+ 	spin_lock_irqsave(&kiq->ring_lock, flags);
+ 
+ 	if (amdgpu_ring_alloc(kiq_ring, 5 + 7 + 7 + kiq->pmf->map_queues_size)) {
+@@ -9581,6 +9583,7 @@ static int gfx_v10_0_reset_kgq(struct amdgpu_ring *ring,
+ 	if (r)
+ 		return r;
+ 	amdgpu_fence_driver_force_completion(ring);
++	drm_sched_wqueue_start(&ring->sched);
+ 	return 0;
+ }
+ 
+@@ -9600,6 +9603,8 @@ static int gfx_v10_0_reset_kcq(struct amdgpu_ring *ring,
+ 	if (!kiq->pmf || !kiq->pmf->kiq_unmap_queues)
+ 		return -EINVAL;
+ 
++	drm_sched_wqueue_stop(&ring->sched);
++
+ 	spin_lock_irqsave(&kiq->ring_lock, flags);
+ 
+ 	if (amdgpu_ring_alloc(kiq_ring, kiq->pmf->unmap_queues_size)) {
+@@ -9658,6 +9663,7 @@ static int gfx_v10_0_reset_kcq(struct amdgpu_ring *ring,
+ 	if (r)
+ 		return r;
+ 	amdgpu_fence_driver_force_completion(ring);
++	drm_sched_wqueue_start(&ring->sched);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c
+index 39f4dd18c277..37dcec2d0784 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c
+@@ -6821,6 +6821,8 @@ static int gfx_v11_0_reset_kgq(struct amdgpu_ring *ring,
+ 	if (amdgpu_sriov_vf(adev))
+ 		return -EINVAL;
+ 
++	drm_sched_wqueue_stop(&ring->sched);
++
+ 	r = amdgpu_mes_reset_legacy_queue(ring->adev, ring, vmid, false);
+ 	if (r) {
+ 
+@@ -6846,6 +6848,7 @@ static int gfx_v11_0_reset_kgq(struct amdgpu_ring *ring,
+ 	if (r)
+ 		return r;
+ 	amdgpu_fence_driver_force_completion(ring);
++	drm_sched_wqueue_start(&ring->sched);
+ 	return 0;
+ }
+ 
+@@ -6989,6 +6992,8 @@ static int gfx_v11_0_reset_kcq(struct amdgpu_ring *ring,
+ 	if (amdgpu_sriov_vf(adev))
+ 		return -EINVAL;
+ 
++	drm_sched_wqueue_stop(&ring->sched);
++
+ 	r = amdgpu_mes_reset_legacy_queue(ring->adev, ring, vmid, true);
+ 	if (r) {
+ 		dev_warn(adev->dev, "fail(%d) to reset kcq and try pipe reset\n", r);
+@@ -7012,6 +7017,7 @@ static int gfx_v11_0_reset_kcq(struct amdgpu_ring *ring,
+ 	if (r)
+ 		return r;
+ 	amdgpu_fence_driver_force_completion(ring);
++	drm_sched_wqueue_start(&ring->sched);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v12_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v12_0.c
+index 964fa3f2e271..e4fc42470cf3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v12_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v12_0.c
+@@ -5317,6 +5317,8 @@ static int gfx_v12_0_reset_kgq(struct amdgpu_ring *ring,
+ 	if (amdgpu_sriov_vf(adev))
+ 		return -EINVAL;
+ 
++	drm_sched_wqueue_stop(&ring->sched);
++
+ 	r = amdgpu_mes_reset_legacy_queue(ring->adev, ring, vmid, false);
+ 	if (r) {
+ 		dev_warn(adev->dev, "reset via MES failed and try pipe reset %d\n", r);
+@@ -5341,6 +5343,7 @@ static int gfx_v12_0_reset_kgq(struct amdgpu_ring *ring,
+ 	if (r)
+ 		return r;
+ 	amdgpu_fence_driver_force_completion(ring);
++	drm_sched_wqueue_start(&ring->sched);
+ 	return 0;
+ }
+ 
+@@ -5437,6 +5440,8 @@ static int gfx_v12_0_reset_kcq(struct amdgpu_ring *ring,
+ 	if (amdgpu_sriov_vf(adev))
+ 		return -EINVAL;
+ 
++	drm_sched_wqueue_stop(&ring->sched);
++
+ 	r = amdgpu_mes_reset_legacy_queue(ring->adev, ring, vmid, true);
+ 	if (r) {
+ 		dev_warn(adev->dev, "fail(%d) to reset kcq  and try pipe reset\n", r);
+@@ -5460,6 +5465,7 @@ static int gfx_v12_0_reset_kcq(struct amdgpu_ring *ring,
+ 	if (r)
+ 		return r;
+ 	amdgpu_fence_driver_force_completion(ring);
++	drm_sched_wqueue_start(&ring->sched);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
+index 95e319974f22..76ba664efecb 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
+@@ -7187,6 +7187,8 @@ static int gfx_v9_0_reset_kcq(struct amdgpu_ring *ring,
+ 	if (!kiq->pmf || !kiq->pmf->kiq_unmap_queues)
+ 		return -EINVAL;
+ 
++	drm_sched_wqueue_stop(&ring->sched);
++
+ 	spin_lock_irqsave(&kiq->ring_lock, flags);
+ 
+ 	if (amdgpu_ring_alloc(kiq_ring, kiq->pmf->unmap_queues_size)) {
+@@ -7247,6 +7249,7 @@ static int gfx_v9_0_reset_kcq(struct amdgpu_ring *ring,
+ 	if (r)
+ 		return r;
+ 	amdgpu_fence_driver_force_completion(ring);
++	drm_sched_wqueue_start(&ring->sched);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v9_4_3.c b/drivers/gpu/drm/amd/amdgpu/gfx_v9_4_3.c
+index 8bfee17a826e..daed0f187bda 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v9_4_3.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v9_4_3.c
+@@ -3567,6 +3567,8 @@ static int gfx_v9_4_3_reset_kcq(struct amdgpu_ring *ring,
+ 	if (!kiq->pmf || !kiq->pmf->kiq_unmap_queues)
+ 		return -EINVAL;
+ 
++	drm_sched_wqueue_stop(&ring->sched);
++
+ 	spin_lock_irqsave(&kiq->ring_lock, flags);
+ 
+ 	if (amdgpu_ring_alloc(kiq_ring, kiq->pmf->unmap_queues_size)) {
+@@ -3625,6 +3627,7 @@ static int gfx_v9_4_3_reset_kcq(struct amdgpu_ring *ring,
+ 	if (r)
+ 		return r;
+ 	amdgpu_fence_driver_force_completion(ring);
++	drm_sched_wqueue_start(&ring->sched);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/jpeg_v2_0.c b/drivers/gpu/drm/amd/amdgpu/jpeg_v2_0.c
+index 6621a7b1f29f..781a5a8a8361 100644
+--- a/drivers/gpu/drm/amd/amdgpu/jpeg_v2_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/jpeg_v2_0.c
+@@ -770,12 +770,14 @@ static int jpeg_v2_0_ring_reset(struct amdgpu_ring *ring,
+ {
+ 	int r;
+ 
++	drm_sched_wqueue_stop(&ring->sched);
+ 	jpeg_v2_0_stop(ring->adev);
+ 	jpeg_v2_0_start(ring->adev);
+ 	r = amdgpu_ring_test_helper(ring);
+ 	if (r)
+ 		return r;
+ 	amdgpu_fence_driver_force_completion(ring);
++	drm_sched_wqueue_start(&ring->sched);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/jpeg_v2_5.c b/drivers/gpu/drm/amd/amdgpu/jpeg_v2_5.c
+index 44a5c0e82ca4..5be9cdcae32c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/jpeg_v2_5.c
++++ b/drivers/gpu/drm/amd/amdgpu/jpeg_v2_5.c
+@@ -649,12 +649,14 @@ static int jpeg_v2_5_ring_reset(struct amdgpu_ring *ring,
+ {
+ 	int r;
+ 
++	drm_sched_wqueue_stop(&ring->sched);
+ 	jpeg_v2_5_stop_inst(ring->adev, ring->me);
+ 	jpeg_v2_5_start_inst(ring->adev, ring->me);
+ 	r = amdgpu_ring_test_helper(ring);
+ 	if (r)
+ 		return r;
+ 	amdgpu_fence_driver_force_completion(ring);
++	drm_sched_wqueue_start(&ring->sched);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/jpeg_v3_0.c b/drivers/gpu/drm/amd/amdgpu/jpeg_v3_0.c
+index e813af4eedd2..a24bd833d644 100644
+--- a/drivers/gpu/drm/amd/amdgpu/jpeg_v3_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/jpeg_v3_0.c
+@@ -561,12 +561,14 @@ static int jpeg_v3_0_ring_reset(struct amdgpu_ring *ring,
+ {
+ 	int r;
+ 
++	drm_sched_wqueue_stop(&ring->sched);
+ 	jpeg_v3_0_stop(ring->adev);
+ 	jpeg_v3_0_start(ring->adev);
+ 	r = amdgpu_ring_test_helper(ring);
+ 	if (r)
+ 		return r;
+ 	amdgpu_fence_driver_force_completion(ring);
++	drm_sched_wqueue_start(&ring->sched);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/jpeg_v4_0.c b/drivers/gpu/drm/amd/amdgpu/jpeg_v4_0.c
+index 190f0742d701..1d4edd77837d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/jpeg_v4_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/jpeg_v4_0.c
+@@ -729,12 +729,14 @@ static int jpeg_v4_0_ring_reset(struct amdgpu_ring *ring,
+ 	if (amdgpu_sriov_vf(ring->adev))
+ 		return -EINVAL;
+ 
++	drm_sched_wqueue_stop(&ring->sched);
+ 	jpeg_v4_0_stop(ring->adev);
+ 	jpeg_v4_0_start(ring->adev);
+ 	r = amdgpu_ring_test_helper(ring);
+ 	if (r)
+ 		return r;
+ 	amdgpu_fence_driver_force_completion(ring);
++	drm_sched_wqueue_start(&ring->sched);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/jpeg_v4_0_3.c b/drivers/gpu/drm/amd/amdgpu/jpeg_v4_0_3.c
+index 04755b7a62d9..78441f8fce97 100644
+--- a/drivers/gpu/drm/amd/amdgpu/jpeg_v4_0_3.c
++++ b/drivers/gpu/drm/amd/amdgpu/jpeg_v4_0_3.c
+@@ -1152,12 +1152,14 @@ static int jpeg_v4_0_3_ring_reset(struct amdgpu_ring *ring,
+ 	if (amdgpu_sriov_vf(ring->adev))
+ 		return -EOPNOTSUPP;
+ 
++	drm_sched_wqueue_stop(&ring->sched);
+ 	jpeg_v4_0_3_core_stall_reset(ring);
+ 	jpeg_v4_0_3_start_jrbc(ring);
+ 	r = amdgpu_ring_test_helper(ring);
+ 	if (r)
+ 		return r;
+ 	amdgpu_fence_driver_force_completion(ring);
++	drm_sched_wqueue_start(&ring->sched);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/jpeg_v5_0_1.c b/drivers/gpu/drm/amd/amdgpu/jpeg_v5_0_1.c
+index e7f942dc714a..6f8a16da9d60 100644
+--- a/drivers/gpu/drm/amd/amdgpu/jpeg_v5_0_1.c
++++ b/drivers/gpu/drm/amd/amdgpu/jpeg_v5_0_1.c
+@@ -843,12 +843,14 @@ static int jpeg_v5_0_1_ring_reset(struct amdgpu_ring *ring,
+ 	if (amdgpu_sriov_vf(ring->adev))
+ 		return -EOPNOTSUPP;
+ 
++	drm_sched_wqueue_stop(&ring->sched);
+ 	jpeg_v5_0_1_core_stall_reset(ring);
+ 	jpeg_v5_0_1_init_jrbc(ring);
+ 	r = amdgpu_ring_test_helper(ring);
+ 	if (r)
+ 		return r;
+ 	amdgpu_fence_driver_force_completion(ring);
++	drm_sched_wqueue_start(&ring->sched);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v6_0.c b/drivers/gpu/drm/amd/amdgpu/sdma_v6_0.c
+index c6cb7ff15caa..cac0882770fd 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v6_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v6_0.c
+@@ -1570,6 +1570,8 @@ static int sdma_v6_0_reset_queue(struct amdgpu_ring *ring,
+ 		return -EINVAL;
+ 	}
+ 
++	drm_sched_wqueue_stop(&ring->sched);
++
+ 	r = amdgpu_mes_reset_legacy_queue(adev, ring, vmid, true);
+ 	if (r)
+ 		return r;
+@@ -1578,6 +1580,7 @@ static int sdma_v6_0_reset_queue(struct amdgpu_ring *ring,
+ 	if (r)
+ 		return r;
+ 	amdgpu_fence_driver_force_completion(ring);
++	drm_sched_wqueue_start(&ring->sched);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/sdma_v7_0.c b/drivers/gpu/drm/amd/amdgpu/sdma_v7_0.c
+index b00c63812899..99a080bad2a3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/sdma_v7_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/sdma_v7_0.c
+@@ -822,6 +822,8 @@ static int sdma_v7_0_reset_queue(struct amdgpu_ring *ring,
+ 		return -EINVAL;
+ 	}
+ 
++	drm_sched_wqueue_stop(&ring->sched);
++
+ 	r = amdgpu_mes_reset_legacy_queue(adev, ring, vmid, true);
+ 	if (r)
+ 		return r;
+@@ -830,6 +832,7 @@ static int sdma_v7_0_reset_queue(struct amdgpu_ring *ring,
+ 	if (r)
+ 		return r;
+ 	amdgpu_fence_driver_force_completion(ring);
++	drm_sched_wqueue_start(&ring->sched);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/vcn_v4_0.c b/drivers/gpu/drm/amd/amdgpu/vcn_v4_0.c
+index 6c25e9fc4f0f..eec9133e1b2c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vcn_v4_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/vcn_v4_0.c
+@@ -1978,6 +1978,7 @@ static int vcn_v4_0_ring_reset(struct amdgpu_ring *ring,
+ 	if (!(adev->vcn.supported_reset & AMDGPU_RESET_TYPE_PER_QUEUE))
+ 		return -EOPNOTSUPP;
+ 
++	drm_sched_wqueue_stop(&ring->sched);
+ 	vcn_v4_0_stop(vinst);
+ 	vcn_v4_0_start(vinst);
+ 
+@@ -1985,6 +1986,7 @@ static int vcn_v4_0_ring_reset(struct amdgpu_ring *ring,
+ 	if (r)
+ 		return r;
+ 	amdgpu_fence_driver_force_completion(ring);
++	drm_sched_wqueue_start(&ring->sched);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/vcn_v4_0_3.c b/drivers/gpu/drm/amd/amdgpu/vcn_v4_0_3.c
+index 1e1dd61b774e..d8fd32c1e38e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vcn_v4_0_3.c
++++ b/drivers/gpu/drm/amd/amdgpu/vcn_v4_0_3.c
+@@ -1609,6 +1609,8 @@ static int vcn_v4_0_3_ring_reset(struct amdgpu_ring *ring,
+ 	if (!(adev->vcn.supported_reset & AMDGPU_RESET_TYPE_PER_QUEUE))
+ 		return -EOPNOTSUPP;
+ 
++	drm_sched_wqueue_stop(&ring->sched);
++
+ 	vcn_inst = GET_INST(VCN, ring->me);
+ 	r = amdgpu_dpm_reset_vcn(adev, 1 << vcn_inst);
+ 
+@@ -1626,6 +1628,7 @@ static int vcn_v4_0_3_ring_reset(struct amdgpu_ring *ring,
+ 	if (r)
+ 		return r;
+ 	amdgpu_fence_driver_force_completion(ring);
++	drm_sched_wqueue_start(&ring->sched);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/vcn_v4_0_5.c b/drivers/gpu/drm/amd/amdgpu/vcn_v4_0_5.c
+index 9c02446bb1a5..7e37ddea6355 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vcn_v4_0_5.c
++++ b/drivers/gpu/drm/amd/amdgpu/vcn_v4_0_5.c
+@@ -1476,6 +1476,7 @@ static int vcn_v4_0_5_ring_reset(struct amdgpu_ring *ring,
+ 	if (!(adev->vcn.supported_reset & AMDGPU_RESET_TYPE_PER_QUEUE))
+ 		return -EOPNOTSUPP;
+ 
++	drm_sched_wqueue_stop(&ring->sched);
+ 	vcn_v4_0_5_stop(vinst);
+ 	vcn_v4_0_5_start(vinst);
+ 
+@@ -1483,6 +1484,7 @@ static int vcn_v4_0_5_ring_reset(struct amdgpu_ring *ring,
+ 	if (r)
+ 		return r;
+ 	amdgpu_fence_driver_force_completion(ring);
++	drm_sched_wqueue_start(&ring->sched);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/vcn_v5_0_0.c b/drivers/gpu/drm/amd/amdgpu/vcn_v5_0_0.c
+index c8924f97cf58..47c0bcc9e7d8 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vcn_v5_0_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/vcn_v5_0_0.c
+@@ -1203,6 +1203,7 @@ static int vcn_v5_0_0_ring_reset(struct amdgpu_ring *ring,
+ 	if (!(adev->vcn.supported_reset & AMDGPU_RESET_TYPE_PER_QUEUE))
+ 		return -EOPNOTSUPP;
+ 
++	drm_sched_wqueue_stop(&ring->sched);
+ 	vcn_v5_0_0_stop(vinst);
+ 	vcn_v5_0_0_start(vinst);
+ 
+@@ -1210,6 +1211,7 @@ static int vcn_v5_0_0_ring_reset(struct amdgpu_ring *ring,
+ 	if (r)
+ 		return r;
+ 	amdgpu_fence_driver_force_completion(ring);
++	drm_sched_wqueue_start(&ring->sched);
+ 	return 0;
+ }
+ 
+-- 
+2.52.0
+
