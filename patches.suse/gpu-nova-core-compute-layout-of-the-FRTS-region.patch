@@ -1,0 +1,391 @@
+From 80213934d00fe09d9dcef3d6f17250be131435aa Mon Sep 17 00:00:00 2001
+From: Alexandre Courbot <acourbot@nvidia.com>
+Date: Thu, 19 Jun 2025 22:24:04 +0900
+Subject: gpu: nova-core: compute layout of the FRTS region
+Git-commit: 80213934d00fe09d9dcef3d6f17250be131435aa
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+FWSEC-FRTS is run with the desired address of the FRTS region as
+parameter, which we need to compute depending on some hardware
+parameters.
+
+Do this in a `FbLayout` structure, that will be later extended to
+describe more memory regions used to boot the GSP.
+
+Reviewed-by: Lyude Paul <lyude@redhat.com>
+Signed-off-by: Alexandre Courbot <acourbot@nvidia.com>
+Link: https://lore.kernel.org/r/20250619-nova-frts-v6-20-ecf41ef99252@nvidia.com
+[ In doc-comment of FbLayout s/bootup process/boot process/ - Danilo ]
+
+Signed-off-by: Danilo Krummrich <dakr@kernel.org>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/nova-core/fb.rs           | 70 ++++++++++++++++++++++++
+ drivers/gpu/nova-core/fb/hal.rs       | 12 ++++-
+ drivers/gpu/nova-core/fb/hal/ga100.rs | 12 +++++
+ drivers/gpu/nova-core/fb/hal/ga102.rs | 36 +++++++++++++
+ drivers/gpu/nova-core/fb/hal/tu102.rs | 16 ++++++
+ drivers/gpu/nova-core/gpu.rs          |  4 ++
+ drivers/gpu/nova-core/regs.rs         | 76 +++++++++++++++++++++++++++
+ 7 files changed, 224 insertions(+), 2 deletions(-)
+ create mode 100644 drivers/gpu/nova-core/fb/hal/ga102.rs
+
+diff --git a/drivers/gpu/nova-core/fb.rs b/drivers/gpu/nova-core/fb.rs
+index bfe3ed063572..5719de5c4759 100644
+--- a/drivers/gpu/nova-core/fb.rs
++++ b/drivers/gpu/nova-core/fb.rs
+@@ -1,12 +1,16 @@
+ // SPDX-License-Identifier: GPL-2.0
+ 
++use core::ops::Range;
++
+ use kernel::prelude::*;
++use kernel::sizes::*;
+ use kernel::types::ARef;
+ use kernel::{dev_warn, device};
+ 
+ use crate::dma::DmaObject;
+ use crate::driver::Bar0;
+ use crate::gpu::Chipset;
++use crate::regs;
+ 
+ mod hal;
+ 
+@@ -65,3 +69,69 @@ pub(crate) fn unregister(&self, bar: &Bar0) {
+         }
+     }
+ }
++
++/// Layout of the GPU framebuffer memory.
++///
++/// Contains ranges of GPU memory reserved for a given purpose during the GSP boot process.
++#[derive(Debug)]
++#[expect(dead_code)]
++pub(crate) struct FbLayout {
++    pub(crate) fb: Range<u64>,
++    pub(crate) vga_workspace: Range<u64>,
++    pub(crate) frts: Range<u64>,
++}
++
++impl FbLayout {
++    /// Computes the FB layout.
++    pub(crate) fn new(chipset: Chipset, bar: &Bar0) -> Result<Self> {
++        let hal = hal::fb_hal(chipset);
++
++        let fb = {
++            let fb_size = hal.vidmem_size(bar);
++
++            0..fb_size
++        };
++
++        let vga_workspace = {
++            let vga_base = {
++                const NV_PRAMIN_SIZE: u64 = SZ_1M as u64;
++                let base = fb.end - NV_PRAMIN_SIZE;
++
++                if hal.supports_display(bar) {
++                    match regs::NV_PDISP_VGA_WORKSPACE_BASE::read(bar).vga_workspace_addr() {
++                        Some(addr) => {
++                            if addr < base {
++                                const VBIOS_WORKSPACE_SIZE: u64 = SZ_128K as u64;
++
++                                // Point workspace address to end of framebuffer.
++                                fb.end - VBIOS_WORKSPACE_SIZE
++                            } else {
++                                addr
++                            }
++                        }
++                        None => base,
++                    }
++                } else {
++                    base
++                }
++            };
++
++            vga_base..fb.end
++        };
++
++        let frts = {
++            const FRTS_DOWN_ALIGN: u64 = SZ_128K as u64;
++            const FRTS_SIZE: u64 = SZ_1M as u64;
++            // TODO: replace with `align_down` once it lands.
++            let frts_base = (vga_workspace.start & !(FRTS_DOWN_ALIGN - 1)) - FRTS_SIZE;
++
++            frts_base..frts_base + FRTS_SIZE
++        };
++
++        Ok(Self {
++            fb,
++            vga_workspace,
++            frts,
++        })
++    }
++}
+diff --git a/drivers/gpu/nova-core/fb/hal.rs b/drivers/gpu/nova-core/fb/hal.rs
+index 23eab57eec9f..2f914948bb9a 100644
+--- a/drivers/gpu/nova-core/fb/hal.rs
++++ b/drivers/gpu/nova-core/fb/hal.rs
+@@ -6,6 +6,7 @@
+ use crate::gpu::Chipset;
+ 
+ mod ga100;
++mod ga102;
+ mod tu102;
+ 
+ pub(crate) trait FbHal {
+@@ -16,6 +17,12 @@ pub(crate) trait FbHal {
+     ///
+     /// This might fail if the address is too large for the receiving register.
+     fn write_sysmem_flush_page(&self, bar: &Bar0, addr: u64) -> Result;
++
++    /// Returns `true` is display is supported.
++    fn supports_display(&self, bar: &Bar0) -> bool;
++
++    /// Returns the VRAM size, in bytes.
++    fn vidmem_size(&self, bar: &Bar0) -> u64;
+ }
+ 
+ /// Returns the HAL corresponding to `chipset`.
+@@ -24,8 +31,9 @@ pub(super) fn fb_hal(chipset: Chipset) -> &'static dyn FbHal {
+ 
+     match chipset {
+         TU102 | TU104 | TU106 | TU117 | TU116 => tu102::TU102_HAL,
+-        GA100 | GA102 | GA103 | GA104 | GA106 | GA107 | AD102 | AD103 | AD104 | AD106 | AD107 => {
+-            ga100::GA100_HAL
++        GA100 => ga100::GA100_HAL,
++        GA102 | GA103 | GA104 | GA106 | GA107 | AD102 | AD103 | AD104 | AD106 | AD107 => {
++            ga102::GA102_HAL
+         }
+     }
+ }
+diff --git a/drivers/gpu/nova-core/fb/hal/ga100.rs b/drivers/gpu/nova-core/fb/hal/ga100.rs
+index 7c10436c1c59..4827721c9860 100644
+--- a/drivers/gpu/nova-core/fb/hal/ga100.rs
++++ b/drivers/gpu/nova-core/fb/hal/ga100.rs
+@@ -25,6 +25,10 @@ pub(super) fn write_sysmem_flush_page_ga100(bar: &Bar0, addr: u64) {
+         .write(bar);
+ }
+ 
++pub(super) fn display_enabled_ga100(bar: &Bar0) -> bool {
++    !regs::ga100::NV_FUSE_STATUS_OPT_DISPLAY::read(bar).display_disabled()
++}
++
+ /// Shift applied to the sysmem address before it is written into
+ /// `NV_PFB_NISO_FLUSH_SYSMEM_ADDR_HI`,
+ const FLUSH_SYSMEM_ADDR_SHIFT_HI: u32 = 40;
+@@ -39,6 +43,14 @@ fn write_sysmem_flush_page(&self, bar: &Bar0, addr: u64) -> Result {
+ 
+         Ok(())
+     }
++
++    fn supports_display(&self, bar: &Bar0) -> bool {
++        display_enabled_ga100(bar)
++    }
++
++    fn vidmem_size(&self, bar: &Bar0) -> u64 {
++        super::tu102::vidmem_size_gp102(bar)
++    }
+ }
+ 
+ const GA100: Ga100 = Ga100;
+diff --git a/drivers/gpu/nova-core/fb/hal/ga102.rs b/drivers/gpu/nova-core/fb/hal/ga102.rs
+new file mode 100644
+index 000000000000..a73b77e39715
+--- /dev/null
++++ b/drivers/gpu/nova-core/fb/hal/ga102.rs
+@@ -0,0 +1,36 @@
++// SPDX-License-Identifier: GPL-2.0
++
++use kernel::prelude::*;
++
++use crate::driver::Bar0;
++use crate::fb::hal::FbHal;
++use crate::regs;
++
++fn vidmem_size_ga102(bar: &Bar0) -> u64 {
++    regs::NV_USABLE_FB_SIZE_IN_MB::read(bar).usable_fb_size()
++}
++
++struct Ga102;
++
++impl FbHal for Ga102 {
++    fn read_sysmem_flush_page(&self, bar: &Bar0) -> u64 {
++        super::ga100::read_sysmem_flush_page_ga100(bar)
++    }
++
++    fn write_sysmem_flush_page(&self, bar: &Bar0, addr: u64) -> Result {
++        super::ga100::write_sysmem_flush_page_ga100(bar, addr);
++
++        Ok(())
++    }
++
++    fn supports_display(&self, bar: &Bar0) -> bool {
++        super::ga100::display_enabled_ga100(bar)
++    }
++
++    fn vidmem_size(&self, bar: &Bar0) -> u64 {
++        vidmem_size_ga102(bar)
++    }
++}
++
++const GA102: Ga102 = Ga102;
++pub(super) const GA102_HAL: &dyn FbHal = &GA102;
+diff --git a/drivers/gpu/nova-core/fb/hal/tu102.rs b/drivers/gpu/nova-core/fb/hal/tu102.rs
+index 048859f9fd9d..6f8ae58e9481 100644
+--- a/drivers/gpu/nova-core/fb/hal/tu102.rs
++++ b/drivers/gpu/nova-core/fb/hal/tu102.rs
+@@ -26,6 +26,14 @@ pub(super) fn write_sysmem_flush_page_gm107(bar: &Bar0, addr: u64) -> Result {
+     }
+ }
+ 
++pub(super) fn display_enabled_gm107(bar: &Bar0) -> bool {
++    !regs::gm107::NV_FUSE_STATUS_OPT_DISPLAY::read(bar).display_disabled()
++}
++
++pub(super) fn vidmem_size_gp102(bar: &Bar0) -> u64 {
++    regs::NV_PFB_PRI_MMU_LOCAL_MEMORY_RANGE::read(bar).usable_fb_size()
++}
++
+ struct Tu102;
+ 
+ impl FbHal for Tu102 {
+@@ -36,6 +44,14 @@ fn read_sysmem_flush_page(&self, bar: &Bar0) -> u64 {
+     fn write_sysmem_flush_page(&self, bar: &Bar0, addr: u64) -> Result {
+         write_sysmem_flush_page_gm107(bar, addr)
+     }
++
++    fn supports_display(&self, bar: &Bar0) -> bool {
++        display_enabled_gm107(bar)
++    }
++
++    fn vidmem_size(&self, bar: &Bar0) -> u64 {
++        vidmem_size_gp102(bar)
++    }
+ }
+ 
+ const TU102: Tu102 = Tu102;
+diff --git a/drivers/gpu/nova-core/gpu.rs b/drivers/gpu/nova-core/gpu.rs
+index 3c64d2b43883..a748ce689e61 100644
+--- a/drivers/gpu/nova-core/gpu.rs
++++ b/drivers/gpu/nova-core/gpu.rs
+@@ -4,6 +4,7 @@
+ 
+ use crate::driver::Bar0;
+ use crate::falcon::{gsp::Gsp, sec2::Sec2, Falcon};
++use crate::fb::FbLayout;
+ use crate::fb::SysmemFlush;
+ use crate::firmware::{Firmware, FIRMWARE_VERSION};
+ use crate::gfw;
+@@ -215,6 +216,9 @@ pub(crate) fn new(
+ 
+         let _sec2_falcon = Falcon::<Sec2>::new(pdev.as_ref(), spec.chipset, bar, true)?;
+ 
++        let fb_layout = FbLayout::new(spec.chipset, bar)?;
++        dev_dbg!(pdev.as_ref(), "{:#x?}\n", fb_layout);
++
+         // Will be used in a later patch when fwsec firmware is needed.
+         let _bios = Vbios::new(pdev, bar)?;
+ 
+diff --git a/drivers/gpu/nova-core/regs.rs b/drivers/gpu/nova-core/regs.rs
+index a2f449eb08b5..8ca7bcb5a93f 100644
+--- a/drivers/gpu/nova-core/regs.rs
++++ b/drivers/gpu/nova-core/regs.rs
+@@ -52,6 +52,27 @@ pub(crate) fn chipset(self) -> Result<Chipset> {
+     23:0    adr_63_40 as u32;
+ });
+ 
++register!(NV_PFB_PRI_MMU_LOCAL_MEMORY_RANGE @ 0x00100ce0 {
++    3:0     lower_scale as u8;
++    9:4     lower_mag as u8;
++    30:30   ecc_mode_enabled as bool;
++});
++
++impl NV_PFB_PRI_MMU_LOCAL_MEMORY_RANGE {
++    /// Returns the usable framebuffer size, in bytes.
++    pub(crate) fn usable_fb_size(self) -> u64 {
++        let size = ((self.lower_mag() as u64) << (self.lower_scale() as u64))
++            * kernel::sizes::SZ_1M as u64;
++
++        if self.ecc_mode_enabled() {
++            // Remove the amount of memory reserved for ECC (one per 16 units).
++            size / 16 * 15
++        } else {
++            size
++        }
++    }
++}
++
+ /* PGC6 */
+ 
+ register!(NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_PRIV_LEVEL_MASK @ 0x00118128 {
+@@ -77,6 +98,42 @@ pub(crate) fn completed(self) -> bool {
+     }
+ }
+ 
++register!(NV_PGC6_AON_SECURE_SCRATCH_GROUP_42 @ 0x001183a4 {
++    31:0    value as u32;
++});
++
++register!(
++    NV_USABLE_FB_SIZE_IN_MB => NV_PGC6_AON_SECURE_SCRATCH_GROUP_42,
++    "Scratch group 42 register used as framebuffer size" {
++        31:0    value as u32, "Usable framebuffer size, in megabytes";
++    }
++);
++
++impl NV_USABLE_FB_SIZE_IN_MB {
++    /// Returns the usable framebuffer size, in bytes.
++    pub(crate) fn usable_fb_size(self) -> u64 {
++        u64::from(self.value()) * kernel::sizes::SZ_1M as u64
++    }
++}
++
++/* PDISP */
++
++register!(NV_PDISP_VGA_WORKSPACE_BASE @ 0x00625f04 {
++    3:3     status_valid as bool, "Set if the `addr` field is valid";
++    31:8    addr as u32, "VGA workspace base address divided by 0x10000";
++});
++
++impl NV_PDISP_VGA_WORKSPACE_BASE {
++    /// Returns the base address of the VGA workspace, or `None` if none exists.
++    pub(crate) fn vga_workspace_addr(self) -> Option<u64> {
++        if self.status_valid() {
++            Some((self.addr() as u64) << 16)
++        } else {
++            None
++        }
++    }
++}
++
+ /* FUSE */
+ 
+ register!(NV_FUSE_OPT_FPF_NVDEC_UCODE1_VERSION @ 0x00824100 {
+@@ -218,3 +275,22 @@ pub(crate) fn mem_scrubbing_done(self) -> bool {
+     4:4     core_select as bool => PeregrineCoreSelect;
+     8:8     br_fetch as bool;
+ });
++
++// The modules below provide registers that are not identical on all supported chips. They should
++// only be used in HAL modules.
++
++pub(crate) mod gm107 {
++    /* FUSE */
++
++    register!(NV_FUSE_STATUS_OPT_DISPLAY @ 0x00021c04 {
++        0:0     display_disabled as bool;
++    });
++}
++
++pub(crate) mod ga100 {
++    /* FUSE */
++
++    register!(NV_FUSE_STATUS_OPT_DISPLAY @ 0x00820c04 {
++        0:0     display_disabled as bool;
++    });
++}
+-- 
+2.52.0
+
