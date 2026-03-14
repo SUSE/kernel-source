@@ -1,0 +1,119 @@
+From 4a4d4e320a4d0b51f56c4a4bede11d595aa502da Mon Sep 17 00:00:00 2001
+From: Joel Fernandes <joelagnelf@nvidia.com>
+Date: Tue, 8 Jul 2025 15:49:41 +0900
+Subject: gpu: nova-core: Add code comments related to devinit
+Git-commit: 4a4d4e320a4d0b51f56c4a4bede11d595aa502da
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Add several code comments to reduce acronym soup and explain how devinit
+magic and bootflow works before driver loads. These are essential for
+debug and development of the nova driver.
+
+[acourbot@nvidia.com: reformat and reword a couple of sentences]
+
+Signed-off-by: Joel Fernandes <joelagnelf@nvidia.com>
+Signed-off-by: Alexandre Courbot <acourbot@nvidia.com>
+Link: https://lore.kernel.org/r/20250708-nova-docs-v4-1-9d188772c4c7@nvidia.com
+Signed-off-by: Danilo Krummrich <dakr@kernel.org>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/nova-core/gfw.rs  | 39 +++++++++++++++++++++++++++++++----
+ drivers/gpu/nova-core/regs.rs | 16 +++++++++++---
+ 2 files changed, 48 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/nova-core/gfw.rs b/drivers/gpu/nova-core/gfw.rs
+index d5b68e02d405..8ac1ed187199 100644
+--- a/drivers/gpu/nova-core/gfw.rs
++++ b/drivers/gpu/nova-core/gfw.rs
+@@ -1,10 +1,22 @@
+ // SPDX-License-Identifier: GPL-2.0
+ 
+-//! GPU Firmware (GFW) support.
++//! GPU Firmware (`GFW`) support, a.k.a `devinit`.
+ //!
+ //! Upon reset, the GPU runs some firmware code from the BIOS to setup its core parameters. Most of
+ //! the GPU is considered unusable until this step is completed, so we must wait on it before
+ //! performing driver initialization.
++//!
++//! A clarification about devinit terminology: devinit is a sequence of register read/writes after
++//! reset that performs tasks such as:
++//! 1. Programming VRAM memory controller timings.
++//! 2. Power sequencing.
++//! 3. Clock and PLL configuration.
++//! 4. Thermal management.
++//!
++//! devinit itself is a 'script' which is interpreted by an interpreter program typically running
++//! on the PMU microcontroller.
++//!
++//! Note that the devinit sequence also needs to run during suspend/resume.
+ 
+ use kernel::bindings;
+ use kernel::prelude::*;
+@@ -14,13 +26,32 @@
+ use crate::regs;
+ use crate::util;
+ 
+-/// Wait until `GFW` (GPU Firmware) completes, or a 4 seconds timeout elapses.
++/// Wait for the `GFW` (GPU firmware) boot completion signal (`GFW_BOOT`), or a 4 seconds timeout.
++///
++/// Upon GPU reset, several microcontrollers (such as PMU, SEC2, GSP etc) run some firmware code to
++/// setup its core parameters. Most of the GPU is considered unusable until this step is completed,
++/// so it must be waited on very early during driver initialization.
++///
++/// The `GFW` code includes several components that need to execute before the driver loads. These
++/// components are located in the VBIOS ROM and executed in a sequence on these different
++/// microcontrollers. The devinit sequence typically runs on the PMU, and the FWSEC runs on the
++/// GSP.
++///
++/// This function waits for a signal indicating that core initialization is complete. Before this
++/// signal is received, little can be done with the GPU. This signal is set by the FWSEC running on
++/// the GSP in Heavy-secured mode.
+ pub(crate) fn wait_gfw_boot_completion(bar: &Bar0) -> Result {
++    // Before accessing the completion status in `NV_PGC6_AON_SECURE_SCRATCH_GROUP_05`, we must
++    // first check `NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_PRIV_LEVEL_MASK`. This is because
++    // `NV_PGC6_AON_SECURE_SCRATCH_GROUP_05` becomes accessible only after the secure firmware
++    // (FWSEC) lowers the privilege level to allow CPU (LS/Light-secured) access. We can only
++    // safely read the status register from CPU (LS/Light-secured) once the mask indicates
++    // that the privilege level has been lowered.
++    //
+     // TIMEOUT: arbitrarily large value. GFW starts running immediately after the GPU is put out of
+     // reset, and should complete in less time than that.
+     util::wait_on(Delta::from_secs(4), || {
+-        // Check that FWSEC has lowered its protection level before reading the GFW_BOOT
+-        // status.
++        // Check that FWSEC has lowered its protection level before reading the GFW_BOOT status.
+         let gfw_booted = regs::NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_PRIV_LEVEL_MASK::read(bar)
+             .read_protection_level0()
+             && regs::NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_0_GFW_BOOT::read(bar).completed();
+diff --git a/drivers/gpu/nova-core/regs.rs b/drivers/gpu/nova-core/regs.rs
+index e8b8aabce3f3..3bb38197a890 100644
+--- a/drivers/gpu/nova-core/regs.rs
++++ b/drivers/gpu/nova-core/regs.rs
+@@ -104,9 +104,19 @@ pub(crate) fn higher_bound(self) -> u64 {
+     }
+ }
+ 
+-/* PGC6 */
+-
+-register!(NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_PRIV_LEVEL_MASK @ 0x00118128 {
++// PGC6 register space.
++//
++// `GC6` is a GPU low-power state where VRAM is in self-refresh and the GPU is powered down (except
++// for power rails needed to keep self-refresh working and important registers and hardware
++// blocks).
++//
++// These scratch registers remain powered on even in a low-power state and have a designated group
++// number.
++
++// Privilege level mask register. It dictates whether the host CPU has privilege to access the
++// `PGC6_AON_SECURE_SCRATCH_GROUP_05` register (which it needs to read GFW_BOOT).
++register!(NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_PRIV_LEVEL_MASK @ 0x00118128,
++          "Privilege level mask register" {
+     0:0     read_protection_level0 as bool, "Set after FWSEC lowers its protection level";
+ });
+ 
+-- 
+2.52.0
+
