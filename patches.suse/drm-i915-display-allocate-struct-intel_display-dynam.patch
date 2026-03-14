@@ -1,0 +1,211 @@
+From 6f142c52d3ce6eca626b1444a0694d27de6be993 Mon Sep 17 00:00:00 2001
+From: Jani Nikula <jani.nikula@intel.com>
+Date: Thu, 22 May 2025 12:48:42 +0300
+Subject: drm/i915/display: allocate struct intel_display dynamically
+Git-commit: 6f142c52d3ce6eca626b1444a0694d27de6be993
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Allocate struct intel_display dynamically in
+intel_display_device_probe() and free in intel_display_device_remove().
+
+V2: Remove duplicate intel_display_device_remove() on error path (Lucas)
+
+Reviewed-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Reviewed-by: Lucas De Marchi <lucas.demarchi@intel.com>
+Link: https://lore.kernel.org/r/8cd526a177061cddf71db59bd0901bd1a24e77be.1747907216.git.jani.nikula@intel.com
+Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/intel_display_device.c | 10 +++++++++-
+ drivers/gpu/drm/i915/i915_driver.c                  | 13 +++++++------
+ drivers/gpu/drm/i915/i915_drv.h                     |  1 -
+ drivers/gpu/drm/i915/selftests/mock_gem_device.c    | 11 ++++++++---
+ drivers/gpu/drm/xe/display/xe_display.c             |  7 ++++---
+ drivers/gpu/drm/xe/xe_device_types.h                |  1 -
+ 6 files changed, 28 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display_device.c b/drivers/gpu/drm/i915/display/intel_display_device.c
+index 90d714598664..1d8c2036d967 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_device.c
++++ b/drivers/gpu/drm/i915/display/intel_display_device.c
+@@ -1621,13 +1621,17 @@ static void display_platforms_or(struct intel_display_platforms *dst,
+ 
+ struct intel_display *intel_display_device_probe(struct pci_dev *pdev)
+ {
+-	struct intel_display *display = to_intel_display(pdev);
++	struct intel_display *display;
+ 	const struct intel_display_device_info *info;
+ 	struct intel_display_ip_ver ip_ver = {};
+ 	const struct platform_desc *desc;
+ 	const struct subplatform_desc *subdesc;
+ 	enum intel_step step;
+ 
++	display = kzalloc(sizeof(*display), GFP_KERNEL);
++	if (!display)
++		return ERR_PTR(-ENOMEM);
++
+ 	/* Add drm device backpointer as early as possible. */
+ 	display->drm = pci_get_drvdata(pdev);
+ 
+@@ -1708,7 +1712,11 @@ struct intel_display *intel_display_device_probe(struct pci_dev *pdev)
+ 
+ void intel_display_device_remove(struct intel_display *display)
+ {
++	if (!display)
++		return;
++
+ 	intel_display_params_free(&display->params);
++	kfree(display);
+ }
+ 
+ static void __intel_display_device_info_runtime_init(struct intel_display *display)
+diff --git a/drivers/gpu/drm/i915/i915_driver.c b/drivers/gpu/drm/i915/i915_driver.c
+index 950b7ad8d675..d33b0eb83a4f 100644
+--- a/drivers/gpu/drm/i915/i915_driver.c
++++ b/drivers/gpu/drm/i915/i915_driver.c
+@@ -293,6 +293,8 @@ static void i915_driver_late_release(struct drm_i915_private *dev_priv)
+ 	intel_sbi_fini(dev_priv);
+ 
+ 	i915_params_free(&dev_priv->params);
++
++	intel_display_device_remove(display);
+ }
+ 
+ /**
+@@ -735,6 +737,7 @@ i915_driver_create(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 	const struct intel_device_info *match_info =
+ 		(struct intel_device_info *)ent->driver_data;
+ 	struct drm_i915_private *i915;
++	struct intel_display *display;
+ 
+ 	i915 = devm_drm_dev_alloc(&pdev->dev, &i915_drm_driver,
+ 				  struct drm_i915_private, drm);
+@@ -749,10 +752,11 @@ i915_driver_create(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 	/* Set up device info and initial runtime info. */
+ 	intel_device_info_driver_create(i915, pdev->device, match_info);
+ 
+-	/* TODO: Allocate display dynamically. */
+-	i915->display = &i915->__display;
++	display = intel_display_device_probe(pdev);
++	if (IS_ERR(display))
++		return ERR_CAST(display);
+ 
+-	intel_display_device_probe(pdev);
++	i915->display = display;
+ 
+ 	return i915;
+ }
+@@ -911,7 +915,6 @@ void i915_driver_remove(struct drm_i915_private *i915)
+ static void i915_driver_release(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = to_i915(dev);
+-	struct intel_display *display = dev_priv->display;
+ 	struct intel_runtime_pm *rpm = &dev_priv->runtime_pm;
+ 	intel_wakeref_t wakeref;
+ 
+@@ -934,8 +937,6 @@ static void i915_driver_release(struct drm_device *dev)
+ 	intel_runtime_pm_driver_release(rpm);
+ 
+ 	i915_driver_late_release(dev_priv);
+-
+-	intel_display_device_remove(display);
+ }
+ 
+ static int i915_driver_open(struct drm_device *dev, struct drm_file *file)
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 0841988c4a67..fd0274ec9c2c 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -178,7 +178,6 @@ struct drm_i915_private {
+ 	struct drm_device drm;
+ 
+ 	struct intel_display *display;
+-	struct intel_display __display; /* Transitional. Do not use directly. */
+ 
+ 	/* FIXME: Device release actions should all be moved to drmm_ */
+ 	bool do_release;
+diff --git a/drivers/gpu/drm/i915/selftests/mock_gem_device.c b/drivers/gpu/drm/i915/selftests/mock_gem_device.c
+index 0ea12c68cedb..dab2b71a2a8f 100644
+--- a/drivers/gpu/drm/i915/selftests/mock_gem_device.c
++++ b/drivers/gpu/drm/i915/selftests/mock_gem_device.c
+@@ -141,6 +141,7 @@ struct drm_i915_private *mock_gem_device(void)
+ 	static struct dev_iommu fake_iommu = { .priv = (void *)-1 };
+ #endif
+ 	struct drm_i915_private *i915;
++	struct intel_display *display;
+ 	struct pci_dev *pdev;
+ 	int ret;
+ 
+@@ -180,10 +181,11 @@ struct drm_i915_private *mock_gem_device(void)
+ 	/* Set up device info and initial runtime info. */
+ 	intel_device_info_driver_create(i915, pdev->device, &mock_info);
+ 
+-	/* TODO: Allocate display dynamically. */
+-	i915->display = &i915->__display;
++	display = intel_display_device_probe(pdev);
++	if (IS_ERR(display))
++		goto err_device;
+ 
+-	intel_display_device_probe(pdev);
++	i915->display = display;
+ 
+ 	dev_pm_domain_set(&pdev->dev, &pm_domain);
+ 	pm_runtime_enable(&pdev->dev);
+@@ -260,6 +262,7 @@ struct drm_i915_private *mock_gem_device(void)
+ 	intel_gt_driver_late_release_all(i915);
+ 	intel_memory_regions_driver_release(i915);
+ 	drm_mode_config_cleanup(&i915->drm);
++err_device:
+ 	mock_destroy_device(i915);
+ 
+ 	return NULL;
+@@ -269,6 +272,8 @@ void mock_destroy_device(struct drm_i915_private *i915)
+ {
+ 	struct device *dev = i915->drm.dev;
+ 
++	intel_display_device_remove(i915->display);
++
+ 	devres_release_group(dev, NULL);
+ 	put_device(dev);
+ }
+diff --git a/drivers/gpu/drm/xe/display/xe_display.c b/drivers/gpu/drm/xe/display/xe_display.c
+index 1e59b6dd2c3b..db7ef8737e1d 100644
+--- a/drivers/gpu/drm/xe/display/xe_display.c
++++ b/drivers/gpu/drm/xe/display/xe_display.c
+@@ -529,15 +529,16 @@ int xe_display_probe(struct xe_device *xe)
+ 	if (!xe->info.probe_display)
+ 		goto no_display;
+ 
+-	/* TODO: Allocate display dynamically. */
+-	xe->display = &xe->__display;
+-
+ 	display = intel_display_device_probe(pdev);
++	if (IS_ERR(display))
++		return PTR_ERR(display);
+ 
+ 	err = drmm_add_action_or_reset(&xe->drm, display_device_remove, display);
+ 	if (err)
+ 		return err;
+ 
++	xe->display = display;
++
+ 	if (has_display(xe))
+ 		return 0;
+ 
+diff --git a/drivers/gpu/drm/xe/xe_device_types.h b/drivers/gpu/drm/xe/xe_device_types.h
+index 5f62fe0e19f2..a0623fac75a9 100644
+--- a/drivers/gpu/drm/xe/xe_device_types.h
++++ b/drivers/gpu/drm/xe/xe_device_types.h
+@@ -601,7 +601,6 @@ struct xe_device {
+ 	 * migrating to the right sub-structs
+ 	 */
+ 	struct intel_display *display;
+-	struct intel_display __display; /* Transitional. Do not use directly. */
+ 
+ 	struct dram_info {
+ 		bool wm_lv_0_adjust_needed;
+-- 
+2.52.0
+
