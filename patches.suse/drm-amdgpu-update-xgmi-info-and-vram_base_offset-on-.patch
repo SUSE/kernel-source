@@ -1,0 +1,113 @@
+From 855a2a029a2eda88317cdccde9b3a3168ad193dc Mon Sep 17 00:00:00 2001
+From: Samuel Zhang <guoqing.zhang@amd.com>
+Date: Fri, 11 Apr 2025 15:59:34 +0800
+Subject: drm/amdgpu: update xgmi info and vram_base_offset on resume
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 855a2a029a2eda88317cdccde9b3a3168ad193dc
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+For SRIOV VM env with XGMI enabled systems, XGMI physical node id may
+change when hibernate and resume with different VF.
+
+Update XGMI info and vram_base_offset on resume for gfx444 SRIOV env.
+Add amdgpu_virt_xgmi_migrate_enabled() as the feature flag.
+
+Signed-off-by: Jiang Liu <gerry@linux.alibaba.com>
+Signed-off-by: Samuel Zhang <guoqing.zhang@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Lijo Lazar <lijo.lazar@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c | 31 ++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_virt.h   |  7 +++++
+ 2 files changed, 38 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 9e84386166b6..0e1668ebe90b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -2773,6 +2773,12 @@ static int amdgpu_device_ip_early_init(struct amdgpu_device *adev)
+ 	if (!amdgpu_device_pcie_dynamic_switching_supported(adev))
+ 		adev->pm.pp_feature &= ~PP_PCIE_DPM_MASK;
+ 
++	adev->virt.is_xgmi_node_migrate_enabled = false;
++	if (amdgpu_sriov_vf(adev)) {
++		adev->virt.is_xgmi_node_migrate_enabled =
++			amdgpu_ip_version((adev), GC_HWIP, 0) == IP_VERSION(9, 4, 4);
++	}
++
+ 	total = true;
+ 	for (i = 0; i < adev->num_ip_blocks; i++) {
+ 		ip_block = &adev->ip_blocks[i];
+@@ -5098,6 +5104,25 @@ int amdgpu_device_suspend(struct drm_device *dev, bool notify_clients)
+ 	return 0;
+ }
+ 
++static inline int amdgpu_virt_resume(struct amdgpu_device *adev)
++{
++	int r;
++	unsigned int prev_physical_node_id = adev->gmc.xgmi.physical_node_id;
++
++	r = adev->gfxhub.funcs->get_xgmi_info(adev);
++	if (r)
++		return r;
++
++	dev_info(adev->dev, "xgmi node, old id %d, new id %d\n",
++		prev_physical_node_id, adev->gmc.xgmi.physical_node_id);
++
++	adev->vm_manager.vram_base_offset = adev->gfxhub.funcs->get_mc_fb_offset(adev);
++	adev->vm_manager.vram_base_offset +=
++		adev->gmc.xgmi.physical_node_id * adev->gmc.xgmi.node_segment_size;
++
++	return 0;
++}
++
+ /**
+  * amdgpu_device_resume - initiate device resume
+  *
+@@ -5119,6 +5144,12 @@ int amdgpu_device_resume(struct drm_device *dev, bool notify_clients)
+ 			return r;
+ 	}
+ 
++	if (amdgpu_virt_xgmi_migrate_enabled(adev)) {
++		r = amdgpu_virt_resume(adev);
++		if (r)
++			goto exit;
++	}
++
+ 	if (dev->switch_power_state == DRM_SWITCH_POWER_OFF)
+ 		return 0;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_virt.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_virt.h
+index 577c6194db78..9320461bb486 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_virt.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_virt.h
+@@ -301,6 +301,9 @@ struct amdgpu_virt {
+ 	union amd_sriov_ras_caps ras_telemetry_en_caps;
+ 	struct amdgpu_virt_ras ras;
+ 	struct amd_sriov_ras_telemetry_error_count count_cache;
++
++	/* hibernate and resume with different VF feature for xgmi enabled system */
++	bool is_xgmi_node_migrate_enabled;
+ };
+ 
+ struct amdgpu_video_codec_info;
+@@ -386,6 +389,10 @@ static inline bool is_virtual_machine(void)
+ 	((adev)->virt.gim_feature & AMDGIM_FEATURE_VCN_RB_DECOUPLE)
+ #define amdgpu_sriov_is_mes_info_enable(adev) \
+ 	((adev)->virt.gim_feature & AMDGIM_FEATURE_MES_INFO_ENABLE)
++
++#define amdgpu_virt_xgmi_migrate_enabled(adev) \
++	((adev)->virt.is_xgmi_node_migrate_enabled && (adev)->gmc.xgmi.node_segment_size != 0)
++
+ bool amdgpu_virt_mmio_blocked(struct amdgpu_device *adev);
+ void amdgpu_virt_init_setting(struct amdgpu_device *adev);
+ int amdgpu_virt_request_full_gpu(struct amdgpu_device *adev, bool init);
+-- 
+2.52.0
+
