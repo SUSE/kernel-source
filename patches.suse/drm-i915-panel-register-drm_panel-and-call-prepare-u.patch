@@ -1,0 +1,199 @@
+From 3fdd5bfbd6381e4acf86ee1d00a87d49fd39fdc6 Mon Sep 17 00:00:00 2001
+From: Jani Nikula <jani.nikula@intel.com>
+Date: Fri, 6 Jun 2025 12:05:11 +0300
+Subject: drm/i915/panel: register drm_panel and call prepare/unprepare for
+ ICL+ DSI
+Git-commit: 3fdd5bfbd6381e4acf86ee1d00a87d49fd39fdc6
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Allocate and register a drm_panel so that drm_panel_followers can find
+the panel. Pass the drm_connector::kdev device to drm_panel allocation
+for matching. That's only available after drm_sysfs_connector_add(), so
+we need to postpone the drm_panel allocation until .late_register()
+hook.
+
+The drm_panel framework is moving towards devm_drm_panel_alloc(). It
+requires a wrapper struct, and struct intel_panel would be the natural
+candidate. However, we can't postpone its allocation until
+.late_register(), so we have to use __devm_drm_panel_alloc() directly
+for now.
+
+Call the drm_panel_prepare() and drm_panel_unprepare() functions for
+ICL+ DSI, so that followers get notified of the panel power state
+changes. This can later be expanded to VLV+ DSI and eDP.
+
+Cc: Maxime Ripard <mripard@kernel.org>
+Cc: Heikki Krogerus <heikki.krogerus@linux.intel.com>
+Cc: Lee Shawn C <shawn.c.lee@intel.com>
+Tested-by: Lee Shawn C <shawn.c.lee@intel.com>
+Reviewed-by: Maxime Ripard <mripard@kernel.org>
+Link: https://lore.kernel.org/r/13d15c1414e65ffb21944d66e2820befdab54e98.1749199013.git.jani.nikula@intel.com
+Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/icl_dsi.c        |  4 +
+ .../drm/i915/display/intel_display_types.h    |  4 +
+ drivers/gpu/drm/i915/display/intel_panel.c    | 82 ++++++++++++++++++-
+ drivers/gpu/drm/i915/display/intel_panel.h    |  4 +
+ 4 files changed, 93 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/i915/display/icl_dsi.c b/drivers/gpu/drm/i915/display/icl_dsi.c
+index ca7033251e91..aa566ad3f5cd 100644
+--- a/drivers/gpu/drm/i915/display/icl_dsi.c
++++ b/drivers/gpu/drm/i915/display/icl_dsi.c
+@@ -1276,6 +1276,8 @@ static void gen11_dsi_enable(struct intel_atomic_state *state,
+ 	intel_backlight_enable(crtc_state, conn_state);
+ 	intel_dsi_vbt_exec_sequence(intel_dsi, MIPI_SEQ_BACKLIGHT_ON);
+ 
++	intel_panel_prepare(crtc_state, conn_state);
++
+ 	intel_crtc_vblank_on(crtc_state);
+ }
+ 
+@@ -1409,6 +1411,8 @@ static void gen11_dsi_disable(struct intel_atomic_state *state,
+ {
+ 	struct intel_dsi *intel_dsi = enc_to_intel_dsi(encoder);
+ 
++	intel_panel_unprepare(old_conn_state);
++
+ 	/* step1: turn off backlight */
+ 	intel_dsi_vbt_exec_sequence(intel_dsi, MIPI_SEQ_BACKLIGHT_OFF);
+ 	intel_backlight_disable(old_conn_state);
+diff --git a/drivers/gpu/drm/i915/display/intel_display_types.h b/drivers/gpu/drm/i915/display/intel_display_types.h
+index d6d0440dcee9..79c328d49ef0 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_types.h
++++ b/drivers/gpu/drm/i915/display/intel_display_types.h
+@@ -37,6 +37,7 @@
+ #include <drm/drm_crtc.h>
+ #include <drm/drm_encoder.h>
+ #include <drm/drm_framebuffer.h>
++#include <drm/drm_panel.h>
+ #include <drm/drm_rect.h>
+ #include <drm/drm_vblank_work.h>
+ #include <drm/intel/i915_hdcp_interface.h>
+@@ -384,6 +385,9 @@ struct intel_vbt_panel_data {
+ };
+ 
+ struct intel_panel {
++	/* Simple drm_panel */
++	struct drm_panel *base;
++
+ 	/* Fixed EDID for eDP and LVDS. May hold ERR_PTR for invalid EDID. */
+ 	const struct drm_edid *fixed_edid;
+ 
+diff --git a/drivers/gpu/drm/i915/display/intel_panel.c b/drivers/gpu/drm/i915/display/intel_panel.c
+index 5ae302bee191..b1d549e6cf53 100644
+--- a/drivers/gpu/drm/i915/display/intel_panel.c
++++ b/drivers/gpu/drm/i915/display/intel_panel.c
+@@ -463,12 +463,92 @@ void intel_panel_fini(struct intel_connector *connector)
+ 	}
+ }
+ 
++const struct drm_panel_funcs dummy_panel_funcs = {
++};
++
+ int intel_panel_register(struct intel_connector *connector)
+ {
+-	return intel_backlight_device_register(connector);
++	struct intel_display *display = to_intel_display(connector);
++	struct intel_panel *panel = &connector->panel;
++	int ret;
++
++	ret = intel_backlight_device_register(connector);
++	if (ret)
++		return ret;
++
++	if (connector->base.connector_type == DRM_MODE_CONNECTOR_DSI) {
++		struct device *dev = connector->base.kdev;
++		struct drm_panel *base;
++
++		/* Sanity check. */
++		if (drm_WARN_ON(display->drm, !dev))
++			goto out;
++
++		/*
++		 * We need drm_connector::kdev for allocating the panel, to make
++		 * drm_panel_add_follower() lookups work. The kdev is
++		 * initialized in drm_sysfs_connector_add(), just before the
++		 * connector .late_register() hooks. So we can't allocate the
++		 * panel at connector init time, and can't allocate struct
++		 * intel_panel with a drm_panel sub-struct. For now, use
++		 * __devm_drm_panel_alloc() directly.
++		 *
++		 * The lookups also depend on drm_connector::fwnode being set in
++		 * intel_acpi_assign_connector_fwnodes(). However, if that's
++		 * missing, it will gracefully lead to -EPROBE_DEFER in
++		 * drm_panel_add_follower().
++		 */
++		base = __devm_drm_panel_alloc(dev, sizeof(*base), 0,
++					      &dummy_panel_funcs,
++					      connector->base.connector_type);
++		if (IS_ERR(base)) {
++			ret = PTR_ERR(base);
++			goto err;
++		}
++
++		panel->base = base;
++
++		drm_panel_add(panel->base);
++
++		drm_dbg_kms(display->drm, "[CONNECTOR:%d:%s] Registered panel device '%s', has fwnode: %s\n",
++			    connector->base.base.id, connector->base.name,
++			    dev_name(dev), str_yes_no(dev_fwnode(dev)));
++	}
++
++out:
++	return 0;
++
++err:
++	intel_backlight_device_unregister(connector);
++
++	return ret;
+ }
+ 
+ void intel_panel_unregister(struct intel_connector *connector)
+ {
++	struct intel_panel *panel = &connector->panel;
++
++	if (panel->base)
++		drm_panel_remove(panel->base);
++
+ 	intel_backlight_device_unregister(connector);
+ }
++
++/* Notify followers, if any, about power being up. */
++void intel_panel_prepare(const struct intel_crtc_state *crtc_state,
++			 const struct drm_connector_state *conn_state)
++{
++	struct intel_connector *connector = to_intel_connector(conn_state->connector);
++	struct intel_panel *panel = &connector->panel;
++
++	drm_panel_prepare(panel->base);
++}
++
++/* Notify followers, if any, about power going down. */
++void intel_panel_unprepare(const struct drm_connector_state *old_conn_state)
++{
++	struct intel_connector *connector = to_intel_connector(old_conn_state->connector);
++	struct intel_panel *panel = &connector->panel;
++
++	drm_panel_unprepare(panel->base);
++}
+diff --git a/drivers/gpu/drm/i915/display/intel_panel.h b/drivers/gpu/drm/i915/display/intel_panel.h
+index 3d592a4404f3..56a6412cf0fb 100644
+--- a/drivers/gpu/drm/i915/display/intel_panel.h
++++ b/drivers/gpu/drm/i915/display/intel_panel.h
+@@ -53,4 +53,8 @@ void intel_panel_add_vbt_sdvo_fixed_mode(struct intel_connector *connector);
+ void intel_panel_add_encoder_fixed_mode(struct intel_connector *connector,
+ 					struct intel_encoder *encoder);
+ 
++void intel_panel_prepare(const struct intel_crtc_state *crtc_state,
++			 const struct drm_connector_state *conn_state);
++void intel_panel_unprepare(const struct drm_connector_state *old_conn_state);
++
+ #endif /* __INTEL_PANEL_H__ */
+-- 
+2.52.0
+
