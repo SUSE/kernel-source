@@ -1,0 +1,163 @@
+From e72cd597c35012146bfe77b736a30fee3e77e61e Mon Sep 17 00:00:00 2001
+From: Dmitry Baryshkov <dmitry.baryshkov@oss.qualcomm.com>
+Date: Sat, 17 May 2025 04:59:39 +0300
+Subject: drm/connector: add CEC-related fields
+Git-commit: e72cd597c35012146bfe77b736a30fee3e77e61e
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+As a preparation to adding HDMI CEC helper code, add CEC-related fields
+to the struct drm_connector. The callbacks abstract CEC infrastructure
+in order to support CEC adapters and CEC notifiers in a universal way.
+
+CEC data is a void pointer as it allows us to make CEC data
+helper-specific. For example, currently it will be either cec_notifier
+or cec_adapter + drm_connector_hdmi_cec_funcs. Later cec-pin might store
+platform callbacks here. DP CEC might need to store AUX pointer, etc.
+
+Signed-off-by: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Reviewed-by: Maxime Ripard <mripard@kernel.org>
+Link: https://lore.kernel.org/r/20250517-drm-hdmi-connector-cec-v6-3-35651db6f19b@oss.qualcomm.com
+Signed-off-by: Dmitry Baryshkov <dmitry.baryshkov@oss.qualcomm.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/drm_connector.c | 41 ++++++++++++++++++++++++++++
+ include/drm/drm_connector.h     | 48 +++++++++++++++++++++++++++++++++
+ 2 files changed, 89 insertions(+)
+
+diff --git a/drivers/gpu/drm/drm_connector.c b/drivers/gpu/drm/drm_connector.c
+index 48b08c9611a7..395e1bf006bd 100644
+--- a/drivers/gpu/drm/drm_connector.c
++++ b/drivers/gpu/drm/drm_connector.c
+@@ -279,6 +279,7 @@ static int drm_connector_init_only(struct drm_device *dev,
+ 	INIT_LIST_HEAD(&connector->probed_modes);
+ 	INIT_LIST_HEAD(&connector->modes);
+ 	mutex_init(&connector->mutex);
++	mutex_init(&connector->cec.mutex);
+ 	mutex_init(&connector->eld_mutex);
+ 	mutex_init(&connector->edid_override_mutex);
+ 	mutex_init(&connector->hdmi.infoframes.lock);
+@@ -701,6 +702,46 @@ static void drm_mode_remove(struct drm_connector *connector,
+ 	drm_mode_destroy(connector->dev, mode);
+ }
+ 
++/**
++ * drm_connector_cec_phys_addr_invalidate - invalidate CEC physical address
++ * @connector: connector undergoing CEC operation
++ *
++ * Invalidated CEC physical address set for this DRM connector.
++ */
++void drm_connector_cec_phys_addr_invalidate(struct drm_connector *connector)
++{
++	mutex_lock(&connector->cec.mutex);
++
++	if (connector->cec.funcs &&
++	    connector->cec.funcs->phys_addr_invalidate)
++		connector->cec.funcs->phys_addr_invalidate(connector);
++
++	mutex_unlock(&connector->cec.mutex);
++}
++EXPORT_SYMBOL(drm_connector_cec_phys_addr_invalidate);
++
++/**
++ * drm_connector_cec_phys_addr_set - propagate CEC physical address
++ * @connector: connector undergoing CEC operation
++ *
++ * Propagate CEC physical address from the display_info to this DRM connector.
++ */
++void drm_connector_cec_phys_addr_set(struct drm_connector *connector)
++{
++	u16 addr;
++
++	mutex_lock(&connector->cec.mutex);
++
++	addr = connector->display_info.source_physical_address;
++
++	if (connector->cec.funcs &&
++	    connector->cec.funcs->phys_addr_set)
++		connector->cec.funcs->phys_addr_set(connector, addr);
++
++	mutex_unlock(&connector->cec.mutex);
++}
++EXPORT_SYMBOL(drm_connector_cec_phys_addr_set);
++
+ /**
+  * drm_connector_cleanup - cleans up an initialised connector
+  * @connector: connector to cleanup
+diff --git a/include/drm/drm_connector.h b/include/drm/drm_connector.h
+index f13d597370a3..73903c3c842f 100644
+--- a/include/drm/drm_connector.h
++++ b/include/drm/drm_connector.h
+@@ -1191,6 +1191,29 @@ struct drm_connector_hdmi_audio_funcs {
+ 			   bool enable, int direction);
+ };
+ 
++void drm_connector_cec_phys_addr_invalidate(struct drm_connector *connector);
++void drm_connector_cec_phys_addr_set(struct drm_connector *connector);
++
++/**
++ * struct drm_connector_cec_funcs - drm_hdmi_connector control functions
++ */
++struct drm_connector_cec_funcs {
++	/**
++	 * @phys_addr_invalidate: mark CEC physical address as invalid
++	 *
++	 * The callback to mark CEC physical address as invalid, abstracting
++	 * the operation.
++	 */
++	void (*phys_addr_invalidate)(struct drm_connector *connector);
++
++	/**
++	 * @phys_addr_set: set CEC physical address
++	 *
++	 * The callback to set CEC physical address, abstracting the operation.
++	 */
++	void (*phys_addr_set)(struct drm_connector *connector, u16 addr);
++};
++
+ /**
+  * struct drm_connector_hdmi_funcs - drm_hdmi_connector control functions
+  */
+@@ -1832,6 +1855,26 @@ struct drm_connector_hdmi {
+ 	} infoframes;
+ };
+ 
++/**
++ * struct drm_connector_cec - DRM Connector CEC-related structure
++ */
++struct drm_connector_cec {
++	/**
++	 * @mutex: protects all fields in this structure.
++	 */
++	struct mutex mutex;
++
++	/**
++	 * @funcs: CEC Control Functions
++	 */
++	const struct drm_connector_cec_funcs *funcs;
++
++	/**
++	 * @data: CEC implementation-specific data
++	 */
++	void *data;
++};
++
+ /**
+  * struct drm_connector - central DRM connector control structure
+  *
+@@ -2253,6 +2296,11 @@ struct drm_connector {
+ 	 * @hdmi_audio: HDMI codec properties and non-DRM state.
+ 	 */
+ 	struct drm_connector_hdmi_audio hdmi_audio;
++
++	/**
++	 * @cec: CEC-related data.
++	 */
++	struct drm_connector_cec cec;
+ };
+ 
+ #define obj_to_connector(x) container_of(x, struct drm_connector, base)
+-- 
+2.52.0
+
