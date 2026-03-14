@@ -1,0 +1,194 @@
+From db122ece325a3a19eeabf98e61db70fe890b4b5a Mon Sep 17 00:00:00 2001
+From: Oleh Kuzhylnyi <okuzhyln@amd.com>
+Date: Thu, 24 Apr 2025 14:40:09 +0200
+Subject: drm/amd/display: Indirect buffer transport for FAMS2 commands
+Git-commit: db122ece325a3a19eeabf98e61db70fe890b4b5a
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+[Why]
+The quantity and duration of FAMS2 commands are set to increase
+in future products. This necessitates the implementation of a new
+mechanism for chaining commands together, allowing all commands
+to be processed within a single transaction.
+
+[How]
+The indirect buffer acts as a shared buffer on the driver side,
+mapped to DMUB's internal CW7 address. Its source address and
+size are sent through mailbox command to DMUB, triggering the
+transaction.
+
+Reviewed-by: Alvin Lee <alvin.lee2@amd.com>
+Signed-off-by: Oleh Kuzhylnyi <okuzhyln@amd.com>
+Signed-off-by: Wayne Lin <wayne.lin@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c |  1 +
+ drivers/gpu/drm/amd/display/dc/dc_dmub_srv.c  | 59 ++++++++++++++++++-
+ drivers/gpu/drm/amd/display/dmub/dmub_srv.h   |  2 +
+ .../gpu/drm/amd/display/dmub/src/dmub_srv.c   |  9 ++-
+ 4 files changed, 69 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index f58fa5da7fe5..dac908baca84 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -2404,6 +2404,7 @@ static int dm_dmub_sw_init(struct amdgpu_device *adev)
+ 		DMUB_WINDOW_MEMORY_TYPE_FB,		//DMUB_WINDOW_5_TRACEBUFF
+ 		DMUB_WINDOW_MEMORY_TYPE_FB,		//DMUB_WINDOW_6_FW_STATE
+ 		DMUB_WINDOW_MEMORY_TYPE_FB,		//DMUB_WINDOW_7_SCRATCH_MEM
++		DMUB_WINDOW_MEMORY_TYPE_FB,		//DMUB_WINDOW_IB_MEM
+ 		DMUB_WINDOW_MEMORY_TYPE_FB,		//DMUB_WINDOW_SHARED_STATE
+ 	};
+ 	int r;
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_dmub_srv.c b/drivers/gpu/drm/amd/display/dc/dc_dmub_srv.c
+index afbcf866520e..8c52d3fea1d8 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_dmub_srv.c
++++ b/drivers/gpu/drm/amd/display/dc/dc_dmub_srv.c
+@@ -1656,7 +1656,7 @@ bool dc_wake_and_execute_gpint(const struct dc_context *ctx, enum dmub_gpint_com
+ 	return result;
+ }
+ 
+-void dc_dmub_srv_fams2_update_config(struct dc *dc,
++static void dc_dmub_srv_rb_based_fams2_update_config(struct dc *dc,
+ 		struct dc_state *context,
+ 		bool enable)
+ {
+@@ -1722,6 +1722,63 @@ void dc_dmub_srv_fams2_update_config(struct dc *dc,
+ 	dm_execute_dmub_cmd_list(dc->ctx, num_cmds, cmd, DM_DMUB_WAIT_TYPE_WAIT);
+ }
+ 
++static void dc_dmub_srv_ib_based_fams2_update_config(struct dc *dc,
++		struct dc_state *context,
++		bool enable)
++{
++	struct dmub_fams2_config_v2 *config = (struct dmub_fams2_config_v2 *)dc->ctx->dmub_srv->dmub->ib_mem_gart.cpu_addr;
++	union dmub_rb_cmd cmd;
++	uint32_t i;
++
++	memset(config, 0, sizeof(*config));
++	memset(&cmd, 0, sizeof(cmd));
++
++	cmd.ib_fams2_config.header.type = DMUB_CMD__FW_ASSISTED_MCLK_SWITCH;
++	cmd.ib_fams2_config.header.sub_type = DMUB_CMD__FAMS2_IB_CONFIG;
++
++	cmd.ib_fams2_config.ib_data.src.quad_part = dc->ctx->dmub_srv->dmub->ib_mem_gart.gpu_addr;
++	cmd.ib_fams2_config.ib_data.size = sizeof(*config);
++
++	if (enable && context->bw_ctx.bw.dcn.fams2_global_config.features.bits.enable) {
++		/* copy static feature configuration overrides */
++		config->global.features.bits.enable_stall_recovery = dc->debug.fams2_config.bits.enable_stall_recovery;
++		config->global.features.bits.enable_offload_flip = dc->debug.fams2_config.bits.enable_offload_flip;
++		config->global.features.bits.enable_debug = dc->debug.fams2_config.bits.enable_debug;
++
++		/* send global configuration parameters */
++		memcpy(&config->global, &context->bw_ctx.bw.dcn.fams2_global_config,
++			sizeof(struct dmub_cmd_fams2_global_config));
++
++		/* construct per-stream configs */
++		for (i = 0; i < context->bw_ctx.bw.dcn.fams2_global_config.num_streams; i++) {
++			/* copy stream static base state */
++			memcpy(&config->stream_v1[i].base,
++				&context->bw_ctx.bw.dcn.fams2_stream_base_params[i],
++				sizeof(config->stream_v1[i].base));
++
++			/* copy stream static sub-state */
++			memcpy(&config->stream_v1[i].sub_state,
++				&context->bw_ctx.bw.dcn.fams2_stream_sub_params[i],
++				sizeof(config->stream_v1[i].sub_state));
++		}
++	}
++
++	config->global.features.bits.enable_visual_confirm = dc->debug.visual_confirm == VISUAL_CONFIRM_FAMS2;
++	config->global.features.bits.enable = enable;
++
++	dm_execute_dmub_cmd_list(dc->ctx, 1, &cmd, DM_DMUB_WAIT_TYPE_WAIT);
++}
++
++void dc_dmub_srv_fams2_update_config(struct dc *dc,
++		struct dc_state *context,
++		bool enable)
++{
++	if (dc->debug.fams_version.major == 2)
++		dc_dmub_srv_rb_based_fams2_update_config(dc, context, enable);
++	if (dc->debug.fams_version.major == 3)
++		dc_dmub_srv_ib_based_fams2_update_config(dc, context, enable);
++}
++
+ void dc_dmub_srv_fams2_drr_update(struct dc *dc,
+ 		uint32_t tg_inst,
+ 		uint32_t vtotal_min,
+diff --git a/drivers/gpu/drm/amd/display/dmub/dmub_srv.h b/drivers/gpu/drm/amd/display/dmub/dmub_srv.h
+index 3f3fa1b6a69e..211486724e84 100644
+--- a/drivers/gpu/drm/amd/display/dmub/dmub_srv.h
++++ b/drivers/gpu/drm/amd/display/dmub/dmub_srv.h
+@@ -129,6 +129,7 @@ enum dmub_window_id {
+ 	DMUB_WINDOW_5_TRACEBUFF,
+ 	DMUB_WINDOW_6_FW_STATE,
+ 	DMUB_WINDOW_7_SCRATCH_MEM,
++	DMUB_WINDOW_IB_MEM,
+ 	DMUB_WINDOW_SHARED_STATE,
+ 	DMUB_WINDOW_TOTAL,
+ };
+@@ -539,6 +540,7 @@ struct dmub_srv {
+ 	uint32_t fw_version;
+ 	bool is_virtual;
+ 	struct dmub_fb scratch_mem_fb;
++	struct dmub_fb ib_mem_gart;
+ 	volatile struct dmub_shared_state_feature_block *shared_state;
+ 	volatile const struct dmub_fw_state *fw_state;
+ 
+diff --git a/drivers/gpu/drm/amd/display/dmub/src/dmub_srv.c b/drivers/gpu/drm/amd/display/dmub/src/dmub_srv.c
+index acca7943a8c8..5f827104b4f8 100644
+--- a/drivers/gpu/drm/amd/display/dmub/src/dmub_srv.c
++++ b/drivers/gpu/drm/amd/display/dmub/src/dmub_srv.c
+@@ -65,6 +65,9 @@
+ /* Default scratch mem size. */
+ #define DMUB_SCRATCH_MEM_SIZE (1024)
+ 
++/* Default indirect buffer size. */
++#define DMUB_IB_MEM_SIZE (1280)
++
+ /* Number of windows in use. */
+ #define DMUB_NUM_WINDOWS (DMUB_WINDOW_TOTAL)
+ /* Base addresses. */
+@@ -559,6 +562,7 @@ enum dmub_status
+ 	window_sizes[DMUB_WINDOW_5_TRACEBUFF] = trace_buffer_size;
+ 	window_sizes[DMUB_WINDOW_6_FW_STATE] = fw_state_size;
+ 	window_sizes[DMUB_WINDOW_7_SCRATCH_MEM] = DMUB_SCRATCH_MEM_SIZE;
++	window_sizes[DMUB_WINDOW_IB_MEM] = DMUB_IB_MEM_SIZE;
+ 	window_sizes[DMUB_WINDOW_SHARED_STATE] = max(DMUB_FW_HEADER_SHARED_STATE_SIZE, shared_state_size);
+ 
+ 	out->fb_size =
+@@ -645,6 +649,7 @@ enum dmub_status dmub_srv_hw_init(struct dmub_srv *dmub,
+ 	struct dmub_fb *tracebuff_fb = params->fb[DMUB_WINDOW_5_TRACEBUFF];
+ 	struct dmub_fb *fw_state_fb = params->fb[DMUB_WINDOW_6_FW_STATE];
+ 	struct dmub_fb *scratch_mem_fb = params->fb[DMUB_WINDOW_7_SCRATCH_MEM];
++	struct dmub_fb *ib_mem_gart = params->fb[DMUB_WINDOW_IB_MEM];
+ 	struct dmub_fb *shared_state_fb = params->fb[DMUB_WINDOW_SHARED_STATE];
+ 
+ 	struct dmub_rb_init_params rb_params, outbox0_rb_params;
+@@ -655,7 +660,7 @@ enum dmub_status dmub_srv_hw_init(struct dmub_srv *dmub,
+ 		return DMUB_STATUS_INVALID;
+ 
+ 	if (!inst_fb || !stack_fb || !data_fb || !bios_fb || !mail_fb ||
+-		!tracebuff_fb || !fw_state_fb || !scratch_mem_fb) {
++		!tracebuff_fb || !fw_state_fb || !scratch_mem_fb || !ib_mem_gart) {
+ 		ASSERT(0);
+ 		return DMUB_STATUS_INVALID;
+ 	}
+@@ -741,6 +746,8 @@ enum dmub_status dmub_srv_hw_init(struct dmub_srv *dmub,
+ 
+ 	dmub->scratch_mem_fb = *scratch_mem_fb;
+ 
++	dmub->ib_mem_gart = *ib_mem_gart;
++
+ 	if (dmub->hw_funcs.setup_windows)
+ 		dmub->hw_funcs.setup_windows(dmub, &cw2, &cw3, &cw4, &cw5, &cw6, &region6);
+ 
+-- 
+2.52.0
+
