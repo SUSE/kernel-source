@@ -1,0 +1,175 @@
+From bf587417ffb5ed86b07b65ca9f928915477273c0 Mon Sep 17 00:00:00 2001
+From: Hawking Zhang <Hawking.Zhang@amd.com>
+Date: Mon, 16 Jun 2025 17:05:05 +0800
+Subject: drm/amdgpu: Convert select_sched into a common helper v3
+Git-commit: bf587417ffb5ed86b07b65ca9f928915477273c0
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+The xcp select_sched function does not need to
+remain as a soc specific callback. It can be reused
+for future products
+
+V2: bypass the function if xcp_mgr is not available (Likun)
+
+V3: Let caller check the availability of xcp mgr (Lijo)
+
+Signed-off-by: Hawking Zhang <Hawking.Zhang@amd.com>
+Reviewed-by: Lijo Lazar <lijo.lazar@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_xcp.c    | 41 ++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_xcp.h    | 13 +++----
+ drivers/gpu/drm/amd/amdgpu/aqua_vanjaram.c | 41 ----------------------
+ 3 files changed, 46 insertions(+), 49 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_xcp.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_xcp.c
+index 322816805bfb..eef827fbdc74 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_xcp.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_xcp.c
+@@ -445,6 +445,47 @@ void amdgpu_xcp_release_sched(struct amdgpu_device *adev,
+ 	}
+ }
+ 
++int amdgpu_xcp_select_scheds(struct amdgpu_device *adev,
++			     u32 hw_ip, u32 hw_prio,
++			     struct amdgpu_fpriv *fpriv,
++			     unsigned int *num_scheds,
++			     struct drm_gpu_scheduler ***scheds)
++{
++	u32 sel_xcp_id;
++	int i;
++	struct amdgpu_xcp_mgr *xcp_mgr = adev->xcp_mgr;
++
++	if (fpriv->xcp_id == AMDGPU_XCP_NO_PARTITION) {
++		u32 least_ref_cnt = ~0;
++
++		fpriv->xcp_id = 0;
++		for (i = 0; i < xcp_mgr->num_xcps; i++) {
++			u32 total_ref_cnt;
++
++			total_ref_cnt = atomic_read(&xcp_mgr->xcp[i].ref_cnt);
++			if (total_ref_cnt < least_ref_cnt) {
++				fpriv->xcp_id = i;
++				least_ref_cnt = total_ref_cnt;
++			}
++		}
++	}
++	sel_xcp_id = fpriv->xcp_id;
++
++	if (xcp_mgr->xcp[sel_xcp_id].gpu_sched[hw_ip][hw_prio].num_scheds) {
++		*num_scheds =
++			xcp_mgr->xcp[fpriv->xcp_id].gpu_sched[hw_ip][hw_prio].num_scheds;
++		*scheds =
++			xcp_mgr->xcp[fpriv->xcp_id].gpu_sched[hw_ip][hw_prio].sched;
++		atomic_inc(&adev->xcp_mgr->xcp[sel_xcp_id].ref_cnt);
++		dev_dbg(adev->dev, "Selected partition #%d", sel_xcp_id);
++	} else {
++		dev_err(adev->dev, "Failed to schedule partition #%d.", sel_xcp_id);
++		return -ENOENT;
++	}
++
++	return 0;
++}
++
+ /*====================== xcp sysfs - configuration ======================*/
+ #define XCP_CFG_SYSFS_RES_ATTR_SHOW(_name)                         \
+ 	static ssize_t amdgpu_xcp_res_sysfs_##_name##_show(        \
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_xcp.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_xcp.h
+index 454b33f889fb..fd8821c6671e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_xcp.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_xcp.h
+@@ -144,9 +144,6 @@ struct amdgpu_xcp_mgr_funcs {
+ 	int (*suspend)(struct amdgpu_xcp_mgr *xcp_mgr, int xcp_id);
+ 	int (*prepare_resume)(struct amdgpu_xcp_mgr *xcp_mgr, int xcp_id);
+ 	int (*resume)(struct amdgpu_xcp_mgr *xcp_mgr, int xcp_id);
+-	int (*select_scheds)(struct amdgpu_device *adev,
+-				  u32 hw_ip, u32 hw_prio, struct amdgpu_fpriv *fpriv,
+-				  unsigned int *num_scheds, struct drm_gpu_scheduler ***scheds);
+ 	int (*update_partition_sched_list)(struct amdgpu_device *adev);
+ };
+ 
+@@ -176,14 +173,14 @@ int amdgpu_xcp_open_device(struct amdgpu_device *adev,
+ 			   struct drm_file *file_priv);
+ void amdgpu_xcp_release_sched(struct amdgpu_device *adev,
+ 			      struct amdgpu_ctx_entity *entity);
+-
++int amdgpu_xcp_select_scheds(struct amdgpu_device *adev,
++			     u32 hw_ip, u32 hw_prio,
++			     struct amdgpu_fpriv *fpriv,
++			     unsigned int *num_scheds,
++			     struct drm_gpu_scheduler ***scheds);
+ void amdgpu_xcp_sysfs_init(struct amdgpu_device *adev);
+ void amdgpu_xcp_sysfs_fini(struct amdgpu_device *adev);
+ 
+-#define amdgpu_xcp_select_scheds(adev, e, c, d, x, y) \
+-	((adev)->xcp_mgr && (adev)->xcp_mgr->funcs && \
+-	(adev)->xcp_mgr->funcs->select_scheds ? \
+-	(adev)->xcp_mgr->funcs->select_scheds((adev), (e), (c), (d), (x), (y)) : -ENOENT)
+ #define amdgpu_xcp_update_partition_sched_list(adev) \
+ 	((adev)->xcp_mgr && (adev)->xcp_mgr->funcs && \
+ 	(adev)->xcp_mgr->funcs->update_partition_sched_list ? \
+diff --git a/drivers/gpu/drm/amd/amdgpu/aqua_vanjaram.c b/drivers/gpu/drm/amd/amdgpu/aqua_vanjaram.c
+index 1a5ff9bf5880..d9b49883f9ec 100644
+--- a/drivers/gpu/drm/amd/amdgpu/aqua_vanjaram.c
++++ b/drivers/gpu/drm/amd/amdgpu/aqua_vanjaram.c
+@@ -180,46 +180,6 @@ static int aqua_vanjaram_update_partition_sched_list(struct amdgpu_device *adev)
+ 	return aqua_vanjaram_xcp_sched_list_update(adev);
+ }
+ 
+-static int aqua_vanjaram_select_scheds(
+-		struct amdgpu_device *adev,
+-		u32 hw_ip,
+-		u32 hw_prio,
+-		struct amdgpu_fpriv *fpriv,
+-		unsigned int *num_scheds,
+-		struct drm_gpu_scheduler ***scheds)
+-{
+-	u32 sel_xcp_id;
+-	int i;
+-
+-	if (fpriv->xcp_id == AMDGPU_XCP_NO_PARTITION) {
+-		u32 least_ref_cnt = ~0;
+-
+-		fpriv->xcp_id = 0;
+-		for (i = 0; i < adev->xcp_mgr->num_xcps; i++) {
+-			u32 total_ref_cnt;
+-
+-			total_ref_cnt = atomic_read(&adev->xcp_mgr->xcp[i].ref_cnt);
+-			if (total_ref_cnt < least_ref_cnt) {
+-				fpriv->xcp_id = i;
+-				least_ref_cnt = total_ref_cnt;
+-			}
+-		}
+-	}
+-	sel_xcp_id = fpriv->xcp_id;
+-
+-	if (adev->xcp_mgr->xcp[sel_xcp_id].gpu_sched[hw_ip][hw_prio].num_scheds) {
+-		*num_scheds = adev->xcp_mgr->xcp[fpriv->xcp_id].gpu_sched[hw_ip][hw_prio].num_scheds;
+-		*scheds = adev->xcp_mgr->xcp[fpriv->xcp_id].gpu_sched[hw_ip][hw_prio].sched;
+-		atomic_inc(&adev->xcp_mgr->xcp[sel_xcp_id].ref_cnt);
+-		DRM_DEBUG("Selected partition #%d", sel_xcp_id);
+-	} else {
+-		DRM_ERROR("Failed to schedule partition #%d.", sel_xcp_id);
+-		return -ENOENT;
+-	}
+-
+-	return 0;
+-}
+-
+ /* Fixed pattern for smn addressing on different AIDs:
+  *   bit[34]: indicate cross AID access
+  *   bit[33:32]: indicate target AID id
+@@ -734,7 +694,6 @@ struct amdgpu_xcp_mgr_funcs aqua_vanjaram_xcp_funcs = {
+ 	.get_ip_details = &aqua_vanjaram_get_xcp_ip_details,
+ 	.get_xcp_res_info = &aqua_vanjaram_get_xcp_res_info,
+ 	.get_xcp_mem_id = &aqua_vanjaram_get_xcp_mem_id,
+-	.select_scheds = &aqua_vanjaram_select_scheds,
+ 	.update_partition_sched_list =
+ 		&aqua_vanjaram_update_partition_sched_list
+ };
+-- 
+2.52.0
+
