@@ -1,0 +1,113 @@
+From 436884511d54b8a090fe2886d48f72143ce95b67 Mon Sep 17 00:00:00 2001
+From: Alexandre Courbot <acourbot@nvidia.com>
+Date: Thu, 19 Jun 2025 22:24:05 +0900
+Subject: gpu: nova-core: add types for patching firmware binaries
+Git-commit: 436884511d54b8a090fe2886d48f72143ce95b67
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Some of the firmwares need to be patched at load-time with a signature.
+Add a couple of types and traits that sub-modules can use to implement
+this behavior, while ensuring that the correct kind of signature is
+applied to the firmware.
+
+Reviewed-by: Lyude Paul <lyude@redhat.com>
+Signed-off-by: Alexandre Courbot <acourbot@nvidia.com>
+Link: https://lore.kernel.org/r/20250619-nova-frts-v6-21-ecf41ef99252@nvidia.com
+Signed-off-by: Danilo Krummrich <dakr@kernel.org>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/nova-core/firmware.rs | 64 +++++++++++++++++++++++++++++++
+ 1 file changed, 64 insertions(+)
+
+diff --git a/drivers/gpu/nova-core/firmware.rs b/drivers/gpu/nova-core/firmware.rs
+index e5583925cb3b..09e6bd104a6c 100644
+--- a/drivers/gpu/nova-core/firmware.rs
++++ b/drivers/gpu/nova-core/firmware.rs
+@@ -3,11 +3,15 @@
+ //! Contains structures and functions dedicated to the parsing, building and patching of firmwares
+ //! to be loaded into a given execution unit.
+ 
++use core::marker::PhantomData;
++
+ use kernel::device;
+ use kernel::firmware;
+ use kernel::prelude::*;
+ use kernel::str::CString;
+ 
++use crate::dma::DmaObject;
++use crate::falcon::FalconFirmware;
+ use crate::gpu;
+ use crate::gpu::Chipset;
+ 
+@@ -84,6 +88,66 @@ pub(crate) fn size(&self) -> usize {
+     }
+ }
+ 
++/// Trait implemented by types defining the signed state of a firmware.
++trait SignedState {}
++
++/// Type indicating that the firmware must be signed before it can be used.
++struct Unsigned;
++impl SignedState for Unsigned {}
++
++/// Type indicating that the firmware is signed and ready to be loaded.
++struct Signed;
++impl SignedState for Signed {}
++
++/// A [`DmaObject`] containing a specific microcode ready to be loaded into a falcon.
++///
++/// This is module-local and meant for sub-modules to use internally.
++///
++/// After construction, a firmware is [`Unsigned`], and must generally be patched with a signature
++/// before it can be loaded (with an exception for development hardware). The
++/// [`Self::patch_signature`] and [`Self::no_patch_signature`] methods are used to transition the
++/// firmware to its [`Signed`] state.
++struct FirmwareDmaObject<F: FalconFirmware, S: SignedState>(DmaObject, PhantomData<(F, S)>);
++
++/// Trait for signatures to be patched directly into a given firmware.
++///
++/// This is module-local and meant for sub-modules to use internally.
++trait FirmwareSignature<F: FalconFirmware>: AsRef<[u8]> {}
++
++#[expect(unused)]
++impl<F: FalconFirmware> FirmwareDmaObject<F, Unsigned> {
++    /// Patches the firmware at offset `sig_base_img` with `signature`.
++    fn patch_signature<S: FirmwareSignature<F>>(
++        mut self,
++        signature: &S,
++        sig_base_img: usize,
++    ) -> Result<FirmwareDmaObject<F, Signed>> {
++        let signature_bytes = signature.as_ref();
++        if sig_base_img + signature_bytes.len() > self.0.size() {
++            return Err(EINVAL);
++        }
++
++        // SAFETY: We are the only user of this object, so there cannot be any race.
++        let dst = unsafe { self.0.start_ptr_mut().add(sig_base_img) };
++
++        // SAFETY: `signature` and `dst` are valid, properly aligned, and do not overlap.
++        unsafe {
++            core::ptr::copy_nonoverlapping(signature_bytes.as_ptr(), dst, signature_bytes.len())
++        };
++
++        Ok(FirmwareDmaObject(self.0, PhantomData))
++    }
++
++    /// Mark the firmware as signed without patching it.
++    ///
++    /// This method is used to explicitly confirm that we do not need to sign the firmware, while
++    /// allowing us to continue as if it was. This is typically only needed for development
++    /// hardware.
++    fn no_patch_signature(self) -> FirmwareDmaObject<F, Signed> {
++        FirmwareDmaObject(self.0, PhantomData)
++    }
++}
++
+ pub(crate) struct ModInfoBuilder<const N: usize>(firmware::ModInfoBuilder<N>);
+ 
+ impl<const N: usize> ModInfoBuilder<N> {
+-- 
+2.52.0
+
