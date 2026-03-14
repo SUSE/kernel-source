@@ -1,0 +1,198 @@
+From 99e80508980583b1c0150b953b64a629211c4e23 Mon Sep 17 00:00:00 2001
+From: Matthew Brost <matthew.brost@intel.com>
+Date: Mon, 2 Jun 2025 09:44:12 -0700
+Subject: drm/xe: Make VMA tile_present, tile_invalidated access rules clear
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 99e80508980583b1c0150b953b64a629211c4e23
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Document VMA tile_invalidated access rules, use READ_ONCE / WRITE_ONCE
+for opportunistic checks of tile_present and tile_invalidated, move
+tile_invalidated state change from page fault handler to PT code under
+the correct locks, and add lockdep asserts to TLB invalidation paths.
+
+V2: - Assert VM dma-resv lock rather than BO in zap PTEs
+V3: - Back to BO's dma-resv lock, adjust documentation
+V4: - Add WRITE_ONCE in xe_vm_invalidate_vma (Thomas)
+ - Change lockdep assert for userptr in xe_vm_invalidate_vma (CI)
+ - Take userptr notifier lock in read mode in xe_vm_userptr_pin before
+   calling xe_vm_invalidate_vma (CI)
+V5: - Fix typos (Thomas)
+
+Signed-off-by: Matthew Brost <matthew.brost@intel.com>
+Reviewed-by: Thomas Hellström <thomas.hellstrom@linux.intel.com>
+Link: https://lore.kernel.org/r/20250602164412.1912293-1-matthew.brost@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/xe/xe_gt_pagefault.c | 11 +++++++----
+ drivers/gpu/drm/xe/xe_pt.c           | 16 +++++++++++++---
+ drivers/gpu/drm/xe/xe_vm.c           | 19 +++++++++++++++----
+ drivers/gpu/drm/xe/xe_vm_types.h     | 11 +++++++++--
+ 4 files changed, 44 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_gt_pagefault.c b/drivers/gpu/drm/xe/xe_gt_pagefault.c
+index 6f46d3737188..efd2944bbf1e 100644
+--- a/drivers/gpu/drm/xe/xe_gt_pagefault.c
++++ b/drivers/gpu/drm/xe/xe_gt_pagefault.c
+@@ -69,8 +69,12 @@ static bool access_is_atomic(enum access_type access_type)
+ 
+ static bool vma_is_valid(struct xe_tile *tile, struct xe_vma *vma)
+ {
+-	return BIT(tile->id) & vma->tile_present &&
+-		!(BIT(tile->id) & vma->tile_invalidated);
++	/*
++	 * Advisory only check whether the VMA currently has a valid mapping,
++	 * READ_ONCE pairs with WRITE_ONCE in xe_pt.c
++	 */
++	return BIT(tile->id) & READ_ONCE(vma->tile_present) &&
++		!(BIT(tile->id) & READ_ONCE(vma->tile_invalidated));
+ }
+ 
+ 
+@@ -122,7 +126,7 @@ static int handle_vma_pagefault(struct xe_gt *gt, struct xe_vma *vma,
+ 
+ 	trace_xe_vma_pagefault(vma);
+ 
+-	/* Check if VMA is valid */
++	/* Check if VMA is valid, opportunistic check only */
+ 	if (vma_is_valid(tile, vma) && !atomic)
+ 		return 0;
+ 
+@@ -159,7 +163,6 @@ static int handle_vma_pagefault(struct xe_gt *gt, struct xe_vma *vma,
+ 
+ 	dma_fence_wait(fence, false);
+ 	dma_fence_put(fence);
+-	vma->tile_invalidated &= ~BIT(tile->id);
+ 
+ unlock_dma_resv:
+ 	drm_exec_fini(&exec);
+diff --git a/drivers/gpu/drm/xe/xe_pt.c b/drivers/gpu/drm/xe/xe_pt.c
+index c9c41fbe125c..f39d5cc9f411 100644
+--- a/drivers/gpu/drm/xe/xe_pt.c
++++ b/drivers/gpu/drm/xe/xe_pt.c
+@@ -907,6 +907,11 @@ bool xe_pt_zap_ptes(struct xe_tile *tile, struct xe_vma *vma)
+ 	struct xe_pt *pt = xe_vma_vm(vma)->pt_root[tile->id];
+ 	u8 pt_mask = (vma->tile_present & ~vma->tile_invalidated);
+ 
++	if (xe_vma_bo(vma))
++		xe_bo_assert_held(xe_vma_bo(vma));
++	else if (xe_vma_is_userptr(vma))
++		lockdep_assert_held(&xe_vma_vm(vma)->userptr.notifier_lock);
++
+ 	if (!(pt_mask & BIT(tile->id)))
+ 		return false;
+ 
+@@ -2191,10 +2196,15 @@ static void bind_op_commit(struct xe_vm *vm, struct xe_tile *tile,
+ 					   DMA_RESV_USAGE_KERNEL :
+ 					   DMA_RESV_USAGE_BOOKKEEP);
+ 	}
+-	vma->tile_present |= BIT(tile->id);
+-	vma->tile_staged &= ~BIT(tile->id);
++	/* All WRITE_ONCE pair with READ_ONCE in xe_gt_pagefault.c */
++	WRITE_ONCE(vma->tile_present, vma->tile_present | BIT(tile->id));
+ 	if (invalidate_on_bind)
+-		vma->tile_invalidated |= BIT(tile->id);
++		WRITE_ONCE(vma->tile_invalidated,
++			   vma->tile_invalidated | BIT(tile->id));
++	else
++		WRITE_ONCE(vma->tile_invalidated,
++			   vma->tile_invalidated & ~BIT(tile->id));
++	vma->tile_staged &= ~BIT(tile->id);
+ 	if (xe_vma_is_userptr(vma)) {
+ 		lockdep_assert_held_read(&vm->userptr.notifier_lock);
+ 		to_userptr_vma(vma)->userptr.initial_bind = true;
+diff --git a/drivers/gpu/drm/xe/xe_vm.c b/drivers/gpu/drm/xe/xe_vm.c
+index 7140d8856bad..18f967ce1f1a 100644
+--- a/drivers/gpu/drm/xe/xe_vm.c
++++ b/drivers/gpu/drm/xe/xe_vm.c
+@@ -732,7 +732,9 @@ int xe_vm_userptr_pin(struct xe_vm *vm)
+ 					      DMA_RESV_USAGE_BOOKKEEP,
+ 					      false, MAX_SCHEDULE_TIMEOUT);
+ 
++			down_read(&vm->userptr.notifier_lock);
+ 			err = xe_vm_invalidate_vma(&uvma->vma);
++			up_read(&vm->userptr.notifier_lock);
+ 			xe_vm_unlock(vm);
+ 			if (err)
+ 				break;
+@@ -3853,6 +3855,7 @@ void xe_vm_unlock(struct xe_vm *vm)
+ int xe_vm_invalidate_vma(struct xe_vma *vma)
+ {
+ 	struct xe_device *xe = xe_vma_vm(vma)->xe;
++	struct xe_vm *vm = xe_vma_vm(vma);
+ 	struct xe_tile *tile;
+ 	struct xe_gt_tlb_invalidation_fence
+ 		fence[XE_MAX_TILES_PER_DEVICE * XE_MAX_GT_PER_TILE];
+@@ -3864,17 +3867,24 @@ int xe_vm_invalidate_vma(struct xe_vma *vma)
+ 	xe_assert(xe, !xe_vma_is_cpu_addr_mirror(vma));
+ 	trace_xe_vma_invalidate(vma);
+ 
+-	vm_dbg(&xe_vma_vm(vma)->xe->drm,
++	vm_dbg(&vm->xe->drm,
+ 	       "INVALIDATE: addr=0x%016llx, range=0x%016llx",
+ 		xe_vma_start(vma), xe_vma_size(vma));
+ 
+-	/* Check that we don't race with page-table updates */
++	/*
++	 * Check that we don't race with page-table updates, tile_invalidated
++	 * update is safe
++	 */
+ 	if (IS_ENABLED(CONFIG_PROVE_LOCKING)) {
+ 		if (xe_vma_is_userptr(vma)) {
++			lockdep_assert(lockdep_is_held_type(&vm->userptr.notifier_lock, 0) ||
++				       (lockdep_is_held_type(&vm->userptr.notifier_lock, 1) &&
++					lockdep_is_held(&xe_vm_resv(vm)->lock.base)));
++
+ 			WARN_ON_ONCE(!mmu_interval_check_retry
+ 				     (&to_userptr_vma(vma)->userptr.notifier,
+ 				      to_userptr_vma(vma)->userptr.notifier_seq));
+-			WARN_ON_ONCE(!dma_resv_test_signaled(xe_vm_resv(xe_vma_vm(vma)),
++			WARN_ON_ONCE(!dma_resv_test_signaled(xe_vm_resv(vm),
+ 							     DMA_RESV_USAGE_BOOKKEEP));
+ 
+ 		} else {
+@@ -3914,7 +3924,8 @@ int xe_vm_invalidate_vma(struct xe_vma *vma)
+ 	for (id = 0; id < fence_id; ++id)
+ 		xe_gt_tlb_invalidation_fence_wait(&fence[id]);
+ 
+-	vma->tile_invalidated = vma->tile_mask;
++	/* WRITE_ONCE pair with READ_ONCE in xe_gt_pagefault.c */
++	WRITE_ONCE(vma->tile_invalidated, vma->tile_mask);
+ 
+ 	return ret;
+ }
+diff --git a/drivers/gpu/drm/xe/xe_vm_types.h b/drivers/gpu/drm/xe/xe_vm_types.h
+index 0e1318a15c9e..bed6088e1bb3 100644
+--- a/drivers/gpu/drm/xe/xe_vm_types.h
++++ b/drivers/gpu/drm/xe/xe_vm_types.h
+@@ -100,14 +100,21 @@ struct xe_vma {
+ 		struct work_struct destroy_work;
+ 	};
+ 
+-	/** @tile_invalidated: VMA has been invalidated */
++	/**
++	 * @tile_invalidated: Tile mask of binding are invalidated for this VMA.
++	 * protected by BO's resv and for userptrs, vm->userptr.notifier_lock in
++	 * write mode for writing or vm->userptr.notifier_lock in read mode and
++	 * the vm->resv. For stable reading, BO's resv or userptr
++	 * vm->userptr.notifier_lock in read mode is required. Can be
++	 * opportunistically read with READ_ONCE outside of locks.
++	 */
+ 	u8 tile_invalidated;
+ 
+ 	/** @tile_mask: Tile mask of where to create binding for this VMA */
+ 	u8 tile_mask;
+ 
+ 	/**
+-	 * @tile_present: GT mask of binding are present for this VMA.
++	 * @tile_present: Tile mask of binding are present for this VMA.
+ 	 * protected by vm->lock, vm->resv and for userptrs,
+ 	 * vm->userptr.notifier_lock for writing. Needs either for reading,
+ 	 * but if reading is done under the vm->lock only, it needs to be held
+-- 
+2.52.0
+
