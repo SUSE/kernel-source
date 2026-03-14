@@ -1,0 +1,228 @@
+From a3b7f9c306e19a5b618483c11e8af6404ff69408 Mon Sep 17 00:00:00 2001
+From: Frank Min <Frank.Min@amd.com>
+Date: Wed, 21 May 2025 16:46:27 +0800
+Subject: drm/amdgpu: reclaim psp fw reservation memory region
+Git-commit: a3b7f9c306e19a5b618483c11e8af6404ff69408
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+PSP v14 fw update introduced changes on memory reservation region, according
+to the change driver reclaim some non-reserved region.
+
+1. introduce 2 new psp commands to query fw reservation regions
+2. add a new reservation region for psp
+3. reclaim psp non-used region
+
+Signed-off-by: Frank Min <Frank.Min@amd.com>
+Reviewed-by: Hawking Zhang <Hawking.Zhang@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c | 99 +++++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c |  2 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h |  1 +
+ drivers/gpu/drm/amd/amdgpu/psp_gfx_if.h | 12 ++-
+ 5 files changed, 114 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
+index e3c8fe2801d8..0461de622751 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
+@@ -655,6 +655,10 @@ static const char *psp_gfx_cmd_name(enum psp_gfx_cmd_id cmd_id)
+ 		return "BOOT_CFG";
+ 	case GFX_CMD_ID_CONFIG_SQ_PERFMON:
+ 		return "CONFIG_SQ_PERFMON";
++	case GFX_CMD_ID_FB_FW_RESERV_ADDR:
++		return "FB_FW_RESERV_ADDR";
++	case GFX_CMD_ID_FB_FW_RESERV_EXT_ADDR:
++		return "FB_FW_RESERV_EXT_ADDR";
+ 	default:
+ 		return "UNKNOWN CMD";
+ 	}
+@@ -987,6 +991,93 @@ int psp_get_fw_attestation_records_addr(struct psp_context *psp,
+ 	return ret;
+ }
+ 
++static int psp_get_fw_reservation_info(struct psp_context *psp,
++						   uint32_t cmd_id,
++						   uint64_t *addr,
++						   uint32_t *size)
++{
++	int ret;
++	uint32_t status;
++	struct psp_gfx_cmd_resp *cmd;
++
++	cmd = acquire_psp_cmd_buf(psp);
++
++	cmd->cmd_id = cmd_id;
++
++	ret = psp_cmd_submit_buf(psp, NULL, cmd,
++				 psp->fence_buf_mc_addr);
++	if (ret) {
++		release_psp_cmd_buf(psp);
++		return ret;
++	}
++
++	status = cmd->resp.status;
++	if (status == PSP_ERR_UNKNOWN_COMMAND) {
++		release_psp_cmd_buf(psp);
++		*addr = 0;
++		*size = 0;
++		return 0;
++	}
++
++	*addr = (uint64_t)cmd->resp.uresp.fw_reserve_info.reserve_base_address_hi << 32 |
++		cmd->resp.uresp.fw_reserve_info.reserve_base_address_lo;
++	*size = cmd->resp.uresp.fw_reserve_info.reserve_size;
++
++	release_psp_cmd_buf(psp);
++
++	return 0;
++}
++
++int psp_update_fw_reservation(struct psp_context *psp)
++{
++	int ret;
++	uint64_t reserv_addr, reserv_addr_ext;
++	uint32_t reserv_size, reserv_size_ext;
++	struct amdgpu_device *adev = psp->adev;
++
++	if (amdgpu_sriov_vf(psp->adev))
++		return 0;
++
++	if ((amdgpu_ip_version(adev, MP0_HWIP, 0) != IP_VERSION(14, 0, 2)) &&
++	    (amdgpu_ip_version(adev, MP0_HWIP, 0) != IP_VERSION(14, 0, 3)))
++		return 0;
++
++	ret = psp_get_fw_reservation_info(psp, GFX_CMD_ID_FB_FW_RESERV_ADDR, &reserv_addr, &reserv_size);
++	if (ret)
++		return ret;
++	ret = psp_get_fw_reservation_info(psp, GFX_CMD_ID_FB_FW_RESERV_EXT_ADDR, &reserv_addr_ext, &reserv_size_ext);
++	if (ret)
++		return ret;
++
++	if (reserv_addr != adev->gmc.real_vram_size - reserv_size) {
++		dev_warn(adev->dev, "reserve fw region is not valid!\n");
++		return 0;
++	}
++
++	amdgpu_bo_free_kernel(&adev->mman.fw_reserved_memory, NULL, NULL);
++
++	reserv_size = roundup(reserv_size, SZ_1M);
++
++	ret = amdgpu_bo_create_kernel_at(adev, reserv_addr, reserv_size, &adev->mman.fw_reserved_memory, NULL);
++	if (ret) {
++		dev_err(adev->dev, "reserve fw region failed(%d)!\n", ret);
++		amdgpu_bo_free_kernel(&adev->mman.fw_reserved_memory, NULL, NULL);
++		return ret;
++	}
++
++	reserv_size_ext = roundup(reserv_size_ext, SZ_1M);
++
++	ret = amdgpu_bo_create_kernel_at(adev, reserv_addr_ext, reserv_size_ext,
++					 &adev->mman.fw_reserved_memory_extend, NULL);
++	if (ret) {
++		dev_err(adev->dev, "reserve extend fw region failed(%d)!\n", ret);
++		amdgpu_bo_free_kernel(&adev->mman.fw_reserved_memory_extend, NULL, NULL);
++		return ret;
++	}
++
++	return 0;
++}
++
+ static int psp_boot_config_get(struct amdgpu_device *adev, uint32_t *boot_cfg)
+ {
+ 	struct psp_context *psp = &adev->psp;
+@@ -2464,6 +2555,14 @@ static int psp_hw_start(struct psp_context *psp)
+ 		return ret;
+ 	}
+ 
++	if (!amdgpu_in_reset(adev) && !adev->in_suspend) {
++		ret = psp_update_fw_reservation(psp);
++		if (ret) {
++			dev_err(adev->dev, "update fw reservation failed!\n");
++			return ret;
++		}
++	}
++
+ 	if (amdgpu_sriov_vf(adev) && amdgpu_in_reset(adev))
+ 		goto skip_pin_bo;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h
+index 428adc7f741d..dbc8e1950e4e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h
+@@ -588,7 +588,7 @@ int psp_init_cap_microcode(struct psp_context *psp,
+ 			  const char *chip_name);
+ int psp_get_fw_attestation_records_addr(struct psp_context *psp,
+ 					uint64_t *output_ptr);
+-
++int psp_update_fw_reservation(struct psp_context *psp);
+ int psp_load_fw_list(struct psp_context *psp,
+ 		     struct amdgpu_firmware_info **ucode_list, int ucode_count);
+ void psp_copy_fw(struct psp_context *psp, uint8_t *start_addr, uint32_t bin_size);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index 7d0b2c3c6ffb..365020956dfa 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -2060,6 +2060,8 @@ void amdgpu_ttm_fini(struct amdgpu_device *adev)
+ 		/* return the FW reserved memory back to VRAM */
+ 		amdgpu_bo_free_kernel(&adev->mman.fw_reserved_memory, NULL,
+ 				      NULL);
++		amdgpu_bo_free_kernel(&adev->mman.fw_reserved_memory_extend, NULL,
++				      NULL);
+ 		if (adev->mman.stolen_reserved_size)
+ 			amdgpu_bo_free_kernel(&adev->mman.stolen_reserved_memory,
+ 					      NULL, NULL);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
+index 450e4bf093b7..2309df3f68a9 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
+@@ -86,6 +86,7 @@ struct amdgpu_mman {
+ 	uint32_t			discovery_tmr_size;
+ 	/* fw reserved memory */
+ 	struct amdgpu_bo		*fw_reserved_memory;
++	struct amdgpu_bo		*fw_reserved_memory_extend;
+ 
+ 	/* firmware VRAM reservation */
+ 	u64		fw_vram_usage_start_offset;
+diff --git a/drivers/gpu/drm/amd/amdgpu/psp_gfx_if.h b/drivers/gpu/drm/amd/amdgpu/psp_gfx_if.h
+index f4a91b126c73..73f87131a7e9 100644
+--- a/drivers/gpu/drm/amd/amdgpu/psp_gfx_if.h
++++ b/drivers/gpu/drm/amd/amdgpu/psp_gfx_if.h
+@@ -106,7 +106,9 @@ enum psp_gfx_cmd_id
+     /*IDs of performance monitoring/profiling*/
+     GFX_CMD_ID_CONFIG_SQ_PERFMON  = 0x00000046,   /* Config CGTT_SQ_CLK_CTRL */
+     /* Dynamic memory partitioninig (NPS mode change)*/
+-    GFX_CMD_ID_FB_NPS_MODE         = 0x00000048,  /* Configure memory partitioning mode */
++    GFX_CMD_ID_FB_NPS_MODE        = 0x00000048,  /* Configure memory partitioning mode */
++    GFX_CMD_ID_FB_FW_RESERV_ADDR  = 0x00000050,  /* Query FW reservation addr */
++    GFX_CMD_ID_FB_FW_RESERV_EXT_ADDR = 0x00000051,  /* Query FW reservation extended addr */
+ };
+ 
+ /* PSP boot config sub-commands */
+@@ -404,11 +406,19 @@ struct psp_gfx_uresp_bootcfg {
+ 	uint32_t boot_cfg;	/* boot config data */
+ };
+ 
++/* Command-specific response for fw reserve info */
++struct psp_gfx_uresp_fw_reserve_info {
++    uint32_t reserve_base_address_hi;
++    uint32_t reserve_base_address_lo;
++    uint32_t reserve_size;
++};
++
+ /* Union of command-specific responses for GPCOM ring. */
+ union psp_gfx_uresp {
+ 	struct psp_gfx_uresp_reserved		reserved;
+ 	struct psp_gfx_uresp_bootcfg		boot_cfg;
+ 	struct psp_gfx_uresp_fwar_db_info	fwar_db_info;
++	struct psp_gfx_uresp_fw_reserve_info	fw_reserve_info;
+ };
+ 
+ /* Structure of GFX Response buffer.
+-- 
+2.52.0
+
