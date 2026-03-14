@@ -1,0 +1,88 @@
+From a73345b866ff8bbd93135af667c973a8fb4b2c40 Mon Sep 17 00:00:00 2001
+From: Vitaly Prosyak <vitaly.prosyak@amd.com>
+Date: Tue, 24 Jun 2025 12:05:10 -0400
+Subject: Revert "drm/amdgpu: fix slab-use-after-free in amdgpu_userq_mgr_fini"
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: a73345b866ff8bbd93135af667c973a8fb4b2c40
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+This reverts commit 5fb90421fa0fbe0a968274912101fe917bf1c47b.
+
+The original patch moved `amdgpu_userq_mgr_fini()` to the driver's
+`postclose` callback, which is called after `drm_gem_release()` in
+the DRM file cleanup sequence.If a user application crashes or aborts
+without cleaning up its user queues, 'drm_gem_release()` may free
+GEM objects that are still referenced by active user queues, leading
+to use-after-free. By reverting, we ensure that user queues are
+disabled and cleaned up before any GEM objects are released,
+preventing this class of bug. However, this reintroduces a race
+during PCI hot-unplug, where device removal can race with per-file
+cleanup, leading to use-after-free in suspend/unplug paths.
+This will be fixed in the next patch.
+
+Fixes: 5fb90421fa0f ("drm/amdgpu: fix slab-use-after-free in amdgpu_userq_mgr_fini+0x70c")
+Signed-off-by: Vitaly Prosyak <vitaly.prosyak@amd.com>
+Acked-by: Alex Deucher <alexander.deucher@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c | 16 +++++++++++++++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c |  3 ---
+ 2 files changed, 15 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+index 4f8632737574..1c54b2e5a225 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+@@ -2911,6 +2911,20 @@ static int amdgpu_pmops_runtime_idle(struct device *dev)
+ 	return ret;
+ }
+ 
++static int amdgpu_drm_release(struct inode *inode, struct file *filp)
++{
++	struct drm_file *file_priv = filp->private_data;
++	struct amdgpu_fpriv *fpriv = file_priv->driver_priv;
++
++	if (fpriv) {
++		fpriv->evf_mgr.fd_closing = true;
++		amdgpu_eviction_fence_destroy(&fpriv->evf_mgr);
++		amdgpu_userq_mgr_fini(&fpriv->userq_mgr);
++	}
++
++	return drm_release(inode, filp);
++}
++
+ long amdgpu_drm_ioctl(struct file *filp,
+ 		      unsigned int cmd, unsigned long arg)
+ {
+@@ -2962,7 +2976,7 @@ static const struct file_operations amdgpu_driver_kms_fops = {
+ 	.owner = THIS_MODULE,
+ 	.open = drm_open,
+ 	.flush = amdgpu_flush,
+-	.release = drm_release,
++	.release = amdgpu_drm_release,
+ 	.unlocked_ioctl = amdgpu_drm_ioctl,
+ 	.mmap = drm_gem_mmap,
+ 	.poll = drm_poll,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+index 17253a531733..c78eea14c70a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+@@ -1503,9 +1503,6 @@ void amdgpu_driver_postclose_kms(struct drm_device *dev,
+ 		amdgpu_vm_bo_del(adev, fpriv->prt_va);
+ 		amdgpu_bo_unreserve(pd);
+ 	}
+-	fpriv->evf_mgr.fd_closing = true;
+-	amdgpu_eviction_fence_destroy(&fpriv->evf_mgr);
+-	amdgpu_userq_mgr_fini(&fpriv->userq_mgr);
+ 
+ 	amdgpu_ctx_mgr_fini(&fpriv->ctx_mgr);
+ 	amdgpu_vm_fini(adev, &fpriv->vm);
+-- 
+2.52.0
+
