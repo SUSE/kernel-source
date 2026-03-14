@@ -1,0 +1,118 @@
+From 8395204aeb84ef6eacbebf2c94be0ce9381d7981 Mon Sep 17 00:00:00 2001
+From: Karol Wachowski <karol.wachowski@intel.com>
+Date: Thu, 15 May 2025 11:31:28 +0200
+Subject: accel/ivpu: Add inference_timeout_ms module parameter
+Git-commit: 8395204aeb84ef6eacbebf2c94be0ce9381d7981
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Add new inference_timeout_ms parameter that allows specifying
+maximum allowed duration in milliseconds that inference can take before
+triggering a recovery.
+
+Calculate maximum number of heartbeat retries based on ratio between
+inference timeout and tdr timeout.
+
+Signed-off-by: Karol Wachowski <karol.wachowski@intel.com>
+Reviewed-by: Jeff Hugo <jeff.hugo@oss.qualcomm.com>
+Signed-off-by: Jacek Lawrynowicz <jacek.lawrynowicz@linux.intel.com>
+Link: https://lore.kernel.org/r/20250515093128.252041-1-jacek.lawrynowicz@linux.intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/accel/ivpu/ivpu_drv.h |  1 +
+ drivers/accel/ivpu/ivpu_hw.c  |  4 ++++
+ drivers/accel/ivpu/ivpu_pm.c  | 15 ++++++++++++---
+ 3 files changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/accel/ivpu/ivpu_drv.h b/drivers/accel/ivpu/ivpu_drv.h
+index 5497e7030e91..b6d6b3238b59 100644
+--- a/drivers/accel/ivpu/ivpu_drv.h
++++ b/drivers/accel/ivpu/ivpu_drv.h
+@@ -165,6 +165,7 @@ struct ivpu_device {
+ 		int boot;
+ 		int jsm;
+ 		int tdr;
++		int inference;
+ 		int autosuspend;
+ 		int d0i3_entry_msg;
+ 		int state_dump_msg;
+diff --git a/drivers/accel/ivpu/ivpu_hw.c b/drivers/accel/ivpu/ivpu_hw.c
+index 633160470c93..08dcc31b56f4 100644
+--- a/drivers/accel/ivpu/ivpu_hw.c
++++ b/drivers/accel/ivpu/ivpu_hw.c
+@@ -94,12 +94,14 @@ static void timeouts_init(struct ivpu_device *vdev)
+ 		vdev->timeout.boot = -1;
+ 		vdev->timeout.jsm = -1;
+ 		vdev->timeout.tdr = -1;
++		vdev->timeout.inference = -1;
+ 		vdev->timeout.autosuspend = -1;
+ 		vdev->timeout.d0i3_entry_msg = -1;
+ 	} else if (ivpu_is_fpga(vdev)) {
+ 		vdev->timeout.boot = 50;
+ 		vdev->timeout.jsm = 15000;
+ 		vdev->timeout.tdr = 30000;
++		vdev->timeout.inference = 900000;
+ 		vdev->timeout.autosuspend = -1;
+ 		vdev->timeout.d0i3_entry_msg = 500;
+ 		vdev->timeout.state_dump_msg = 10000;
+@@ -107,6 +109,7 @@ static void timeouts_init(struct ivpu_device *vdev)
+ 		vdev->timeout.boot = 50;
+ 		vdev->timeout.jsm = 500;
+ 		vdev->timeout.tdr = 10000;
++		vdev->timeout.inference = 300000;
+ 		vdev->timeout.autosuspend = 100;
+ 		vdev->timeout.d0i3_entry_msg = 100;
+ 		vdev->timeout.state_dump_msg = 10;
+@@ -114,6 +117,7 @@ static void timeouts_init(struct ivpu_device *vdev)
+ 		vdev->timeout.boot = 1000;
+ 		vdev->timeout.jsm = 500;
+ 		vdev->timeout.tdr = 2000;
++		vdev->timeout.inference = 60000;
+ 		if (ivpu_hw_ip_gen(vdev) == IVPU_HW_IP_37XX)
+ 			vdev->timeout.autosuspend = 10;
+ 		else
+diff --git a/drivers/accel/ivpu/ivpu_pm.c b/drivers/accel/ivpu/ivpu_pm.c
+index ea30db181cd7..eacda1dbe840 100644
+--- a/drivers/accel/ivpu/ivpu_pm.c
++++ b/drivers/accel/ivpu/ivpu_pm.c
+@@ -33,8 +33,11 @@ static unsigned long ivpu_tdr_timeout_ms;
+ module_param_named(tdr_timeout_ms, ivpu_tdr_timeout_ms, ulong, 0644);
+ MODULE_PARM_DESC(tdr_timeout_ms, "Timeout for device hang detection, in milliseconds, 0 - default");
+ 
++static unsigned long ivpu_inference_timeout_ms;
++module_param_named(inference_timeout_ms, ivpu_inference_timeout_ms, ulong, 0644);
++MODULE_PARM_DESC(inference_timeout_ms, "Inference maximum duration, in milliseconds, 0 - default");
++
+ #define PM_RESCHEDULE_LIMIT     5
+-#define PM_TDR_HEARTBEAT_LIMIT  30
+ 
+ static void ivpu_pm_prepare_cold_boot(struct ivpu_device *vdev)
+ {
+@@ -191,6 +194,10 @@ static void ivpu_job_timeout_work(struct work_struct *work)
+ {
+ 	struct ivpu_pm_info *pm = container_of(work, struct ivpu_pm_info, job_timeout_work.work);
+ 	struct ivpu_device *vdev = pm->vdev;
++	unsigned long timeout_ms = ivpu_tdr_timeout_ms ? ivpu_tdr_timeout_ms : vdev->timeout.tdr;
++	unsigned long inference_timeout_ms = ivpu_inference_timeout_ms ? ivpu_inference_timeout_ms :
++					     vdev->timeout.inference;
++	u64 inference_max_retries;
+ 	u64 heartbeat;
+ 
+ 	if (ivpu_jsm_get_heartbeat(vdev, 0, &heartbeat) || heartbeat <= vdev->fw->last_heartbeat) {
+@@ -198,8 +205,10 @@ static void ivpu_job_timeout_work(struct work_struct *work)
+ 		goto recovery;
+ 	}
+ 
+-	if (atomic_fetch_inc(&vdev->job_timeout_counter) > PM_TDR_HEARTBEAT_LIMIT) {
+-		ivpu_err(vdev, "Job timeout detected, heartbeat limit exceeded\n");
++	inference_max_retries = DIV_ROUND_UP(inference_timeout_ms, timeout_ms);
++	if (atomic_fetch_inc(&vdev->job_timeout_counter) >= inference_max_retries) {
++		ivpu_err(vdev, "Job timeout detected, heartbeat limit (%lld) exceeded\n",
++			 inference_max_retries);
+ 		goto recovery;
+ 	}
+ 
+-- 
+2.52.0
+
