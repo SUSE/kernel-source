@@ -1,0 +1,87 @@
+From 3dbab383e3afe999d9e9513cd9a67883b6750358 Mon Sep 17 00:00:00 2001
+From: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Date: Tue, 13 May 2025 00:00:18 +0200
+Subject: drm/xe/guc: Don't allocate managed BO for each policy change
+Git-commit: 3dbab383e3afe999d9e9513cd9a67883b6750358
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+We shouldn't use xe_managed_bo_create_from_data() to allocate
+temporary BO, as it will be released only on unload and every
+change in wedge_mode policy will consume resources (including
+precious GGTT). Instead just switchover to GuC buffer cache.
+
+Signed-off-by: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Cc: John Harrison <John.C.Harrison@Intel.com>
+Cc: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Reviewed-by: Matthew Brost <matthew.brost@intel.com>
+Link: https://lore.kernel.org/r/20250512220018.172-3-michal.wajdeczko@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/xe/xe_guc_ads.c | 27 +++++++++++++--------------
+ 1 file changed, 13 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_guc_ads.c b/drivers/gpu/drm/xe/xe_guc_ads.c
+index 44c1fa2fe7c8..07a027755627 100644
+--- a/drivers/gpu/drm/xe/xe_guc_ads.c
++++ b/drivers/gpu/drm/xe/xe_guc_ads.c
+@@ -20,6 +20,7 @@
+ #include "xe_gt_ccs_mode.h"
+ #include "xe_gt_printk.h"
+ #include "xe_guc.h"
++#include "xe_guc_buf.h"
+ #include "xe_guc_capture.h"
+ #include "xe_guc_ct.h"
+ #include "xe_hw_engine.h"
+@@ -994,6 +995,16 @@ static int guc_ads_action_update_policies(struct xe_guc_ads *ads, u32 policy_off
+ 	return xe_guc_ct_send(ct, action, ARRAY_SIZE(action), 0, 0);
+ }
+ 
++static int guc_ads_update_policies(struct xe_guc_ads *ads, const struct guc_policies *policies)
++{
++	CLASS(xe_guc_buf_from_data, buf)(&ads_to_guc(ads)->buf, policies, sizeof(*policies));
++
++	if (!xe_guc_buf_is_valid(buf))
++		return -ENOBUFS;
++
++	return guc_ads_action_update_policies(ads, xe_guc_buf_flush(buf));
++}
++
+ /**
+  * xe_guc_ads_scheduler_policy_toggle_reset - Toggle reset policy
+  * @ads: Additional data structures object
+@@ -1005,11 +1016,8 @@ static int guc_ads_action_update_policies(struct xe_guc_ads *ads, u32 policy_off
+ int xe_guc_ads_scheduler_policy_toggle_reset(struct xe_guc_ads *ads)
+ {
+ 	struct xe_device *xe = ads_to_xe(ads);
+-	struct xe_gt *gt = ads_to_gt(ads);
+-	struct xe_tile *tile = gt_to_tile(gt);
+ 	struct guc_policies *policies;
+-	struct xe_bo *bo;
+-	int ret = 0;
++	int ret;
+ 
+ 	policies = kmalloc(sizeof(*policies), GFP_KERNEL);
+ 	if (!policies)
+@@ -1023,16 +1031,7 @@ int xe_guc_ads_scheduler_policy_toggle_reset(struct xe_guc_ads *ads)
+ 	else
+ 		policies->global_flags &= ~GLOBAL_POLICY_DISABLE_ENGINE_RESET;
+ 
+-	bo = xe_managed_bo_create_from_data(xe, tile, policies, sizeof(struct guc_policies),
+-					    XE_BO_FLAG_VRAM_IF_DGFX(tile) |
+-					    XE_BO_FLAG_GGTT);
+-	if (IS_ERR(bo)) {
+-		ret = PTR_ERR(bo);
+-		goto out;
+-	}
+-
+-	ret = guc_ads_action_update_policies(ads, xe_bo_ggtt_addr(bo));
+-out:
++	ret = guc_ads_update_policies(ads, policies);
+ 	kfree(policies);
+ 	return ret;
+ }
+-- 
+2.52.0
+
