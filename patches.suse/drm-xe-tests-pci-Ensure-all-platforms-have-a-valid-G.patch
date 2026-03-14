@@ -1,0 +1,224 @@
+From fb72cd2104a9a57c390fe773e0c6ff58679a0a12 Mon Sep 17 00:00:00 2001
+From: Matt Roper <matthew.d.roper@intel.com>
+Date: Tue, 1 Jul 2025 13:13:25 -0700
+Subject: drm/xe/tests/pci: Ensure all platforms have a valid GT/tile count
+Git-commit: fb72cd2104a9a57c390fe773e0c6ff58679a0a12
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Add a simple kunit test to ensure each platform's GT per tile count is
+non-zero and does not exceed the global XE_MAX_GT_PER_TILE definition.
+
+We need to move 'struct xe_subplatform_desc' from the .c file to the
+types header to ensure it is accessible from the kunit test.
+
+V2: - Rebase on latest xe_pci test rework from Michal and convert to
+   a parameterized test that runs on each PCI ID supported by the
+   driver.
+
+Cc: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Reviewed-by: Ravi Kumar Vodapalli <ravi.kumar.vodapalli@intel.com>
+Link: https://lore.kernel.org/r/20250701201320.2514369-13-matthew.d.roper@intel.com
+Signed-off-by: Matt Roper <matthew.d.roper@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/xe/tests/xe_pci.c      | 31 +++++++++++++++++++
+ drivers/gpu/drm/xe/tests/xe_pci_test.c | 12 ++++++++
+ drivers/gpu/drm/xe/tests/xe_pci_test.h |  1 +
+ drivers/gpu/drm/xe/xe_pci.c            | 39 ------------------------
+ drivers/gpu/drm/xe/xe_pci_types.h      | 41 ++++++++++++++++++++++++++
+ 5 files changed, 85 insertions(+), 39 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/tests/xe_pci.c b/drivers/gpu/drm/xe/tests/xe_pci.c
+index baccb657bd05..9c715e59f030 100644
+--- a/drivers/gpu/drm/xe/tests/xe_pci.c
++++ b/drivers/gpu/drm/xe/tests/xe_pci.c
+@@ -21,6 +21,18 @@ static void xe_ip_kunit_desc(const struct xe_ip *param, char *desc)
+ KUNIT_ARRAY_PARAM(graphics_ip, graphics_ips, xe_ip_kunit_desc);
+ KUNIT_ARRAY_PARAM(media_ip, media_ips, xe_ip_kunit_desc);
+ 
++static void xe_pci_id_kunit_desc(const struct pci_device_id *param, char *desc)
++{
++	const struct xe_device_desc *dev_desc =
++		(const struct xe_device_desc *)param->driver_data;
++
++	if (dev_desc)
++		snprintf(desc, KUNIT_PARAM_DESC_SIZE, "0x%X (%s)",
++			 param->device, dev_desc->platform_name);
++}
++
++KUNIT_ARRAY_PARAM(pci_id, pciidlist, xe_pci_id_kunit_desc);
++
+ /**
+  * xe_pci_graphics_ip_gen_param - Generate graphics struct xe_ip parameters
+  * @prev: the pointer to the previous parameter to iterate from or NULL
+@@ -55,6 +67,25 @@ const void *xe_pci_media_ip_gen_param(const void *prev, char *desc)
+ }
+ EXPORT_SYMBOL_IF_KUNIT(xe_pci_media_ip_gen_param);
+ 
++/**
++ * xe_pci_id_gen_param - Generate struct pci_device_id parameters
++ * @prev: the pointer to the previous parameter to iterate from or NULL
++ * @desc: output buffer with minimum size of KUNIT_PARAM_DESC_SIZE
++ *
++ * This function prepares struct pci_device_id parameter.
++ *
++ * To be used only as a parameter generator function in &KUNIT_CASE_PARAM.
++ *
++ * Return: pointer to the next parameter or NULL if no more parameters
++ */
++const void *xe_pci_id_gen_param(const void *prev, char *desc)
++{
++	const struct pci_device_id *pci = pci_id_gen_params(prev, desc);
++
++	return pci->driver_data ? pci : NULL;
++}
++EXPORT_SYMBOL_IF_KUNIT(xe_pci_id_gen_param);
++
+ static void fake_read_gmdid(struct xe_device *xe, enum xe_gmdid_type type,
+ 			    u32 *ver, u32 *revid)
+ {
+diff --git a/drivers/gpu/drm/xe/tests/xe_pci_test.c b/drivers/gpu/drm/xe/tests/xe_pci_test.c
+index 95fed41f7ff2..37b344df2dc3 100644
+--- a/drivers/gpu/drm/xe/tests/xe_pci_test.c
++++ b/drivers/gpu/drm/xe/tests/xe_pci_test.c
+@@ -44,9 +44,21 @@ static void check_media_ip(struct kunit *test)
+ 	KUNIT_ASSERT_EQ(test, mask, 0);
+ }
+ 
++static void check_platform_gt_count(struct kunit *test)
++{
++	const struct pci_device_id *pci = test->param_value;
++	const struct xe_device_desc *desc =
++		(const struct xe_device_desc *)pci->driver_data;
++	int max_gt = desc->max_gt_per_tile;
++
++	KUNIT_ASSERT_GT(test, max_gt, 0);
++	KUNIT_ASSERT_LE(test, max_gt, XE_MAX_GT_PER_TILE);
++}
++
+ static struct kunit_case xe_pci_tests[] = {
+ 	KUNIT_CASE_PARAM(check_graphics_ip, xe_pci_graphics_ip_gen_param),
+ 	KUNIT_CASE_PARAM(check_media_ip, xe_pci_media_ip_gen_param),
++	KUNIT_CASE_PARAM(check_platform_gt_count, xe_pci_id_gen_param),
+ 	{}
+ };
+ 
+diff --git a/drivers/gpu/drm/xe/tests/xe_pci_test.h b/drivers/gpu/drm/xe/tests/xe_pci_test.h
+index 3a1df7a5e291..ce4d2b86b778 100644
+--- a/drivers/gpu/drm/xe/tests/xe_pci_test.h
++++ b/drivers/gpu/drm/xe/tests/xe_pci_test.h
+@@ -27,6 +27,7 @@ int xe_pci_fake_device_init(struct xe_device *xe);
+ 
+ const void *xe_pci_graphics_ip_gen_param(const void *prev, char *desc);
+ const void *xe_pci_media_ip_gen_param(const void *prev, char *desc);
++const void *xe_pci_id_gen_param(const void *prev, char *desc);
+ const void *xe_pci_live_device_gen_param(const void *prev, char *desc);
+ 
+ #endif
+diff --git a/drivers/gpu/drm/xe/xe_pci.c b/drivers/gpu/drm/xe/xe_pci.c
+index 77418f8be6ee..0737ed9baa2f 100644
+--- a/drivers/gpu/drm/xe/xe_pci.c
++++ b/drivers/gpu/drm/xe/xe_pci.c
+@@ -38,45 +38,6 @@ enum toggle_d3cold {
+ 	D3COLD_ENABLE,
+ };
+ 
+-struct xe_subplatform_desc {
+-	enum xe_subplatform subplatform;
+-	const char *name;
+-	const u16 *pciidlist;
+-};
+-
+-struct xe_device_desc {
+-	/* Should only ever be set for platforms without GMD_ID */
+-	const struct xe_ip *pre_gmdid_graphics_ip;
+-	/* Should only ever be set for platforms without GMD_ID */
+-	const struct xe_ip *pre_gmdid_media_ip;
+-
+-	const char *platform_name;
+-	const struct xe_subplatform_desc *subplatforms;
+-
+-	enum xe_platform platform;
+-
+-	u8 dma_mask_size;
+-	u8 max_remote_tiles:2;
+-	u8 max_gt_per_tile:2;
+-
+-	u8 require_force_probe:1;
+-	u8 is_dgfx:1;
+-
+-	u8 has_display:1;
+-	u8 has_fan_control:1;
+-	u8 has_gsc_nvm:1;
+-	u8 has_heci_gscfi:1;
+-	u8 has_heci_cscfi:1;
+-	u8 has_llc:1;
+-	u8 has_mbx_power_limits:1;
+-	u8 has_pxp:1;
+-	u8 has_sriov:1;
+-	u8 needs_scratch:1;
+-	u8 skip_guc_pc:1;
+-	u8 skip_mtcfg:1;
+-	u8 skip_pcode:1;
+-};
+-
+ __diag_push();
+ __diag_ignore_all("-Woverride-init", "Allow field overrides in table");
+ 
+diff --git a/drivers/gpu/drm/xe/xe_pci_types.h b/drivers/gpu/drm/xe/xe_pci_types.h
+index ca6b10d35573..4de6f69ed975 100644
+--- a/drivers/gpu/drm/xe/xe_pci_types.h
++++ b/drivers/gpu/drm/xe/xe_pci_types.h
+@@ -8,6 +8,47 @@
+ 
+ #include <linux/types.h>
+ 
++#include "xe_platform_types.h"
++
++struct xe_subplatform_desc {
++	enum xe_subplatform subplatform;
++	const char *name;
++	const u16 *pciidlist;
++};
++
++struct xe_device_desc {
++	/* Should only ever be set for platforms without GMD_ID */
++	const struct xe_ip *pre_gmdid_graphics_ip;
++	/* Should only ever be set for platforms without GMD_ID */
++	const struct xe_ip *pre_gmdid_media_ip;
++
++	const char *platform_name;
++	const struct xe_subplatform_desc *subplatforms;
++
++	enum xe_platform platform;
++
++	u8 dma_mask_size;
++	u8 max_remote_tiles:2;
++	u8 max_gt_per_tile:2;
++
++	u8 require_force_probe:1;
++	u8 is_dgfx:1;
++
++	u8 has_display:1;
++	u8 has_fan_control:1;
++	u8 has_gsc_nvm:1;
++	u8 has_heci_gscfi:1;
++	u8 has_heci_cscfi:1;
++	u8 has_llc:1;
++	u8 has_mbx_power_limits:1;
++	u8 has_pxp:1;
++	u8 has_sriov:1;
++	u8 needs_scratch:1;
++	u8 skip_guc_pc:1;
++	u8 skip_mtcfg:1;
++	u8 skip_pcode:1;
++};
++
+ struct xe_graphics_desc {
+ 	u8 va_bits;
+ 	u8 vm_max_level;
+-- 
+2.52.0
+
