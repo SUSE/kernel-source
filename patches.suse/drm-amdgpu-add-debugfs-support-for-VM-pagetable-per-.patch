@@ -1,0 +1,123 @@
+From 719b378d371899c8bbaf0ce5f42bf7db4be819f9 Mon Sep 17 00:00:00 2001
+From: Sunil Khatri <sunil.khatri@amd.com>
+Date: Fri, 4 Jul 2025 13:25:47 +0530
+Subject: drm/amdgpu: add debugfs support for VM pagetable per client
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 719b378d371899c8bbaf0ce5f42bf7db4be819f9
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Add a debugfs file under the client directory which shares
+the root page table base address of the VM.
+
+This address could be used to dump the pagetable for debug
+memory issues.
+
+Signed-off-by: Sunil Khatri <sunil.khatri@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Link: https://lore.kernel.org/r/20250704075548.1549849-4-sunil.khatri@amd.com
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_debugfs.c | 52 +++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_debugfs.h |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c     |  2 +
+ 3 files changed, 55 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_debugfs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_debugfs.c
+index 83f211903425..2353455d4aff 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_debugfs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_debugfs.c
+@@ -2131,6 +2131,55 @@ int amdgpu_debugfs_init(struct amdgpu_device *adev)
+ 	return 0;
+ }
+ 
++static int amdgpu_pt_info_read(struct seq_file *m, void *unused)
++{
++	struct drm_file *file;
++	struct amdgpu_fpriv *fpriv;
++	struct amdgpu_bo *root_bo;
++	int r;
++
++	file = m->private;
++	if (!file)
++		return -EINVAL;
++
++	fpriv = file->driver_priv;
++	if (!fpriv && !fpriv->vm.root.bo)
++		return -ENODEV;
++
++	root_bo = amdgpu_bo_ref(fpriv->vm.root.bo);
++	r = amdgpu_bo_reserve(root_bo, true);
++	if (r) {
++		amdgpu_bo_unref(&root_bo);
++		return -EINVAL;
++	}
++
++	seq_printf(m, "gpu_address: 0x%llx\n", amdgpu_bo_gpu_offset(fpriv->vm.root.bo));
++
++	amdgpu_bo_unreserve(root_bo);
++	amdgpu_bo_unref(&root_bo);
++
++	return 0;
++}
++
++static int amdgpu_pt_info_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, amdgpu_pt_info_read, inode->i_private);
++}
++
++static const struct file_operations amdgpu_pt_info_fops = {
++	.owner = THIS_MODULE,
++	.open = amdgpu_pt_info_open,
++	.read = seq_read,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++
++void amdgpu_debugfs_vm_init(struct drm_file *file)
++{
++	debugfs_create_file("vm_pagetable_info", 0444, file->debugfs_client, file,
++			    &amdgpu_pt_info_fops);
++}
++
+ #else
+ int amdgpu_debugfs_init(struct amdgpu_device *adev)
+ {
+@@ -2140,4 +2189,7 @@ int amdgpu_debugfs_regs_init(struct amdgpu_device *adev)
+ {
+ 	return 0;
+ }
++void amdgpu_debugfs_vm_init(struct drm_file *file)
++{
++}
+ #endif
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_debugfs.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_debugfs.h
+index 0425432d8659..e7b3c38e5186 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_debugfs.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_debugfs.h
+@@ -33,4 +33,5 @@ void amdgpu_debugfs_fence_init(struct amdgpu_device *adev);
+ void amdgpu_debugfs_firmware_init(struct amdgpu_device *adev);
+ void amdgpu_debugfs_gem_init(struct amdgpu_device *adev);
+ void amdgpu_debugfs_mes_event_log_init(struct amdgpu_device *adev);
++void amdgpu_debugfs_vm_init(struct drm_file *file);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+index d2ce7d86dbc8..d555853c5717 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+@@ -1395,6 +1395,8 @@ int amdgpu_driver_open_kms(struct drm_device *dev, struct drm_file *file_priv)
+ 	if (r)
+ 		goto error_pasid;
+ 
++	amdgpu_debugfs_vm_init(file_priv);
++
+ 	r = amdgpu_vm_init(adev, &fpriv->vm, fpriv->xcp_id);
+ 	if (r)
+ 		goto error_pasid;
+-- 
+2.52.0
+
