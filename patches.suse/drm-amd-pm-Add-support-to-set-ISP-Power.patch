@@ -1,0 +1,158 @@
+From fba8d147472ef23fbf2e173f5421cdb3873c4f33 Mon Sep 17 00:00:00 2001
+From: Pratap Nirujogi <pratap.nirujogi@amd.com>
+Date: Mon, 16 Jun 2025 15:07:57 -0400
+Subject: drm/amd/pm: Add support to set ISP Power
+Git-commit: fba8d147472ef23fbf2e173f5421cdb3873c4f33
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Add support to set ISP power for SMU v14.0.0. ISP driver
+uses amdgpu_dpm_set_powergating_by_smu() API to
+enable / disable power via SMU interface than communicating
+with PMFW directly.
+
+Reviewed-by: Lijo Lazar <lijo.lazar@amd.com>
+Reviewed-by: Mario Limonciello <mario.limonciello@amd.com>
+Signed-off-by: Pratap Nirujogi <pratap.nirujogi@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/pm/amdgpu_dpm.c           |  1 +
+ drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c     | 27 +++++++++++++++++++
+ drivers/gpu/drm/amd/pm/swsmu/inc/amdgpu_smu.h |  7 +++++
+ .../inc/pmfw_if/smu14_driver_if_v14_0_0.h     |  1 +
+ .../drm/amd/pm/swsmu/smu14/smu_v14_0_0_ppt.c  |  9 +++++++
+ 5 files changed, 45 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/pm/amdgpu_dpm.c b/drivers/gpu/drm/amd/pm/amdgpu_dpm.c
+index 5c1cbdc122d2..95f1fff442cb 100644
+--- a/drivers/gpu/drm/amd/pm/amdgpu_dpm.c
++++ b/drivers/gpu/drm/amd/pm/amdgpu_dpm.c
+@@ -98,6 +98,7 @@ int amdgpu_dpm_set_powergating_by_smu(struct amdgpu_device *adev,
+ 	case AMD_IP_BLOCK_TYPE_GMC:
+ 	case AMD_IP_BLOCK_TYPE_ACP:
+ 	case AMD_IP_BLOCK_TYPE_VPE:
++	case AMD_IP_BLOCK_TYPE_ISP:
+ 		if (pp_funcs && pp_funcs->set_powergating_by_smu)
+ 			ret = (pp_funcs->set_powergating_by_smu(
+ 				(adev)->powerplay.pp_handle, block_type, gate, 0));
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c b/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c
+index 0c9232009da9..97572fe26ddf 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c
+@@ -307,6 +307,26 @@ static int smu_dpm_set_vpe_enable(struct smu_context *smu,
+ 	return ret;
+ }
+ 
++static int smu_dpm_set_isp_enable(struct smu_context *smu,
++				  bool enable)
++{
++	struct smu_power_context *smu_power = &smu->smu_power;
++	struct smu_power_gate *power_gate = &smu_power->power_gate;
++	int ret;
++
++	if (!smu->ppt_funcs->dpm_set_isp_enable)
++		return 0;
++
++	if (atomic_read(&power_gate->isp_gated) ^ enable)
++		return 0;
++
++	ret = smu->ppt_funcs->dpm_set_isp_enable(smu, enable);
++	if (!ret)
++		atomic_set(&power_gate->isp_gated, !enable);
++
++	return ret;
++}
++
+ static int smu_dpm_set_umsch_mm_enable(struct smu_context *smu,
+ 				   bool enable)
+ {
+@@ -408,6 +428,12 @@ static int smu_dpm_set_power_gate(void *handle,
+ 			dev_err(smu->adev->dev, "Failed to power %s VPE!\n",
+ 				gate ? "gate" : "ungate");
+ 		break;
++	case AMD_IP_BLOCK_TYPE_ISP:
++		ret = smu_dpm_set_isp_enable(smu, !gate);
++		if (ret)
++			dev_err(smu->adev->dev, "Failed to power %s ISP!\n",
++				gate ? "gate" : "ungate");
++		break;
+ 	default:
+ 		dev_err(smu->adev->dev, "Unsupported block type!\n");
+ 		return -EINVAL;
+@@ -1300,6 +1326,7 @@ static int smu_sw_init(struct amdgpu_ip_block *ip_block)
+ 		atomic_set(&smu->smu_power.power_gate.vcn_gated[i], 1);
+ 	atomic_set(&smu->smu_power.power_gate.jpeg_gated, 1);
+ 	atomic_set(&smu->smu_power.power_gate.vpe_gated, 1);
++	atomic_set(&smu->smu_power.power_gate.isp_gated, 1);
+ 	atomic_set(&smu->smu_power.power_gate.umsch_mm_gated, 1);
+ 
+ 	smu_init_power_profile(smu);
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/inc/amdgpu_smu.h b/drivers/gpu/drm/amd/pm/swsmu/inc/amdgpu_smu.h
+index 9aacc7bc1c69..41d4a7f93660 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/inc/amdgpu_smu.h
++++ b/drivers/gpu/drm/amd/pm/swsmu/inc/amdgpu_smu.h
+@@ -402,6 +402,7 @@ struct smu_power_gate {
+ 	atomic_t vcn_gated[AMDGPU_MAX_VCN_INSTANCES];
+ 	atomic_t jpeg_gated;
+ 	atomic_t vpe_gated;
++	atomic_t isp_gated;
+ 	atomic_t umsch_mm_gated;
+ };
+ 
+@@ -1435,6 +1436,12 @@ struct pptable_funcs {
+ 	 */
+ 	int (*dpm_set_vpe_enable)(struct smu_context *smu, bool enable);
+ 
++	/**
++	 * @dpm_set_isp_enable: Enable/disable ISP engine dynamic power
++	 *                       management.
++	 */
++	int (*dpm_set_isp_enable)(struct smu_context *smu, bool enable);
++
+ 	/**
+ 	 * @dpm_set_umsch_mm_enable: Enable/disable UMSCH engine dynamic power
+ 	 *                       management.
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/inc/pmfw_if/smu14_driver_if_v14_0_0.h b/drivers/gpu/drm/amd/pm/swsmu/inc/pmfw_if/smu14_driver_if_v14_0_0.h
+index 1bc30db22f9c..cd44f4254134 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/inc/pmfw_if/smu14_driver_if_v14_0_0.h
++++ b/drivers/gpu/drm/amd/pm/swsmu/inc/pmfw_if/smu14_driver_if_v14_0_0.h
+@@ -106,6 +106,7 @@ typedef struct {
+ #define NUM_FCLK_DPM_LEVELS       8
+ #define NUM_MEM_PSTATE_LEVELS     4
+ 
++#define  ISP_ALL_TILES_MASK       0x7FF
+ 
+ typedef struct {
+   uint32_t UClk;
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/smu14/smu_v14_0_0_ppt.c b/drivers/gpu/drm/amd/pm/swsmu/smu14/smu_v14_0_0_ppt.c
+index 84f9b007b59f..fe4735d5ebd4 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/smu14/smu_v14_0_0_ppt.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/smu14/smu_v14_0_0_ppt.c
+@@ -1533,6 +1533,14 @@ static int smu_v14_0_0_set_vpe_enable(struct smu_context *smu,
+ 					       0, NULL);
+ }
+ 
++static int smu_v14_0_0_set_isp_enable(struct smu_context *smu,
++				      bool enable)
++{
++	return smu_cmn_send_smc_msg_with_param(smu, enable ?
++				      SMU_MSG_PowerUpIspByTile : SMU_MSG_PowerDownIspByTile,
++				      ISP_ALL_TILES_MASK, NULL);
++}
++
+ static int smu_v14_0_0_set_umsch_mm_enable(struct smu_context *smu,
+ 			      bool enable)
+ {
+@@ -1669,6 +1677,7 @@ static const struct pptable_funcs smu_v14_0_0_ppt_funcs = {
+ 	.set_fine_grain_gfx_freq_parameters = smu_v14_0_common_set_fine_grain_gfx_freq_parameters,
+ 	.set_gfx_power_up_by_imu = smu_v14_0_set_gfx_power_up_by_imu,
+ 	.dpm_set_vpe_enable = smu_v14_0_0_set_vpe_enable,
++	.dpm_set_isp_enable = smu_v14_0_0_set_isp_enable,
+ 	.dpm_set_umsch_mm_enable = smu_v14_0_0_set_umsch_mm_enable,
+ 	.get_dpm_clock_table = smu_v14_0_common_get_dpm_table,
+ 	.set_mall_enable = smu_v14_0_common_set_mall_enable,
+-- 
+2.52.0
+
