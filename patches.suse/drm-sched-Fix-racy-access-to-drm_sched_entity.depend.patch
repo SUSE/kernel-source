@@ -1,0 +1,77 @@
+From 232674e1a6dd2f7a68b0d496a7ed1a57d79533da Mon Sep 17 00:00:00 2001
+From: Pierre-Eric Pelloux-Prayer <pierre-eric.pelloux-prayer@amd.com>
+Date: Mon, 1 Sep 2025 14:40:32 +0200
+Subject: drm/sched: Fix racy access to drm_sched_entity.dependency
+Git-commit: 232674e1a6dd2f7a68b0d496a7ed1a57d79533da
+Patch-mainline: v6.17-rc5
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+The drm_sched_job_unschedulable trace point can access
+entity->dependency after it was cleared by the callback
+installed in drm_sched_entity_add_dependency_cb, causing:
+
+BUG: kernel NULL pointer dereference, address: 0000000000000020
+[...]
+Workqueue: comp_1.1.0 drm_sched_run_job_work [gpu_sched]
+RIP: 0010:trace_event_raw_event_drm_sched_job_unschedulable+0x70/0xd0 [gpu_sched]
+
+To fix this we either need to keep a reference to the fence before
+setting up the callbacks, or move the trace_drm_sched_job_unschedulable
+calls into drm_sched_entity_add_dependency_cb where they can be
+done earlier.
+
+Fixes: 76d97c870f29 ("drm/sched: Trace dependencies for GPU jobs")
+
+Signed-off-by: Pierre-Eric Pelloux-Prayer <pierre-eric.pelloux-prayer@amd.com>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@igalia.com>
+Signed-off-by: Philipp Stanner <phasta@kernel.org>
+Link: https://lore.kernel.org/r/20250901124032.1955-1-pierre-eric.pelloux-prayer@amd.com
+(cherry picked from commit b2b8af21fec35be417a3199b5a6c354605dd222a)
+
+Signed-off-by: Maxime Ripard <mripard@kernel.org>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/scheduler/sched_entity.c | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/scheduler/sched_entity.c b/drivers/gpu/drm/scheduler/sched_entity.c
+index 8867b95ab089..3d06f72531ba 100644
+--- a/drivers/gpu/drm/scheduler/sched_entity.c
++++ b/drivers/gpu/drm/scheduler/sched_entity.c
+@@ -391,7 +391,8 @@ EXPORT_SYMBOL(drm_sched_entity_set_priority);
+  * Add a callback to the current dependency of the entity to wake up the
+  * scheduler when the entity becomes available.
+  */
+-static bool drm_sched_entity_add_dependency_cb(struct drm_sched_entity *entity)
++static bool drm_sched_entity_add_dependency_cb(struct drm_sched_entity *entity,
++					       struct drm_sched_job *sched_job)
+ {
+ 	struct drm_gpu_scheduler *sched = entity->rq->sched;
+ 	struct dma_fence *fence = entity->dependency;
+@@ -421,6 +422,10 @@ static bool drm_sched_entity_add_dependency_cb(struct drm_sched_entity *entity)
+ 		entity->dependency = fence;
+ 	}
+ 
++	if (trace_drm_sched_job_unschedulable_enabled() &&
++	    !test_bit(DMA_FENCE_FLAG_SIGNALED_BIT, &entity->dependency->flags))
++		trace_drm_sched_job_unschedulable(sched_job, entity->dependency);
++
+ 	if (!dma_fence_add_callback(entity->dependency, &entity->cb,
+ 				    drm_sched_entity_wakeup))
+ 		return true;
+@@ -461,10 +466,8 @@ struct drm_sched_job *drm_sched_entity_pop_job(struct drm_sched_entity *entity)
+ 
+ 	while ((entity->dependency =
+ 			drm_sched_job_dependency(sched_job, entity))) {
+-		if (drm_sched_entity_add_dependency_cb(entity)) {
+-			trace_drm_sched_job_unschedulable(sched_job, entity->dependency);
++		if (drm_sched_entity_add_dependency_cb(entity, sched_job))
+ 			return NULL;
+-		}
+ 	}
+ 
+ 	/* skip jobs from entity that marked guilty */
+-- 
+2.52.0
+
