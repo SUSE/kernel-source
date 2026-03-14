@@ -1,0 +1,129 @@
+From ab3ef56f58c21220dd131195385de212861a3f53 Mon Sep 17 00:00:00 2001
+From: Jani Nikula <jani.nikula@intel.com>
+Date: Mon, 23 Jun 2025 14:43:44 +0300
+Subject: drm/i915/pcode: drop fast wait from snb_pcode_write_timeout()
+Git-commit: ab3ef56f58c21220dd131195385de212861a3f53
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Only use the ms granularity wait in snb_pcode_write_timeout(), primarily
+to better align with the xe driver, which also only has the millisecond
+wait.
+
+Use an arbitrary 250 us fast wait before the specified ms wait, and have
+snb_pcode_write() default to 1 ms.
+
+This means snb_pcode_write() and snb_pcode_write_timeout() will always
+be sleeping functions. There should not be any atomic users for pcode
+writes though, and any display code using pcode via xe has already been
+non-atomic. The uncore wait will do a might_sleep() annotation that
+should catch any problems.
+
+Reviewed-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Link: https://lore.kernel.org/r/ba86280f53cea2d020308db35f1ecbd615d07d8a.1750678991.git.jani.nikula@intel.com
+Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/intel_cdclk.c              | 5 ++---
+ drivers/gpu/drm/i915/display/intel_display_power_well.c | 3 +--
+ drivers/gpu/drm/i915/intel_pcode.c                      | 5 ++---
+ drivers/gpu/drm/i915/intel_pcode.h                      | 5 ++---
+ drivers/gpu/drm/xe/compat-i915-headers/intel_pcode.h    | 6 ++----
+ 5 files changed, 9 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_cdclk.c b/drivers/gpu/drm/i915/display/intel_cdclk.c
+index 3f68098f27c9..8c5c9ebb75c1 100644
+--- a/drivers/gpu/drm/i915/display/intel_cdclk.c
++++ b/drivers/gpu/drm/i915/display/intel_cdclk.c
+@@ -2148,7 +2148,7 @@ static void bxt_set_cdclk(struct intel_display *display,
+ 		 */
+ 		ret = snb_pcode_write_timeout(&dev_priv->uncore,
+ 					      HSW_PCODE_DE_WRITE_FREQ_REQ,
+-					      0x80000000, 150, 2);
++					      0x80000000, 2);
+ 
+ 	if (ret) {
+ 		drm_err(display->drm,
+@@ -2188,8 +2188,7 @@ static void bxt_set_cdclk(struct intel_display *display,
+ 		 */
+ 		ret = snb_pcode_write_timeout(&dev_priv->uncore,
+ 					      HSW_PCODE_DE_WRITE_FREQ_REQ,
+-					      cdclk_config->voltage_level,
+-					      150, 2);
++					      cdclk_config->voltage_level, 2);
+ 	}
+ 	if (ret) {
+ 		drm_err(display->drm,
+diff --git a/drivers/gpu/drm/i915/display/intel_display_power_well.c b/drivers/gpu/drm/i915/display/intel_display_power_well.c
+index 0f1848b970a7..109be9801ba1 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_power_well.c
++++ b/drivers/gpu/drm/i915/display/intel_display_power_well.c
+@@ -486,8 +486,7 @@ static void icl_tc_cold_exit(struct intel_display *display)
+ 	int ret, tries = 0;
+ 
+ 	while (1) {
+-		ret = snb_pcode_write_timeout(&i915->uncore, ICL_PCODE_EXIT_TCCOLD, 0,
+-					      250, 1);
++		ret = snb_pcode_write(&i915->uncore, ICL_PCODE_EXIT_TCCOLD, 0);
+ 		if (ret != -EAGAIN || ++tries == 3)
+ 			break;
+ 		msleep(1);
+diff --git a/drivers/gpu/drm/i915/intel_pcode.c b/drivers/gpu/drm/i915/intel_pcode.c
+index 3db2ba439bb5..b7e9b4ee1425 100644
+--- a/drivers/gpu/drm/i915/intel_pcode.c
++++ b/drivers/gpu/drm/i915/intel_pcode.c
+@@ -110,13 +110,12 @@ int snb_pcode_read(struct intel_uncore *uncore, u32 mbox, u32 *val, u32 *val1)
+ }
+ 
+ int snb_pcode_write_timeout(struct intel_uncore *uncore, u32 mbox, u32 val,
+-			    int fast_timeout_us, int slow_timeout_ms)
++			    int timeout_ms)
+ {
+ 	int err;
+ 
+ 	mutex_lock(&uncore->i915->sb_lock);
+-	err = __snb_pcode_rw(uncore, mbox, &val, NULL,
+-			     fast_timeout_us, slow_timeout_ms, false);
++	err = __snb_pcode_rw(uncore, mbox, &val, NULL, 250, timeout_ms, false);
+ 	mutex_unlock(&uncore->i915->sb_lock);
+ 
+ 	if (err) {
+diff --git a/drivers/gpu/drm/i915/intel_pcode.h b/drivers/gpu/drm/i915/intel_pcode.h
+index 8d2198e29422..401ce27f72d4 100644
+--- a/drivers/gpu/drm/i915/intel_pcode.h
++++ b/drivers/gpu/drm/i915/intel_pcode.h
+@@ -11,10 +11,9 @@
+ struct intel_uncore;
+ 
+ int snb_pcode_read(struct intel_uncore *uncore, u32 mbox, u32 *val, u32 *val1);
+-int snb_pcode_write_timeout(struct intel_uncore *uncore, u32 mbox, u32 val,
+-			    int fast_timeout_us, int slow_timeout_ms);
++int snb_pcode_write_timeout(struct intel_uncore *uncore, u32 mbox, u32 val, int timeout_ms);
+ #define snb_pcode_write(uncore, mbox, val) \
+-	snb_pcode_write_timeout(uncore, mbox, val, 500, 0)
++	snb_pcode_write_timeout((uncore), (mbox), (val), 1)
+ 
+ int skl_pcode_request(struct intel_uncore *uncore, u32 mbox, u32 request,
+ 		      u32 reply_mask, u32 reply, int timeout_base_ms);
+diff --git a/drivers/gpu/drm/xe/compat-i915-headers/intel_pcode.h b/drivers/gpu/drm/xe/compat-i915-headers/intel_pcode.h
+index a473aa6697d0..32da708680c2 100644
+--- a/drivers/gpu/drm/xe/compat-i915-headers/intel_pcode.h
++++ b/drivers/gpu/drm/xe/compat-i915-headers/intel_pcode.h
+@@ -10,11 +10,9 @@
+ #include "xe_pcode.h"
+ 
+ static inline int
+-snb_pcode_write_timeout(struct intel_uncore *uncore, u32 mbox, u32 val,
+-			int fast_timeout_us, int slow_timeout_ms)
++snb_pcode_write_timeout(struct intel_uncore *uncore, u32 mbox, u32 val, int timeout_ms)
+ {
+-	return xe_pcode_write_timeout(__compat_uncore_to_tile(uncore), mbox, val,
+-				      slow_timeout_ms ?: 1);
++	return xe_pcode_write_timeout(__compat_uncore_to_tile(uncore), mbox, val, timeout_ms);
+ }
+ 
+ static inline int
+-- 
+2.52.0
+
