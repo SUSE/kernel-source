@@ -1,0 +1,179 @@
+From 20905edb2461d8dac1c03f28f6ad06e957f3b45c Mon Sep 17 00:00:00 2001
+From: Likun Gao <Likun.Gao@amd.com>
+Date: Fri, 13 Jun 2025 22:30:34 +0800
+Subject: drm/amdgpu: make ip map init to common function
+Git-commit: 20905edb2461d8dac1c03f28f6ad06e957f3b45c
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+IP instance map init function can be an common function
+instead of operation on different ASIC.
+V2: Create amdgpu_ip.[ch] file for ip related functions.
+
+Signed-off-by: Likun Gao <Likun.Gao@amd.com>
+Reviewed-by: Hawking Zhang <Hawking.Zhang@amd.com>
+Reviewed-by: Lijo Lazar <lijo.lazar@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/Makefile    |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ip.c | 96 ++++++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ip.h | 29 ++++++++
+ 3 files changed, 126 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/gpu/drm/amd/amdgpu/amdgpu_ip.c
+ create mode 100644 drivers/gpu/drm/amd/amdgpu/amdgpu_ip.h
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/Makefile b/drivers/gpu/drm/amd/amdgpu/Makefile
+index 87080c06e5fc..930de203d533 100644
+--- a/drivers/gpu/drm/amd/amdgpu/Makefile
++++ b/drivers/gpu/drm/amd/amdgpu/Makefile
+@@ -66,7 +66,7 @@ amdgpu-y += amdgpu_device.o amdgpu_doorbell_mgr.o amdgpu_kms.o \
+ 	amdgpu_fw_attestation.o amdgpu_securedisplay.o \
+ 	amdgpu_eeprom.o amdgpu_mca.o amdgpu_psp_ta.o amdgpu_lsdma.o \
+ 	amdgpu_ring_mux.o amdgpu_xcp.o amdgpu_seq64.o amdgpu_aca.o amdgpu_dev_coredump.o \
+-	amdgpu_cper.o amdgpu_userq_fence.o amdgpu_eviction_fence.o
++	amdgpu_cper.o amdgpu_userq_fence.o amdgpu_eviction_fence.o amdgpu_ip.o
+ 
+ amdgpu-$(CONFIG_PROC_FS) += amdgpu_fdinfo.o
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ip.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ip.c
+new file mode 100644
+index 000000000000..99e1cf4fc955
+--- /dev/null
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ip.c
+@@ -0,0 +1,96 @@
++/*
++ * Copyright 2025 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++
++#include "amdgpu.h"
++#include "amdgpu_ip.h"
++
++static int8_t amdgpu_logical_to_dev_inst(struct amdgpu_device *adev,
++					 enum amd_hw_ip_block_type block,
++					 int8_t inst)
++{
++	int8_t dev_inst;
++
++	switch (block) {
++	case GC_HWIP:
++	case SDMA0_HWIP:
++	/* Both JPEG and VCN as JPEG is only alias of VCN */
++	case VCN_HWIP:
++		dev_inst = adev->ip_map.dev_inst[block][inst];
++		break;
++	default:
++		/* For rest of the IPs, no look up required.
++		 * Assume 'logical instance == physical instance' for all configs. */
++		dev_inst = inst;
++		break;
++	}
++
++	return dev_inst;
++}
++
++static uint32_t amdgpu_logical_to_dev_mask(struct amdgpu_device *adev,
++					   enum amd_hw_ip_block_type block,
++					   uint32_t mask)
++{
++	uint32_t dev_mask = 0;
++	int8_t log_inst, dev_inst;
++
++	while (mask) {
++		log_inst = ffs(mask) - 1;
++		dev_inst = amdgpu_logical_to_dev_inst(adev, block, log_inst);
++		dev_mask |= (1 << dev_inst);
++		mask &= ~(1 << log_inst);
++	}
++
++	return dev_mask;
++}
++
++static void amdgpu_populate_ip_map(struct amdgpu_device *adev,
++				   enum amd_hw_ip_block_type ip_block,
++				   uint32_t inst_mask)
++{
++	int l = 0, i;
++
++	while (inst_mask) {
++		i = ffs(inst_mask) - 1;
++		adev->ip_map.dev_inst[ip_block][l++] = i;
++		inst_mask &= ~(1 << i);
++	}
++	for (; l < HWIP_MAX_INSTANCE; l++)
++		adev->ip_map.dev_inst[ip_block][l] = -1;
++}
++
++void amdgpu_ip_map_init(struct amdgpu_device *adev)
++{
++	u32 ip_map[][2] = {
++		{ GC_HWIP, adev->gfx.xcc_mask },
++		{ SDMA0_HWIP, adev->sdma.sdma_mask },
++		{ VCN_HWIP, adev->vcn.inst_mask },
++	};
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(ip_map); ++i)
++		amdgpu_populate_ip_map(adev, ip_map[i][0], ip_map[i][1]);
++
++	adev->ip_map.logical_to_dev_inst = amdgpu_logical_to_dev_inst;
++	adev->ip_map.logical_to_dev_mask = amdgpu_logical_to_dev_mask;
++}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ip.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ip.h
+new file mode 100644
+index 000000000000..2490fd322aec
+--- /dev/null
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ip.h
+@@ -0,0 +1,29 @@
++/*
++ * Copyright 2025 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++
++#ifndef __AMDGPU_IP_H__
++#define __AMDGPU_IP_H__
++
++void amdgpu_ip_map_init(struct amdgpu_device *adev);
++
++#endif /* __AMDGPU_IP_H__ */
+-- 
+2.52.0
+
