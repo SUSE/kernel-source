@@ -1,0 +1,144 @@
+From 2c41d62f6fb16d591df17b29edaa81ea56569bb3 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Fri, 23 May 2025 11:50:34 +0530
+Subject: drm/i915/dsb: Implement intel_dsb_gosub()
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 2c41d62f6fb16d591df17b29edaa81ea56569bb3
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Add support for the new GOSUB DSB instruction (available on ptl+),
+which instructs the DSB to jump to a different buffer, execute
+the commands there, and then return execution to the next
+instruction in the original buffer.
+
+There are a few alignment related workarounds that need to
+be dealt with when emitting GOSUB instruction.
+
+V2: Right shift head and tail pointer passed to gosub command (chaitanya)
+V3: Add macro for right shifting head/tail pointers (Animesh)
+V4: Fix typo in commit message (Uma)
+    Add comments explaining why right shifting htp is needed (Animesh)
+
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Signed-off-by: Chaitanya Kumar Borah <chaitanya.kumar.borah@intel.com>
+Reviewed-by: Uma Shankar <uma.shankar@intel.com>
+Reviewed-by: Animesh Manna <animesh.manna@intel.com>
+Signed-off-by: Animesh Manna <animesh.manna@intel.com>
+Link: https://lore.kernel.org/r/20250523062041.166468-5-chaitanya.kumar.borah@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/intel_dsb.c | 73 ++++++++++++++++++++++++
+ drivers/gpu/drm/i915/display/intel_dsb.h |  2 +
+ 2 files changed, 75 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_dsb.c b/drivers/gpu/drm/i915/display/intel_dsb.c
+index 9b2de4e7e681..cd32b59adf18 100644
+--- a/drivers/gpu/drm/i915/display/intel_dsb.c
++++ b/drivers/gpu/drm/i915/display/intel_dsb.c
+@@ -93,6 +93,10 @@ struct intel_dsb {
+ /* see DSB_REG_VALUE_MASK */
+ #define DSB_OPCODE_POLL			0xA
+ /* see DSB_REG_VALUE_MASK */
++#define DSB_OPCODE_GOSUB		0xC /* ptl+ */
++#define   DSB_GOSUB_HEAD_SHIFT		26
++#define   DSB_GOSUB_TAIL_SHIFT		0
++#define   DSB_GOSUB_CONVERT_ADDR(x)	((x) >> 6)
+ 
+ static bool pre_commit_is_vrr_active(struct intel_atomic_state *state,
+ 				     struct intel_crtc *crtc)
+@@ -533,6 +537,75 @@ static void intel_dsb_align_tail(struct intel_dsb *dsb)
+ 	dsb->free_pos = aligned_tail / 4;
+ }
+ 
++static void intel_dsb_gosub_align(struct intel_dsb *dsb)
++{
++	u32 aligned_tail, tail;
++
++	intel_dsb_ins_align(dsb);
++
++	tail = dsb->free_pos * 4;
++	aligned_tail = ALIGN(tail, CACHELINE_BYTES);
++
++	/*
++	 * "The GOSUB instruction cannot be placed in
++	 *  cacheline QW slot 6 or 7 (numbered 0-7)"
++	 */
++	if (aligned_tail - tail <= 2 * 8)
++		intel_dsb_buffer_memset(&dsb->dsb_buf, dsb->free_pos, 0,
++					aligned_tail - tail);
++
++	dsb->free_pos = aligned_tail / 4;
++}
++
++void intel_dsb_gosub(struct intel_dsb *dsb,
++		     struct intel_dsb *sub_dsb)
++{
++	struct intel_crtc *crtc = dsb->crtc;
++	struct intel_display *display = to_intel_display(crtc->base.dev);
++	unsigned int head, tail;
++	u64 head_tail;
++
++	if (drm_WARN_ON(display->drm, dsb->id != sub_dsb->id))
++		return;
++
++	if (!assert_dsb_tail_is_aligned(sub_dsb))
++		return;
++
++	intel_dsb_gosub_align(dsb);
++
++	head = intel_dsb_head(sub_dsb);
++	tail = intel_dsb_tail(sub_dsb);
++
++	/*
++	 * The GOSUB instruction has the following memory layout.
++	 *
++	 * +------------------------------------------------------------+
++	 * |  Opcode  |   Rsvd    |      Head Ptr     |     Tail Ptr    |
++	 * |   0x0c   |           |                   |                 |
++	 * +------------------------------------------------------------+
++	 * |<- 8bits->|<- 4bits ->|<--   26bits    -->|<--  26bits   -->|
++	 *
++	 * We have only 26 bits each to represent the head and  tail
++	 * pointers even though the addresses itself are of 32 bit. However, this
++	 * is not a problem because the addresses are 64 bit aligned and therefore
++	 * the last 6 bits are always Zero's. Therefore, we right shift the address
++	 * by 6 before embedding it into the GOSUB instruction.
++	 */
++
++	head_tail = ((u64)(DSB_GOSUB_CONVERT_ADDR(head)) << DSB_GOSUB_HEAD_SHIFT) |
++		((u64)(DSB_GOSUB_CONVERT_ADDR(tail)) << DSB_GOSUB_TAIL_SHIFT);
++
++	intel_dsb_emit(dsb, lower_32_bits(head_tail),
++		       (DSB_OPCODE_GOSUB << DSB_OPCODE_SHIFT) |
++		       upper_32_bits(head_tail));
++
++	/*
++	 * "NOTE: the instructions within the cacheline
++	 *  FOLLOWING the GOSUB instruction must be NOPs."
++	 */
++	intel_dsb_align_tail(dsb);
++}
++
+ void intel_dsb_finish(struct intel_dsb *dsb)
+ {
+ 	struct intel_crtc *crtc = dsb->crtc;
+diff --git a/drivers/gpu/drm/i915/display/intel_dsb.h b/drivers/gpu/drm/i915/display/intel_dsb.h
+index e843c52bf97c..8b2cf0a7b7e6 100644
+--- a/drivers/gpu/drm/i915/display/intel_dsb.h
++++ b/drivers/gpu/drm/i915/display/intel_dsb.h
+@@ -57,6 +57,8 @@ void intel_dsb_vblank_evade(struct intel_atomic_state *state,
+ void intel_dsb_poll(struct intel_dsb *dsb,
+ 		    i915_reg_t reg, u32 mask, u32 val,
+ 		    int wait_us, int count);
++void intel_dsb_gosub(struct intel_dsb *dsb,
++		     struct intel_dsb *sub_dsb);
+ void intel_dsb_chain(struct intel_atomic_state *state,
+ 		     struct intel_dsb *dsb,
+ 		     struct intel_dsb *chained_dsb,
+-- 
+2.52.0
+
