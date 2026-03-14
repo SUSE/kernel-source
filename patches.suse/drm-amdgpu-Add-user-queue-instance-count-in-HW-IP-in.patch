@@ -1,0 +1,111 @@
+From 78d0a27ae0e2e70b22895f4b388cc0ab88e3c6ca Mon Sep 17 00:00:00 2001
+From: Jesse Zhang <jesse.zhang@amd.com>
+Date: Wed, 25 Jun 2025 15:29:45 +0800
+Subject: drm/amdgpu: Add user queue instance count in HW IP info
+Git-commit: 78d0a27ae0e2e70b22895f4b388cc0ab88e3c6ca
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+This change exposes the number of available user queue instances
+for each hardware IP type (GFX, COMPUTE, SDMA) through the
+drm_amdgpu_info_hw_ip interface.
+
+Key changes:
+1. Added userq_num_instance field to drm_amdgpu_info_hw_ip structure
+2. Implemented counting of available HQD slots using:
+   - mes.gfx_hqd_mask for GFX queues
+   - mes.compute_hqd_mask for COMPUTE queues
+   - mes.sdma_hqd_mask for SDMA queues
+3. Only counts available instances when user queues are enabled
+   (!disable_uq)
+
+V2: using the adev->mes.gfx_hqd_mask[]/compute_hqd_mask[]/sdma_hqd_mask[] masks
+  to determine the number of queue slots available for each engine type (Alex)
+V3: rename userq_num_instance to userq_num_hqds (Alex)
+
+Suggested-by: Alex Deucher <alexander.deucher@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Jesse Zhang <Jesse.Zhang@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c | 20 ++++++++++++++++++++
+ include/uapi/drm/amdgpu_drm.h           |  2 ++
+ 2 files changed, 22 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+index c78eea14c70a..3d4185a1d938 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c
+@@ -399,6 +399,7 @@ static int amdgpu_hw_ip_info(struct amdgpu_device *adev,
+ 	uint32_t ib_size_alignment = 0;
+ 	enum amd_ip_block_type type;
+ 	unsigned int num_rings = 0;
++	uint32_t num_hqds = 0;
+ 	unsigned int i, j;
+ 
+ 	if (info->query_hw_ip.ip_instance >= AMDGPU_HW_IP_INSTANCE_MAX_COUNT)
+@@ -411,6 +412,12 @@ static int amdgpu_hw_ip_info(struct amdgpu_device *adev,
+ 			if (adev->gfx.gfx_ring[i].sched.ready &&
+ 			    !adev->gfx.gfx_ring[i].no_user_submission)
+ 				++num_rings;
++
++		if (!adev->gfx.disable_uq) {
++			for (i = 0; i < AMDGPU_MES_MAX_GFX_PIPES; i++)
++				num_hqds += hweight32(adev->mes.gfx_hqd_mask[i]);
++		}
++
+ 		ib_start_alignment = 32;
+ 		ib_size_alignment = 32;
+ 		break;
+@@ -420,6 +427,12 @@ static int amdgpu_hw_ip_info(struct amdgpu_device *adev,
+ 			if (adev->gfx.compute_ring[i].sched.ready &&
+ 			    !adev->gfx.compute_ring[i].no_user_submission)
+ 				++num_rings;
++
++		if (!adev->sdma.disable_uq) {
++			for (i = 0; i < AMDGPU_MES_MAX_COMPUTE_PIPES; i++)
++				num_hqds += hweight32(adev->mes.compute_hqd_mask[i]);
++		}
++
+ 		ib_start_alignment = 32;
+ 		ib_size_alignment = 32;
+ 		break;
+@@ -429,6 +442,12 @@ static int amdgpu_hw_ip_info(struct amdgpu_device *adev,
+ 			if (adev->sdma.instance[i].ring.sched.ready &&
+ 			    !adev->sdma.instance[i].ring.no_user_submission)
+ 				++num_rings;
++
++		if (!adev->gfx.disable_uq) {
++			for (i = 0; i < AMDGPU_MES_MAX_SDMA_PIPES; i++)
++				num_hqds += hweight32(adev->mes.sdma_hqd_mask[i]);
++		}
++
+ 		ib_start_alignment = 256;
+ 		ib_size_alignment = 4;
+ 		break;
+@@ -570,6 +589,7 @@ static int amdgpu_hw_ip_info(struct amdgpu_device *adev,
+ 	}
+ 	result->capabilities_flags = 0;
+ 	result->available_rings = (1 << num_rings) - 1;
++	result->userq_num_hqds = num_hqds;
+ 	result->ib_start_alignment = ib_start_alignment;
+ 	result->ib_size_alignment = ib_size_alignment;
+ 	return 0;
+diff --git a/include/uapi/drm/amdgpu_drm.h b/include/uapi/drm/amdgpu_drm.h
+index 45c4fa13499c..66c4a03ac9f9 100644
+--- a/include/uapi/drm/amdgpu_drm.h
++++ b/include/uapi/drm/amdgpu_drm.h
+@@ -1493,6 +1493,8 @@ struct drm_amdgpu_info_hw_ip {
+ 	__u32  available_rings;
+ 	/** version info: bits 23:16 major, 15:8 minor, 7:0 revision */
+ 	__u32  ip_discovery_version;
++	/* Userq available hqds */
++	__u32  userq_num_hqds;
+ };
+ 
+ /* GFX metadata BO sizes and alignment info (in bytes) */
+-- 
+2.52.0
+
