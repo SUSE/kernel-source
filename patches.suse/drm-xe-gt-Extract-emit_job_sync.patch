@@ -1,0 +1,127 @@
+From fab2cc0c09fd4e6ebfa645af0914fd5917478e7f Mon Sep 17 00:00:00 2001
+From: Lucas De Marchi <lucas.demarchi@intel.com>
+Date: Thu, 10 Jul 2025 13:33:48 -0700
+Subject: drm/xe/gt: Extract emit_job_sync()
+Git-commit: fab2cc0c09fd4e6ebfa645af0914fd5917478e7f
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Both the nop and wa jobs are going through the same boiler plate calls
+to emit the job with a timeout and handling error for both bb and job.
+Extract emit_job_sync() so those functions create the bb, handling
+possible errors and delegate the part about really emitting the job
+and waiting for its completion.
+
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@igalia.com>
+Link: https://lore.kernel.org/r/20250710-lrc-refactors-v2-3-a5e2ca03f6bd@intel.com
+Signed-off-by: Lucas De Marchi <lucas.demarchi@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/xe/xe_gt.c | 54 ++++++++++++++++----------------------
+ 1 file changed, 22 insertions(+), 32 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_gt.c b/drivers/gpu/drm/xe/xe_gt.c
+index 7176bfc96dda..45636eb182e6 100644
+--- a/drivers/gpu/drm/xe/xe_gt.c
++++ b/drivers/gpu/drm/xe/xe_gt.c
+@@ -146,30 +146,23 @@ static void xe_gt_disable_host_l2_vram(struct xe_gt *gt)
+ 
+ static void gt_reset_worker(struct work_struct *w);
+ 
+-static int emit_nop_job(struct xe_gt *gt, struct xe_exec_queue *q)
++static int emit_job_sync(struct xe_exec_queue *q, struct xe_bb *bb,
++			 long timeout_jiffies)
+ {
+ 	struct xe_sched_job *job;
+-	struct xe_bb *bb;
+ 	struct dma_fence *fence;
+ 	long timeout;
+ 
+-	bb = xe_bb_new(gt, 4, false);
+-	if (IS_ERR(bb))
+-		return PTR_ERR(bb);
+-
+ 	job = xe_bb_create_job(q, bb);
+-	if (IS_ERR(job)) {
+-		xe_bb_free(bb, NULL);
++	if (IS_ERR(job))
+ 		return PTR_ERR(job);
+-	}
+ 
+ 	xe_sched_job_arm(job);
+ 	fence = dma_fence_get(&job->drm.s_fence->finished);
+ 	xe_sched_job_push(job);
+ 
+-	timeout = dma_fence_wait_timeout(fence, false, HZ);
++	timeout = dma_fence_wait_timeout(fence, false, timeout_jiffies);
+ 	dma_fence_put(fence);
+-	xe_bb_free(bb, NULL);
+ 	if (timeout < 0)
+ 		return timeout;
+ 	else if (!timeout)
+@@ -178,17 +171,28 @@ static int emit_nop_job(struct xe_gt *gt, struct xe_exec_queue *q)
+ 	return 0;
+ }
+ 
++static int emit_nop_job(struct xe_gt *gt, struct xe_exec_queue *q)
++{
++	struct xe_bb *bb;
++	int ret;
++
++	bb = xe_bb_new(gt, 4, false);
++	if (IS_ERR(bb))
++		return PTR_ERR(bb);
++
++	ret = emit_job_sync(q, bb, HZ);
++	xe_bb_free(bb, NULL);
++
++	return ret;
++}
++
+ static int emit_wa_job(struct xe_gt *gt, struct xe_exec_queue *q)
+ {
+ 	struct xe_reg_sr *sr = &q->hwe->reg_lrc;
+ 	struct xe_reg_sr_entry *entry;
++	int count_rmw = 0, count = 0, ret;
+ 	unsigned long idx;
+-	struct xe_sched_job *job;
+ 	struct xe_bb *bb;
+-	struct dma_fence *fence;
+-	long timeout;
+-	int count_rmw = 0;
+-	int count = 0;
+ 	size_t bb_len = 0;
+ 
+ 	/* count RMW registers as those will be handled separately */
+@@ -293,25 +297,11 @@ static int emit_wa_job(struct xe_gt *gt, struct xe_exec_queue *q)
+ 
+ 	xe_lrc_emit_hwe_state_instructions(q, bb);
+ 
+-	job = xe_bb_create_job(q, bb);
+-	if (IS_ERR(job)) {
+-		xe_bb_free(bb, NULL);
+-		return PTR_ERR(job);
+-	}
++	ret = emit_job_sync(q, bb, HZ);
+ 
+-	xe_sched_job_arm(job);
+-	fence = dma_fence_get(&job->drm.s_fence->finished);
+-	xe_sched_job_push(job);
+-
+-	timeout = dma_fence_wait_timeout(fence, false, HZ);
+-	dma_fence_put(fence);
+ 	xe_bb_free(bb, NULL);
+-	if (timeout < 0)
+-		return timeout;
+-	else if (!timeout)
+-		return -ETIME;
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ int xe_gt_record_default_lrcs(struct xe_gt *gt)
+-- 
+2.52.0
+
