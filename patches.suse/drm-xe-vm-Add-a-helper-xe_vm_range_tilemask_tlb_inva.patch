@@ -1,0 +1,295 @@
+From 3ee9f2058ab202fd29d6a4adbf520d8878530520 Mon Sep 17 00:00:00 2001
+From: Himal Prasad Ghimiray <himal.prasad.ghimiray@intel.com>
+Date: Mon, 9 Jun 2025 09:46:16 +0530
+Subject: drm/xe/vm: Add a helper xe_vm_range_tilemask_tlb_invalidation()
+Git-commit: 3ee9f2058ab202fd29d6a4adbf520d8878530520
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Introduce xe_vm_range_tilemask_tlb_invalidation(), which issues a TLB
+invalidation for a specified address range across GTs indicated by a
+tilemask.
+
+v2 (Matthew Brost)
+- Move WARN_ON_ONCE to svm caller
+- Remove xe_gt_tlb_invalidation_vma
+- s/XE_WARN_ON/WARN_ON_ONCE
+
+v3
+- Rebase
+
+Suggested-by: Matthew Brost <matthew.brost@intel.com>
+Reviewed-by: Matthew Brost <matthew.brost@intel.com>
+Link: https://lore.kernel.org/r/20250609041616.1723636-1-himal.prasad.ghimiray@intel.com
+Signed-off-by: Himal Prasad Ghimiray <himal.prasad.ghimiray@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/xe/xe_gt_tlb_invalidation.c |  24 -----
+ drivers/gpu/drm/xe/xe_gt_tlb_invalidation.h |   3 -
+ drivers/gpu/drm/xe/xe_svm.c                 |  43 +-------
+ drivers/gpu/drm/xe/xe_vm.c                  | 103 +++++++++++++-------
+ drivers/gpu/drm/xe/xe_vm.h                  |   3 +
+ 5 files changed, 75 insertions(+), 101 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_gt_tlb_invalidation.c b/drivers/gpu/drm/xe/xe_gt_tlb_invalidation.c
+index e1362e608146..6088df8e159c 100644
+--- a/drivers/gpu/drm/xe/xe_gt_tlb_invalidation.c
++++ b/drivers/gpu/drm/xe/xe_gt_tlb_invalidation.c
+@@ -448,30 +448,6 @@ void xe_gt_tlb_invalidation_vm(struct xe_gt *gt, struct xe_vm *vm)
+ 	xe_gt_tlb_invalidation_fence_wait(&fence);
+ }
+ 
+-/**
+- * xe_gt_tlb_invalidation_vma - Issue a TLB invalidation on this GT for a VMA
+- * @gt: GT structure
+- * @fence: invalidation fence which will be signal on TLB invalidation
+- * completion, can be NULL
+- * @vma: VMA to invalidate
+- *
+- * Issue a range based TLB invalidation if supported, if not fallback to a full
+- * TLB invalidation. Completion of TLB is asynchronous and caller can use
+- * the invalidation fence to wait for completion.
+- *
+- * Return: Negative error code on error, 0 on success
+- */
+-int xe_gt_tlb_invalidation_vma(struct xe_gt *gt,
+-			       struct xe_gt_tlb_invalidation_fence *fence,
+-			       struct xe_vma *vma)
+-{
+-	xe_gt_assert(gt, vma);
+-
+-	return xe_gt_tlb_invalidation_range(gt, fence, xe_vma_start(vma),
+-					    xe_vma_end(vma),
+-					    xe_vma_vm(vma)->usm.asid);
+-}
+-
+ /**
+  * xe_guc_tlb_invalidation_done_handler - TLB invalidation done handler
+  * @guc: guc
+diff --git a/drivers/gpu/drm/xe/xe_gt_tlb_invalidation.h b/drivers/gpu/drm/xe/xe_gt_tlb_invalidation.h
+index abe9b03d543e..31072dbcad8e 100644
+--- a/drivers/gpu/drm/xe/xe_gt_tlb_invalidation.h
++++ b/drivers/gpu/drm/xe/xe_gt_tlb_invalidation.h
+@@ -19,9 +19,6 @@ int xe_gt_tlb_invalidation_init_early(struct xe_gt *gt);
+ 
+ void xe_gt_tlb_invalidation_reset(struct xe_gt *gt);
+ int xe_gt_tlb_invalidation_ggtt(struct xe_gt *gt);
+-int xe_gt_tlb_invalidation_vma(struct xe_gt *gt,
+-			       struct xe_gt_tlb_invalidation_fence *fence,
+-			       struct xe_vma *vma);
+ void xe_gt_tlb_invalidation_vm(struct xe_gt *gt, struct xe_vm *vm);
+ int xe_gt_tlb_invalidation_range(struct xe_gt *gt,
+ 				 struct xe_gt_tlb_invalidation_fence *fence,
+diff --git a/drivers/gpu/drm/xe/xe_svm.c b/drivers/gpu/drm/xe/xe_svm.c
+index 36464e413007..46e3ccc3fd10 100644
+--- a/drivers/gpu/drm/xe/xe_svm.c
++++ b/drivers/gpu/drm/xe/xe_svm.c
+@@ -169,14 +169,9 @@ static void xe_svm_invalidate(struct drm_gpusvm *gpusvm,
+ {
+ 	struct xe_vm *vm = gpusvm_to_vm(gpusvm);
+ 	struct xe_device *xe = vm->xe;
+-	struct xe_tile *tile;
+ 	struct drm_gpusvm_range *r, *first;
+-	struct xe_gt_tlb_invalidation_fence
+-		fence[XE_MAX_TILES_PER_DEVICE * XE_MAX_GT_PER_TILE];
+ 	u64 adj_start = mmu_range->start, adj_end = mmu_range->end;
+ 	u8 tile_mask = 0;
+-	u8 id;
+-	u32 fence_id = 0;
+ 	long err;
+ 
+ 	xe_svm_assert_in_notifier(vm);
+@@ -222,42 +217,8 @@ static void xe_svm_invalidate(struct drm_gpusvm *gpusvm,
+ 
+ 	xe_device_wmb(xe);
+ 
+-	for_each_tile(tile, xe, id) {
+-		if (tile_mask & BIT(id)) {
+-			int err;
+-
+-			xe_gt_tlb_invalidation_fence_init(tile->primary_gt,
+-							  &fence[fence_id], true);
+-
+-			err = xe_gt_tlb_invalidation_range(tile->primary_gt,
+-							   &fence[fence_id],
+-							   adj_start,
+-							   adj_end,
+-							   vm->usm.asid);
+-			if (WARN_ON_ONCE(err < 0))
+-				goto wait;
+-			++fence_id;
+-
+-			if (!tile->media_gt)
+-				continue;
+-
+-			xe_gt_tlb_invalidation_fence_init(tile->media_gt,
+-							  &fence[fence_id], true);
+-
+-			err = xe_gt_tlb_invalidation_range(tile->media_gt,
+-							   &fence[fence_id],
+-							   adj_start,
+-							   adj_end,
+-							   vm->usm.asid);
+-			if (WARN_ON_ONCE(err < 0))
+-				goto wait;
+-			++fence_id;
+-		}
+-	}
+-
+-wait:
+-	for (id = 0; id < fence_id; ++id)
+-		xe_gt_tlb_invalidation_fence_wait(&fence[id]);
++	err = xe_vm_range_tilemask_tlb_invalidation(vm, adj_start, adj_end, tile_mask);
++	WARN_ON_ONCE(err);
+ 
+ range_notifier_event_end:
+ 	r = first;
+diff --git a/drivers/gpu/drm/xe/xe_vm.c b/drivers/gpu/drm/xe/xe_vm.c
+index d18807b92b18..6ef8c4dab647 100644
+--- a/drivers/gpu/drm/xe/xe_vm.c
++++ b/drivers/gpu/drm/xe/xe_vm.c
+@@ -3842,6 +3842,68 @@ void xe_vm_unlock(struct xe_vm *vm)
+ 	dma_resv_unlock(xe_vm_resv(vm));
+ }
+ 
++/**
++ * xe_vm_range_tilemask_tlb_invalidation - Issue a TLB invalidation on this tilemask for an
++ * address range
++ * @vm: The VM
++ * @start: start address
++ * @end: end address
++ * @tile_mask: mask for which gt's issue tlb invalidation
++ *
++ * Issue a range based TLB invalidation for gt's in tilemask
++ *
++ * Returns 0 for success, negative error code otherwise.
++ */
++int xe_vm_range_tilemask_tlb_invalidation(struct xe_vm *vm, u64 start,
++					  u64 end, u8 tile_mask)
++{
++	struct xe_gt_tlb_invalidation_fence fence[XE_MAX_TILES_PER_DEVICE * XE_MAX_GT_PER_TILE];
++	struct xe_tile *tile;
++	u32 fence_id = 0;
++	u8 id;
++	int err;
++
++	if (!tile_mask)
++		return 0;
++
++	for_each_tile(tile, vm->xe, id) {
++		if (tile_mask & BIT(id)) {
++			xe_gt_tlb_invalidation_fence_init(tile->primary_gt,
++							  &fence[fence_id], true);
++
++			err = xe_gt_tlb_invalidation_range(tile->primary_gt,
++							   &fence[fence_id],
++							   start,
++							   end,
++							   vm->usm.asid);
++			if (err)
++				goto wait;
++			++fence_id;
++
++			if (!tile->media_gt)
++				continue;
++
++			xe_gt_tlb_invalidation_fence_init(tile->media_gt,
++							  &fence[fence_id], true);
++
++			err = xe_gt_tlb_invalidation_range(tile->media_gt,
++							   &fence[fence_id],
++							   start,
++							   end,
++							   vm->usm.asid);
++			if (err)
++				goto wait;
++			++fence_id;
++		}
++	}
++
++wait:
++	for (id = 0; id < fence_id; ++id)
++		xe_gt_tlb_invalidation_fence_wait(&fence[id]);
++
++	return err;
++}
++
+ /**
+  * xe_vm_invalidate_vma - invalidate GPU mappings for VMA without a lock
+  * @vma: VMA to invalidate
+@@ -3857,11 +3919,9 @@ int xe_vm_invalidate_vma(struct xe_vma *vma)
+ 	struct xe_device *xe = xe_vma_vm(vma)->xe;
+ 	struct xe_vm *vm = xe_vma_vm(vma);
+ 	struct xe_tile *tile;
+-	struct xe_gt_tlb_invalidation_fence
+-		fence[XE_MAX_TILES_PER_DEVICE * XE_MAX_GT_PER_TILE];
+-	u8 id;
+-	u32 fence_id = 0;
++	u8 tile_mask = 0;
+ 	int ret = 0;
++	u8 id;
+ 
+ 	xe_assert(xe, !xe_vma_is_null(vma));
+ 	xe_assert(xe, !xe_vma_is_cpu_addr_mirror(vma));
+@@ -3892,37 +3952,14 @@ int xe_vm_invalidate_vma(struct xe_vma *vma)
+ 		}
+ 	}
+ 
+-	for_each_tile(tile, xe, id) {
+-		if (xe_pt_zap_ptes(tile, vma)) {
+-			xe_device_wmb(xe);
+-			xe_gt_tlb_invalidation_fence_init(tile->primary_gt,
+-							  &fence[fence_id],
+-							  true);
+-
+-			ret = xe_gt_tlb_invalidation_vma(tile->primary_gt,
+-							 &fence[fence_id], vma);
+-			if (ret)
+-				goto wait;
+-			++fence_id;
+-
+-			if (!tile->media_gt)
+-				continue;
+-
+-			xe_gt_tlb_invalidation_fence_init(tile->media_gt,
+-							  &fence[fence_id],
+-							  true);
++	for_each_tile(tile, xe, id)
++		if (xe_pt_zap_ptes(tile, vma))
++			tile_mask |= BIT(id);
+ 
+-			ret = xe_gt_tlb_invalidation_vma(tile->media_gt,
+-							 &fence[fence_id], vma);
+-			if (ret)
+-				goto wait;
+-			++fence_id;
+-		}
+-	}
++	xe_device_wmb(xe);
+ 
+-wait:
+-	for (id = 0; id < fence_id; ++id)
+-		xe_gt_tlb_invalidation_fence_wait(&fence[id]);
++	ret = xe_vm_range_tilemask_tlb_invalidation(xe_vma_vm(vma), xe_vma_start(vma),
++						    xe_vma_end(vma), tile_mask);
+ 
+ 	/* WRITE_ONCE pair with READ_ONCE in xe_gt_pagefault.c */
+ 	WRITE_ONCE(vma->tile_invalidated, vma->tile_mask);
+diff --git a/drivers/gpu/drm/xe/xe_vm.h b/drivers/gpu/drm/xe/xe_vm.h
+index 88d6c0ef89c7..acd3fd6c605b 100644
+--- a/drivers/gpu/drm/xe/xe_vm.h
++++ b/drivers/gpu/drm/xe/xe_vm.h
+@@ -228,6 +228,9 @@ struct dma_fence *xe_vm_range_rebind(struct xe_vm *vm,
+ struct dma_fence *xe_vm_range_unbind(struct xe_vm *vm,
+ 				     struct xe_svm_range *range);
+ 
++int xe_vm_range_tilemask_tlb_invalidation(struct xe_vm *vm, u64 start,
++					  u64 end, u8 tile_mask);
++
+ int xe_vm_invalidate_vma(struct xe_vma *vma);
+ 
+ int xe_vm_validate_protected(struct xe_vm *vm);
+-- 
+2.52.0
+
