@@ -1,0 +1,162 @@
+From 2cb38bb0add9b81f89ccdb2db88af89e99925880 Mon Sep 17 00:00:00 2001
+From: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Date: Mon, 19 May 2025 22:09:14 +0200
+Subject: drm/xe: Allow to trigger GT resets using debugfs writes
+Git-commit: 2cb38bb0add9b81f89ccdb2db88af89e99925880
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Today we allow to trigger GT resest by reading dedicated debugfs
+files "force_reset" and "force_reset_sync" that we are exposing
+using drm_info_list[] and drm_debugfs_create_files().
+
+To avoid triggering potentially disruptive actions during otherwise
+"safe" read operations, expose those two attributes using debugfs
+function where we can specify file permissions and provide custom
+"write" handler to trigger the GT resets also from there.
+
+This step would allow us to drop triggering GT resets during read
+operations, which we leave just to give users more time to switch.
+
+Signed-off-by: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Cc: Lucas De Marchi <lucas.demarchi@intel.com>
+Cc: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Reviewed-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Link: https://lore.kernel.org/r/20250519200914.216-1-michal.wajdeczko@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/xe/xe_gt_debugfs.c | 96 +++++++++++++++++++++++-------
+ 1 file changed, 76 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_gt_debugfs.c b/drivers/gpu/drm/xe/xe_gt_debugfs.c
+index 119a55bb7580..848618acdca8 100644
+--- a/drivers/gpu/drm/xe/xe_gt_debugfs.c
++++ b/drivers/gpu/drm/xe/xe_gt_debugfs.c
+@@ -122,24 +122,6 @@ static int powergate_info(struct xe_gt *gt, struct drm_printer *p)
+ 	return ret;
+ }
+ 
+-static int force_reset(struct xe_gt *gt, struct drm_printer *p)
+-{
+-	xe_pm_runtime_get(gt_to_xe(gt));
+-	xe_gt_reset_async(gt);
+-	xe_pm_runtime_put(gt_to_xe(gt));
+-
+-	return 0;
+-}
+-
+-static int force_reset_sync(struct xe_gt *gt, struct drm_printer *p)
+-{
+-	xe_pm_runtime_get(gt_to_xe(gt));
+-	xe_gt_reset(gt);
+-	xe_pm_runtime_put(gt_to_xe(gt));
+-
+-	return 0;
+-}
+-
+ static int sa_info(struct xe_gt *gt, struct drm_printer *p)
+ {
+ 	struct xe_tile *tile = gt_to_tile(gt);
+@@ -306,8 +288,6 @@ static int hwconfig(struct xe_gt *gt, struct drm_printer *p)
+  * - without access to the PF specific data
+  */
+ static const struct drm_info_list vf_safe_debugfs_list[] = {
+-	{"force_reset", .show = xe_gt_debugfs_simple_show, .data = force_reset},
+-	{"force_reset_sync", .show = xe_gt_debugfs_simple_show, .data = force_reset_sync},
+ 	{"sa_info", .show = xe_gt_debugfs_simple_show, .data = sa_info},
+ 	{"topology", .show = xe_gt_debugfs_simple_show, .data = topology},
+ 	{"ggtt", .show = xe_gt_debugfs_simple_show, .data = ggtt},
+@@ -332,6 +312,78 @@ static const struct drm_info_list pf_only_debugfs_list[] = {
+ 	{"steering", .show = xe_gt_debugfs_simple_show, .data = steering},
+ };
+ 
++static ssize_t write_to_gt_call(const char __user *userbuf, size_t count, loff_t *ppos,
++				void (*call)(struct xe_gt *), struct xe_gt *gt)
++{
++	bool yes;
++	int ret;
++
++	if (*ppos)
++		return -EINVAL;
++	ret = kstrtobool_from_user(userbuf, count, &yes);
++	if (ret < 0)
++		return ret;
++	if (yes)
++		call(gt);
++	return count;
++}
++
++static void force_reset(struct xe_gt *gt)
++{
++	struct xe_device *xe = gt_to_xe(gt);
++
++	xe_pm_runtime_get(xe);
++	xe_gt_reset_async(gt);
++	xe_pm_runtime_put(xe);
++}
++
++static ssize_t force_reset_write(struct file *file,
++				 const char __user *userbuf,
++				 size_t count, loff_t *ppos)
++{
++	struct seq_file *s = file->private_data;
++	struct xe_gt *gt = s->private;
++
++	return write_to_gt_call(userbuf, count, ppos, force_reset, gt);
++}
++
++static int force_reset_show(struct seq_file *s, void *unused)
++{
++	struct xe_gt *gt = s->private;
++
++	force_reset(gt); /* to be deprecated! */
++	return 0;
++}
++DEFINE_SHOW_STORE_ATTRIBUTE(force_reset);
++
++static void force_reset_sync(struct xe_gt *gt)
++{
++	struct xe_device *xe = gt_to_xe(gt);
++
++	xe_pm_runtime_get(xe);
++	xe_gt_reset(gt);
++	xe_pm_runtime_put(xe);
++}
++
++static ssize_t force_reset_sync_write(struct file *file,
++				      const char __user *userbuf,
++				      size_t count, loff_t *ppos)
++{
++	struct seq_file *s = file->private_data;
++	struct xe_gt *gt = s->private;
++
++	return write_to_gt_call(userbuf, count, ppos, force_reset_sync, gt);
++}
++
++static int force_reset_sync_show(struct seq_file *s, void *unused)
++{
++	struct xe_gt *gt = s->private;
++
++	force_reset_sync(gt); /* to be deprecated! */
++	return 0;
++}
++DEFINE_SHOW_STORE_ATTRIBUTE(force_reset_sync);
++
+ void xe_gt_debugfs_register(struct xe_gt *gt)
+ {
+ 	struct xe_device *xe = gt_to_xe(gt);
+@@ -355,6 +407,10 @@ void xe_gt_debugfs_register(struct xe_gt *gt)
+ 	 */
+ 	root->d_inode->i_private = gt;
+ 
++	/* VF safe */
++	debugfs_create_file("force_reset", 0600, root, gt, &force_reset_fops);
++	debugfs_create_file("force_reset_sync", 0600, root, gt, &force_reset_sync_fops);
++
+ 	drm_debugfs_create_files(vf_safe_debugfs_list,
+ 				 ARRAY_SIZE(vf_safe_debugfs_list),
+ 				 root, minor);
+-- 
+2.52.0
+
