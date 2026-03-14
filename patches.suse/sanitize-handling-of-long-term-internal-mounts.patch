@@ -1,0 +1,234 @@
+From 24368a744bafce7daf1eafd6a163871925ee5892 Mon Sep 17 00:00:00 2001
+From: Al Viro <viro@zeniv.linux.org.uk>
+Date: Fri, 2 May 2025 21:32:01 -0400
+Subject: sanitize handling of long-term internal mounts
+Git-commit: 24368a744bafce7daf1eafd6a163871925ee5892
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Original rationale for those had been the reduced cost of mntput()
+for the stuff that is mounted somewhere.  Mount refcount increments and
+decrements are frequent; what's worse, they tend to concentrate on the
+same instances and cacheline pingpong is quite noticable.
+
+As the result, mount refcounts are per-cpu; that allows a very cheap
+increment.  Plain decrement would be just as easy, but decrement-and-test
+is anything but (we need to add the components up, with exclusion against
+possible increment-from-zero, etc.).
+
+Fortunately, there is a very common case where we can tell that decrement
+won't be the final one - if the thing we are dropping is currently
+mounted somewhere.  We have an RCU delay between the removal from mount
+tree and dropping the reference that used to pin it there, so we can
+just take rcu_read_lock() and check if the victim is mounted somewhere.
+If it is, we can go ahead and decrement without and further checks -
+the reference we are dropping is not the last one.  If it isn't, we
+get all the fun with locking, carefully adding up components, etc.,
+but the majority of refcount decrements end up taking the fast path.
+
+There is a major exception, though - pipes and sockets.  Those live
+on the internal filesystems that are not going to be mounted anywhere.
+They are not going to be _un_mounted, of course, so having to take the
+slow path every time a pipe or socket gets closed is really obnoxious.
+Solution had been to mark them as long-lived ones - essentially faking
+"they are mounted somewhere" indicator.
+
+With minor modification that works even for ones that do eventually get
+dropped - all it takes is making sure we have an RCU delay between
+clearing the "mounted somewhere" indicator and dropping the reference.
+
+There are some additional twists (if you want to drop a dozen of such
+internal mounts, you'd be better off with clearing the indicator on
+all of them, doing an RCU delay once, then dropping the references),
+but in the basic form it had been
+	* use kern_mount() if you want your internal mount to be
+a long-term one.
+	* use kern_unmount() to undo that.
+
+Unfortunately, the things did rot a bit during the mount API reshuffling.
+In several cases we have lost the "fake the indicator" part; kern_unmount()
+on the unmount side remained (it doesn't warn if you use it on a mount
+without the indicator), but all benefits regaring mntput() cost had been
+lost.
+
+To get rid of that bitrot, let's add a new helper that would work
+with fs_context-based API: fc_mount_longterm().  It's a counterpart
+of fc_mount() that does, on success, mark its result as long-term.
+It must be paired with kern_unmount() or equivalents.
+
+Converted: 1) mqueue (it used to use kern_mount_data() and the umount side
+is still as it used to be)
+	2) hugetlbfs (used to use kern_mount_data(), internal mount is
+never unmounted in this one)
+	3) i915 gemfs (used to be kern_mount() + manual remount to set
+options, still uses kern_unmount() on umount side)
+	4) v3d gemfs (copied from i915)
+
+Reviewed-by: Christian Brauner <brauner@kernel.org>
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/gem/i915_gemfs.c | 21 ++++++++++++++++++---
+ drivers/gpu/drm/v3d/v3d_gemfs.c       | 21 ++++++++++++++++++---
+ fs/hugetlbfs/inode.c                  |  2 +-
+ fs/namespace.c                        |  9 +++++++++
+ include/linux/mount.h                 |  1 +
+ ipc/mqueue.c                          |  2 +-
+ 6 files changed, 48 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gem/i915_gemfs.c b/drivers/gpu/drm/i915/gem/i915_gemfs.c
+index 65d84a93c525..a09e2eb47175 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gemfs.c
++++ b/drivers/gpu/drm/i915/gem/i915_gemfs.c
+@@ -5,16 +5,23 @@
+ 
+ #include <linux/fs.h>
+ #include <linux/mount.h>
++#include <linux/fs_context.h>
+ 
+ #include "i915_drv.h"
+ #include "i915_gemfs.h"
+ #include "i915_utils.h"
+ 
++static int add_param(struct fs_context *fc, const char *key, const char *val)
++{
++	return vfs_parse_fs_string(fc, key, val, strlen(val));
++}
++
+ void i915_gemfs_init(struct drm_i915_private *i915)
+ {
+-	char huge_opt[] = "huge=within_size"; /* r/w */
+ 	struct file_system_type *type;
++	struct fs_context *fc;
+ 	struct vfsmount *gemfs;
++	int ret;
+ 
+ 	/*
+ 	 * By creating our own shmemfs mountpoint, we can pass in
+@@ -38,8 +45,16 @@ void i915_gemfs_init(struct drm_i915_private *i915)
+ 	if (!type)
+ 		goto err;
+ 
+-	gemfs = vfs_kern_mount(type, SB_KERNMOUNT, type->name, huge_opt);
+-	if (IS_ERR(gemfs))
++	fc = fs_context_for_mount(type, SB_KERNMOUNT);
++	if (IS_ERR(fc))
++		goto err;
++	ret = add_param(fc, "source", "tmpfs");
++	if (!ret)
++		ret = add_param(fc, "huge", "within_size");
++	if (!ret)
++		gemfs = fc_mount_longterm(fc);
++	put_fs_context(fc);
++	if (ret)
+ 		goto err;
+ 
+ 	i915->mm.gemfs = gemfs;
+diff --git a/drivers/gpu/drm/v3d/v3d_gemfs.c b/drivers/gpu/drm/v3d/v3d_gemfs.c
+index 4c5e18590a5c..8ec6ed82b3d9 100644
+--- a/drivers/gpu/drm/v3d/v3d_gemfs.c
++++ b/drivers/gpu/drm/v3d/v3d_gemfs.c
+@@ -3,14 +3,21 @@
+ 
+ #include <linux/fs.h>
+ #include <linux/mount.h>
++#include <linux/fs_context.h>
+ 
+ #include "v3d_drv.h"
+ 
++static int add_param(struct fs_context *fc, const char *key, const char *val)
++{
++	return vfs_parse_fs_string(fc, key, val, strlen(val));
++}
++
+ void v3d_gemfs_init(struct v3d_dev *v3d)
+ {
+-	char huge_opt[] = "huge=within_size";
+ 	struct file_system_type *type;
++	struct fs_context *fc;
+ 	struct vfsmount *gemfs;
++	int ret;
+ 
+ 	/*
+ 	 * By creating our own shmemfs mountpoint, we can pass in
+@@ -28,8 +35,16 @@ void v3d_gemfs_init(struct v3d_dev *v3d)
+ 	if (!type)
+ 		goto err;
+ 
+-	gemfs = vfs_kern_mount(type, SB_KERNMOUNT, type->name, huge_opt);
+-	if (IS_ERR(gemfs))
++	fc = fs_context_for_mount(type, SB_KERNMOUNT);
++	if (IS_ERR(fc))
++		goto err;
++	ret = add_param(fc, "source", "tmpfs");
++	if (!ret)
++		ret = add_param(fc, "huge", "within_size");
++	if (!ret)
++		gemfs = fc_mount_longterm(fc);
++	put_fs_context(fc);
++	if (ret)
+ 		goto err;
+ 
+ 	v3d->gemfs = gemfs;
+diff --git a/fs/hugetlbfs/inode.c b/fs/hugetlbfs/inode.c
+index 5cf327337e22..61f5f1eb1d83 100644
+--- a/fs/hugetlbfs/inode.c
++++ b/fs/hugetlbfs/inode.c
+@@ -1651,7 +1651,7 @@ static struct vfsmount *__init mount_one_hugetlbfs(struct hstate *h)
+ 	} else {
+ 		struct hugetlbfs_fs_context *ctx = fc->fs_private;
+ 		ctx->hstate = h;
+-		mnt = fc_mount(fc);
++		mnt = fc_mount_longterm(fc);
+ 		put_fs_context(fc);
+ 	}
+ 	if (IS_ERR(mnt))
+diff --git a/fs/namespace.c b/fs/namespace.c
+index d26f5e6d2ca3..afb744de916f 100644
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -1237,6 +1237,15 @@ struct vfsmount *fc_mount(struct fs_context *fc)
+ }
+ EXPORT_SYMBOL(fc_mount);
+ 
++struct vfsmount *fc_mount_longterm(struct fs_context *fc)
++{
++	struct vfsmount *mnt = fc_mount(fc);
++	if (!IS_ERR(mnt))
++		real_mount(mnt)->mnt_ns = MNT_NS_INTERNAL;
++	return mnt;
++}
++EXPORT_SYMBOL(fc_mount_longterm);
++
+ struct vfsmount *vfs_kern_mount(struct file_system_type *type,
+ 				int flags, const char *name,
+ 				void *data)
+diff --git a/include/linux/mount.h b/include/linux/mount.h
+index c34c18b4e8f3..f663212a6020 100644
+--- a/include/linux/mount.h
++++ b/include/linux/mount.h
+@@ -95,6 +95,7 @@ int mnt_get_write_access(struct vfsmount *mnt);
+ void mnt_put_write_access(struct vfsmount *mnt);
+ 
+ extern struct vfsmount *fc_mount(struct fs_context *fc);
++extern struct vfsmount *fc_mount_longterm(struct fs_context *fc);
+ extern struct vfsmount *vfs_create_mount(struct fs_context *fc);
+ extern struct vfsmount *vfs_kern_mount(struct file_system_type *type,
+ 				      int flags, const char *name,
+diff --git a/ipc/mqueue.c b/ipc/mqueue.c
+index 34fa0bd8bb11..268196ef0931 100644
+--- a/ipc/mqueue.c
++++ b/ipc/mqueue.c
+@@ -482,7 +482,7 @@ static struct vfsmount *mq_create_mount(struct ipc_namespace *ns)
+ 	put_user_ns(fc->user_ns);
+ 	fc->user_ns = get_user_ns(ctx->ipc_ns->user_ns);
+ 
+-	mnt = fc_mount(fc);
++	mnt = fc_mount_longterm(fc);
+ 	put_fs_context(fc);
+ 	return mnt;
+ }
+-- 
+2.52.0
+
