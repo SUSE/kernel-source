@@ -1,0 +1,144 @@
+From 7184a994cf7629dfb0440cdf05dc9407964d9eb5 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Tue, 17 Jun 2025 20:07:56 +0300
+Subject: drm/i915/dmc: Reload pipe DMC MMIO registers for pipe C/D on various
+ platforms
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 7184a994cf7629dfb0440cdf05dc9407964d9eb5
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+On ADL/MTL pipe DMC MMIO state evidently lives in PG0. The main DMC
+saves/restores it for pipes A/B, but for pipes C/D we have to do it
+in the driver.
+
+On PTL the situation is mostly the same, except the main DMC firmware
+doesn't seem to have the PG0 save/restore code anymore, and instead the
+hardware (or maybe Punit?) seems to take care of this job now. Pipes
+C/D still need a manual restore by the driver.
+
+On LNL I've been unable to lose any pipe DMC state, despite the main
+DMC firmware still implementing the PG0 save/restore for pipes A/B.
+Not sure what's going on here.
+
+On DG2 I've also not been able to lose the pipe DMC state. DG2
+doesn't support DC6, so that might explain part of it. But even
+DC9 doesn't make a difference here. Perhaps PG0 is just always on
+for DG2?
+
+BMG I've not tested at all. The main DMC firmware does appaer to
+implement the PG0 pipe A/B save/restore logic.
+
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250617170759.19552-7-ville.syrjala@linux.intel.com
+Reviewed-by: Uma Shankar <uma.shankar@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/intel_dmc.c | 67 +++++++++++++++++++++---
+ 1 file changed, 61 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_dmc.c b/drivers/gpu/drm/i915/display/intel_dmc.c
+index 4cbc19e97db7..2a40a09dca94 100644
+--- a/drivers/gpu/drm/i915/display/intel_dmc.c
++++ b/drivers/gpu/drm/i915/display/intel_dmc.c
+@@ -576,8 +576,18 @@ static u32 dmc_mmiodata(struct intel_display *display,
+ 		return dmc->dmc_info[dmc_id].mmiodata[i];
+ }
+ 
+-static void dmc_load_program(struct intel_display *display,
+-			     enum intel_dmc_id dmc_id)
++static void dmc_load_mmio(struct intel_display *display, enum intel_dmc_id dmc_id)
++{
++	struct intel_dmc *dmc = display_to_dmc(display);
++	int i;
++
++	for (i = 0; i < dmc->dmc_info[dmc_id].mmio_count; i++) {
++		intel_de_write(display, dmc->dmc_info[dmc_id].mmioaddr[i],
++			       dmc_mmiodata(display, dmc, dmc_id, i));
++	}
++}
++
++static void dmc_load_program(struct intel_display *display, enum intel_dmc_id dmc_id)
+ {
+ 	struct intel_dmc *dmc = display_to_dmc(display);
+ 	int i;
+@@ -594,10 +604,7 @@ static void dmc_load_program(struct intel_display *display,
+ 
+ 	preempt_enable();
+ 
+-	for (i = 0; i < dmc->dmc_info[dmc_id].mmio_count; i++) {
+-		intel_de_write(display, dmc->dmc_info[dmc_id].mmioaddr[i],
+-			       dmc_mmiodata(display, dmc, dmc_id, i));
+-	}
++	dmc_load_mmio(display, dmc_id);
+ }
+ 
+ static bool need_pipedmc_load_program(struct intel_display *display)
+@@ -606,6 +613,52 @@ static bool need_pipedmc_load_program(struct intel_display *display)
+ 	return DISPLAY_VER(display) == 12;
+ }
+ 
++static bool need_pipedmc_load_mmio(struct intel_display *display, enum pipe pipe)
++{
++	/*
++	 * PTL:
++	 * - pipe A/B DMC doesn't need save/restore
++	 * - pipe C/D DMC is in PG0, needs manual save/restore
++	 */
++	if (DISPLAY_VER(display) == 30)
++		return pipe >= PIPE_C;
++
++	/*
++	 * FIXME LNL unclear, main DMC firmware has the pipe DMC A/B PG0
++	 * save/restore, but so far unable to see the loss of pipe DMC state
++	 * in action. Are we just failing to turn off PG0 due to some other
++	 * SoC level stuff?
++	 */
++	if (DISPLAY_VER(display) == 20)
++		return false;
++
++	/*
++	 * FIXME BMG untested, main DMC firmware has the
++	 * pipe DMC A/B PG0 save/restore...
++	 */
++	if (display->platform.battlemage)
++		return false;
++
++	/*
++	 * DG2:
++	 * - Pipe DMCs presumably in PG0?
++	 * - No DC6, and even DC9 doesn't seem to result
++	 *   in loss of DMC state for whatever reason
++	 */
++	if (display->platform.dg2)
++		return false;
++
++	/*
++	 * ADL/MTL:
++	 * - pipe A/B DMC is in PG0, saved/restored by the main DMC
++	 * - pipe C/D DMC is in PG0, needs manual save/restore
++	 */
++	if (IS_DISPLAY_VER(display, 13, 14))
++		return pipe >= PIPE_C;
++
++	return false;
++}
++
+ void intel_dmc_enable_pipe(struct intel_display *display, enum pipe pipe)
+ {
+ 	enum intel_dmc_id dmc_id = PIPE_TO_DMC_ID(pipe);
+@@ -615,6 +668,8 @@ void intel_dmc_enable_pipe(struct intel_display *display, enum pipe pipe)
+ 
+ 	if (need_pipedmc_load_program(display))
+ 		dmc_load_program(display, dmc_id);
++	else if (need_pipedmc_load_mmio(display, pipe))
++		dmc_load_mmio(display, dmc_id);
+ 
+ 	if (DISPLAY_VER(display) >= 20) {
+ 		intel_de_write(display, PIPEDMC_INTERRUPT(pipe), pipedmc_interrupt_mask(display));
+-- 
+2.52.0
+
