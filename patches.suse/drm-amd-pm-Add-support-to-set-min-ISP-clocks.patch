@@ -1,0 +1,290 @@
+From 9bed716f8722999a2b15a2e5df4dfca48e4c06c9 Mon Sep 17 00:00:00 2001
+From: Pratap Nirujogi <pratap.nirujogi@amd.com>
+Date: Mon, 16 Jun 2025 14:16:43 -0400
+Subject: drm/amd/pm: Add support to set min ISP clocks
+Git-commit: 9bed716f8722999a2b15a2e5df4dfca48e4c06c9
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Add support to set ISP clocks for SMU v14.0.0. ISP driver
+uses amdgpu_dpm_set_soft_freq_range() API to set clocks via
+SMU interface than communicating with PMFW directly.
+
+amdgpu_dpm_set_soft_freq_range() is updated to take in any
+pp_clock_type than limiting to support only PP_SCLK to allow
+ISP and other driver modules to set the min/max clocks. Any
+clock specific restrictions are expected to be taken care in
+SOC specific SMU implementations instead of generic amdgpu_dpm
+and amdgpu_smu interfaces.
+
+Reviewed-by: Xiaojian Du <xiaojian.du@amd.com>
+Reviewed-by: Lijo Lazar <lijo.lazar@amd.com>
+Reviewed-by: Mario Limonciello <mario.limonciello@amd.com>
+Signed-off-by: Pratap Nirujogi <pratap.nirujogi@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../gpu/drm/amd/include/kgd_pp_interface.h    |  2 +
+ drivers/gpu/drm/amd/pm/amdgpu_dpm.c           | 14 ++---
+ drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c     | 14 ++++-
+ drivers/gpu/drm/amd/pm/swsmu/inc/amdgpu_smu.h |  2 +-
+ drivers/gpu/drm/amd/pm/swsmu/inc/smu_types.h  |  2 +
+ .../drm/amd/pm/swsmu/smu14/smu_v14_0_0_ppt.c  | 51 ++++++++++++-------
+ 6 files changed, 56 insertions(+), 29 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/include/kgd_pp_interface.h b/drivers/gpu/drm/amd/include/kgd_pp_interface.h
+index f4d914dc731f..e2b1ea7467b0 100644
+--- a/drivers/gpu/drm/amd/include/kgd_pp_interface.h
++++ b/drivers/gpu/drm/amd/include/kgd_pp_interface.h
+@@ -108,6 +108,8 @@ enum pp_clock_type {
+ 	PP_VCLK1,
+ 	PP_DCLK,
+ 	PP_DCLK1,
++	PP_ISPICLK,
++	PP_ISPXCLK,
+ 	OD_SCLK,
+ 	OD_MCLK,
+ 	OD_VDDC_CURVE,
+diff --git a/drivers/gpu/drm/amd/pm/amdgpu_dpm.c b/drivers/gpu/drm/amd/pm/amdgpu_dpm.c
+index 95f1fff442cb..71d986dd7a6e 100644
+--- a/drivers/gpu/drm/amd/pm/amdgpu_dpm.c
++++ b/drivers/gpu/drm/amd/pm/amdgpu_dpm.c
+@@ -853,22 +853,16 @@ int amdgpu_dpm_set_soft_freq_range(struct amdgpu_device *adev,
+ 				   uint32_t max)
+ {
+ 	struct smu_context *smu = adev->powerplay.pp_handle;
+-	int ret = 0;
+-
+-	if (type != PP_SCLK)
+-		return -EINVAL;
+ 
+ 	if (!is_support_sw_smu(adev))
+ 		return -EOPNOTSUPP;
+ 
+-	mutex_lock(&adev->pm.mutex);
+-	ret = smu_set_soft_freq_range(smu,
+-				      SMU_SCLK,
++	guard(mutex)(&adev->pm.mutex);
++
++	return smu_set_soft_freq_range(smu,
++				      type,
+ 				      min,
+ 				      max);
+-	mutex_unlock(&adev->pm.mutex);
+-
+-	return ret;
+ }
+ 
+ int amdgpu_dpm_write_watermarks_table(struct amdgpu_device *adev)
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c b/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c
+index 97572fe26ddf..756afe78a6e5 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c
+@@ -76,6 +76,7 @@ static void smu_power_profile_mode_get(struct smu_context *smu,
+ 				       enum PP_SMC_POWER_PROFILE profile_mode);
+ static void smu_power_profile_mode_put(struct smu_context *smu,
+ 				       enum PP_SMC_POWER_PROFILE profile_mode);
++static enum smu_clk_type smu_convert_to_smuclk(enum pp_clock_type type);
+ 
+ static int smu_sys_get_pp_feature_mask(void *handle,
+ 				       char *buf)
+@@ -134,12 +135,17 @@ int smu_get_status_gfxoff(struct smu_context *smu, uint32_t *value)
+ }
+ 
+ int smu_set_soft_freq_range(struct smu_context *smu,
+-			    enum smu_clk_type clk_type,
++			    enum pp_clock_type type,
+ 			    uint32_t min,
+ 			    uint32_t max)
+ {
++	enum smu_clk_type clk_type;
+ 	int ret = 0;
+ 
++	clk_type = smu_convert_to_smuclk(type);
++	if (clk_type == SMU_CLK_COUNT)
++		return -EINVAL;
++
+ 	if (smu->ppt_funcs->set_soft_freq_limited_range)
+ 		ret = smu->ppt_funcs->set_soft_freq_limited_range(smu,
+ 								  clk_type,
+@@ -2980,6 +2986,12 @@ static enum smu_clk_type smu_convert_to_smuclk(enum pp_clock_type type)
+ 		clk_type = SMU_DCLK; break;
+ 	case PP_DCLK1:
+ 		clk_type = SMU_DCLK1; break;
++	case PP_ISPICLK:
++		clk_type = SMU_ISPICLK;
++		break;
++	case PP_ISPXCLK:
++		clk_type = SMU_ISPXCLK;
++		break;
+ 	case OD_SCLK:
+ 		clk_type = SMU_OD_SCLK; break;
+ 	case OD_MCLK:
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/inc/amdgpu_smu.h b/drivers/gpu/drm/amd/pm/swsmu/inc/amdgpu_smu.h
+index 41d4a7f93660..b52e194397e2 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/inc/amdgpu_smu.h
++++ b/drivers/gpu/drm/amd/pm/swsmu/inc/amdgpu_smu.h
+@@ -1642,7 +1642,7 @@ int smu_write_watermarks_table(struct smu_context *smu);
+ int smu_get_dpm_freq_range(struct smu_context *smu, enum smu_clk_type clk_type,
+ 			   uint32_t *min, uint32_t *max);
+ 
+-int smu_set_soft_freq_range(struct smu_context *smu, enum smu_clk_type clk_type,
++int smu_set_soft_freq_range(struct smu_context *smu, enum pp_clock_type clk_type,
+ 			    uint32_t min, uint32_t max);
+ 
+ int smu_set_gfx_power_up_by_imu(struct smu_context *smu);
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/inc/smu_types.h b/drivers/gpu/drm/amd/pm/swsmu/inc/smu_types.h
+index eefdaa0b5df6..d7a9e41820fa 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/inc/smu_types.h
++++ b/drivers/gpu/drm/amd/pm/swsmu/inc/smu_types.h
+@@ -305,6 +305,8 @@ enum smu_clk_type {
+ 	SMU_MCLK,
+ 	SMU_PCIE,
+ 	SMU_LCLK,
++	SMU_ISPICLK,
++	SMU_ISPXCLK,
+ 	SMU_OD_CCLK,
+ 	SMU_OD_SCLK,
+ 	SMU_OD_MCLK,
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/smu14/smu_v14_0_0_ppt.c b/drivers/gpu/drm/amd/pm/swsmu/smu14/smu_v14_0_0_ppt.c
+index fe4735d5ebd4..fe00c84b1cc6 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/smu14/smu_v14_0_0_ppt.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/smu14/smu_v14_0_0_ppt.c
+@@ -1207,11 +1207,13 @@ static int smu_v14_0_0_print_clk_levels(struct smu_context *smu,
+ 
+ static int smu_v14_0_0_set_soft_freq_limited_range(struct smu_context *smu,
+ 						   enum smu_clk_type clk_type,
+-						   uint32_t min,
+-						   uint32_t max)
++						   u32 min,
++						   u32 max,
++						   bool __always_unused automatic)
+ {
+-	enum smu_message_type msg_set_min, msg_set_max;
+-	int ret = 0;
++	enum smu_message_type msg_set_min = SMU_MSG_MAX_COUNT;
++	enum smu_message_type msg_set_max = SMU_MSG_MAX_COUNT;
++	int ret = -EINVAL;
+ 
+ 	if (!smu_v14_0_0_clk_dpm_is_enabled(smu, clk_type))
+ 		return -EINVAL;
+@@ -1240,16 +1242,23 @@ static int smu_v14_0_0_set_soft_freq_limited_range(struct smu_context *smu,
+ 		msg_set_min = SMU_MSG_SetHardMinVcn1;
+ 		msg_set_max = SMU_MSG_SetSoftMaxVcn1;
+ 		break;
++	case SMU_ISPICLK:
++		msg_set_min = SMU_MSG_SetHardMinIspiclkByFreq;
++		break;
++	case SMU_ISPXCLK:
++		msg_set_min = SMU_MSG_SetHardMinIspxclkByFreq;
++		break;
+ 	default:
+ 		return -EINVAL;
+ 	}
+ 
+-	ret = smu_cmn_send_smc_msg_with_param(smu, msg_set_min, min, NULL);
+-	if (ret)
+-		return ret;
++	if (min && msg_set_min != SMU_MSG_MAX_COUNT)
++		ret = smu_cmn_send_smc_msg_with_param(smu, msg_set_min, min, NULL);
++
++	if (max && msg_set_max != SMU_MSG_MAX_COUNT)
++		ret = smu_cmn_send_smc_msg_with_param(smu, msg_set_max, max, NULL);
+ 
+-	return smu_cmn_send_smc_msg_with_param(smu, msg_set_max,
+-					       max, NULL);
++	return ret;
+ }
+ 
+ static int smu_v14_0_0_force_clk_levels(struct smu_context *smu,
+@@ -1278,7 +1287,7 @@ static int smu_v14_0_0_force_clk_levels(struct smu_context *smu,
+ 		if (ret)
+ 			break;
+ 
+-		ret = smu_v14_0_0_set_soft_freq_limited_range(smu, clk_type, min_freq, max_freq);
++		ret = smu_v14_0_0_set_soft_freq_limited_range(smu, clk_type, min_freq, max_freq, false);
+ 		break;
+ 	default:
+ 		ret = -EINVAL;
+@@ -1426,7 +1435,8 @@ static int smu_v14_0_common_set_performance_level(struct smu_context *smu,
+ 		ret = smu_v14_0_0_set_soft_freq_limited_range(smu,
+ 							      SMU_SCLK,
+ 							      sclk_min,
+-							      sclk_max);
++							      sclk_max,
++							      false);
+ 		if (ret)
+ 			return ret;
+ 
+@@ -1438,7 +1448,8 @@ static int smu_v14_0_common_set_performance_level(struct smu_context *smu,
+ 		ret = smu_v14_0_0_set_soft_freq_limited_range(smu,
+ 							      SMU_FCLK,
+ 							      fclk_min,
+-							      fclk_max);
++							      fclk_max,
++							      false);
+ 		if (ret)
+ 			return ret;
+ 	}
+@@ -1447,7 +1458,8 @@ static int smu_v14_0_common_set_performance_level(struct smu_context *smu,
+ 		ret = smu_v14_0_0_set_soft_freq_limited_range(smu,
+ 							      SMU_SOCCLK,
+ 							      socclk_min,
+-							      socclk_max);
++							      socclk_max,
++							      false);
+ 		if (ret)
+ 			return ret;
+ 	}
+@@ -1456,7 +1468,8 @@ static int smu_v14_0_common_set_performance_level(struct smu_context *smu,
+ 		ret = smu_v14_0_0_set_soft_freq_limited_range(smu,
+ 							      SMU_VCLK,
+ 							      vclk_min,
+-							      vclk_max);
++							      vclk_max,
++							      false);
+ 		if (ret)
+ 			return ret;
+ 	}
+@@ -1465,7 +1478,8 @@ static int smu_v14_0_common_set_performance_level(struct smu_context *smu,
+ 		ret = smu_v14_0_0_set_soft_freq_limited_range(smu,
+ 							      SMU_VCLK1,
+ 							      vclk1_min,
+-							      vclk1_max);
++							      vclk1_max,
++							      false);
+ 		if (ret)
+ 			return ret;
+ 	}
+@@ -1474,7 +1488,8 @@ static int smu_v14_0_common_set_performance_level(struct smu_context *smu,
+ 		ret = smu_v14_0_0_set_soft_freq_limited_range(smu,
+ 							      SMU_DCLK,
+ 							      dclk_min,
+-							      dclk_max);
++							      dclk_max,
++							      false);
+ 		if (ret)
+ 			return ret;
+ 	}
+@@ -1483,7 +1498,8 @@ static int smu_v14_0_common_set_performance_level(struct smu_context *smu,
+ 		ret = smu_v14_0_0_set_soft_freq_limited_range(smu,
+ 							      SMU_DCLK1,
+ 							      dclk1_min,
+-							      dclk1_max);
++							      dclk1_max,
++							      false);
+ 		if (ret)
+ 			return ret;
+ 	}
+@@ -1670,6 +1686,7 @@ static const struct pptable_funcs smu_v14_0_0_ppt_funcs = {
+ 	.gfx_off_control = smu_v14_0_gfx_off_control,
+ 	.mode2_reset = smu_v14_0_0_mode2_reset,
+ 	.get_dpm_ultimate_freq = smu_v14_0_common_get_dpm_ultimate_freq,
++	.set_soft_freq_limited_range = smu_v14_0_0_set_soft_freq_limited_range,
+ 	.od_edit_dpm_table = smu_v14_0_od_edit_dpm_table,
+ 	.print_clk_levels = smu_v14_0_0_print_clk_levels,
+ 	.force_clk_levels = smu_v14_0_0_force_clk_levels,
+-- 
+2.52.0
+
