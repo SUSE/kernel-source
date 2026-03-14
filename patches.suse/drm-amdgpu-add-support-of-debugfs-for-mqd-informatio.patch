@@ -1,0 +1,126 @@
+From c03ea34cbf88dd778197a929b3269003567def55 Mon Sep 17 00:00:00 2001
+From: Sunil Khatri <sunil.khatri@amd.com>
+Date: Fri, 4 Jul 2025 13:25:48 +0530
+Subject: drm/amdgpu: add support of debugfs for mqd information
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: c03ea34cbf88dd778197a929b3269003567def55
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Add debugfs support for mqd for each queue of the client.
+
+The address exposed to debugfs could be used to dump
+the mqd.
+
+Signed-off-by: Sunil Khatri <sunil.khatri@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Link: https://lore.kernel.org/r/20250704075548.1549849-5-sunil.khatri@amd.com
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_userq.c | 52 +++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_userq.h |  1 +
+ 2 files changed, 53 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_userq.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_userq.c
+index 295e7186e156..115d53bc9a8d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_userq.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_userq.c
+@@ -318,6 +318,9 @@ amdgpu_userq_destroy(struct drm_file *filp, int queue_id)
+ 		amdgpu_bo_unreserve(queue->db_obj.obj);
+ 	}
+ 	amdgpu_bo_unref(&queue->db_obj.obj);
++
++	debugfs_remove_recursive(queue->debugfs_queue);
++
+ 	r = amdgpu_userq_unmap_helper(uq_mgr, queue);
+ 	amdgpu_userq_cleanup(uq_mgr, queue, queue_id);
+ 	mutex_unlock(&uq_mgr->userq_mutex);
+@@ -343,6 +346,46 @@ static int amdgpu_userq_priority_permit(struct drm_file *filp,
+ 	return -EACCES;
+ }
+ 
++#if defined(CONFIG_DEBUG_FS)
++static int amdgpu_mqd_info_read(struct seq_file *m, void *unused)
++{
++	struct amdgpu_usermode_queue *queue = m->private;
++	struct amdgpu_bo *bo;
++	int r;
++
++	if (!queue || !queue->mqd.obj)
++		return -EINVAL;
++
++	bo = amdgpu_bo_ref(queue->mqd.obj);
++	r = amdgpu_bo_reserve(bo, true);
++	if (r) {
++		amdgpu_bo_unref(&bo);
++		return -EINVAL;
++	}
++
++	seq_printf(m, "queue_type %d\n", queue->queue_type);
++	seq_printf(m, "mqd_gpu_address: 0x%llx\n", amdgpu_bo_gpu_offset(queue->mqd.obj));
++
++	amdgpu_bo_unreserve(bo);
++	amdgpu_bo_unref(&bo);
++
++	return 0;
++}
++
++static int amdgpu_mqd_info_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, amdgpu_mqd_info_read, inode->i_private);
++}
++
++static const struct file_operations amdgpu_mqd_info_fops = {
++	.owner = THIS_MODULE,
++	.open = amdgpu_mqd_info_open,
++	.read = seq_read,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++#endif
++
+ static int
+ amdgpu_userq_create(struct drm_file *filp, union drm_amdgpu_userq *args)
+ {
+@@ -352,6 +395,7 @@ amdgpu_userq_create(struct drm_file *filp, union drm_amdgpu_userq *args)
+ 	const struct amdgpu_userq_funcs *uq_funcs;
+ 	struct amdgpu_usermode_queue *queue;
+ 	struct amdgpu_db_info db_info;
++	char *queue_name;
+ 	bool skip_map_queue;
+ 	uint64_t index;
+ 	int qid, r = 0;
+@@ -475,6 +519,14 @@ amdgpu_userq_create(struct drm_file *filp, union drm_amdgpu_userq *args)
+ 		}
+ 	}
+ 
++	queue_name = kasprintf(GFP_KERNEL, "queue-%d", qid);
++	if (!queue_name)
++		return -ENOMEM;
++
++	/* Queue dentry per client to hold MQD information   */
++	queue->debugfs_queue = debugfs_create_dir(queue_name, filp->debugfs_client);
++	debugfs_create_file("mqd_info", 0444, queue->debugfs_queue, queue, &amdgpu_mqd_info_fops);
++	kfree(queue_name);
+ 
+ 	args->out.queue_id = qid;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_userq.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_userq.h
+index ec040c2fd6c9..b1ca91b7cda4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_userq.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_userq.h
+@@ -65,6 +65,7 @@ struct amdgpu_usermode_queue {
+ 	struct dma_fence	*last_fence;
+ 	u32			xcp_id;
+ 	int			priority;
++	struct dentry		*debugfs_queue;
+ };
+ 
+ struct amdgpu_userq_funcs {
+-- 
+2.52.0
+
