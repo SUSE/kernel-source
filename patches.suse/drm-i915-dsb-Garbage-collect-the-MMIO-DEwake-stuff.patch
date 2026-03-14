@@ -1,0 +1,141 @@
+From 00863f06fd8bcb075bb95655bbdcdb562d81bb03 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Thu, 12 Jun 2025 17:50:16 +0300
+Subject: drm/i915/dsb: Garbage collect the MMIO DEwake stuff
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 00863f06fd8bcb075bb95655bbdcdb562d81bb03
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Since the introduction of DSB chaining we no longer need the
+DEwake tricks in intel_dsb_commit().
+
+I also need to relocate the DSB_PMCTRL* writes out of
+intel_dsb_finish() (due to the flip queue DMC vs. DSB register
+corruption issues), and it'll be a bit more straightforward if
+I don't have to worry about the non-chained DSB path anymore.
+
+Reviewed-by: Uma Shankar <uma.shankar@intel.com>
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20250612145018.8735-5-ville.syrjala@linux.intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/intel_display.c |  4 +-
+ drivers/gpu/drm/i915/display/intel_dsb.c     | 45 ++++----------------
+ drivers/gpu/drm/i915/display/intel_dsb.h     |  3 +-
+ 3 files changed, 11 insertions(+), 41 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+index 0ac3664d996f..83a0c5036b52 100644
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -6748,13 +6748,13 @@ static void intel_update_crtc(struct intel_atomic_state *state,
+ 	if (new_crtc_state->use_dsb) {
+ 		intel_crtc_prepare_vblank_event(new_crtc_state, &crtc->dsb_event);
+ 
+-		intel_dsb_commit(new_crtc_state->dsb_commit, false);
++		intel_dsb_commit(new_crtc_state->dsb_commit);
+ 	} else {
+ 		/* Perform vblank evasion around commit operation */
+ 		intel_pipe_update_start(state, crtc);
+ 
+ 		if (new_crtc_state->dsb_commit)
+-			intel_dsb_commit(new_crtc_state->dsb_commit, false);
++			intel_dsb_commit(new_crtc_state->dsb_commit);
+ 
+ 		commit_pipe_pre_planes(state, crtc);
+ 
+diff --git a/drivers/gpu/drm/i915/display/intel_dsb.c b/drivers/gpu/drm/i915/display/intel_dsb.c
+index 06a615d36a86..2f7bd8da1bf1 100644
+--- a/drivers/gpu/drm/i915/display/intel_dsb.c
++++ b/drivers/gpu/drm/i915/display/intel_dsb.c
+@@ -825,8 +825,13 @@ void intel_dsb_wait_vblank_delay(struct intel_atomic_state *state,
+ 	intel_dsb_wait_usec(dsb, usecs);
+ }
+ 
+-static void _intel_dsb_commit(struct intel_dsb *dsb, u32 ctrl,
+-			      int hw_dewake_scanline)
++/**
++ * intel_dsb_commit() - Trigger workload execution of DSB.
++ * @dsb: DSB context
++ *
++ * This function is used to do actual write to hardware using DSB.
++ */
++void intel_dsb_commit(struct intel_dsb *dsb)
+ {
+ 	struct intel_crtc *crtc = dsb->crtc;
+ 	struct intel_display *display = to_intel_display(crtc->base.dev);
+@@ -842,7 +847,7 @@ static void _intel_dsb_commit(struct intel_dsb *dsb, u32 ctrl,
+ 	}
+ 
+ 	intel_de_write_fw(display, DSB_CTRL(pipe, dsb->id),
+-			  ctrl | DSB_ENABLE);
++			  DSB_ENABLE);
+ 
+ 	intel_de_write_fw(display, DSB_CHICKEN(pipe, dsb->id),
+ 			  dsb->chicken);
+@@ -854,44 +859,10 @@ static void _intel_dsb_commit(struct intel_dsb *dsb, u32 ctrl,
+ 	intel_de_write_fw(display, DSB_HEAD(pipe, dsb->id),
+ 			  intel_dsb_head(dsb));
+ 
+-	if (hw_dewake_scanline >= 0) {
+-		int diff, position;
+-
+-		intel_de_write_fw(display, DSB_PMCTRL(pipe, dsb->id),
+-				  DSB_ENABLE_DEWAKE |
+-				  DSB_SCANLINE_FOR_DEWAKE(hw_dewake_scanline));
+-
+-		/*
+-		 * Force DEwake immediately if we're already past
+-		 * or close to racing past the target scanline.
+-		 */
+-		position = intel_de_read_fw(display, PIPEDSL(display, pipe)) & PIPEDSL_LINE_MASK;
+-
+-		diff = hw_dewake_scanline - position;
+-		intel_de_write_fw(display, DSB_PMCTRL_2(pipe, dsb->id),
+-				  (diff >= 0 && diff < 5 ? DSB_FORCE_DEWAKE : 0) |
+-				  DSB_BLOCK_DEWAKE_EXTENSION);
+-	}
+-
+ 	intel_de_write_fw(display, DSB_TAIL(pipe, dsb->id),
+ 			  intel_dsb_tail(dsb));
+ }
+ 
+-/**
+- * intel_dsb_commit() - Trigger workload execution of DSB.
+- * @dsb: DSB context
+- * @wait_for_vblank: wait for vblank before executing
+- *
+- * This function is used to do actual write to hardware using DSB.
+- */
+-void intel_dsb_commit(struct intel_dsb *dsb,
+-		      bool wait_for_vblank)
+-{
+-	_intel_dsb_commit(dsb,
+-			  wait_for_vblank ? DSB_WAIT_FOR_VBLANK : 0,
+-			  wait_for_vblank ? dsb->hw_dewake_scanline : -1);
+-}
+-
+ void intel_dsb_wait(struct intel_dsb *dsb)
+ {
+ 	struct intel_crtc *crtc = dsb->crtc;
+diff --git a/drivers/gpu/drm/i915/display/intel_dsb.h b/drivers/gpu/drm/i915/display/intel_dsb.h
+index 6bcfb03f3415..c8f4499916eb 100644
+--- a/drivers/gpu/drm/i915/display/intel_dsb.h
++++ b/drivers/gpu/drm/i915/display/intel_dsb.h
+@@ -68,8 +68,7 @@ void intel_dsb_chain(struct intel_atomic_state *state,
+ 		     struct intel_dsb *chained_dsb,
+ 		     bool wait_for_vblank);
+ 
+-void intel_dsb_commit(struct intel_dsb *dsb,
+-		      bool wait_for_vblank);
++void intel_dsb_commit(struct intel_dsb *dsb);
+ void intel_dsb_wait(struct intel_dsb *dsb);
+ 
+ void intel_dsb_irq_handler(struct intel_display *display,
+-- 
+2.52.0
+
