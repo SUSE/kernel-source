@@ -1,0 +1,95 @@
+Message-ID: <65f2a3b2323edde7c5de3a44e67fec00873b4217.1773654281.git.wqu@suse.com>
+From: Qu Wenruo <wqu@suse.com>
+Date: Fri, 28 Mar 2025 07:59:12 +1030
+Subject: btrfs: remove folio order ASSERT()s in super block writeback path
+References: bsc#1259676
+Git-commit: 65f2a3b2323edde7c5de3a44e67fec00873b4217
+Patch-mainline: 6.15-rc3
+
+[BUG]
+There is a syzbot report that the ASSERT() inside write_dev_supers() got
+triggered:
+
+  assertion failed: folio_order(folio) == 0, in fs/btrfs/disk-io.c:3858
+  ------------[ cut here ]------------
+  kernel BUG at fs/btrfs/disk-io.c:3858!
+  Oops: invalid opcode: 0000 [#1] SMP KASAN NOPTI
+  CPU: 0 UID: 0 PID: 6730 Comm: syz-executor378 Not tainted 6.14.0-syzkaller-03565-gf6e0150b2003 #0 PREEMPT(full)
+  Hardware name: QEMU Standard PC (Q35 + ICH9, 2009), BIOS 1.16.3-debian-1.16.3-2~bpo12+1 04/01/2014
+  RIP: 0010:write_dev_supers fs/btrfs/disk-io.c:3858 [inline]
+  RIP: 0010:write_all_supers+0x400f/0x4090 fs/btrfs/disk-io.c:4155
+  Call Trace:
+   <TASK>
+   btrfs_commit_transaction+0x1eda/0x3750 fs/btrfs/transaction.c:2528
+   btrfs_quota_enable+0xfcc/0x21a0 fs/btrfs/qgroup.c:1226
+   btrfs_ioctl_quota_ctl+0x144/0x1c0 fs/btrfs/ioctl.c:3677
+   vfs_ioctl fs/ioctl.c:51 [inline]
+   __do_sys_ioctl fs/ioctl.c:906 [inline]
+   __se_sys_ioctl+0xf1/0x160 fs/ioctl.c:892
+   do_syscall_x64 arch/x86/entry/syscall_64.c:63 [inline]
+   do_syscall_64+0xf3/0x230 arch/x86/entry/syscall_64.c:94
+   entry_SYSCALL_64_after_hwframe+0x77/0x7f
+  RIP: 0033:0x7f5ad1f20289
+   </TASK>
+  ---[ end trace 0000000000000000 ]---
+
+[CAUSE]
+Since commit f93ee0df5139 ("btrfs: convert super block writes to folio
+in write_dev_supers()") and commit c94b7349b859 ("btrfs: convert super
+block writes to folio in wait_dev_supers()"), the super block writeback
+path is converted to use folio.
+
+Since the original code is using page based interfaces, we have an
+"ASSERT(folio_order(folio) == 0);" added to make sure everything is not
+changed.
+
+But the folio here is not from any btrfs inode, but from the block
+device, and we have no control on the folio order in bdev, the device
+can choose whatever folio size they want/need.
+
+E.g. the bdev may even have a block size of multiple pages.
+
+So the ASSERT() is triggered.
+
+[FIX]
+The super block writeback path has taken larger folios into
+consideration, so there is no need for the ASSERT().
+
+And since commit bc00965dbff7 ("btrfs: count super block write errors in
+device instead of tracking folio error state"), the wait path no longer
+checks the folio status but only wait for the folio writeback to finish,
+there is nothing requiring the ASSERT() either.
+
+So we can remove both ASSERT()s safely now.
+
+Reported-by: syzbot+34122898a11ab689518a@syzkaller.appspotmail.com
+Signed-off-by: Qu Wenruo <wqu@suse.com>
+Reviewed-by: David Sterba <dsterba@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/disk-io.c | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+index 1a916716cefe..d0da9988ea48 100644
+--- a/fs/btrfs/disk-io.c
++++ b/fs/btrfs/disk-io.c
+@@ -3853,7 +3853,6 @@ static int write_dev_supers(struct btrfs_device *device,
+ 			atomic_inc(&device->sb_write_errors);
+ 			continue;
+ 		}
+-		ASSERT(folio_order(folio) == 0);
+ 
+ 		offset = offset_in_folio(folio, bytenr);
+ 		disk_super = folio_address(folio) + offset;
+@@ -3926,7 +3925,6 @@ static int wait_dev_supers(struct btrfs_device *device, int max_mirrors)
+ 		/* If the folio has been removed, then we know it completed. */
+ 		if (IS_ERR(folio))
+ 			continue;
+-		ASSERT(folio_order(folio) == 0);
+ 
+ 		/* Folio will be unlocked once the write completes. */
+ 		folio_wait_locked(folio);
+-- 
+2.53.0
+
