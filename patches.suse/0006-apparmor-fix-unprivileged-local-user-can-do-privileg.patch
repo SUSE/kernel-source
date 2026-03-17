@@ -1,0 +1,172 @@
+From 05632f6e8d2d5c94bd600191a5434f62c11f6f54 Mon Sep 17 00:00:00 2001
+From: John Johansen <john.johansen@canonical.com>
+Date: Fri, 7 Nov 2025 08:36:04 -0800
+Subject: [PATCH 6/6] apparmor: fix unprivileged local user can do privileged
+ policy management
+References: bsc#1258849
+Patch-mainline: v7.0-rc4
+Git-commit: 6601e13e82841879406bf9f369032656f441a425
+
+An unprivileged local user can load, replace, and remove profiles by
+opening the apparmorfs interfaces, via a confused deputy attack, by
+passing the opened fd to a privileged process, and getting the
+privileged process to write to the interface.
+
+This does require a privileged target that can be manipulated to do
+the write for the unprivileged process, but once such access is
+achieved full policy management is possible and all the possible
+implications that implies: removing confinement, DoS of system or
+target applications by denying all execution, by-passing the
+unprivileged user namespace restriction, to exploiting kernel bugs for
+a local privilege escalation.
+
+The policy management interface can not have its permissions simply
+changed from 0666 to 0600 because non-root processes need to be able
+to load policy to different policy namespaces.
+
+Instead ensure the task writing the interface has privileges that
+are a subset of the task that opened the interface. This is already
+done via policy for confined processes, but unconfined can delegate
+access to the opened fd, by-passing the usual policy check.
+
+Fixes: c88d4c7b049e8 ("AppArmor: core policy routines")
+Reported-by: Qualys Security Advisory <qsa@qualys.com>
+Tested-by: Salvatore Bonaccorso <carnil@debian.org>
+Reviewed-by: Georgia Garcia <georgia.garcia@canonical.com>
+Reviewed-by: Cengiz Can <cengiz.can@canonical.com>
+Signed-off-by: John Johansen <john.johansen@canonical.com>
+[ddiss: rebase without commits 90c436a64a6e2 ("apparmor: pass cred
+ through to audit info."), 92de220a7f336 ("apparmor: update policy
+ capable checks to use a label"), 18e99f191a8e6 ("apparmor: provide
+ finer control over policy management"), 4ae47f33354a9 ("apparmor: add
+ mkdir/rmdir interface to manage policy namespaces"), 637f688dc3dc3
+ ("apparmor: switch from profiles to using labels on contexts")]
+Acked-by: David Disseldorp <ddiss@suse.de>
+
+---
+ security/apparmor/apparmorfs.c     | 11 ++++++-----
+ security/apparmor/include/policy.h |  2 +-
+ security/apparmor/policy.c         | 31 +++++++++++++++++++++++++++++-
+ 3 files changed, 37 insertions(+), 7 deletions(-)
+
+diff --git a/security/apparmor/apparmorfs.c b/security/apparmor/apparmorfs.c
+index ff2ed2e299337..0c32ff342bcd5 100644
+--- a/security/apparmor/apparmorfs.c
++++ b/security/apparmor/apparmorfs.c
+@@ -115,7 +115,8 @@ static struct aa_loaddata *aa_simple_write_to_buffer(const char __user *userbuf,
+ }
+ 
+ static ssize_t policy_update(int binop, const char __user *buf, size_t size,
+-			     loff_t *pos, struct aa_ns *ns)
++			     loff_t *pos, struct aa_ns *ns,
++			     const struct cred *ocred)
+ {
+ 	ssize_t error;
+ 	struct aa_loaddata *data;
+@@ -124,7 +125,7 @@ static ssize_t policy_update(int binop, const char __user *buf, size_t size,
+ 	/* high level check about policy management - fine grained in
+ 	 * below after unpack
+ 	 */
+-	error = aa_may_manage_policy(profile, ns, op);
++	error = aa_may_manage_policy(profile, ns, ocred, op);
+ 	if (error)
+ 		return error;
+ 
+@@ -144,7 +145,7 @@ static ssize_t profile_load(struct file *f, const char __user *buf, size_t size,
+ 			    loff_t *pos)
+ {
+ 	struct aa_ns *ns = aa_get_ns(f->f_inode->i_private);
+-	int error = policy_update(PROF_ADD, buf, size, pos, ns);
++	int error = policy_update(PROF_ADD, buf, size, pos, ns, f->f_cred);
+ 
+ 	aa_put_ns(ns);
+ 
+@@ -161,7 +162,7 @@ static ssize_t profile_replace(struct file *f, const char __user *buf,
+ 			       size_t size, loff_t *pos)
+ {
+ 	struct aa_ns *ns = aa_get_ns(f->f_inode->i_private);
+-	int error = policy_update(PROF_REPLACE, buf, size, pos, ns);
++	int error = policy_update(PROF_REPLACE, buf, size, pos, ns, f->f_cred);
+ 
+ 	aa_put_ns(ns);
+ 
+@@ -186,7 +187,7 @@ static ssize_t profile_remove(struct file *f, const char __user *buf,
+ 	/* high level check about policy management - fine grained in
+ 	 * below after unpack
+ 	 */
+-	error = aa_may_manage_policy(profile, ns, OP_PROF_RM);
++	error = aa_may_manage_policy(profile, ns, f->f_cred, OP_PROF_RM);
+ 	if (error)
+ 		goto out;
+ 
+diff --git a/security/apparmor/include/policy.h b/security/apparmor/include/policy.h
+index a3d18ea8d730c..32e01fc0ac18e 100644
+--- a/security/apparmor/include/policy.h
++++ b/security/apparmor/include/policy.h
+@@ -323,6 +323,6 @@ static inline int AUDIT_MODE(struct aa_profile *profile)
+ bool policy_view_capable(struct aa_ns *ns);
+ bool policy_admin_capable(struct aa_ns *ns);
+ int aa_may_manage_policy(struct aa_profile *profile, struct aa_ns *ns,
+-			 const char *op);
++			 const struct cred *ocred, const char *op);
+ 
+ #endif /* __AA_POLICY_H */
+diff --git a/security/apparmor/policy.c b/security/apparmor/policy.c
+index 3734736ad0653..7c89ade080c73 100644
+--- a/security/apparmor/policy.c
++++ b/security/apparmor/policy.c
+@@ -708,21 +708,50 @@ bool policy_admin_capable(struct aa_ns *ns)
+ 	return policy_view_capable(ns) && capable && !aa_g_lock_policy;
+ }
+ 
++static bool is_subset_of_obj_privilege(const struct cred *cred,
++				       const struct cred *ocred)
++{
++	if (cred == ocred)
++		return true;
++
++	/* don't allow crossing userns for now */
++	if (cred->user_ns != ocred->user_ns)
++		return false;
++	if (!cap_issubset(cred->cap_inheritable, ocred->cap_inheritable))
++		return false;
++	if (!cap_issubset(cred->cap_permitted, ocred->cap_permitted))
++		return false;
++	if (!cap_issubset(cred->cap_effective, ocred->cap_effective))
++		return false;
++	if (!cap_issubset(cred->cap_bset, ocred->cap_bset))
++		return false;
++	if (!cap_issubset(cred->cap_ambient, ocred->cap_ambient))
++		return false;
++	return true;
++}
++
++
+ /**
+  * aa_may_manage_policy - can the current task manage policy
+  * @profile: profile to check if it can manage policy
++ * @ocred: object cred if request is coming from an open object
+  * @op: the policy manipulation operation being done
+  *
+  * Returns: 0 if the task is allowed to manipulate policy else error
+  */
+ int aa_may_manage_policy(struct aa_profile *profile, struct aa_ns *ns,
+-			 const char *op)
++			 const struct cred *ocred, const char *op)
+ {
+ 	/* check if loading policy is locked out */
+ 	if (aa_g_lock_policy)
+ 		return audit_policy(profile, op, NULL, NULL,
+ 			     "policy_locked", -EACCES);
+ 
++	if (ocred && !is_subset_of_obj_privilege(current_cred(), ocred))
++		return audit_policy(profile, op, NULL, NULL,
++				    "not privileged for target profile",
++				    -EACCES);
++
+ 	if (!policy_admin_capable(ns))
+ 		return audit_policy(profile, op, NULL, NULL,
+ 				    "not policy admin", -EACCES);
+-- 
+2.51.0
+
