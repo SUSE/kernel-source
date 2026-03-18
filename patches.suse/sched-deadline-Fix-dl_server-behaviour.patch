@@ -1,0 +1,148 @@
+From c03734199d7d5e3c3481b72961467c4835bac8d4 Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Wed, 17 Sep 2025 12:03:20 +0200
+Subject: [PATCH] sched/deadline: Fix dl_server behaviour
+
+References: bsc#1234634 (Scheduler functional and performance backports SL-16.1)
+Patch-mainline: v6.17
+Git-commit: a3a70caf7906708bf9bbc80018752a6b36543808
+
+John reported undesirable behaviour with the dl_server since commit:
+cccb45d7c4295 ("sched/deadline: Less agressive dl_server handling").
+
+When starving fair tasks on purpose (starting spinning FIFO tasks),
+his fair workload, which often goes (briefly) idle, would delay fair
+invocations for a second, running one invocation per second was both
+unexpected and terribly slow.
+
+The reason this happens is that when dl_se->server_pick_task() returns
+NULL, indicating no runnable tasks, it would yield, pushing any later
+jobs out a whole period (1 second).
+
+Instead simply stop the server. This should restore behaviour in that
+a later wakeup (which restarts the server) will be able to continue
+running (subject to the CBS wakeup rules).
+
+Notably, this does not re-introduce the behaviour cccb45d7c4295 set
+out to solve, any start/stop cycle is naturally throttled by the timer
+period (no active cancel).
+
+Fixes: cccb45d7c4295 ("sched/deadline: Less agressive dl_server handling")
+Reported-by: John Stultz <jstultz@google.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Tested-by: John Stultz <jstultz@google.com>
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+---
+ include/linux/sched.h   |  1 -
+ kernel/sched/deadline.c | 23 ++---------------------
+ kernel/sched/sched.h    | 33 +++++++++++++++++++++++++++++++--
+ 3 files changed, 33 insertions(+), 24 deletions(-)
+
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index ad26bd85df36..b1408cf07f20 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -689,7 +689,6 @@ struct sched_dl_entity {
+ 	unsigned int			dl_defer	  : 1;
+ 	unsigned int			dl_defer_armed	  : 1;
+ 	unsigned int			dl_defer_running  : 1;
+-	unsigned int			dl_server_idle    : 1;
+ 
+ 	/*
+ 	 * Bandwidth enforcement timer. Each -deadline task has its
+diff --git a/kernel/sched/deadline.c b/kernel/sched/deadline.c
+index fd840d6a8ebc..2d25481029b0 100644
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@ -1642,10 +1642,8 @@ void dl_server_update_idle_time(struct rq *rq, struct task_struct *p)
+ void dl_server_update(struct sched_dl_entity *dl_se, s64 delta_exec)
+ {
+ 	/* 0 runtime = fair server disabled */
+-	if (dl_se->dl_runtime) {
+-		dl_se->dl_server_idle = 0;
++	if (dl_se->dl_runtime)
+ 		update_curr_dl_se(dl_se->rq, dl_se, delta_exec);
+-	}
+ }
+ 
+ void dl_server_start(struct sched_dl_entity *dl_se)
+@@ -1676,20 +1674,6 @@ void dl_server_stop(struct sched_dl_entity *dl_se)
+ 	dl_se->dl_server_active = 0;
+ }
+ 
+-static bool dl_server_stopped(struct sched_dl_entity *dl_se)
+-{
+-	if (!dl_se->dl_server_active)
+-		return true;
+-
+-	if (dl_se->dl_server_idle) {
+-		dl_server_stop(dl_se);
+-		return true;
+-	}
+-
+-	dl_se->dl_server_idle = 1;
+-	return false;
+-}
+-
+ void dl_server_init(struct sched_dl_entity *dl_se, struct rq *rq,
+ 		    dl_server_pick_f pick_task)
+ {
+@@ -2469,10 +2453,7 @@ static struct task_struct *__pick_task_dl(struct rq *rq)
+ 	if (dl_server(dl_se)) {
+ 		p = dl_se->server_pick_task(dl_se);
+ 		if (!p) {
+-			if (!dl_server_stopped(dl_se)) {
+-				dl_se->dl_yielded = 1;
+-				update_curr_dl_se(rq, dl_se, 0);
+-			}
++			dl_server_stop(dl_se);
+ 			goto again;
+ 		}
+ 		rq->dl_server = dl_se;
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 1ae4f1ac2a46..688cf1b39ddd 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -372,10 +372,39 @@ extern s64 dl_scaled_delta_exec(struct rq *rq, struct sched_dl_entity *dl_se, s6
+  *   dl_server_update() -- called from update_curr_common(), propagates runtime
+  *                         to the server.
+  *
+- *   dl_server_start()
+- *   dl_server_stop()  -- start/stop the server when it has (no) tasks.
++ *   dl_server_start() -- start the server when it has tasks; it will stop
++ *			  automatically when there are no more tasks, per
++ *			  dl_se::server_pick() returning NULL.
++ *
++ *   dl_server_stop() -- (force) stop the server; use when updating
++ *                       parameters.
+  *
+  *   dl_server_init() -- initializes the server.
++ *
++ * When started the dl_server will (per dl_defer) schedule a timer for its
++ * zero-laxity point -- that is, unlike regular EDF tasks which run ASAP, a
++ * server will run at the very end of its period.
++ *
++ * This is done such that any runtime from the target class can be accounted
++ * against the server -- through dl_server_update() above -- such that when it
++ * becomes time to run, it might already be out of runtime and get deferred
++ * until the next period. In this case dl_server_timer() will alternate
++ * between defer and replenish but never actually enqueue the server.
++ *
++ * Only when the target class does not manage to exhaust the server's runtime
++ * (there's actualy starvation in the given period), will the dl_server get on
++ * the runqueue. Once queued it will pick tasks from the target class and run
++ * them until either its runtime is exhaused, at which point its back to
++ * dl_server_timer, or until there are no more tasks to run, at which point
++ * the dl_server stops itself.
++ *
++ * By stopping at this point the dl_server retains bandwidth, which, if a new
++ * task wakes up imminently (starting the server again), can be used --
++ * subject to CBS wakeup rules -- without having to wait for the next period.
++ *
++ * Additionally, because of the dl_defer behaviour the start/stop behaviour is
++ * naturally thottled to once per period, avoiding high context switch
++ * workloads from spamming the hrtimer program/cancel paths.
+  */
+ extern void dl_server_update(struct sched_dl_entity *dl_se, s64 delta_exec);
+ extern void dl_server_start(struct sched_dl_entity *dl_se);

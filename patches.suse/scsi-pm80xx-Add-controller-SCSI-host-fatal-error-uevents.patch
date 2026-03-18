@@ -1,0 +1,135 @@
+From: Salomon Dushimirimana <salomondush@google.com>
+Date: Mon, 16 Jun 2025 19:00:18 +0000
+Subject: scsi: pm80xx: Add controller SCSI host fatal error uevents
+Git-commit: c7ee6c8f2f1e3d4b8efa6ac957289676a3f5cd51
+Patch-mainline: v6.17-rc1
+References: jsc#PED-15354
+
+Add pm80xx_fatal_error_uevent_emit() which is called when the pm80xx
+driver encouters a fatal error. The uevent has the following additional
+custom key/value pair sets:
+
+ - DRIVER: driver name, pm80xx in this case
+ - HBA_NUM: the scsi host id of the device
+ - EVENT_TYPE: to indicate a fatal error
+ - REPORTED_BY: either driver or firmware
+
+The uevent is anchored to the kernel object that represents the SCSI
+controller, which includes other useful core variables, such as, ACTION,
+DEVPATH, SUBSYSTEM, and more.
+
+The fatal_error_uevent_emit() function is called when the controller
+fatal error state changes. Since this doesn't happen often for a
+specific SCSI host, there is no worries of a uevent storm.
+
+Signed-off-by: Salomon Dushimirimana <salomondush@google.com>
+Link: https://lore.kernel.org/r/20250616190018.2136260-1-salomondush@google.com
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Acked-by: Lee Duncan <lduncan@suse.com>
+---
+ drivers/scsi/pm8001/pm8001_sas.h | 10 +++++++++
+ drivers/scsi/pm8001/pm80xx_hwi.c | 48 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 58 insertions(+)
+
+diff --git a/drivers/scsi/pm8001/pm8001_sas.h b/drivers/scsi/pm8001/pm8001_sas.h
+index 315f6a7523f0..334485bb2c12 100644
+--- a/drivers/scsi/pm8001/pm8001_sas.h
++++ b/drivers/scsi/pm8001/pm8001_sas.h
+@@ -170,6 +170,14 @@ struct forensic_data {
+ #define SPCV_MSGU_CFG_TABLE_TRANSFER_DEBUG_INFO  0x80
+ #define MAIN_MERRDCTO_MERRDCES		         0xA0/* DWORD 0x28) */
+ 
++/**
++ * enum fatal_error_reporter: Indicates the originator of the fatal error
++ */
++enum fatal_error_reporter {
++	REPORTER_DRIVER,
++	REPORTER_FIRMWARE,
++};
++
+ struct pm8001_dispatch {
+ 	char *name;
+ 	int (*chip_init)(struct pm8001_hba_info *pm8001_ha);
+@@ -715,6 +723,8 @@ ssize_t pm80xx_get_non_fatal_dump(struct device *cdev,
+ 		struct device_attribute *attr, char *buf);
+ ssize_t pm8001_get_gsm_dump(struct device *cdev, u32, char *buf);
+ int pm80xx_fatal_errors(struct pm8001_hba_info *pm8001_ha);
++void pm80xx_fatal_error_uevent_emit(struct pm8001_hba_info *pm8001_ha,
++	enum fatal_error_reporter error_reporter);
+ void pm8001_free_dev(struct pm8001_device *pm8001_dev);
+ /* ctl shared API */
+ extern const struct attribute_group *pm8001_host_groups[];
+diff --git a/drivers/scsi/pm8001/pm80xx_hwi.c b/drivers/scsi/pm8001/pm80xx_hwi.c
+index c4074f062d93..c1bae995a412 100644
+--- a/drivers/scsi/pm8001/pm80xx_hwi.c
++++ b/drivers/scsi/pm8001/pm80xx_hwi.c
+@@ -1551,6 +1551,52 @@ static int mpi_uninit_check(struct pm8001_hba_info *pm8001_ha)
+ 	return 0;
+ }
+ 
++/**
++ * pm80xx_fatal_error_uevent_emit - emits a single fatal error uevent
++ * @pm8001_ha: our hba card information
++ * @error_reporter: reporter of fatal error
++ */
++void pm80xx_fatal_error_uevent_emit(struct pm8001_hba_info *pm8001_ha,
++	enum fatal_error_reporter error_reporter)
++{
++	struct kobj_uevent_env *env;
++
++	pm8001_dbg(pm8001_ha, FAIL, "emitting fatal error uevent");
++
++	env = kzalloc(sizeof(struct kobj_uevent_env), GFP_KERNEL);
++	if (!env)
++		return;
++
++	if (add_uevent_var(env, "DRIVER=%s", DRV_NAME))
++		goto exit;
++
++	if (add_uevent_var(env, "HBA_NUM=%u", pm8001_ha->id))
++		goto exit;
++
++	if (add_uevent_var(env, "EVENT_TYPE=FATAL_ERROR"))
++		goto exit;
++
++	switch (error_reporter) {
++	case REPORTER_DRIVER:
++		if (add_uevent_var(env, "REPORTED_BY=DRIVER"))
++			goto exit;
++		break;
++	case REPORTER_FIRMWARE:
++		if (add_uevent_var(env, "REPORTED_BY=FIRMWARE"))
++			goto exit;
++		break;
++	default:
++		if (add_uevent_var(env, "REPORTED_BY=OTHER"))
++			goto exit;
++		break;
++	}
++
++	kobject_uevent_env(&pm8001_ha->shost->shost_dev.kobj, KOBJ_CHANGE, env->envp);
++
++exit:
++	kfree(env);
++}
++
+ /**
+  * pm80xx_fatal_errors - returns non-zero *ONLY* when fatal errors
+  * @pm8001_ha: our hba card information
+@@ -1580,6 +1626,7 @@ pm80xx_fatal_errors(struct pm8001_hba_info *pm8001_ha)
+ 			"Fatal error SCRATCHPAD1 = 0x%x SCRATCHPAD2 = 0x%x SCRATCHPAD3 = 0x%x SCRATCHPAD_RSVD0 = 0x%x SCRATCHPAD_RSVD1 = 0x%x\n",
+ 				scratch_pad1, scratch_pad2, scratch_pad3,
+ 				scratch_pad_rsvd0, scratch_pad_rsvd1);
++		pm80xx_fatal_error_uevent_emit(pm8001_ha, REPORTER_DRIVER);
+ 		ret = 1;
+ 	}
+ 
+@@ -4039,6 +4086,7 @@ static int process_oq(struct pm8001_hba_info *pm8001_ha, u8 vec)
+ 			pm8001_dbg(pm8001_ha, FAIL,
+ 				   "Firmware Fatal error! Regval:0x%x\n",
+ 				   regval);
++			pm80xx_fatal_error_uevent_emit(pm8001_ha, REPORTER_FIRMWARE);
+ 			pm8001_handle_event(pm8001_ha, NULL, IO_FATAL_ERROR);
+ 			print_scratchpad_registers(pm8001_ha);
+ 			return ret;
+

@@ -1,0 +1,62 @@
+From 21f7799e8da0c082fc1482cd260bdbed08d0f87a Mon Sep 17 00:00:00 2001
+From: Gabriele Monaco <gmonaco@redhat.com>
+Date: Thu, 20 Nov 2025 15:56:51 +0100
+Subject: [PATCH] sched/isolation: Force housekeeping if isolcpus and nohz_full
+ don't leave any
+
+References: bsc#1234634 (Scheduler functional and performance backports SL-16.1)
+Patch-mainline: v6.19-rc1
+Git-commit: 185bccc79797d71477e672a1b2a2b7d0325044e7
+
+Currently the user can set up isolcpus and nohz_full in such a way that
+leaves no housekeeping CPU (i.e. no CPU that is neither domain isolated
+nor nohz full). This can be a problem for other subsystems (e.g. the
+timer wheel imgration).
+
+Prevent this configuration by invalidating the last setting in case the
+union of isolcpus (domain) and nohz_full covers all CPUs.
+
+Signed-off-by: Gabriele Monaco <gmonaco@redhat.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Reviewed-by: Waiman Long <longman@redhat.com>
+Reviewed-by: Frederic Weisbecker <frederic@kernel.org>
+Link: https://patch.msgid.link/20251120145653.296659-6-gmonaco@redhat.com
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+---
+ kernel/sched/isolation.c | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/kernel/sched/isolation.c b/kernel/sched/isolation.c
+index a4cf17b1fab0..3ad0d6df6a0a 100644
+--- a/kernel/sched/isolation.c
++++ b/kernel/sched/isolation.c
+@@ -167,6 +167,29 @@ static int __init housekeeping_setup(char *str, unsigned long flags)
+ 			}
+ 		}
+ 
++		/*
++		 * Check the combination of nohz_full and isolcpus=domain,
++		 * necessary to avoid problems with the timer migration
++		 * hierarchy. managed_irq is ignored by this check since it
++		 * isn't considered in the timer migration logic.
++		 */
++		iter_flags = housekeeping.flags & (HK_FLAG_KERNEL_NOISE | HK_FLAG_DOMAIN);
++		type = find_first_bit(&iter_flags, HK_TYPE_MAX);
++		/*
++		 * Pass the check if none of these flags were previously set or
++		 * are not in the current selection.
++		 */
++		iter_flags = flags & (HK_FLAG_KERNEL_NOISE | HK_FLAG_DOMAIN);
++		first_cpu = (type == HK_TYPE_MAX || !iter_flags) ? 0 :
++			    cpumask_first_and_and(cpu_present_mask,
++				    housekeeping_staging, housekeeping.cpumasks[type]);
++		if (first_cpu >= min(nr_cpu_ids, setup_max_cpus)) {
++			pr_warn("Housekeeping: must include one present CPU "
++				"neither in nohz_full= nor in isolcpus=domain, "
++				"ignoring setting %s\n", str);
++			goto free_housekeeping_staging;
++		}
++
+ 		iter_flags = flags & ~housekeeping.flags;
+ 
+ 		for_each_set_bit(type, &iter_flags, HK_TYPE_MAX)
