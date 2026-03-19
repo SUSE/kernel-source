@@ -1,0 +1,122 @@
+From: Adrian Hunter <adrian.hunter@intel.com>
+Date: Fri, 6 Mar 2026 09:24:40 +0200
+Subject: [PATCH] i3c: mipi-i3c-hci: Factor out DMA mapping from queuing path
+References: bsc#1258210
+Patch-mainline: 6.18.19
+Git-commit: f3bcbfe1b8b0b836b772927f75f8cb6e759eb00a
+
+commit f3bcbfe1b8b0b836b772927f75f8cb6e759eb00a upstream.
+
+Prepare for fixing a race in the DMA ring enqueue path when handling
+parallel transfers.  Move all DMA mapping out of hci_dma_queue_xfer()
+and into a new helper that performs the mapping up front.
+
+This refactoring allows the upcoming fix to extend the spinlock coverage
+around the enqueue operation without performing DMA mapping under the
+spinlock.
+
+No functional change is intended in this patch.
+
+Fixes: 9ad9a52cce282 ("i3c/master: introduce the mipi-i3c-hci driver")
+Cc: stable@vger.kernel.org
+Signed-off-by: Adrian Hunter <adrian.hunter@intel.com>
+Reviewed-by: Frank Li <Frank.Li@nxp.com>
+Link: https://patch.msgid.link/20260306072451.11131-4-adrian.hunter@intel.com
+Signed-off-by: Alexandre Belloni <alexandre.belloni@bootlin.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/i3c/master/mipi-i3c-hci/dma.c | 49 ++++++++++++++++++---------
+ 1 file changed, 33 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/i3c/master/mipi-i3c-hci/dma.c b/drivers/i3c/master/mipi-i3c-hci/dma.c
+index 951abfea5a6f..00809f19f69a 100644
+--- a/drivers/i3c/master/mipi-i3c-hci/dma.c
++++ b/drivers/i3c/master/mipi-i3c-hci/dma.c
+@@ -375,6 +375,33 @@ static void hci_dma_unmap_xfer(struct i3c_hci *hci,
+ 	}
+ }
+ 
++static struct i3c_dma *hci_dma_map_xfer(struct device *dev, struct hci_xfer *xfer)
++{
++	enum dma_data_direction dir = xfer->rnw ? DMA_FROM_DEVICE : DMA_TO_DEVICE;
++	bool need_bounce = device_iommu_mapped(dev) && xfer->rnw && (xfer->data_len & 3);
++
++	return i3c_master_dma_map_single(dev, xfer->data, xfer->data_len, need_bounce, dir);
++}
++
++static int hci_dma_map_xfer_list(struct i3c_hci *hci, struct device *dev,
++				 struct hci_xfer *xfer_list, int n)
++{
++	for (int i = 0; i < n; i++) {
++		struct hci_xfer *xfer = xfer_list + i;
++
++		if (!xfer->data)
++			continue;
++
++		xfer->dma = hci_dma_map_xfer(dev, xfer);
++		if (!xfer->dma) {
++			hci_dma_unmap_xfer(hci, xfer_list, i);
++			return -ENOMEM;
++		}
++	}
++
++	return 0;
++}
++
+ static int hci_dma_queue_xfer(struct i3c_hci *hci,
+ 			      struct hci_xfer *xfer_list, int n)
+ {
+@@ -382,6 +409,11 @@ static int hci_dma_queue_xfer(struct i3c_hci *hci,
+ 	struct hci_rh_data *rh;
+ 	unsigned int i, ring, enqueue_ptr;
+ 	u32 op1_val, op2_val;
++	int ret;
++
++	ret = hci_dma_map_xfer_list(hci, rings->sysdev, xfer_list, n);
++	if (ret)
++		return ret;
+ 
+ 	/* For now we only use ring 0 */
+ 	ring = 0;
+@@ -392,9 +424,6 @@ static int hci_dma_queue_xfer(struct i3c_hci *hci,
+ 	for (i = 0; i < n; i++) {
+ 		struct hci_xfer *xfer = xfer_list + i;
+ 		u32 *ring_data = rh->xfer + rh->xfer_struct_sz * enqueue_ptr;
+-		enum dma_data_direction dir = xfer->rnw ? DMA_FROM_DEVICE :
+-							  DMA_TO_DEVICE;
+-		bool need_bounce;
+ 
+ 		/* store cmd descriptor */
+ 		*ring_data++ = xfer->cmd_desc[0];
+@@ -413,18 +442,6 @@ static int hci_dma_queue_xfer(struct i3c_hci *hci,
+ 
+ 		/* 2nd and 3rd words of Data Buffer Descriptor Structure */
+ 		if (xfer->data) {
+-			need_bounce = device_iommu_mapped(rings->sysdev) &&
+-				      xfer->rnw &&
+-				      xfer->data_len != ALIGN(xfer->data_len, 4);
+-			xfer->dma = i3c_master_dma_map_single(rings->sysdev,
+-							      xfer->data,
+-							      xfer->data_len,
+-							      need_bounce,
+-							      dir);
+-			if (!xfer->dma) {
+-				hci_dma_unmap_xfer(hci, xfer_list, i);
+-				return -ENOMEM;
+-			}
+ 			*ring_data++ = lower_32_bits(xfer->dma->addr);
+ 			*ring_data++ = upper_32_bits(xfer->dma->addr);
+ 		} else {
+@@ -447,7 +464,7 @@ static int hci_dma_queue_xfer(struct i3c_hci *hci,
+ 		op2_val = rh_reg_read(RING_OPERATION2);
+ 		if (enqueue_ptr == FIELD_GET(RING_OP2_CR_DEQ_PTR, op2_val)) {
+ 			/* the ring is full */
+-			hci_dma_unmap_xfer(hci, xfer_list, i + 1);
++			hci_dma_unmap_xfer(hci, xfer_list, n);
+ 			return -EBUSY;
+ 		}
+ 	}
+-- 
+2.51.0
+

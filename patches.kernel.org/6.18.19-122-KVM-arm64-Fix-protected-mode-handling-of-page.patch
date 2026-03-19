@@ -1,0 +1,88 @@
+From: Marc Zyngier <maz@kernel.org>
+Date: Sun, 22 Feb 2026 13:35:13 +0000
+Subject: [PATCH] KVM: arm64: Fix protected mode handling of pages larger than
+ 4kB
+References: bsc#1258210
+Patch-mainline: 6.18.19
+Git-commit: 08f97454b7fa39bfcf82524955c771d2d693d6fe
+
+commit 08f97454b7fa39bfcf82524955c771d2d693d6fe upstream.
+
+Since 3669ddd8fa8b5 ("KVM: arm64: Add a range to pkvm_mappings"),
+pKVM tracks the memory that has been mapped into a guest in a
+side data structure. Crucially, it uses it to find out whether
+a page has already been mapped, and therefore refuses to map it
+twice. So far, so good.
+
+However, this very patch completely breaks non-4kB page support,
+with guests being unable to boot. The most obvious symptom is that
+we take the same fault repeatedly, and not making forward progress.
+A quick investigation shows that this is because of the above
+rejection code.
+
+As it turns out, there are multiple issues at play:
+
+- while the HPFAR_EL2 register gives you the faulting IPA minus
+  the bottom 12 bits, it will still give you the extra bits that
+  are part of the page offset for anything larger than 4kB,
+  even for a level-3 mapping
+
+- pkvm_pgtable_stage2_map() assumes that the address passed as
+  a parameter is aligned to the size of the intended mapping
+
+- the faulting address is only aligned for a non-page mapping
+
+When the planets are suitably aligned (pun intended), the guest
+faults on a page by accessing it past the bottom 4kB, and extra bits
+get set in the HPFAR_EL2 register. If this results in a page mapping
+(which is likely with large granule sizes), nothing aligns it further
+down, and pkvm_mapping_iter_first() finds an intersection that
+doesn't really exist. We assume this is a spurious fault and return
+-EAGAIN. And again...
+
+This doesn't hit outside of the protected code, as the page table
+code always aligns the IPA down to a page boundary, hiding the issue
+for everyone else.
+
+Fix it by always forcing the alignment on vma_pagesize, irrespective
+of the value of vma_pagesize.
+
+Fixes: 3669ddd8fa8b5 ("KVM: arm64: Add a range to pkvm_mappings")
+Reviewed-by: Fuad Tabba <tabba@google.com>
+Tested-by: Fuad Tabba <tabba@google.com>
+Signed-off-by: Marc Zyngier <maz@kernel.org>
+Link: https://https://patch.msgid.link/20260222141000.3084258-1-maz@kernel.org
+Cc: stable@vger.kernel.org
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ arch/arm64/kvm/mmu.c | 12 +++++-------
+ 1 file changed, 5 insertions(+), 7 deletions(-)
+
+diff --git a/arch/arm64/kvm/mmu.c b/arch/arm64/kvm/mmu.c
+index 7cc964af8d30..0d38dc72dfc6 100644
+--- a/arch/arm64/kvm/mmu.c
++++ b/arch/arm64/kvm/mmu.c
+@@ -1712,14 +1712,12 @@ static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
+ 	}
+ 
+ 	/*
+-	 * Both the canonical IPA and fault IPA must be hugepage-aligned to
+-	 * ensure we find the right PFN and lay down the mapping in the right
+-	 * place.
++	 * Both the canonical IPA and fault IPA must be aligned to the
++	 * mapping size to ensure we find the right PFN and lay down the
++	 * mapping in the right place.
+ 	 */
+-	if (vma_pagesize == PMD_SIZE || vma_pagesize == PUD_SIZE) {
+-		fault_ipa &= ~(vma_pagesize - 1);
+-		ipa &= ~(vma_pagesize - 1);
+-	}
++	fault_ipa = ALIGN_DOWN(fault_ipa, vma_pagesize);
++	ipa = ALIGN_DOWN(ipa, vma_pagesize);
+ 
+ 	gfn = ipa >> PAGE_SHIFT;
+ 	mte_allowed = kvm_vma_mte_allowed(vma);
+-- 
+2.51.0
+

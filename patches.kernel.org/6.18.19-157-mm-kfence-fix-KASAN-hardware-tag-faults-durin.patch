@@ -1,0 +1,97 @@
+From: Alexander Potapenko <glider@google.com>
+Date: Fri, 20 Feb 2026 15:49:40 +0100
+Subject: [PATCH] mm/kfence: fix KASAN hardware tag faults during late
+ enablement
+References: bsc#1258210
+Patch-mainline: 6.18.19
+Git-commit: d155aab90fffa00f93cea1f107aef0a3d548b2ff
+
+commit d155aab90fffa00f93cea1f107aef0a3d548b2ff upstream.
+
+When KASAN hardware tags are enabled, re-enabling KFENCE late (via
+/sys/module/kfence/parameters/sample_interval) causes KASAN faults.
+
+This happens because the KFENCE pool and metadata are allocated via the
+page allocator, which tags the memory, while KFENCE continues to access it
+using untagged pointers during initialization.
+
+Use __GFP_SKIP_KASAN for late KFENCE pool and metadata allocations to
+ensure the memory remains untagged, consistent with early allocations from
+memblock.  To support this, add __GFP_SKIP_KASAN to the allowlist in
+__alloc_contig_verify_gfp_mask().
+
+Link: https://lkml.kernel.org/r/20260220144940.2779209-1-glider@google.com
+Fixes: 0ce20dd84089 ("mm: add Kernel Electric-Fence infrastructure")
+Signed-off-by: Alexander Potapenko <glider@google.com>
+Suggested-by: Ernesto Martinez Garcia <ernesto.martinezgarcia@tugraz.at>
+Cc: Andrey Konovalov <andreyknvl@gmail.com>
+Cc: Andrey Ryabinin <ryabinin.a.a@gmail.com>
+Cc: Dmitry Vyukov <dvyukov@google.com>
+Cc: Greg KH <gregkh@linuxfoundation.org>
+Cc: Kees Cook <kees@kernel.org>
+Cc: Marco Elver <elver@google.com>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ mm/kfence/core.c | 14 ++++++++------
+ mm/page_alloc.c  |  3 ++-
+ 2 files changed, 10 insertions(+), 7 deletions(-)
+
+diff --git a/mm/kfence/core.c b/mm/kfence/core.c
+index 6da35d477269..f4f0d2a491a1 100644
+--- a/mm/kfence/core.c
++++ b/mm/kfence/core.c
+@@ -951,14 +951,14 @@ static int kfence_init_late(void)
+ #ifdef CONFIG_CONTIG_ALLOC
+ 	struct page *pages;
+ 
+-	pages = alloc_contig_pages(nr_pages_pool, GFP_KERNEL, first_online_node,
+-				   NULL);
++	pages = alloc_contig_pages(nr_pages_pool, GFP_KERNEL | __GFP_SKIP_KASAN,
++				   first_online_node, NULL);
+ 	if (!pages)
+ 		return -ENOMEM;
+ 
+ 	__kfence_pool = page_to_virt(pages);
+-	pages = alloc_contig_pages(nr_pages_meta, GFP_KERNEL, first_online_node,
+-				   NULL);
++	pages = alloc_contig_pages(nr_pages_meta, GFP_KERNEL | __GFP_SKIP_KASAN,
++				   first_online_node, NULL);
+ 	if (pages)
+ 		kfence_metadata_init = page_to_virt(pages);
+ #else
+@@ -968,11 +968,13 @@ static int kfence_init_late(void)
+ 		return -EINVAL;
+ 	}
+ 
+-	__kfence_pool = alloc_pages_exact(KFENCE_POOL_SIZE, GFP_KERNEL);
++	__kfence_pool = alloc_pages_exact(KFENCE_POOL_SIZE,
++					  GFP_KERNEL | __GFP_SKIP_KASAN);
+ 	if (!__kfence_pool)
+ 		return -ENOMEM;
+ 
+-	kfence_metadata_init = alloc_pages_exact(KFENCE_METADATA_SIZE, GFP_KERNEL);
++	kfence_metadata_init = alloc_pages_exact(KFENCE_METADATA_SIZE,
++						 GFP_KERNEL | __GFP_SKIP_KASAN);
+ #endif
+ 
+ 	if (!kfence_metadata_init)
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index d76f0f60f080..6288c7e4b971 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -6888,7 +6888,8 @@ static int __alloc_contig_verify_gfp_mask(gfp_t gfp_mask, gfp_t *gfp_cc_mask)
+ {
+ 	const gfp_t reclaim_mask = __GFP_IO | __GFP_FS | __GFP_RECLAIM;
+ 	const gfp_t action_mask = __GFP_COMP | __GFP_RETRY_MAYFAIL | __GFP_NOWARN |
+-				  __GFP_ZERO | __GFP_ZEROTAGS | __GFP_SKIP_ZERO;
++				  __GFP_ZERO | __GFP_ZEROTAGS | __GFP_SKIP_ZERO |
++				  __GFP_SKIP_KASAN;
+ 	const gfp_t cc_action_mask = __GFP_RETRY_MAYFAIL | __GFP_NOWARN;
+ 
+ 	/*
+-- 
+2.51.0
+

@@ -1,0 +1,75 @@
+From: Alice Ryhl <aliceryhl@google.com>
+Date: Wed, 18 Feb 2026 11:53:27 +0000
+Subject: [PATCH] rust_binder: avoid reading the written value in offsets array
+References: bsc#1258210
+Patch-mainline: 6.18.19
+Git-commit: 4cb9e13fec0de7c942f5f927469beb8e48ddd20f
+
+commit 4cb9e13fec0de7c942f5f927469beb8e48ddd20f upstream.
+
+When sending a transaction, its offsets array is first copied into the
+target proc's vma, and then the values are read back from there. This is
+normally fine because the vma is a read-only mapping, so the target
+process cannot change the value under us.
+
+However, if the target process somehow gains the ability to write to its
+own vma, it could change the offset before it's read back, causing the
+kernel to misinterpret what the sender meant. If the sender happens to
+send a payload with a specific shape, this could in the worst case lead
+to the receiver being able to privilege escalate into the sender.
+
+The intent is that gaining the ability to change the read-only vma of
+your own process should not be exploitable, so remove this TOCTOU read
+even though it's unexploitable without another Binder bug.
+
+Cc: stable <stable@kernel.org>
+Fixes: eafedbc7c050 ("rust_binder: add Rust Binder driver")
+Reported-by: Jann Horn <jannh@google.com>
+Reviewed-by: Jann Horn <jannh@google.com>
+Signed-off-by: Alice Ryhl <aliceryhl@google.com>
+Acked-by: Liam R. Howlett <Liam.Howlett@oracle.com>
+Link: https://patch.msgid.link/20260218-binder-vma-check-v2-2-60f9d695a990@google.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/android/binder/thread.rs | 17 ++++++-----------
+ 1 file changed, 6 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/android/binder/thread.rs b/drivers/android/binder/thread.rs
+index 67af5ff28166..6a2ddf0039c1 100644
+--- a/drivers/android/binder/thread.rs
++++ b/drivers/android/binder/thread.rs
+@@ -1018,12 +1018,9 @@ pub(crate) fn copy_transaction_data(
+ 
+         // Copy offsets if there are any.
+         if offsets_size > 0 {
+-            {
+-                let mut reader =
+-                    UserSlice::new(UserPtr::from_addr(trd_data_ptr.offsets as _), offsets_size)
+-                        .reader();
+-                alloc.copy_into(&mut reader, aligned_data_size, offsets_size)?;
+-            }
++            let mut offsets_reader =
++                UserSlice::new(UserPtr::from_addr(trd_data_ptr.offsets as _), offsets_size)
++                    .reader();
+ 
+             let offsets_start = aligned_data_size;
+             let offsets_end = aligned_data_size + offsets_size;
+@@ -1044,11 +1041,9 @@ pub(crate) fn copy_transaction_data(
+                 .step_by(size_of::<u64>())
+                 .enumerate()
+             {
+-                let offset: usize = view
+-                    .alloc
+-                    .read::<u64>(index_offset)?
+-                    .try_into()
+-                    .map_err(|_| EINVAL)?;
++                let offset = offsets_reader.read::<u64>()?;
++                view.alloc.write(index_offset, &offset)?;
++                let offset: usize = offset.try_into().map_err(|_| EINVAL)?;
+ 
+                 if offset < end_of_previous_object || !is_aligned(offset, size_of::<u32>()) {
+                     pr_warn!("Got transaction with invalid offset.");
+-- 
+2.51.0
+

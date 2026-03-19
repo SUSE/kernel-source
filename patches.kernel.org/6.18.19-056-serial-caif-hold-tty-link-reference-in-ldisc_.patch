@@ -1,0 +1,65 @@
+From: Shuangpeng Bai <shuangpeng.kernel@gmail.com>
+Date: Thu, 5 Mar 2026 22:40:06 -0500
+Subject: [PATCH] serial: caif: hold tty->link reference in ldisc_open and
+ ser_release
+References: bsc#1258210
+Patch-mainline: 6.18.19
+Git-commit: 288598d80a068a0e9281de35bcb4ce495f189e2a
+
+[ Upstream commit 288598d80a068a0e9281de35bcb4ce495f189e2a ]
+
+A reproducer triggers a KASAN slab-use-after-free in pty_write_room()
+when caif_serial's TX path calls tty_write_room(). The faulting access
+is on tty->link->port.
+
+Hold an extra kref on tty->link for the lifetime of the caif_serial line
+discipline: get it in ldisc_open() and drop it in ser_release(), and
+also drop it on the ldisc_open() error path.
+
+With this change applied, the reproducer no longer triggers the UAF in
+my testing.
+
+Link: https://gist.github.com/shuangpengbai/c898debad6bdf170a84be7e6b3d8707f
+Link: https://lore.kernel.org/netdev/20260301220525.1546355-1-shuangpeng.kernel@gmail.com
+Fixes: e31d5a05948e ("caif: tty's are kref objects so take a reference")
+Signed-off-by: Shuangpeng Bai <shuangpeng.kernel@gmail.com>
+Reviewed-by: Jiayuan Chen <jiayuan.chen@linux.dev>
+Link: https://patch.msgid.link/20260306034006.3395740-1-shuangpeng.kernel@gmail.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/net/caif/caif_serial.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/drivers/net/caif/caif_serial.c b/drivers/net/caif/caif_serial.c
+index b90890030751..1873d8287bb9 100644
+--- a/drivers/net/caif/caif_serial.c
++++ b/drivers/net/caif/caif_serial.c
+@@ -297,6 +297,7 @@ static void ser_release(struct work_struct *work)
+ 			dev_close(ser->dev);
+ 			unregister_netdevice(ser->dev);
+ 			debugfs_deinit(ser);
++			tty_kref_put(tty->link);
+ 			tty_kref_put(tty);
+ 		}
+ 		rtnl_unlock();
+@@ -331,6 +332,7 @@ static int ldisc_open(struct tty_struct *tty)
+ 
+ 	ser = netdev_priv(dev);
+ 	ser->tty = tty_kref_get(tty);
++	tty_kref_get(tty->link);
+ 	ser->dev = dev;
+ 	debugfs_init(ser, tty);
+ 	tty->receive_room = 4096;
+@@ -339,6 +341,7 @@ static int ldisc_open(struct tty_struct *tty)
+ 	rtnl_lock();
+ 	result = register_netdevice(dev);
+ 	if (result) {
++		tty_kref_put(tty->link);
+ 		tty_kref_put(tty);
+ 		rtnl_unlock();
+ 		free_netdev(dev);
+-- 
+2.51.0
+

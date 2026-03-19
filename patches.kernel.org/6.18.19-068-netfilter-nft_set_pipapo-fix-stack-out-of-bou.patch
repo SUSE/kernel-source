@@ -1,0 +1,66 @@
+From: Jenny Guanni Qu <qguanni@gmail.com>
+Date: Fri, 6 Mar 2026 19:12:38 +0000
+Subject: [PATCH] netfilter: nft_set_pipapo: fix stack out-of-bounds read in
+ pipapo_drop()
+References: bsc#1258210
+Patch-mainline: 6.18.19
+Git-commit: d6d8cd2db236a9dd13dbc2d05843b3445cc964b5
+
+[ Upstream commit d6d8cd2db236a9dd13dbc2d05843b3445cc964b5 ]
+
+pipapo_drop() passes rulemap[i + 1].n to pipapo_unmap() as the
+to_offset argument on every iteration, including the last one where
+i == m->field_count - 1. This reads one element past the end of the
+stack-allocated rulemap array (declared as rulemap[NFT_PIPAPO_MAX_FIELDS]
+with NFT_PIPAPO_MAX_FIELDS == 16).
+
+Although pipapo_unmap() returns early when is_last is true without
+using the to_offset value, the argument is evaluated at the call site
+before the function body executes, making this a genuine out-of-bounds
+stack read confirmed by KASAN:
+
+  BUG: KASAN: stack-out-of-bounds in pipapo_drop+0x50c/0x57c [nf_tables]
+  Read of size 4 at addr ffff8000810e71a4
+
+  This frame has 1 object:
+   [32, 160) 'rulemap'
+
+  The buggy address is at offset 164 -- exactly 4 bytes past the end
+  of the rulemap array.
+
+Pass 0 instead of rulemap[i + 1].n on the last iteration to avoid
+the out-of-bounds read.
+
+Fixes: 3c4287f62044 ("nf_tables: Add set type for arbitrary concatenation of ranges")
+Signed-off-by: Jenny Guanni Qu <qguanni@gmail.com>
+Signed-off-by: Florian Westphal <fw@strlen.de>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ net/netfilter/nft_set_pipapo.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/net/netfilter/nft_set_pipapo.c b/net/netfilter/nft_set_pipapo.c
+index d9b74d588c76..394b78a00a6a 100644
+--- a/net/netfilter/nft_set_pipapo.c
++++ b/net/netfilter/nft_set_pipapo.c
+@@ -1641,6 +1641,7 @@ static void pipapo_drop(struct nft_pipapo_match *m,
+ 	int i;
+ 
+ 	nft_pipapo_for_each_field(f, i, m) {
++		bool last = i == m->field_count - 1;
+ 		int g;
+ 
+ 		for (g = 0; g < f->groups; g++) {
+@@ -1660,7 +1661,7 @@ static void pipapo_drop(struct nft_pipapo_match *m,
+ 		}
+ 
+ 		pipapo_unmap(f->mt, f->rules, rulemap[i].to, rulemap[i].n,
+-			     rulemap[i + 1].n, i == m->field_count - 1);
++			     last ? 0 : rulemap[i + 1].n, last);
+ 		if (pipapo_resize(f, f->rules, f->rules - rulemap[i].n)) {
+ 			/* We can ignore this, a failure to shrink tables down
+ 			 * doesn't make tables invalid.
+-- 
+2.51.0
+

@@ -1,0 +1,111 @@
+From: Jakub Staniszewski <jakub.staniszewski@linux.intel.com>
+Date: Tue, 13 Jan 2026 20:38:17 +0100
+Subject: [PATCH] ice: fix retry for AQ command 0x06EE
+References: bsc#1258210
+Patch-mainline: 6.18.19
+Git-commit: fb4903b3354aed4a2301180cf991226f896c87ed
+
+commit fb4903b3354aed4a2301180cf991226f896c87ed upstream.
+
+Executing ethtool -m can fail reporting a netlink I/O error while firmware
+link management holds the i2c bus used to communicate with the module.
+
+According to Intel(R) Ethernet Controller E810 Datasheet Rev 2.8 [1]
+Section 3.3.10.4 Read/Write SFF EEPROM (0x06EE)
+request should to be retried upon receiving EBUSY from firmware.
+
+Commit e9c9692c8a81 ("ice: Reimplement module reads used by ethtool")
+implemented it only for part of ice_get_module_eeprom(), leaving all other
+calls to ice_aq_sff_eeprom() vulnerable to returning early on getting
+EBUSY without retrying.
+
+Remove the retry loop from ice_get_module_eeprom() and add Admin Queue
+(AQ) command with opcode 0x06EE to the list of commands that should be
+retried on receiving EBUSY from firmware.
+
+Cc: stable@vger.kernel.org
+Fixes: e9c9692c8a81 ("ice: Reimplement module reads used by ethtool")
+Signed-off-by: Jakub Staniszewski <jakub.staniszewski@linux.intel.com>
+Co-developed-by: Dawid Osuchowski <dawid.osuchowski@linux.intel.com>
+Signed-off-by: Dawid Osuchowski <dawid.osuchowski@linux.intel.com>
+Reviewed-by: Aleksandr Loktionov <aleksandr.loktionov@intel.com>
+Reviewed-by: Przemek Kitszel <przemyslaw.kitszel@intel.com>
+Link: https://www.intel.com/content/www/us/en/content-details/613875/intel-ethernet-controller-e810-datasheet.html [1]
+Reviewed-by: Paul Menzel <pmenzel@molgen.mpg.de>
+Tested-by: Rinitha S <sx.rinitha@intel.com> (A Contingent worker at Intel)
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/net/ethernet/intel/ice/ice_common.c  |  1 +
+ drivers/net/ethernet/intel/ice/ice_ethtool.c | 35 ++++++++------------
+ 2 files changed, 15 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/net/ethernet/intel/ice/ice_common.c b/drivers/net/ethernet/intel/ice/ice_common.c
+index e42347f2cc57..c23a31ec3c41 100644
+--- a/drivers/net/ethernet/intel/ice/ice_common.c
++++ b/drivers/net/ethernet/intel/ice/ice_common.c
+@@ -1854,6 +1854,7 @@ static bool ice_should_retry_sq_send_cmd(u16 opcode)
+ 	case ice_aqc_opc_lldp_stop:
+ 	case ice_aqc_opc_lldp_start:
+ 	case ice_aqc_opc_lldp_filter_ctrl:
++	case ice_aqc_opc_sff_eeprom:
+ 		return true;
+ 	}
+ 
+diff --git a/drivers/net/ethernet/intel/ice/ice_ethtool.c b/drivers/net/ethernet/intel/ice/ice_ethtool.c
+index 06b5677e9bff..5396ddd66ef7 100644
+--- a/drivers/net/ethernet/intel/ice/ice_ethtool.c
++++ b/drivers/net/ethernet/intel/ice/ice_ethtool.c
+@@ -4495,7 +4495,7 @@ ice_get_module_eeprom(struct net_device *netdev,
+ 	struct ice_pf *pf = vsi->back;
+ 	struct ice_hw *hw = &pf->hw;
+ 	bool is_sfp = false;
+-	unsigned int i, j;
++	unsigned int i;
+ 	u16 offset = 0;
+ 	u8 page = 0;
+ 	int status;
+@@ -4537,26 +4537,19 @@ ice_get_module_eeprom(struct net_device *netdev,
+ 		if (page == 0 || !(data[0x2] & 0x4)) {
+ 			u32 copy_len;
+ 
+-			/* If i2c bus is busy due to slow page change or
+-			 * link management access, call can fail. This is normal.
+-			 * So we retry this a few times.
+-			 */
+-			for (j = 0; j < 4; j++) {
+-				status = ice_aq_sff_eeprom(hw, 0, addr, offset, page,
+-							   !is_sfp, value,
+-							   SFF_READ_BLOCK_SIZE,
+-							   0, NULL);
+-				netdev_dbg(netdev, "SFF %02X %02X %02X %X = %02X%02X%02X%02X.%02X%02X%02X%02X (%X)\n",
+-					   addr, offset, page, is_sfp,
+-					   value[0], value[1], value[2], value[3],
+-					   value[4], value[5], value[6], value[7],
+-					   status);
+-				if (status) {
+-					usleep_range(1500, 2500);
+-					memset(value, 0, SFF_READ_BLOCK_SIZE);
+-					continue;
+-				}
+-				break;
++			status = ice_aq_sff_eeprom(hw, 0, addr, offset, page,
++						   !is_sfp, value,
++						   SFF_READ_BLOCK_SIZE,
++						   0, NULL);
++			netdev_dbg(netdev, "SFF %02X %02X %02X %X = %02X%02X%02X%02X.%02X%02X%02X%02X (%pe)\n",
++				   addr, offset, page, is_sfp,
++				   value[0], value[1], value[2], value[3],
++				   value[4], value[5], value[6], value[7],
++				   ERR_PTR(status));
++			if (status) {
++				netdev_err(netdev, "%s: error reading module EEPROM: status %pe\n",
++					   __func__, ERR_PTR(status));
++				return status;
+ 			}
+ 
+ 			/* Make sure we have enough room for the new block */
+-- 
+2.51.0
+
