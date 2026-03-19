@@ -1,0 +1,112 @@
+From: Paulo Alcantara <pc@manguebit.org>
+Date: Sat, 7 Mar 2026 18:20:16 -0300
+Subject: [PATCH] smb: client: fix atomic open with O_DIRECT & O_SYNC
+References: bsc#1012628
+Patch-mainline: 6.19.9
+Git-commit: 4a7d2729dc99437dbb880a64c47828c0d191b308
+
+commit 4a7d2729dc99437dbb880a64c47828c0d191b308 upstream.
+
+When user application requests O_DIRECT|O_SYNC along with O_CREAT on
+open(2), CREATE_NO_BUFFER and CREATE_WRITE_THROUGH bits were missed in
+CREATE request when performing an atomic open, thus leading to
+potentially data integrity issues.
+
+Fix this by setting those missing bits in CREATE request when
+O_DIRECT|O_SYNC has been specified in cifs_do_create().
+
+Fixes: 1da177e4c3f4 ("Linux-2.6.12-rc2")
+Signed-off-by: Paulo Alcantara (Red Hat) <pc@manguebit.org>
+Reviewed-by: David Howells <dhowells@redhat.com>
+Acked-by: Henrique Carvalho <henrique.carvalho@suse.com>
+Cc: Tom Talpey <tom@talpey.com>
+Cc: linux-cifs@vger.kernel.org
+Cc: stable@vger.kernel.org
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ fs/smb/client/cifsglob.h | 11 +++++++++++
+ fs/smb/client/dir.c      |  1 +
+ fs/smb/client/file.c     | 18 +++---------------
+ 3 files changed, 15 insertions(+), 15 deletions(-)
+
+diff --git a/fs/smb/client/cifsglob.h b/fs/smb/client/cifsglob.h
+index 3eca5bfb7030..0c3d2bbef938 100644
+--- a/fs/smb/client/cifsglob.h
++++ b/fs/smb/client/cifsglob.h
+@@ -20,6 +20,7 @@
+ #include <linux/utsname.h>
+ #include <linux/sched/mm.h>
+ #include <linux/netfs.h>
++#include <linux/fcntl.h>
+ #include "cifs_fs_sb.h"
+ #include "cifsacl.h"
+ #include <crypto/internal/hash.h>
+@@ -2313,4 +2314,14 @@ static inline void cifs_requeue_server_reconn(struct TCP_Server_Info *server)
+ 	queue_delayed_work(cifsiod_wq, &server->reconnect, delay * HZ);
+ }
+ 
++static inline int cifs_open_create_options(unsigned int oflags, int opts)
++{
++	/* O_SYNC also has bit for O_DSYNC so following check picks up either */
++	if (oflags & O_SYNC)
++		opts |= CREATE_WRITE_THROUGH;
++	if (oflags & O_DIRECT)
++		opts |= CREATE_NO_BUFFER;
++	return opts;
++}
++
+ #endif	/* _CIFS_GLOB_H */
+diff --git a/fs/smb/client/dir.c b/fs/smb/client/dir.c
+index 747256025e49..462d8e751ecf 100644
+--- a/fs/smb/client/dir.c
++++ b/fs/smb/client/dir.c
+@@ -307,6 +307,7 @@ static int cifs_do_create(struct inode *inode, struct dentry *direntry, unsigned
+ 		goto out;
+ 	}
+ 
++	create_options |= cifs_open_create_options(oflags, create_options);
+ 	/*
+ 	 * if we're not using unix extensions, see if we need to set
+ 	 * ATTR_READONLY on the create call
+diff --git a/fs/smb/client/file.c b/fs/smb/client/file.c
+index 7ff5cc9c5c5b..89dab96292de 100644
+--- a/fs/smb/client/file.c
++++ b/fs/smb/client/file.c
+@@ -585,15 +585,8 @@ static int cifs_nt_open(const char *full_path, struct inode *inode, struct cifs_
+  *********************************************************************/
+ 
+ 	disposition = cifs_get_disposition(f_flags);
+-
+ 	/* BB pass O_SYNC flag through on file attributes .. BB */
+-
+-	/* O_SYNC also has bit for O_DSYNC so following check picks up either */
+-	if (f_flags & O_SYNC)
+-		create_options |= CREATE_WRITE_THROUGH;
+-
+-	if (f_flags & O_DIRECT)
+-		create_options |= CREATE_NO_BUFFER;
++	create_options |= cifs_open_create_options(f_flags, create_options);
+ 
+ retry_open:
+ 	oparms = (struct cifs_open_parms) {
+@@ -1319,13 +1312,8 @@ cifs_reopen_file(struct cifsFileInfo *cfile, bool can_flush)
+ 		rdwr_for_fscache = 1;
+ 
+ 	desired_access = cifs_convert_flags(cfile->f_flags, rdwr_for_fscache);
+-
+-	/* O_SYNC also has bit for O_DSYNC so following check picks up either */
+-	if (cfile->f_flags & O_SYNC)
+-		create_options |= CREATE_WRITE_THROUGH;
+-
+-	if (cfile->f_flags & O_DIRECT)
+-		create_options |= CREATE_NO_BUFFER;
++	create_options |= cifs_open_create_options(cfile->f_flags,
++						   create_options);
+ 
+ 	if (server->ops->get_lease_key)
+ 		server->ops->get_lease_key(inode, &cfile->fid);
+-- 
+2.53.0
+

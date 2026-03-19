@@ -1,0 +1,120 @@
+From: Jim Mattson <jmattson@google.com>
+Date: Thu, 5 Feb 2026 15:15:26 -0800
+Subject: [PATCH] KVM: x86: Introduce KVM_X86_QUIRK_VMCS12_ALLOW_FREEZE_IN_SMM
+References: bsc#1012628
+Patch-mainline: 6.19.9
+Git-commit: e2ffe85b6d2bb7780174b87aa4468a39be17eb81
+
+commit e2ffe85b6d2bb7780174b87aa4468a39be17eb81 upstream.
+
+Add KVM_X86_QUIRK_VMCS12_ALLOW_FREEZE_IN_SMM to allow L1 to set
+FREEZE_IN_SMM in vmcs12's GUEST_IA32_DEBUGCTL field, as permitted
+prior to commit 6b1dd26544d0 ("KVM: VMX: Preserve host's
+DEBUGCTLMSR_FREEZE_IN_SMM while running the guest").  Enable the quirk
+by default for backwards compatibility (like all quirks); userspace
+can disable it via KVM_CAP_DISABLE_QUIRKS2 for consistency with the
+constraints on WRMSR(IA32_DEBUGCTL).
+
+Note that the quirk only bypasses the consistency check.  The vmcs02 bit is
+still owned by the host, and PMCs are not frozen during virtualized SMM.
+In particular, if a host administrator decides that PMCs should not be
+frozen during physical SMM, then L1 has no say in the matter.
+
+Fixes: 095686e6fcb4 ("KVM: nVMX: Check vmcs12->guest_ia32_debugctl on nested VM-Enter")
+Cc: stable@vger.kernel.org
+Signed-off-by: Jim Mattson <jmattson@google.com>
+Link: https://patch.msgid.link/20260205231537.1278753-1-jmattson@google.com
+[sean: tag for stable@, clean-up and fix goofs in the comment and docs]
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+[Rename quirk. - Paolo]
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ Documentation/virt/kvm/api.rst  |  8 ++++++++
+ arch/x86/include/asm/kvm_host.h |  3 ++-
+ arch/x86/include/uapi/asm/kvm.h |  1 +
+ arch/x86/kvm/vmx/nested.c       | 22 ++++++++++++++++++----
+ 4 files changed, 29 insertions(+), 5 deletions(-)
+
+diff --git a/Documentation/virt/kvm/api.rst b/Documentation/virt/kvm/api.rst
+index f1f1d2e5dc7c..b1008283e11d 100644
+--- a/Documentation/virt/kvm/api.rst
++++ b/Documentation/virt/kvm/api.rst
+@@ -8438,6 +8438,14 @@ KVM_X86_QUIRK_IGNORE_GUEST_PAT      By default, on Intel platforms, KVM ignores
+                                     guest software, for example if it does not
+                                     expose a bochs graphics device (which is
+                                     known to have had a buggy driver).
++
++KVM_X86_QUIRK_VMCS12_ALLOW_FREEZE_IN_SMM   By default, KVM relaxes the consistency
++                                      check for GUEST_IA32_DEBUGCTL in vmcs12
++                                      to allow FREEZE_IN_SMM to be set.  When
++                                      this quirk is disabled, KVM requires this
++                                      bit to be cleared.  Note that the vmcs02
++                                      bit is still completely controlled by the
++                                      host, regardless of the quirk setting.
+ =================================== ============================================
+ 
+ 7.32 KVM_CAP_MAX_VCPU_ID
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index c27b3e5f60c2..8b8f7bb5cc82 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -2470,7 +2470,8 @@ int memslot_rmap_alloc(struct kvm_memory_slot *slot, unsigned long npages);
+ 	 KVM_X86_QUIRK_MWAIT_NEVER_UD_FAULTS |	\
+ 	 KVM_X86_QUIRK_SLOT_ZAP_ALL |		\
+ 	 KVM_X86_QUIRK_STUFF_FEATURE_MSRS |	\
+-	 KVM_X86_QUIRK_IGNORE_GUEST_PAT)
++	 KVM_X86_QUIRK_IGNORE_GUEST_PAT |	\
++	 KVM_X86_QUIRK_VMCS12_ALLOW_FREEZE_IN_SMM)
+ 
+ #define KVM_X86_CONDITIONAL_QUIRKS		\
+ 	(KVM_X86_QUIRK_CD_NW_CLEARED |		\
+diff --git a/arch/x86/include/uapi/asm/kvm.h b/arch/x86/include/uapi/asm/kvm.h
+index 1208932e5cc3..774eb6989ef9 100644
+--- a/arch/x86/include/uapi/asm/kvm.h
++++ b/arch/x86/include/uapi/asm/kvm.h
+@@ -476,6 +476,7 @@ struct kvm_sync_regs {
+ #define KVM_X86_QUIRK_SLOT_ZAP_ALL		(1 << 7)
+ #define KVM_X86_QUIRK_STUFF_FEATURE_MSRS	(1 << 8)
+ #define KVM_X86_QUIRK_IGNORE_GUEST_PAT		(1 << 9)
++#define KVM_X86_QUIRK_VMCS12_ALLOW_FREEZE_IN_SMM (1 << 10)
+ 
+ #define KVM_STATE_NESTED_FORMAT_VMX	0
+ #define KVM_STATE_NESTED_FORMAT_SVM	1
+diff --git a/arch/x86/kvm/vmx/nested.c b/arch/x86/kvm/vmx/nested.c
+index 6137e5307d0f..89ef3551e35c 100644
+--- a/arch/x86/kvm/vmx/nested.c
++++ b/arch/x86/kvm/vmx/nested.c
+@@ -3292,10 +3292,24 @@ static int nested_vmx_check_guest_state(struct kvm_vcpu *vcpu,
+ 	if (CC(vmcs12->guest_cr4 & X86_CR4_CET && !(vmcs12->guest_cr0 & X86_CR0_WP)))
+ 		return -EINVAL;
+ 
+-	if ((vmcs12->vm_entry_controls & VM_ENTRY_LOAD_DEBUG_CONTROLS) &&
+-	    (CC(!kvm_dr7_valid(vmcs12->guest_dr7)) ||
+-	     CC(!vmx_is_valid_debugctl(vcpu, vmcs12->guest_ia32_debugctl, false))))
+-		return -EINVAL;
++	if (vmcs12->vm_entry_controls & VM_ENTRY_LOAD_DEBUG_CONTROLS) {
++		u64 debugctl = vmcs12->guest_ia32_debugctl;
++
++		/*
++		 * FREEZE_IN_SMM is not virtualized, but allow L1 to set it in
++		 * vmcs12's DEBUGCTL under a quirk for backwards compatibility.
++		 * Note that the quirk only relaxes the consistency check.  The
++		 * vmcc02 bit is still under the control of the host.  In
++		 * particular, if a host administrator decides to clear the bit,
++		 * then L1 has no say in the matter.
++		 */
++		if (kvm_check_has_quirk(vcpu->kvm, KVM_X86_QUIRK_VMCS12_ALLOW_FREEZE_IN_SMM))
++			debugctl &= ~DEBUGCTLMSR_FREEZE_IN_SMM;
++
++		if (CC(!kvm_dr7_valid(vmcs12->guest_dr7)) ||
++		    CC(!vmx_is_valid_debugctl(vcpu, debugctl, false)))
++			return -EINVAL;
++	}
+ 
+ 	if ((vmcs12->vm_entry_controls & VM_ENTRY_LOAD_IA32_PAT) &&
+ 	    CC(!kvm_pat_valid(vmcs12->guest_ia32_pat)))
+-- 
+2.53.0
+

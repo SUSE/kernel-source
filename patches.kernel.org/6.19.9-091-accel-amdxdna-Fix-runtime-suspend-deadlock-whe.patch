@@ -1,0 +1,118 @@
+From: Lizhi Hou <lizhi.hou@amd.com>
+Date: Tue, 10 Mar 2026 11:00:58 -0700
+Subject: [PATCH] accel/amdxdna: Fix runtime suspend deadlock when there is
+ pending job
+References: bsc#1012628
+Patch-mainline: 6.19.9
+Git-commit: 6b13cb8f48a42ddf6dd98865b673a82e37ff238b
+
+[ Upstream commit 6b13cb8f48a42ddf6dd98865b673a82e37ff238b ]
+
+The runtime suspend callback drains the running job workqueue before
+suspending the device. If a job is still executing and calls
+pm_runtime_resume_and_get(), it can deadlock with the runtime suspend
+path.
+
+Fix this by moving pm_runtime_resume_and_get() from the job execution
+routine to the job submission routine, ensuring the device is resumed
+before the job is queued and avoiding the deadlock during runtime
+suspend.
+
+Fixes: 063db451832b ("accel/amdxdna: Enhance runtime power management")
+Reviewed-by: Mario Limonciello (AMD) <superm1@kernel.org>
+Signed-off-by: Lizhi Hou <lizhi.hou@amd.com>
+Link: https://patch.msgid.link/20260310180058.336348-1-lizhi.hou@amd.com
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/accel/amdxdna/aie2_ctx.c    | 14 ++------------
+ drivers/accel/amdxdna/amdxdna_ctx.c | 10 ++++++++++
+ 2 files changed, 12 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/accel/amdxdna/aie2_ctx.c b/drivers/accel/amdxdna/aie2_ctx.c
+index 9fc33b4298f2..9284c35aacfb 100644
+--- a/drivers/accel/amdxdna/aie2_ctx.c
++++ b/drivers/accel/amdxdna/aie2_ctx.c
+@@ -165,7 +165,6 @@ aie2_sched_notify(struct amdxdna_sched_job *job)
+ 
+ 	trace_xdna_job(&job->base, job->hwctx->name, "signaled fence", job->seq);
+ 
+-	amdxdna_pm_suspend_put(job->hwctx->client->xdna);
+ 	job->hwctx->priv->completed++;
+ 	dma_fence_signal(fence);
+ 
+@@ -290,19 +289,11 @@ aie2_sched_job_run(struct drm_sched_job *sched_job)
+ 	struct dma_fence *fence;
+ 	int ret;
+ 
+-	ret = amdxdna_pm_resume_get(hwctx->client->xdna);
+-	if (ret)
++	if (!hwctx->priv->mbox_chann)
+ 		return NULL;
+ 
+-	if (!hwctx->priv->mbox_chann) {
+-		amdxdna_pm_suspend_put(hwctx->client->xdna);
+-		return NULL;
+-	}
+-
+-	if (!mmget_not_zero(job->mm)) {
+-		amdxdna_pm_suspend_put(hwctx->client->xdna);
++	if (!mmget_not_zero(job->mm))
+ 		return ERR_PTR(-ESRCH);
+-	}
+ 
+ 	kref_get(&job->refcnt);
+ 	fence = dma_fence_get(job->fence);
+@@ -333,7 +324,6 @@ aie2_sched_job_run(struct drm_sched_job *sched_job)
+ 
+ out:
+ 	if (ret) {
+-		amdxdna_pm_suspend_put(hwctx->client->xdna);
+ 		dma_fence_put(job->fence);
+ 		aie2_job_put(job);
+ 		mmput(job->mm);
+diff --git a/drivers/accel/amdxdna/amdxdna_ctx.c b/drivers/accel/amdxdna/amdxdna_ctx.c
+index 4e48519b699a..f678ae4c682d 100644
+--- a/drivers/accel/amdxdna/amdxdna_ctx.c
++++ b/drivers/accel/amdxdna/amdxdna_ctx.c
+@@ -17,6 +17,7 @@
+ #include "amdxdna_ctx.h"
+ #include "amdxdna_gem.h"
+ #include "amdxdna_pci_drv.h"
++#include "amdxdna_pm.h"
+ 
+ #define MAX_HWCTX_ID		255
+ #define MAX_ARG_COUNT		4095
+@@ -445,6 +446,7 @@ amdxdna_arg_bos_lookup(struct amdxdna_client *client,
+ void amdxdna_sched_job_cleanup(struct amdxdna_sched_job *job)
+ {
+ 	trace_amdxdna_debug_point(job->hwctx->name, job->seq, "job release");
++	amdxdna_pm_suspend_put(job->hwctx->client->xdna);
+ 	amdxdna_arg_bos_put(job);
+ 	amdxdna_gem_put_obj(job->cmd_bo);
+ 	dma_fence_put(job->fence);
+@@ -482,6 +484,12 @@ int amdxdna_cmd_submit(struct amdxdna_client *client,
+ 		goto cmd_put;
+ 	}
+ 
++	ret = amdxdna_pm_resume_get(xdna);
++	if (ret) {
++		XDNA_ERR(xdna, "Resume failed, ret %d", ret);
++		goto put_bos;
++	}
++
+ 	idx = srcu_read_lock(&client->hwctx_srcu);
+ 	hwctx = xa_load(&client->hwctx_xa, hwctx_hdl);
+ 	if (!hwctx) {
+@@ -522,6 +530,8 @@ int amdxdna_cmd_submit(struct amdxdna_client *client,
+ 	dma_fence_put(job->fence);
+ unlock_srcu:
+ 	srcu_read_unlock(&client->hwctx_srcu, idx);
++	amdxdna_pm_suspend_put(xdna);
++put_bos:
+ 	amdxdna_arg_bos_put(job);
+ cmd_put:
+ 	amdxdna_gem_put_obj(job->cmd_bo);
+-- 
+2.53.0
+

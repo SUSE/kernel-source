@@ -1,0 +1,77 @@
+From: Jiasheng Jiang <jiashengjiangcool@gmail.com>
+Date: Thu, 19 Feb 2026 02:38:34 +0000
+Subject: [PATCH] usb: gadget: f_tcm: Fix NULL pointer dereferences in nexus
+ handling
+References: bsc#1012628
+Patch-mainline: 6.19.9
+Git-commit: b9fde507355342a2d64225d582dc8b98ff5ecb19
+
+commit b9fde507355342a2d64225d582dc8b98ff5ecb19 upstream.
+
+The `tpg->tpg_nexus` pointer in the USB Target driver is dynamically
+managed and tied to userspace configuration via ConfigFS. It can be
+NULL if the USB host sends requests before the nexus is fully
+established or immediately after it is dropped.
+
+Currently, functions like `bot_submit_command()` and the data
+transfer paths retrieve `tv_nexus = tpg->tpg_nexus` and immediately
+dereference `tv_nexus->tvn_se_sess` without any validation. If a
+malicious or misconfigured USB host sends a BOT (Bulk-Only Transport)
+command during this race window, it triggers a NULL pointer
+dereference, leading to a kernel panic (local DoS).
+
+This exposes an inconsistent API usage within the module, as peer
+functions like `usbg_submit_command()` and `bot_send_bad_response()`
+correctly implement a NULL check for `tv_nexus` before proceeding.
+
+Fix this by bringing consistency to the nexus handling. Add the
+missing `if (!tv_nexus)` checks to the vulnerable BOT command and
+request processing paths, aborting the command gracefully with an
+error instead of crashing the system.
+
+Fixes: c52661d60f63 ("usb-gadget: Initial merge of target module for UASP + BOT")
+Cc: stable <stable@kernel.org>
+Signed-off-by: Jiasheng Jiang <jiashengjiangcool@gmail.com>
+Reviewed-by: Thinh Nguyen <Thinh.Nguyen@synopsys.com>
+Link: https://patch.msgid.link/20260219023834.17976-1-jiashengjiangcool@gmail.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/usb/gadget/function/f_tcm.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/drivers/usb/gadget/function/f_tcm.c b/drivers/usb/gadget/function/f_tcm.c
+index 6e8804f04baa..7b27f8082ace 100644
+--- a/drivers/usb/gadget/function/f_tcm.c
++++ b/drivers/usb/gadget/function/f_tcm.c
+@@ -1222,6 +1222,13 @@ static void usbg_submit_cmd(struct usbg_cmd *cmd)
+ 	se_cmd = &cmd->se_cmd;
+ 	tpg = cmd->fu->tpg;
+ 	tv_nexus = tpg->tpg_nexus;
++	if (!tv_nexus) {
++		struct usb_gadget *gadget = fuas_to_gadget(cmd->fu);
++
++		dev_err(&gadget->dev, "Missing nexus, ignoring command\n");
++		return;
++	}
++
+ 	dir = get_cmd_dir(cmd->cmd_buf);
+ 	if (dir < 0)
+ 		goto out;
+@@ -1482,6 +1489,13 @@ static void bot_cmd_work(struct work_struct *work)
+ 	se_cmd = &cmd->se_cmd;
+ 	tpg = cmd->fu->tpg;
+ 	tv_nexus = tpg->tpg_nexus;
++	if (!tv_nexus) {
++		struct usb_gadget *gadget = fuas_to_gadget(cmd->fu);
++
++		dev_err(&gadget->dev, "Missing nexus, ignoring command\n");
++		return;
++	}
++
+ 	dir = get_cmd_dir(cmd->cmd_buf);
+ 	if (dir < 0)
+ 		goto out;
+-- 
+2.53.0
+

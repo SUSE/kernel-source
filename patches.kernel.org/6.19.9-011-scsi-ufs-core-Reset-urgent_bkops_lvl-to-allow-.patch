@@ -1,0 +1,76 @@
+From: Won Jung <wone.jung@samsung.com>
+Date: Wed, 11 Feb 2026 15:01:05 +0900
+Subject: [PATCH] scsi: ufs: core: Reset urgent_bkops_lvl to allow runtime PM
+ power mode
+References: bsc#1012628
+Patch-mainline: 6.19.9
+Git-commit: 5b313760059c9df7d60aba7832279bcb81b4aec0
+
+[ Upstream commit 5b313760059c9df7d60aba7832279bcb81b4aec0 ]
+
+Ensures that UFS Runtime PM can achieve power saving after System PM
+suspend by resetting hba->urgent_bkops_lvl. Also modify the
+ufshcd_bkops_exception_event_handler to avoid setting urgent_bkops_lvl when
+status is 0, which helps maintain optimal power management.
+
+On UFS devices supporting UFSHCD_CAP_AUTO_BKOPS_SUSPEND, a BKOPS exception
+event can lead to a situation where UFS Runtime PM can't enter low-power
+mode states even after the BKOPS exception has been resolved.
+
+BKOPS exception with bkops status 0 occurs, the driver logs:
+
+ "ufshcd_bkops_exception_event_handler: device raised urgent BKOPS exception for bkops status 0"
+
+When a BKOPS exception occurs, ufshcd_bkops_exception_event_handler() reads
+the BKOPS status and sets hba->urgent_bkops_lvl to BKOPS_STATUS_NO_OP(0).
+This allows the device to perform Runtime PM without changing the UFS power
+mode.  (__ufshcd_wl_suspend(hba, UFS_RUNTIME_PM))
+
+During system PM suspend, ufshcd_disable_auto_bkops() is called, disabling
+auto bkops. After UFS System PM Resume, when runtime PM attempts to suspend
+again, ufshcd_urgent_bkops() is invoked. Since hba->urgent_bkops_lvl
+remains at BKOPS_STATUS_NO_OP(0), ufshcd_enable_auto_bkops() is triggered.
+
+However, in ufshcd_bkops_ctrl(), the driver compares the current BKOPS
+status with hba->urgent_bkops_lvl, and only enables auto bkops if
+curr_status >= hba->urgent_bkops_lvl.  Since both values are 0, the
+condition is met
+
+As a result, __ufshcd_wl_suspend(hba, UFS_RUNTIME_PM) skips power mode
+transitions and remains in an active state, preventing power saving even
+though no urgent BKOPS condition exists.
+
+Signed-off-by: Won Jung <wone.jung@samsung.com>
+Reviewed-by: Peter Wang <peter.wang@mediatek.com>
+Link: https://patch.msgid.link/1891546521.01770806581968.JavaMail.epsvc@epcpadp2new
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/ufs/core/ufshcd.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/ufs/core/ufshcd.c b/drivers/ufs/core/ufshcd.c
+index 80fafad339c7..6f9c5d701281 100644
+--- a/drivers/ufs/core/ufshcd.c
++++ b/drivers/ufs/core/ufshcd.c
+@@ -5971,6 +5971,7 @@ static int ufshcd_disable_auto_bkops(struct ufs_hba *hba)
+ 
+ 	hba->auto_bkops_enabled = false;
+ 	trace_ufshcd_auto_bkops_state(hba, "Disabled");
++	hba->urgent_bkops_lvl = BKOPS_STATUS_PERF_IMPACT;
+ 	hba->is_urgent_bkops_lvl_checked = false;
+ out:
+ 	return err;
+@@ -6074,7 +6075,7 @@ static void ufshcd_bkops_exception_event_handler(struct ufs_hba *hba)
+ 	 * impacted or critical. Handle these device by determining their urgent
+ 	 * bkops status at runtime.
+ 	 */
+-	if (curr_status < BKOPS_STATUS_PERF_IMPACT) {
++	if ((curr_status > BKOPS_STATUS_NO_OP) && (curr_status < BKOPS_STATUS_PERF_IMPACT)) {
+ 		dev_err(hba->dev, "%s: device raised urgent BKOPS exception for bkops status %d\n",
+ 				__func__, curr_status);
+ 		/* update the current status as the urgent bkops level */
+-- 
+2.53.0
+

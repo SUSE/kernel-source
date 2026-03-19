@@ -1,0 +1,78 @@
+From: Joanne Koong <joannelkoong@gmail.com>
+Date: Tue, 3 Mar 2026 15:34:20 -0800
+Subject: [PATCH] iomap: don't mark folio uptodate if read IO has bytes pending
+References: bsc#1012628
+Patch-mainline: 6.19.9
+Git-commit: debc1a492b2695d05973994fb0f796dbd9ceaae6
+
+commit debc1a492b2695d05973994fb0f796dbd9ceaae6 upstream.
+
+If a folio has ifs metadata attached to it and the folio is partially
+read in through an async IO helper with the rest of it then being read
+in through post-EOF zeroing or as inline data, and the helper
+successfully finishes the read first, then post-EOF zeroing / reading
+inline will mark the folio as uptodate in iomap_set_range_uptodate().
+
+This is a problem because when the read completion path later calls
+iomap_read_end(), it will call folio_end_read(), which sets the uptodate
+bit using XOR semantics. Calling folio_end_read() on a folio that was
+already marked uptodate clears the uptodate bit.
+
+Fix this by not marking the folio as uptodate if the read IO has bytes
+pending. The folio uptodate state will be set in the read completion
+path through iomap_end_read() -> folio_end_read().
+
+Reported-by: Wei Gao <wegao@suse.com>
+Suggested-by: Sasha Levin <sashal@kernel.org>
+Tested-by: Wei Gao <wegao@suse.com>
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Cc: stable@vger.kernel.org # v6.19
+Link: https://lore.kernel.org/linux-fsdevel/aYbmy8JdgXwsGaPP@autotest-wegao.qe.prg2.suse.org/
+Fixes: b2f35ac4146d ("iomap: add caller-provided callbacks for read and readahead")
+Signed-off-by: Joanne Koong <joannelkoong@gmail.com>
+Link: https://patch.msgid.link/20260303233420.874231-2-joannelkoong@gmail.com
+Signed-off-by: Christian Brauner <brauner@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ fs/iomap/buffered-io.c | 15 ++++++++++++---
+ 1 file changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/fs/iomap/buffered-io.c b/fs/iomap/buffered-io.c
+index e3bedcbb5f1e..660457e60e2f 100644
+--- a/fs/iomap/buffered-io.c
++++ b/fs/iomap/buffered-io.c
+@@ -79,18 +79,27 @@ static void iomap_set_range_uptodate(struct folio *folio, size_t off,
+ {
+ 	struct iomap_folio_state *ifs = folio->private;
+ 	unsigned long flags;
+-	bool uptodate = true;
++	bool mark_uptodate = true;
+ 
+ 	if (folio_test_uptodate(folio))
+ 		return;
+ 
+ 	if (ifs) {
+ 		spin_lock_irqsave(&ifs->state_lock, flags);
+-		uptodate = ifs_set_range_uptodate(folio, ifs, off, len);
++		/*
++		 * If a read with bytes pending is in progress, we must not call
++		 * folio_mark_uptodate(). The read completion path
++		 * (iomap_read_end()) will call folio_end_read(), which uses XOR
++		 * semantics to set the uptodate bit. If we set it here, the XOR
++		 * in folio_end_read() will clear it, leaving the folio not
++		 * uptodate.
++		 */
++		mark_uptodate = ifs_set_range_uptodate(folio, ifs, off, len) &&
++				!ifs->read_bytes_pending;
+ 		spin_unlock_irqrestore(&ifs->state_lock, flags);
+ 	}
+ 
+-	if (uptodate)
++	if (mark_uptodate)
+ 		folio_mark_uptodate(folio);
+ }
+ 
+-- 
+2.53.0
+

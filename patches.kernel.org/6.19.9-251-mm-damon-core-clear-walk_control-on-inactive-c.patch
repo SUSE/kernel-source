@@ -1,0 +1,80 @@
+From: Raul Pazemecxas De Andrade <raul_pazemecxas@hotmail.com>
+Date: Mon, 23 Feb 2026 17:10:59 -0800
+Subject: [PATCH] mm/damon/core: clear walk_control on inactive context in
+ damos_walk()
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+References: bsc#1012628
+Patch-mainline: 6.19.9
+Git-commit: d210fdcac9c0d1380eab448aebc93f602c1cd4e6
+
+commit d210fdcac9c0d1380eab448aebc93f602c1cd4e6 upstream.
+
+damos_walk() sets ctx->walk_control to the caller-provided control
+structure before checking whether the context is running.  If the context
+is inactive (damon_is_running() returns false), the function returns
+-EINVAL without clearing ctx->walk_control.  This leaves a dangling
+pointer to a stack-allocated structure that will be freed when the caller
+returns.
+
+This is structurally identical to the bug fixed in commit f9132fbc2e83
+("mm/damon/core: remove call_control in inactive contexts") for
+damon_call(), which had the same pattern of linking a control object and
+returning an error without unlinking it.
+
+The dangling walk_control pointer can cause:
+1. Use-after-free if the context is later started and kdamond
+   dereferences ctx->walk_control (e.g., in damos_walk_cancel()
+   which writes to control->canceled and calls complete())
+2. Permanent -EBUSY from subsequent damos_walk() calls, since the
+   stale pointer is non-NULL
+
+Nonetheless, the real user impact is quite restrictive.  The
+use-after-free is impossible because there is no damos_walk() callers who
+starts the context later.  The permanent -EBUSY can actually confuse
+users, as DAMON is not running.  But the symptom is kept only while the
+context is turned off.  Turning it on again will make DAMON internally
+uses a newly generated damon_ctx object that doesn't have the invalid
+damos_walk_control pointer, so everything will work fine again.
+
+Fix this by clearing ctx->walk_control under walk_control_lock before
+returning -EINVAL, mirroring the fix pattern from f9132fbc2e83.
+
+Link: https://lkml.kernel.org/r/20260224011102.56033-1-sj@kernel.org
+Fixes: bf0eaba0ff9c ("mm/damon/core: implement damos_walk()")
+Reported-by: Raul Pazemecxas De Andrade <raul_pazemecxas@hotmail.com>
+Closes: https://lore.kernel.org/CPUPR80MB8171025468965E583EF2490F956CA@CPUPR80MB8171.lamprd80.prod.outlook.com
+Signed-off-by: Raul Pazemecxas De Andrade <raul_pazemecxas@hotmail.com>
+Signed-off-by: SeongJae Park <sj@kernel.org>
+Reviewed-by: SeongJae Park <sj@kernel.org>
+Cc: <stable@vger.kernel.org>	[6.14+]
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ mm/damon/core.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/mm/damon/core.c b/mm/damon/core.c
+index 84f80a20f233..4189f99c1cdc 100644
+--- a/mm/damon/core.c
++++ b/mm/damon/core.c
+@@ -1531,8 +1531,13 @@ int damos_walk(struct damon_ctx *ctx, struct damos_walk_control *control)
+ 	}
+ 	ctx->walk_control = control;
+ 	mutex_unlock(&ctx->walk_control_lock);
+-	if (!damon_is_running(ctx))
++	if (!damon_is_running(ctx)) {
++		mutex_lock(&ctx->walk_control_lock);
++		if (ctx->walk_control == control)
++			ctx->walk_control = NULL;
++		mutex_unlock(&ctx->walk_control_lock);
+ 		return -EINVAL;
++	}
+ 	wait_for_completion(&control->completion);
+ 	if (control->canceled)
+ 		return -ECANCELED;
+-- 
+2.53.0
+

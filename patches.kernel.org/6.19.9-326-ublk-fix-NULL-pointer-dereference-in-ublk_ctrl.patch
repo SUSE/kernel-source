@@ -1,0 +1,74 @@
+From: Mehul Rao <mehulrao@gmail.com>
+Date: Thu, 5 Mar 2026 14:31:46 -0500
+Subject: [PATCH] ublk: fix NULL pointer dereference in ublk_ctrl_set_size()
+References: bsc#1012628
+Patch-mainline: 6.19.9
+Git-commit: 25966fc097691e5c925ad080f64a2f19c5fd940a
+
+commit 25966fc097691e5c925ad080f64a2f19c5fd940a upstream.
+
+ublk_ctrl_set_size() unconditionally dereferences ub->ub_disk via
+set_capacity_and_notify() without checking if it is NULL.
+
+ub->ub_disk is NULL before UBLK_CMD_START_DEV completes (it is only
+assigned in ublk_ctrl_start_dev()) and after UBLK_CMD_STOP_DEV runs
+(ublk_detach_disk() sets it to NULL). Since the UBLK_CMD_UPDATE_SIZE
+handler performs no state validation, a user can trigger a NULL pointer
+dereference by sending UPDATE_SIZE to a device that has been added but
+not yet started, or one that has been stopped.
+
+Fix this by checking ub->ub_disk under ub->mutex before dereferencing
+it, and returning -ENODEV if the disk is not available.
+
+Fixes: 98b995660bff ("ublk: Add UBLK_U_CMD_UPDATE_SIZE")
+Cc: stable@vger.kernel.org
+Signed-off-by: Mehul Rao <mehulrao@gmail.com>
+Reviewed-by: Ming Lei <ming.lei@redhat.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/block/ublk_drv.c | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/block/ublk_drv.c b/drivers/block/ublk_drv.c
+index 06e0790150d1..60053af9242e 100644
+--- a/drivers/block/ublk_drv.c
++++ b/drivers/block/ublk_drv.c
+@@ -3534,15 +3534,22 @@ static int ublk_ctrl_get_features(const struct ublksrv_ctrl_cmd *header)
+ 	return 0;
+ }
+ 
+-static void ublk_ctrl_set_size(struct ublk_device *ub, const struct ublksrv_ctrl_cmd *header)
++static int ublk_ctrl_set_size(struct ublk_device *ub, const struct ublksrv_ctrl_cmd *header)
+ {
+ 	struct ublk_param_basic *p = &ub->params.basic;
+ 	u64 new_size = header->data[0];
++	int ret = 0;
+ 
+ 	mutex_lock(&ub->mutex);
++	if (!ub->ub_disk) {
++		ret = -ENODEV;
++		goto out;
++	}
+ 	p->dev_sectors = new_size;
+ 	set_capacity_and_notify(ub->ub_disk, p->dev_sectors);
++out:
+ 	mutex_unlock(&ub->mutex);
++	return ret;
+ }
+ 
+ struct count_busy {
+@@ -3853,8 +3860,7 @@ static int ublk_ctrl_uring_cmd(struct io_uring_cmd *cmd,
+ 		ret = ublk_ctrl_end_recovery(ub, &header);
+ 		break;
+ 	case UBLK_CMD_UPDATE_SIZE:
+-		ublk_ctrl_set_size(ub, &header);
+-		ret = 0;
++		ret = ublk_ctrl_set_size(ub, &header);
+ 		break;
+ 	case UBLK_CMD_QUIESCE_DEV:
+ 		ret = ublk_ctrl_quiesce_dev(ub, &header);
+-- 
+2.53.0
+

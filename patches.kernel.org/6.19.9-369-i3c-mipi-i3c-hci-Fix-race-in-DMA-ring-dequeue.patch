@@ -1,0 +1,76 @@
+From: Adrian Hunter <adrian.hunter@intel.com>
+Date: Fri, 6 Mar 2026 09:24:43 +0200
+Subject: [PATCH] i3c: mipi-i3c-hci: Fix race in DMA ring dequeue
+References: bsc#1012628
+Patch-mainline: 6.19.9
+Git-commit: 1dca8aee80eea76d2aae21265de5dd64f6ba0f09
+
+commit 1dca8aee80eea76d2aae21265de5dd64f6ba0f09 upstream.
+
+The HCI DMA dequeue path (hci_dma_dequeue_xfer()) may be invoked for
+multiple transfers that timeout around the same time.  However, the
+function is not serialized and can race with itself.
+
+When a timeout occurs, hci_dma_dequeue_xfer() stops the ring, processes
+incomplete transfers, and then restarts the ring.  If another timeout
+triggers a parallel call into the same function, the two instances may
+interfere with each other - stopping or restarting the ring at unexpected
+times.
+
+Add a mutex so that hci_dma_dequeue_xfer() is serialized with respect to
+itself.
+
+Fixes: 9ad9a52cce282 ("i3c/master: introduce the mipi-i3c-hci driver")
+Cc: stable@vger.kernel.org
+Signed-off-by: Adrian Hunter <adrian.hunter@intel.com>
+Reviewed-by: Frank Li <Frank.Li@nxp.com>
+Link: https://patch.msgid.link/20260306072451.11131-7-adrian.hunter@intel.com
+Signed-off-by: Alexandre Belloni <alexandre.belloni@bootlin.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/i3c/master/mipi-i3c-hci/core.c | 1 +
+ drivers/i3c/master/mipi-i3c-hci/dma.c  | 2 ++
+ drivers/i3c/master/mipi-i3c-hci/hci.h  | 1 +
+ 3 files changed, 4 insertions(+)
+
+diff --git a/drivers/i3c/master/mipi-i3c-hci/core.c b/drivers/i3c/master/mipi-i3c-hci/core.c
+index 3debc5f1327d..c529c527d722 100644
+--- a/drivers/i3c/master/mipi-i3c-hci/core.c
++++ b/drivers/i3c/master/mipi-i3c-hci/core.c
+@@ -632,6 +632,7 @@ static int i3c_hci_init(struct i3c_hci *hci)
+ 		return ret;
+ 
+ 	spin_lock_init(&hci->lock);
++	mutex_init(&hci->control_mutex);
+ 
+ 	/*
+ 	 * Now let's reset the hardware.
+diff --git a/drivers/i3c/master/mipi-i3c-hci/dma.c b/drivers/i3c/master/mipi-i3c-hci/dma.c
+index 1ed9d053c62f..032753a2bd68 100644
+--- a/drivers/i3c/master/mipi-i3c-hci/dma.c
++++ b/drivers/i3c/master/mipi-i3c-hci/dma.c
+@@ -486,6 +486,8 @@ static bool hci_dma_dequeue_xfer(struct i3c_hci *hci,
+ 	unsigned int i;
+ 	bool did_unqueue = false;
+ 
++	guard(mutex)(&hci->control_mutex);
++
+ 	/* stop the ring */
+ 	rh_reg_write(RING_CONTROL, RING_CTRL_ABORT);
+ 	if (wait_for_completion_timeout(&rh->op_done, HZ) == 0) {
+diff --git a/drivers/i3c/master/mipi-i3c-hci/hci.h b/drivers/i3c/master/mipi-i3c-hci/hci.h
+index 5656d43a1009..32c8aecde9f7 100644
+--- a/drivers/i3c/master/mipi-i3c-hci/hci.h
++++ b/drivers/i3c/master/mipi-i3c-hci/hci.h
+@@ -46,6 +46,7 @@ struct i3c_hci {
+ 	void *io_data;
+ 	const struct hci_cmd_ops *cmd;
+ 	spinlock_t lock;
++	struct mutex control_mutex;
+ 	atomic_t next_cmd_tid;
+ 	u32 caps;
+ 	unsigned int quirks;
+-- 
+2.53.0
+

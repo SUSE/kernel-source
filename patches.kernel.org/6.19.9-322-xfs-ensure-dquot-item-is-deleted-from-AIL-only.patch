@@ -1,0 +1,72 @@
+From: Long Li <leo.lilong@huawei.com>
+Date: Thu, 5 Mar 2026 16:49:22 +0800
+Subject: [PATCH] xfs: ensure dquot item is deleted from AIL only after log
+ shutdown
+References: bsc#1012628
+Patch-mainline: 6.19.9
+Git-commit: 186ac39b8a7d3ec7ce9c5dd45e5c2730177f375c
+
+commit 186ac39b8a7d3ec7ce9c5dd45e5c2730177f375c upstream.
+
+In xfs_qm_dqflush(), when a dquot flush fails due to corruption
+(the out_abort error path), the original code removed the dquot log
+item from the AIL before calling xfs_force_shutdown(). This ordering
+introduces a subtle race condition that can lead to data loss after
+a crash.
+
+The AIL tracks the oldest dirty metadata in the journal. The position
+of the tail item in the AIL determines the log tail LSN, which is the
+oldest LSN that must be preserved for crash recovery. When an item is
+removed from the AIL, the log tail can advance past the LSN of that item.
+
+The race window is as follows: if the dquot item happens to be at
+the tail of the log, removing it from the AIL allows the log tail
+to advance. If a concurrent log write is sampling the tail LSN at
+the same time and subsequently writes a complete checkpoint (i.e.,
+one containing a commit record) to disk before the shutdown takes
+effect, the journal will no longer protect the dquot's last
+modification. On the next mount, log recovery will not replay the
+dquot changes, even though they were never written back to disk,
+resulting in silent data loss.
+
+Fix this by calling xfs_force_shutdown() before xfs_trans_ail_delete()
+in the out_abort path. Once the log is shut down, no new log writes
+can complete with an updated tail LSN, making it safe to remove the
+dquot item from the AIL.
+
+Cc: stable@vger.kernel.org
+Fixes: b707fffda6a3 ("xfs: abort consistently on dquot flush failure")
+Signed-off-by: Long Li <leo.lilong@huawei.com>
+Reviewed-by: Carlos Maiolino <cmaiolino@redhat.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Carlos Maiolino <cem@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ fs/xfs/xfs_dquot.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/fs/xfs/xfs_dquot.c b/fs/xfs/xfs_dquot.c
+index 612ca682a513..d00f0a466b58 100644
+--- a/fs/xfs/xfs_dquot.c
++++ b/fs/xfs/xfs_dquot.c
+@@ -1439,9 +1439,15 @@ xfs_qm_dqflush(
+ 	return 0;
+ 
+ out_abort:
++	/*
++	 * Shut down the log before removing the dquot item from the AIL.
++	 * Otherwise, the log tail may advance past this item's LSN while
++	 * log writes are still in progress, making these unflushed changes
++	 * unrecoverable on the next mount.
++	 */
++	xfs_force_shutdown(mp, SHUTDOWN_CORRUPT_INCORE);
+ 	dqp->q_flags &= ~XFS_DQFLAG_DIRTY;
+ 	xfs_trans_ail_delete(lip, 0);
+-	xfs_force_shutdown(mp, SHUTDOWN_CORRUPT_INCORE);
+ 	xfs_dqfunlock(dqp);
+ 	return error;
+ }
+-- 
+2.53.0
+

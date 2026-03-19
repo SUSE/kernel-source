@@ -1,0 +1,144 @@
+From: Marc Zyngier <maz@kernel.org>
+Date: Sat, 7 Mar 2026 19:11:51 +0000
+Subject: [PATCH] KVM: arm64: vgic: Pick EOIcount deactivations from AP-list
+ tail
+References: bsc#1012628
+Patch-mainline: 6.19.9
+Git-commit: 6da5e537f5afe091658e846da1949d7e557d2ade
+
+commit 6da5e537f5afe091658e846da1949d7e557d2ade upstream.
+
+Valentine reports that their guests fail to boot correctly, losing
+interrupts, and indicates that the wrong interrupt gets deactivated.
+
+What happens here is that if the maintenance interrupt is slow enough
+to kick us out of the guest, extra interrupts can be activated from
+the LRs. We then exit and proceed to handle EOIcount deactivations,
+picking active interrupts from the AP list. But we start from the
+top of the list, potentially deactivating interrupts that were in
+the LRs, while EOIcount only denotes deactivation of interrupts that
+are not present in an LR.
+
+Solve this by tracking the last interrupt that made it in the LRs,
+and start the EOIcount deactivation walk *after* that interrupt.
+Since this only makes sense while the vcpu is loaded, stash this
+in the per-CPU host state.
+
+Huge thanks to Valentine for doing all the detective work and
+providing an initial patch.
+
+Fixes: 3cfd59f81e0f3 ("KVM: arm64: GICv3: Handle LR overflow when EOImode==0")
+Fixes: 281c6c06e2a7b ("KVM: arm64: GICv2: Handle LR overflow when EOImode==0")
+Reported-by: Valentine Burley <valentine.burley@collabora.com>
+Tested-by: Valentine Burley <valentine.burley@collabora.com>
+Signed-off-by: Marc Zyngier <maz@kernel.org>
+Link: https://lore.kernel.org/r/20260307115955.369455-1-valentine.burley@collabora.com
+Link: https://patch.msgid.link/20260307191151.3781182-1-maz@kernel.org
+Cc: stable@vger.kernel.org
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ arch/arm64/include/asm/kvm_host.h |  3 +++
+ arch/arm64/kvm/vgic/vgic-v2.c     |  4 ++--
+ arch/arm64/kvm/vgic/vgic-v3.c     | 12 ++++++------
+ arch/arm64/kvm/vgic/vgic.c        |  6 ++++++
+ 4 files changed, 17 insertions(+), 8 deletions(-)
+
+diff --git a/arch/arm64/include/asm/kvm_host.h b/arch/arm64/include/asm/kvm_host.h
+index ac7f970c7883..59f25b85be2b 100644
+--- a/arch/arm64/include/asm/kvm_host.h
++++ b/arch/arm64/include/asm/kvm_host.h
+@@ -760,6 +760,9 @@ struct kvm_host_data {
+ 	/* Number of debug breakpoints/watchpoints for this CPU (minus 1) */
+ 	unsigned int debug_brps;
+ 	unsigned int debug_wrps;
++
++	/* Last vgic_irq part of the AP list recorded in an LR */
++	struct vgic_irq *last_lr_irq;
+ };
+ 
+ struct kvm_host_psci_config {
+diff --git a/arch/arm64/kvm/vgic/vgic-v2.c b/arch/arm64/kvm/vgic/vgic-v2.c
+index 585491fbda80..cafa3cb32bda 100644
+--- a/arch/arm64/kvm/vgic/vgic-v2.c
++++ b/arch/arm64/kvm/vgic/vgic-v2.c
+@@ -115,7 +115,7 @@ void vgic_v2_fold_lr_state(struct kvm_vcpu *vcpu)
+ 	struct vgic_cpu *vgic_cpu = &vcpu->arch.vgic_cpu;
+ 	struct vgic_v2_cpu_if *cpuif = &vgic_cpu->vgic_v2;
+ 	u32 eoicount = FIELD_GET(GICH_HCR_EOICOUNT, cpuif->vgic_hcr);
+-	struct vgic_irq *irq;
++	struct vgic_irq *irq = *host_data_ptr(last_lr_irq);
+ 
+ 	DEBUG_SPINLOCK_BUG_ON(!irqs_disabled());
+ 
+@@ -123,7 +123,7 @@ void vgic_v2_fold_lr_state(struct kvm_vcpu *vcpu)
+ 		vgic_v2_fold_lr(vcpu, cpuif->vgic_lr[lr]);
+ 
+ 	/* See the GICv3 equivalent for the EOIcount handling rationale */
+-	list_for_each_entry(irq, &vgic_cpu->ap_list_head, ap_list) {
++	list_for_each_entry_continue(irq, &vgic_cpu->ap_list_head, ap_list) {
+ 		u32 lr;
+ 
+ 		if (!eoicount) {
+diff --git a/arch/arm64/kvm/vgic/vgic-v3.c b/arch/arm64/kvm/vgic/vgic-v3.c
+index 1d6dd1b545bd..db2f220c29f7 100644
+--- a/arch/arm64/kvm/vgic/vgic-v3.c
++++ b/arch/arm64/kvm/vgic/vgic-v3.c
+@@ -148,7 +148,7 @@ void vgic_v3_fold_lr_state(struct kvm_vcpu *vcpu)
+ 	struct vgic_cpu *vgic_cpu = &vcpu->arch.vgic_cpu;
+ 	struct vgic_v3_cpu_if *cpuif = &vgic_cpu->vgic_v3;
+ 	u32 eoicount = FIELD_GET(ICH_HCR_EL2_EOIcount, cpuif->vgic_hcr);
+-	struct vgic_irq *irq;
++	struct vgic_irq *irq = *host_data_ptr(last_lr_irq);
+ 
+ 	DEBUG_SPINLOCK_BUG_ON(!irqs_disabled());
+ 
+@@ -158,12 +158,12 @@ void vgic_v3_fold_lr_state(struct kvm_vcpu *vcpu)
+ 	/*
+ 	 * EOIMode=0: use EOIcount to emulate deactivation. We are
+ 	 * guaranteed to deactivate in reverse order of the activation, so
+-	 * just pick one active interrupt after the other in the ap_list,
+-	 * and replay the deactivation as if the CPU was doing it. We also
+-	 * rely on priority drop to have taken place, and the list to be
+-	 * sorted by priority.
++	 * just pick one active interrupt after the other in the tail part
++	 * of the ap_list, past the LRs, and replay the deactivation as if
++	 * the CPU was doing it. We also rely on priority drop to have taken
++	 * place, and the list to be sorted by priority.
+ 	 */
+-	list_for_each_entry(irq, &vgic_cpu->ap_list_head, ap_list) {
++	list_for_each_entry_continue(irq, &vgic_cpu->ap_list_head, ap_list) {
+ 		u64 lr;
+ 
+ 		/*
+diff --git a/arch/arm64/kvm/vgic/vgic.c b/arch/arm64/kvm/vgic/vgic.c
+index 430aa98888fd..e22b79cfff96 100644
+--- a/arch/arm64/kvm/vgic/vgic.c
++++ b/arch/arm64/kvm/vgic/vgic.c
+@@ -814,6 +814,9 @@ static void vgic_prune_ap_list(struct kvm_vcpu *vcpu)
+ 
+ static inline void vgic_fold_lr_state(struct kvm_vcpu *vcpu)
+ {
++	if (!*host_data_ptr(last_lr_irq))
++		return;
++
+ 	if (kvm_vgic_global_state.type == VGIC_V2)
+ 		vgic_v2_fold_lr_state(vcpu);
+ 	else
+@@ -960,10 +963,13 @@ static void vgic_flush_lr_state(struct kvm_vcpu *vcpu)
+ 	if (irqs_outside_lrs(&als))
+ 		vgic_sort_ap_list(vcpu);
+ 
++	*host_data_ptr(last_lr_irq) = NULL;
++
+ 	list_for_each_entry(irq, &vgic_cpu->ap_list_head, ap_list) {
+ 		scoped_guard(raw_spinlock,  &irq->irq_lock) {
+ 			if (likely(vgic_target_oracle(irq) == vcpu)) {
+ 				vgic_populate_lr(vcpu, irq, count++);
++				*host_data_ptr(last_lr_irq) = irq;
+ 			}
+ 		}
+ 
+-- 
+2.53.0
+

@@ -1,0 +1,107 @@
+From: Richard Fitzgerald <rf@opensource.cirrus.com>
+Date: Wed, 4 Mar 2026 14:12:50 +0000
+Subject: [PATCH] firmware: cs_dsp: Fix fragmentation regression in firmware
+ download
+References: bsc#1012628
+Patch-mainline: 6.19.9
+Git-commit: facfdef64d11c08e6f1e69d02a0b87cb74cee0f5
+
+[ Upstream commit facfdef64d11c08e6f1e69d02a0b87cb74cee0f5 ]
+
+Use vmalloc() instead of kmalloc(..., GFP_DMA) to alloc the temporary
+buffer for firmware download blobs. This avoids the problem that a
+heavily fragmented system cannot allocate enough physically-contiguous
+memory for a large blob.
+
+The redundant alloc buffer mechanism was removed in commit 900baa6e7bb0
+("firmware: cs_dsp: Remove redundant download buffer allocator").
+While doing that I was overly focused on the possibility of the
+underlying bus requiring DMA-safe memory. So I used GFP_DMA kmalloc()s.
+I failed to notice that the code I was removing used vmalloc().
+This creates a regression.
+
+Way back in 2014 the problem of fragmentation with kmalloc()s was fixed
+by commit cdcd7f728753 ("ASoC: wm_adsp: Use vmalloc to allocate firmware
+download buffer").
+
+Although we don't need physically-contiguous memory, we don't know if the
+bus needs some particular alignment of the buffers. Since the change in
+2014, the firmware download has always used whatever alignment vmalloc()
+returns. To avoid introducing a new problem, the temporary buffer is still
+used, to keep the same alignment of pointers passed to regmap_raw_write().
+
+Signed-off-by: Richard Fitzgerald <rf@opensource.cirrus.com>
+Fixes: 900baa6e7bb0 ("firmware: cs_dsp: Remove redundant download buffer allocator")
+Link: https://patch.msgid.link/20260304141250.1578597-1-rf@opensource.cirrus.com
+Signed-off-by: Mark Brown <broonie@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/firmware/cirrus/cs_dsp.c | 24 ++++++++++++++++++------
+ 1 file changed, 18 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/firmware/cirrus/cs_dsp.c b/drivers/firmware/cirrus/cs_dsp.c
+index abed96fa5853..a34633b87575 100644
+--- a/drivers/firmware/cirrus/cs_dsp.c
++++ b/drivers/firmware/cirrus/cs_dsp.c
+@@ -1610,11 +1610,17 @@ static int cs_dsp_load(struct cs_dsp *dsp, const struct firmware *firmware,
+ 			   region_name);
+ 
+ 		if (reg) {
++			/*
++			 * Although we expect the underlying bus does not require
++			 * physically-contiguous buffers, we pessimistically use
++			 * a temporary buffer instead of trusting that the
++			 * alignment of region->data is ok.
++			 */
+ 			region_len = le32_to_cpu(region->len);
+ 			if (region_len > buf_len) {
+ 				buf_len = round_up(region_len, PAGE_SIZE);
+-				kfree(buf);
+-				buf = kmalloc(buf_len, GFP_KERNEL | GFP_DMA);
++				vfree(buf);
++				buf = vmalloc(buf_len);
+ 				if (!buf) {
+ 					ret = -ENOMEM;
+ 					goto out_fw;
+@@ -1643,7 +1649,7 @@ static int cs_dsp_load(struct cs_dsp *dsp, const struct firmware *firmware,
+ 
+ 	ret = 0;
+ out_fw:
+-	kfree(buf);
++	vfree(buf);
+ 
+ 	if (ret == -EOVERFLOW)
+ 		cs_dsp_err(dsp, "%s: file content overflows file data\n", file);
+@@ -2320,11 +2326,17 @@ static int cs_dsp_load_coeff(struct cs_dsp *dsp, const struct firmware *firmware
+ 		}
+ 
+ 		if (reg) {
++			/*
++			 * Although we expect the underlying bus does not require
++			 * physically-contiguous buffers, we pessimistically use
++			 * a temporary buffer instead of trusting that the
++			 * alignment of blk->data is ok.
++			 */
+ 			region_len = le32_to_cpu(blk->len);
+ 			if (region_len > buf_len) {
+ 				buf_len = round_up(region_len, PAGE_SIZE);
+-				kfree(buf);
+-				buf = kmalloc(buf_len, GFP_KERNEL | GFP_DMA);
++				vfree(buf);
++				buf = vmalloc(buf_len);
+ 				if (!buf) {
+ 					ret = -ENOMEM;
+ 					goto out_fw;
+@@ -2355,7 +2367,7 @@ static int cs_dsp_load_coeff(struct cs_dsp *dsp, const struct firmware *firmware
+ 
+ 	ret = 0;
+ out_fw:
+-	kfree(buf);
++	vfree(buf);
+ 
+ 	if (ret == -EOVERFLOW)
+ 		cs_dsp_err(dsp, "%s: file content overflows file data\n", file);
+-- 
+2.53.0
+

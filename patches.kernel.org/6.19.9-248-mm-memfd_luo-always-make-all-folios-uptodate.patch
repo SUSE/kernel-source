@@ -1,0 +1,106 @@
+From: "Pratyush Yadav (Google)" <pratyush@kernel.org>
+Date: Mon, 23 Feb 2026 18:39:28 +0100
+Subject: [PATCH] mm: memfd_luo: always make all folios uptodate
+References: bsc#1012628
+Patch-mainline: 6.19.9
+Git-commit: 50d7b4332f27762d24641970fc34bb68a2621926
+
+commit 50d7b4332f27762d24641970fc34bb68a2621926 upstream.
+
+Patch series "mm: memfd_luo: fixes for folio flag preservation".
+
+This series contains a couple fixes for flag preservation for memfd live
+update.
+
+The first patch fixes memfd preservation when fallocate() was used to
+pre-allocate some pages.  For these memfds, all the writes to fallocated
+pages touched after preserve were lost.
+
+The second patch fixes dirty flag tracking.  If the dirty flag is not
+tracked correctly, the next kernel might incorrectly reclaim some folios
+under memory pressure, losing user data.  This is a theoretical bug that I
+observed when reading the code, and haven't been able to reproduce it.
+
+
+This patch (of 2):
+
+When a folio is added to a shmem file via fallocate, it is not zeroed on
+allocation.  This is done as a performance optimization since it is
+possible the folio will never end up being used at all.  When the folio is
+used, shmem checks for the uptodate flag, and if absent, zeroes the folio
+(and sets the flag) before returning to user.
+
+With LUO, the flags of each folio are saved at preserve time.  It is
+possible to have a memfd with some folios fallocated but not uptodate.
+For those, the uptodate flag doesn't get saved.  The folios might later
+end up being used and become uptodate.  They would get passed to the next
+kernel via KHO correctly since they did get preserved.  But they won't
+have the MEMFD_LUO_FOLIO_UPTODATE flag.
+
+This means that when the memfd is retrieved, the folios will be added to
+the shmem file without the uptodate flag.  They will be zeroed before
+first use, losing the data in those folios.
+
+Since we take a big performance hit in allocating, zeroing, and pinning
+all folios at prepare time anyway, take some more and zero all
+non-uptodate ones too.
+
+Later when there is a stronger need to make prepare faster, this can be
+optimized.
+
+To avoid racing with another uptodate operation, take the folio lock.
+
+Link: https://lkml.kernel.org/r/20260223173931.2221759-2-pratyush@kernel.org
+Fixes: b3749f174d68 ("mm: memfd_luo: allow preserving memfd")
+Signed-off-by: Pratyush Yadav (Google) <pratyush@kernel.org>
+Reviewed-by: Mike Rapoport (Microsoft) <rppt@kernel.org>
+Cc: Pasha Tatashin <pasha.tatashin@soleen.com>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ mm/memfd_luo.c | 25 +++++++++++++++++++++++--
+ 1 file changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/mm/memfd_luo.c b/mm/memfd_luo.c
+index 785f26aa58c0..71d64bcc9c2b 100644
+--- a/mm/memfd_luo.c
++++ b/mm/memfd_luo.c
+@@ -152,10 +152,31 @@ static int memfd_luo_preserve_folios(struct file *file,
+ 		if (err)
+ 			goto err_unpreserve;
+ 
++		folio_lock(folio);
++
+ 		if (folio_test_dirty(folio))
+ 			flags |= MEMFD_LUO_FOLIO_DIRTY;
+-		if (folio_test_uptodate(folio))
+-			flags |= MEMFD_LUO_FOLIO_UPTODATE;
++
++		/*
++		 * If the folio is not uptodate, it was fallocated but never
++		 * used. Saving this flag at prepare() doesn't work since it
++		 * might change later when someone uses the folio.
++		 *
++		 * Since we have taken the performance penalty of allocating,
++		 * zeroing, and pinning all the folios in the holes, take a bit
++		 * more and zero all non-uptodate folios too.
++		 *
++		 * NOTE: For someone looking to improve preserve performance,
++		 * this is a good place to look.
++		 */
++		if (!folio_test_uptodate(folio)) {
++			folio_zero_range(folio, 0, folio_size(folio));
++			flush_dcache_folio(folio);
++			folio_mark_uptodate(folio);
++		}
++		flags |= MEMFD_LUO_FOLIO_UPTODATE;
++
++		folio_unlock(folio);
+ 
+ 		pfolio->pfn = folio_pfn(folio);
+ 		pfolio->flags = flags;
+-- 
+2.53.0
+

@@ -1,0 +1,190 @@
+From: Kevin Hao <haokexin@gmail.com>
+Date: Sat, 7 Mar 2026 15:08:54 +0800
+Subject: [PATCH] net: macb: Shuffle the tx ring before enabling tx
+References: bsc#1012628
+Patch-mainline: 6.19.9
+Git-commit: 881a0263d502e1a93ebc13a78254e9ad19520232
+
+commit 881a0263d502e1a93ebc13a78254e9ad19520232 upstream.
+
+Quanyang observed that when using an NFS rootfs on an AMD ZynqMp board,
+the rootfs may take an extended time to recover after a suspend.
+Upon investigation, it was determined that the issue originates from a
+problem in the macb driver.
+
+According to the Zynq UltraScale TRM [1], when transmit is disabled,
+the transmit buffer queue pointer resets to point to the address
+specified by the transmit buffer queue base address register.
+
+In the current implementation, the code merely resets `queue->tx_head`
+and `queue->tx_tail` to '0'. This approach presents several issues:
+
+- Packets already queued in the tx ring are silently lost,
+  leading to memory leaks since the associated skbs cannot be released.
+
+- Concurrent write access to `queue->tx_head` and `queue->tx_tail` may
+  occur from `macb_tx_poll()` or `macb_start_xmit()` when these values
+  are reset to '0'.
+
+- The transmission may become stuck on a packet that has already been sent
+  out, with its 'TX_USED' bit set, but has not yet been processed. However,
+  due to the manipulation of 'queue->tx_head' and 'queue->tx_tail',
+  `macb_tx_poll()` incorrectly assumes there are no packets to handle
+  because `queue->tx_head == queue->tx_tail`. This issue is only resolved
+  when a new packet is placed at this position. This is the root cause of
+  the prolonged recovery time observed for the NFS root filesystem.
+
+To resolve this issue, shuffle the tx ring and tx skb array so that
+the first unsent packet is positioned at the start of the tx ring.
+Additionally, ensure that updates to `queue->tx_head` and
+`queue->tx_tail` are properly protected with the appropriate lock.
+
+[1] https://docs.amd.com/v/u/en-US/ug1085-zynq-ultrascale-trm
+
+Fixes: bf9cf80cab81 ("net: macb: Fix tx/rx malfunction after phy link down and up")
+Reported-by: Quanyang Wang <quanyang.wang@windriver.com>
+Signed-off-by: Kevin Hao <haokexin@gmail.com>
+Cc: stable@vger.kernel.org
+Reviewed-by: Simon Horman <horms@kernel.org>
+Link: https://patch.msgid.link/20260307-zynqmp-v2-1-6ef98a70e1d0@gmail.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/net/ethernet/cadence/macb_main.c | 98 +++++++++++++++++++++++-
+ 1 file changed, 95 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/ethernet/cadence/macb_main.c b/drivers/net/ethernet/cadence/macb_main.c
+index 4ebb40adfab3..256cb5bcfac7 100644
+--- a/drivers/net/ethernet/cadence/macb_main.c
++++ b/drivers/net/ethernet/cadence/macb_main.c
+@@ -36,6 +36,7 @@
+ #include <linux/tcp.h>
+ #include <linux/types.h>
+ #include <linux/udp.h>
++#include <linux/gcd.h>
+ #include <net/pkt_sched.h>
+ #include "macb.h"
+ 
+@@ -668,6 +669,97 @@ static void macb_mac_link_down(struct phylink_config *config, unsigned int mode,
+ 	netif_tx_stop_all_queues(ndev);
+ }
+ 
++/* Use juggling algorithm to left rotate tx ring and tx skb array */
++static void gem_shuffle_tx_one_ring(struct macb_queue *queue)
++{
++	unsigned int head, tail, count, ring_size, desc_size;
++	struct macb_tx_skb tx_skb, *skb_curr, *skb_next;
++	struct macb_dma_desc *desc_curr, *desc_next;
++	unsigned int i, cycles, shift, curr, next;
++	struct macb *bp = queue->bp;
++	unsigned char desc[24];
++	unsigned long flags;
++
++	desc_size = macb_dma_desc_get_size(bp);
++
++	if (WARN_ON_ONCE(desc_size > ARRAY_SIZE(desc)))
++		return;
++
++	spin_lock_irqsave(&queue->tx_ptr_lock, flags);
++	head = queue->tx_head;
++	tail = queue->tx_tail;
++	ring_size = bp->tx_ring_size;
++	count = CIRC_CNT(head, tail, ring_size);
++
++	if (!(tail % ring_size))
++		goto unlock;
++
++	if (!count) {
++		queue->tx_head = 0;
++		queue->tx_tail = 0;
++		goto unlock;
++	}
++
++	shift = tail % ring_size;
++	cycles = gcd(ring_size, shift);
++
++	for (i = 0; i < cycles; i++) {
++		memcpy(&desc, macb_tx_desc(queue, i), desc_size);
++		memcpy(&tx_skb, macb_tx_skb(queue, i),
++		       sizeof(struct macb_tx_skb));
++
++		curr = i;
++		next = (curr + shift) % ring_size;
++
++		while (next != i) {
++			desc_curr = macb_tx_desc(queue, curr);
++			desc_next = macb_tx_desc(queue, next);
++
++			memcpy(desc_curr, desc_next, desc_size);
++
++			if (next == ring_size - 1)
++				desc_curr->ctrl &= ~MACB_BIT(TX_WRAP);
++			if (curr == ring_size - 1)
++				desc_curr->ctrl |= MACB_BIT(TX_WRAP);
++
++			skb_curr = macb_tx_skb(queue, curr);
++			skb_next = macb_tx_skb(queue, next);
++			memcpy(skb_curr, skb_next, sizeof(struct macb_tx_skb));
++
++			curr = next;
++			next = (curr + shift) % ring_size;
++		}
++
++		desc_curr = macb_tx_desc(queue, curr);
++		memcpy(desc_curr, &desc, desc_size);
++		if (i == ring_size - 1)
++			desc_curr->ctrl &= ~MACB_BIT(TX_WRAP);
++		if (curr == ring_size - 1)
++			desc_curr->ctrl |= MACB_BIT(TX_WRAP);
++		memcpy(macb_tx_skb(queue, curr), &tx_skb,
++		       sizeof(struct macb_tx_skb));
++	}
++
++	queue->tx_head = count;
++	queue->tx_tail = 0;
++
++	/* Make descriptor updates visible to hardware */
++	wmb();
++
++unlock:
++	spin_unlock_irqrestore(&queue->tx_ptr_lock, flags);
++}
++
++/* Rotate the queue so that the tail is at index 0 */
++static void gem_shuffle_tx_rings(struct macb *bp)
++{
++	struct macb_queue *queue;
++	int q;
++
++	for (q = 0, queue = bp->queues; q < bp->num_queues; q++, queue++)
++		gem_shuffle_tx_one_ring(queue);
++}
++
+ static void macb_mac_link_up(struct phylink_config *config,
+ 			     struct phy_device *phy,
+ 			     unsigned int mode, phy_interface_t interface,
+@@ -706,8 +798,6 @@ static void macb_mac_link_up(struct phylink_config *config,
+ 			ctrl |= MACB_BIT(PAE);
+ 
+ 		for (q = 0, queue = bp->queues; q < bp->num_queues; ++q, ++queue) {
+-			queue->tx_head = 0;
+-			queue->tx_tail = 0;
+ 			queue_writel(queue, IER,
+ 				     bp->rx_intr_mask | MACB_TX_INT_FLAGS | MACB_BIT(HRESP));
+ 		}
+@@ -721,8 +811,10 @@ static void macb_mac_link_up(struct phylink_config *config,
+ 
+ 	spin_unlock_irqrestore(&bp->lock, flags);
+ 
+-	if (!(bp->caps & MACB_CAPS_MACB_IS_EMAC))
++	if (!(bp->caps & MACB_CAPS_MACB_IS_EMAC)) {
+ 		macb_set_tx_clk(bp, speed);
++		gem_shuffle_tx_rings(bp);
++	}
+ 
+ 	/* Enable Rx and Tx; Enable PTP unicast */
+ 	ctrl = macb_readl(bp, NCR);
+-- 
+2.53.0
+

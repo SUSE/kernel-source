@@ -1,0 +1,104 @@
+From: "Pratyush Yadav (Google)" <pratyush@kernel.org>
+Date: Mon, 23 Feb 2026 18:39:29 +0100
+Subject: [PATCH] mm: memfd_luo: always dirty all folios
+References: bsc#1012628
+Patch-mainline: 6.19.9
+Git-commit: 7e04bf1f33151a30e06a65b74b5f2c19fc2be128
+
+commit 7e04bf1f33151a30e06a65b74b5f2c19fc2be128 upstream.
+
+A dirty folio is one which has been written to.  A clean folio is its
+opposite.  Since a clean folio has no user data, it can be freed under
+memory pressure.
+
+memfd preservation with LUO saves the flag at preserve().  This is
+problematic.  The folio might get dirtied later.  Saving it at freeze()
+also doesn't work, since the dirty bit from PTE is normally synced at
+unmap and there might still be mappings of the file at freeze().
+
+To see why this is a problem, say a folio is clean at preserve, but gets
+dirtied later.  The serialized state of the folio will mark it as clean.
+After retrieve, the next kernel will see the folio as clean and might try
+to reclaim it under memory pressure.  This will result in losing user
+data.
+
+Mark all folios of the file as dirty, and always set the
+MEMFD_LUO_FOLIO_DIRTY flag.  This comes with the side effect of making all
+clean folios un-reclaimable.  This is a cost that has to be paid for
+participants of live update.  It is not expected to be a common use case
+to preserve a lot of clean folios anyway.
+
+Since the value of pfolio->flags is a constant now, drop the flags
+variable and set it directly.
+
+Link: https://lkml.kernel.org/r/20260223173931.2221759-3-pratyush@kernel.org
+Fixes: b3749f174d68 ("mm: memfd_luo: allow preserving memfd")
+Signed-off-by: Pratyush Yadav (Google) <pratyush@kernel.org>
+Reviewed-by: Mike Rapoport (Microsoft) <rppt@kernel.org>
+Cc: Pasha Tatashin <pasha.tatashin@soleen.com>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ mm/memfd_luo.c | 26 +++++++++++++++++++++-----
+ 1 file changed, 21 insertions(+), 5 deletions(-)
+
+diff --git a/mm/memfd_luo.c b/mm/memfd_luo.c
+index 71d64bcc9c2b..02993d83d39c 100644
+--- a/mm/memfd_luo.c
++++ b/mm/memfd_luo.c
+@@ -146,7 +146,6 @@ static int memfd_luo_preserve_folios(struct file *file,
+ 	for (i = 0; i < nr_folios; i++) {
+ 		struct memfd_luo_folio_ser *pfolio = &folios_ser[i];
+ 		struct folio *folio = folios[i];
+-		unsigned int flags = 0;
+ 
+ 		err = kho_preserve_folio(folio);
+ 		if (err)
+@@ -154,8 +153,26 @@ static int memfd_luo_preserve_folios(struct file *file,
+ 
+ 		folio_lock(folio);
+ 
+-		if (folio_test_dirty(folio))
+-			flags |= MEMFD_LUO_FOLIO_DIRTY;
++		/*
++		 * A dirty folio is one which has been written to. A clean folio
++		 * is its opposite. Since a clean folio does not carry user
++		 * data, it can be freed by page reclaim under memory pressure.
++		 *
++		 * Saving the dirty flag at prepare() time doesn't work since it
++		 * can change later. Saving it at freeze() also won't work
++		 * because the dirty bit is normally synced at unmap and there
++		 * might still be a mapping of the file at freeze().
++		 *
++		 * To see why this is a problem, say a folio is clean at
++		 * preserve, but gets dirtied later. The pfolio flags will mark
++		 * it as clean. After retrieve, the next kernel might try to
++		 * reclaim this folio under memory pressure, losing user data.
++		 *
++		 * Unconditionally mark it dirty to avoid this problem. This
++		 * comes at the cost of making clean folios un-reclaimable after
++		 * live update.
++		 */
++		folio_mark_dirty(folio);
+ 
+ 		/*
+ 		 * If the folio is not uptodate, it was fallocated but never
+@@ -174,12 +191,11 @@ static int memfd_luo_preserve_folios(struct file *file,
+ 			flush_dcache_folio(folio);
+ 			folio_mark_uptodate(folio);
+ 		}
+-		flags |= MEMFD_LUO_FOLIO_UPTODATE;
+ 
+ 		folio_unlock(folio);
+ 
+ 		pfolio->pfn = folio_pfn(folio);
+-		pfolio->flags = flags;
++		pfolio->flags = MEMFD_LUO_FOLIO_DIRTY | MEMFD_LUO_FOLIO_UPTODATE;
+ 		pfolio->index = folio->index;
+ 	}
+ 
+-- 
+2.53.0
+

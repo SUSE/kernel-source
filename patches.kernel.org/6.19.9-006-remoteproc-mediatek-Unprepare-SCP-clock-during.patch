@@ -1,0 +1,101 @@
+From: Tzung-Bi Shih <tzungbi@kernel.org>
+Date: Fri, 6 Feb 2026 03:30:33 +0000
+Subject: [PATCH] remoteproc: mediatek: Unprepare SCP clock during system
+ suspend
+References: bsc#1012628
+Patch-mainline: 6.19.9
+Git-commit: 35c3f72a2d55dbf52f28f4ecae51c76be1acf545
+
+[ Upstream commit 35c3f72a2d55dbf52f28f4ecae51c76be1acf545 ]
+
+Prior to commit d935187cfb27 ("remoteproc: mediatek: Break lock
+dependency to prepare_lock"), `scp->clk` was prepared and enabled only
+when it needs to communicate with the SCP.  The commit d935187cfb27
+moved the prepare operation to remoteproc's prepare(), keeping the clock
+prepared as long as the SCP is running.
+
+The power consumption due to the prolonged clock preparation can be
+negligible when the system is running, as SCP is designed to be a very
+power efficient processor.
+
+However, the clock remains prepared even when the system enters system
+suspend.  This prevents the underlying clock controller (and potentially
+the parent PLLs) from shutting down, which increases power consumption
+and may block the system from entering deep sleep states.
+
+Add suspend and resume callbacks.  Unprepare the clock in suspend() if
+it was active and re-prepare it in resume() to ensure the clock is
+properly disabled during system suspend, while maintaining the "always
+prepared" semantics while the system is active.  The driver doesn't
+implement .attach() callback, hence it only checks for RPROC_RUNNING.
+
+Fixes: d935187cfb27 ("remoteproc: mediatek: Break lock dependency to prepare_lock")
+Reviewed-by: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Signed-off-by: Tzung-Bi Shih <tzungbi@kernel.org>
+Link: https://lore.kernel.org/r/20260206033034.3031781-1-tzungbi@kernel.org
+Signed-off-by: Mathieu Poirier <mathieu.poirier@linaro.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/remoteproc/mtk_scp.c | 39 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 39 insertions(+)
+
+diff --git a/drivers/remoteproc/mtk_scp.c b/drivers/remoteproc/mtk_scp.c
+index 98d00bd5200c..b0b65aefc719 100644
+--- a/drivers/remoteproc/mtk_scp.c
++++ b/drivers/remoteproc/mtk_scp.c
+@@ -1597,12 +1597,51 @@ static const struct of_device_id mtk_scp_of_match[] = {
+ };
+ MODULE_DEVICE_TABLE(of, mtk_scp_of_match);
+ 
++static int __maybe_unused scp_suspend(struct device *dev)
++{
++	struct mtk_scp *scp = dev_get_drvdata(dev);
++	struct rproc *rproc = scp->rproc;
++
++	/*
++	 * Only unprepare if the SCP is running and holding the clock.
++	 *
++	 * Note: `scp_ops` doesn't implement .attach() callback, hence
++	 * `rproc->state` can never be RPROC_ATTACHED.  Otherwise, it
++	 * should also be checked here.
++	 */
++	if (rproc->state == RPROC_RUNNING)
++		clk_unprepare(scp->clk);
++	return 0;
++}
++
++static int __maybe_unused scp_resume(struct device *dev)
++{
++	struct mtk_scp *scp = dev_get_drvdata(dev);
++	struct rproc *rproc = scp->rproc;
++
++	/*
++	 * Only prepare if the SCP was running and holding the clock.
++	 *
++	 * Note: `scp_ops` doesn't implement .attach() callback, hence
++	 * `rproc->state` can never be RPROC_ATTACHED.  Otherwise, it
++	 * should also be checked here.
++	 */
++	if (rproc->state == RPROC_RUNNING)
++		return clk_prepare(scp->clk);
++	return 0;
++}
++
++static const struct dev_pm_ops scp_pm_ops = {
++	SET_SYSTEM_SLEEP_PM_OPS(scp_suspend, scp_resume)
++};
++
+ static struct platform_driver mtk_scp_driver = {
+ 	.probe = scp_probe,
+ 	.remove = scp_remove,
+ 	.driver = {
+ 		.name = "mtk-scp",
+ 		.of_match_table = mtk_scp_of_match,
++		.pm = &scp_pm_ops,
+ 	},
+ };
+ 
+-- 
+2.53.0
+

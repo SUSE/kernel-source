@@ -1,0 +1,58 @@
+From: Tom Ryan <ryan36005@gmail.com>
+Date: Mon, 9 Mar 2026 22:20:02 -0700
+Subject: [PATCH] io_uring: fix physical SQE bounds check for SQE_MIXED
+ 128-byte ops
+References: bsc#1012628
+Patch-mainline: 6.19.9
+Git-commit: 6f02c6b196036dbb6defb4647d8707d29b7fe95b
+
+[ Upstream commit 6f02c6b196036dbb6defb4647d8707d29b7fe95b ]
+
+When IORING_SETUP_SQE_MIXED is used without IORING_SETUP_NO_SQARRAY,
+the boundary check for 128-byte SQE operations in io_init_req()
+validated the logical SQ head position rather than the physical SQE
+index.
+
+The existing check:
+
+  !(ctx->cached_sq_head & (ctx->sq_entries - 1))
+
+ensures the logical position isn't at the end of the ring, which is
+correct for NO_SQARRAY rings where physical == logical. However, when
+sq_array is present, an unprivileged user can remap any logical
+position to an arbitrary physical index via sq_array. Setting
+sq_array[N] = sq_entries - 1 places a 128-byte operation at the last
+physical SQE slot, causing the 128-byte memcpy in
+io_uring_cmd_sqe_copy() to read 64 bytes past the end of the SQE
+array.
+
+Replace the cached_sq_head alignment check with a direct validation
+of the physical SQE index, which correctly handles both sq_array and
+NO_SQARRAY cases.
+
+Fixes: 1cba30bf9fdd ("io_uring: add support for IORING_SETUP_SQE_MIXED")
+Signed-off-by: Tom Ryan <ryan36005@gmail.com>
+Link: https://patch.msgid.link/20260310052003.72871-1-ryan36005@gmail.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ io_uring/io_uring.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/io_uring/io_uring.c b/io_uring/io_uring.c
+index 63efd60829f3..b10f33eef19d 100644
+--- a/io_uring/io_uring.c
++++ b/io_uring/io_uring.c
+@@ -2152,7 +2152,7 @@ static int io_init_req(struct io_ring_ctx *ctx, struct io_kiocb *req,
+ 		 * well as 2 contiguous entries.
+ 		 */
+ 		if (!(ctx->flags & IORING_SETUP_SQE_MIXED) || *left < 2 ||
+-		    !(ctx->cached_sq_head & (ctx->sq_entries - 1)))
++		    (unsigned)(sqe - ctx->sq_sqes) >= ctx->sq_entries - 1)
+ 			return io_init_fail_req(req, -EINVAL);
+ 		/*
+ 		 * A 128b operation on a mixed SQ uses two entries, so we have
+-- 
+2.53.0
+
