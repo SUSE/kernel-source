@@ -1,0 +1,191 @@
+From: Pauli Virtanen <pav@iki.fi>
+Date: Tue, 18 Mar 2025 21:06:45 +0200
+Subject: Bluetooth: L2CAP: add TX timestamping
+Patch-mainline: v6.15-rc1
+Git-commit: 11770f41b8a7e1207576e944ec1c98b74fac89a5
+References: jsc#PED-14261
+
+Support TX timestamping in L2CAP sockets.
+
+Support MSG_ERRQUEUE recvmsg.
+
+For other than SOCK_STREAM L2CAP sockets, if a packet from sendmsg() is
+fragmented, only the first ACL fragment is timestamped.
+
+For SOCK_STREAM L2CAP sockets, use the bytestream convention and
+timestamp the last fragment and count bytes in tskey.
+
+Timestamps are not generated in the Enhanced Retransmission mode, as
+meaning of COMPLETION stamp is unclear if L2CAP layer retransmits.
+
+Signed-off-by: Pauli Virtanen <pav@iki.fi>
+Reviewed-by: Willem de Bruijn <willemb@google.com>
+Signed-off-by: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+Acked-by: Chun-Yi Lee <jlee@suse.com>
+---
+ include/net/bluetooth/l2cap.h |    3 ++-
+ net/bluetooth/6lowpan.c       |    2 +-
+ net/bluetooth/l2cap_core.c    |   41 ++++++++++++++++++++++++++++++++++++++---
+ net/bluetooth/l2cap_sock.c    |   15 ++++++++++++++-
+ net/bluetooth/smp.c           |    2 +-
+ 5 files changed, 56 insertions(+), 7 deletions(-)
+
+--- a/include/net/bluetooth/l2cap.h
++++ b/include/net/bluetooth/l2cap.h
+@@ -955,7 +955,8 @@ void l2cap_chan_close(struct l2cap_chan
+ int l2cap_chan_connect(struct l2cap_chan *chan, __le16 psm, u16 cid,
+ 		       bdaddr_t *dst, u8 dst_type, u16 timeout);
+ int l2cap_chan_reconfigure(struct l2cap_chan *chan, __u16 mtu);
+-int l2cap_chan_send(struct l2cap_chan *chan, struct msghdr *msg, size_t len);
++int l2cap_chan_send(struct l2cap_chan *chan, struct msghdr *msg, size_t len,
++		    const struct sockcm_cookie *sockc);
+ void l2cap_chan_busy(struct l2cap_chan *chan, int busy);
+ void l2cap_chan_rx_avail(struct l2cap_chan *chan, ssize_t rx_avail);
+ int l2cap_chan_check_security(struct l2cap_chan *chan, bool initiator);
+--- a/net/bluetooth/6lowpan.c
++++ b/net/bluetooth/6lowpan.c
+@@ -443,7 +443,7 @@ static int send_pkt(struct l2cap_chan *c
+ 	memset(&msg, 0, sizeof(msg));
+ 	iov_iter_kvec(&msg.msg_iter, ITER_SOURCE, &iv, 1, skb->len);
+ 
+-	err = l2cap_chan_send(chan, &msg, skb->len);
++	err = l2cap_chan_send(chan, &msg, skb->len, NULL);
+ 	if (err > 0) {
+ 		netdev->stats.tx_bytes += err;
+ 		netdev->stats.tx_packets++;
+--- a/net/bluetooth/l2cap_core.c
++++ b/net/bluetooth/l2cap_core.c
+@@ -2515,7 +2515,33 @@ static void l2cap_le_flowctl_send(struct
+ 	       skb_queue_len(&chan->tx_q));
+ }
+ 
+-int l2cap_chan_send(struct l2cap_chan *chan, struct msghdr *msg, size_t len)
++static void l2cap_tx_timestamp(struct sk_buff *skb,
++			       const struct sockcm_cookie *sockc,
++			       size_t len)
++{
++	struct sock *sk = skb ? skb->sk : NULL;
++
++	if (sk && sk->sk_type == SOCK_STREAM)
++		hci_setup_tx_timestamp(skb, len, sockc);
++	else
++		hci_setup_tx_timestamp(skb, 1, sockc);
++}
++
++static void l2cap_tx_timestamp_seg(struct sk_buff_head *queue,
++				   const struct sockcm_cookie *sockc,
++				   size_t len)
++{
++	struct sk_buff *skb = skb_peek(queue);
++	struct sock *sk = skb ? skb->sk : NULL;
++
++	if (sk && sk->sk_type == SOCK_STREAM)
++		l2cap_tx_timestamp(skb_peek_tail(queue), sockc, len);
++	else
++		l2cap_tx_timestamp(skb, sockc, len);
++}
++
++int l2cap_chan_send(struct l2cap_chan *chan, struct msghdr *msg, size_t len,
++		    const struct sockcm_cookie *sockc)
+ {
+ 	struct sk_buff *skb;
+ 	int err;
+@@ -2530,6 +2556,8 @@ int l2cap_chan_send(struct l2cap_chan *c
+ 		if (IS_ERR(skb))
+ 			return PTR_ERR(skb);
+ 
++		l2cap_tx_timestamp(skb, sockc, len);
++
+ 		l2cap_do_send(chan, skb);
+ 		return len;
+ 	}
+@@ -2553,6 +2581,8 @@ int l2cap_chan_send(struct l2cap_chan *c
+ 		if (err)
+ 			return err;
+ 
++		l2cap_tx_timestamp_seg(&seg_queue, sockc, len);
++
+ 		skb_queue_splice_tail_init(&seg_queue, &chan->tx_q);
+ 
+ 		l2cap_le_flowctl_send(chan);
+@@ -2574,6 +2604,8 @@ int l2cap_chan_send(struct l2cap_chan *c
+ 		if (IS_ERR(skb))
+ 			return PTR_ERR(skb);
+ 
++		l2cap_tx_timestamp(skb, sockc, len);
++
+ 		l2cap_do_send(chan, skb);
+ 		err = len;
+ 		break;
+@@ -2597,10 +2629,13 @@ int l2cap_chan_send(struct l2cap_chan *c
+ 		if (err)
+ 			break;
+ 
+-		if (chan->mode == L2CAP_MODE_ERTM)
++		if (chan->mode == L2CAP_MODE_ERTM) {
++			/* TODO: ERTM mode timestamping */
+ 			l2cap_tx(chan, NULL, &seg_queue, L2CAP_EV_DATA_REQUEST);
+-		else
++		} else {
++			l2cap_tx_timestamp_seg(&seg_queue, sockc, len);
+ 			l2cap_streaming_send(chan, &seg_queue);
++		}
+ 
+ 		err = len;
+ 
+--- a/net/bluetooth/l2cap_sock.c
++++ b/net/bluetooth/l2cap_sock.c
+@@ -1106,6 +1106,7 @@ static int l2cap_sock_sendmsg(struct soc
+ {
+ 	struct sock *sk = sock->sk;
+ 	struct l2cap_chan *chan = l2cap_pi(sk)->chan;
++	struct sockcm_cookie sockc;
+ 	int err;
+ 
+ 	BT_DBG("sock %p, sk %p", sock, sk);
+@@ -1120,6 +1121,14 @@ static int l2cap_sock_sendmsg(struct soc
+ 	if (sk->sk_state != BT_CONNECTED)
+ 		return -ENOTCONN;
+ 
++	hci_sockcm_init(&sockc, sk);
++
++	if (msg->msg_controllen) {
++		err = sock_cmsg_send(sk, msg, &sockc);
++		if (err)
++			return err;
++	}
++
+ 	lock_sock(sk);
+ 	err = bt_sock_wait_ready(sk, msg->msg_flags);
+ 	release_sock(sk);
+@@ -1127,7 +1136,7 @@ static int l2cap_sock_sendmsg(struct soc
+ 		return err;
+ 
+ 	l2cap_chan_lock(chan);
+-	err = l2cap_chan_send(chan, msg, len);
++	err = l2cap_chan_send(chan, msg, len, &sockc);
+ 	l2cap_chan_unlock(chan);
+ 
+ 	return err;
+@@ -1168,6 +1177,10 @@ static int l2cap_sock_recvmsg(struct soc
+ 	struct l2cap_pinfo *pi = l2cap_pi(sk);
+ 	int err;
+ 
++	if (unlikely(flags & MSG_ERRQUEUE))
++		return sock_recv_errqueue(sk, msg, len, SOL_BLUETOOTH,
++					  BT_SCM_ERROR);
++
+ 	lock_sock(sk);
+ 
+ 	if (sk->sk_state == BT_CONNECT2 && test_bit(BT_SK_DEFER_SETUP,
+--- a/net/bluetooth/smp.c
++++ b/net/bluetooth/smp.c
+@@ -608,7 +608,7 @@ static void smp_send_cmd(struct l2cap_co
+ 
+ 	iov_iter_kvec(&msg.msg_iter, ITER_SOURCE, iv, 2, 1 + len);
+ 
+-	l2cap_chan_send(chan, &msg, 1 + len);
++	l2cap_chan_send(chan, &msg, 1 + len, NULL);
+ 
+ 	if (!chan->data)
+ 		return;
