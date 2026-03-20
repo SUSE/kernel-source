@@ -1,0 +1,120 @@
+From: Willem de Bruijn <willemb@google.com>
+Date: Mon, 24 Feb 2025 21:33:55 -0500
+Subject: net: skb: free up one bit in tx_flags
+Patch-mainline: v6.15-rc1
+Git-commit: e6116fc605574bb58c2016938ff24a7fbafe6e2a
+References: jsc#PED-14261
+
+The linked series wants to add skb tx completion timestamps.
+That needs a bit in skb_shared_info.tx_flags, but all are in use.
+
+A per-skb bit is only needed for features that are configured on a
+per packet basis. Per socket features can be read from sk->sk_tsflags.
+
+Per packet tsflags can be set in sendmsg using cmsg, but only those in
+SOF_TIMESTAMPING_TX_RECORD_MASK.
+
+Per packet tsflags can also be set without cmsg by sandwiching a
+send inbetween two setsockopts:
+
+    val |= SOF_TIMESTAMPING_$FEATURE;
+    setsockopt(fd, SOL_SOCKET, SO_TIMESTAMPING, &val, sizeof(val));
+    write(fd, buf, sz);
+    val &= ~SOF_TIMESTAMPING_$FEATURE;
+    setsockopt(fd, SOL_SOCKET, SO_TIMESTAMPING, &val, sizeof(val));
+
+Changing a datapath test from skb_shinfo(skb)->tx_flags to
+skb->sk->sk_tsflags can change behavior in that case, as the tx_flags
+is written before the second setsockopt updates sk_tsflags.
+
+Therefore, only bits can be reclaimed that cannot be set by cmsg and
+are also highly unlikely to be used to target individual packets
+otherwise.
+
+Free up the bit currently used for SKBTX_HW_TSTAMP_USE_CYCLES. This
+selects between clock and free running counter source for HW TX
+timestamps. It is probable that all packets of the same socket will
+always use the same source.
+
+Link: https://lore.kernel.org/netdev/cover.1739988644.git.pav@iki.fi/
+Signed-off-by: Willem de Bruijn <willemb@google.com>
+Reviewed-by: Jason Xing <kerneljasonxing@gmail.com>
+Reviewed-by: Gerhard Engleder <gerhard@engleder-embedded.com>
+Link: https://patch.msgid.link/20250225023416.2088705-1-willemdebruijn.kernel@gmail.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Chun-Yi Lee <jlee@suse.com>
+---
+ drivers/net/ethernet/engleder/tsnep_main.c |    4 ++--
+ drivers/net/ethernet/intel/igc/igc_main.c  |    3 ++-
+ include/linux/skbuff.h                     |    5 ++---
+ net/socket.c                               |   11 +----------
+ 4 files changed, 7 insertions(+), 16 deletions(-)
+
+--- a/drivers/net/ethernet/engleder/tsnep_main.c
++++ b/drivers/net/ethernet/engleder/tsnep_main.c
+@@ -852,8 +852,8 @@ static bool tsnep_tx_poll(struct tsnep_t
+ 			struct skb_shared_hwtstamps hwtstamps;
+ 			u64 timestamp;
+ 
+-			if (skb_shinfo(entry->skb)->tx_flags &
+-			    SKBTX_HW_TSTAMP_USE_CYCLES)
++			if (entry->skb->sk &&
++			    READ_ONCE(entry->skb->sk->sk_tsflags) & SOF_TIMESTAMPING_BIND_PHC)
+ 				timestamp =
+ 					__le64_to_cpu(entry->desc_wb->counter);
+ 			else
+--- a/drivers/net/ethernet/intel/igc/igc_main.c
++++ b/drivers/net/ethernet/intel/igc/igc_main.c
+@@ -1668,7 +1668,8 @@ done:
+ 		if (igc_request_tx_tstamp(adapter, skb, &tstamp_flags)) {
+ 			skb_shinfo(skb)->tx_flags |= SKBTX_IN_PROGRESS;
+ 			tx_flags |= IGC_TX_FLAGS_TSTAMP | tstamp_flags;
+-			if (skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP_USE_CYCLES)
++			if (skb->sk &&
++			    READ_ONCE(skb->sk->sk_tsflags) & SOF_TIMESTAMPING_BIND_PHC)
+ 				tx_flags |= IGC_TX_FLAGS_TSTAMP_TIMER_1;
+ 		} else {
+ 			adapter->tx_hwtstamp_skipped++;
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -478,8 +478,8 @@ enum {
+ 	/* device driver is going to provide hardware time stamp */
+ 	SKBTX_IN_PROGRESS = 1 << 2,
+ 
+-	/* generate hardware time stamp based on cycles if supported */
+-	SKBTX_HW_TSTAMP_USE_CYCLES = 1 << 3,
++	/* reserved */
++	SKBTX_RESERVED = 1 << 3,
+ 
+ 	/* generate wifi status information (where possible) */
+ 	SKBTX_WIFI_STATUS = 1 << 4,
+@@ -494,7 +494,6 @@ enum {
+ #define SKBTX_ANY_SW_TSTAMP	(SKBTX_SW_TSTAMP    | \
+ 				 SKBTX_SCHED_TSTAMP)
+ #define SKBTX_ANY_TSTAMP	(SKBTX_HW_TSTAMP | \
+-				 SKBTX_HW_TSTAMP_USE_CYCLES | \
+ 				 SKBTX_ANY_SW_TSTAMP)
+ 
+ /* Definitions for flags in struct skb_shared_info */
+--- a/net/socket.c
++++ b/net/socket.c
+@@ -691,18 +691,9 @@ void __sock_tx_timestamp(__u32 tsflags,
+ {
+ 	u8 flags = *tx_flags;
+ 
+-	if (tsflags & SOF_TIMESTAMPING_TX_HARDWARE) {
++	if (tsflags & SOF_TIMESTAMPING_TX_HARDWARE)
+ 		flags |= SKBTX_HW_TSTAMP;
+ 
+-		/* PTP hardware clocks can provide a free running cycle counter
+-		 * as a time base for virtual clocks. Tell driver to use the
+-		 * free running cycle counter for timestamp if socket is bound
+-		 * to virtual clock.
+-		 */
+-		if (tsflags & SOF_TIMESTAMPING_BIND_PHC)
+-			flags |= SKBTX_HW_TSTAMP_USE_CYCLES;
+-	}
+-
+ 	if (tsflags & SOF_TIMESTAMPING_TX_SOFTWARE)
+ 		flags |= SKBTX_SW_TSTAMP;
+ 
