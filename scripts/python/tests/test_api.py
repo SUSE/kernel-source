@@ -646,7 +646,7 @@ class TestUploader(unittest.TestCase):
         ul.obs.url = 'https://api.suse.de'
         reference = '''
 <project name="Devel:Kernel:SLE15-SP6">
-  <title>Kernel builds for branch SLE15-SP6</title>
+  <title>Kernel builds for branch unknown</title>
   <description/>
   <group groupid="kernel-maintainers" role="maintainer"/>
   <person userid="jones_tony" role="maintainer"/>
@@ -694,7 +694,7 @@ class TestUploader(unittest.TestCase):
 
         reference = '''
 <project name="Devel:Kernel:SLE15-SP6">
-  <title>Kernel builds for branch SLE15-SP6</title>
+  <title>Kernel builds for branch unknown</title>
   <description/>
   <group groupid="kernel-maintainers" role="maintainer"/>
   <person userid="jones_tony" role="maintainer"/>

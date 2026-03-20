@@ -57,7 +57,8 @@ def _unquote(val):
             idx = endidx + 1
     return ret
 
-def read_source_timestamp(file):
+def read_source_timestamp(directory):
+    file = os.path.join(directory, 'source-timestamp')
     cp = configparser.ConfigParser(delimiters=(':'), interpolation=None)
     with open(file, 'r') as fd:
         cp.read_string('[section]\nDate: ' + fd.read())
