@@ -1,0 +1,163 @@
+From: Kuen-Han Tsai <khtsai@google.com>
+Date: Sat, 21 Feb 2026 22:48:16 +0800
+Subject: [PATCH] usb: gadget: f_ncm: Fix atomic context locking issue
+References: bsc#1258210
+Patch-mainline: 6.18.19
+Git-commit: 0d6c8144ca4d93253de952a5ea0028c19ed7ab68
+
+commit 0d6c8144ca4d93253de952a5ea0028c19ed7ab68 upstream.
+
+The ncm_set_alt function was holding a mutex to protect against races
+with configfs, which invokes the might-sleep function inside an atomic
+context.
+
+Remove the struct net_device pointer from the f_ncm_opts structure to
+eliminate the contention. The connection state is now managed by a new
+boolean flag to preserve the use-after-free fix from
+commit 6334b8e4553c ("usb: gadget: f_ncm: Fix UAF ncm object at re-bind
+after usb ep transport error").
+
+BUG: sleeping function called from invalid context
+Call Trace:
+ dump_stack_lvl+0x83/0xc0
+ dump_stack+0x14/0x16
+ __might_resched+0x389/0x4c0
+ __might_sleep+0x8e/0x100
+ ...
+ __mutex_lock+0x6f/0x1740
+ ...
+ ncm_set_alt+0x209/0xa40
+ set_config+0x6b6/0xb40
+ composite_setup+0x734/0x2b40
+ ...
+
+Fixes: 56a512a9b410 ("usb: gadget: f_ncm: align net_device lifecycle with bind/unbind")
+Cc: stable@kernel.org
+Signed-off-by: Kuen-Han Tsai <khtsai@google.com>
+Link: https://patch.msgid.link/20260221-legacy-ncm-v2-2-dfb891d76507@google.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/usb/gadget/function/f_ncm.c           | 29 ++++++++-----------
+ .../usb/gadget/function/u_ether_configfs.h    | 11 +------
+ drivers/usb/gadget/function/u_ncm.h           |  1 -
+ 3 files changed, 13 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/usb/gadget/function/f_ncm.c b/drivers/usb/gadget/function/f_ncm.c
+index e23adc132f88..6f074b85eebc 100644
+--- a/drivers/usb/gadget/function/f_ncm.c
++++ b/drivers/usb/gadget/function/f_ncm.c
+@@ -58,6 +58,7 @@ struct f_ncm {
+ 	u8				notify_state;
+ 	atomic_t			notify_count;
+ 	bool				is_open;
++	bool				is_connected;
+ 
+ 	const struct ndp_parser_opts	*parser_opts;
+ 	bool				is_crc;
+@@ -864,7 +865,6 @@ static int ncm_setup(struct usb_function *f, const struct usb_ctrlrequest *ctrl)
+ static int ncm_set_alt(struct usb_function *f, unsigned intf, unsigned alt)
+ {
+ 	struct f_ncm		*ncm = func_to_ncm(f);
+-	struct f_ncm_opts	*opts = func_to_ncm_opts(f);
+ 	struct usb_composite_dev *cdev = f->config->cdev;
+ 
+ 	/* Control interface has only altsetting 0 */
+@@ -887,13 +887,12 @@ static int ncm_set_alt(struct usb_function *f, unsigned intf, unsigned alt)
+ 		if (alt > 1)
+ 			goto fail;
+ 
+-		scoped_guard(mutex, &opts->lock)
+-			if (opts->net) {
+-				DBG(cdev, "reset ncm\n");
+-				opts->net = NULL;
+-				gether_disconnect(&ncm->port);
+-				ncm_reset_values(ncm);
+-			}
++		if (ncm->is_connected) {
++			DBG(cdev, "reset ncm\n");
++			ncm->is_connected = false;
++			gether_disconnect(&ncm->port);
++			ncm_reset_values(ncm);
++		}
+ 
+ 		/*
+ 		 * CDC Network only sends data in non-default altsettings.
+@@ -926,8 +925,7 @@ static int ncm_set_alt(struct usb_function *f, unsigned intf, unsigned alt)
+ 			net = gether_connect(&ncm->port);
+ 			if (IS_ERR(net))
+ 				return PTR_ERR(net);
+-			scoped_guard(mutex, &opts->lock)
+-				opts->net = net;
++			ncm->is_connected = true;
+ 		}
+ 
+ 		spin_lock(&ncm->lock);
+@@ -1374,16 +1372,14 @@ static int ncm_unwrap_ntb(struct gether *port,
+ static void ncm_disable(struct usb_function *f)
+ {
+ 	struct f_ncm		*ncm = func_to_ncm(f);
+-	struct f_ncm_opts	*opts = func_to_ncm_opts(f);
+ 	struct usb_composite_dev *cdev = f->config->cdev;
+ 
+ 	DBG(cdev, "ncm deactivated\n");
+ 
+-	scoped_guard(mutex, &opts->lock)
+-		if (opts->net) {
+-			opts->net = NULL;
+-			gether_disconnect(&ncm->port);
+-		}
++	if (ncm->is_connected) {
++		ncm->is_connected = false;
++		gether_disconnect(&ncm->port);
++	}
+ 
+ 	if (ncm->notify->enabled) {
+ 		usb_ep_disable(ncm->notify);
+@@ -1687,7 +1683,6 @@ static struct usb_function_instance *ncm_alloc_inst(void)
+ 	if (!opts)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-	opts->net = NULL;
+ 	opts->ncm_os_desc.ext_compat_id = opts->ncm_ext_compat_id;
+ 	gether_setup_opts_default(&opts->net_opts, "usb");
+ 
+diff --git a/drivers/usb/gadget/function/u_ether_configfs.h b/drivers/usb/gadget/function/u_ether_configfs.h
+index a3696797e074..65b0360d3918 100644
+--- a/drivers/usb/gadget/function/u_ether_configfs.h
++++ b/drivers/usb/gadget/function/u_ether_configfs.h
+@@ -326,18 +326,9 @@ out:									\
+ 					      char *page)			\
+ 	{									\
+ 		struct f_##_f_##_opts *opts = to_f_##_f_##_opts(item);		\
+-		const char *name;						\
+ 										\
+ 		guard(mutex)(&opts->lock);					\
+-		rtnl_lock();							\
+-		if (opts->net_opts.ifname_set)					\
+-			name = opts->net_opts.name;				\
+-		else if (opts->net)						\
+-			name = netdev_name(opts->net);				\
+-		else								\
+-			name = "(inactive net_device)";				\
+-		rtnl_unlock();							\
+-		return sysfs_emit(page, "%s\n", name);				\
++		return sysfs_emit(page, "%s\n", opts->net_opts.name);		\
+ 	}									\
+ 										\
+ 	static ssize_t _f_##_opts_ifname_store(struct config_item *item,	\
+diff --git a/drivers/usb/gadget/function/u_ncm.h b/drivers/usb/gadget/function/u_ncm.h
+index d99330fe31e8..6d7538855744 100644
+--- a/drivers/usb/gadget/function/u_ncm.h
++++ b/drivers/usb/gadget/function/u_ncm.h
+@@ -19,7 +19,6 @@
+ 
+ struct f_ncm_opts {
+ 	struct usb_function_instance	func_inst;
+-	struct net_device		*net;
+ 
+ 	struct gether_opts		net_opts;
+ 	struct config_group		*ncm_interf_group;
+-- 
+2.51.0
+

@@ -1,0 +1,81 @@
+From: Chuck Lever <chuck.lever@oracle.com>
+Date: Tue, 10 Mar 2026 13:59:51 -0400
+Subject: [PATCH] perf synthetic-events: Fix stale build ID in module MMAP2
+ records
+References: bsc#1258210
+Patch-mainline: 6.18.19
+Git-commit: 35b16a7a2c4fc458304447128b86514ce9f70f3c
+
+[ Upstream commit 35b16a7a2c4fc458304447128b86514ce9f70f3c ]
+
+perf_event__synthesize_modules() allocates a single union perf_event and
+reuses it across every kernel module callback.
+
+After the first module is processed, perf_record_mmap2__read_build_id()
+sets PERF_RECORD_MISC_MMAP_BUILD_ID in header.misc and writes that
+module's build ID into the event.
+
+On subsequent iterations the callback overwrites start, len, pid, and
+filename for the next module but never clears the stale build ID fields
+or the MMAP_BUILD_ID flag.
+
+When perf_record_mmap2__read_build_id() runs for the second module it
+sees the flag, reads the stale build ID into a dso_id, and
+__dso__improve_id() permanently poisons the DSO with the wrong build ID.
+
+Every module after the first therefore receives the first module's build
+ID in its MMAP2 record.
+
+On a system with the sunrpc and nfsd modules loaded, this causes perf
+script and perf report to show [unknown] for all module symbols.
+
+The latent bug has existed since commit d9f2ecbc5e47fca7 ("perf dso:
+Move build_id to dso_id") introduced the PERF_RECORD_MISC_MMAP_BUILD_ID
+check in perf_record_mmap2__read_build_id().
+
+Commit 53b00ff358dc75b1 ("perf record: Make --buildid-mmap the default")
+then exposed it to all users by making the MMAP2-with-build-ID path the
+default.  Both commits were merged in the same series.
+
+Clear the MMAP_BUILD_ID flag and zero the build_id union before each
+call to perf_record_mmap2__read_build_id() so that every module starts
+with a clean slate.
+
+Fixes: d9f2ecbc5e47fca7 ("perf dso: Move build_id to dso_id")
+Reviewed-by: Ian Rogers <irogers@google.com>
+Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+Cc: Adrian Hunter <adrian.hunter@intel.com>
+Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Cc: Ian Rogers <irogers@google.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: James Clark <james.clark@linaro.org>
+Cc: Jiri Olsa <jolsa@kernel.org>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Namhyung Kim <namhyung@kernel.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ tools/perf/util/synthetic-events.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/tools/perf/util/synthetic-events.c b/tools/perf/util/synthetic-events.c
+index fcd1fd13c30e..c85d219928d4 100644
+--- a/tools/perf/util/synthetic-events.c
++++ b/tools/perf/util/synthetic-events.c
+@@ -703,6 +703,11 @@ static int perf_event__synthesize_modules_maps_cb(struct map *map, void *data)
+ 
+ 		memcpy(event->mmap2.filename, dso__long_name(dso), dso__long_name_len(dso) + 1);
+ 
++		/* Clear stale build ID from previous module iteration */
++		event->mmap2.header.misc &= ~PERF_RECORD_MISC_MMAP_BUILD_ID;
++		memset(event->mmap2.build_id, 0, sizeof(event->mmap2.build_id));
++		event->mmap2.build_id_size = 0;
++
+ 		perf_record_mmap2__read_build_id(&event->mmap2, args->machine, false);
+ 	} else {
+ 		size = PERF_ALIGN(dso__long_name_len(dso) + 1, sizeof(u64));
+-- 
+2.51.0
+

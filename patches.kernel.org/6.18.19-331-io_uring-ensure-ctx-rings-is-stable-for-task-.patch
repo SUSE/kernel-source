@@ -1,0 +1,148 @@
+From: Jens Axboe <axboe@kernel.dk>
+Date: Mon, 9 Mar 2026 14:21:37 -0600
+Subject: [PATCH] io_uring: ensure ctx->rings is stable for task work flags
+ manipulation
+References: bsc#1258210
+Patch-mainline: 6.18.19
+Git-commit: 96189080265e6bb5dde3a4afbaf947af493e3f82
+
+Commit 96189080265e6bb5dde3a4afbaf947af493e3f82 upstream.
+
+If DEFER_TASKRUN | SETUP_TASKRUN is used and task work is added while
+the ring is being resized, it's possible for the OR'ing of
+IORING_SQ_TASKRUN to happen in the small window of swapping into the
+new rings and the old rings being freed.
+
+Prevent this by adding a 2nd ->rings pointer, ->rings_rcu, which is
+protected by RCU. The task work flags manipulation is inside RCU
+already, and if the resize ring freeing is done post an RCU synchronize,
+then there's no need to add locking to the fast path of task work
+additions.
+
+Note: this is only done for DEFER_TASKRUN, as that's the only setup mode
+that supports ring resizing. If this ever changes, then they too need to
+use the io_ctx_mark_taskrun() helper.
+
+Link: https://lore.kernel.org/io-uring/20260309062759.482210-1-naup96721@gmail.com/
+Cc: stable@vger.kernel.org
+Fixes: 79cfe9e59c2a ("io_uring/register: add IORING_REGISTER_RESIZE_RINGS")
+Reported-by: Hao-Yu Yang <naup96721@gmail.com>
+Suggested-by: Pavel Begunkov <asml.silence@gmail.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ include/linux/io_uring_types.h |  1 +
+ io_uring/io_uring.c            | 25 ++++++++++++++++++++++---
+ io_uring/register.c            | 11 +++++++++++
+ 3 files changed, 34 insertions(+), 3 deletions(-)
+
+diff --git a/include/linux/io_uring_types.h b/include/linux/io_uring_types.h
+index b4d8aca3e786..3f3506056b9a 100644
+--- a/include/linux/io_uring_types.h
++++ b/include/linux/io_uring_types.h
+@@ -372,6 +372,7 @@ struct io_ring_ctx {
+ 	 * regularly bounce b/w CPUs.
+ 	 */
+ 	struct {
++		struct io_rings	__rcu	*rings_rcu;
+ 		struct llist_head	work_llist;
+ 		struct llist_head	retry_llist;
+ 		unsigned long		check_cq;
+diff --git a/io_uring/io_uring.c b/io_uring/io_uring.c
+index 65af47b9135b..d10a38c9dbfb 100644
+--- a/io_uring/io_uring.c
++++ b/io_uring/io_uring.c
+@@ -1238,6 +1238,21 @@ void tctx_task_work(struct callback_head *cb)
+ 	WARN_ON_ONCE(ret);
+ }
+ 
++/*
++ * Sets IORING_SQ_TASKRUN in the sq_flags shared with userspace, using the
++ * RCU protected rings pointer to be safe against concurrent ring resizing.
++ */
++static void io_ctx_mark_taskrun(struct io_ring_ctx *ctx)
++{
++	lockdep_assert_in_rcu_read_lock();
++
++	if (ctx->flags & IORING_SETUP_TASKRUN_FLAG) {
++		struct io_rings *rings = rcu_dereference(ctx->rings_rcu);
++
++		atomic_or(IORING_SQ_TASKRUN, &rings->sq_flags);
++	}
++}
++
+ static void io_req_local_work_add(struct io_kiocb *req, unsigned flags)
+ {
+ 	struct io_ring_ctx *ctx = req->ctx;
+@@ -1292,8 +1307,7 @@ static void io_req_local_work_add(struct io_kiocb *req, unsigned flags)
+ 	 */
+ 
+ 	if (!head) {
+-		if (ctx->flags & IORING_SETUP_TASKRUN_FLAG)
+-			atomic_or(IORING_SQ_TASKRUN, &ctx->rings->sq_flags);
++		io_ctx_mark_taskrun(ctx);
+ 		if (ctx->has_evfd)
+ 			io_eventfd_signal(ctx, false);
+ 	}
+@@ -1317,6 +1331,10 @@ static void io_req_normal_work_add(struct io_kiocb *req)
+ 	if (!llist_add(&req->io_task_work.node, &tctx->task_list))
+ 		return;
+ 
++	/*
++	 * Doesn't need to use ->rings_rcu, as resizing isn't supported for
++	 * !DEFER_TASKRUN.
++	 */
+ 	if (ctx->flags & IORING_SETUP_TASKRUN_FLAG)
+ 		atomic_or(IORING_SQ_TASKRUN, &ctx->rings->sq_flags);
+ 
+@@ -2774,6 +2792,7 @@ static void io_rings_free(struct io_ring_ctx *ctx)
+ 	io_free_region(ctx, &ctx->sq_region);
+ 	io_free_region(ctx, &ctx->ring_region);
+ 	ctx->rings = NULL;
++	RCU_INIT_POINTER(ctx->rings_rcu, NULL);
+ 	ctx->sq_sqes = NULL;
+ }
+ 
+@@ -3627,7 +3646,7 @@ static __cold int io_allocate_scq_urings(struct io_ring_ctx *ctx,
+ 	if (ret)
+ 		return ret;
+ 	ctx->rings = rings = io_region_get_ptr(&ctx->ring_region);
+-
++	rcu_assign_pointer(ctx->rings_rcu, rings);
+ 	if (!(ctx->flags & IORING_SETUP_NO_SQARRAY))
+ 		ctx->sq_array = (u32 *)((char *)rings + sq_array_offset);
+ 
+diff --git a/io_uring/register.c b/io_uring/register.c
+index db53e664348d..faa44dd32cd5 100644
+--- a/io_uring/register.c
++++ b/io_uring/register.c
+@@ -556,7 +556,15 @@ static int io_register_resize_rings(struct io_ring_ctx *ctx, void __user *arg)
+ 	ctx->sq_entries = p.sq_entries;
+ 	ctx->cq_entries = p.cq_entries;
+ 
++	/*
++	 * Just mark any flag we may have missed and that the application
++	 * should act on unconditionally. Worst case it'll be an extra
++	 * syscall.
++	 */
++	atomic_or(IORING_SQ_TASKRUN | IORING_SQ_NEED_WAKEUP, &n.rings->sq_flags);
+ 	ctx->rings = n.rings;
++	rcu_assign_pointer(ctx->rings_rcu, n.rings);
++
+ 	ctx->sq_sqes = n.sq_sqes;
+ 	swap_old(ctx, o, n, ring_region);
+ 	swap_old(ctx, o, n, sq_region);
+@@ -565,6 +573,9 @@ static int io_register_resize_rings(struct io_ring_ctx *ctx, void __user *arg)
+ out:
+ 	spin_unlock(&ctx->completion_lock);
+ 	mutex_unlock(&ctx->mmap_lock);
++	/* Wait for concurrent io_ctx_mark_taskrun() */
++	if (to_free == &o)
++		synchronize_rcu_expedited();
+ 	io_register_free_rings(ctx, &p, to_free);
+ 
+ 	if (ctx->sq_data)
+-- 
+2.51.0
+

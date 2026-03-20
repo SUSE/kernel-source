@@ -1,0 +1,65 @@
+From: Alice Ryhl <aliceryhl@google.com>
+Date: Tue, 24 Feb 2026 18:16:39 +0000
+Subject: [PATCH] rust_binder: call set_notification_done() without proc lock
+References: bsc#1258210
+Patch-mainline: 6.18.19
+Git-commit: 2e303f0febb65a434040774b793ba8356698802b
+
+commit 2e303f0febb65a434040774b793ba8356698802b upstream.
+
+Consider the following sequence of events on a death listener:
+1. The remote process dies and sends a BR_DEAD_BINDER message.
+2. The local process invokes the BC_CLEAR_DEATH_NOTIFICATION command.
+3. The local process then invokes the BC_DEAD_BINDER_DONE.
+Then, the kernel will reply to the BC_DEAD_BINDER_DONE command with a
+BR_CLEAR_DEATH_NOTIFICATION_DONE reply using push_work_if_looper().
+
+However, this can result in a deadlock if the current thread is not a
+looper. This is because dead_binder_done() still holds the proc lock
+during set_notification_done(), which called push_work_if_looper().
+Normally, push_work_if_looper() takes the thread lock, which is fine to
+take under the proc lock. But if the current thread is not a looper,
+then it falls back to delivering the reply to the process work queue,
+which involves taking the proc lock. Since the proc lock is already
+held, this is a deadlock.
+
+Fix this by releasing the proc lock during set_notification_done(). It
+was not intentional that it was held during that function to begin with.
+
+I don't think this ever happens in Android because BC_DEAD_BINDER_DONE
+is only invoked in response to BR_DEAD_BINDER messages, and the kernel
+always delivers BR_DEAD_BINDER to a looper. So there's no scenario where
+Android userspace will call BC_DEAD_BINDER_DONE on a non-looper thread.
+
+Cc: stable <stable@kernel.org>
+Fixes: eafedbc7c050 ("rust_binder: add Rust Binder driver")
+Reported-by: syzbot+c8287e65a57a89e7fb72@syzkaller.appspotmail.com
+Tested-by: syzbot+c8287e65a57a89e7fb72@syzkaller.appspotmail.com
+Signed-off-by: Alice Ryhl <aliceryhl@google.com>
+Reviewed-by: Gary Guo <gary@garyguo.net>
+Reviewed-by: Andreas Hindborg <a.hindborg@kernel.org>
+Link: https://patch.msgid.link/20260224-binder-dead-binder-done-proc-lock-v1-1-bbe1b8a6e74a@google.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/android/binder/process.rs | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/android/binder/process.rs b/drivers/android/binder/process.rs
+index ef4dbb2b571c..7d66d8cba932 100644
+--- a/drivers/android/binder/process.rs
++++ b/drivers/android/binder/process.rs
+@@ -1259,7 +1259,8 @@ pub(crate) fn clear_death(&self, reader: &mut UserSliceReader, thread: &Thread)
+     }
+ 
+     pub(crate) fn dead_binder_done(&self, cookie: u64, thread: &Thread) {
+-        if let Some(death) = self.inner.lock().pull_delivered_death(cookie) {
++        let death = self.inner.lock().pull_delivered_death(cookie);
++        if let Some(death) = death {
+             death.set_notification_done(thread);
+         }
+     }
+-- 
+2.51.0
+

@@ -1,0 +1,136 @@
+From: Max Kellermann <max.kellermann@ionos.com>
+Date: Tue, 24 Feb 2026 14:10:29 +0100
+Subject: [PATCH] ceph: add a bunch of missing ceph_path_info initializers
+References: bsc#1258210
+Patch-mainline: 6.18.19
+Git-commit: 43323a5934b660afae687e8e4e95ac328615a5c4
+
+commit 43323a5934b660afae687e8e4e95ac328615a5c4 upstream.
+
+ceph_mdsc_build_path() must be called with a zero-initialized
+ceph_path_info parameter, or else the following
+ceph_mdsc_free_path_info() may crash.
+
+Example crash (on Linux 6.18.12):
+
+  virt_to_cache: Object is not a Slab page!
+  WARNING: CPU: 184 PID: 2871736 at mm/slub.c:6732 kmem_cache_free+0x316/0x400
+  [...]
+  Call Trace:
+   [...]
+   ceph_open+0x13d/0x3e0
+   do_dentry_open+0x134/0x480
+   vfs_open+0x2a/0xe0
+   path_openat+0x9a3/0x1160
+  [...]
+  cache_from_obj: Wrong slab cache. names_cache but object is from ceph_inode_info
+  WARNING: CPU: 184 PID: 2871736 at mm/slub.c:6746 kmem_cache_free+0x2dd/0x400
+  [...]
+  kernel BUG at mm/slub.c:634!
+  Oops: invalid opcode: 0000 [#1] SMP NOPTI
+  RIP: 0010:__slab_free+0x1a4/0x350
+
+Some of the ceph_mdsc_build_path() callers had initializers, but
+others had not, even though they were all added by commit 15f519e9f883
+("ceph: fix race condition validating r_parent before applying state").
+The ones without initializer are suspectible to random crashes.  (I can
+imagine it could even be possible to exploit this bug to elevate
+privileges.)
+
+Unfortunately, these Ceph functions are undocumented and its semantics
+can only be derived from the code.  I see that ceph_mdsc_build_path()
+initializes the structure only on success, but not on error.
+
+Calling ceph_mdsc_free_path_info() after a failed
+ceph_mdsc_build_path() call does not even make sense, but that's what
+all callers do, and for it to be safe, the structure must be
+zero-initialized.  The least intrusive approach to fix this is
+therefore to add initializers everywhere.
+
+Cc: stable@vger.kernel.org
+Fixes: 15f519e9f883 ("ceph: fix race condition validating r_parent before applying state")
+Signed-off-by: Max Kellermann <max.kellermann@ionos.com>
+Reviewed-by: Viacheslav Dubeyko <Slava.Dubeyko@ibm.com>
+Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ fs/ceph/debugfs.c | 4 ++--
+ fs/ceph/dir.c     | 2 +-
+ fs/ceph/file.c    | 4 ++--
+ fs/ceph/inode.c   | 2 +-
+ 4 files changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/fs/ceph/debugfs.c b/fs/ceph/debugfs.c
+index f3fe786b4143..7dc307790240 100644
+--- a/fs/ceph/debugfs.c
++++ b/fs/ceph/debugfs.c
+@@ -79,7 +79,7 @@ static int mdsc_show(struct seq_file *s, void *p)
+ 		if (req->r_inode) {
+ 			seq_printf(s, " #%llx", ceph_ino(req->r_inode));
+ 		} else if (req->r_dentry) {
+-			struct ceph_path_info path_info;
++			struct ceph_path_info path_info = {0};
+ 			path = ceph_mdsc_build_path(mdsc, req->r_dentry, &path_info, 0);
+ 			if (IS_ERR(path))
+ 				path = NULL;
+@@ -98,7 +98,7 @@ static int mdsc_show(struct seq_file *s, void *p)
+ 		}
+ 
+ 		if (req->r_old_dentry) {
+-			struct ceph_path_info path_info;
++			struct ceph_path_info path_info = {0};
+ 			path = ceph_mdsc_build_path(mdsc, req->r_old_dentry, &path_info, 0);
+ 			if (IS_ERR(path))
+ 				path = NULL;
+diff --git a/fs/ceph/dir.c b/fs/ceph/dir.c
+index d18c0eaef9b7..da126f255e2e 100644
+--- a/fs/ceph/dir.c
++++ b/fs/ceph/dir.c
+@@ -1362,7 +1362,7 @@ static int ceph_unlink(struct inode *dir, struct dentry *dentry)
+ 	if (!dn) {
+ 		try_async = false;
+ 	} else {
+-		struct ceph_path_info path_info;
++		struct ceph_path_info path_info = {0};
+ 		path = ceph_mdsc_build_path(mdsc, dn, &path_info, 0);
+ 		if (IS_ERR(path)) {
+ 			try_async = false;
+diff --git a/fs/ceph/file.c b/fs/ceph/file.c
+index f43a42909e7c..ceb5706fe366 100644
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@ -397,7 +397,7 @@ int ceph_open(struct inode *inode, struct file *file)
+ 	if (!dentry) {
+ 		do_sync = true;
+ 	} else {
+-		struct ceph_path_info path_info;
++		struct ceph_path_info path_info = {0};
+ 		path = ceph_mdsc_build_path(mdsc, dentry, &path_info, 0);
+ 		if (IS_ERR(path)) {
+ 			do_sync = true;
+@@ -807,7 +807,7 @@ int ceph_atomic_open(struct inode *dir, struct dentry *dentry,
+ 	if (!dn) {
+ 		try_async = false;
+ 	} else {
+-		struct ceph_path_info path_info;
++		struct ceph_path_info path_info = {0};
+ 		path = ceph_mdsc_build_path(mdsc, dn, &path_info, 0);
+ 		if (IS_ERR(path)) {
+ 			try_async = false;
+diff --git a/fs/ceph/inode.c b/fs/ceph/inode.c
+index a6e260d9e420..b6c60d787692 100644
+--- a/fs/ceph/inode.c
++++ b/fs/ceph/inode.c
+@@ -2562,7 +2562,7 @@ int __ceph_setattr(struct mnt_idmap *idmap, struct inode *inode,
+ 	if (!dentry) {
+ 		do_sync = true;
+ 	} else {
+-		struct ceph_path_info path_info;
++		struct ceph_path_info path_info = {0};
+ 		path = ceph_mdsc_build_path(mdsc, dentry, &path_info, 0);
+ 		if (IS_ERR(path)) {
+ 			do_sync = true;
+-- 
+2.51.0
+
