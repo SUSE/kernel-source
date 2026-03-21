@@ -1,0 +1,195 @@
+From: Shuran Liu <electronlsr@gmail.com>
+Date: Sat, 6 Dec 2025 22:12:10 +0800
+Subject: selftests/bpf: add regression test for bpf_d_path()
+Patch-mainline: v6.19-rc2
+Git-commit: 79e247d6608848c09038d0b1e7d256432624fd84
+References: jsc#PED-14653
+
+Add a regression test for bpf_d_path() to cover incorrect verifier
+assumptions caused by an incorrect function prototype. The test
+attaches to the fallocate hook, calls bpf_d_path() and verifies that
+a simple prefix comparison on the returned pathname behaves correctly
+after the fix in patch 1. It ensures the verifier does not assume
+the buffer remains unwritten.
+
+Co-developed-by: Zesen Liu <ftyg@live.com>
+Signed-off-by: Zesen Liu <ftyg@live.com>
+Co-developed-by: Peili Gao <gplhust955@gmail.com>
+Signed-off-by: Peili Gao <gplhust955@gmail.com>
+Co-developed-by: Haoran Ni <haoran.ni.cs@gmail.com>
+Signed-off-by: Haoran Ni <haoran.ni.cs@gmail.com>
+Signed-off-by: Shuran Liu <electronlsr@gmail.com>
+Link: https://lore.kernel.org/r/20251206141210.3148-3-electronlsr@gmail.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ tools/testing/selftests/bpf/prog_tests/d_path.c |   89 +++++++++++++++++++-----
+ tools/testing/selftests/bpf/progs/test_d_path.c |   23 ++++++
+ 2 files changed, 95 insertions(+), 17 deletions(-)
+
+--- a/tools/testing/selftests/bpf/prog_tests/d_path.c
++++ b/tools/testing/selftests/bpf/prog_tests/d_path.c
+@@ -38,6 +38,14 @@
+ 	return readlink(buf, src.paths[src.cnt++], MAX_PATH_LEN);
+ }
+ 
++static inline long syscall_close(int fd)
++{
++	return syscall(__NR_close_range,
++			(unsigned int)fd,
++			(unsigned int)fd,
++			0u);
++}
++
+ static int trigger_fstat_events(pid_t pid)
+ {
+ 	int sockfd = -1, procfd = -1, devfd = -1;
+@@ -104,18 +112,34 @@
+ 	/* sys_close no longer triggers filp_close, but we can
+ 	 * call sys_close_range instead which still does
+ 	 */
+-#define close(fd) syscall(__NR_close_range, fd, fd, 0)
++	syscall_close(pipefd[0]);
++	syscall_close(pipefd[1]);
++	syscall_close(sockfd);
++	syscall_close(procfd);
++	syscall_close(devfd);
++	syscall_close(localfd);
++	syscall_close(indicatorfd);
++	return ret;
++}
+ 
+-	close(pipefd[0]);
+-	close(pipefd[1]);
+-	close(sockfd);
+-	close(procfd);
+-	close(devfd);
+-	close(localfd);
+-	close(indicatorfd);
++static void attach_and_load(struct test_d_path **skel)
++{
++	int err;
+ 
+-#undef close
+-	return ret;
++	*skel = test_d_path__open_and_load();
++	if (CHECK(!*skel, "setup", "d_path skeleton failed\n"))
++		goto cleanup;
++
++	err = test_d_path__attach(*skel);
++	if (CHECK(err, "setup", "attach failed: %d\n", err))
++		goto cleanup;
++
++	(*skel)->bss->my_pid = getpid();
++	return;
++
++cleanup:
++	test_d_path__destroy(*skel);
++	*skel = NULL;
+ }
+ 
+ static void test_d_path_basic(void)
+@@ -124,16 +148,11 @@
+ 	struct test_d_path *skel;
+ 	int err;
+ 
+-	skel = test_d_path__open_and_load();
+-	if (CHECK(!skel, "setup", "d_path skeleton failed\n"))
+-		goto cleanup;
+-
+-	err = test_d_path__attach(skel);
+-	if (CHECK(err, "setup", "attach failed: %d\n", err))
++	attach_and_load(&skel);
++	if (!skel)
+ 		goto cleanup;
+ 
+ 	bss = skel->bss;
+-	bss->my_pid = getpid();
+ 
+ 	err = trigger_fstat_events(bss->my_pid);
+ 	if (err < 0)
+@@ -195,6 +214,39 @@
+ 	test_d_path_check_types__destroy(skel);
+ }
+ 
++/* Check if the verifier correctly generates code for
++ * accessing the memory modified by d_path helper.
++ */
++static void test_d_path_mem_access(void)
++{
++	int localfd = -1;
++	char path_template[] = "/dev/shm/d_path_loadgen.XXXXXX";
++	struct test_d_path__bss *bss;
++	struct test_d_path *skel;
++
++	attach_and_load(&skel);
++	if (!skel)
++		goto cleanup;
++
++	bss = skel->bss;
++
++	localfd = mkstemp(path_template);
++	if (CHECK(localfd < 0, "trigger", "mkstemp failed\n"))
++		goto cleanup;
++
++	if (CHECK(fallocate(localfd, 0, 0, 1024) < 0, "trigger", "fallocate failed\n"))
++		goto cleanup;
++	remove(path_template);
++
++	if (CHECK(!bss->path_match_fallocate, "check",
++		  "failed to read fallocate path"))
++		goto cleanup;
++
++cleanup:
++	syscall_close(localfd);
++	test_d_path__destroy(skel);
++}
++
+ void test_d_path(void)
+ {
+ 	if (test__start_subtest("basic"))
+@@ -205,4 +257,7 @@
+ 
+ 	if (test__start_subtest("check_alloc_mem"))
+ 		test_d_path_check_types();
++
++	if (test__start_subtest("check_mem_access"))
++		test_d_path_mem_access();
+ }
+--- a/tools/testing/selftests/bpf/progs/test_d_path.c
++++ b/tools/testing/selftests/bpf/progs/test_d_path.c
+@@ -17,6 +17,7 @@
+ 
+ int called_stat = 0;
+ int called_close = 0;
++int path_match_fallocate = 0;
+ 
+ SEC("fentry/security_inode_getattr")
+ int BPF_PROG(prog_stat, struct path *path, struct kstat *stat,
+@@ -62,4 +63,26 @@
+ 	return 0;
+ }
+ 
++SEC("fentry/vfs_fallocate")
++int BPF_PROG(prog_fallocate, struct file *file, int mode, loff_t offset, loff_t len)
++{
++	pid_t pid = bpf_get_current_pid_tgid() >> 32;
++	int ret = 0;
++	char path_fallocate[MAX_PATH_LEN] = {};
++
++	if (pid != my_pid)
++		return 0;
++
++	ret = bpf_d_path(&file->f_path,
++			 path_fallocate, MAX_PATH_LEN);
++	if (ret < 0)
++		return 0;
++
++	if (!path_fallocate[0])
++		return 0;
++
++	path_match_fallocate = 1;
++	return 0;
++}
++
+ char _license[] SEC("license") = "GPL";
