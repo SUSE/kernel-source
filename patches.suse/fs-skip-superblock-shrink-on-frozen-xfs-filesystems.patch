@@ -1,0 +1,48 @@
+From: Anthony Iliopoulos <ailiop@suse.com>
+Date: Fri, 20 Mar 2026 16:34:57 +0100
+Subject: fs: skip superblock shrink on frozen xfs filesystems
+Patch-mainline: Never, SUSE-specific, upstream has async inode freeing
+References: bsc#1259770
+
+Ensure that the fs is not frozen before proceeding with inode eviction
+since calling into filesystem code may require writing.
+
+This is especially the case for xfs, since during destroy_inode the
+inactivation code will possibly need to free any preallocated post-eof
+blocks, and that can block on transaction allocation waiting to acquire
+the sb_writers rwsem in sb_start_intwrite.
+
+All this is called synchronously from the same calling context (e.g.
+kswapd on background reclaim), and can cause a deadlock on an already
+frozen filesystem since thaw_super requires acquisition of the s_umount
+superblock lock which is already taken during super_cache_scan.
+
+This is more properly addressed upstream by implementing asynchronous
+inode deactivation running from a workqueue context.
+
+Fix this by just skipping shrinking on xfs filesystems that are in a
+frozen state.
+
+Signed-off-by: Anthony Iliopoulos <ailiop@suse.com>
+---
+ fs/super.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/fs/super.c b/fs/super.c
+index ea38a599999d..1120340a548c 100644
+--- a/fs/super.c
++++ b/fs/super.c
+@@ -75,6 +75,12 @@ static unsigned long super_cache_scan(struct shrinker *shrink,
+ 	if (!trylock_super(sb))
+ 		return SHRINK_STOP;
+ 
++	if (sb->s_writers.frozen != SB_UNFROZEN &&
++			sb->s_magic == 0x58465342 /* XFS_SB_MAGIC */) {
++		up_read(&sb->s_umount);
++		return SHRINK_STOP;
++	}
++
+ 	if (sb->s_op->nr_cached_objects)
+ 		fs_objects = sb->s_op->nr_cached_objects(sb, sc);
+ 
+
