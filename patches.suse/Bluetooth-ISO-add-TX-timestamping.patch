@@ -1,0 +1,105 @@
+From: Pauli Virtanen <pav@iki.fi>
+Date: Tue, 18 Mar 2025 21:06:44 +0200
+Subject: Bluetooth: ISO: add TX timestamping
+Patch-mainline: v6.15-rc1
+Git-commit: d415ba28825909423b1253a3a0db131d74ea6242
+References: jsc#PED-14261
+
+Add BT_SCM_ERROR socket CMSG type.
+
+Support TX timestamping in ISO sockets.
+
+Support MSG_ERRQUEUE in ISO recvmsg.
+
+If a packet from sendmsg() is fragmented, only the first ACL fragment is
+timestamped.
+
+Signed-off-by: Pauli Virtanen <pav@iki.fi>
+Reviewed-by: Willem de Bruijn <willemb@google.com>
+Signed-off-by: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+Acked-by: Chun-Yi Lee <jlee@suse.com>
+---
+ include/net/bluetooth/bluetooth.h |    1 +
+ net/bluetooth/iso.c               |   24 ++++++++++++++++++++----
+ 2 files changed, 21 insertions(+), 4 deletions(-)
+
+--- a/include/net/bluetooth/bluetooth.h
++++ b/include/net/bluetooth/bluetooth.h
+@@ -156,6 +156,7 @@ struct bt_voice {
+ #define BT_PKT_STATUS           16
+ 
+ #define BT_SCM_PKT_STATUS	0x03
++#define BT_SCM_ERROR		0x04
+ 
+ #define BT_ISO_QOS		17
+ 
+--- a/net/bluetooth/iso.c
++++ b/net/bluetooth/iso.c
+@@ -518,7 +518,8 @@ static struct bt_iso_qos *iso_sock_get_q
+ 	return &iso_pi(sk)->qos;
+ }
+ 
+-static int iso_send_frame(struct sock *sk, struct sk_buff *skb)
++static int iso_send_frame(struct sock *sk, struct sk_buff *skb,
++			  const struct sockcm_cookie *sockc)
+ {
+ 	struct iso_conn *conn = iso_pi(sk)->conn;
+ 	struct bt_iso_qos *qos = iso_sock_get_qos(sk);
+@@ -538,10 +539,12 @@ static int iso_send_frame(struct sock *s
+ 	hdr->slen = cpu_to_le16(hci_iso_data_len_pack(len,
+ 						      HCI_ISO_STATUS_VALID));
+ 
+-	if (sk->sk_state == BT_CONNECTED)
++	if (sk->sk_state == BT_CONNECTED) {
++		hci_setup_tx_timestamp(skb, 1, sockc);
+ 		hci_send_iso(conn->hcon, skb);
+-	else
++	} else {
+ 		len = -ENOTCONN;
++	}
+ 
+ 	return len;
+ }
+@@ -1348,6 +1351,7 @@ static int iso_sock_sendmsg(struct socke
+ {
+ 	struct sock *sk = sock->sk;
+ 	struct sk_buff *skb, **frag;
++	struct sockcm_cookie sockc;
+ 	size_t mtu;
+ 	int err;
+ 
+@@ -1360,6 +1364,14 @@ static int iso_sock_sendmsg(struct socke
+ 	if (msg->msg_flags & MSG_OOB)
+ 		return -EOPNOTSUPP;
+ 
++	hci_sockcm_init(&sockc, sk);
++
++	if (msg->msg_controllen) {
++		err = sock_cmsg_send(sk, msg, &sockc);
++		if (err)
++			return err;
++	}
++
+ 	lock_sock(sk);
+ 
+ 	if (sk->sk_state != BT_CONNECTED) {
+@@ -1405,7 +1417,7 @@ static int iso_sock_sendmsg(struct socke
+ 	lock_sock(sk);
+ 
+ 	if (sk->sk_state == BT_CONNECTED)
+-		err = iso_send_frame(sk, skb);
++		err = iso_send_frame(sk, skb, &sockc);
+ 	else
+ 		err = -ENOTCONN;
+ 
+@@ -1474,6 +1486,10 @@ static int iso_sock_recvmsg(struct socke
+ 
+ 	BT_DBG("sk %p", sk);
+ 
++	if (unlikely(flags & MSG_ERRQUEUE))
++		return sock_recv_errqueue(sk, msg, len, SOL_BLUETOOTH,
++					  BT_SCM_ERROR);
++
+ 	if (test_and_clear_bit(BT_SK_DEFER_SETUP, &bt_sk(sk)->flags)) {
+ 		sock_hold(sk);
+ 		lock_sock(sk);
