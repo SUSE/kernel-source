@@ -1,0 +1,105 @@
+From: Hari Bathini <hbathini@linux.ibm.com>
+Date: Tue, 3 Mar 2026 23:40:29 +0530
+Subject: powerpc64/bpf: fix handling of BPF stack in exception callback
+Patch-mainline: v7.0-rc4
+Git-commit: 51b8de4b3d27ec12128fa2405e526c527a77ae65
+References: jsc#PED-15386
+
+Exception callback reuses the stack frame of exception boundary. When
+exception boundary and exception callback programs have different BPF
+stack depth, the current stack unwind in exception callback will fail.
+Adjust the stack frame size of exception callback, in its prologue,
+if its BPF stack depth is different from that of exception boundary.
+
+Reported-by: bot+bpf-ci@kernel.org
+Closes: https://lore.kernel.org/bpf/2a310e86a59eb4c44c3ac9e5647814469d9c955580c9c0f1b3d9ca4a44717a34@mail.kernel.org/
+Fixes: 11d45eee9f42 ("powerpc64/bpf: Additional NVR handling for bpf_throw")
+Signed-off-by: Hari Bathini <hbathini@linux.ibm.com>
+Signed-off-by: Madhavan Srinivasan <maddy@linux.ibm.com>
+Link: https://patch.msgid.link/20260303181031.390073-6-hbathini@linux.ibm.com
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ arch/powerpc/net/bpf_jit_comp64.c |   36 +++++++++++++++++++++++++-----------
+ 1 file changed, 25 insertions(+), 11 deletions(-)
+
+--- a/arch/powerpc/net/bpf_jit_comp64.c
++++ b/arch/powerpc/net/bpf_jit_comp64.c
+@@ -32,14 +32,15 @@
+  *
+  *		[	prev sp		] <-------------
+  *		[    tail_call_info	] 8		|
+- *		[   nv gpr save area	] 6*8 + (12*8)	|
++ *		[   nv gpr save area	] (6 * 8)	|
++ *		[ addl. nv gpr save area] (12 * 8)	| <--- exception boundary/callback program
+  *		[    local_tmp_var	] 24		|
+  * fp (r31) -->	[   ebpf stack space	] upto 512	|
+  *		[     frame header	] 32/112	|
+  * sp (r1) --->	[    stack pointer	] --------------
+  *
+- * Additional (12*8) in 'nv gpr save area' only in case of
+- * exception boundary.
++ * Additional (12 * 8) in 'nv gpr save area' only in case of
++ * exception boundary/callback.
+  */
+ 
+ /* BPF non-volatile registers save area size */
+@@ -51,7 +52,7 @@
+  * for additional non volatile registers(r14-r25) to be saved
+  * at exception boundary
+  */
+-#define BPF_PPC_EXC_STACK_SAVE (12*8)
++#define BPF_PPC_EXC_STACK_SAVE (12 * 8)
+ 
+ /* stack frame excluding BPF stack, ensure this is quadword aligned */
+ #define BPF_PPC_STACKFRAME	(STACK_FRAME_MIN_SIZE + \
+@@ -128,12 +129,13 @@
+  *		[	  ...       	] 		|
+  * sp (r1) --->	[    stack pointer	] --------------
+  *		[    tail_call_info	] 8
+- *		[   nv gpr save area	] 6*8 + (12*8)
++ *		[   nv gpr save area	] (6 * 8)
++ *		[ addl. nv gpr save area] (12 * 8) <--- exception boundary/callback program
+  *		[    local_tmp_var	] 24
+  *		[   unused red zone	] 224
+  *
+- * Additional (12*8) in 'nv gpr save area' only in case of
+- * exception boundary.
++ * Additional (12 * 8) in 'nv gpr save area' only in case of
++ * exception boundary/callback.
+  */
+ static int bpf_jit_stack_local(struct codegen_context *ctx)
+ {
+@@ -240,10 +242,6 @@
+ 
+ 	if (bpf_has_stack_frame(ctx) && !ctx->exception_cb) {
+ 		/*
+-		 * exception_cb uses boundary frame after stack walk.
+-		 * It can simply use redzone, this optimization reduces
+-		 * stack walk loop by one level.
+-		 *
+ 		 * We need a stack frame, but we don't necessarily need to
+ 		 * save/restore LR unless we call other functions
+ 		 */
+@@ -287,6 +285,22 @@
+ 		 * program(main prog) as third arg
+ 		 */
+ 		EMIT(PPC_RAW_MR(_R1, _R5));
++		/*
++		 * Exception callback reuses the stack frame of exception boundary.
++		 * But BPF stack depth of exception callback and exception boundary
++		 * don't have to be same. If BPF stack depth is different, adjust the
++		 * stack frame size considering BPF stack depth of exception callback.
++		 * The non-volatile register save area remains unchanged. These non-
++		 * volatile registers are restored in exception callback's epilogue.
++		 */
++		EMIT(PPC_RAW_LD(bpf_to_ppc(TMP_REG_1), _R5, 0));
++		EMIT(PPC_RAW_SUB(bpf_to_ppc(TMP_REG_2), bpf_to_ppc(TMP_REG_1), _R1));
++		EMIT(PPC_RAW_ADDI(bpf_to_ppc(TMP_REG_2), bpf_to_ppc(TMP_REG_2),
++			-BPF_PPC_EXC_STACKFRAME));
++		EMIT(PPC_RAW_CMPLDI(bpf_to_ppc(TMP_REG_2), ctx->stack_size));
++		PPC_BCC_CONST_SHORT(COND_EQ, 12);
++		EMIT(PPC_RAW_MR(_R1, bpf_to_ppc(TMP_REG_1)));
++		EMIT(PPC_RAW_STDU(_R1, _R1, -(BPF_PPC_EXC_STACKFRAME + ctx->stack_size)));
+ 	}
+ 
+ 	/*
