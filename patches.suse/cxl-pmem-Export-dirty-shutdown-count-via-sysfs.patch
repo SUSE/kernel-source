@@ -1,0 +1,260 @@
+From: Davidlohr Bueso <dave@stgolabs.net>
+Date: Thu, 20 Feb 2025 14:02:34 -0800
+Subject: [PATCH] cxl/pmem: Export dirty shutdown count via sysfs
+Git-commit: 7d0ecc0bd83dc2b2f46087f955c9572073e45aca
+Patch-mainline: v6.15-rc1
+References: jsc#PED-15409
+
+Similar to how the acpi_nfit driver exports Optane dirty shutdown count,
+introduce:
+
+  /sys/bus/cxl/devices/nvdimm-bridge0/ndbusX/nmemY/cxl/dirty_shutdown
+
+Under the conditions that 1) dirty shutdown can be set, 2) Device GPF
+DVSEC exists, and 3) the count itself can be retrieved.
+
+Suggested-by: Dan Williams <dan.j.williams@intel.com>
+Signed-off-by: Davidlohr Bueso <dave@stgolabs.net>
+Reviewed-by: Dave Jiang <dave.jiang@intel.com>
+Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+Reviewed-by: Jonathan Cameron <Jonathan.Cameron@huawei.com>
+Link: https://patch.msgid.link/20250220220235.276831-4-dave@stgolabs.net
+Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ Documentation/ABI/testing/sysfs-bus-cxl       | 12 +++
+ Documentation/driver-api/cxl/maturity-map.rst |  2 +-
+ drivers/cxl/core/mbox.c                       | 21 +++++
+ drivers/cxl/cxl.h                             |  1 +
+ drivers/cxl/cxlmem.h                          | 13 ++++
+ drivers/cxl/pmem.c                            | 77 +++++++++++++++++--
+ 6 files changed, 117 insertions(+), 9 deletions(-)
+
+diff --git a/Documentation/ABI/testing/sysfs-bus-cxl b/Documentation/ABI/testing/sysfs-bus-cxl
+index 3f5627a1210a..a7491d214098 100644
+--- a/Documentation/ABI/testing/sysfs-bus-cxl
++++ b/Documentation/ABI/testing/sysfs-bus-cxl
+@@ -586,3 +586,15 @@ Description:
+ 		See Documentation/ABI/stable/sysfs-devices-node. access0 provides
+ 		the number to the closest initiator and access1 provides the
+ 		number to the closest CPU.
++
++
++What:		/sys/bus/cxl/devices/nvdimm-bridge0/ndbusX/nmemY/cxl/dirty_shutdown
++Date:		Feb, 2025
++KernelVersion:	v6.15
++Contact:	linux-cxl@vger.kernel.org
++Description:
++		(RO) The device dirty shutdown count value, which is the number
++		of times the device could have incurred in potential data loss.
++		The count is persistent across power loss and wraps back to 0
++		upon overflow. If this file is not present, the device does not
++		have the necessary support for dirty tracking.
+diff --git a/Documentation/driver-api/cxl/maturity-map.rst b/Documentation/driver-api/cxl/maturity-map.rst
+index 99dd2c841e69..a2288f9df658 100644
+--- a/Documentation/driver-api/cxl/maturity-map.rst
++++ b/Documentation/driver-api/cxl/maturity-map.rst
+@@ -130,7 +130,7 @@ Mailbox commands
+ * [0] Switch CCI
+ * [3] Timestamp
+ * [1] PMEM labels
+-* [1] PMEM GPF / Dirty Shutdown
++* [3] PMEM GPF / Dirty Shutdown
+ * [0] Scan Media
+ 
+ PMU
+diff --git a/drivers/cxl/core/mbox.c b/drivers/cxl/core/mbox.c
+index 3687c8da1927..ec7b70ae5c06 100644
+--- a/drivers/cxl/core/mbox.c
++++ b/drivers/cxl/core/mbox.c
+@@ -1308,6 +1308,27 @@ int cxl_mem_create_range_info(struct cxl_memdev_state *mds)
+ }
+ EXPORT_SYMBOL_NS_GPL(cxl_mem_dpa_fetch, CXL);
+ 
++int cxl_get_dirty_count(struct cxl_memdev_state *mds, u32 *count)
++{
++	struct cxl_mailbox *cxl_mbox = &mds->cxlds.cxl_mbox;
++	struct cxl_mbox_get_health_info_out hi;
++	struct cxl_mbox_cmd mbox_cmd;
++	int rc;
++
++	mbox_cmd = (struct cxl_mbox_cmd) {
++		.opcode = CXL_MBOX_OP_GET_HEALTH_INFO,
++		.size_out = sizeof(hi),
++		.payload_out = &hi,
++	};
++
++	rc = cxl_internal_send_cmd(cxl_mbox, &mbox_cmd);
++	if (!rc)
++		*count = le32_to_cpu(hi.dirty_shutdown_cnt);
++
++	return rc;
++}
++EXPORT_SYMBOL_NS_GPL(cxl_get_dirty_count, CXL);
++
+ int cxl_arm_dirty_shutdown(struct cxl_memdev_state *mds)
+ {
+ 	struct cxl_mailbox *cxl_mbox = &mds->cxlds.cxl_mbox;
+diff --git a/drivers/cxl/cxl.h b/drivers/cxl/cxl.h
+index fc4edd5536b9..b265347cedce 100644
+--- a/drivers/cxl/cxl.h
++++ b/drivers/cxl/cxl.h
+@@ -563,6 +563,7 @@ struct cxl_nvdimm {
+ 	struct device dev;
+ 	struct cxl_memdev *cxlmd;
+ 	u8 dev_id[CXL_DEV_ID_LEN]; /* for nvdimm, string of 'serial' */
++	u64 dirty_shutdowns;
+ };
+ 
+ struct cxl_pmem_region_mapping {
+diff --git a/drivers/cxl/cxlmem.h b/drivers/cxl/cxlmem.h
+index 0e2df6904454..236e418d26f4 100644
+--- a/drivers/cxl/cxlmem.h
++++ b/drivers/cxl/cxlmem.h
+@@ -693,6 +693,18 @@ struct cxl_mbox_set_partition_info {
+ 
+ #define  CXL_SET_PARTITION_IMMEDIATE_FLAG	BIT(0)
+ 
++/* Get Health Info Output Payload CXL 3.2 Spec 8.2.10.9.3.1 Table 8-148 */
++struct cxl_mbox_get_health_info_out {
++	u8 health_status;
++	u8 media_status;
++	u8 additional_status;
++	u8 life_used;
++	__le16 device_temperature;
++	__le32 dirty_shutdown_cnt;
++	__le32 corrected_volatile_error_cnt;
++	__le32 corrected_persistent_error_cnt;
++} __packed;
++
+ /* Set Shutdown State Input Payload CXL 3.2 Spec 8.2.10.9.3.5 Table 8-152 */
+ struct cxl_mbox_set_shutdown_state_in {
+ 	u8 state;
+@@ -834,6 +846,7 @@ void cxl_event_trace_record(const struct cxl_memdev *cxlmd,
+ 			    enum cxl_event_log_type type,
+ 			    enum cxl_event_type event_type,
+ 			    const uuid_t *uuid, union cxl_event *evt);
++int cxl_get_dirty_count(struct cxl_memdev_state *mds, u32 *count);
+ int cxl_arm_dirty_shutdown(struct cxl_memdev_state *mds);
+ int cxl_set_timestamp(struct cxl_memdev_state *mds);
+ int cxl_poison_state_init(struct cxl_memdev_state *mds);
+diff --git a/drivers/cxl/pmem.c b/drivers/cxl/pmem.c
+index 6b284962592f..81db5d629049 100644
+--- a/drivers/cxl/pmem.c
++++ b/drivers/cxl/pmem.c
+@@ -42,15 +42,44 @@ static ssize_t id_show(struct device *dev, struct device_attribute *attr, char *
+ }
+ static DEVICE_ATTR_RO(id);
+ 
++static ssize_t dirty_shutdown_show(struct device *dev,
++				   struct device_attribute *attr, char *buf)
++{
++	struct nvdimm *nvdimm = to_nvdimm(dev);
++	struct cxl_nvdimm *cxl_nvd = nvdimm_provider_data(nvdimm);
++
++	return sysfs_emit(buf, "%llu\n", cxl_nvd->dirty_shutdowns);
++}
++static DEVICE_ATTR_RO(dirty_shutdown);
++
+ static struct attribute *cxl_dimm_attributes[] = {
+ 	&dev_attr_id.attr,
+ 	&dev_attr_provider.attr,
++	&dev_attr_dirty_shutdown.attr,
+ 	NULL
+ };
+ 
++#define CXL_INVALID_DIRTY_SHUTDOWN_COUNT ULLONG_MAX
++static umode_t cxl_dimm_visible(struct kobject *kobj,
++				struct attribute *a, int n)
++{
++	if (a == &dev_attr_dirty_shutdown.attr) {
++		struct device *dev = kobj_to_dev(kobj);
++		struct nvdimm *nvdimm = to_nvdimm(dev);
++		struct cxl_nvdimm *cxl_nvd = nvdimm_provider_data(nvdimm);
++
++		if (cxl_nvd->dirty_shutdowns ==
++		    CXL_INVALID_DIRTY_SHUTDOWN_COUNT)
++			return 0;
++	}
++
++	return a->mode;
++}
++
+ static const struct attribute_group cxl_dimm_attribute_group = {
+ 	.name = "cxl",
+ 	.attrs = cxl_dimm_attributes,
++	.is_visible = cxl_dimm_visible
+ };
+ 
+ static const struct attribute_group *cxl_dimm_attribute_groups[] = {
+@@ -58,6 +87,38 @@ static const struct attribute_group *cxl_dimm_attribute_groups[] = {
+ 	NULL
+ };
+ 
++static void cxl_nvdimm_arm_dirty_shutdown_tracking(struct cxl_nvdimm *cxl_nvd)
++{
++	struct cxl_memdev *cxlmd = cxl_nvd->cxlmd;
++	struct cxl_dev_state *cxlds = cxlmd->cxlds;
++	struct cxl_memdev_state *mds = to_cxl_memdev_state(cxlds);
++	struct device *dev = &cxl_nvd->dev;
++	u32 count;
++
++	/*
++	 * Dirty tracking is enabled and exposed to the user, only when:
++	 *   - dirty shutdown on the device can be set, and,
++	 *   - the device has a Device GPF DVSEC (albeit unused), and,
++	 *   - the Get Health Info cmd can retrieve the device's dirty count.
++	 */
++	cxl_nvd->dirty_shutdowns = CXL_INVALID_DIRTY_SHUTDOWN_COUNT;
++
++	if (cxl_arm_dirty_shutdown(mds)) {
++		dev_warn(dev, "GPF: could not set dirty shutdown state\n");
++		return;
++	}
++
++	if (!cxl_gpf_get_dvsec(cxlds->dev, false))
++		return;
++
++	if (cxl_get_dirty_count(mds, &count)) {
++		dev_warn(dev, "GPF: could not retrieve dirty count\n");
++		return;
++	}
++
++	cxl_nvd->dirty_shutdowns = count;
++}
++
+ static int cxl_nvdimm_probe(struct device *dev)
+ {
+ 	struct cxl_nvdimm *cxl_nvd = to_cxl_nvdimm(dev);
+@@ -78,20 +139,20 @@ static int cxl_nvdimm_probe(struct device *dev)
+ 	set_bit(ND_CMD_GET_CONFIG_SIZE, &cmd_mask);
+ 	set_bit(ND_CMD_GET_CONFIG_DATA, &cmd_mask);
+ 	set_bit(ND_CMD_SET_CONFIG_DATA, &cmd_mask);
+-	nvdimm = __nvdimm_create(cxl_nvb->nvdimm_bus, cxl_nvd,
+-				 cxl_dimm_attribute_groups, flags,
+-				 cmd_mask, 0, NULL, cxl_nvd->dev_id,
+-				 cxl_security_ops, NULL);
+-	if (!nvdimm)
+-		return -ENOMEM;
+ 
+ 	/*
+ 	 * Set dirty shutdown now, with the expectation that the device
+ 	 * clear it upon a successful GPF flow. The exception to this
+ 	 * is upon Viral detection, per CXL 3.2 section 12.4.2.
+ 	 */
+-	if (cxl_arm_dirty_shutdown(mds))
+-		dev_warn(dev, "GPF: could not dirty shutdown state\n");
++	cxl_nvdimm_arm_dirty_shutdown_tracking(cxl_nvd);
++
++	nvdimm = __nvdimm_create(cxl_nvb->nvdimm_bus, cxl_nvd,
++				 cxl_dimm_attribute_groups, flags,
++				 cmd_mask, 0, NULL, cxl_nvd->dev_id,
++				 cxl_security_ops, NULL);
++	if (!nvdimm)
++		return -ENOMEM;
+ 
+ 	dev_set_drvdata(dev, nvdimm);
+ 	return devm_add_action_or_reset(dev, unregister_nvdimm, nvdimm);
+-- 
+2.43.0
+
