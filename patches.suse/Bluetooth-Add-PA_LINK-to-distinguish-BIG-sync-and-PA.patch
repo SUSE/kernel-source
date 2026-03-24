@@ -1,0 +1,388 @@
+From: Yang Li <yang.li@amlogic.com>
+Date: Thu, 10 Jul 2025 18:52:47 +0800
+Subject: Bluetooth: Add PA_LINK to distinguish BIG sync and PA sync
+ connections
+Patch-mainline: v6.17-rc1
+Git-commit: a7bcffc673de219af2698fbb90627016233de67b
+References: jsc#PED-14261
+
+Currently, BIS_LINK is used for both BIG sync and PA sync connections,
+which makes it impossible to distinguish them when searching for a PA
+sync connection.
+
+Adding PA_LINK will make the distinction clearer and simplify future
+extensions for PA-related features.
+
+Signed-off-by: Yang Li <yang.li@amlogic.com>
+Signed-off-by: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+Acked-by: Chun-Yi Lee <jlee@suse.com>
+---
+ include/net/bluetooth/hci.h      |    1 +
+ include/net/bluetooth/hci_core.h |   10 +++++++---
+ net/bluetooth/hci_conn.c         |   14 +++++++++-----
+ net/bluetooth/hci_core.c         |   27 +++++++++++++++------------
+ net/bluetooth/hci_event.c        |    7 ++++---
+ net/bluetooth/hci_sync.c         |   10 +++++-----
+ net/bluetooth/iso.c              |    6 ++++--
+ net/bluetooth/mgmt.c             |    1 +
+ 8 files changed, 46 insertions(+), 30 deletions(-)
+
+--- a/include/net/bluetooth/hci.h
++++ b/include/net/bluetooth/hci.h
+@@ -560,6 +560,7 @@ enum {
+ #define LE_LINK		0x80
+ #define CIS_LINK	0x82
+ #define BIS_LINK	0x83
++#define PA_LINK		0x84
+ #define INVALID_LINK	0xff
+ 
+ /* LMP features */
+--- a/include/net/bluetooth/hci_core.h
++++ b/include/net/bluetooth/hci_core.h
+@@ -1011,6 +1011,7 @@ static inline void hci_conn_hash_add(str
+ 		break;
+ 	case CIS_LINK:
+ 	case BIS_LINK:
++	case PA_LINK:
+ 		h->iso_num++;
+ 		break;
+ 	}
+@@ -1038,6 +1039,7 @@ static inline void hci_conn_hash_del(str
+ 		break;
+ 	case CIS_LINK:
+ 	case BIS_LINK:
++	case PA_LINK:
+ 		h->iso_num--;
+ 		break;
+ 	}
+@@ -1056,6 +1058,7 @@ static inline unsigned int hci_conn_num(
+ 		return h->sco_num;
+ 	case CIS_LINK:
+ 	case BIS_LINK:
++	case PA_LINK:
+ 		return h->iso_num;
+ 	default:
+ 		return 0;
+@@ -1138,7 +1141,7 @@ hci_conn_hash_lookup_create_pa_sync(stru
+ 	rcu_read_lock();
+ 
+ 	list_for_each_entry_rcu(c, &h->list, list) {
+-		if (c->type != BIS_LINK)
++		if (c->type != PA_LINK)
+ 			continue;
+ 
+ 		if (!test_bit(HCI_CONN_CREATE_PA_SYNC, &c->flags))
+@@ -1333,7 +1336,7 @@ hci_conn_hash_lookup_big_sync_pend(struc
+ 	rcu_read_lock();
+ 
+ 	list_for_each_entry_rcu(c, &h->list, list) {
+-		if (c->type != BIS_LINK)
++		if (c->type != PA_LINK)
+ 			continue;
+ 
+ 		if (handle == c->iso_qos.bcast.big && num_bis == c->num_bis) {
+@@ -1402,7 +1405,7 @@ hci_conn_hash_lookup_pa_sync_handle(stru
+ 	rcu_read_lock();
+ 
+ 	list_for_each_entry_rcu(c, &h->list, list) {
+-		if (c->type != BIS_LINK)
++		if (c->type != PA_LINK)
+ 			continue;
+ 
+ 		/* Ignore the listen hcon, we are looking
+@@ -2021,6 +2024,7 @@ static inline int hci_proto_connect_ind(
+ 
+ 	case CIS_LINK:
+ 	case BIS_LINK:
++	case PA_LINK:
+ 		return iso_connect_ind(hdev, bdaddr, flags);
+ 
+ 	default:
+--- a/net/bluetooth/hci_conn.c
++++ b/net/bluetooth/hci_conn.c
+@@ -785,7 +785,7 @@ static int hci_le_big_terminate(struct h
+ 	d->sync_handle = conn->sync_handle;
+ 
+ 	if (test_and_clear_bit(HCI_CONN_PA_SYNC, &conn->flags)) {
+-		hci_conn_hash_list_flag(hdev, find_bis, BIS_LINK,
++		hci_conn_hash_list_flag(hdev, find_bis, PA_LINK,
+ 					HCI_CONN_PA_SYNC, d);
+ 
+ 		if (!d->count)
+@@ -914,6 +914,7 @@ static struct hci_conn *__hci_conn_add(s
+ 		break;
+ 	case CIS_LINK:
+ 	case BIS_LINK:
++	case PA_LINK:
+ 		if (hdev->iso_mtu)
+ 			/* Dedicated ISO Buffer exists */
+ 			break;
+@@ -979,6 +980,7 @@ static struct hci_conn *__hci_conn_add(s
+ 		break;
+ 	case CIS_LINK:
+ 	case BIS_LINK:
++	case PA_LINK:
+ 		/* conn->src should reflect the local identity address */
+ 		hci_copy_identity_address(hdev, &conn->src, &conn->src_type);
+ 
+@@ -1033,7 +1035,6 @@ static struct hci_conn *__hci_conn_add(s
+ 	}
+ 
+ 	hci_conn_init_sysfs(conn);
+-
+ 	return conn;
+ }
+ 
+@@ -1077,6 +1078,7 @@ static void hci_conn_cleanup_child(struc
+ 		break;
+ 	case CIS_LINK:
+ 	case BIS_LINK:
++	case PA_LINK:
+ 		if ((conn->state != BT_CONNECTED &&
+ 		    !test_bit(HCI_CONN_CREATE_CIS, &conn->flags)) ||
+ 		    test_bit(HCI_CONN_BIG_CREATED, &conn->flags))
+@@ -1152,7 +1154,8 @@ void hci_conn_del(struct hci_conn *conn)
+ 	} else {
+ 		/* Unacked ISO frames */
+ 		if (conn->type == CIS_LINK ||
+-		    conn->type == BIS_LINK) {
++		    conn->type == BIS_LINK ||
++		    conn->type == PA_LINK) {
+ 			if (hdev->iso_pkts)
+ 				hdev->iso_cnt += conn->sent;
+ 			else if (hdev->le_pkts)
+@@ -2081,7 +2084,7 @@ struct hci_conn *hci_pa_create_sync(stru
+ 
+ 	bt_dev_dbg(hdev, "dst %pMR type %d sid %d", dst, dst_type, sid);
+ 
+-	conn = hci_conn_add_unset(hdev, BIS_LINK, dst, HCI_ROLE_SLAVE);
++	conn = hci_conn_add_unset(hdev, PA_LINK, dst, HCI_ROLE_SLAVE);
+ 	if (IS_ERR(conn))
+ 		return conn;
+ 
+@@ -2245,7 +2248,7 @@ struct hci_conn *hci_connect_bis(struct
+ 	 * the start periodic advertising and create BIG commands have
+ 	 * been queued
+ 	 */
+-	hci_conn_hash_list_state(hdev, bis_mark_per_adv, BIS_LINK,
++	hci_conn_hash_list_state(hdev, bis_mark_per_adv, PA_LINK,
+ 				 BT_BOUND, &data);
+ 
+ 	/* Queue start periodic advertising and create BIG */
+@@ -2979,6 +2982,7 @@ void hci_conn_tx_queue(struct hci_conn *
+ 	switch (conn->type) {
+ 	case CIS_LINK:
+ 	case BIS_LINK:
++	case PA_LINK:
+ 	case ACL_LINK:
+ 	case LE_LINK:
+ 		break;
+--- a/net/bluetooth/hci_core.c
++++ b/net/bluetooth/hci_core.c
+@@ -2938,12 +2938,14 @@ int hci_recv_frame(struct hci_dev *hdev,
+ 	case HCI_ACLDATA_PKT:
+ 		/* Detect if ISO packet has been sent as ACL */
+ 		if (hci_conn_num(hdev, CIS_LINK) ||
+-		    hci_conn_num(hdev, BIS_LINK)) {
++		    hci_conn_num(hdev, BIS_LINK) ||
++			hci_conn_num(hdev, PA_LINK)) {
+ 			__u16 handle = __le16_to_cpu(hci_acl_hdr(skb)->handle);
+ 			__u8 type;
+ 
+ 			type = hci_conn_lookup_type(hdev, hci_handle(handle));
+-			if (type == CIS_LINK || type == BIS_LINK)
++			if (type == CIS_LINK || type == BIS_LINK ||
++			    type == PA_LINK)
+ 				hci_skb_pkt_type(skb) = HCI_ISODATA_PKT;
+ 		}
+ 		break;
+@@ -3398,6 +3400,7 @@ static inline void hci_quote_sent(struct
+ 		break;
+ 	case CIS_LINK:
+ 	case BIS_LINK:
++	case PA_LINK:
+ 		cnt = hdev->iso_mtu ? hdev->iso_cnt :
+ 			hdev->le_mtu ? hdev->le_cnt : hdev->acl_cnt;
+ 		break;
+@@ -3411,7 +3414,7 @@ static inline void hci_quote_sent(struct
+ }
+ 
+ static struct hci_conn *hci_low_sent(struct hci_dev *hdev, __u8 type,
+-				     __u8 type2, int *quote)
++				     int *quote)
+ {
+ 	struct hci_conn_hash *h = &hdev->conn_hash;
+ 	struct hci_conn *conn = NULL, *c;
+@@ -3423,7 +3426,7 @@ static struct hci_conn *hci_low_sent(str
+ 	rcu_read_lock();
+ 
+ 	list_for_each_entry_rcu(c, &h->list, list) {
+-		if ((c->type != type && c->type != type2) ||
++		if (c->type != type ||
+ 		    skb_queue_empty(&c->data_q))
+ 			continue;
+ 
+@@ -3627,7 +3630,7 @@ static void hci_sched_sco(struct hci_dev
+ 	else
+ 		cnt = &hdev->sco_cnt;
+ 
+-	while (*cnt && (conn = hci_low_sent(hdev, type, type, &quote))) {
++	while (*cnt && (conn = hci_low_sent(hdev, type, &quote))) {
+ 		while (quote-- && (skb = skb_dequeue(&conn->data_q))) {
+ 			BT_DBG("skb %p len %d", skb, skb->len);
+ 			hci_send_conn_frame(hdev, conn, skb);
+@@ -3746,8 +3749,8 @@ static void hci_sched_le(struct hci_dev
+ 		hci_prio_recalculate(hdev, LE_LINK);
+ }
+ 
+-/* Schedule CIS */
+-static void hci_sched_iso(struct hci_dev *hdev)
++/* Schedule iso */
++static void hci_sched_iso(struct hci_dev *hdev, __u8 type)
+ {
+ 	struct hci_conn *conn;
+ 	struct sk_buff *skb;
+@@ -3755,14 +3758,12 @@ static void hci_sched_iso(struct hci_dev
+ 
+ 	BT_DBG("%s", hdev->name);
+ 
+-	if (!hci_conn_num(hdev, CIS_LINK) &&
+-	    !hci_conn_num(hdev, BIS_LINK))
++	if (!hci_conn_num(hdev, type))
+ 		return;
+ 
+ 	cnt = hdev->iso_pkts ? &hdev->iso_cnt :
+ 		hdev->le_pkts ? &hdev->le_cnt : &hdev->acl_cnt;
+-	while (*cnt && (conn = hci_low_sent(hdev, CIS_LINK, BIS_LINK,
+-					    &quote))) {
++	while (*cnt && (conn = hci_low_sent(hdev, type, &quote))) {
+ 		while (quote-- && (skb = skb_dequeue(&conn->data_q))) {
+ 			BT_DBG("skb %p len %d", skb, skb->len);
+ 			hci_send_conn_frame(hdev, conn, skb);
+@@ -3787,7 +3788,9 @@ static void hci_tx_work(struct work_stru
+ 		/* Schedule queues and send stuff to HCI driver */
+ 		hci_sched_sco(hdev, SCO_LINK);
+ 		hci_sched_sco(hdev, ESCO_LINK);
+-		hci_sched_iso(hdev);
++		hci_sched_iso(hdev, CIS_LINK);
++		hci_sched_iso(hdev, BIS_LINK);
++		hci_sched_iso(hdev, PA_LINK);
+ 		hci_sched_acl(hdev);
+ 		hci_sched_le(hdev);
+ 	}
+--- a/net/bluetooth/hci_event.c
++++ b/net/bluetooth/hci_event.c
+@@ -4433,6 +4433,7 @@ static void hci_num_comp_pkts_evt(struct
+ 
+ 		case CIS_LINK:
+ 		case BIS_LINK:
++		case PA_LINK:
+ 			if (hdev->iso_pkts) {
+ 				hdev->iso_cnt += count;
+ 				if (hdev->iso_cnt > hdev->iso_pkts)
+@@ -6382,7 +6383,7 @@ static void hci_le_pa_sync_estabilished_
+ 	conn->sync_handle = le16_to_cpu(ev->handle);
+ 	conn->sid = HCI_SID_INVALID;
+ 
+-	mask |= hci_proto_connect_ind(hdev, &ev->bdaddr, BIS_LINK,
++	mask |= hci_proto_connect_ind(hdev, &ev->bdaddr, PA_LINK,
+ 				      &flags);
+ 	if (!(mask & HCI_LM_ACCEPT)) {
+ 		hci_le_pa_term_sync(hdev, ev->handle);
+@@ -6393,7 +6394,7 @@ static void hci_le_pa_sync_estabilished_
+ 		goto unlock;
+ 
+ 	/* Add connection to indicate PA sync event */
+-	pa_sync = hci_conn_add_unset(hdev, BIS_LINK, BDADDR_ANY,
++	pa_sync = hci_conn_add_unset(hdev, PA_LINK, BDADDR_ANY,
+ 				     HCI_ROLE_SLAVE);
+ 
+ 	if (IS_ERR(pa_sync))
+@@ -6424,7 +6425,7 @@ static void hci_le_per_adv_report_evt(st
+ 
+ 	hci_dev_lock(hdev);
+ 
+-	mask |= hci_proto_connect_ind(hdev, BDADDR_ANY, BIS_LINK, &flags);
++	mask |= hci_proto_connect_ind(hdev, BDADDR_ANY, PA_LINK, &flags);
+ 	if (!(mask & HCI_LM_ACCEPT))
+ 		goto unlock;
+ 
+--- a/net/bluetooth/hci_sync.c
++++ b/net/bluetooth/hci_sync.c
+@@ -2929,7 +2929,7 @@ static int hci_le_set_ext_scan_param_syn
+ 		if (sent) {
+ 			struct hci_conn *conn;
+ 
+-			conn = hci_conn_hash_lookup_ba(hdev, BIS_LINK,
++			conn = hci_conn_hash_lookup_ba(hdev, PA_LINK,
+ 						       &sent->bdaddr);
+ 			if (conn) {
+ 				struct bt_iso_qos *qos = &conn->iso_qos;
+@@ -5493,7 +5493,7 @@ static int hci_disconnect_sync(struct hc
+ {
+ 	struct hci_cp_disconnect cp;
+ 
+-	if (conn->type == BIS_LINK) {
++	if (conn->type == BIS_LINK || conn->type == PA_LINK) {
+ 		/* This is a BIS connection, hci_conn_del will
+ 		 * do the necessary cleanup.
+ 		 */
+@@ -5562,7 +5562,7 @@ static int hci_connect_cancel_sync(struc
+ 		return HCI_ERROR_LOCAL_HOST_TERM;
+ 	}
+ 
+-	if (conn->type == BIS_LINK) {
++	if (conn->type == BIS_LINK || conn->type == PA_LINK) {
+ 		/* There is no way to cancel a BIS without terminating the BIG
+ 		 * which is done later on connection cleanup.
+ 		 */
+@@ -5627,7 +5627,7 @@ static int hci_reject_conn_sync(struct h
+ 	if (conn->type == CIS_LINK)
+ 		return hci_le_reject_cis_sync(hdev, conn, reason);
+ 
+-	if (conn->type == BIS_LINK)
++	if (conn->type == BIS_LINK || conn->type == PA_LINK)
+ 		return -EINVAL;
+ 
+ 	if (conn->type == SCO_LINK || conn->type == ESCO_LINK)
+@@ -6995,7 +6995,7 @@ static void create_pa_complete(struct hc
+ 		goto unlock;
+ 
+ 	/* Add connection to indicate PA sync error */
+-	pa_sync = hci_conn_add_unset(hdev, BIS_LINK, BDADDR_ANY,
++	pa_sync = hci_conn_add_unset(hdev, PA_LINK, BDADDR_ANY,
+ 				     HCI_ROLE_SLAVE);
+ 
+ 	if (IS_ERR(pa_sync))
+--- a/net/bluetooth/iso.c
++++ b/net/bluetooth/iso.c
+@@ -2226,7 +2226,8 @@ done:
+ 
+ static void iso_connect_cfm(struct hci_conn *hcon, __u8 status)
+ {
+-	if (hcon->type != CIS_LINK && hcon->type != BIS_LINK) {
++	if (hcon->type != CIS_LINK && hcon->type != BIS_LINK &&
++	    hcon->type != PA_LINK) {
+ 		if (hcon->type != LE_LINK)
+ 			return;
+ 
+@@ -2267,7 +2268,8 @@ static void iso_connect_cfm(struct hci_c
+ 
+ static void iso_disconn_cfm(struct hci_conn *hcon, __u8 reason)
+ {
+-	if (hcon->type != CIS_LINK && hcon->type != BIS_LINK)
++	if (hcon->type != CIS_LINK && hcon->type !=  BIS_LINK &&
++	    hcon->type != PA_LINK)
+ 		return;
+ 
+ 	BT_DBG("hcon %p reason %d", hcon, reason);
+--- a/net/bluetooth/mgmt.c
++++ b/net/bluetooth/mgmt.c
+@@ -3239,6 +3239,7 @@ static u8 link_to_bdaddr(u8 link_type, u
+ 	switch (link_type) {
+ 	case CIS_LINK:
+ 	case BIS_LINK:
++	case PA_LINK:
+ 	case LE_LINK:
+ 		switch (addr_type) {
+ 		case ADDR_LE_DEV_PUBLIC:
