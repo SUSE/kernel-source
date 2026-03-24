@@ -1,0 +1,311 @@
+From: Smita Koralahalli <Smita.KoralahalliChannabasappa@amd.com>
+Date: Mon, 10 Mar 2025 22:38:38 +0000
+Subject: [PATCH] acpi/ghes, cxl/pci: Process CXL CPER Protocol Errors
+Git-commit: 36f257e3b0ba904f5a4e7fa8dafaa60e88cdd28c
+Patch-mainline: v6.15-rc1
+References: jsc#PED-15409
+
+When PCIe AER is in FW-First, OS should process CXL Protocol errors from
+CPER records. Introduce support for handling and logging CXL Protocol
+errors.
+
+The defined trace events cxl_aer_uncorrectable_error and
+cxl_aer_correctable_error trace native CXL AER endpoint errors. Reuse them
+to trace FW-First Protocol errors.
+
+Since the CXL code is required to be called from process context and
+GHES is in interrupt context, use workqueues for processing.
+
+Similar to CXL CPER event handling, use kfifo to handle errors as it
+simplifies queue processing by providing lock free fifo operations.
+
+Add the ability for the CXL sub-system to register a workqueue to
+process CXL CPER protocol errors.
+
+[DJ: return cxl_cper_register_prot_err_work() directly in cxl_ras_init()]
+
+Signed-off-by: Smita Koralahalli <Smita.KoralahalliChannabasappa@amd.com>
+Reviewed-by: Li Ming <ming.li@zohomail.com>
+Reviewed-by: Alison Schofield <alison.schofield@intel.com>
+Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+Reviewed-by: Tony Luck <tony.luck@intel.com>
+Link: https://patch.msgid.link/20250310223839.31342-2-Smita.KoralahalliChannabasappa@amd.com
+Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/acpi/apei/ghes.c  | 49 +++++++++++++++++++++++
+ drivers/cxl/core/Makefile |  1 +
+ drivers/cxl/core/core.h   |  3 ++
+ drivers/cxl/core/port.c   |  7 ++++
+ drivers/cxl/core/ras.c    | 82 +++++++++++++++++++++++++++++++++++++++
+ include/cxl/event.h       | 15 +++++++
+ tools/testing/cxl/Kbuild  |  1 +
+ 7 files changed, 158 insertions(+)
+ create mode 100644 drivers/cxl/core/ras.c
+
+diff --git a/drivers/acpi/apei/ghes.c b/drivers/acpi/apei/ghes.c
+index 4d725d988c43..289e365f84b2 100644
+--- a/drivers/acpi/apei/ghes.c
++++ b/drivers/acpi/apei/ghes.c
+@@ -674,6 +674,15 @@ static void ghes_defer_non_standard_event(struct acpi_hest_generic_data *gdata,
+ 	schedule_work(&entry->work);
+ }
+ 
++/* Room for 8 entries */
++#define CXL_CPER_PROT_ERR_FIFO_DEPTH 8
++static DEFINE_KFIFO(cxl_cper_prot_err_fifo, struct cxl_cper_prot_err_work_data,
++		    CXL_CPER_PROT_ERR_FIFO_DEPTH);
++
++/* Synchronize schedule_work() with cxl_cper_prot_err_work changes */
++static DEFINE_SPINLOCK(cxl_cper_prot_err_work_lock);
++struct work_struct *cxl_cper_prot_err_work;
++
+ static void cxl_cper_post_prot_err(struct cxl_cper_sec_prot_err *prot_err,
+ 				   int severity)
+ {
+@@ -700,6 +709,11 @@ static void cxl_cper_post_prot_err(struct cxl_cper_sec_prot_err *prot_err,
+ 	if (!(prot_err->valid_bits & PROT_ERR_VALID_SERIAL_NUMBER))
+ 		pr_warn(FW_WARN "CXL CPER no device serial number\n");
+ 
++	guard(spinlock_irqsave)(&cxl_cper_prot_err_work_lock);
++
++	if (!cxl_cper_prot_err_work)
++		return;
++
+ 	switch (prot_err->agent_type) {
+ 	case RCD:
+ 	case DEVICE:
+@@ -721,9 +735,44 @@ static void cxl_cper_post_prot_err(struct cxl_cper_sec_prot_err *prot_err,
+ 				   prot_err->agent_type);
+ 		return;
+ 	}
++
++	if (!kfifo_put(&cxl_cper_prot_err_fifo, wd)) {
++		pr_err_ratelimited("CXL CPER kfifo overflow\n");
++		return;
++	}
++
++	schedule_work(cxl_cper_prot_err_work);
+ #endif
+ }
+ 
++int cxl_cper_register_prot_err_work(struct work_struct *work)
++{
++	if (cxl_cper_prot_err_work)
++		return -EINVAL;
++
++	guard(spinlock)(&cxl_cper_prot_err_work_lock);
++	cxl_cper_prot_err_work = work;
++	return 0;
++}
++EXPORT_SYMBOL_NS_GPL(cxl_cper_register_prot_err_work, CXL);
++
++int cxl_cper_unregister_prot_err_work(struct work_struct *work)
++{
++	if (cxl_cper_prot_err_work != work)
++		return -EINVAL;
++
++	guard(spinlock)(&cxl_cper_prot_err_work_lock);
++	cxl_cper_prot_err_work = NULL;
++	return 0;
++}
++EXPORT_SYMBOL_NS_GPL(cxl_cper_unregister_prot_err_work, CXL);
++
++int cxl_cper_prot_err_kfifo_get(struct cxl_cper_prot_err_work_data *wd)
++{
++	return kfifo_get(&cxl_cper_prot_err_fifo, wd);
++}
++EXPORT_SYMBOL_NS_GPL(cxl_cper_prot_err_kfifo_get, CXL);
++
+ /* Room for 8 entries for each of the 4 event log queues */
+ #define CXL_CPER_FIFO_DEPTH 32
+ DEFINE_KFIFO(cxl_cper_fifo, struct cxl_cper_work_data, CXL_CPER_FIFO_DEPTH);
+diff --git a/drivers/cxl/core/Makefile b/drivers/cxl/core/Makefile
+index 9259bcc6773c..ba5f0916d379 100644
+--- a/drivers/cxl/core/Makefile
++++ b/drivers/cxl/core/Makefile
+@@ -14,6 +14,7 @@ cxl_core-y += pci.o
+ cxl_core-y += hdm.o
+ cxl_core-y += pmu.o
+ cxl_core-y += cdat.o
++cxl_core-y += ras.o
+ cxl_core-$(CONFIG_TRACING) += trace.o
+ cxl_core-$(CONFIG_CXL_REGION) += region.o
+ cxl_core-$(CONFIG_CXL_FEATURES) += features.o
+diff --git a/drivers/cxl/core/core.h b/drivers/cxl/core/core.h
+index 800466f96a68..c87dbfcc9403 100644
+--- a/drivers/cxl/core/core.h
++++ b/drivers/cxl/core/core.h
+@@ -115,6 +115,9 @@ bool cxl_need_node_perf_attrs_update(int nid);
+ int cxl_port_get_switch_dport_bandwidth(struct cxl_port *port,
+ 					struct access_coordinate *c);
+ 
++int cxl_ras_init(void);
++void cxl_ras_exit(void);
++
+ #ifdef CONFIG_CXL_FEATURES
+ size_t cxl_get_feature(struct cxl_mailbox *cxl_mbox, const uuid_t *feat_uuid,
+ 		       enum cxl_get_feat_selection selection,
+diff --git a/drivers/cxl/core/port.c b/drivers/cxl/core/port.c
+index 78a5c2c25982..7ed6e8f374af 100644
+--- a/drivers/cxl/core/port.c
++++ b/drivers/cxl/core/port.c
+@@ -2339,8 +2339,14 @@ static __init int cxl_core_init(void)
+ 	if (rc)
+ 		goto err_region;
+ 
++	rc = cxl_ras_init();
++	if (rc)
++		goto err_ras;
++
+ 	return 0;
+ 
++err_ras:
++	cxl_region_exit();
+ err_region:
+ 	bus_unregister(&cxl_bus_type);
+ err_bus:
+@@ -2352,6 +2358,7 @@ static __init int cxl_core_init(void)
+ 
+ static void cxl_core_exit(void)
+ {
++	cxl_ras_exit();
+ 	cxl_region_exit();
+ 	bus_unregister(&cxl_bus_type);
+ 	destroy_workqueue(cxl_bus_wq);
+diff --git a/drivers/cxl/core/ras.c b/drivers/cxl/core/ras.c
+new file mode 100644
+index 000000000000..91273af6ccbc
+--- /dev/null
++++ b/drivers/cxl/core/ras.c
+@@ -0,0 +1,82 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Copyright(c) 2025 AMD Corporation. All rights reserved. */
++
++#include <linux/pci.h>
++#include <linux/aer.h>
++#include <cxl/event.h>
++#include <cxlmem.h>
++#include "trace.h"
++
++static void cxl_cper_trace_corr_prot_err(struct pci_dev *pdev,
++				  struct cxl_ras_capability_regs ras_cap)
++{
++	u32 status = ras_cap.cor_status & ~ras_cap.cor_mask;
++	struct cxl_dev_state *cxlds;
++
++	cxlds = pci_get_drvdata(pdev);
++	if (!cxlds)
++		return;
++
++	trace_cxl_aer_correctable_error(cxlds->cxlmd, status);
++}
++
++static void cxl_cper_trace_uncorr_prot_err(struct pci_dev *pdev,
++				    struct cxl_ras_capability_regs ras_cap)
++{
++	u32 status = ras_cap.uncor_status & ~ras_cap.uncor_mask;
++	struct cxl_dev_state *cxlds;
++	u32 fe;
++
++	cxlds = pci_get_drvdata(pdev);
++	if (!cxlds)
++		return;
++
++	if (hweight32(status) > 1)
++		fe = BIT(FIELD_GET(CXL_RAS_CAP_CONTROL_FE_MASK,
++				   ras_cap.cap_control));
++	else
++		fe = status;
++
++	trace_cxl_aer_uncorrectable_error(cxlds->cxlmd, status, fe,
++					  ras_cap.header_log);
++}
++
++static void cxl_cper_handle_prot_err(struct cxl_cper_prot_err_work_data *data)
++{
++	unsigned int devfn = PCI_DEVFN(data->prot_err.agent_addr.device,
++				       data->prot_err.agent_addr.function);
++	struct pci_dev *pdev __free(pci_dev_put) =
++		pci_get_domain_bus_and_slot(data->prot_err.agent_addr.segment,
++					    data->prot_err.agent_addr.bus,
++					    devfn);
++
++	if (!pdev)
++		return;
++
++	guard(device)(&pdev->dev);
++
++	if (data->severity == AER_CORRECTABLE)
++		cxl_cper_trace_corr_prot_err(pdev, data->ras_cap);
++	else
++		cxl_cper_trace_uncorr_prot_err(pdev, data->ras_cap);
++}
++
++static void cxl_cper_prot_err_work_fn(struct work_struct *work)
++{
++	struct cxl_cper_prot_err_work_data wd;
++
++	while (cxl_cper_prot_err_kfifo_get(&wd))
++		cxl_cper_handle_prot_err(&wd);
++}
++static DECLARE_WORK(cxl_cper_prot_err_work, cxl_cper_prot_err_work_fn);
++
++int cxl_ras_init(void)
++{
++	return cxl_cper_register_prot_err_work(&cxl_cper_prot_err_work);
++}
++
++void cxl_ras_exit(void)
++{
++	cxl_cper_unregister_prot_err_work(&cxl_cper_prot_err_work);
++	cancel_work_sync(&cxl_cper_prot_err_work);
++}
+diff --git a/include/cxl/event.h b/include/cxl/event.h
+index 8381a07052d0..f9ae1796da85 100644
+--- a/include/cxl/event.h
++++ b/include/cxl/event.h
+@@ -254,6 +254,9 @@ struct cxl_cper_prot_err_work_data {
+ int cxl_cper_register_work(struct work_struct *work);
+ int cxl_cper_unregister_work(struct work_struct *work);
+ int cxl_cper_kfifo_get(struct cxl_cper_work_data *wd);
++int cxl_cper_register_prot_err_work(struct work_struct *work);
++int cxl_cper_unregister_prot_err_work(struct work_struct *work);
++int cxl_cper_prot_err_kfifo_get(struct cxl_cper_prot_err_work_data *wd);
+ #else
+ static inline int cxl_cper_register_work(struct work_struct *work)
+ {
+@@ -268,6 +271,18 @@ static inline int cxl_cper_kfifo_get(struct cxl_cper_work_data *wd)
+ {
+ 	return 0;
+ }
++static inline int cxl_cper_register_prot_err_work(struct work_struct *work)
++{
++	return 0;
++}
++static inline int cxl_cper_unregister_prot_err_work(struct work_struct *work)
++{
++	return 0;
++}
++static inline int cxl_cper_prot_err_kfifo_get(struct cxl_cper_prot_err_work_data *wd)
++{
++	return 0;
++}
+ #endif
+ 
+ #endif /* _LINUX_CXL_EVENT_H */
+diff --git a/tools/testing/cxl/Kbuild b/tools/testing/cxl/Kbuild
+index b1256fee3567..3d71447c0bd8 100644
+--- a/tools/testing/cxl/Kbuild
++++ b/tools/testing/cxl/Kbuild
+@@ -61,6 +61,7 @@ cxl_core-y += $(CXL_CORE_SRC)/pci.o
+ cxl_core-y += $(CXL_CORE_SRC)/hdm.o
+ cxl_core-y += $(CXL_CORE_SRC)/pmu.o
+ cxl_core-y += $(CXL_CORE_SRC)/cdat.o
++cxl_core-y += $(CXL_CORE_SRC)/ras.o
+ cxl_core-$(CONFIG_TRACING) += $(CXL_CORE_SRC)/trace.o
+ cxl_core-$(CONFIG_CXL_REGION) += $(CXL_CORE_SRC)/region.o
+ cxl_core-$(CONFIG_CXL_FEATURES) += $(CXL_CORE_SRC)/features.o
+-- 
+2.43.0
+
