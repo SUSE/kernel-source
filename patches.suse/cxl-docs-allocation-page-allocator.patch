@@ -1,0 +1,125 @@
+From: Gregory Price <gourry@gourry.net>
+Date: Mon, 12 May 2025 12:21:31 -0400
+Subject: [PATCH] cxl: docs/allocation/page-allocator
+Git-commit: 419dc40b82374cc7c417f0af613b9e6ea1d34095
+Patch-mainline: v6.16-rc1
+References: jsc#PED-15409
+
+Document some interesting interactions that occur when exposing CXL
+memory capacity to page allocator.
+
+Signed-off-by: Gregory Price <gourry@gourry.net>
+Link: https://patch.msgid.link/20250512162134.3596150-15-gourry@gourry.net
+Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ .../cxl/allocation/page-allocator.rst         | 85 +++++++++++++++++++
+ Documentation/driver-api/cxl/index.rst        |  1 +
+ 2 files changed, 86 insertions(+)
+ create mode 100644 Documentation/driver-api/cxl/allocation/page-allocator.rst
+
+diff --git a/Documentation/driver-api/cxl/allocation/page-allocator.rst b/Documentation/driver-api/cxl/allocation/page-allocator.rst
+new file mode 100644
+index 000000000000..7b8fe1b8d5bb
+--- /dev/null
++++ b/Documentation/driver-api/cxl/allocation/page-allocator.rst
+@@ -0,0 +1,85 @@
++.. SPDX-License-Identifier: GPL-2.0
++
++==================
++The Page Allocator
++==================
++
++The kernel page allocator services all general page allocation requests, such
++as :code:`kmalloc`.  CXL configuration steps affect the behavior of the page
++allocator based on the selected `Memory Zone` and `NUMA node` the capacity is
++placed in.
++
++This section mostly focuses on how these configurations affect the page
++allocator (as of Linux v6.15) rather than the overall page allocator behavior.
++
++NUMA nodes and mempolicy
++========================
++Unless a task explicitly registers a mempolicy, the default memory policy
++of the linux kernel is to allocate memory from the `local NUMA node` first,
++and fall back to other nodes only if the local node is pressured.
++
++Generally, we expect to see local DRAM and CXL memory on separate NUMA nodes,
++with the CXL memory being non-local.  Technically, however, it is possible
++for a compute node to have no local DRAM, and for CXL memory to be the
++`local` capacity for that compute node.
++
++
++Memory Zones
++============
++CXL capacity may be onlined in :code:`ZONE_NORMAL` or :code:`ZONE_MOVABLE`.
++
++As of v6.15, the page allocator attempts to allocate from the highest
++available and compatible ZONE for an allocation from the local node first.
++
++An example of a `zone incompatibility` is attempting to service an allocation
++marked :code:`GFP_KERNEL` from :code:`ZONE_MOVABLE`.  Kernel allocations are
++typically not migratable, and as a result can only be serviced from
++:code:`ZONE_NORMAL` or lower.
++
++To simplify this, the page allocator will prefer :code:`ZONE_MOVABLE` over
++:code:`ZONE_NORMAL` by default, but if :code:`ZONE_MOVABLE` is depleted, it
++will fallback to allocate from :code:`ZONE_NORMAL`.
++
++
++Zone and Node Quirks
++====================
++Let's consider a configuration where the local DRAM capacity is largely onlined
++into :code:`ZONE_NORMAL`, with no :code:`ZONE_MOVABLE` capacity present. The
++CXL capacity has the opposite configuration - all onlined in
++:code:`ZONE_MOVABLE`.
++
++Under the default allocation policy, the page allocator will completely skip
++:code:`ZONE_MOVABLE` as a valid allocation target.  This is because, as of
++Linux v6.15, the page allocator does (approximately) the following: ::
++
++  for (each zone in local_node):
++
++    for (each node in fallback_order):
++
++      attempt_allocation(gfp_flags);
++
++Because the local node does not have :code:`ZONE_MOVABLE`, the CXL node is
++functionally unreachable for direct allocation.  As a result, the only way
++for CXL capacity to be used is via `demotion` in the reclaim path.
++
++This configuration also means that if the DRAM ndoe has :code:`ZONE_MOVABLE`
++capacity - when that capacity is depleted, the page allocator will actually
++prefer CXL :code:`ZONE_MOVABLE` pages over DRAM :code:`ZONE_NORMAL` pages.
++
++We may wish to invert this priority in future Linux versions.
++
++If `demotion` and `swap` are disabled, Linux will begin to cause OOM crashes
++when the DRAM nodes are depleted. See the reclaim section for more details.
++
++
++CGroups and CPUSets
++===================
++Finally, assuming CXL memory is reachable via the page allocation (i.e. onlined
++in :code:`ZONE_NORMAL`), the :code:`cpusets.mems_allowed` may be used by
++containers to limit the accessibility of certain NUMA nodes for tasks in that
++container.  Users may wish to utilize this in multi-tenant systems where some
++tasks prefer not to use slower memory.
++
++In the reclaim section we'll discuss some limitations of this interface to
++prevent demotions of shared data to CXL memory (if demotions are enabled).
++
+diff --git a/Documentation/driver-api/cxl/index.rst b/Documentation/driver-api/cxl/index.rst
+index 6e7497f4811a..7acab7e7df96 100644
+--- a/Documentation/driver-api/cxl/index.rst
++++ b/Documentation/driver-api/cxl/index.rst
+@@ -45,5 +45,6 @@ that have impacts on each other.  The docs here break up configurations steps.
+    :caption: Memory Allocation
+ 
+    allocation/dax
++   allocation/page-allocator
+ 
+ .. only::  subproject and html
+-- 
+2.43.0
+
