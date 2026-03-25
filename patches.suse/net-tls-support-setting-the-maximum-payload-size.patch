@@ -1,0 +1,244 @@
+From: Wilfred Mallawa <wilfred.mallawa@wdc.com>
+Date: Wed, 22 Oct 2025 10:19:36 +1000
+Subject: net/tls: support setting the maximum payload size
+Patch-mainline: v6.19-rc1
+Git-commit: 82cb5be6ad64198a3a028aeb49dcc7f6224d558a
+References: jsc#PED-16011
+
+During a handshake, an endpoint may specify a maximum record size limit.
+Currently, the kernel defaults to TLS_MAX_PAYLOAD_SIZE (16KB) for the
+maximum record size. Meaning that, the outgoing records from the kernel
+can exceed a lower size negotiated during the handshake. In such a case,
+the TLS endpoint must send a fatal "record_overflow" alert [1], and
+thus the record is discarded.
+
+Upcoming Western Digital NVMe-TCP hardware controllers implement TLS
+support. For these devices, supporting TLS record size negotiation is
+necessary because the maximum TLS record size supported by the controller
+is less than the default 16KB currently used by the kernel.
+
+Currently, there is no way to inform the kernel of such a limit. This patch
+adds support to a new setsockopt() option `TLS_TX_MAX_PAYLOAD_LEN` that
+allows for setting the maximum plaintext fragment size. Once set, outgoing
+records are no larger than the size specified. This option can be used to
+specify the record size limit.
+
+[1] https://www.rfc-editor.org/rfc/rfc8449
+
+Signed-off-by: Wilfred Mallawa <wilfred.mallawa@wdc.com>
+Reviewed-by: Sabrina Dubroca <sd@queasysnail.net>
+Link: https://patch.msgid.link/20251022001937.20155-1-wilfred.opensource@gmail.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Pedro Falcato <pfalcato@suse.de>
+---
+ Documentation/networking/tls.rst |   20 ++++++++++++
+ include/net/tls.h                |    3 +
+ include/uapi/linux/tls.h         |    2 +
+ net/tls/tls_device.c             |    2 -
+ net/tls/tls_main.c               |   64 +++++++++++++++++++++++++++++++++++++++
+ net/tls/tls_sw.c                 |    2 -
+ 6 files changed, 91 insertions(+), 2 deletions(-)
+
+--- a/Documentation/networking/tls.rst
++++ b/Documentation/networking/tls.rst
+@@ -252,6 +252,26 @@ If the record decrypted turns out to had
+ record it will be decrypted again into a kernel buffer without zero copy.
+ Such events are counted in the ``TlsDecryptRetry`` statistic.
+ 
++TLS_TX_MAX_PAYLOAD_LEN
++~~~~~~~~~~~~~~~~~~~~~~
++
++Specifies the maximum size of the plaintext payload for transmitted TLS records.
++
++When this option is set, the kernel enforces the specified limit on all outgoing
++TLS records. No plaintext fragment will exceed this size. This option can be used
++to implement the TLS Record Size Limit extension [1].
++
++* For TLS 1.2, the value corresponds directly to the record size limit.
++* For TLS 1.3, the value should be set to record_size_limit - 1, since
++  the record size limit includes one additional byte for the ContentType
++  field.
++
++The valid range for this option is 64 to 16384 bytes for TLS 1.2, and 63 to
++16384 bytes for TLS 1.3. The lower minimum for TLS 1.3 accounts for the
++extra byte used by the ContentType field.
++
++[1] https://datatracker.ietf.org/doc/html/rfc8449
++
+ Statistics
+ ==========
+ 
+--- a/include/net/tls.h
++++ b/include/net/tls.h
+@@ -53,6 +53,8 @@ struct tls_rec;
+ 
+ /* Maximum data size carried in a TLS record */
+ #define TLS_MAX_PAYLOAD_SIZE		((size_t)1 << 14)
++/* Minimum record size limit as per RFC8449 */
++#define TLS_MIN_RECORD_SIZE_LIM		((size_t)1 << 6)
+ 
+ #define TLS_HEADER_SIZE			5
+ #define TLS_NONCE_OFFSET		TLS_HEADER_SIZE
+@@ -226,6 +228,7 @@ struct tls_context {
+ 	u8 rx_conf:3;
+ 	u8 zerocopy_sendfile:1;
+ 	u8 rx_no_pad:1;
++	u16 tx_max_payload_len;
+ 
+ 	int (*push_pending_record)(struct sock *sk, int flags);
+ 	void (*sk_write_space)(struct sock *sk);
+--- a/include/uapi/linux/tls.h
++++ b/include/uapi/linux/tls.h
+@@ -41,6 +41,7 @@
+ #define TLS_RX			2	/* Set receive parameters */
+ #define TLS_TX_ZEROCOPY_RO	3	/* TX zerocopy (only sendfile now) */
+ #define TLS_RX_EXPECT_NO_PAD	4	/* Attempt opportunistic zero-copy */
++#define TLS_TX_MAX_PAYLOAD_LEN	5	/* Maximum plaintext size */
+ 
+ /* Supported versions */
+ #define TLS_VERSION_MINOR(ver)	((ver) & 0xFF)
+@@ -194,6 +195,7 @@ enum {
+ 	TLS_INFO_RXCONF,
+ 	TLS_INFO_ZC_RO_TX,
+ 	TLS_INFO_RX_NO_PAD,
++	TLS_INFO_TX_MAX_PAYLOAD_LEN,
+ 	__TLS_INFO_MAX,
+ };
+ #define TLS_INFO_MAX (__TLS_INFO_MAX - 1)
+--- a/net/tls/tls_device.c
++++ b/net/tls/tls_device.c
+@@ -461,7 +461,7 @@ static int tls_push_data(struct sock *sk
+ 	/* TLS_HEADER_SIZE is not counted as part of the TLS record, and
+ 	 * we need to leave room for an authentication tag.
+ 	 */
+-	max_open_record_len = TLS_MAX_PAYLOAD_SIZE +
++	max_open_record_len = tls_ctx->tx_max_payload_len +
+ 			      prot->prepend_size;
+ 	do {
+ 		rc = tls_do_allocation(sk, ctx, pfrag, prot->prepend_size);
+--- a/net/tls/tls_main.c
++++ b/net/tls/tls_main.c
+@@ -541,6 +541,28 @@ static int do_tls_getsockopt_no_pad(stru
+ 	return 0;
+ }
+ 
++static int do_tls_getsockopt_tx_payload_len(struct sock *sk, char __user *optval,
++					    int __user *optlen)
++{
++	struct tls_context *ctx = tls_get_ctx(sk);
++	u16 payload_len = ctx->tx_max_payload_len;
++	int len;
++
++	if (get_user(len, optlen))
++		return -EFAULT;
++
++	if (len < sizeof(payload_len))
++		return -EINVAL;
++
++	if (put_user(sizeof(payload_len), optlen))
++		return -EFAULT;
++
++	if (copy_to_user(optval, &payload_len, sizeof(payload_len)))
++		return -EFAULT;
++
++	return 0;
++}
++
+ static int do_tls_getsockopt(struct sock *sk, int optname,
+ 			     char __user *optval, int __user *optlen)
+ {
+@@ -560,6 +582,9 @@ static int do_tls_getsockopt(struct sock
+ 	case TLS_RX_EXPECT_NO_PAD:
+ 		rc = do_tls_getsockopt_no_pad(sk, optval, optlen);
+ 		break;
++	case TLS_TX_MAX_PAYLOAD_LEN:
++		rc = do_tls_getsockopt_tx_payload_len(sk, optval, optlen);
++		break;
+ 	default:
+ 		rc = -ENOPROTOOPT;
+ 		break;
+@@ -809,6 +834,32 @@ static int do_tls_setsockopt_no_pad(stru
+ 	return rc;
+ }
+ 
++static int do_tls_setsockopt_tx_payload_len(struct sock *sk, sockptr_t optval,
++					    unsigned int optlen)
++{
++	struct tls_context *ctx = tls_get_ctx(sk);
++	struct tls_sw_context_tx *sw_ctx = tls_sw_ctx_tx(ctx);
++	u16 value;
++	bool tls_13 = ctx->prot_info.version == TLS_1_3_VERSION;
++
++	if (sw_ctx && sw_ctx->open_rec)
++		return -EBUSY;
++
++	if (sockptr_is_null(optval) || optlen != sizeof(value))
++		return -EINVAL;
++
++	if (copy_from_sockptr(&value, optval, sizeof(value)))
++		return -EFAULT;
++
++	if (value < TLS_MIN_RECORD_SIZE_LIM - (tls_13 ? 1 : 0) ||
++	    value > TLS_MAX_PAYLOAD_SIZE)
++		return -EINVAL;
++
++	ctx->tx_max_payload_len = value;
++
++	return 0;
++}
++
+ static int do_tls_setsockopt(struct sock *sk, int optname, sockptr_t optval,
+ 			     unsigned int optlen)
+ {
+@@ -830,6 +881,11 @@ static int do_tls_setsockopt(struct sock
+ 	case TLS_RX_EXPECT_NO_PAD:
+ 		rc = do_tls_setsockopt_no_pad(sk, optval, optlen);
+ 		break;
++	case TLS_TX_MAX_PAYLOAD_LEN:
++		lock_sock(sk);
++		rc = do_tls_setsockopt_tx_payload_len(sk, optval, optlen);
++		release_sock(sk);
++		break;
+ 	default:
+ 		rc = -ENOPROTOOPT;
+ 		break;
+@@ -1019,6 +1075,7 @@ static int tls_init(struct sock *sk)
+ 
+ 	ctx->tx_conf = TLS_BASE;
+ 	ctx->rx_conf = TLS_BASE;
++	ctx->tx_max_payload_len = TLS_MAX_PAYLOAD_SIZE;
+ 	update_sk_prot(sk, ctx);
+ out:
+ 	write_unlock_bh(&sk->sk_callback_lock);
+@@ -1108,6 +1165,12 @@ static int tls_get_info(struct sock *sk,
+ 			goto nla_failure;
+ 	}
+ 
++	err = nla_put_u16(skb, TLS_INFO_TX_MAX_PAYLOAD_LEN,
++			  ctx->tx_max_payload_len);
++
++	if (err)
++		goto nla_failure;
++
+ 	rcu_read_unlock();
+ 	nla_nest_end(skb, start);
+ 	return 0;
+@@ -1129,6 +1192,7 @@ static size_t tls_get_info_size(const st
+ 		nla_total_size(sizeof(u16)) +	/* TLS_INFO_TXCONF */
+ 		nla_total_size(0) +		/* TLS_INFO_ZC_RO_TX */
+ 		nla_total_size(0) +		/* TLS_INFO_RX_NO_PAD */
++		nla_total_size(sizeof(u16)) +   /* TLS_INFO_TX_MAX_PAYLOAD_LEN */
+ 		0;
+ 
+ 	return size;
+--- a/net/tls/tls_sw.c
++++ b/net/tls/tls_sw.c
+@@ -1079,7 +1079,7 @@ static int tls_sw_sendmsg_locked(struct
+ 		orig_size = msg_pl->sg.size;
+ 		full_record = false;
+ 		try_to_copy = msg_data_left(msg);
+-		record_room = TLS_MAX_PAYLOAD_SIZE - msg_pl->sg.size;
++		record_room = tls_ctx->tx_max_payload_len - msg_pl->sg.size;
+ 		if (try_to_copy >= record_room) {
+ 			try_to_copy = record_room;
+ 			full_record = true;
