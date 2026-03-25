@@ -1,0 +1,76 @@
+From: Hyunwoo Kim <imv4bel@gmail.com>
+Date: Wed, 11 Mar 2026 03:18:09 +0900
+Subject: [PATCH] bridge: cfm: Fix race condition in peer_mep deletion
+References: bsc#1258210
+Patch-mainline: 6.18.20
+Git-commit: 3715a00855316066cdda69d43648336367422127
+
+[ Upstream commit 3715a00855316066cdda69d43648336367422127 ]
+
+When a peer MEP is being deleted, cancel_delayed_work_sync() is called
+on ccm_rx_dwork before freeing. However, br_cfm_frame_rx() runs in
+softirq context under rcu_read_lock (without RTNL) and can re-schedule
+ccm_rx_dwork via ccm_rx_timer_start() between cancel_delayed_work_sync()
+returning and kfree_rcu() being called.
+
+The following is a simple race scenario:
+
+           cpu0                                     cpu1
+
+mep_delete_implementation()
+  cancel_delayed_work_sync(ccm_rx_dwork);
+                                           br_cfm_frame_rx()
+                                             // peer_mep still in hlist
+                                             if (peer_mep->ccm_defect)
+                                               ccm_rx_timer_start()
+                                                 queue_delayed_work(ccm_rx_dwork)
+  hlist_del_rcu(&peer_mep->head);
+  kfree_rcu(peer_mep, rcu);
+                                           ccm_rx_work_expired()
+                                             // on freed peer_mep
+
+To prevent this, cancel_delayed_work_sync() is replaced with
+disable_delayed_work_sync() in both peer MEP deletion paths, so
+that subsequent queue_delayed_work() calls from br_cfm_frame_rx()
+are silently rejected.
+
+The cc_peer_disable() helper retains cancel_delayed_work_sync()
+because it is also used for the CC enable/disable toggle path where
+the work must remain re-schedulable.
+
+Fixes: dc32cbb3dbd7 ("bridge: cfm: Kernel space implementation of CFM. CCM frame RX added.")
+Signed-off-by: Hyunwoo Kim <imv4bel@gmail.com>
+Reviewed-by: Ido Schimmel <idosch@nvidia.com>
+Link: https://patch.msgid.link/abBgYT5K_FI9rD1a@v4bel
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ net/bridge/br_cfm.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/net/bridge/br_cfm.c b/net/bridge/br_cfm.c
+index c2c1c7d44c61..f4ca77d9b0e9 100644
+--- a/net/bridge/br_cfm.c
++++ b/net/bridge/br_cfm.c
+@@ -576,7 +576,7 @@ static void mep_delete_implementation(struct net_bridge *br,
+ 
+ 	/* Empty and free peer MEP list */
+ 	hlist_for_each_entry_safe(peer_mep, n_store, &mep->peer_mep_list, head) {
+-		cancel_delayed_work_sync(&peer_mep->ccm_rx_dwork);
++		disable_delayed_work_sync(&peer_mep->ccm_rx_dwork);
+ 		hlist_del_rcu(&peer_mep->head);
+ 		kfree_rcu(peer_mep, rcu);
+ 	}
+@@ -732,7 +732,7 @@ int br_cfm_cc_peer_mep_remove(struct net_bridge *br, const u32 instance,
+ 		return -ENOENT;
+ 	}
+ 
+-	cc_peer_disable(peer_mep);
++	disable_delayed_work_sync(&peer_mep->ccm_rx_dwork);
+ 
+ 	hlist_del_rcu(&peer_mep->head);
+ 	kfree_rcu(peer_mep, rcu);
+-- 
+2.51.0
+

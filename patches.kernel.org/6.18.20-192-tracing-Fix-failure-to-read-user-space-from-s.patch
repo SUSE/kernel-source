@@ -1,0 +1,107 @@
+From: Steven Rostedt <rostedt@goodmis.org>
+Date: Mon, 16 Mar 2026 13:07:34 -0400
+Subject: [PATCH] tracing: Fix failure to read user space from system call
+ trace events
+References: bsc#1258210
+Patch-mainline: 6.18.20
+Git-commit: edca33a56297d5741ccf867669debec116681987
+
+commit edca33a56297d5741ccf867669debec116681987 upstream.
+
+The system call trace events call trace_user_fault_read() to read the user
+space part of some system calls. This is done by grabbing a per-cpu
+buffer, disabling migration, enabling preemption, calling
+copy_from_user(), disabling preemption, enabling migration and checking if
+the task was preempted while preemption was enabled. If it was, the buffer
+is considered corrupted and it tries again.
+
+There's a safety mechanism that will fail out of this loop if it fails 100
+times (with a warning). That warning message was triggered in some
+pi_futex stress tests. Enabling the sched_switch trace event and
+traceoff_on_warning, showed the problem:
+
+ pi_mutex_hammer-1375    [006] d..21   138.981648: sched_switch: prev_comm=pi_mutex_hammer prev_pid=1375 prev_prio=95 prev_state=R+ ==> next_comm=migration/6 next_pid=47 next_prio=0
+     migration/6-47      [006] d..2.   138.981651: sched_switch: prev_comm=migration/6 prev_pid=47 prev_prio=0 prev_state=S ==> next_comm=pi_mutex_hammer next_pid=1375 next_prio=95
+ pi_mutex_hammer-1375    [006] d..21   138.981656: sched_switch: prev_comm=pi_mutex_hammer prev_pid=1375 prev_prio=95 prev_state=R+ ==> next_comm=migration/6 next_pid=47 next_prio=0
+     migration/6-47      [006] d..2.   138.981659: sched_switch: prev_comm=migration/6 prev_pid=47 prev_prio=0 prev_state=S ==> next_comm=pi_mutex_hammer next_pid=1375 next_prio=95
+ pi_mutex_hammer-1375    [006] d..21   138.981664: sched_switch: prev_comm=pi_mutex_hammer prev_pid=1375 prev_prio=95 prev_state=R+ ==> next_comm=migration/6 next_pid=47 next_prio=0
+     migration/6-47      [006] d..2.   138.981667: sched_switch: prev_comm=migration/6 prev_pid=47 prev_prio=0 prev_state=S ==> next_comm=pi_mutex_hammer next_pid=1375 next_prio=95
+ pi_mutex_hammer-1375    [006] d..21   138.981671: sched_switch: prev_comm=pi_mutex_hammer prev_pid=1375 prev_prio=95 prev_state=R+ ==> next_comm=migration/6 next_pid=47 next_prio=0
+     migration/6-47      [006] d..2.   138.981675: sched_switch: prev_comm=migration/6 prev_pid=47 prev_prio=0 prev_state=S ==> next_comm=pi_mutex_hammer next_pid=1375 next_prio=95
+ pi_mutex_hammer-1375    [006] d..21   138.981679: sched_switch: prev_comm=pi_mutex_hammer prev_pid=1375 prev_prio=95 prev_state=R+ ==> next_comm=migration/6 next_pid=47 next_prio=0
+     migration/6-47      [006] d..2.   138.981682: sched_switch: prev_comm=migration/6 prev_pid=47 prev_prio=0 prev_state=S ==> next_comm=pi_mutex_hammer next_pid=1375 next_prio=95
+ pi_mutex_hammer-1375    [006] d..21   138.981687: sched_switch: prev_comm=pi_mutex_hammer prev_pid=1375 prev_prio=95 prev_state=R+ ==> next_comm=migration/6 next_pid=47 next_prio=0
+     migration/6-47      [006] d..2.   138.981690: sched_switch: prev_comm=migration/6 prev_pid=47 prev_prio=0 prev_state=S ==> next_comm=pi_mutex_hammer next_pid=1375 next_prio=95
+ pi_mutex_hammer-1375    [006] d..21   138.981695: sched_switch: prev_comm=pi_mutex_hammer prev_pid=1375 prev_prio=95 prev_state=R+ ==> next_comm=migration/6 next_pid=47 next_prio=0
+     migration/6-47      [006] d..2.   138.981698: sched_switch: prev_comm=migration/6 prev_pid=47 prev_prio=0 prev_state=S ==> next_comm=pi_mutex_hammer next_pid=1375 next_prio=95
+ pi_mutex_hammer-1375    [006] d..21   138.981703: sched_switch: prev_comm=pi_mutex_hammer prev_pid=1375 prev_prio=95 prev_state=R+ ==> next_comm=migration/6 next_pid=47 next_prio=0
+     migration/6-47      [006] d..2.   138.981706: sched_switch: prev_comm=migration/6 prev_pid=47 prev_prio=0 prev_state=S ==> next_comm=pi_mutex_hammer next_pid=1375 next_prio=95
+ pi_mutex_hammer-1375    [006] d..21   138.981711: sched_switch: prev_comm=pi_mutex_hammer prev_pid=1375 prev_prio=95 prev_state=R+ ==> next_comm=migration/6 next_pid=47 next_prio=0
+     migration/6-47      [006] d..2.   138.981714: sched_switch: prev_comm=migration/6 prev_pid=47 prev_prio=0 prev_state=S ==> next_comm=pi_mutex_hammer next_pid=1375 next_prio=95
+ pi_mutex_hammer-1375    [006] d..21   138.981719: sched_switch: prev_comm=pi_mutex_hammer prev_pid=1375 prev_prio=95 prev_state=R+ ==> next_comm=migration/6 next_pid=47 next_prio=0
+     migration/6-47      [006] d..2.   138.981722: sched_switch: prev_comm=migration/6 prev_pid=47 prev_prio=0 prev_state=S ==> next_comm=pi_mutex_hammer next_pid=1375 next_prio=95
+ pi_mutex_hammer-1375    [006] d..21   138.981727: sched_switch: prev_comm=pi_mutex_hammer prev_pid=1375 prev_prio=95 prev_state=R+ ==> next_comm=migration/6 next_pid=47 next_prio=0
+     migration/6-47      [006] d..2.   138.981730: sched_switch: prev_comm=migration/6 prev_pid=47 prev_prio=0 prev_state=S ==> next_comm=pi_mutex_hammer next_pid=1375 next_prio=95
+ pi_mutex_hammer-1375    [006] d..21   138.981735: sched_switch: prev_comm=pi_mutex_hammer prev_pid=1375 prev_prio=95 prev_state=R+ ==> next_comm=migration/6 next_pid=47 next_prio=0
+     migration/6-47      [006] d..2.   138.981738: sched_switch: prev_comm=migration/6 prev_pid=47 prev_prio=0 prev_state=S ==> next_comm=pi_mutex_hammer next_pid=1375 next_prio=95
+
+What happened was the task 1375 was flagged to be migrated. When
+preemption was enabled, the migration thread woke up to migrate that task,
+but failed because migration for that task was disabled. This caused the
+loop to fail to exit because the task scheduled out while trying to read
+user space.
+
+Every time the task enabled preemption the migration thread would schedule
+in, try to migrate the task, fail and let the task continue. But because
+the loop would only enable preemption with migration disabled, it would
+always fail because each time it enabled preemption to read user space,
+the migration thread would try to migrate it.
+
+To solve this, when the loop fails to read user space without being
+scheduled out, enabled and disable preemption with migration enabled. This
+will allow the migration task to successfully migrate the task and the
+next loop should succeed to read user space without being scheduled out.
+
+Cc: stable@vger.kernel.org
+Cc: Masami Hiramatsu <mhiramat@kernel.org>
+Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Link: https://patch.msgid.link/20260316130734.1858a998@gandalf.local.home
+Fixes: 64cf7d058a005 ("tracing: Have trace_marker use per-cpu data to read user space")
+Signed-off-by: Steven Rostedt (Google) <rostedt@goodmis.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ kernel/trace/trace.c | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/kernel/trace/trace.c b/kernel/trace/trace.c
+index ff5d0b6d52e0..295eb5034ce3 100644
+--- a/kernel/trace/trace.c
++++ b/kernel/trace/trace.c
+@@ -7345,6 +7345,23 @@ static char *trace_user_fault_read(struct trace_user_buf_info *tinfo,
+ 	 */
+ 
+ 	do {
++		/*
++		 * It is possible that something is trying to migrate this
++		 * task. What happens then, is when preemption is enabled,
++		 * the migration thread will preempt this task, try to
++		 * migrate it, fail, then let it run again. That will
++		 * cause this to loop again and never succeed.
++		 * On failures, enabled and disable preemption with
++		 * migration enabled, to allow the migration thread to
++		 * migrate this task.
++		 */
++		if (trys) {
++			preempt_enable_notrace();
++			preempt_disable_notrace();
++			cpu = smp_processor_id();
++			buffer = per_cpu_ptr(tinfo->tbuf, cpu)->buf;
++		}
++
+ 		/*
+ 		 * If for some reason, copy_from_user() always causes a context
+ 		 * switch, this would then cause an infinite loop.
+-- 
+2.51.0
+
