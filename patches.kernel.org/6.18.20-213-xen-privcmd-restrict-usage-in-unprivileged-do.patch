@@ -1,0 +1,163 @@
+From: Juergen Gross <jgross@suse.com>
+Date: Thu, 9 Oct 2025 16:54:58 +0200
+Subject: [PATCH] xen/privcmd: restrict usage in unprivileged domU
+References: bsc#1258210
+Patch-mainline: 6.18.20
+Git-commit: 453b8fb68f3641fea970db88b7d9a153ed2a37e8
+
+commit 453b8fb68f3641fea970db88b7d9a153ed2a37e8 upstream.
+
+The Xen privcmd driver allows to issue arbitrary hypercalls from
+user space processes. This is normally no problem, as access is
+usually limited to root and the hypervisor will deny any hypercalls
+affecting other domains.
+
+In case the guest is booted using secure boot, however, the privcmd
+driver would be enabling a root user process to modify e.g. kernel
+memory contents, thus breaking the secure boot feature.
+
+The only known case where an unprivileged domU is really needing to
+use the privcmd driver is the case when it is acting as the device
+model for another guest. In this case all hypercalls issued via the
+privcmd driver will target that other guest.
+
+Fortunately the privcmd driver can already be locked down to allow
+only hypercalls targeting a specific domain, but this mode can be
+activated from user land only today.
+
+The target domain can be obtained from Xenstore, so when not running
+in dom0 restrict the privcmd driver to that target domain from the
+beginning, resolving the potential problem of breaking secure boot.
+
+This is XSA-482
+
+Reported-by: Teddy Astie <teddy.astie@vates.tech>
+Fixes: 1c5de1939c20 ("xen: add privcmd driver")
+Signed-off-by: Juergen Gross <jgross@suse.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/xen/privcmd.c | 60 ++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 57 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/xen/privcmd.c b/drivers/xen/privcmd.c
+index f52a457b302d..88ad6aff54a1 100644
+--- a/drivers/xen/privcmd.c
++++ b/drivers/xen/privcmd.c
+@@ -12,6 +12,7 @@
+ #include <linux/eventfd.h>
+ #include <linux/file.h>
+ #include <linux/kernel.h>
++#include <linux/kstrtox.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+ #include <linux/poll.h>
+@@ -30,7 +31,9 @@
+ #include <linux/seq_file.h>
+ #include <linux/miscdevice.h>
+ #include <linux/moduleparam.h>
++#include <linux/notifier.h>
+ #include <linux/virtio_mmio.h>
++#include <linux/wait.h>
+ 
+ #include <asm/xen/hypervisor.h>
+ #include <asm/xen/hypercall.h>
+@@ -46,6 +49,7 @@
+ #include <xen/page.h>
+ #include <xen/xen-ops.h>
+ #include <xen/balloon.h>
++#include <xen/xenbus.h>
+ #ifdef CONFIG_XEN_ACPI
+ #include <xen/acpi.h>
+ #endif
+@@ -72,6 +76,11 @@ struct privcmd_data {
+ 	domid_t domid;
+ };
+ 
++/* DOMID_INVALID implies no restriction */
++static domid_t target_domain = DOMID_INVALID;
++static bool restrict_wait;
++static DECLARE_WAIT_QUEUE_HEAD(restrict_wait_wq);
++
+ static int privcmd_vma_range_is_mapped(
+                struct vm_area_struct *vma,
+                unsigned long addr,
+@@ -1562,13 +1571,16 @@ static long privcmd_ioctl(struct file *file,
+ 
+ static int privcmd_open(struct inode *ino, struct file *file)
+ {
+-	struct privcmd_data *data = kzalloc(sizeof(*data), GFP_KERNEL);
++	struct privcmd_data *data;
++
++	if (wait_event_interruptible(restrict_wait_wq, !restrict_wait) < 0)
++		return -EINTR;
+ 
++	data = kzalloc(sizeof(*data), GFP_KERNEL);
+ 	if (!data)
+ 		return -ENOMEM;
+ 
+-	/* DOMID_INVALID implies no restriction */
+-	data->domid = DOMID_INVALID;
++	data->domid = target_domain;
+ 
+ 	file->private_data = data;
+ 	return 0;
+@@ -1661,6 +1673,45 @@ static struct miscdevice privcmd_dev = {
+ 	.fops = &xen_privcmd_fops,
+ };
+ 
++static int init_restrict(struct notifier_block *notifier,
++			 unsigned long event,
++			 void *data)
++{
++	char *target;
++	unsigned int domid;
++
++	/* Default to an guaranteed unused domain-id. */
++	target_domain = DOMID_IDLE;
++
++	target = xenbus_read(XBT_NIL, "target", "", NULL);
++	if (IS_ERR(target) || kstrtouint(target, 10, &domid)) {
++		pr_err("No target domain found, blocking all hypercalls\n");
++		goto out;
++	}
++
++	target_domain = domid;
++
++ out:
++	if (!IS_ERR(target))
++		kfree(target);
++
++	restrict_wait = false;
++	wake_up_all(&restrict_wait_wq);
++
++	return NOTIFY_DONE;
++}
++
++static struct notifier_block xenstore_notifier = {
++	.notifier_call = init_restrict,
++};
++
++static void __init restrict_driver(void)
++{
++	restrict_wait = true;
++
++	register_xenstore_notifier(&xenstore_notifier);
++}
++
+ static int __init privcmd_init(void)
+ {
+ 	int err;
+@@ -1668,6 +1719,9 @@ static int __init privcmd_init(void)
+ 	if (!xen_domain())
+ 		return -ENODEV;
+ 
++	if (!xen_initial_domain())
++		restrict_driver();
++
+ 	err = misc_register(&privcmd_dev);
+ 	if (err != 0) {
+ 		pr_err("Could not register Xen privcmd device\n");
+-- 
+2.51.0
+

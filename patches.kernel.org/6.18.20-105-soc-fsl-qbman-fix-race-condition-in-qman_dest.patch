@@ -1,0 +1,93 @@
+From: Richard Genoud <richard.genoud@bootlin.com>
+Date: Tue, 23 Dec 2025 08:25:49 +0100
+Subject: [PATCH] soc: fsl: qbman: fix race condition in qman_destroy_fq
+References: bsc#1258210
+Patch-mainline: 6.18.20
+Git-commit: 014077044e874e270ec480515edbc1cadb976cf2
+
+[ Upstream commit 014077044e874e270ec480515edbc1cadb976cf2 ]
+
+When QMAN_FQ_FLAG_DYNAMIC_FQID is set, there's a race condition between
+fq_table[fq->idx] state and freeing/allocating from the pool and
+WARN_ON(fq_table[fq->idx]) in qman_create_fq() gets triggered.
+
+Indeed, we can have:
+         Thread A                             Thread B
+    qman_destroy_fq()                    qman_create_fq()
+      qman_release_fqid()
+        qman_shutdown_fq()
+        gen_pool_free()
+           -- At this point, the fqid is available again --
+                                           qman_alloc_fqid()
+           -- so, we can get the just-freed fqid in thread B --
+                                           fq->fqid = fqid;
+                                           fq->idx = fqid * 2;
+                                           WARN_ON(fq_table[fq->idx]);
+                                           fq_table[fq->idx] = fq;
+     fq_table[fq->idx] = NULL;
+
+And adding some logs between qman_release_fqid() and
+fq_table[fq->idx] = NULL makes the WARN_ON() trigger a lot more.
+
+To prevent that, ensure that fq_table[fq->idx] is set to NULL before
+gen_pool_free() is called by using smp_wmb().
+
+Fixes: c535e923bb97 ("soc/fsl: Introduce DPAA 1.x QMan device driver")
+Signed-off-by: Richard Genoud <richard.genoud@bootlin.com>
+Tested-by: CHAMPSEIX Thomas <thomas.champseix@alstomgroup.com>
+Link: https://lore.kernel.org/r/20251223072549.397625-1-richard.genoud@bootlin.com
+Signed-off-by: Christophe Leroy (CS GROUP) <chleroy@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/soc/fsl/qbman/qman.c | 24 ++++++++++++++++++++++--
+ 1 file changed, 22 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/soc/fsl/qbman/qman.c b/drivers/soc/fsl/qbman/qman.c
+index 9be240999f87..43a4e8d58b9b 100644
+--- a/drivers/soc/fsl/qbman/qman.c
++++ b/drivers/soc/fsl/qbman/qman.c
+@@ -1827,6 +1827,8 @@ EXPORT_SYMBOL(qman_create_fq);
+ 
+ void qman_destroy_fq(struct qman_fq *fq)
+ {
++	int leaked;
++
+ 	/*
+ 	 * We don't need to lock the FQ as it is a pre-condition that the FQ be
+ 	 * quiesced. Instead, run some checks.
+@@ -1834,11 +1836,29 @@ void qman_destroy_fq(struct qman_fq *fq)
+ 	switch (fq->state) {
+ 	case qman_fq_state_parked:
+ 	case qman_fq_state_oos:
+-		if (fq_isset(fq, QMAN_FQ_FLAG_DYNAMIC_FQID))
+-			qman_release_fqid(fq->fqid);
++		/*
++		 * There's a race condition here on releasing the fqid,
++		 * setting the fq_table to NULL, and freeing the fqid.
++		 * To prevent it, this order should be respected:
++		 */
++		if (fq_isset(fq, QMAN_FQ_FLAG_DYNAMIC_FQID)) {
++			leaked = qman_shutdown_fq(fq->fqid);
++			if (leaked)
++				pr_debug("FQID %d leaked\n", fq->fqid);
++		}
+ 
+ 		DPAA_ASSERT(fq_table[fq->idx]);
+ 		fq_table[fq->idx] = NULL;
++
++		if (fq_isset(fq, QMAN_FQ_FLAG_DYNAMIC_FQID) && !leaked) {
++			/*
++			 * fq_table[fq->idx] should be set to null before
++			 * freeing fq->fqid otherwise it could by allocated by
++			 * qman_alloc_fqid() while still being !NULL
++			 */
++			smp_wmb();
++			gen_pool_free(qm_fqalloc, fq->fqid | DPAA_GENALLOC_OFF, 1);
++		}
+ 		return;
+ 	default:
+ 		break;
+-- 
+2.51.0
+
