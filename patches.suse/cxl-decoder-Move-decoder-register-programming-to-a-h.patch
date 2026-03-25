@@ -1,0 +1,133 @@
+From: Dan Williams <dan.j.williams@intel.com>
+Date: Fri, 11 Jul 2025 16:49:27 -0700
+Subject: [PATCH] cxl/decoder: Move decoder register programming to a helper
+Git-commit: 7cb3b42a6bce4e604ca948e6ede543542b49fb54
+Patch-mainline: v6.17-rc1
+References: jsc#PED-15409
+
+In preparation for converting to rw_semaphore_acquire semantics move the
+contents of an open-coded {down,up}_read(&cxl_dpa_rwsem) section to a
+helper function.
+
+Cc: Davidlohr Bueso <dave@stgolabs.net>
+Cc: Jonathan Cameron <jonathan.cameron@huawei.com>
+Cc: Dave Jiang <dave.jiang@intel.com>
+Cc: Alison Schofield <alison.schofield@intel.com>
+Cc: Vishal Verma <vishal.l.verma@intel.com>
+Cc: Ira Weiny <ira.weiny@intel.com>
+Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Reviewed-by: Dave Jiang <dave.jiang@intel.com>
+Reviewed-by: Jonathan Cameron <jonathan.cameron@huawei.com>
+Reviewed-by: Alison Schofield <alison.schofield@intel.com>
+Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+Link: https://patch.msgid.link/20250711234932.671292-4-dan.j.williams@intel.com
+Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/cxl/core/hdm.c | 77 +++++++++++++++++++++++-------------------
+ 1 file changed, 42 insertions(+), 35 deletions(-)
+
+diff --git a/drivers/cxl/core/hdm.c b/drivers/cxl/core/hdm.c
+index ab1007495f6b..81556d12e9b8 100644
+--- a/drivers/cxl/core/hdm.c
++++ b/drivers/cxl/core/hdm.c
+@@ -764,14 +764,53 @@ static int cxld_await_commit(void __iomem *hdm, int id)
+ 	return -ETIMEDOUT;
+ }
+ 
++static void setup_hw_decoder(struct cxl_decoder *cxld, void __iomem *hdm)
++{
++	int id = cxld->id;
++	u64 base, size;
++	u32 ctrl;
++
++	/* common decoder settings */
++	ctrl = readl(hdm + CXL_HDM_DECODER0_CTRL_OFFSET(cxld->id));
++	cxld_set_interleave(cxld, &ctrl);
++	cxld_set_type(cxld, &ctrl);
++	base = cxld->hpa_range.start;
++	size = range_len(&cxld->hpa_range);
++
++	writel(upper_32_bits(base), hdm + CXL_HDM_DECODER0_BASE_HIGH_OFFSET(id));
++	writel(lower_32_bits(base), hdm + CXL_HDM_DECODER0_BASE_LOW_OFFSET(id));
++	writel(upper_32_bits(size), hdm + CXL_HDM_DECODER0_SIZE_HIGH_OFFSET(id));
++	writel(lower_32_bits(size), hdm + CXL_HDM_DECODER0_SIZE_LOW_OFFSET(id));
++
++	if (is_switch_decoder(&cxld->dev)) {
++		struct cxl_switch_decoder *cxlsd =
++			to_cxl_switch_decoder(&cxld->dev);
++		void __iomem *tl_hi = hdm + CXL_HDM_DECODER0_TL_HIGH(id);
++		void __iomem *tl_lo = hdm + CXL_HDM_DECODER0_TL_LOW(id);
++		u64 targets;
++
++		cxlsd_set_targets(cxlsd, &targets);
++		writel(upper_32_bits(targets), tl_hi);
++		writel(lower_32_bits(targets), tl_lo);
++	} else {
++		struct cxl_endpoint_decoder *cxled =
++			to_cxl_endpoint_decoder(&cxld->dev);
++		void __iomem *sk_hi = hdm + CXL_HDM_DECODER0_SKIP_HIGH(id);
++		void __iomem *sk_lo = hdm + CXL_HDM_DECODER0_SKIP_LOW(id);
++
++		writel(upper_32_bits(cxled->skip), sk_hi);
++		writel(lower_32_bits(cxled->skip), sk_lo);
++	}
++
++	writel(ctrl, hdm + CXL_HDM_DECODER0_CTRL_OFFSET(id));
++}
++
+ static int cxl_decoder_commit(struct cxl_decoder *cxld)
+ {
+ 	struct cxl_port *port = to_cxl_port(cxld->dev.parent);
+ 	struct cxl_hdm *cxlhdm = dev_get_drvdata(&port->dev);
+ 	void __iomem *hdm = cxlhdm->regs.hdm_decoder;
+ 	int id = cxld->id, rc;
+-	u64 base, size;
+-	u32 ctrl;
+ 
+ 	if (cxld->flags & CXL_DECODER_F_ENABLE)
+ 		return 0;
+@@ -804,39 +843,7 @@ static int cxl_decoder_commit(struct cxl_decoder *cxld)
+ 	}
+ 
+ 	down_read(&cxl_dpa_rwsem);
+-	/* common decoder settings */
+-	ctrl = readl(hdm + CXL_HDM_DECODER0_CTRL_OFFSET(cxld->id));
+-	cxld_set_interleave(cxld, &ctrl);
+-	cxld_set_type(cxld, &ctrl);
+-	base = cxld->hpa_range.start;
+-	size = range_len(&cxld->hpa_range);
+-
+-	writel(upper_32_bits(base), hdm + CXL_HDM_DECODER0_BASE_HIGH_OFFSET(id));
+-	writel(lower_32_bits(base), hdm + CXL_HDM_DECODER0_BASE_LOW_OFFSET(id));
+-	writel(upper_32_bits(size), hdm + CXL_HDM_DECODER0_SIZE_HIGH_OFFSET(id));
+-	writel(lower_32_bits(size), hdm + CXL_HDM_DECODER0_SIZE_LOW_OFFSET(id));
+-
+-	if (is_switch_decoder(&cxld->dev)) {
+-		struct cxl_switch_decoder *cxlsd =
+-			to_cxl_switch_decoder(&cxld->dev);
+-		void __iomem *tl_hi = hdm + CXL_HDM_DECODER0_TL_HIGH(id);
+-		void __iomem *tl_lo = hdm + CXL_HDM_DECODER0_TL_LOW(id);
+-		u64 targets;
+-
+-		cxlsd_set_targets(cxlsd, &targets);
+-		writel(upper_32_bits(targets), tl_hi);
+-		writel(lower_32_bits(targets), tl_lo);
+-	} else {
+-		struct cxl_endpoint_decoder *cxled =
+-			to_cxl_endpoint_decoder(&cxld->dev);
+-		void __iomem *sk_hi = hdm + CXL_HDM_DECODER0_SKIP_HIGH(id);
+-		void __iomem *sk_lo = hdm + CXL_HDM_DECODER0_SKIP_LOW(id);
+-
+-		writel(upper_32_bits(cxled->skip), sk_hi);
+-		writel(lower_32_bits(cxled->skip), sk_lo);
+-	}
+-
+-	writel(ctrl, hdm + CXL_HDM_DECODER0_CTRL_OFFSET(id));
++	setup_hw_decoder(cxld, hdm);
+ 	up_read(&cxl_dpa_rwsem);
+ 
+ 	port->commit_end++;
+-- 
+2.43.0
+
