@@ -1,0 +1,121 @@
+From: Neeraj Sanjay Kale <neeraj.sanjaykale@nxp.com>
+Date: Mon, 14 Jul 2025 13:00:16 +0530
+Subject: Bluetooth: btnxpuart: Add uevents for FW dump and FW download
+ complete
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Patch-mainline: v6.17-rc1
+Git-commit: 085ee7cf937ce1f524cc6e68e81f109ddb1682c7
+References: jsc#PED-14261
+
+This adds uevents which will be generated whenever FW dump is triggered,
+FW dump is complete and FW (re)download is done.
+
+This feature is needed for IW612 chipset, which is a tri-radio chipset,
+where WLAN runs on CPU1 and BT and Zigbee runs on CPU2.
+
+Currently, whenever BT FW crashes, and FW dump is in progress, there is
+no way for 15.4 application to know that CPU2 is in bad state, and when
+it will be recovered.
+
+With the help of these uevents and udev rules, the 15.4 app, or any
+userspace application can be alerted whenever CPU2 goes in bad state and
+recoveres after BTNXPUART reloads the firmware.
+
+[  334.255154] Bluetooth: hci0: ==== Start FW dump ===
+[  334.261003] Bluetooth: hci0: ==== Send uevent: BTNXPUART_DEV=serial0-0:BTNXPUART_STATE=FW_DUMP_ACTIVE ===
+[  351.486048] Bluetooth: hci0: ==== FW dump complete ===
+[  351.491356] Bluetooth: hci0: ==== Send uevent: BTNXPUART_DEV=serial0-0:BTNXPUART_STATE=FW_DUMP_DONE ===
+[  352.028974] Bluetooth: hci0: ChipID: 7601, Version: 0
+[  352.034490] Bluetooth: hci0: Request Firmware: nxp/uartspi_n61x_v1.bin.se
+[  353.979977] Bluetooth: hci0: FW Download Complete: 417064 bytes
+[  355.197222] Bluetooth: hci0: ==== Send uevent: BTNXPUART_DEV=serial0-0:BTNXPUART_STATE=FW_READY ===
+
+Tested this change by creating a simple udev rule to store the
+BTNXPUART_STATE value in a ~/<BTNXPUART_DEV>/state file, and running
+15.4 traffic.
+
+The 15.4 packets were sent over SPI only when BTNXPUART_STATE was
+FW_READY.
+
+Signed-off-by: Neeraj Sanjay Kale <neeraj.sanjaykale@nxp.com>
+Tested-by: Jean-Yves Salaün <jean-yves.salaun@nxp.com>
+Signed-off-by: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+Acked-by: Chun-Yi Lee <jlee@suse.com>
+---
+ drivers/bluetooth/btnxpuart.c |   42 +++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 41 insertions(+), 1 deletion(-)
+
+--- a/drivers/bluetooth/btnxpuart.c
++++ b/drivers/bluetooth/btnxpuart.c
+@@ -1440,6 +1440,10 @@ static int nxp_set_bdaddr(struct hci_dev
+ static int nxp_setup(struct hci_dev *hdev)
+ {
+ 	struct btnxpuart_dev *nxpdev = hci_get_drvdata(hdev);
++	struct serdev_device *serdev = nxpdev->serdev;
++	char device_string[30];
++	char event_string[50];
++	char *envp[] = {device_string, event_string, NULL};
+ 	int err = 0;
+ 
+ 	if (nxp_check_boot_sign(nxpdev)) {
+@@ -1452,6 +1456,12 @@ static int nxp_setup(struct hci_dev *hde
+ 		clear_bit(BTNXPUART_FW_DOWNLOADING, &nxpdev->tx_state);
+ 	}
+ 
++	snprintf(device_string, 30, "BTNXPUART_DEV=%s", dev_name(&serdev->dev));
++	snprintf(event_string, 50, "BTNXPUART_STATE=FW_READY");
++	bt_dev_dbg(hdev, "==== Send uevent: %s:%s ===", device_string,
++		   event_string);
++	kobject_uevent_env(&serdev->dev.kobj, KOBJ_CHANGE, envp);
++
+ 	serdev_device_set_baudrate(nxpdev->serdev, nxpdev->fw_init_baudrate);
+ 	nxpdev->current_baudrate = nxpdev->fw_init_baudrate;
+ 
+@@ -1772,6 +1782,35 @@ static const struct serdev_device_ops bt
+ 	.write_wakeup = btnxpuart_write_wakeup,
+ };
+ 
++static void nxp_coredump_notify(struct hci_dev *hdev, int state)
++{
++	struct btnxpuart_dev *nxpdev = hci_get_drvdata(hdev);
++	struct serdev_device *serdev = nxpdev->serdev;
++	char device_string[30];
++	char event_string[50];
++	char *envp[] = {device_string, event_string, NULL};
++
++	snprintf(device_string, 30, "BTNXPUART_DEV=%s", dev_name(&serdev->dev));
++	switch (state) {
++	case HCI_DEVCOREDUMP_ACTIVE:
++		snprintf(event_string, 50, "BTNXPUART_STATE=FW_DUMP_ACTIVE");
++		break;
++	case HCI_DEVCOREDUMP_DONE:
++		snprintf(event_string, 50, "BTNXPUART_STATE=FW_DUMP_DONE");
++		break;
++	case HCI_DEVCOREDUMP_TIMEOUT:
++		snprintf(event_string, 50, "BTNXPUART_STATE=FW_DUMP_TIMEOUT");
++		break;
++	default:
++		snprintf(event_string, 50, "BTNXPUART_STATE=FW_DUMP_STATE_%d",
++			 state);
++		break;
++	}
++	bt_dev_dbg(hdev, "==== Send uevent: %s:%s ===", device_string,
++		   event_string);
++	kobject_uevent_env(&serdev->dev.kobj, KOBJ_CHANGE, envp);
++}
++
+ static int nxp_serdev_probe(struct serdev_device *serdev)
+ {
+ 	struct hci_dev *hdev;
+@@ -1868,7 +1907,8 @@ static int nxp_serdev_probe(struct serde
+ 	if (ps_setup(hdev))
+ 		goto probe_fail;
+ 
+-	hci_devcd_register(hdev, nxp_coredump, nxp_coredump_hdr, NULL);
++	hci_devcd_register(hdev, nxp_coredump, nxp_coredump_hdr,
++			   nxp_coredump_notify);
+ 
+ 	return 0;
+ 

@@ -1,0 +1,137 @@
+From: Zijun Hu <zijun.hu@oss.qualcomm.com>
+Date: Tue, 15 Jul 2025 20:40:14 +0800
+Subject: Bluetooth: btusb: QCA: Support downloading custom-made firmwares
+Patch-mainline: v6.17-rc1
+Git-commit: a3f9f6dd047af711341a2367a8b08a3ade31438d
+References: jsc#PED-14261
+
+There are custom-made firmwares based on board ID for a given QCA BT
+chip sometimes, and they are different with existing firmwares and put
+in a separate subdirectory to avoid conflict, for example:
+QCA2066, as a variant of WCN6855, has firmwares under 'qca/QCA2066/'
+of linux-firmware repository.
+
+Support downloading custom-made firmwares based on a table newly added.
+
+Signed-off-by: Zijun Hu <zijun.hu@oss.qualcomm.com>
+Signed-off-by: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+Acked-by: Chun-Yi Lee <jlee@suse.com>
+---
+ drivers/bluetooth/btusb.c |   54 +++++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 49 insertions(+), 5 deletions(-)
+
+--- a/drivers/bluetooth/btusb.c
++++ b/drivers/bluetooth/btusb.c
+@@ -3190,6 +3190,12 @@ struct qca_device_info {
+ 	u8	ver_offset;	/* offset of version structure in rampatch */
+ };
+ 
++struct qca_custom_firmware {
++	u32 rom_version;
++	u16 board_id;
++	const char *subdirectory;
++};
++
+ static const struct qca_device_info qca_devices_table[] = {
+ 	{ 0x00000100, 20, 4,  8 }, /* Rome 1.0 */
+ 	{ 0x00000101, 20, 4,  8 }, /* Rome 1.1 */
+@@ -3203,6 +3209,11 @@ static const struct qca_device_info qca_
+ 	{ 0x00190200, 40, 4, 16 }, /* WCN785x 2.0 */
+ };
+ 
++static const struct qca_custom_firmware qca_custom_btfws[] = {
++	{ 0x00130201, 0x030A, "QCA2066" },
++	{ },
++};
++
+ static u16 qca_extract_board_id(const struct qca_version *ver)
+ {
+ 	u16 flag = le16_to_cpu(ver->flag);
+@@ -3229,6 +3240,26 @@ static u16 qca_extract_board_id(const st
+ 	return board_id;
+ }
+ 
++static const char *qca_get_fw_subdirectory(const struct qca_version *ver)
++{
++	const struct qca_custom_firmware *ptr;
++	u32 rom_ver;
++	u16 board_id;
++
++	rom_ver = le32_to_cpu(ver->rom_version);
++	board_id = qca_extract_board_id(ver);
++	if (!board_id)
++		return NULL;
++
++	for (ptr = qca_custom_btfws; ptr->rom_version; ptr++) {
++		if (ptr->rom_version == rom_ver &&
++		    ptr->board_id == board_id)
++			return ptr->subdirectory;
++	}
++
++	return NULL;
++}
++
+ static int btusb_qca_send_vendor_req(struct usb_device *udev, u8 request,
+ 				     void *data, u16 size)
+ {
+@@ -3333,15 +3364,22 @@ static int btusb_setup_qca_load_rampatch
+ {
+ 	struct qca_rampatch_version *rver;
+ 	const struct firmware *fw;
++	const char *fw_subdir;
+ 	u32 ver_rom, ver_patch, rver_rom;
+ 	u16 rver_rom_low, rver_rom_high, rver_patch;
+-	char fwname[64];
++	char fwname[80];
+ 	int err;
+ 
+ 	ver_rom = le32_to_cpu(ver->rom_version);
+ 	ver_patch = le32_to_cpu(ver->patch_version);
+ 
+-	snprintf(fwname, sizeof(fwname), "qca/rampatch_usb_%08x.bin", ver_rom);
++	fw_subdir = qca_get_fw_subdirectory(ver);
++	if (fw_subdir)
++		snprintf(fwname, sizeof(fwname), "qca/%s/rampatch_usb_%08x.bin",
++			 fw_subdir, ver_rom);
++	else
++		snprintf(fwname, sizeof(fwname), "qca/rampatch_usb_%08x.bin",
++			 ver_rom);
+ 
+ 	err = request_firmware(&fw, fwname, &hdev->dev);
+ 	if (err) {
+@@ -3385,10 +3423,11 @@ static void btusb_generate_qca_nvm_name(
+ 					const struct qca_version *ver)
+ {
+ 	u32 rom_version = le32_to_cpu(ver->rom_version);
+-	const char *variant;
++	const char *variant, *fw_subdir;
+ 	int len;
+ 	u16 board_id;
+ 
++	fw_subdir = qca_get_fw_subdirectory(ver);
+ 	board_id = qca_extract_board_id(ver);
+ 
+ 	switch (le32_to_cpu(ver->ram_version)) {
+@@ -3401,7 +3440,12 @@ static void btusb_generate_qca_nvm_name(
+ 		break;
+ 	}
+ 
+-	len = snprintf(fwname, max_size, "qca/nvm_usb_%08x", rom_version);
++	if (fw_subdir)
++		len = snprintf(fwname, max_size, "qca/%s/nvm_usb_%08x",
++			       fw_subdir, rom_version);
++	else
++		len = snprintf(fwname, max_size, "qca/nvm_usb_%08x",
++			       rom_version);
+ 	if (variant)
+ 		len += snprintf(fwname + len, max_size - len, "%s", variant);
+ 	if (board_id)
+@@ -3414,7 +3458,7 @@ static int btusb_setup_qca_load_nvm(stru
+ 				    const struct qca_device_info *info)
+ {
+ 	const struct firmware *fw;
+-	char fwname[64];
++	char fwname[80];
+ 	int err;
+ 
+ 	btusb_generate_qca_nvm_name(fwname, sizeof(fwname), ver);
