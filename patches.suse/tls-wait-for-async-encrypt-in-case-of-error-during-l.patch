@@ -1,0 +1,60 @@
+From: Sabrina Dubroca <sd@queasysnail.net>
+Date: Tue, 14 Oct 2025 11:16:57 +0200
+Subject: tls: wait for async encrypt in case of error during latter iterations
+ of sendmsg
+Patch-mainline: v6.18-rc2
+Git-commit: b014a4e066c555185b7c367efacdc33f16695495
+References: jsc#PED-16011
+
+If we hit an error during the main loop of tls_sw_sendmsg_locked (eg
+failed allocation), we jump to send_end and immediately
+return. Previous iterations may have queued async encryption requests
+that are still pending. We should wait for those before returning, as
+we could otherwise be reading from memory that userspace believes
+we're not using anymore, which would be a sort of use-after-free.
+
+This is similar to what tls_sw_recvmsg already does: failures during
+the main loop jump to the "wait for async" code, not straight to the
+unlock/return.
+
+Fixes: a42055e8d2c3 ("net/tls: Add support for async encryption of records for performance")
+Reported-by: Jann Horn <jannh@google.com>
+Signed-off-by: Sabrina Dubroca <sd@queasysnail.net>
+Link: https://patch.msgid.link/c793efe9673b87f808d84fdefc0f732217030c52.1760432043.git.sd@queasysnail.net
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Pedro Falcato <pfalcato@suse.de>
+---
+ net/tls/tls_sw.c |    7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+--- a/net/tls/tls_sw.c
++++ b/net/tls/tls_sw.c
+@@ -1054,7 +1054,7 @@ static int tls_sw_sendmsg_locked(struct
+ 			if (ret == -EINPROGRESS)
+ 				num_async++;
+ 			else if (ret != -EAGAIN)
+-				goto send_end;
++				goto end;
+ 		}
+ 	}
+ 
+@@ -1226,8 +1226,9 @@ trim_sgl:
+ 			goto alloc_encrypted;
+ 	}
+ 
++send_end:
+ 	if (!num_async) {
+-		goto send_end;
++		goto end;
+ 	} else if (num_zc || eor) {
+ 		int err;
+ 
+@@ -1245,7 +1246,7 @@ trim_sgl:
+ 		tls_tx_records(sk, msg->msg_flags);
+ 	}
+ 
+-send_end:
++end:
+ 	ret = sk_stream_error(sk, msg->msg_flags, ret);
+ 	return copied > 0 ? copied : ret;
+ }
