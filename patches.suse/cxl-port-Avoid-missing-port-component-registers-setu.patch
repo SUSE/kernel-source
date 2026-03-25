@@ -1,0 +1,95 @@
+From: Li Ming <ming.li@zohomail.com>
+Date: Wed, 1 Oct 2025 14:03:37 +0800
+Subject: [PATCH] cxl/port: Avoid missing port component registers setup
+Git-commit: 02e7567f5da023524476053a38c54f4f19130959
+Patch-mainline: v6.18-rc2
+References: jsc#PED-15409
+
+port->nr_dports is used to represent how many dports added to the cxl
+port, it will increase in add_dport() when a new dport is being added to
+the cxl port, but it will not be reduced when a dport is removed from
+the cxl port.
+
+Currently, when the first dport is added to a cxl port, it will trigger
+component registers setup on the cxl port, the implementation is using
+port->nr_dports to confirm if the dport is the first dport.
+
+A corner case here is that adding dport could fail after port->nr_dports
+updating and before checking port->nr_dports for component registers
+setup. If the failure happens during the first dport attaching, it will
+cause that CXL subsystem has not chance to execute component registers
+setup for the cxl port. the failure flow like below:
+
+port->nr_dports = 0
+dport 1 adding to the port:
+	add_dport()	# port->nr_dports: 1
+	failed on devm_add_action_or_reset() or sysfs_create_link()
+	return error	# port->nr_dports: 1
+dport 2 adding to the port:
+	add_dport()	# port->nr_dports: 2
+	no failure
+	skip component registers setup because of port->nr_dports is 2
+
+The solution here is that moving component registers setup closer to
+add_dport(), so if add_dport() is executed correctly for the first
+dport, component registers setup on the port will be executed
+immediately after that.
+
+Fixes: f6ee24913de2 ("cxl: Move port register setup to when first dport appear")
+Signed-off-by: Li Ming <ming.li@zohomail.com>
+Reviewed-by: Dave Jiang <dave.jiang@intel.com>
+Reviewed-by: Davidlohr Bueso <dave@stgolabs.net>
+Reviewed-by: Jonathan Cameron <jonathan.cameron@huawei.com>
+Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/cxl/core/port.c | 26 ++++++++++++++------------
+ 1 file changed, 14 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/cxl/core/port.c b/drivers/cxl/core/port.c
+index d5f71eb1ade8..8128fd2b5b31 100644
+--- a/drivers/cxl/core/port.c
++++ b/drivers/cxl/core/port.c
+@@ -1182,6 +1182,20 @@ __devm_cxl_add_dport(struct cxl_port *port, struct device *dport_dev,
+ 	if (rc)
+ 		return ERR_PTR(rc);
+ 
++	/*
++	 * Setup port register if this is the first dport showed up. Having
++	 * a dport also means that there is at least 1 active link.
++	 */
++	if (port->nr_dports == 1 &&
++	    port->component_reg_phys != CXL_RESOURCE_NONE) {
++		rc = cxl_port_setup_regs(port, port->component_reg_phys);
++		if (rc) {
++			xa_erase(&port->dports, (unsigned long)dport->dport_dev);
++			return ERR_PTR(rc);
++		}
++		port->component_reg_phys = CXL_RESOURCE_NONE;
++	}
++
+ 	get_device(dport_dev);
+ 	rc = devm_add_action_or_reset(host, cxl_dport_remove, dport);
+ 	if (rc)
+@@ -1200,18 +1214,6 @@ __devm_cxl_add_dport(struct cxl_port *port, struct device *dport_dev,
+ 
+ 	cxl_debugfs_create_dport_dir(dport);
+ 
+-	/*
+-	 * Setup port register if this is the first dport showed up. Having
+-	 * a dport also means that there is at least 1 active link.
+-	 */
+-	if (port->nr_dports == 1 &&
+-	    port->component_reg_phys != CXL_RESOURCE_NONE) {
+-		rc = cxl_port_setup_regs(port, port->component_reg_phys);
+-		if (rc)
+-			return ERR_PTR(rc);
+-		port->component_reg_phys = CXL_RESOURCE_NONE;
+-	}
+-
+ 	return dport;
+ }
+ 
+-- 
+2.43.0
+
