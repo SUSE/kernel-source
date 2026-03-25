@@ -1,0 +1,179 @@
+From: Eric Dumazet <edumazet@google.com>
+Date: Mon, 17 Mar 2025 08:53:13 +0000
+Subject: tcp: move icsk_clean_acked to a better location
+Patch-mainline: v6.15-rc1
+Git-commit: 1937a0be28c01a13e18912602b8eff08d7db77cf
+References: jsc#PED-16011
+
+As a followup of my presentation in Zagreb for netdev 0x19:
+
+icsk_clean_acked is only used by TCP when/if CONFIG_TLS_DEVICE
+is enabled from tcp_ack().
+
+Rename it to tcp_clean_acked, move it to tcp_sock structure
+in the tcp_sock_read_rx for better cache locality in TCP
+fast path.
+
+Define this field only when CONFIG_TLS_DEVICE is enabled
+saving 8 bytes on configs not using it.
+
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Reviewed-by: Neal Cardwell <ncardwell@google.com>
+Reviewed-by: Sabrina Dubroca <sd@queasysnail.net>
+Reviewed-by: Kuniyuki Iwashima <kuniyu@amazon.com>
+Link: https://patch.msgid.link/20250317085313.2023214-1-edumazet@google.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Pedro Falcato <pfalcato@suse.de>
+---
+ Documentation/networking/net_cachelines/tcp_sock.rst |    1 +
+ include/linux/tcp.h                                  |    3 +++
+ include/net/inet_connection_sock.h                   |    2 --
+ include/net/tcp.h                                    |    4 ++--
+ net/ipv4/tcp.c                                       |    5 +++++
+ net/ipv4/tcp_input.c                                 |   12 ++++++------
+ net/tls/tls_device.c                                 |    8 ++++----
+ 7 files changed, 21 insertions(+), 14 deletions(-)
+
+--- a/Documentation/networking/net_cachelines/tcp_sock.rst
++++ b/Documentation/networking/net_cachelines/tcp_sock.rst
+@@ -27,6 +27,7 @@ u32                           dsack_dups
+ u32                           snd_una                 read_mostly         read_write          tcp_wnd_end,tcp_urg_mode,tcp_minshall_check,tcp_cwnd_validate(tx);tcp_ack,tcp_may_update_window,tcp_clean_rtx_queue(write),tcp_ack_tstamp(rx)
+ u32                           snd_sml                 read_write                              tcp_minshall_check,tcp_minshall_update
+ u32                           rcv_tstamp                                  read_mostly         tcp_ack
++void *                        tcp_clean_acked                             read_mostly         tcp_ack
+ u32                           lsndtime                read_write                              tcp_slow_start_after_idle_check,tcp_event_data_sent
+ u32                           last_oow_ack_time
+ u32                           compressed_ack_rcv_nxt
+--- a/include/linux/tcp.h
++++ b/include/linux/tcp.h
+@@ -243,6 +243,9 @@ struct tcp_sock {
+ 	struct  minmax rtt_min;
+ 	/* OOO segments go in this rbtree. Socket lock must be held. */
+ 	struct rb_root	out_of_order_queue;
++#if defined(CONFIG_TLS_DEVICE)
++	void (*tcp_clean_acked)(struct sock *sk, u32 acked_seq);
++#endif
+ 	u32	snd_ssthresh;	/* Slow start size threshold		*/
+ 	u8	recvmsg_inq : 1;/* Indicate # of bytes in queue upon recvmsg */
+ 	__cacheline_group_end(tcp_sock_read_rx);
+--- a/include/net/inet_connection_sock.h
++++ b/include/net/inet_connection_sock.h
+@@ -66,7 +66,6 @@ struct inet_connection_sock_af_ops {
+  * @icsk_af_ops		   Operations which are AF_INET{4,6} specific
+  * @icsk_ulp_ops	   Pluggable ULP control hook
+  * @icsk_ulp_data	   ULP private data
+- * @icsk_clean_acked	   Clean acked data hook
+  * @icsk_ca_state:	   Congestion control state
+  * @icsk_retransmits:	   Number of unrecovered [RTO] timeouts
+  * @icsk_pending:	   Scheduled timer event
+@@ -96,7 +95,6 @@ struct inet_connection_sock {
+ 	const struct inet_connection_sock_af_ops *icsk_af_ops;
+ 	const struct tcp_ulp_ops  *icsk_ulp_ops;
+ 	void __rcu		  *icsk_ulp_data;
+-	void (*icsk_clean_acked)(struct sock *sk, u32 acked_seq);
+ 	unsigned int		  (*icsk_sync_mss)(struct sock *sk, u32 pmtu);
+ 	__u8			  icsk_ca_state:5,
+ 				  icsk_ca_initialized:1,
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -2755,9 +2755,9 @@ extern struct static_key_false tcp_have_
+ #endif
+ 
+ #if IS_ENABLED(CONFIG_TLS_DEVICE)
+-void clean_acked_data_enable(struct inet_connection_sock *icsk,
++void clean_acked_data_enable(struct tcp_sock *tp,
+ 			     void (*cad)(struct sock *sk, u32 ack_seq));
+-void clean_acked_data_disable(struct inet_connection_sock *icsk);
++void clean_acked_data_disable(struct tcp_sock *tp);
+ void clean_acked_data_flush(void);
+ #endif
+ 
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -5005,7 +5005,12 @@ static void __init tcp_struct_check(void
+ 	CACHELINE_ASSERT_GROUP_MEMBER(struct tcp_sock, tcp_sock_read_rx, rtt_min);
+ 	CACHELINE_ASSERT_GROUP_MEMBER(struct tcp_sock, tcp_sock_read_rx, out_of_order_queue);
+ 	CACHELINE_ASSERT_GROUP_MEMBER(struct tcp_sock, tcp_sock_read_rx, snd_ssthresh);
++#if IS_ENABLED(CONFIG_TLS_DEVICE)
++	CACHELINE_ASSERT_GROUP_MEMBER(struct tcp_sock, tcp_sock_read_rx, tcp_clean_acked);
++	CACHELINE_ASSERT_GROUP_SIZE(struct tcp_sock, tcp_sock_read_rx, 77);
++#else
+ 	CACHELINE_ASSERT_GROUP_SIZE(struct tcp_sock, tcp_sock_read_rx, 69);
++#endif
+ 
+ 	/* TX read-write hotpath cache lines */
+ 	CACHELINE_ASSERT_GROUP_MEMBER(struct tcp_sock, tcp_sock_write_tx, segs_out);
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -118,18 +118,18 @@ int sysctl_tcp_max_orphans __read_mostly
+ #if IS_ENABLED(CONFIG_TLS_DEVICE)
+ static DEFINE_STATIC_KEY_DEFERRED_FALSE(clean_acked_data_enabled, HZ);
+ 
+-void clean_acked_data_enable(struct inet_connection_sock *icsk,
++void clean_acked_data_enable(struct tcp_sock *tp,
+ 			     void (*cad)(struct sock *sk, u32 ack_seq))
+ {
+-	icsk->icsk_clean_acked = cad;
++	tp->tcp_clean_acked = cad;
+ 	static_branch_deferred_inc(&clean_acked_data_enabled);
+ }
+ EXPORT_SYMBOL_GPL(clean_acked_data_enable);
+ 
+-void clean_acked_data_disable(struct inet_connection_sock *icsk)
++void clean_acked_data_disable(struct tcp_sock *tp)
+ {
+ 	static_branch_slow_dec_deferred(&clean_acked_data_enabled);
+-	icsk->icsk_clean_acked = NULL;
++	tp->tcp_clean_acked = NULL;
+ }
+ EXPORT_SYMBOL_GPL(clean_acked_data_disable);
+ 
+@@ -3976,8 +3976,8 @@ static int tcp_ack(struct sock *sk, cons
+ 
+ #if IS_ENABLED(CONFIG_TLS_DEVICE)
+ 		if (static_branch_unlikely(&clean_acked_data_enabled.key))
+-			if (icsk->icsk_clean_acked)
+-				icsk->icsk_clean_acked(sk, ack);
++			if (tp->tcp_clean_acked)
++				tp->tcp_clean_acked(sk, ack);
+ #endif
+ 	}
+ 
+--- a/net/tls/tls_device.c
++++ b/net/tls/tls_device.c
+@@ -157,7 +157,7 @@ static void delete_all_records(struct tl
+ 	offload_ctx->retransmit_hint = NULL;
+ }
+ 
+-static void tls_icsk_clean_acked(struct sock *sk, u32 acked_seq)
++static void tls_tcp_clean_acked(struct sock *sk, u32 acked_seq)
+ {
+ 	struct tls_context *tls_ctx = tls_get_ctx(sk);
+ 	struct tls_record_info *info, *temp;
+@@ -204,7 +204,7 @@ void tls_device_sk_destruct(struct sock
+ 			destroy_record(ctx->open_record);
+ 		delete_all_records(ctx);
+ 		crypto_free_aead(ctx->aead_send);
+-		clean_acked_data_disable(inet_csk(sk));
++		clean_acked_data_disable(tcp_sk(sk));
+ 	}
+ 
+ 	tls_device_queue_ctx_destruction(tls_ctx);
+@@ -1126,7 +1126,7 @@ int tls_set_device_offload(struct sock *
+ 	start_marker_record->num_frags = 0;
+ 	list_add_tail(&start_marker_record->list, &offload_ctx->records_list);
+ 
+-	clean_acked_data_enable(inet_csk(sk), &tls_icsk_clean_acked);
++	clean_acked_data_enable(tcp_sk(sk), &tls_tcp_clean_acked);
+ 	ctx->push_pending_record = tls_device_push_pending_record;
+ 
+ 	/* TLS offload is greatly simplified if we don't send
+@@ -1172,7 +1172,7 @@ int tls_set_device_offload(struct sock *
+ 
+ release_lock:
+ 	up_read(&device_offload_lock);
+-	clean_acked_data_disable(inet_csk(sk));
++	clean_acked_data_disable(tcp_sk(sk));
+ 	crypto_free_aead(offload_ctx->aead_send);
+ free_offload_ctx:
+ 	kfree(offload_ctx);
