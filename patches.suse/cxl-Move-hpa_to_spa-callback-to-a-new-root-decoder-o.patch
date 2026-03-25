@@ -1,0 +1,152 @@
+From: Alison Schofield <alison.schofield@intel.com>
+Date: Mon, 4 Aug 2025 01:00:09 -0700
+Subject: [PATCH] cxl: Move hpa_to_spa callback to a new root decoder ops
+ structure
+Git-commit: 524b2b76f365fb90a7f894ac17261ea760464e2c
+Patch-mainline: v6.18-rc1
+References: jsc#PED-15409
+
+The root decoder's HPA to SPA translation logic was implemented using
+a single function pointer. In preparation for additional per-decoder
+callbacks, convert this into a struct cxl_rd_ops and move the
+hpa_to_spa pointer into it.
+
+To avoid maintaining a static ops instance populated with mostly NULL
+pointers, allocate the ops structure dynamically only when a platform
+requires overrides (e.g. XOR interleave decoding).
+
+The setup can be extended as additional callbacks are added.
+
+Co-developed-by: Dave Jiang <dave.jiang@intel.com>
+Signed-off-by: Alison Schofield <alison.schofield@intel.com>
+Reviewed-by: Jonathan Cameron <jonathan.cameron@huawei.com>
+Link: https://patch.msgid.link/818530c82c351a9c0d3a204f593068dd2126a5a9.1754290144.git.alison.schofield@intel.com
+Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/cxl/acpi.c        | 10 +++++++---
+ drivers/cxl/core/port.c   |  1 +
+ drivers/cxl/core/region.c | 11 ++++++++---
+ drivers/cxl/cxl.h         | 12 +++++++++---
+ 4 files changed, 25 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/cxl/acpi.c b/drivers/cxl/acpi.c
+index 712624cba2b6..b8d69460a368 100644
+--- a/drivers/cxl/acpi.c
++++ b/drivers/cxl/acpi.c
+@@ -20,7 +20,6 @@ static const guid_t acpi_cxl_qtg_id_guid =
+ 	GUID_INIT(0xF365F9A6, 0xA7DE, 0x4071,
+ 		  0xA6, 0x6A, 0xB4, 0x0C, 0x0B, 0x4F, 0x8E, 0x52);
+ 
+-
+ static u64 cxl_xor_hpa_to_spa(struct cxl_root_decoder *cxlrd, u64 hpa)
+ {
+ 	struct cxl_cxims_data *cximsd = cxlrd->platform_data;
+@@ -472,8 +471,13 @@ static int __cxl_parse_cfmws(struct acpi_cedt_cfmws *cfmws,
+ 
+ 	cxlrd->qos_class = cfmws->qtg_id;
+ 
+-	if (cfmws->interleave_arithmetic == ACPI_CEDT_CFMWS_ARITHMETIC_XOR)
+-		cxlrd->hpa_to_spa = cxl_xor_hpa_to_spa;
++	if (cfmws->interleave_arithmetic == ACPI_CEDT_CFMWS_ARITHMETIC_XOR) {
++		cxlrd->ops = kzalloc(sizeof(*cxlrd->ops), GFP_KERNEL);
++		if (!cxlrd->ops)
++			return -ENOMEM;
++
++		cxlrd->ops->hpa_to_spa = cxl_xor_hpa_to_spa;
++	}
+ 
+ 	rc = cxl_decoder_add(cxld, target_map);
+ 	if (rc)
+diff --git a/drivers/cxl/core/port.c b/drivers/cxl/core/port.c
+index 29197376b18e..8f36ff413f5d 100644
+--- a/drivers/cxl/core/port.c
++++ b/drivers/cxl/core/port.c
+@@ -450,6 +450,7 @@ static void cxl_root_decoder_release(struct device *dev)
+ 	if (atomic_read(&cxlrd->region_id) >= 0)
+ 		memregion_free(atomic_read(&cxlrd->region_id));
+ 	__cxl_decoder_release(&cxlrd->cxlsd.cxld);
++	kfree(cxlrd->ops);
+ 	kfree(cxlrd);
+ }
+ 
+diff --git a/drivers/cxl/core/region.c b/drivers/cxl/core/region.c
+index 71cc42d05248..06cac5d28bf1 100644
+--- a/drivers/cxl/core/region.c
++++ b/drivers/cxl/core/region.c
+@@ -2918,6 +2918,11 @@ static bool cxl_is_hpa_in_chunk(u64 hpa, struct cxl_region *cxlr, int pos)
+ 	return false;
+ }
+ 
++static bool has_hpa_to_spa(struct cxl_root_decoder *cxlrd)
++{
++	return cxlrd->ops && cxlrd->ops->hpa_to_spa;
++}
++
+ u64 cxl_dpa_to_hpa(struct cxl_region *cxlr, const struct cxl_memdev *cxlmd,
+ 		   u64 dpa)
+ {
+@@ -2972,8 +2977,8 @@ u64 cxl_dpa_to_hpa(struct cxl_region *cxlr, const struct cxl_memdev *cxlmd,
+ 	hpa = hpa_offset + p->res->start + p->cache_size;
+ 
+ 	/* Root decoder translation overrides typical modulo decode */
+-	if (cxlrd->hpa_to_spa)
+-		hpa = cxlrd->hpa_to_spa(cxlrd, hpa);
++	if (has_hpa_to_spa(cxlrd))
++		hpa = cxlrd->ops->hpa_to_spa(cxlrd, hpa);
+ 
+ 	if (!cxl_resource_contains_addr(p->res, hpa)) {
+ 		dev_dbg(&cxlr->dev,
+@@ -2982,7 +2987,7 @@ u64 cxl_dpa_to_hpa(struct cxl_region *cxlr, const struct cxl_memdev *cxlmd,
+ 	}
+ 
+ 	/* Simple chunk check, by pos & gran, only applies to modulo decodes */
+-	if (!cxlrd->hpa_to_spa && (!cxl_is_hpa_in_chunk(hpa, cxlr, pos)))
++	if (!has_hpa_to_spa(cxlrd) && (!cxl_is_hpa_in_chunk(hpa, cxlr, pos)))
+ 		return ULLONG_MAX;
+ 
+ 	return hpa;
+diff --git a/drivers/cxl/cxl.h b/drivers/cxl/cxl.h
+index 847e37be42c4..4b247ab18883 100644
+--- a/drivers/cxl/cxl.h
++++ b/drivers/cxl/cxl.h
+@@ -419,27 +419,33 @@ struct cxl_switch_decoder {
+ };
+ 
+ struct cxl_root_decoder;
+-typedef u64 (*cxl_hpa_to_spa_fn)(struct cxl_root_decoder *cxlrd, u64 hpa);
++/**
++ * struct cxl_rd_ops - CXL root decoder callback operations
++ * @hpa_to_spa: Convert host physical address to system physical address
++ */
++struct cxl_rd_ops {
++	u64 (*hpa_to_spa)(struct cxl_root_decoder *cxlrd, u64 hpa);
++};
+ 
+ /**
+  * struct cxl_root_decoder - Static platform CXL address decoder
+  * @res: host / parent resource for region allocations
+  * @cache_size: extended linear cache size if exists, otherwise zero.
+  * @region_id: region id for next region provisioning event
+- * @hpa_to_spa: translate CXL host-physical-address to Platform system-physical-address
+  * @platform_data: platform specific configuration data
+  * @range_lock: sync region autodiscovery by address range
+  * @qos_class: QoS performance class cookie
++ * @ops: CXL root decoder operations
+  * @cxlsd: base cxl switch decoder
+  */
+ struct cxl_root_decoder {
+ 	struct resource *res;
+ 	resource_size_t cache_size;
+ 	atomic_t region_id;
+-	cxl_hpa_to_spa_fn hpa_to_spa;
+ 	void *platform_data;
+ 	struct mutex range_lock;
+ 	int qos_class;
++	struct cxl_rd_ops *ops;
+ 	struct cxl_switch_decoder cxlsd;
+ };
+ 
+-- 
+2.43.0
+
