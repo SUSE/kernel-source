@@ -1,0 +1,71 @@
+From: Petr Oros <poros@redhat.com>
+Date: Wed, 25 Feb 2026 11:01:37 +0100
+Subject: [PATCH] iavf: fix VLAN filter lost on add/delete race
+References: bsc#1012628
+Patch-mainline: 6.19.10
+Git-commit: fc9c69be594756b81b54c6bc40803fa6052f35ae
+
+[ Upstream commit fc9c69be594756b81b54c6bc40803fa6052f35ae ]
+
+When iavf_add_vlan() finds an existing filter in IAVF_VLAN_REMOVE
+state, it transitions the filter to IAVF_VLAN_ACTIVE assuming the
+pending delete can simply be cancelled. However, there is no guarantee
+that iavf_del_vlans() has not already processed the delete AQ request
+and removed the filter from the PF. In that case the filter remains in
+the driver's list as IAVF_VLAN_ACTIVE but is no longer programmed on
+the NIC. Since iavf_add_vlans() only picks up filters in
+IAVF_VLAN_ADD state, the filter is never re-added, and spoof checking
+drops all traffic for that VLAN.
+
+  CPU0                       CPU1                     Workqueue
+  ----                       ----                     ---------
+  iavf_del_vlan(vlan 100)
+    f->state = REMOVE
+    schedule AQ_DEL_VLAN
+                             iavf_add_vlan(vlan 100)
+                               f->state = ACTIVE
+                                                      iavf_del_vlans()
+                                                        f is ACTIVE, skip
+                                                      iavf_add_vlans()
+                                                        f is ACTIVE, skip
+
+  Filter is ACTIVE in driver but absent from NIC.
+
+Transition to IAVF_VLAN_ADD instead and schedule
+IAVF_FLAG_AQ_ADD_VLAN_FILTER so iavf_add_vlans() re-programs the
+filter.  A duplicate add is idempotent on the PF.
+
+Fixes: 0c0da0e95105 ("iavf: refactor VLAN filter states")
+Signed-off-by: Petr Oros <poros@redhat.com>
+Tested-by: Rafal Romanowski <rafal.romanowski@intel.com>
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/net/ethernet/intel/iavf/iavf_main.c | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/ethernet/intel/iavf/iavf_main.c b/drivers/net/ethernet/intel/iavf/iavf_main.c
+index 03ab2a4276bb..0a72d419782e 100644
+--- a/drivers/net/ethernet/intel/iavf/iavf_main.c
++++ b/drivers/net/ethernet/intel/iavf/iavf_main.c
+@@ -757,10 +757,13 @@ iavf_vlan_filter *iavf_add_vlan(struct iavf_adapter *adapter,
+ 		adapter->num_vlan_filters++;
+ 		iavf_schedule_aq_request(adapter, IAVF_FLAG_AQ_ADD_VLAN_FILTER);
+ 	} else if (f->state == IAVF_VLAN_REMOVE) {
+-		/* IAVF_VLAN_REMOVE means that VLAN wasn't yet removed.
+-		 * We can safely only change the state here.
++		/* Re-add the filter since we cannot tell whether the
++		 * pending delete has already been processed by the PF.
++		 * A duplicate add is harmless.
+ 		 */
+-		f->state = IAVF_VLAN_ACTIVE;
++		f->state = IAVF_VLAN_ADD;
++		iavf_schedule_aq_request(adapter,
++					 IAVF_FLAG_AQ_ADD_VLAN_FILTER);
+ 	}
+ 
+ clearout:
+-- 
+2.53.0
+
