@@ -1,0 +1,144 @@
+From: Li Ming <ming.li@zohomail.com>
+Date: Sun, 23 Mar 2025 17:31:08 +0800
+Subject: [PATCH] cxl/core: Fix caching dport GPF DVSEC issue
+Git-commit: 87d2de042c602e12230283cd40fa604b881e12f7
+Patch-mainline: v6.15-rc4
+References: jsc#PED-15409
+
+Per Table 8-2 in CXL r3.2 section 8.1.1 and CXL r3.2 section 8.1.6, only
+CXL Downstream switch ports and CXL root ports have GPF DVSEC for CXL
+Port(DVSEC ID 04h).
+
+CXL subsystem has a gpf_dvsec in struct cxl_port which is used to cache
+the offset of a GPF DVSEC in PCIe configuration space. It will be
+updated during the first EP attaching to the cxl_port, so the gpf_dvsec
+can only cache the GPF DVSEC offset of the dport which the first EP is
+under. Will not have chance to update it during other EPs attaching.
+That means CXL subsystem will use the same GPF DVSEC offset for all
+dports under the port, it will be a problem if the GPF DVSEC offset
+cached in cxl_port is not the right offset for a dport.
+
+Moving gpf_dvsec from struct cxl_port to struct cxl_dport, make every
+cxl dport has their own GPF DVSEC offset caching, and each cxl dport
+uses its own GPF DVSEC offset for GPF DVSEC accessing.
+
+Fixes: a52b6a2c1c99 ("cxl/pci: Support Global Persistent Flush (GPF)")
+Signed-off-by: Li Ming <ming.li@zohomail.com>
+Reviewed-by: Davidlohr Bueso <dave@stgolabs.net>
+Reviewed-by: Jonathan Cameron <Jonathan.Cameron@huawei.com>
+Reviewed-by: Dan Williams <dan.j.williams@intel.com>
+Tested-by: Davidlohr Bueso <dave@stgolabs.net>
+Link: https://patch.msgid.link/20250323093110.233040-2-ming.li@zohomail.com
+Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/cxl/core/core.h |  2 +-
+ drivers/cxl/core/pci.c  | 16 ++++++++--------
+ drivers/cxl/core/port.c |  2 +-
+ drivers/cxl/cxl.h       |  4 ++--
+ 4 files changed, 12 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/cxl/core/core.h b/drivers/cxl/core/core.h
+index 15699299dc11..17b692eb3257 100644
+--- a/drivers/cxl/core/core.h
++++ b/drivers/cxl/core/core.h
+@@ -119,7 +119,7 @@ int cxl_port_get_switch_dport_bandwidth(struct cxl_port *port,
+ 
+ int cxl_ras_init(void);
+ void cxl_ras_exit(void);
+-int cxl_gpf_port_setup(struct device *dport_dev, struct cxl_port *port);
++int cxl_gpf_port_setup(struct cxl_dport *dport);
+ int cxl_acpi_get_extended_linear_cache_size(struct resource *backing_res,
+ 					    int nid, resource_size_t *size);
+ 
+diff --git a/drivers/cxl/core/pci.c b/drivers/cxl/core/pci.c
+index 96fecb799cbc..aab0a505d527 100644
+--- a/drivers/cxl/core/pci.c
++++ b/drivers/cxl/core/pci.c
+@@ -1128,26 +1128,26 @@ static int update_gpf_port_dvsec(struct pci_dev *pdev, int dvsec, int phase)
+ 	return rc;
+ }
+ 
+-int cxl_gpf_port_setup(struct device *dport_dev, struct cxl_port *port)
++int cxl_gpf_port_setup(struct cxl_dport *dport)
+ {
+ 	struct pci_dev *pdev;
+ 
+-	if (!port)
++	if (!dport)
+ 		return -EINVAL;
+ 
+-	if (!port->gpf_dvsec) {
++	if (!dport->gpf_dvsec) {
+ 		int dvsec;
+ 
+-		dvsec = cxl_gpf_get_dvsec(dport_dev, true);
++		dvsec = cxl_gpf_get_dvsec(dport->dport_dev, true);
+ 		if (!dvsec)
+ 			return -EINVAL;
+ 
+-		port->gpf_dvsec = dvsec;
++		dport->gpf_dvsec = dvsec;
+ 	}
+ 
+-	pdev = to_pci_dev(dport_dev);
+-	update_gpf_port_dvsec(pdev, port->gpf_dvsec, 1);
+-	update_gpf_port_dvsec(pdev, port->gpf_dvsec, 2);
++	pdev = to_pci_dev(dport->dport_dev);
++	update_gpf_port_dvsec(pdev, dport->gpf_dvsec, 1);
++	update_gpf_port_dvsec(pdev, dport->gpf_dvsec, 2);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/cxl/core/port.c b/drivers/cxl/core/port.c
+index 0fd6646c1a2e..726bd4a7de27 100644
+--- a/drivers/cxl/core/port.c
++++ b/drivers/cxl/core/port.c
+@@ -1678,7 +1678,7 @@ int devm_cxl_enumerate_ports(struct cxl_memdev *cxlmd)
+ 			if (rc && rc != -EBUSY)
+ 				return rc;
+ 
+-			cxl_gpf_port_setup(dport_dev, port);
++			cxl_gpf_port_setup(dport);
+ 
+ 			/* Any more ports to add between this one and the root? */
+ 			if (!dev_is_cxl_root_child(&port->dev))
+diff --git a/drivers/cxl/cxl.h b/drivers/cxl/cxl.h
+index be8a7dc77719..2d81ccd83916 100644
+--- a/drivers/cxl/cxl.h
++++ b/drivers/cxl/cxl.h
+@@ -592,7 +592,6 @@ struct cxl_dax_region {
+  * @cdat: Cached CDAT data
+  * @cdat_available: Should a CDAT attribute be available in sysfs
+  * @pci_latency: Upstream latency in picoseconds
+- * @gpf_dvsec: Cached GPF port DVSEC
+  */
+ struct cxl_port {
+ 	struct device dev;
+@@ -616,7 +615,6 @@ struct cxl_port {
+ 	} cdat;
+ 	bool cdat_available;
+ 	long pci_latency;
+-	int gpf_dvsec;
+ };
+ 
+ /**
+@@ -664,6 +662,7 @@ struct cxl_rcrb_info {
+  * @regs: Dport parsed register blocks
+  * @coord: access coordinates (bandwidth and latency performance attributes)
+  * @link_latency: calculated PCIe downstream latency
++ * @gpf_dvsec: Cached GPF port DVSEC
+  */
+ struct cxl_dport {
+ 	struct device *dport_dev;
+@@ -675,6 +674,7 @@ struct cxl_dport {
+ 	struct cxl_regs regs;
+ 	struct access_coordinate coord[ACCESS_COORDINATE_MAX];
+ 	long link_latency;
++	int gpf_dvsec;
+ };
+ 
+ /**
+-- 
+2.43.0
+
