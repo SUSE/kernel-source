@@ -1,0 +1,138 @@
+From: Chandrashekar Devegowda <chandrashekar.devegowda@intel.com>
+Date: Fri, 25 Jul 2025 14:31:33 +0530
+Subject: Bluetooth: btintel_pcie: Add support for _suspend() / _resume()
+Patch-mainline: v6.18-rc1
+Git-commit: e57362f4911b025c31e032c7e1c67389b7eb8dd1
+References: jsc#PED-14261
+
+This patch implements _suspend() and _resume() functions for the
+Bluetooth controller. When the system enters a suspended state, the
+driver notifies the controller to perform necessary housekeeping tasks
+by writing to the sleep control register and waits for an alive
+interrupt. The firmware raises the alive interrupt when it has
+transitioned to the D3 state. The same flow occurs when the system
+resumes.
+
+Command to test host initiated wakeup after 60 seconds
+sudo rtcwake -m mem -s 60
+
+dmesg log (tested on Whale Peak2 on Panther Lake platform)
+On system suspend:
+[Fri Jul 25 11:05:37 2025] Bluetooth: hci0: device entered into d3 state from d0 in 80 us
+
+On system resume:
+[Fri Jul 25 11:06:36 2025] Bluetooth: hci0: device entered into d0 state from d3 in 7117 us
+
+Signed-off-by: Chandrashekar Devegowda <chandrashekar.devegowda@intel.com>
+Signed-off-by: Kiran K <kiran.k@intel.com>
+Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+Reviewed-by: Paul Menzel <pmenzel@molgen.mpg.de>
+Signed-off-by: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+Acked-by: Chun-Yi Lee <jlee@suse.com>
+---
+ drivers/bluetooth/btintel_pcie.c |   89 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 89 insertions(+)
+
+--- a/drivers/bluetooth/btintel_pcie.c
++++ b/drivers/bluetooth/btintel_pcie.c
+@@ -2574,11 +2574,100 @@ static void btintel_pcie_coredump(struct
+ }
+ #endif
+ 
++static int btintel_pcie_suspend_late(struct device *dev, pm_message_t mesg)
++{
++	struct pci_dev *pdev = to_pci_dev(dev);
++	struct btintel_pcie_data *data;
++	ktime_t start;
++	u32 dxstate;
++	int err;
++
++	data = pci_get_drvdata(pdev);
++
++	dxstate = (mesg.event == PM_EVENT_SUSPEND ?
++		   BTINTEL_PCIE_STATE_D3_HOT : BTINTEL_PCIE_STATE_D3_COLD);
++
++	data->gp0_received = false;
++
++	start = ktime_get();
++
++	/* Refer: 6.4.11.7 -> Platform power management */
++	btintel_pcie_wr_sleep_cntrl(data, dxstate);
++	err = wait_event_timeout(data->gp0_wait_q, data->gp0_received,
++				 msecs_to_jiffies(BTINTEL_DEFAULT_INTR_TIMEOUT_MS));
++	if (err == 0) {
++		bt_dev_err(data->hdev,
++			   "Timeout (%u ms) on alive interrupt for D3 entry",
++			   BTINTEL_DEFAULT_INTR_TIMEOUT_MS);
++		return -EBUSY;
++	}
++
++	bt_dev_dbg(data->hdev,
++		   "device entered into d3 state from d0 in %lld us",
++		   ktime_to_us(ktime_get() - start));
++
++	return 0;
++}
++
++static int btintel_pcie_suspend(struct device *dev)
++{
++	return btintel_pcie_suspend_late(dev, PMSG_SUSPEND);
++}
++
++static int btintel_pcie_hibernate(struct device *dev)
++{
++	return btintel_pcie_suspend_late(dev, PMSG_HIBERNATE);
++}
++
++static int btintel_pcie_freeze(struct device *dev)
++{
++	return btintel_pcie_suspend_late(dev, PMSG_FREEZE);
++}
++
++static int btintel_pcie_resume(struct device *dev)
++{
++	struct pci_dev *pdev = to_pci_dev(dev);
++	struct btintel_pcie_data *data;
++	ktime_t start;
++	int err;
++
++	data = pci_get_drvdata(pdev);
++	data->gp0_received = false;
++
++	start = ktime_get();
++
++	/* Refer: 6.4.11.7 -> Platform power management */
++	btintel_pcie_wr_sleep_cntrl(data, BTINTEL_PCIE_STATE_D0);
++	err = wait_event_timeout(data->gp0_wait_q, data->gp0_received,
++				 msecs_to_jiffies(BTINTEL_DEFAULT_INTR_TIMEOUT_MS));
++	if (err == 0) {
++		bt_dev_err(data->hdev,
++			   "Timeout (%u ms) on alive interrupt for D0 entry",
++			   BTINTEL_DEFAULT_INTR_TIMEOUT_MS);
++		return -EBUSY;
++	}
++
++	bt_dev_dbg(data->hdev,
++		    "device entered into d0 state from d3 in %lld us",
++		     ktime_to_us(ktime_get() - start));
++	return 0;
++}
++
++static const struct dev_pm_ops btintel_pcie_pm_ops = {
++	.suspend = btintel_pcie_suspend,
++	.resume = btintel_pcie_resume,
++	.freeze = btintel_pcie_freeze,
++	.thaw = btintel_pcie_resume,
++	.poweroff = btintel_pcie_hibernate,
++	.restore = btintel_pcie_resume,
++};
++
+ static struct pci_driver btintel_pcie_driver = {
+ 	.name = KBUILD_MODNAME,
+ 	.id_table = btintel_pcie_table,
+ 	.probe = btintel_pcie_probe,
+ 	.remove = btintel_pcie_remove,
++	.driver.pm = pm_sleep_ptr(&btintel_pcie_pm_ops),
+ #ifdef CONFIG_DEV_COREDUMP
+ 	.driver.coredump = btintel_pcie_coredump
+ #endif
