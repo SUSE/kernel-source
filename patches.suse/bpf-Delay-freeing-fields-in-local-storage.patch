@@ -1,0 +1,116 @@
+From: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Date: Fri, 27 Feb 2026 14:48:03 -0800
+Subject: bpf: Delay freeing fields in local storage
+Patch-mainline: v7.0-rc2
+Git-commit: f41deee082dc7b1c198de21710cb5cb9c604cae0
+References: git-fixes
+X-Info: context mismatch refresh, caused by missing kmalloc_nolock() backport
+
+Currently, when use_kmalloc_nolock is false, the freeing of fields for a
+local storage selem is done eagerly before waiting for the RCU or RCU
+tasks trace grace period to elapse. This opens up a window where the
+program which has access to the selem can recreate the fields after the
+freeing of fields is done eagerly, causing memory leaks when the element
+is finally freed and returned to the kernel.
+
+Make a few changes to address this. First, delay the freeing of fields
+until after the grace periods have expired using a __bpf_selem_free_rcu
+wrapper which is eventually invoked after transitioning through the
+necessary number of grace period waits. Replace usage of the kfree_rcu
+with call_rcu to be able to take a custom callback. Finally, care needs
+to be taken to extend the rcu barriers for all cases, and not just when
+use_kmalloc_nolock is true, as RCU and RCU tasks trace callbacks can be
+in flight for either case and access the smap field, which is used to
+obtain the BTF record to walk over special fields in the map value.
+
+While we're at it, drop migrate_disable() from bpf_selem_free_rcu, since
+migration should be disabled for RCU callbacks already.
+
+Fixes: 9bac675e6368 ("bpf: Postpone bpf_obj_free_fields to the rcu callback")
+Reviewed-by: Amery Hung <ameryhung@gmail.com>
+Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Link: https://lore.kernel.org/r/20260227224806.646888-4-memxor@gmail.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ kernel/bpf/bpf_local_storage.c |   34 ++++++++++++++++++++++------------
+ 1 file changed, 22 insertions(+), 12 deletions(-)
+
+--- a/kernel/bpf/bpf_local_storage.c
++++ b/kernel/bpf/bpf_local_storage.c
+@@ -182,16 +182,28 @@
+ 		call_rcu(&local_storage->rcu, bpf_local_storage_free_rcu);
+ }
+ 
+-/* rcu tasks trace callback for bpf_ma == false */
+-static void __bpf_selem_free_trace_rcu(struct rcu_head *rcu)
++/* rcu callback for bpf_ma == false */
++static void __bpf_selem_free_rcu(struct rcu_head *rcu)
+ {
+ 	struct bpf_local_storage_elem *selem;
++	struct bpf_local_storage_map *smap;
+ 
+ 	selem = container_of(rcu, struct bpf_local_storage_elem, rcu);
++	/* smap may have already cleared and freed fields. */
++	smap = rcu_dereference_check(SDATA(selem)->smap, 1);
++
++	if (smap)
++		bpf_obj_free_fields(smap->map.record, SDATA(selem)->data);
++	kfree(selem);
++}
++
++/* rcu tasks trace callback for bpf_ma == false */
++static void __bpf_selem_free_trace_rcu(struct rcu_head *rcu)
++{
+ 	if (rcu_trace_implies_rcu_gp())
+-		kfree(selem);
++		__bpf_selem_free_rcu(rcu);
+ 	else
+-		kfree_rcu(selem, rcu);
++		call_rcu(rcu, __bpf_selem_free_rcu);
+ }
+ 
+ /* Handle bpf_ma == false */
+@@ -199,7 +211,7 @@
+ 			     bool vanilla_rcu)
+ {
+ 	if (vanilla_rcu)
+-		kfree_rcu(selem, rcu);
++		call_rcu(&selem->rcu, __bpf_selem_free_rcu);
+ 	else
+ 		call_rcu_tasks_trace(&selem->rcu, __bpf_selem_free_trace_rcu);
+ }
+@@ -213,9 +225,8 @@
+ 	/* The bpf_local_storage_map_free will wait for rcu_barrier */
+ 	smap = rcu_dereference_check(SDATA(selem)->smap, 1);
+ 
+-	migrate_disable();
+-	bpf_obj_free_fields(smap->map.record, SDATA(selem)->data);
+-	migrate_enable();
++	if (smap)
++		bpf_obj_free_fields(smap->map.record, SDATA(selem)->data);
+ 	bpf_mem_cache_raw_free(selem);
+ }
+ 
+@@ -237,7 +248,6 @@
+ 		 * for task storage, so this bpf_obj_free_fields() won't unpin
+ 		 * any uptr.
+ 		 */
+-		bpf_obj_free_fields(smap->map.record, SDATA(selem)->data);
+ 		__bpf_selem_free(selem, reuse_now);
+ 		return;
+ 	}
+@@ -912,10 +922,10 @@
+ 	 */
+ 	synchronize_rcu();
+ 
++	/* smap remains in use regardless of bpf_ma, so wait unconditionally. */
++	rcu_barrier_tasks_trace();
++	rcu_barrier();
+ 	if (smap->bpf_ma) {
+-		rcu_barrier_tasks_trace();
+-		if (!rcu_trace_implies_rcu_gp())
+-			rcu_barrier();
+ 		bpf_mem_alloc_destroy(&smap->selem_ma);
+ 		bpf_mem_alloc_destroy(&smap->storage_ma);
+ 	}
