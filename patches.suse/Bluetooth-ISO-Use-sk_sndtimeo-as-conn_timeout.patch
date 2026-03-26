@@ -1,0 +1,188 @@
+From: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+Date: Wed, 13 Aug 2025 15:21:19 -0400
+Subject: Bluetooth: ISO: Use sk_sndtimeo as conn_timeout
+Patch-mainline: v6.18-rc1
+Git-commit: 339a87883a14d6a818ca436fed41aa5d10e0f4bd
+References: jsc#PED-14261
+
+This aligns the usage of socket sk_sndtimeo as conn_timeout when
+initiating a connection and then use it when scheduling the
+resulting HCI command, similar to what has been done in bf98feea5b65
+("Bluetooth: hci_conn: Always use sk_timeo as conn_timeout").
+
+Signed-off-by: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+Acked-by: Chun-Yi Lee <jlee@suse.com>
+---
+ include/net/bluetooth/hci_core.h |   10 ++++++----
+ net/bluetooth/hci_conn.c         |   20 ++++++++++++--------
+ net/bluetooth/iso.c              |   16 ++++++++++------
+ 3 files changed, 28 insertions(+), 18 deletions(-)
+
+--- a/include/net/bluetooth/hci_core.h
++++ b/include/net/bluetooth/hci_core.h
+@@ -1583,16 +1583,18 @@ struct hci_conn *hci_connect_sco(struct
+ 				 __u16 setting, struct bt_codec *codec,
+ 				 u16 timeout);
+ struct hci_conn *hci_bind_cis(struct hci_dev *hdev, bdaddr_t *dst,
+-			      __u8 dst_type, struct bt_iso_qos *qos);
++			      __u8 dst_type, struct bt_iso_qos *qos,
++			      u16 timeout);
+ struct hci_conn *hci_bind_bis(struct hci_dev *hdev, bdaddr_t *dst, __u8 sid,
+ 			      struct bt_iso_qos *qos,
+-			      __u8 base_len, __u8 *base);
++			      __u8 base_len, __u8 *base, u16 timeout);
+ struct hci_conn *hci_connect_cis(struct hci_dev *hdev, bdaddr_t *dst,
+-				 __u8 dst_type, struct bt_iso_qos *qos);
++				 __u8 dst_type, struct bt_iso_qos *qos,
++				 u16 timeout);
+ struct hci_conn *hci_connect_bis(struct hci_dev *hdev, bdaddr_t *dst,
+ 				 __u8 dst_type, __u8 sid,
+ 				 struct bt_iso_qos *qos,
+-				 __u8 data_len, __u8 *data);
++				 __u8 data_len, __u8 *data, u16 timeout);
+ struct hci_conn *hci_pa_create_sync(struct hci_dev *hdev, bdaddr_t *dst,
+ 		       __u8 dst_type, __u8 sid, struct bt_iso_qos *qos);
+ int hci_conn_big_create_sync(struct hci_dev *hdev, struct hci_conn *hcon,
+--- a/net/bluetooth/hci_conn.c
++++ b/net/bluetooth/hci_conn.c
+@@ -1539,7 +1539,7 @@ static int qos_set_bis(struct hci_dev *h
+ /* This function requires the caller holds hdev->lock */
+ static struct hci_conn *hci_add_bis(struct hci_dev *hdev, bdaddr_t *dst,
+ 				    __u8 sid, struct bt_iso_qos *qos,
+-				    __u8 base_len, __u8 *base)
++				    __u8 base_len, __u8 *base, u16 timeout)
+ {
+ 	struct hci_conn *conn;
+ 	int err;
+@@ -1581,6 +1581,7 @@ static struct hci_conn *hci_add_bis(stru
+ 
+ 	conn->state = BT_CONNECT;
+ 	conn->sid = sid;
++	conn->conn_timeout = timeout;
+ 
+ 	hci_conn_hold(conn);
+ 	return conn;
+@@ -1921,7 +1922,8 @@ done:
+ }
+ 
+ struct hci_conn *hci_bind_cis(struct hci_dev *hdev, bdaddr_t *dst,
+-			      __u8 dst_type, struct bt_iso_qos *qos)
++			      __u8 dst_type, struct bt_iso_qos *qos,
++			      u16 timeout)
+ {
+ 	struct hci_conn *cis;
+ 
+@@ -1936,6 +1938,7 @@ struct hci_conn *hci_bind_cis(struct hci
+ 		cis->dst_type = dst_type;
+ 		cis->iso_qos.ucast.cig = BT_ISO_QOS_CIG_UNSET;
+ 		cis->iso_qos.ucast.cis = BT_ISO_QOS_CIS_UNSET;
++		cis->conn_timeout = timeout;
+ 	}
+ 
+ 	if (cis->state == BT_CONNECTED)
+@@ -2175,7 +2178,7 @@ static void create_big_complete(struct h
+ 
+ struct hci_conn *hci_bind_bis(struct hci_dev *hdev, bdaddr_t *dst, __u8 sid,
+ 			      struct bt_iso_qos *qos,
+-			      __u8 base_len, __u8 *base)
++			      __u8 base_len, __u8 *base, u16 timeout)
+ {
+ 	struct hci_conn *conn;
+ 	struct hci_conn *parent;
+@@ -2196,7 +2199,7 @@ struct hci_conn *hci_bind_bis(struct hci
+ 						   base, base_len);
+ 
+ 	/* We need hci_conn object using the BDADDR_ANY as dst */
+-	conn = hci_add_bis(hdev, dst, sid, qos, base_len, eir);
++	conn = hci_add_bis(hdev, dst, sid, qos, base_len, eir, timeout);
+ 	if (IS_ERR(conn))
+ 		return conn;
+ 
+@@ -2249,13 +2252,13 @@ static void bis_mark_per_adv(struct hci_
+ struct hci_conn *hci_connect_bis(struct hci_dev *hdev, bdaddr_t *dst,
+ 				 __u8 dst_type, __u8 sid,
+ 				 struct bt_iso_qos *qos,
+-				 __u8 base_len, __u8 *base)
++				 __u8 base_len, __u8 *base, u16 timeout)
+ {
+ 	struct hci_conn *conn;
+ 	int err;
+ 	struct iso_list_data data;
+ 
+-	conn = hci_bind_bis(hdev, dst, sid, qos, base_len, base);
++	conn = hci_bind_bis(hdev, dst, sid, qos, base_len, base, timeout);
+ 	if (IS_ERR(conn))
+ 		return conn;
+ 
+@@ -2298,7 +2301,8 @@ struct hci_conn *hci_connect_bis(struct
+ }
+ 
+ struct hci_conn *hci_connect_cis(struct hci_dev *hdev, bdaddr_t *dst,
+-				 __u8 dst_type, struct bt_iso_qos *qos)
++				 __u8 dst_type, struct bt_iso_qos *qos,
++				 u16 timeout)
+ {
+ 	struct hci_conn *le;
+ 	struct hci_conn *cis;
+@@ -2322,7 +2326,7 @@ struct hci_conn *hci_connect_cis(struct
+ 	hci_iso_qos_setup(hdev, le, &qos->ucast.in,
+ 			  le->le_rx_phy ? le->le_rx_phy : hdev->le_rx_def_phys);
+ 
+-	cis = hci_bind_cis(hdev, dst, dst_type, qos);
++	cis = hci_bind_cis(hdev, dst, dst_type, qos, timeout);
+ 	if (IS_ERR(cis)) {
+ 		hci_conn_drop(le);
+ 		return cis;
+--- a/net/bluetooth/iso.c
++++ b/net/bluetooth/iso.c
+@@ -91,8 +91,8 @@ static struct sock *iso_get_sock(bdaddr_
+ 				 iso_sock_match_t match, void *data);
+ 
+ /* ---- ISO timers ---- */
+-#define ISO_CONN_TIMEOUT	(HZ * 40)
+-#define ISO_DISCONN_TIMEOUT	(HZ * 2)
++#define ISO_CONN_TIMEOUT	secs_to_jiffies(20)
++#define ISO_DISCONN_TIMEOUT	secs_to_jiffies(2)
+ 
+ static void iso_conn_free(struct kref *ref)
+ {
+@@ -367,7 +367,8 @@ static int iso_connect_bis(struct sock *
+ 	if (test_bit(BT_SK_DEFER_SETUP, &bt_sk(sk)->flags)) {
+ 		hcon = hci_bind_bis(hdev, &iso_pi(sk)->dst, iso_pi(sk)->bc_sid,
+ 				    &iso_pi(sk)->qos, iso_pi(sk)->base_len,
+-				    iso_pi(sk)->base);
++				    iso_pi(sk)->base,
++				    READ_ONCE(sk->sk_sndtimeo));
+ 		if (IS_ERR(hcon)) {
+ 			err = PTR_ERR(hcon);
+ 			goto unlock;
+@@ -376,7 +377,8 @@ static int iso_connect_bis(struct sock *
+ 		hcon = hci_connect_bis(hdev, &iso_pi(sk)->dst,
+ 				       le_addr_type(iso_pi(sk)->dst_type),
+ 				       iso_pi(sk)->bc_sid, &iso_pi(sk)->qos,
+-				       iso_pi(sk)->base_len, iso_pi(sk)->base);
++				       iso_pi(sk)->base_len, iso_pi(sk)->base,
++				       READ_ONCE(sk->sk_sndtimeo));
+ 		if (IS_ERR(hcon)) {
+ 			err = PTR_ERR(hcon);
+ 			goto unlock;
+@@ -469,7 +471,8 @@ static int iso_connect_cis(struct sock *
+ 	if (test_bit(BT_SK_DEFER_SETUP, &bt_sk(sk)->flags)) {
+ 		hcon = hci_bind_cis(hdev, &iso_pi(sk)->dst,
+ 				    le_addr_type(iso_pi(sk)->dst_type),
+-				    &iso_pi(sk)->qos);
++				    &iso_pi(sk)->qos,
++				    READ_ONCE(sk->sk_sndtimeo));
+ 		if (IS_ERR(hcon)) {
+ 			err = PTR_ERR(hcon);
+ 			goto unlock;
+@@ -477,7 +480,8 @@ static int iso_connect_cis(struct sock *
+ 	} else {
+ 		hcon = hci_connect_cis(hdev, &iso_pi(sk)->dst,
+ 				       le_addr_type(iso_pi(sk)->dst_type),
+-				       &iso_pi(sk)->qos);
++				       &iso_pi(sk)->qos,
++				       READ_ONCE(sk->sk_sndtimeo));
+ 		if (IS_ERR(hcon)) {
+ 			err = PTR_ERR(hcon);
+ 			goto unlock;
