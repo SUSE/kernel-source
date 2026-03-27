@@ -1,0 +1,299 @@
+From: "Anirudh Rayabharam (Microsoft)" <anirudh@anirudhrb.com>
+Date: Wed, 25 Feb 2026 12:44:02 +0000
+Patch-mainline: v7.0-rc5
+Subject: mshv: refactor synic init and cleanup
+Git-commit: 5a674ef871fe9d4c7477127340941f2c4d9a2741
+References: git-fixes
+
+Rename mshv_synic_init() to mshv_synic_cpu_init() and
+mshv_synic_cleanup() to mshv_synic_cpu_exit() to better reflect that
+these functions handle per-cpu synic setup and teardown.
+
+Use mshv_synic_init/cleanup() to perform init/cleanup that is not per-cpu.
+Move all the synic related setup from mshv_parent_partition_init.
+
+Move the reboot notifier to mshv_synic.c because it currently only
+operates on the synic cpuhp state.
+
+Move out synic_pages from the global mshv_root since its use is now
+completely local to mshv_synic.c.
+
+This is in preparation for adding more stuff to mshv_synic_init().
+
+No functional change.
+
+Reviewed-by: Michael Kelley <mhklinux@outlook.com>
+Signed-off-by: Anirudh Rayabharam (Microsoft) <anirudh@anirudhrb.com>
+Signed-off-by: Wei Liu <wei.liu@kernel.org>
+Acked-by: Olaf Hering <ohering@suse.de>
+---
+ drivers/hv/mshv_root.h      |  5 +-
+ drivers/hv/mshv_root_main.c | 64 +-------
+ drivers/hv/mshv_synic.c     | 71 ++++++++-
+ 3 files changed, 75 insertions(+), 65 deletions(-)
+
+diff --git a/drivers/hv/mshv_root.h b/drivers/hv/mshv_root.h
+--- a/drivers/hv/mshv_root.h
++++ b/drivers/hv/mshv_root.h
+@@ -190,7 +190,6 @@ struct hv_synic_pages {
+ };
+ 
+ struct mshv_root {
+-	struct hv_synic_pages __percpu *synic_pages;
+ 	spinlock_t pt_ht_lock;
+ 	DECLARE_HASHTABLE(pt_htable, MSHV_PARTITIONS_HASH_BITS);
+ 	struct hv_partition_property_vmm_capabilities vmm_caps;
+@@ -249,8 +248,8 @@ int mshv_register_doorbell(u64 partition_id, doorbell_cb_t doorbell_cb,
+ void mshv_unregister_doorbell(u64 partition_id, int doorbell_portid);
+ 
+ void mshv_isr(void);
+-int mshv_synic_init(unsigned int cpu);
+-int mshv_synic_cleanup(unsigned int cpu);
++int mshv_synic_init(struct device *dev);
++void mshv_synic_exit(void);
+ 
+ static inline bool mshv_partition_encrypted(struct mshv_partition *partition)
+ {
+diff --git a/drivers/hv/mshv_root_main.c b/drivers/hv/mshv_root_main.c
+--- a/drivers/hv/mshv_root_main.c
++++ b/drivers/hv/mshv_root_main.c
+@@ -2064,7 +2064,6 @@ mshv_dev_release(struct inode *inode, struct file *filp)
+ 	return 0;
+ }
+ 
+-static int mshv_cpuhp_online;
+ static int mshv_root_sched_online;
+ 
+ static const char *scheduler_type_to_string(enum hv_scheduler_type type)
+@@ -2249,27 +2248,6 @@ root_scheduler_deinit(void)
+ 	free_percpu(root_scheduler_output);
+ }
+ 
+-static int mshv_reboot_notify(struct notifier_block *nb,
+-			      unsigned long code, void *unused)
+-{
+-	cpuhp_remove_state(mshv_cpuhp_online);
+-	return 0;
+-}
+-
+-struct notifier_block mshv_reboot_nb = {
+-	.notifier_call = mshv_reboot_notify,
+-};
+-
+-static void mshv_root_partition_exit(void)
+-{
+-	unregister_reboot_notifier(&mshv_reboot_nb);
+-}
+-
+-static int __init mshv_root_partition_init(struct device *dev)
+-{
+-	return register_reboot_notifier(&mshv_reboot_nb);
+-}
+-
+ static int __init mshv_init_vmm_caps(struct device *dev)
+ {
+ 	int ret;
+@@ -2314,39 +2292,21 @@ static int __init mshv_parent_partition_init(void)
+ 			MSHV_HV_MAX_VERSION);
+ 	}
+ 
+-	mshv_root.synic_pages = alloc_percpu(struct hv_synic_pages);
+-	if (!mshv_root.synic_pages) {
+-		dev_err(dev, "Failed to allocate percpu synic page\n");
+-		ret = -ENOMEM;
++	ret = mshv_synic_init(dev);
++	if (ret)
+ 		goto device_deregister;
+-	}
+-
+-	ret = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "mshv_synic",
+-				mshv_synic_init,
+-				mshv_synic_cleanup);
+-	if (ret < 0) {
+-		dev_err(dev, "Failed to setup cpu hotplug state: %i\n", ret);
+-		goto free_synic_pages;
+-	}
+-
+-	mshv_cpuhp_online = ret;
+ 
+ 	ret = mshv_init_vmm_caps(dev);
+ 	if (ret)
+-		goto remove_cpu_state;
++		goto synic_cleanup;
+ 
+ 	ret = mshv_retrieve_scheduler_type(dev);
+ 	if (ret)
+-		goto remove_cpu_state;
+-
+-	if (hv_root_partition())
+-		ret = mshv_root_partition_init(dev);
+-	if (ret)
+-		goto remove_cpu_state;
++		goto synic_cleanup;
+ 
+ 	ret = root_scheduler_init(dev);
+ 	if (ret)
+-		goto exit_partition;
++		goto synic_cleanup;
+ 
+ 	ret = mshv_debugfs_init();
+ 	if (ret)
+@@ -2367,13 +2327,8 @@ exit_debugfs:
+ 	mshv_debugfs_exit();
+ deinit_root_scheduler:
+ 	root_scheduler_deinit();
+-exit_partition:
+-	if (hv_root_partition())
+-		mshv_root_partition_exit();
+-remove_cpu_state:
+-	cpuhp_remove_state(mshv_cpuhp_online);
+-free_synic_pages:
+-	free_percpu(mshv_root.synic_pages);
++synic_cleanup:
++	mshv_synic_exit();
+ device_deregister:
+ 	misc_deregister(&mshv_dev);
+ 	return ret;
+@@ -2387,10 +2342,7 @@ static void __exit mshv_parent_partition_exit(void)
+ 	misc_deregister(&mshv_dev);
+ 	mshv_irqfd_wq_cleanup();
+ 	root_scheduler_deinit();
+-	if (hv_root_partition())
+-		mshv_root_partition_exit();
+-	cpuhp_remove_state(mshv_cpuhp_online);
+-	free_percpu(mshv_root.synic_pages);
++	mshv_synic_exit();
+ }
+ 
+ module_init(mshv_parent_partition_init);
+diff --git a/drivers/hv/mshv_synic.c b/drivers/hv/mshv_synic.c
+--- a/drivers/hv/mshv_synic.c
++++ b/drivers/hv/mshv_synic.c
+@@ -12,11 +12,16 @@
+ #include <linux/mm.h>
+ #include <linux/io.h>
+ #include <linux/random.h>
++#include <linux/cpuhotplug.h>
++#include <linux/reboot.h>
+ #include <asm/mshyperv.h>
+ 
+ #include "mshv_eventfd.h"
+ #include "mshv.h"
+ 
++static int synic_cpuhp_online;
++static struct hv_synic_pages __percpu *synic_pages;
++
+ static u32 synic_event_ring_get_queued_port(u32 sint_index)
+ {
+ 	struct hv_synic_event_ring_page **event_ring_page;
+@@ -26,7 +31,7 @@ static u32 synic_event_ring_get_queued_port(u32 sint_index)
+ 	u32 message;
+ 	u8 tail;
+ 
+-	spages = this_cpu_ptr(mshv_root.synic_pages);
++	spages = this_cpu_ptr(synic_pages);
+ 	event_ring_page = &spages->synic_event_ring_page;
+ 	synic_eventring_tail = (u8 **)this_cpu_ptr(hv_synic_eventring_tail);
+ 
+@@ -393,7 +398,7 @@ unlock_out:
+ 
+ void mshv_isr(void)
+ {
+-	struct hv_synic_pages *spages = this_cpu_ptr(mshv_root.synic_pages);
++	struct hv_synic_pages *spages = this_cpu_ptr(synic_pages);
+ 	struct hv_message_page **msg_page = &spages->hyp_synic_message_page;
+ 	struct hv_message *msg;
+ 	bool handled;
+@@ -446,7 +451,7 @@ void mshv_isr(void)
+ 	}
+ }
+ 
+-int mshv_synic_init(unsigned int cpu)
++static int mshv_synic_cpu_init(unsigned int cpu)
+ {
+ 	union hv_synic_simp simp;
+ 	union hv_synic_siefp siefp;
+@@ -455,7 +460,7 @@ int mshv_synic_init(unsigned int cpu)
+ 	union hv_synic_sint sint;
+ #endif
+ 	union hv_synic_scontrol sctrl;
+-	struct hv_synic_pages *spages = this_cpu_ptr(mshv_root.synic_pages);
++	struct hv_synic_pages *spages = this_cpu_ptr(synic_pages);
+ 	struct hv_message_page **msg_page = &spages->hyp_synic_message_page;
+ 	struct hv_synic_event_flags_page **event_flags_page =
+ 			&spages->synic_event_flags_page;
+@@ -542,14 +547,14 @@ cleanup:
+ 	return -EFAULT;
+ }
+ 
+-int mshv_synic_cleanup(unsigned int cpu)
++static int mshv_synic_cpu_exit(unsigned int cpu)
+ {
+ 	union hv_synic_sint sint;
+ 	union hv_synic_simp simp;
+ 	union hv_synic_siefp siefp;
+ 	union hv_synic_sirbp sirbp;
+ 	union hv_synic_scontrol sctrl;
+-	struct hv_synic_pages *spages = this_cpu_ptr(mshv_root.synic_pages);
++	struct hv_synic_pages *spages = this_cpu_ptr(synic_pages);
+ 	struct hv_message_page **msg_page = &spages->hyp_synic_message_page;
+ 	struct hv_synic_event_flags_page **event_flags_page =
+ 		&spages->synic_event_flags_page;
+@@ -663,3 +668,57 @@ mshv_unregister_doorbell(u64 partition_id, int doorbell_portid)
+ 
+ 	mshv_portid_free(doorbell_portid);
+ }
++
++static int mshv_synic_reboot_notify(struct notifier_block *nb,
++			      unsigned long code, void *unused)
++{
++	if (!hv_root_partition())
++		return 0;
++
++	cpuhp_remove_state(synic_cpuhp_online);
++	return 0;
++}
++
++static struct notifier_block mshv_synic_reboot_nb = {
++	.notifier_call = mshv_synic_reboot_notify,
++};
++
++int __init mshv_synic_init(struct device *dev)
++{
++	int ret = 0;
++
++	synic_pages = alloc_percpu(struct hv_synic_pages);
++	if (!synic_pages) {
++		dev_err(dev, "Failed to allocate percpu synic page\n");
++		return -ENOMEM;
++	}
++
++	ret = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "mshv_synic",
++				mshv_synic_cpu_init,
++				mshv_synic_cpu_exit);
++	if (ret < 0) {
++		dev_err(dev, "Failed to setup cpu hotplug state: %i\n", ret);
++		goto free_synic_pages;
++	}
++
++	synic_cpuhp_online = ret;
++
++	ret = register_reboot_notifier(&mshv_synic_reboot_nb);
++	if (ret)
++		goto remove_cpuhp_state;
++
++	return 0;
++
++remove_cpuhp_state:
++	cpuhp_remove_state(synic_cpuhp_online);
++free_synic_pages:
++	free_percpu(synic_pages);
++	return ret;
++}
++
++void mshv_synic_exit(void)
++{
++	unregister_reboot_notifier(&mshv_synic_reboot_nb);
++	cpuhp_remove_state(synic_cpuhp_online);
++	free_percpu(synic_pages);
++}
