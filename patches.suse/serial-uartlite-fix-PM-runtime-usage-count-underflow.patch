@@ -1,0 +1,59 @@
+From d54801cd509515f674a5aac1d3ea1401d2a05863 Mon Sep 17 00:00:00 2001
+From: Maciej Andrzejewski ICEYE <maciej.andrzejewski@m-works.net>
+Date: Thu, 5 Mar 2026 13:37:51 +0100
+Subject: [PATCH] serial: uartlite: fix PM runtime usage count underflow on probe
+Git-commit: d54801cd509515f674a5aac1d3ea1401d2a05863
+Patch-mainline: v7.0-rc5
+References: git-fixes
+
+ulite_probe() calls pm_runtime_put_autosuspend() at the end of probe
+without holding a corresponding PM runtime reference for non-console
+ports.
+
+During ulite_assign(), uart_add_one_port() triggers uart_configure_port()
+which calls ulite_pm() via uart_change_pm(). For non-console ports, the
+UART core performs a balanced get/put cycle:
+
+  uart_change_pm(ON)  -> ulite_pm() -> pm_runtime_get_sync()        +1
+  uart_change_pm(OFF) -> ulite_pm() -> pm_runtime_put_autosuspend() -1
+
+This leaves no spare reference for the pm_runtime_put_autosuspend() at
+the end of probe. The PM runtime core prevents the count from actually
+going below zero, and instead triggers a
+"Runtime PM usage count underflow!" warning.
+
+For console ports the bug is masked: the UART core skips the
+uart_change_pm(OFF) call, so the UART core's unbalanced get happens to
+pair with probe's trailing put.
+
+Add pm_runtime_get_noresume() before pm_runtime_enable() to take an
+explicit probe-owned reference that the trailing
+pm_runtime_put_autosuspend() can release. This ensures a correct usage
+count regardless of whether the port is a console.
+
+Fixes: 5bbe10a6942d ("tty: serial: uartlite: Add runtime pm support")
+Cc: stable <stable@kernel.org>
+Signed-off-by: Maciej Andrzejewski ICEYE <maciej.andrzejewski@m-works.net>
+Link: https://patch.msgid.link/20260305123746.4152800-1-maciej.andrzejewski@m-works.net
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/tty/serial/uartlite.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/tty/serial/uartlite.c b/drivers/tty/serial/uartlite.c
+index 39c1fd1ff9ce..6240c3d4dfd7 100644
+--- a/drivers/tty/serial/uartlite.c
++++ b/drivers/tty/serial/uartlite.c
+@@ -878,6 +878,7 @@ static int ulite_probe(struct platform_device *pdev)
+ 	pm_runtime_use_autosuspend(&pdev->dev);
+ 	pm_runtime_set_autosuspend_delay(&pdev->dev, UART_AUTOSUSPEND_TIMEOUT);
+ 	pm_runtime_set_active(&pdev->dev);
++	pm_runtime_get_noresume(&pdev->dev);
+ 	pm_runtime_enable(&pdev->dev);
+ 
+ 	ret = ulite_assign(&pdev->dev, id, res->start, irq, pdata);
+-- 
+2.53.0
+
