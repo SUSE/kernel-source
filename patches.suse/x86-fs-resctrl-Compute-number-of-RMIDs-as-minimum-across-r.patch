@@ -1,0 +1,83 @@
+From: Tony Luck <tony.luck@intel.com>
+Date: Wed, 17 Dec 2025 09:21:14 -0800
+Subject: x86,fs/resctrl: Compute number of RMIDs as minimum across resources
+Git-commit: 0ecc988b0232259cbdb2b7e452bda74f550f0911
+Patch-mainline: v7.0-rc1
+References: jsc#PED-13854
+
+resctrl assumes that only the L3 resource supports monitor events, so it
+simply takes the rdt_resource::num_rmid from RDT_RESOURCE_L3 as the system's
+number of RMIDs.
+
+The addition of telemetry events in a different resource breaks that
+assumption.
+
+Compute the number of available RMIDs as the minimum value across all
+mon_capable resources (analogous to how the number of CLOSIDs is computed
+across alloc_capable resources).
+
+Note that mount time enumeration of the telemetry resource means that
+this number can be reduced. If this happens, then some memory will
+be wasted as the allocations for rdt_l3_mon_domain::mbm_states[] and
+rdt_l3_mon_domain::rmid_busy_llc created during resctrl initialization will
+be larger than needed.
+
+Signed-off-by: Tony Luck <tony.luck@intel.com>
+Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+Reviewed-by: Reinette Chatre <reinette.chatre@intel.com>
+Link: https://lore.kernel.org/20251217172121.12030-1-tony.luck@intel.com
+
+Acked-by: Nikolay Borisov <nik.borisov@suse.com>
+---
+ arch/x86/kernel/cpu/resctrl/core.c | 15 +++++++++++++--
+ fs/resctrl/rdtgroup.c              |  6 ++++++
+ 2 files changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/resctrl/core.c b/arch/x86/kernel/cpu/resctrl/core.c
+index e38d7fc4f427..0da44cad28fd 100644
+--- a/arch/x86/kernel/cpu/resctrl/core.c
++++ b/arch/x86/kernel/cpu/resctrl/core.c
+@@ -110,12 +110,23 @@ struct rdt_hw_resource rdt_resources_all[RDT_NUM_RESOURCES] = {
+ 	},
+ };
+ 
++/**
++ * resctrl_arch_system_num_rmid_idx - Compute number of supported RMIDs
++ *				      (minimum across all mon_capable resource)
++ *
++ * Return: Number of supported RMIDs at time of call. Note that mount time
++ * enumeration of resources may reduce the number.
++ */
+ u32 resctrl_arch_system_num_rmid_idx(void)
+ {
+-	struct rdt_resource *r = &rdt_resources_all[RDT_RESOURCE_L3].r_resctrl;
++	u32 num_rmids = U32_MAX;
++	struct rdt_resource *r;
++
++	for_each_mon_capable_rdt_resource(r)
++		num_rmids = min(num_rmids, r->mon.num_rmid);
+ 
+ 	/* RMID are independent numbers for x86. num_rmid_idx == num_rmid */
+-	return r->mon.num_rmid;
++	return num_rmids == U32_MAX ? 0 : num_rmids;
+ }
+ 
+ struct rdt_resource *resctrl_arch_get_resource(enum resctrl_res_level l)
+diff --git a/fs/resctrl/rdtgroup.c b/fs/resctrl/rdtgroup.c
+index 90c4a199a288..666cac7661ce 100644
+--- a/fs/resctrl/rdtgroup.c
++++ b/fs/resctrl/rdtgroup.c
+@@ -4353,6 +4353,12 @@ void resctrl_offline_mon_domain(struct rdt_resource *r, struct rdt_domain_hdr *h
+  * During boot this may be called before global allocations have been made by
+  * resctrl_l3_mon_resource_init().
+  *
++ * Called during CPU online that may run as soon as CPU online callbacks
++ * are set up during resctrl initialization. The number of supported RMIDs
++ * may be reduced if additional mon_capable resources are enumerated
++ * at mount time. This means the rdt_l3_mon_domain::mbm_states[] and
++ * rdt_l3_mon_domain::rmid_busy_llc allocations may be larger than needed.
++ *
+  * Return: 0 for success, or -ENOMEM.
+  */
+ static int domain_setup_l3_mon_state(struct rdt_resource *r, struct rdt_l3_mon_domain *d)
+

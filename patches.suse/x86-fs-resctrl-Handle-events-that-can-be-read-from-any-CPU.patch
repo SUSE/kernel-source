@@ -1,0 +1,140 @@
+From: Tony Luck <tony.luck@intel.com>
+Date: Wed, 17 Dec 2025 09:20:58 -0800
+Subject: x86,fs/resctrl: Handle events that can be read from any CPU
+Git-commit: ab0308aee3819a3eccde42f9eb5bb01d6733be38
+Patch-mainline: v7.0-rc1
+References: jsc#PED-13854
+
+resctrl assumes that monitor events can only be read from a CPU in the
+cpumask_t set of each domain.  This is true for x86 events accessed with an
+MSR interface, but may not be true for other access methods such as MMIO.
+
+Introduce and use flag mon_evt::any_cpu, settable by architecture, that
+indicates there are no restrictions on which CPU can read that event.  This
+flag is not supported by the L3 event reading that requires to be run on a CPU
+that belongs to the L3 domain of the event being read.
+
+Signed-off-by: Tony Luck <tony.luck@intel.com>
+Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+Reviewed-by: Reinette Chatre <reinette.chatre@intel.com>
+Link: https://lore.kernel.org/20251217172121.12030-1-tony.luck@intel.com
+
+Acked-by: Nikolay Borisov <nik.borisov@suse.com>
+---
+ arch/x86/kernel/cpu/resctrl/core.c | 6 +++---
+ fs/resctrl/ctrlmondata.c           | 6 ++++++
+ fs/resctrl/internal.h              | 2 ++
+ fs/resctrl/monitor.c               | 4 +++-
+ include/linux/resctrl.h            | 2 +-
+ 5 files changed, 15 insertions(+), 5 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/resctrl/core.c b/arch/x86/kernel/cpu/resctrl/core.c
+index b3a2dc56155d..bd4a98106153 100644
+--- a/arch/x86/kernel/cpu/resctrl/core.c
++++ b/arch/x86/kernel/cpu/resctrl/core.c
+@@ -902,15 +902,15 @@ static __init bool get_rdt_mon_resources(void)
+ 	bool ret = false;
+ 
+ 	if (rdt_cpu_has(X86_FEATURE_CQM_OCCUP_LLC)) {
+-		resctrl_enable_mon_event(QOS_L3_OCCUP_EVENT_ID);
++		resctrl_enable_mon_event(QOS_L3_OCCUP_EVENT_ID, false);
+ 		ret = true;
+ 	}
+ 	if (rdt_cpu_has(X86_FEATURE_CQM_MBM_TOTAL)) {
+-		resctrl_enable_mon_event(QOS_L3_MBM_TOTAL_EVENT_ID);
++		resctrl_enable_mon_event(QOS_L3_MBM_TOTAL_EVENT_ID, false);
+ 		ret = true;
+ 	}
+ 	if (rdt_cpu_has(X86_FEATURE_CQM_MBM_LOCAL)) {
+-		resctrl_enable_mon_event(QOS_L3_MBM_LOCAL_EVENT_ID);
++		resctrl_enable_mon_event(QOS_L3_MBM_LOCAL_EVENT_ID, false);
+ 		ret = true;
+ 	}
+ 	if (rdt_cpu_has(X86_FEATURE_ABMC))
+diff --git a/fs/resctrl/ctrlmondata.c b/fs/resctrl/ctrlmondata.c
+index 7f9b2fed117a..2c69fcd70eeb 100644
+--- a/fs/resctrl/ctrlmondata.c
++++ b/fs/resctrl/ctrlmondata.c
+@@ -578,6 +578,11 @@ void mon_event_read(struct rmid_read *rr, struct rdt_resource *r,
+ 		}
+ 	}
+ 
++	if (evt->any_cpu) {
++		mon_event_count(rr);
++		goto out_ctx_free;
++	}
++
+ 	cpu = cpumask_any_housekeeping(cpumask, RESCTRL_PICK_ANY_CPU);
+ 
+ 	/*
+@@ -591,6 +596,7 @@ void mon_event_read(struct rmid_read *rr, struct rdt_resource *r,
+ 	else
+ 		smp_call_on_cpu(cpu, smp_mon_event_count, rr, false);
+ 
++out_ctx_free:
+ 	if (rr->arch_mon_ctx)
+ 		resctrl_arch_mon_ctx_free(r, evt->evtid, rr->arch_mon_ctx);
+ }
+diff --git a/fs/resctrl/internal.h b/fs/resctrl/internal.h
+index 86cf38ab08a7..fb0b6e40d022 100644
+--- a/fs/resctrl/internal.h
++++ b/fs/resctrl/internal.h
+@@ -61,6 +61,7 @@ static inline struct rdt_fs_context *rdt_fc2context(struct fs_context *fc)
+  *			READS_TO_REMOTE_MEM) being tracked by @evtid.
+  *			Only valid if @evtid is an MBM event.
+  * @configurable:	true if the event is configurable
++ * @any_cpu:		true if the event can be read from any CPU
+  * @enabled:		true if the event is enabled
+  */
+ struct mon_evt {
+@@ -69,6 +70,7 @@ struct mon_evt {
+ 	char			*name;
+ 	u32			evt_cfg;
+ 	bool			configurable;
++	bool			any_cpu;
+ 	bool			enabled;
+ };
+ 
+diff --git a/fs/resctrl/monitor.c b/fs/resctrl/monitor.c
+index 340b847ab397..8c76ac133bca 100644
+--- a/fs/resctrl/monitor.c
++++ b/fs/resctrl/monitor.c
+@@ -518,6 +518,7 @@ static int __mon_event_count(struct rdtgroup *rdtgrp, struct rmid_read *rr)
+ {
+ 	switch (rr->r->rid) {
+ 	case RDT_RESOURCE_L3:
++		WARN_ON_ONCE(rr->evt->any_cpu);
+ 		if (rr->hdr)
+ 			return __l3_mon_event_count(rdtgrp, rr);
+ 		else
+@@ -987,7 +988,7 @@ struct mon_evt mon_event_all[QOS_NUM_EVENTS] = {
+ 	},
+ };
+ 
+-void resctrl_enable_mon_event(enum resctrl_event_id eventid)
++void resctrl_enable_mon_event(enum resctrl_event_id eventid, bool any_cpu)
+ {
+ 	if (WARN_ON_ONCE(eventid < QOS_FIRST_EVENT || eventid >= QOS_NUM_EVENTS))
+ 		return;
+@@ -996,6 +997,7 @@ void resctrl_enable_mon_event(enum resctrl_event_id eventid)
+ 		return;
+ 	}
+ 
++	mon_event_all[eventid].any_cpu = any_cpu;
+ 	mon_event_all[eventid].enabled = true;
+ }
+ 
+diff --git a/include/linux/resctrl.h b/include/linux/resctrl.h
+index 79aaaabcdd3f..22c5d07fe9ff 100644
+--- a/include/linux/resctrl.h
++++ b/include/linux/resctrl.h
+@@ -412,7 +412,7 @@ u32 resctrl_arch_get_num_closid(struct rdt_resource *r);
+ u32 resctrl_arch_system_num_rmid_idx(void);
+ int resctrl_arch_update_domains(struct rdt_resource *r, u32 closid);
+ 
+-void resctrl_enable_mon_event(enum resctrl_event_id eventid);
++void resctrl_enable_mon_event(enum resctrl_event_id eventid, bool any_cpu);
+ 
+ bool resctrl_is_mon_event_enabled(enum resctrl_event_id eventid);
+ 
+

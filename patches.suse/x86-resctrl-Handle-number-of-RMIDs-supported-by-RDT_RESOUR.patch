@@ -1,0 +1,197 @@
+From: Tony Luck <tony.luck@intel.com>
+Date: Wed, 17 Dec 2025 09:21:12 -0800
+Subject: x86/resctrl: Handle number of RMIDs supported by
+ RDT_RESOURCE_PERF_PKG
+Git-commit: 67640e333b983298be624a41c43e3a8ed4713a73
+Patch-mainline: v7.0-rc1
+References: jsc#PED-13854
+
+There are now three meanings for "number of RMIDs":
+
+1) The number for legacy features enumerated by CPUID leaf 0xF. This is the
+   maximum number of distinct values that can be loaded into MSR_IA32_PQR_ASSOC.
+   Note that systems with Sub-NUMA Cluster mode enabled will force scaling down
+   the CPUID enumerated value by the number of SNC nodes per L3-cache.
+
+2) The number of registers in MMIO space for each event. This is enumerated in
+   the XML files and is the value initialized into event_group::num_rmid.
+
+3) The number of "hardware counters" (this isn't a strictly accurate
+   description of how things work, but serves as a useful analogy that does
+   describe the limitations) feeding to those MMIO registers. This is enumerated
+   in telemetry_region::num_rmids returned by intel_pmt_get_regions_by_feature().
+
+Event groups with insufficient "hardware counters" to track all RMIDs are
+difficult for users to use, since the system may reassign "hardware counters"
+at any time. This means that users cannot reliably collect two consecutive
+event counts to compute the rate at which events are occurring.
+
+Disable such event groups by default. The user may override this with
+a command line "rdt=" option. In this case limit an under-resourced event
+group's number of possible monitor resource groups to the lowest number of
+"hardware counters".
+
+Scan all enabled event groups and assign the RDT_RESOURCE_PERF_PKG resource
+"num_rmid" value to the smallest of these values as this value will be used
+later to compare against the number of RMIDs supported by other resources to
+determine how many monitoring resource groups are supported.
+
+N.B. Change type of resctrl_mon::num_rmid to u32 to match its usage and the
+type of event_group::num_rmid so that min(r->num_rmid, e->num_rmid) won't
+complain about mixing signed and unsigned types.
+
+Signed-off-by: Tony Luck <tony.luck@intel.com>
+Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+Reviewed-by: Reinette Chatre <reinette.chatre@intel.com>
+Link: https://lore.kernel.org/20251217172121.12030-1-tony.luck@intel.com
+
+Acked-by: Nikolay Borisov <nik.borisov@suse.com>
+---
+ arch/x86/kernel/cpu/resctrl/intel_aet.c | 53 ++++++++++++++++++++++++++++++++-
+ fs/resctrl/rdtgroup.c                   |  2 +-
+ include/linux/resctrl.h                 |  2 +-
+ 3 files changed, 54 insertions(+), 3 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/resctrl/intel_aet.c b/arch/x86/kernel/cpu/resctrl/intel_aet.c
+index dc25e8d2527d..aba997135003 100644
+--- a/arch/x86/kernel/cpu/resctrl/intel_aet.c
++++ b/arch/x86/kernel/cpu/resctrl/intel_aet.c
+@@ -22,6 +22,7 @@
+ #include <linux/intel_pmt_features.h>
+ #include <linux/intel_vsec.h>
+ #include <linux/io.h>
++#include <linux/minmax.h>
+ #include <linux/printk.h>
+ #include <linux/rculist.h>
+ #include <linux/rcupdate.h>
+@@ -60,10 +61,14 @@ struct pmt_event {
+  *			Valid if the system supports the event group,
+  *			NULL otherwise.
+  * @force_off:		True when "rdt" command line or architecture code disables
+- *			this event group.
++ *			this event group due to insufficient RMIDs.
+  * @force_on:		True when "rdt" command line overrides disable of this
+  *			event group.
+  * @guid:		Unique number per XML description file.
++ * @num_rmid:		Number of RMIDs supported by this group. May be
++ *			adjusted downwards if enumeration from
++ *			intel_pmt_get_regions_by_feature() indicates fewer
++ *			RMIDs can be tracked simultaneously.
+  * @mmio_size:		Number of bytes of MMIO registers for this group.
+  * @num_events:		Number of events in this group.
+  * @evts:		Array of event descriptors.
+@@ -76,6 +81,7 @@ struct event_group {
+ 
+ 	/* Remaining fields initialized from XML file. */
+ 	u32				guid;
++	u32				num_rmid;
+ 	size_t				mmio_size;
+ 	unsigned int			num_events;
+ 	struct pmt_event		evts[] __counted_by(num_events);
+@@ -90,6 +96,7 @@ struct event_group {
+ static struct event_group energy_0x26696143 = {
+ 	.pfname		= "energy",
+ 	.guid		= 0x26696143,
++	.num_rmid	= 576,
+ 	.mmio_size	= XML_MMIO_SIZE(576, 2, 3),
+ 	.num_events	= 2,
+ 	.evts		= {
+@@ -104,6 +111,7 @@ static struct event_group energy_0x26696143 = {
+ static struct event_group perf_0x26557651 = {
+ 	.pfname		= "perf",
+ 	.guid		= 0x26557651,
++	.num_rmid	= 576,
+ 	.mmio_size	= XML_MMIO_SIZE(576, 7, 3),
+ 	.num_events	= 7,
+ 	.evts		= {
+@@ -198,6 +206,23 @@ static bool group_has_usable_regions(struct event_group *e, struct pmt_feature_g
+ 	return usable_regions;
+ }
+ 
++static bool all_regions_have_sufficient_rmid(struct event_group *e, struct pmt_feature_group *p)
++{
++	struct telemetry_region *tr;
++
++	for (int i = 0; i < p->count; i++) {
++		if (!p->regions[i].addr)
++			continue;
++		tr = &p->regions[i];
++		if (tr->num_rmids < e->num_rmid) {
++			e->force_off = true;
++			return false;
++		}
++	}
++
++	return true;
++}
++
+ static bool enable_events(struct event_group *e, struct pmt_feature_group *p)
+ {
+ 	struct rdt_resource *r = &rdt_resources_all[RDT_RESOURCE_PERF_PKG].r_resctrl;
+@@ -209,6 +234,27 @@ static bool enable_events(struct event_group *e, struct pmt_feature_group *p)
+ 	if (!group_has_usable_regions(e, p))
+ 		return false;
+ 
++	/*
++	 * Only enable event group with insufficient RMIDs if the user requested
++	 * it from the kernel command line.
++	 */
++	if (!all_regions_have_sufficient_rmid(e, p) && !e->force_on) {
++		pr_info("%s %s:0x%x monitoring not enabled due to insufficient RMIDs\n",
++			r->name, e->pfname, e->guid);
++		return false;
++	}
++
++	for (int i = 0; i < p->count; i++) {
++		if (!p->regions[i].addr)
++			continue;
++		/*
++		 * e->num_rmid only adjusted lower if user (via rdt= kernel
++		 * parameter) forces an event group with insufficient RMID
++		 * to be enabled.
++		 */
++		e->num_rmid = min(e->num_rmid, p->regions[i].num_rmids);
++	}
++
+ 	for (int j = 0; j < e->num_events; j++) {
+ 		if (!resctrl_enable_mon_event(e->evts[j].id, true,
+ 					      e->evts[j].bin_bits, &e->evts[j]))
+@@ -219,6 +265,11 @@ static bool enable_events(struct event_group *e, struct pmt_feature_group *p)
+ 		return false;
+ 	}
+ 
++	if (r->mon.num_rmid)
++		r->mon.num_rmid = min(r->mon.num_rmid, e->num_rmid);
++	else
++		r->mon.num_rmid = e->num_rmid;
++
+ 	return true;
+ }
+ 
+diff --git a/fs/resctrl/rdtgroup.c b/fs/resctrl/rdtgroup.c
+index b9363a938f74..90c4a199a288 100644
+--- a/fs/resctrl/rdtgroup.c
++++ b/fs/resctrl/rdtgroup.c
+@@ -1158,7 +1158,7 @@ static int rdt_num_rmids_show(struct kernfs_open_file *of,
+ {
+ 	struct rdt_resource *r = rdt_kn_parent_priv(of->kn);
+ 
+-	seq_printf(seq, "%d\n", r->mon.num_rmid);
++	seq_printf(seq, "%u\n", r->mon.num_rmid);
+ 
+ 	return 0;
+ }
+diff --git a/include/linux/resctrl.h b/include/linux/resctrl.h
+index 451eb45e44f8..006e57fd7ca5 100644
+--- a/include/linux/resctrl.h
++++ b/include/linux/resctrl.h
+@@ -295,7 +295,7 @@ enum resctrl_schema_fmt {
+  *			events of monitor groups created via mkdir.
+  */
+ struct resctrl_mon {
+-	int			num_rmid;
++	u32			num_rmid;
+ 	unsigned int		mbm_cfg_mask;
+ 	int			num_mbm_cntrs;
+ 	bool			mbm_cntr_assignable;
+

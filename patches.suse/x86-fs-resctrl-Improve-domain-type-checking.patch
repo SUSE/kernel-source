@@ -1,0 +1,129 @@
+From: Tony Luck <tony.luck@intel.com>
+Date: Wed, 17 Dec 2025 09:20:48 -0800
+Subject: x86,fs/resctrl: Improve domain type checking
+Git-commit: 03eb578b37659e10bed14c2d9e7cc45dfe24123b
+Patch-mainline: v7.0-rc1
+References: jsc#PED-13854
+
+Every resctrl resource has a list of domain structures. struct rdt_ctrl_domain
+and struct rdt_mon_domain both begin with struct rdt_domain_hdr with
+rdt_domain_hdr::type used in validity checks before accessing the domain of
+a particular type.
+
+Add the resource id to struct rdt_domain_hdr in preparation for a new monitoring
+domain structure that will be associated with a new monitoring resource. Improve
+existing domain validity checks with a new helper domain_header_is_valid()
+that checks both domain type and resource id.  domain_header_is_valid() should
+be used before every call to container_of() that accesses a domain structure.
+
+Signed-off-by: Tony Luck <tony.luck@intel.com>
+Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+Reviewed-by: Reinette Chatre <reinette.chatre@intel.com>
+Link: https://lore.kernel.org/20251217172121.12030-1-tony.luck@intel.com
+
+Acked-by: Nikolay Borisov <nik.borisov@suse.com>
+---
+ arch/x86/kernel/cpu/resctrl/core.c | 10 ++++++----
+ fs/resctrl/ctrlmondata.c           |  2 +-
+ include/linux/resctrl.h            |  9 +++++++++
+ 3 files changed, 16 insertions(+), 5 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/resctrl/core.c b/arch/x86/kernel/cpu/resctrl/core.c
+index 3792ab4819dc..0b8b7b8697a7 100644
+--- a/arch/x86/kernel/cpu/resctrl/core.c
++++ b/arch/x86/kernel/cpu/resctrl/core.c
+@@ -464,7 +464,7 @@ static void domain_add_cpu_ctrl(int cpu, struct rdt_resource *r)
+ 
+ 	hdr = resctrl_find_domain(&r->ctrl_domains, id, &add_pos);
+ 	if (hdr) {
+-		if (WARN_ON_ONCE(hdr->type != RESCTRL_CTRL_DOMAIN))
++		if (!domain_header_is_valid(hdr, RESCTRL_CTRL_DOMAIN, r->rid))
+ 			return;
+ 		d = container_of(hdr, struct rdt_ctrl_domain, hdr);
+ 
+@@ -481,6 +481,7 @@ static void domain_add_cpu_ctrl(int cpu, struct rdt_resource *r)
+ 	d = &hw_dom->d_resctrl;
+ 	d->hdr.id = id;
+ 	d->hdr.type = RESCTRL_CTRL_DOMAIN;
++	d->hdr.rid = r->rid;
+ 	cpumask_set_cpu(cpu, &d->hdr.cpu_mask);
+ 
+ 	rdt_domain_reconfigure_cdp(r);
+@@ -520,7 +521,7 @@ static void domain_add_cpu_mon(int cpu, struct rdt_resource *r)
+ 
+ 	hdr = resctrl_find_domain(&r->mon_domains, id, &add_pos);
+ 	if (hdr) {
+-		if (WARN_ON_ONCE(hdr->type != RESCTRL_MON_DOMAIN))
++		if (!domain_header_is_valid(hdr, RESCTRL_MON_DOMAIN, r->rid))
+ 			return;
+ 		d = container_of(hdr, struct rdt_mon_domain, hdr);
+ 
+@@ -538,6 +539,7 @@ static void domain_add_cpu_mon(int cpu, struct rdt_resource *r)
+ 	d = &hw_dom->d_resctrl;
+ 	d->hdr.id = id;
+ 	d->hdr.type = RESCTRL_MON_DOMAIN;
++	d->hdr.rid = r->rid;
+ 	ci = get_cpu_cacheinfo_level(cpu, RESCTRL_L3_CACHE);
+ 	if (!ci) {
+ 		pr_warn_once("Can't find L3 cache for CPU:%d resource %s\n", cpu, r->name);
+@@ -598,7 +600,7 @@ static void domain_remove_cpu_ctrl(int cpu, struct rdt_resource *r)
+ 		return;
+ 	}
+ 
+-	if (WARN_ON_ONCE(hdr->type != RESCTRL_CTRL_DOMAIN))
++	if (!domain_header_is_valid(hdr, RESCTRL_CTRL_DOMAIN, r->rid))
+ 		return;
+ 
+ 	d = container_of(hdr, struct rdt_ctrl_domain, hdr);
+@@ -644,7 +646,7 @@ static void domain_remove_cpu_mon(int cpu, struct rdt_resource *r)
+ 		return;
+ 	}
+ 
+-	if (WARN_ON_ONCE(hdr->type != RESCTRL_MON_DOMAIN))
++	if (!domain_header_is_valid(hdr, RESCTRL_MON_DOMAIN, r->rid))
+ 		return;
+ 
+ 	d = container_of(hdr, struct rdt_mon_domain, hdr);
+diff --git a/fs/resctrl/ctrlmondata.c b/fs/resctrl/ctrlmondata.c
+index b2d178d3556e..905c310de573 100644
+--- a/fs/resctrl/ctrlmondata.c
++++ b/fs/resctrl/ctrlmondata.c
+@@ -653,7 +653,7 @@ int rdtgroup_mondata_show(struct seq_file *m, void *arg)
+ 		 * the resource to find the domain with "domid".
+ 		 */
+ 		hdr = resctrl_find_domain(&r->mon_domains, domid, NULL);
+-		if (!hdr || WARN_ON_ONCE(hdr->type != RESCTRL_MON_DOMAIN)) {
++		if (!hdr || !domain_header_is_valid(hdr, RESCTRL_MON_DOMAIN, resid)) {
+ 			ret = -ENOENT;
+ 			goto out;
+ 		}
+diff --git a/include/linux/resctrl.h b/include/linux/resctrl.h
+index 54701668b3df..e7c218f8d4f7 100644
+--- a/include/linux/resctrl.h
++++ b/include/linux/resctrl.h
+@@ -131,15 +131,24 @@ enum resctrl_domain_type {
+  * @list:		all instances of this resource
+  * @id:			unique id for this instance
+  * @type:		type of this instance
++ * @rid:		resource id for this instance
+  * @cpu_mask:		which CPUs share this resource
+  */
+ struct rdt_domain_hdr {
+ 	struct list_head		list;
+ 	int				id;
+ 	enum resctrl_domain_type	type;
++	enum resctrl_res_level		rid;
+ 	struct cpumask			cpu_mask;
+ };
+ 
++static inline bool domain_header_is_valid(struct rdt_domain_hdr *hdr,
++					  enum resctrl_domain_type type,
++					  enum resctrl_res_level rid)
++{
++	return !WARN_ON_ONCE(hdr->type != type || hdr->rid != rid);
++}
++
+ /**
+  * struct rdt_ctrl_domain - group of CPUs sharing a resctrl control resource
+  * @hdr:		common header for different domain types
+
