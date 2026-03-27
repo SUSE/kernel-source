@@ -1,0 +1,216 @@
+From: Artem Bityutskiy <artem.bityutskiy@linux.intel.com>
+Date: Mon, 17 Mar 2025 15:55:39 +0200
+Subject: intel_idle: Add C1 demotion on/off sysfs knob
+Git-commit: 6138f34515162340520b0415184367e12775f68a
+Patch-mainline: v6.16-rc1
+References: jsc#PED-15870
+
+Add a sysfs knob to enable/disable C1 demotion for the following Intel
+platforms: Sapphire Rapids Xeon, Emerald Rapids Xeon, Granite Rapids Xeon,
+Sierra Forest Xeon, and Grand Ridge SoC.
+
+This sysfs file shows up as
+"/sys/devices/system/cpu/cpuidle/intel_c1_demotion".
+
+The C1 demotion feature involves the platform firmware demoting deep
+C-state requests from the OS (e.g., C6 requests) to C1. The idea is
+that firmware monitors CPU wake-up rate, and if it is higher than a
+platform-specific threshold, the firmware demotes deep C-state
+requests to C1. For example, Linux requests C6, but firmware noticed
+too many wake-ups per second, and it keeps the CPU in C1. When the
+CPU stays in C1 long enough, the platform promotes it back to C6.
+
+The default value for C1 demotion is whatever is configured by BIOS.
+
+Signed-off-by: Artem Bityutskiy <artem.bityutskiy@linux.intel.com>
+Link: https://patch.msgid.link/20250317135541.1471754-2-dedekind1@gmail.com
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Acked-by: Giovanni Gherdovich <ggherdovich@suse.cz>
+---
+ drivers/idle/intel_idle.c |  102 ++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 102 insertions(+)
+
+--- a/drivers/idle/intel_idle.c
++++ b/drivers/idle/intel_idle.c
+@@ -48,9 +48,11 @@
+ #include <trace/events/power.h>
+ #include <linux/sched.h>
+ #include <linux/sched/smt.h>
++#include <linux/mutex.h>
+ #include <linux/notifier.h>
+ #include <linux/cpu.h>
+ #include <linux/moduleparam.h>
++#include <linux/sysfs.h>
+ #include <asm/cpu_device_id.h>
+ #include <asm/intel-family.h>
+ #include <asm/mwait.h>
+@@ -92,9 +94,15 @@ struct idle_cpu {
+ 	unsigned long auto_demotion_disable_flags;
+ 	bool byt_auto_demotion_disable_flag;
+ 	bool disable_promotion_to_c1e;
++	bool c1_demotion_supported;
+ 	bool use_acpi;
+ };
+ 
++static bool c1_demotion_supported;
++static DEFINE_MUTEX(c1_demotion_mutex);
++
++static struct device *sysfs_root __initdata;
++
+ static const struct idle_cpu *icpu __initdata;
+ static struct cpuidle_state *cpuidle_state_table __initdata;
+ 
+@@ -1553,18 +1561,21 @@ static const struct idle_cpu idle_cpu_gm
+ static const struct idle_cpu idle_cpu_spr __initconst = {
+ 	.state_table = spr_cstates,
+ 	.disable_promotion_to_c1e = true,
++	.c1_demotion_supported = true,
+ 	.use_acpi = true,
+ };
+ 
+ static const struct idle_cpu idle_cpu_gnr __initconst = {
+ 	.state_table = gnr_cstates,
+ 	.disable_promotion_to_c1e = true,
++	.c1_demotion_supported = true,
+ 	.use_acpi = true,
+ };
+ 
+ static const struct idle_cpu idle_cpu_gnrd __initconst = {
+ 	.state_table = gnrd_cstates,
+ 	.disable_promotion_to_c1e = true,
++	.c1_demotion_supported = true,
+ 	.use_acpi = true,
+ };
+ 
+@@ -1603,12 +1614,14 @@ static const struct idle_cpu idle_cpu_sn
+ static const struct idle_cpu idle_cpu_grr __initconst = {
+ 	.state_table = grr_cstates,
+ 	.disable_promotion_to_c1e = true,
++	.c1_demotion_supported = true,
+ 	.use_acpi = true,
+ };
+ 
+ static const struct idle_cpu idle_cpu_srf __initconst = {
+ 	.state_table = srf_cstates,
+ 	.disable_promotion_to_c1e = true,
++	.c1_demotion_supported = true,
+ 	.use_acpi = true,
+ };
+ 
+@@ -2307,6 +2320,88 @@ static void __init intel_idle_cpuidle_de
+ 		cpuidle_unregister_device(per_cpu_ptr(intel_idle_cpuidle_devices, i));
+ }
+ 
++static void intel_c1_demotion_toggle(void *enable)
++{
++	unsigned long long msr_val;
++
++	rdmsrl(MSR_PKG_CST_CONFIG_CONTROL, msr_val);
++	/*
++	 * Enable/disable C1 undemotion along with C1 demotion, as this is the
++	 * most sensible configuration in general.
++	 */
++	if (enable)
++		msr_val |= NHM_C1_AUTO_DEMOTE | SNB_C1_AUTO_UNDEMOTE;
++	else
++		msr_val &= ~(NHM_C1_AUTO_DEMOTE | SNB_C1_AUTO_UNDEMOTE);
++	wrmsrl(MSR_PKG_CST_CONFIG_CONTROL, msr_val);
++}
++
++static ssize_t intel_c1_demotion_store(struct device *dev,
++				       struct device_attribute *attr,
++				       const char *buf, size_t count)
++{
++	bool enable;
++	int err;
++
++	err = kstrtobool(buf, &enable);
++	if (err)
++		return err;
++
++	mutex_lock(&c1_demotion_mutex);
++	/* Enable/disable C1 demotion on all CPUs */
++	on_each_cpu(intel_c1_demotion_toggle, (void *)enable, 1);
++	mutex_unlock(&c1_demotion_mutex);
++
++	return count;
++}
++
++static ssize_t intel_c1_demotion_show(struct device *dev,
++				      struct device_attribute *attr, char *buf)
++{
++	unsigned long long msr_val;
++
++	/*
++	 * Read the MSR value for a CPU and assume it is the same for all CPUs. Any other
++	 * configuration would be a BIOS bug.
++	 */
++	rdmsrl(MSR_PKG_CST_CONFIG_CONTROL, msr_val);
++	return sysfs_emit(buf, "%d\n", !!(msr_val & NHM_C1_AUTO_DEMOTE));
++}
++static DEVICE_ATTR_RW(intel_c1_demotion);
++
++static int __init intel_idle_sysfs_init(void)
++{
++	int err;
++
++	if (!c1_demotion_supported)
++		return 0;
++
++	sysfs_root = bus_get_dev_root(&cpu_subsys);
++	if (!sysfs_root)
++		return 0;
++
++	err = sysfs_add_file_to_group(&sysfs_root->kobj,
++				      &dev_attr_intel_c1_demotion.attr,
++				      "cpuidle");
++	if (err) {
++		put_device(sysfs_root);
++		return err;
++	}
++
++	return 0;
++}
++
++static void __init intel_idle_sysfs_uninit(void)
++{
++	if (!sysfs_root)
++		return;
++
++	sysfs_remove_file_from_group(&sysfs_root->kobj,
++				     &dev_attr_intel_c1_demotion.attr,
++				     "cpuidle");
++	put_device(sysfs_root);
++}
++
+ static int __init intel_idle_init(void)
+ {
+ 	const struct x86_cpu_id *id;
+@@ -2356,6 +2451,8 @@ static int __init intel_idle_init(void)
+ 		auto_demotion_disable_flags = icpu->auto_demotion_disable_flags;
+ 		if (icpu->disable_promotion_to_c1e)
+ 			c1e_promotion = C1E_PROMOTION_DISABLE;
++		if (icpu->c1_demotion_supported)
++			c1_demotion_supported = true;
+ 		if (icpu->use_acpi || force_use_acpi)
+ 			intel_idle_acpi_cst_extract();
+ 	} else if (!intel_idle_acpi_cst_extract()) {
+@@ -2369,6 +2466,10 @@ static int __init intel_idle_init(void)
+ 	if (!intel_idle_cpuidle_devices)
+ 		return -ENOMEM;
+ 
++	retval = intel_idle_sysfs_init();
++	if (retval)
++		pr_warn("failed to initialized sysfs");
++
+ 	intel_idle_cpuidle_driver_init(&intel_idle_driver);
+ 
+ 	retval = cpuidle_register_driver(&intel_idle_driver);
+@@ -2393,6 +2494,7 @@ hp_setup_fail:
+ 	intel_idle_cpuidle_devices_uninit();
+ 	cpuidle_unregister_driver(&intel_idle_driver);
+ init_driver_fail:
++	intel_idle_sysfs_uninit();
+ 	free_percpu(intel_idle_cpuidle_devices);
+ 	return retval;
+ 
