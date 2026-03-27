@@ -1,0 +1,146 @@
+From: Kurt Borja <kuurtb@gmail.com>
+Date: Tue, 20 Jan 2026 01:20:42 -0500
+Subject: [PATCH] iio: core: Refactor iio_device_claim_direct() implementation
+Git-commit: c37ec9d507966a827913f42e06179e3475a00181
+Patch-mainline: v7.0-rc1
+References: jsc#PED-15409
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+In order to eventually unify the locking API, implement
+iio_device_claim_direct() fully inline, with the use of
+__iio_dev_mode_lock(), which takes care of sparse annotations.
+
+Reviewed-by: David Lechner <dlechner@baylibre.com>
+Reviewed-by: Nuno Sá <nuno.sa@analog.com>
+Signed-off-by: Kurt Borja <kuurtb@gmail.com>
+Signed-off-by: Jonathan Cameron <Jonathan.Cameron@huawei.com>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/iio/industrialio-core.c | 44 ---------------------------------
+ include/linux/iio/iio.h         | 40 +++++++++++++++++++++---------
+ 2 files changed, 28 insertions(+), 56 deletions(-)
+
+diff --git a/drivers/iio/industrialio-core.c b/drivers/iio/industrialio-core.c
+index db803267df6e..0f8e3aa98b72 100644
+--- a/drivers/iio/industrialio-core.c
++++ b/drivers/iio/industrialio-core.c
+@@ -2201,50 +2201,6 @@ void __iio_dev_mode_unlock(struct iio_dev *indio_dev)
+ }
+ EXPORT_SYMBOL_GPL(__iio_dev_mode_unlock);
+ 
+-/**
+- * __iio_device_claim_direct - Keep device in direct mode
+- * @indio_dev:	the iio_dev associated with the device
+- *
+- * If the device is in direct mode it is guaranteed to stay
+- * that way until __iio_device_release_direct() is called.
+- *
+- * Use with __iio_device_release_direct().
+- *
+- * Drivers should only call iio_device_claim_direct().
+- *
+- * Returns: true on success, false on failure.
+- */
+-bool __iio_device_claim_direct(struct iio_dev *indio_dev)
+-{
+-	struct iio_dev_opaque *iio_dev_opaque = to_iio_dev_opaque(indio_dev);
+-
+-	mutex_lock(&iio_dev_opaque->mlock);
+-
+-	if (iio_buffer_enabled(indio_dev)) {
+-		mutex_unlock(&iio_dev_opaque->mlock);
+-		return false;
+-	}
+-	return true;
+-}
+-EXPORT_SYMBOL_GPL(__iio_device_claim_direct);
+-
+-/**
+- * __iio_device_release_direct - releases claim on direct mode
+- * @indio_dev:	the iio_dev associated with the device
+- *
+- * Release the claim. Device is no longer guaranteed to stay
+- * in direct mode.
+- *
+- * Drivers should only call iio_device_release_direct().
+- *
+- * Use with __iio_device_claim_direct()
+- */
+-void __iio_device_release_direct(struct iio_dev *indio_dev)
+-{
+-	mutex_unlock(&to_iio_dev_opaque(indio_dev)->mlock);
+-}
+-EXPORT_SYMBOL_GPL(__iio_device_release_direct);
+-
+ /**
+  * iio_device_claim_buffer_mode - Keep device in buffer mode
+  * @indio_dev:	the iio_dev associated with the device
+diff --git a/include/linux/iio/iio.h b/include/linux/iio/iio.h
+index aecda887d833..e263ab5eeccf 100644
+--- a/include/linux/iio/iio.h
++++ b/include/linux/iio/iio.h
+@@ -664,31 +664,47 @@ int iio_push_event(struct iio_dev *indio_dev, u64 ev_code, s64 timestamp);
+ 
+ void __iio_dev_mode_lock(struct iio_dev *indio_dev) __acquires(indio_dev);
+ void __iio_dev_mode_unlock(struct iio_dev *indio_dev) __releases(indio_dev);
+-bool __iio_device_claim_direct(struct iio_dev *indio_dev);
+-void __iio_device_release_direct(struct iio_dev *indio_dev);
+ 
+ /*
+  * Helper functions that allow claim and release of direct mode
+  * in a fashion that doesn't generate many false positives from sparse.
+  * Note this must remain static inline in the header so that sparse
+- * can see the __acquire() marking. Revisit when sparse supports
+- * __cond_acquires()
++ * can see the __acquires() and __releases() annotations.
++ */
++
++/**
++ * iio_device_claim_direct() - Keep device in direct mode
++ * @indio_dev:	the iio_dev associated with the device
++ *
++ * If the device is in direct mode it is guaranteed to stay
++ * that way until iio_device_release_direct() is called.
++ *
++ * Use with iio_device_release_direct().
++ *
++ * Returns: true on success, false on failure.
+  */
+ static inline bool iio_device_claim_direct(struct iio_dev *indio_dev)
+ {
+-	if (!__iio_device_claim_direct(indio_dev))
+-		return false;
++	__iio_dev_mode_lock(indio_dev);
+ 
+-	__acquire(iio_dev);
++	if (iio_buffer_enabled(indio_dev)) {
++		__iio_dev_mode_unlock(indio_dev);
++		return false;
++	}
+ 
+ 	return true;
+ }
+ 
+-static inline void iio_device_release_direct(struct iio_dev *indio_dev)
+-{
+-	__iio_device_release_direct(indio_dev);
+-	__release(indio_dev);
+-}
++/**
++ * iio_device_release_direct() - Releases claim on direct mode
++ * @indio_dev:	the iio_dev associated with the device
++ *
++ * Release the claim. Device is no longer guaranteed to stay
++ * in direct mode.
++ *
++ * Use with iio_device_claim_direct().
++ */
++#define iio_device_release_direct(indio_dev) __iio_dev_mode_unlock(indio_dev)
+ 
+ int iio_device_claim_buffer_mode(struct iio_dev *indio_dev);
+ void iio_device_release_buffer_mode(struct iio_dev *indio_dev);
+-- 
+2.43.0
+
