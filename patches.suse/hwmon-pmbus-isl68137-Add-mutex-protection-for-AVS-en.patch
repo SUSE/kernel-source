@@ -1,0 +1,93 @@
+From 3075a3951f7708da5a8ab47b0b7d068a32f69e58 Mon Sep 17 00:00:00 2001
+From: Sanman Pradhan <psanman@juniper.net>
+Date: Thu, 19 Mar 2026 17:31:29 +0000
+Subject: [PATCH] hwmon: (pmbus/isl68137) Add mutex protection for AVS enable sysfs attributes
+Git-commit: 3075a3951f7708da5a8ab47b0b7d068a32f69e58
+Patch-mainline: v7.0-rc6
+References: git-fixes
+
+The custom avs0_enable and avs1_enable sysfs attributes access PMBus
+registers through the exported API helpers (pmbus_read_byte_data,
+pmbus_read_word_data, pmbus_write_word_data, pmbus_update_byte_data)
+without holding the PMBus update_lock mutex. These exported helpers do
+not acquire the mutex internally, unlike the core's internal callers
+which hold the lock before invoking them.
+
+The store callback is especially vulnerable: it performs a multi-step
+read-modify-write sequence (read VOUT_COMMAND, write VOUT_COMMAND, then
+update OPERATION) where concurrent access from another thread could
+interleave and corrupt the register state.
+
+Add pmbus_lock_interruptible()/pmbus_unlock() around both the show and
+store callbacks to serialize PMBus register access with the rest of the
+driver.
+
+Fixes: 038a9c3d1e424 ("hwmon: (pmbus/isl68137) Add driver for Intersil ISL68137 PWM Controller")
+Cc: stable@vger.kernel.org
+Signed-off-by: Sanman Pradhan <psanman@juniper.net>
+Link: https://lore.kernel.org/r/20260319173055.125271-3-sanman.pradhan@hpe.com
+Signed-off-by: Guenter Roeck <linux@roeck-us.net>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/hwmon/pmbus/isl68137.c | 21 ++++++++++++++++++---
+ 1 file changed, 18 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/hwmon/pmbus/isl68137.c b/drivers/hwmon/pmbus/isl68137.c
+index e7dac26b5be6..3e3a887aad05 100644
+--- a/drivers/hwmon/pmbus/isl68137.c
++++ b/drivers/hwmon/pmbus/isl68137.c
+@@ -96,7 +96,15 @@ static ssize_t isl68137_avs_enable_show_page(struct i2c_client *client,
+ 					     int page,
+ 					     char *buf)
+ {
+-	int val = pmbus_read_byte_data(client, page, PMBUS_OPERATION);
++	int val;
++
++	val = pmbus_lock_interruptible(client);
++	if (val)
++		return val;
++
++	val = pmbus_read_byte_data(client, page, PMBUS_OPERATION);
++
++	pmbus_unlock(client);
+ 
+ 	if (val < 0)
+ 		return val;
+@@ -118,6 +126,10 @@ static ssize_t isl68137_avs_enable_store_page(struct i2c_client *client,
+ 
+ 	op_val = result ? ISL68137_VOUT_AVS : 0;
+ 
++	rc = pmbus_lock_interruptible(client);
++	if (rc)
++		return rc;
++
+ 	/*
+ 	 * Writes to VOUT setpoint over AVSBus will persist after the VRM is
+ 	 * switched to PMBus control. Switching back to AVSBus control
+@@ -129,17 +141,20 @@ static ssize_t isl68137_avs_enable_store_page(struct i2c_client *client,
+ 		rc = pmbus_read_word_data(client, page, 0xff,
+ 					  PMBUS_VOUT_COMMAND);
+ 		if (rc < 0)
+-			return rc;
++			goto unlock;
+ 
+ 		rc = pmbus_write_word_data(client, page, PMBUS_VOUT_COMMAND,
+ 					   rc);
+ 		if (rc < 0)
+-			return rc;
++			goto unlock;
+ 	}
+ 
+ 	rc = pmbus_update_byte_data(client, page, PMBUS_OPERATION,
+ 				    ISL68137_VOUT_AVS, op_val);
+ 
++unlock:
++	pmbus_unlock(client);
++
+ 	return (rc < 0) ? rc : count;
+ }
+ 
+-- 
+2.53.0
+
