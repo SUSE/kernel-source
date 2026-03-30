@@ -1,0 +1,91 @@
+From: Larysa Zaremba <larysa.zaremba@intel.com>
+Date: Thu, 5 Mar 2026 12:12:48 +0100
+Subject: libeth, idpf: use truesize as XDP RxQ info frag_size
+Patch-mainline: v7.0-rc3
+Git-commit: 75d9228982f23d68066ca0b7d87014c3eb8ddc85
+References: git-fixes
+
+The only user of frag_size field in XDP RxQ info is
+bpf_xdp_frags_increase_tail(). It clearly expects whole buffer size instead
+of DMA write size. Different assumptions in idpf driver configuration lead
+to negative tailroom.
+
+To make it worse, buffer sizes are not actually uniform in idpf when
+splitq is enabled, as there are several buffer queues, so rxq->rx_buf_size
+is meaningless in this case.
+
+Use truesize of the first bufq in AF_XDP ZC, as there is only one. Disable
+growing tail for regular splitq.
+
+Fixes: ac8a861f632e ("idpf: prepare structures to support XDP")
+Reviewed-by: Aleksandr Loktionov <aleksandr.loktionov@intel.com>
+Signed-off-by: Larysa Zaremba <larysa.zaremba@intel.com>
+Link: https://patch.msgid.link/20260305111253.2317394-8-larysa.zaremba@intel.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/idpf/xdp.c   |    6 +++++-
+ drivers/net/ethernet/intel/idpf/xsk.c   |    1 +
+ drivers/net/ethernet/intel/libeth/xsk.c |    1 +
+ include/net/libeth/xsk.h                |    3 +++
+ 4 files changed, 10 insertions(+), 1 deletion(-)
+
+--- a/drivers/net/ethernet/intel/idpf/xdp.c
++++ b/drivers/net/ethernet/intel/idpf/xdp.c
+@@ -47,12 +47,16 @@ static int __idpf_xdp_rxq_info_init(stru
+ {
+ 	const struct idpf_vport *vport = rxq->q_vector->vport;
+ 	const struct idpf_q_vec_rsrc *rsrc;
++	u32 frag_size = 0;
+ 	bool split;
+ 	int err;
+ 
++	if (idpf_queue_has(XSK, rxq))
++		frag_size = rxq->bufq_sets[0].bufq.truesize;
++
+ 	err = __xdp_rxq_info_reg(&rxq->xdp_rxq, vport->netdev, rxq->idx,
+ 				 rxq->q_vector->napi.napi_id,
+-				 rxq->rx_buf_size);
++				 frag_size);
+ 	if (err)
+ 		return err;
+ 
+--- a/drivers/net/ethernet/intel/idpf/xsk.c
++++ b/drivers/net/ethernet/intel/idpf/xsk.c
+@@ -403,6 +403,7 @@ int idpf_xskfq_init(struct idpf_buf_queu
+ 	bufq->pending = fq.pending;
+ 	bufq->thresh = fq.thresh;
+ 	bufq->rx_buf_size = fq.buf_len;
++	bufq->truesize = fq.truesize;
+ 
+ 	if (!idpf_xskfq_refill(bufq))
+ 		netdev_err(bufq->pool->netdev,
+--- a/drivers/net/ethernet/intel/libeth/xsk.c
++++ b/drivers/net/ethernet/intel/libeth/xsk.c
+@@ -167,6 +167,7 @@ int libeth_xskfq_create(struct libeth_xs
+ 	fq->pending = fq->count;
+ 	fq->thresh = libeth_xdp_queue_threshold(fq->count);
+ 	fq->buf_len = xsk_pool_get_rx_frame_size(fq->pool);
++	fq->truesize = xsk_pool_get_rx_frag_step(fq->pool);
+ 
+ 	return 0;
+ }
+--- a/include/net/libeth/xsk.h
++++ b/include/net/libeth/xsk.h
+@@ -597,6 +597,7 @@ __libeth_xsk_run_pass(struct libeth_xdp_
+  * @pending: current number of XSkFQEs to refill
+  * @thresh: threshold below which the queue is refilled
+  * @buf_len: HW-writeable length per each buffer
++ * @truesize: step between consecutive buffers, 0 if none exists
+  * @nid: ID of the closest NUMA node with memory
+  */
+ struct libeth_xskfq {
+@@ -614,6 +615,8 @@ struct libeth_xskfq {
+ 	u32			thresh;
+ 
+ 	u32			buf_len;
++	u32			truesize;
++
+ 	int			nid;
+ };
+ 
