@@ -1,0 +1,113 @@
+From 465f1dba74c010995190bff267ae5a75afcdcfea Mon Sep 17 00:00:00 2001
+From: Balasubramani Vivekanandan <balasubramani.vivekanandan@intel.com>
+Date: Fri, 1 Aug 2025 10:53:56 +0530
+Subject: drm/xe/devcoredump: Defer devcoredump initialization during probe
+Git-commit: 465f1dba74c010995190bff267ae5a75afcdcfea
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Doing devcoredump initializing before GT though look harmless, it leads
+to problem during driver unbind. Because of this order, GT/Engine
+release functions will be called before xe devcoredump release function
+(xe_driver_devcoredump_fini) leading to the following kernel crash[1]
+because the devcoredump functions might still use GT/Engine
+datastructures after those are freed.
+
+The following crash is observed while running the IGT
+xe_wedged@wedged-at-any-timeout. The test forces a wedged state by
+submitting a workload which hangs. Then does a unbind/rebind of the
+driver to recover from the wedged state.
+The hanged workload leads to a devcoredump. The following crash is
+noticed when the devcoredump capture races with the driver unbind.
+During driver unbind, the release function hw_engine_fini() will be
+called which assigns NULL to hwe->gt. But the same data structure is
+accessed during the coredump capture in the function
+xe_engine_snapshot_print by reading snapshot->hwe->gt.
+
+With this patch, we make sure the devcoredump is stopped before
+deinitializing the core driver functions.
+
+[1]: 
+BUG: kernel NULL pointer dereference, address: 0000000000000000
+Workqueue: events_unbound xe_devcoredump_deferred_snap_work [xe]
+RIP: 0010:xe_engine_snapshot_print+0x47/0x420 [xe]
+Call Trace:
+ <TASK>
+ ? drm_printf+0x64/0x90
+ __xe_devcoredump_read+0x23f/0x2d0 [xe]
+ ? __pfx___drm_printfn_coredump+0x10/0x10
+ ? __pfx___drm_puts_coredump+0x10/0x10
+ xe_devcoredump_deferred_snap_work+0x17a/0x190 [xe]
+ process_one_work+0x22e/0x6f0
+ worker_thread+0x1e8/0x3d0
+ ? __pfx_worker_thread+0x10/0x10
+ kthread+0x11f/0x250
+ ? __pfx_kthread+0x10/0x10
+ ret_from_fork+0x47/0x70
+ ? __pfx_kthread+0x10/0x10
+ ret_from_fork_asm+0x1a/0x30
+
+V2: Detailed commit description (Rodrigo)
+V3: FIXME added (Rodrigo, Stuart)
+
+Fixes: 4209d635a823 ("drm/xe: Remove devcoredump during driver release")
+Reviewed-by: Stuart Summers <stuart.summers@intel.com>
+Link: https://lore.kernel.org/r/20250731061300.14320-1-balasubramani.vivekanandan@intel.com
+Signed-off-by: Balasubramani Vivekanandan <balasubramani.vivekanandan@intel.com>
+Link: https://lore.kernel.org/r/20250801052356.21885-1-balasubramani.vivekanandan@intel.com
+Signed-off-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+(cherry picked from commit 1fdc4c381ff765479d76ccf3134717c430c871b8)
+
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/xe/xe_device.c      | 8 ++++----
+ drivers/gpu/drm/xe/xe_guc_capture.c | 6 ++++++
+ 2 files changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_device.c b/drivers/gpu/drm/xe/xe_device.c
+index 5bd2f7d7b4ea..6ece4defa9df 100644
+--- a/drivers/gpu/drm/xe/xe_device.c
++++ b/drivers/gpu/drm/xe/xe_device.c
+@@ -802,10 +802,6 @@ int xe_device_probe(struct xe_device *xe)
+ 			return err;
+ 	}
+ 
+-	err = xe_devcoredump_init(xe);
+-	if (err)
+-		return err;
+-
+ 	/*
+ 	 * From here on, if a step fails, make sure a Driver-FLR is triggereed
+ 	 */
+@@ -870,6 +866,10 @@ int xe_device_probe(struct xe_device *xe)
+ 	    XE_WA(xe->tiles->media_gt, 15015404425_disable))
+ 		XE_DEVICE_WA_DISABLE(xe, 15015404425);
+ 
++	err = xe_devcoredump_init(xe);
++	if (err)
++		return err;
++
+ 	xe_nvm_init(xe);
+ 
+ 	err = xe_heci_gsc_init(xe);
+diff --git a/drivers/gpu/drm/xe/xe_guc_capture.c b/drivers/gpu/drm/xe/xe_guc_capture.c
+index 859a3ba91be5..243dad3e2418 100644
+--- a/drivers/gpu/drm/xe/xe_guc_capture.c
++++ b/drivers/gpu/drm/xe/xe_guc_capture.c
+@@ -1817,6 +1817,12 @@ void xe_engine_snapshot_print(struct xe_hw_engine_snapshot *snapshot, struct drm
+ 		   str_yes_no(snapshot->kernel_reserved));
+ 
+ 	for (type = GUC_STATE_CAPTURE_TYPE_GLOBAL; type < GUC_STATE_CAPTURE_TYPE_MAX; type++) {
++		/*
++		 * FIXME: During devcoredump print we should avoid accessing the
++		 * driver pointers for gt or engine. Printing should be done only
++		 * using the snapshot captured. Here we are accessing the gt
++		 * pointer. It should be fixed.
++		 */
+ 		list = xe_guc_capture_get_reg_desc_list(gt, GUC_CAPTURE_LIST_INDEX_PF, type,
+ 							capture_class, false);
+ 		snapshot_print_by_list_order(snapshot, p, type, list);
+-- 
+2.52.0
+

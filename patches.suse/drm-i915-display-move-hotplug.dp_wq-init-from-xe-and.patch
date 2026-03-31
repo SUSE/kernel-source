@@ -1,0 +1,146 @@
+From ed23224b3f5e5e938e5c97d246678702df98eb93 Mon Sep 17 00:00:00 2001
+From: Jani Nikula <jani.nikula@intel.com>
+Date: Fri, 16 May 2025 15:16:57 +0300
+Subject: drm/i915/display: move hotplug.dp_wq init from xe and i915 to display
+Git-commit: ed23224b3f5e5e938e5c97d246678702df98eb93
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+The workqueue init and destroy belongs in display. Move it.
+
+Reviewed-by: Matthew Auld <matthew.auld@intel.com>
+Link: https://lore.kernel.org/r/4730167548a40dc2abe38cd084809b74de988f1a.1747397638.git.jani.nikula@intel.com
+Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../gpu/drm/i915/display/intel_display_driver.c    | 11 ++++++++++-
+ drivers/gpu/drm/i915/i915_driver.c                 | 13 +------------
+ drivers/gpu/drm/xe/display/xe_display.c            | 14 +-------------
+ 3 files changed, 12 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display_driver.c b/drivers/gpu/drm/i915/display/intel_display_driver.c
+index 581787d0452e..2bdafab9b6d0 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_driver.c
++++ b/drivers/gpu/drm/i915/display/intel_display_driver.c
+@@ -243,10 +243,16 @@ int intel_display_driver_probe_noirq(struct intel_display *display)
+ 
+ 	intel_dmc_init(display);
+ 
++	display->hotplug.dp_wq = alloc_ordered_workqueue("intel-dp", 0);
++	if (!display->hotplug.dp_wq) {
++		ret = -ENOMEM;
++		goto cleanup_vga_client_pw_domain_dmc;
++	}
++
+ 	display->wq.modeset = alloc_ordered_workqueue("i915_modeset", 0);
+ 	if (!display->wq.modeset) {
+ 		ret = -ENOMEM;
+-		goto cleanup_vga_client_pw_domain_dmc;
++		goto cleanup_wq_dp;
+ 	}
+ 
+ 	display->wq.flip = alloc_workqueue("i915_flip", WQ_HIGHPRI |
+@@ -296,6 +302,8 @@ int intel_display_driver_probe_noirq(struct intel_display *display)
+ 	destroy_workqueue(display->wq.flip);
+ cleanup_wq_modeset:
+ 	destroy_workqueue(display->wq.modeset);
++cleanup_wq_dp:
++	destroy_workqueue(display->hotplug.dp_wq);
+ cleanup_vga_client_pw_domain_dmc:
+ 	intel_dmc_fini(display);
+ 	intel_power_domains_driver_remove(display);
+@@ -631,6 +639,7 @@ void intel_display_driver_remove_noirq(struct intel_display *display)
+ 
+ 	intel_gmbus_teardown(display);
+ 
++	destroy_workqueue(display->hotplug.dp_wq);
+ 	destroy_workqueue(display->wq.flip);
+ 	destroy_workqueue(display->wq.modeset);
+ 	destroy_workqueue(display->wq.cleanup);
+diff --git a/drivers/gpu/drm/i915/i915_driver.c b/drivers/gpu/drm/i915/i915_driver.c
+index 5c69d14a7673..950b7ad8d675 100644
+--- a/drivers/gpu/drm/i915/i915_driver.c
++++ b/drivers/gpu/drm/i915/i915_driver.c
+@@ -115,8 +115,6 @@ static const struct drm_driver i915_drm_driver;
+ 
+ static int i915_workqueues_init(struct drm_i915_private *dev_priv)
+ {
+-	struct intel_display *display = dev_priv->display;
+-
+ 	/*
+ 	 * The i915 workqueue is primarily used for batched retirement of
+ 	 * requests (and thus managing bo) once the task has been completed
+@@ -135,10 +133,6 @@ static int i915_workqueues_init(struct drm_i915_private *dev_priv)
+ 	if (dev_priv->wq == NULL)
+ 		goto out_err;
+ 
+-	display->hotplug.dp_wq = alloc_ordered_workqueue("i915-dp", 0);
+-	if (!display->hotplug.dp_wq)
+-		goto out_free_wq;
+-
+ 	/*
+ 	 * The unordered i915 workqueue should be used for all work
+ 	 * scheduling that do not require running in order, which used
+@@ -147,12 +141,10 @@ static int i915_workqueues_init(struct drm_i915_private *dev_priv)
+ 	 */
+ 	dev_priv->unordered_wq = alloc_workqueue("i915-unordered", 0, 0);
+ 	if (dev_priv->unordered_wq == NULL)
+-		goto out_free_dp_wq;
++		goto out_free_wq;
+ 
+ 	return 0;
+ 
+-out_free_dp_wq:
+-	destroy_workqueue(display->hotplug.dp_wq);
+ out_free_wq:
+ 	destroy_workqueue(dev_priv->wq);
+ out_err:
+@@ -163,10 +155,7 @@ static int i915_workqueues_init(struct drm_i915_private *dev_priv)
+ 
+ static void i915_workqueues_cleanup(struct drm_i915_private *dev_priv)
+ {
+-	struct intel_display *display = dev_priv->display;
+-
+ 	destroy_workqueue(dev_priv->unordered_wq);
+-	destroy_workqueue(display->hotplug.dp_wq);
+ 	destroy_workqueue(dev_priv->wq);
+ }
+ 
+diff --git a/drivers/gpu/drm/xe/display/xe_display.c b/drivers/gpu/drm/xe/display/xe_display.c
+index 1fcca7acaef4..b0f5624177bd 100644
+--- a/drivers/gpu/drm/xe/display/xe_display.c
++++ b/drivers/gpu/drm/xe/display/xe_display.c
+@@ -83,14 +83,6 @@ static void unset_display_features(struct xe_device *xe)
+ 	xe->drm.driver_features &= ~(DRIVER_MODESET | DRIVER_ATOMIC);
+ }
+ 
+-static void display_destroy(struct drm_device *dev, void *dummy)
+-{
+-	struct xe_device *xe = to_xe_device(dev);
+-	struct intel_display *display = xe->display;
+-
+-	destroy_workqueue(display->hotplug.dp_wq);
+-}
+-
+ /**
+  * xe_display_create - create display struct
+  * @xe: XE device instance
+@@ -105,13 +97,9 @@ static void display_destroy(struct drm_device *dev, void *dummy)
+ int xe_display_create(struct xe_device *xe)
+ {
+ 	/* TODO: Allocate display dynamically. */
+-	struct intel_display *display = &xe->__display;
+-
+ 	xe->display = &xe->__display;
+ 
+-	display->hotplug.dp_wq = alloc_ordered_workqueue("xe-dp", 0);
+-
+-	return drmm_add_action_or_reset(&xe->drm, display_destroy, NULL);
++	return 0;
+ }
+ 
+ static void xe_display_fini_early(void *arg)
+-- 
+2.52.0
+

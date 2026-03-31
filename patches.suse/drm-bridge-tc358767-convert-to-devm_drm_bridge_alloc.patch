@@ -1,0 +1,179 @@
+From a59a271769149f0b8258507276f3d2a24370cbdb Mon Sep 17 00:00:00 2001
+From: Luca Ceresoli <luca.ceresoli@bootlin.com>
+Date: Wed, 28 May 2025 11:29:36 +0200
+Subject: drm/bridge: tc358767: convert to devm_drm_bridge_alloc() API
+Git-commit: a59a271769149f0b8258507276f3d2a24370cbdb
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+This is the new API for allocating DRM bridges.
+
+Converting this driver is a bit complex because the drm_bridge funcs
+pointer differs based on the bridge mode. So the current code does:
+
+ * tc_probe()
+   * devm_kzalloc() private struct embedding drm_bridge
+   * call tc_probe_bridge_endpoint() which
+     * parses DT description into struct fields
+     * computes the mode
+     * calls different bridge init functions based on the mode
+       * each sets a different bridge.funcs pointer
+
+The new API expects the funcs pointer to be known at alloc time, which does
+not fit in the current code structure.
+
+Solve this by splitting tc_probe_bridge_endpoint() in two functions:
+
+ * tc_probe_get_mode(), computing the mode without needing the private
+   driver structure
+ * tc_probe_bridge_endpoint(), only initializing the endpoints
+
+So now the mode is known before allocation and so
+is the funcs pointer, while all other operations are still happening after
+allocation, directly into the private struct data, as they used to.
+
+The new code flow is:
+
+ * tc_probe()
+   * tc_probe_get_mode()
+     * parses DT description
+     * computes and returns the mode
+   * based onf the mode, pick the funcs pointer
+   * devm_drm_bridfge_alloc(..., funcs)
+   * call tc_probe_bridge_endpoint() which
+     * calls different bridge init functions based on the mode
+       * these don't set the funcs pointer, it was done by _alloc
+
+This solution is chosen to minimize the changes in the driver logical code
+flow. The drawback is we now iterate twice over the endpoints during probe.
+
+Reviewed-by: Dmitry Baryshkov <dmitry.baryshkov@oss.qualcomm.com>
+Link: https://lore.kernel.org/r/20250528-drm-bridge-convert-to-alloc-api-v4-1-f04e698c9a77@bootlin.com
+Signed-off-by: Luca Ceresoli <luca.ceresoli@bootlin.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/bridge/tc358767.c | 56 ++++++++++++++++++++++---------
+ 1 file changed, 40 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/bridge/tc358767.c b/drivers/gpu/drm/bridge/tc358767.c
+index 7e5449fb86a3..61559467e2d2 100644
+--- a/drivers/gpu/drm/bridge/tc358767.c
++++ b/drivers/gpu/drm/bridge/tc358767.c
+@@ -344,6 +344,14 @@
+ #define COLOR_BAR_MODE_BARS	2
+ #define PLL_DBG			0x0a04
+ 
++enum tc_mode {
++	mode_dpi_to_edp = BIT(1) | BIT(2),
++	mode_dpi_to_dp  = BIT(1),
++	mode_dsi_to_edp = BIT(0) | BIT(2),
++	mode_dsi_to_dp  = BIT(0),
++	mode_dsi_to_dpi = BIT(0) | BIT(1),
++};
++
+ static bool tc_test_pattern;
+ module_param_named(test, tc_test_pattern, bool, 0644);
+ 
+@@ -2327,7 +2335,6 @@ static int tc_probe_dpi_bridge_endpoint(struct tc_data *tc)
+ 	if (bridge) {
+ 		tc->panel_bridge = bridge;
+ 		tc->bridge.type = DRM_MODE_CONNECTOR_DPI;
+-		tc->bridge.funcs = &tc_dpi_bridge_funcs;
+ 
+ 		return 0;
+ 	}
+@@ -2360,7 +2367,6 @@ static int tc_probe_edp_bridge_endpoint(struct tc_data *tc)
+ 		tc->bridge.type = DRM_MODE_CONNECTOR_DisplayPort;
+ 	}
+ 
+-	tc->bridge.funcs = &tc_edp_bridge_funcs;
+ 	if (tc->hpd_pin >= 0)
+ 		tc->bridge.ops |= DRM_BRIDGE_OP_DETECT;
+ 	tc->bridge.ops |= DRM_BRIDGE_OP_EDID;
+@@ -2368,17 +2374,11 @@ static int tc_probe_edp_bridge_endpoint(struct tc_data *tc)
+ 	return 0;
+ }
+ 
+-static int tc_probe_bridge_endpoint(struct tc_data *tc)
++static enum tc_mode tc_probe_get_mode(struct device *dev)
+ {
+-	struct device *dev = tc->dev;
+ 	struct of_endpoint endpoint;
+ 	struct device_node *node = NULL;
+-	const u8 mode_dpi_to_edp = BIT(1) | BIT(2);
+-	const u8 mode_dpi_to_dp = BIT(1);
+-	const u8 mode_dsi_to_edp = BIT(0) | BIT(2);
+-	const u8 mode_dsi_to_dp = BIT(0);
+-	const u8 mode_dsi_to_dpi = BIT(0) | BIT(1);
+-	u8 mode = 0;
++	enum tc_mode mode = 0;
+ 
+ 	/*
+ 	 * Determine bridge configuration.
+@@ -2401,7 +2401,27 @@ static int tc_probe_bridge_endpoint(struct tc_data *tc)
+ 			return -EINVAL;
+ 		}
+ 		mode |= BIT(endpoint.port);
++	}
++
++	if (mode != mode_dpi_to_edp &&
++	    mode != mode_dpi_to_dp  &&
++	    mode != mode_dsi_to_dpi &&
++	    mode != mode_dsi_to_edp &&
++	    mode != mode_dsi_to_dp) {
++		dev_warn(dev, "Invalid mode (0x%x) is not supported!\n", mode);
++		return -EINVAL;
++	}
++
++	return mode;
++}
+ 
++static int tc_probe_bridge_endpoint(struct tc_data *tc, enum tc_mode mode)
++{
++	struct device *dev = tc->dev;
++	struct of_endpoint endpoint;
++	struct device_node *node = NULL;
++
++	for_each_endpoint_of_node(dev->of_node, node) {
+ 		if (endpoint.port == 2) {
+ 			of_property_read_u8_array(node, "toshiba,pre-emphasis",
+ 						  tc->pre_emphasis,
+@@ -2427,24 +2447,28 @@ static int tc_probe_bridge_endpoint(struct tc_data *tc)
+ 		return tc_probe_edp_bridge_endpoint(tc);
+ 	}
+ 
+-	dev_warn(dev, "Invalid mode (0x%x) is not supported!\n", mode);
+-
++	/* Should never happen, mode was validated by tc_probe_get_mode() */
+ 	return -EINVAL;
+ }
+ 
+ static int tc_probe(struct i2c_client *client)
+ {
+ 	struct device *dev = &client->dev;
++	const struct drm_bridge_funcs *funcs;
+ 	struct tc_data *tc;
++	int mode;
+ 	int ret;
+ 
+-	tc = devm_kzalloc(dev, sizeof(*tc), GFP_KERNEL);
+-	if (!tc)
+-		return -ENOMEM;
++	mode = tc_probe_get_mode(dev);
++	funcs = (mode == mode_dsi_to_dpi) ? &tc_dpi_bridge_funcs : &tc_edp_bridge_funcs;
++
++	tc = devm_drm_bridge_alloc(dev, struct tc_data, bridge, funcs);
++	if (IS_ERR(tc))
++		return PTR_ERR(tc);
+ 
+ 	tc->dev = dev;
+ 
+-	ret = tc_probe_bridge_endpoint(tc);
++	ret = tc_probe_bridge_endpoint(tc, mode);
+ 	if (ret)
+ 		return ret;
+ 
+-- 
+2.52.0
+

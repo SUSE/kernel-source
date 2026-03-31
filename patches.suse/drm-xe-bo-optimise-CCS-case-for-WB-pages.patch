@@ -1,0 +1,80 @@
+From 338ec84deefdaf8e479455ee7d55434571799cf0 Mon Sep 17 00:00:00 2001
+From: Matthew Auld <matthew.auld@intel.com>
+Date: Fri, 16 May 2025 16:38:11 +0100
+Subject: drm/xe/bo: optimise CCS case for WB pages
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 338ec84deefdaf8e479455ee7d55434571799cf0
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Dealing with CCS state is significant on LNL+, where we end up clearing
+the compression state on every page alloc using the blitter for user
+buffers, including also saving and restoring it when moving between
+domains, plus we need to alloc extra pages to hold the raw CCS state for
+the save step.
+
+However all compression PAT modes, on platforms like LNL, also require
+coh_none, meaning that only WC memory can use compression in the first
+place. With this we can be sneaky and completely ignore CCS for WB
+buffers, which is likely the common case anyway. This would then skip
+all blitter moves/clears between sys <-> tt and then also means we can
+drop the extra CCS pages.
+
+This should be safe since there is no way to interact with the
+compression state (potentially uncleared) without using a PAT enabled
+index (which is rejected at bind), including if trying to be malicious
+and copy the raw CCS state from userpace, which should give back all
+zeroes if the src surface (indirect) is lacking compressed PAT index.
+
+Signed-off-by: Matthew Auld <matthew.auld@intel.com>
+Cc: Satyanarayana K V P <satyanarayana.k.v.p@intel.com>
+Cc: Thomas Hellström <thomas.hellstrom@linux.intel.com>
+Cc: Matthew Brost <matthew.brost@intel.com>
+Reviewed-by: José Roberto de Souza <jose.souza@intel.com>
+Reviewed-by: Satyanarayana K V P <satyanarayana.k.v.p@intel.com>
+Link: https://lore.kernel.org/r/20250516153810.223530-2-matthew.auld@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/xe/xe_bo.c  | 8 ++++++++
+ drivers/gpu/drm/xe/xe_pat.c | 3 ++-
+ 2 files changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_bo.c b/drivers/gpu/drm/xe/xe_bo.c
+index 7aa2c17825da..61d208c85281 100644
+--- a/drivers/gpu/drm/xe/xe_bo.c
++++ b/drivers/gpu/drm/xe/xe_bo.c
+@@ -2992,6 +2992,14 @@ bool xe_bo_needs_ccs_pages(struct xe_bo *bo)
+ 	if (IS_DGFX(xe) && (bo->flags & XE_BO_FLAG_SYSTEM))
+ 		return false;
+ 
++	/*
++	 * Compression implies coh_none, therefore we know for sure that WB
++	 * memory can't currently use compression, which is likely one of the
++	 * common cases.
++	 */
++	if (bo->cpu_caching == DRM_XE_GEM_CPU_CACHING_WB)
++		return false;
++
+ 	return true;
+ }
+ 
+diff --git a/drivers/gpu/drm/xe/xe_pat.c b/drivers/gpu/drm/xe/xe_pat.c
+index 30fdbdb9341e..38a6a49c1b2a 100644
+--- a/drivers/gpu/drm/xe/xe_pat.c
++++ b/drivers/gpu/drm/xe/xe_pat.c
+@@ -103,7 +103,8 @@ static const struct xe_pat_table_entry xelpg_pat_table[] = {
+  *
+  * Note: There is an implicit assumption in the driver that compression and
+  * coh_1way+ are mutually exclusive. If this is ever not true then userptr
+- * and imported dma-buf from external device will have uncleared ccs state.
++ * and imported dma-buf from external device will have uncleared ccs state. See
++ * also xe_bo_needs_ccs_pages().
+  */
+ #define XE2_PAT(no_promote, comp_en, l3clos, l3_policy, l4_policy, __coh_mode) \
+ 	{ \
+-- 
+2.52.0
+

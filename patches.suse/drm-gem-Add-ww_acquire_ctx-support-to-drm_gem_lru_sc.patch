@@ -1,0 +1,193 @@
+From 02070f04987524caf77d4bf4c94ebceb783b7bcc Mon Sep 17 00:00:00 2001
+From: Rob Clark <robdclark@chromium.org>
+Date: Sun, 29 Jun 2025 13:12:46 -0700
+Subject: drm/gem: Add ww_acquire_ctx support to drm_gem_lru_scan()
+Git-commit: 02070f04987524caf77d4bf4c94ebceb783b7bcc
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+If the callback is going to have to attempt to grab more locks, it is
+useful to have an ww_acquire_ctx to avoid locking order problems.
+
+Why not use the drm_exec helper instead?  Mainly because (a) where
+ww_acquire_init() is called is awkward, and (b) we don't really
+need to retry after backoff, we can just move on to the next object.
+
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+Signed-off-by: Rob Clark <robin.clark@oss.qualcomm.com>
+Tested-by: Antonino Maniscalco <antomani103@gmail.com>
+Reviewed-by: Antonino Maniscalco <antomani103@gmail.com>
+Patchwork: https://patchwork.freedesktop.org/patch/661463/
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/drm_gem.c              | 14 +++++++++++---
+ drivers/gpu/drm/msm/msm_gem_shrinker.c | 24 +++++++++++++-----------
+ include/drm/drm_gem.h                  | 10 ++++++----
+ 3 files changed, 30 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_gem.c b/drivers/gpu/drm/drm_gem.c
+index c45b62cceedc..6a44351e58b7 100644
+--- a/drivers/gpu/drm/drm_gem.c
++++ b/drivers/gpu/drm/drm_gem.c
+@@ -1483,12 +1483,14 @@ EXPORT_SYMBOL(drm_gem_lru_move_tail);
+  * @nr_to_scan: The number of pages to try to reclaim
+  * @remaining: The number of pages left to reclaim, should be initialized by caller
+  * @shrink: Callback to try to shrink/reclaim the object.
++ * @ticket: Optional ww_acquire_ctx context to use for locking
+  */
+ unsigned long
+ drm_gem_lru_scan(struct drm_gem_lru *lru,
+ 		 unsigned int nr_to_scan,
+ 		 unsigned long *remaining,
+-		 bool (*shrink)(struct drm_gem_object *obj))
++		 bool (*shrink)(struct drm_gem_object *obj, struct ww_acquire_ctx *ticket),
++		 struct ww_acquire_ctx *ticket)
+ {
+ 	struct drm_gem_lru still_in_lru;
+ 	struct drm_gem_object *obj;
+@@ -1521,17 +1523,20 @@ drm_gem_lru_scan(struct drm_gem_lru *lru,
+ 		 */
+ 		mutex_unlock(lru->lock);
+ 
++		if (ticket)
++			ww_acquire_init(ticket, &reservation_ww_class);
++
+ 		/*
+ 		 * Note that this still needs to be trylock, since we can
+ 		 * hit shrinker in response to trying to get backing pages
+ 		 * for this obj (ie. while it's lock is already held)
+ 		 */
+-		if (!dma_resv_trylock(obj->resv)) {
++		if (!ww_mutex_trylock(&obj->resv->lock, ticket)) {
+ 			*remaining += obj->size >> PAGE_SHIFT;
+ 			goto tail;
+ 		}
+ 
+-		if (shrink(obj)) {
++		if (shrink(obj, ticket)) {
+ 			freed += obj->size >> PAGE_SHIFT;
+ 
+ 			/*
+@@ -1545,6 +1550,9 @@ drm_gem_lru_scan(struct drm_gem_lru *lru,
+ 
+ 		dma_resv_unlock(obj->resv);
+ 
++		if (ticket)
++			ww_acquire_fini(ticket);
++
+ tail:
+ 		drm_gem_object_put(obj);
+ 		mutex_lock(lru->lock);
+diff --git a/drivers/gpu/drm/msm/msm_gem_shrinker.c b/drivers/gpu/drm/msm/msm_gem_shrinker.c
+index 07ca4ddfe4e3..de185fc34084 100644
+--- a/drivers/gpu/drm/msm/msm_gem_shrinker.c
++++ b/drivers/gpu/drm/msm/msm_gem_shrinker.c
+@@ -44,7 +44,7 @@ msm_gem_shrinker_count(struct shrinker *shrinker, struct shrink_control *sc)
+ }
+ 
+ static bool
+-purge(struct drm_gem_object *obj)
++purge(struct drm_gem_object *obj, struct ww_acquire_ctx *ticket)
+ {
+ 	if (!is_purgeable(to_msm_bo(obj)))
+ 		return false;
+@@ -58,7 +58,7 @@ purge(struct drm_gem_object *obj)
+ }
+ 
+ static bool
+-evict(struct drm_gem_object *obj)
++evict(struct drm_gem_object *obj, struct ww_acquire_ctx *ticket)
+ {
+ 	if (is_unevictable(to_msm_bo(obj)))
+ 		return false;
+@@ -79,21 +79,21 @@ wait_for_idle(struct drm_gem_object *obj)
+ }
+ 
+ static bool
+-active_purge(struct drm_gem_object *obj)
++active_purge(struct drm_gem_object *obj, struct ww_acquire_ctx *ticket)
+ {
+ 	if (!wait_for_idle(obj))
+ 		return false;
+ 
+-	return purge(obj);
++	return purge(obj, ticket);
+ }
+ 
+ static bool
+-active_evict(struct drm_gem_object *obj)
++active_evict(struct drm_gem_object *obj, struct ww_acquire_ctx *ticket)
+ {
+ 	if (!wait_for_idle(obj))
+ 		return false;
+ 
+-	return evict(obj);
++	return evict(obj, ticket);
+ }
+ 
+ static unsigned long
+@@ -102,7 +102,7 @@ msm_gem_shrinker_scan(struct shrinker *shrinker, struct shrink_control *sc)
+ 	struct msm_drm_private *priv = shrinker->private_data;
+ 	struct {
+ 		struct drm_gem_lru *lru;
+-		bool (*shrink)(struct drm_gem_object *obj);
++		bool (*shrink)(struct drm_gem_object *obj, struct ww_acquire_ctx *ticket);
+ 		bool cond;
+ 		unsigned long freed;
+ 		unsigned long remaining;
+@@ -122,8 +122,9 @@ msm_gem_shrinker_scan(struct shrinker *shrinker, struct shrink_control *sc)
+ 			continue;
+ 		stages[i].freed =
+ 			drm_gem_lru_scan(stages[i].lru, nr,
+-					&stages[i].remaining,
+-					 stages[i].shrink);
++					 &stages[i].remaining,
++					 stages[i].shrink,
++					 NULL);
+ 		nr -= stages[i].freed;
+ 		freed += stages[i].freed;
+ 		remaining += stages[i].remaining;
+@@ -164,7 +165,7 @@ msm_gem_shrinker_shrink(struct drm_device *dev, unsigned long nr_to_scan)
+ static const int vmap_shrink_limit = 15;
+ 
+ static bool
+-vmap_shrink(struct drm_gem_object *obj)
++vmap_shrink(struct drm_gem_object *obj, struct ww_acquire_ctx *ticket)
+ {
+ 	if (!is_vunmapable(to_msm_bo(obj)))
+ 		return false;
+@@ -192,7 +193,8 @@ msm_gem_shrinker_vmap(struct notifier_block *nb, unsigned long event, void *ptr)
+ 		unmapped += drm_gem_lru_scan(lrus[idx],
+ 					     vmap_shrink_limit - unmapped,
+ 					     &remaining,
+-					     vmap_shrink);
++					     vmap_shrink,
++					     NULL);
+ 	}
+ 
+ 	*(unsigned long *)ptr += unmapped;
+diff --git a/include/drm/drm_gem.h b/include/drm/drm_gem.h
+index 1a79ec3fe45c..d3a7b43e2c63 100644
+--- a/include/drm/drm_gem.h
++++ b/include/drm/drm_gem.h
+@@ -560,10 +560,12 @@ void drm_gem_lru_init(struct drm_gem_lru *lru, struct mutex *lock);
+ void drm_gem_lru_remove(struct drm_gem_object *obj);
+ void drm_gem_lru_move_tail_locked(struct drm_gem_lru *lru, struct drm_gem_object *obj);
+ void drm_gem_lru_move_tail(struct drm_gem_lru *lru, struct drm_gem_object *obj);
+-unsigned long drm_gem_lru_scan(struct drm_gem_lru *lru,
+-			       unsigned int nr_to_scan,
+-			       unsigned long *remaining,
+-			       bool (*shrink)(struct drm_gem_object *obj));
++unsigned long
++drm_gem_lru_scan(struct drm_gem_lru *lru,
++		 unsigned int nr_to_scan,
++		 unsigned long *remaining,
++		 bool (*shrink)(struct drm_gem_object *obj, struct ww_acquire_ctx *ticket),
++		 struct ww_acquire_ctx *ticket);
+ 
+ int drm_gem_evict_locked(struct drm_gem_object *obj);
+ 
+-- 
+2.52.0
+

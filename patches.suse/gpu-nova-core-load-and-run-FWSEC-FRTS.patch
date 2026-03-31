@@ -1,0 +1,233 @@
+From 859aa3d940585db3f3513964020c2a42614804dc Mon Sep 17 00:00:00 2001
+From: Alexandre Courbot <acourbot@nvidia.com>
+Date: Thu, 19 Jun 2025 22:24:07 +0900
+Subject: gpu: nova-core: load and run FWSEC-FRTS
+Git-commit: 859aa3d940585db3f3513964020c2a42614804dc
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+With all the required pieces in place, load FWSEC-FRTS onto the GSP
+falcon, run it, and check that it successfully carved out the WPR2
+region out of framebuffer memory.
+
+Reviewed-by: Lyude Paul <lyude@redhat.com>
+Signed-off-by: Alexandre Courbot <acourbot@nvidia.com>
+Link: https://lore.kernel.org/r/20250619-nova-frts-v6-23-ecf41ef99252@nvidia.com
+Signed-off-by: Danilo Krummrich <dakr@kernel.org>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/nova-core/falcon.rs         |  3 -
+ drivers/gpu/nova-core/firmware/fwsec.rs | 25 +++++++
+ drivers/gpu/nova-core/gpu.rs            | 90 ++++++++++++++++++++++---
+ drivers/gpu/nova-core/regs.rs           | 31 +++++++++
+ 4 files changed, 136 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/nova-core/falcon.rs b/drivers/gpu/nova-core/falcon.rs
+index ba14cb24b80d..fe4d3d458a6b 100644
+--- a/drivers/gpu/nova-core/falcon.rs
++++ b/drivers/gpu/nova-core/falcon.rs
+@@ -2,9 +2,6 @@
+ 
+ //! Falcon microprocessor base support
+ 
+-// To be removed when all code is used.
+-#![expect(dead_code)]
+-
+ use core::ops::Deref;
+ use core::time::Duration;
+ use hal::FalconHal;
+diff --git a/drivers/gpu/nova-core/firmware/fwsec.rs b/drivers/gpu/nova-core/firmware/fwsec.rs
+index de179c201139..6058598ce76e 100644
+--- a/drivers/gpu/nova-core/firmware/fwsec.rs
++++ b/drivers/gpu/nova-core/firmware/fwsec.rs
+@@ -395,4 +395,29 @@ pub(crate) fn new(
+             ucode: ucode_signed,
+         })
+     }
++
++    /// Loads the FWSEC firmware into `falcon` and execute it.
++    pub(crate) fn run(
++        &self,
++        dev: &Device<device::Bound>,
++        falcon: &Falcon<Gsp>,
++        bar: &Bar0,
++    ) -> Result<()> {
++        // Reset falcon, load the firmware, and run it.
++        falcon
++            .reset(bar)
++            .inspect_err(|e| dev_err!(dev, "Failed to reset GSP falcon: {:?}\n", e))?;
++        falcon
++            .dma_load(bar, self)
++            .inspect_err(|e| dev_err!(dev, "Failed to load FWSEC firmware: {:?}\n", e))?;
++        let (mbox0, _) = falcon
++            .boot(bar, Some(0), None)
++            .inspect_err(|e| dev_err!(dev, "Failed to boot FWSEC firmware: {:?}\n", e))?;
++        if mbox0 != 0 {
++            dev_err!(dev, "FWSEC firmware returned error {}\n", mbox0);
++            Err(EIO)
++        } else {
++            Ok(())
++        }
++    }
+ }
+diff --git a/drivers/gpu/nova-core/gpu.rs b/drivers/gpu/nova-core/gpu.rs
+index c53e6135ca7d..43c8120559a7 100644
+--- a/drivers/gpu/nova-core/gpu.rs
++++ b/drivers/gpu/nova-core/gpu.rs
+@@ -184,6 +184,85 @@ fn drop(self: Pin<&mut Self>) {
+ }
+ 
+ impl Gpu {
++    /// Helper function to load and run the FWSEC-FRTS firmware and confirm that it has properly
++    /// created the WPR2 region.
++    ///
++    /// TODO: this needs to be moved into a larger type responsible for booting the whole GSP
++    /// (`GspBooter`?).
++    fn run_fwsec_frts(
++        dev: &device::Device<device::Bound>,
++        falcon: &Falcon<Gsp>,
++        bar: &Bar0,
++        bios: &Vbios,
++        fb_layout: &FbLayout,
++    ) -> Result<()> {
++        // Check that the WPR2 region does not already exists - if it does, we cannot run
++        // FWSEC-FRTS until the GPU is reset.
++        if regs::NV_PFB_PRI_MMU_WPR2_ADDR_HI::read(bar).higher_bound() != 0 {
++            dev_err!(
++                dev,
++                "WPR2 region already exists - GPU needs to be reset to proceed\n"
++            );
++            return Err(EBUSY);
++        }
++
++        let fwsec_frts = FwsecFirmware::new(
++            dev,
++            falcon,
++            bar,
++            bios,
++            FwsecCommand::Frts {
++                frts_addr: fb_layout.frts.start,
++                frts_size: fb_layout.frts.end - fb_layout.frts.start,
++            },
++        )?;
++
++        // Run FWSEC-FRTS to create the WPR2 region.
++        fwsec_frts.run(dev, falcon, bar)?;
++
++        // SCRATCH_E contains the error code for FWSEC-FRTS.
++        let frts_status = regs::NV_PBUS_SW_SCRATCH_0E::read(bar).frts_err_code();
++        if frts_status != 0 {
++            dev_err!(
++                dev,
++                "FWSEC-FRTS returned with error code {:#x}",
++                frts_status
++            );
++
++            return Err(EIO);
++        }
++
++        // Check that the WPR2 region has been created as we requested.
++        let (wpr2_lo, wpr2_hi) = (
++            regs::NV_PFB_PRI_MMU_WPR2_ADDR_LO::read(bar).lower_bound(),
++            regs::NV_PFB_PRI_MMU_WPR2_ADDR_HI::read(bar).higher_bound(),
++        );
++
++        match (wpr2_lo, wpr2_hi) {
++            (_, 0) => {
++                dev_err!(dev, "WPR2 region not created after running FWSEC-FRTS\n");
++
++                Err(EIO)
++            }
++            (wpr2_lo, _) if wpr2_lo != fb_layout.frts.start => {
++                dev_err!(
++                    dev,
++                    "WPR2 region created at unexpected address {:#x}; expected {:#x}\n",
++                    wpr2_lo,
++                    fb_layout.frts.start,
++                );
++
++                Err(EIO)
++            }
++            (wpr2_lo, wpr2_hi) => {
++                dev_dbg!(dev, "WPR2: {:#x}-{:#x}\n", wpr2_lo, wpr2_hi);
++                dev_dbg!(dev, "GPU instance built\n");
++
++                Ok(())
++            }
++        }
++    }
++
+     pub(crate) fn new(
+         pdev: &pci::Device<device::Bound>,
+         devres_bar: Devres<Bar0>,
+@@ -222,16 +301,7 @@ pub(crate) fn new(
+ 
+         let bios = Vbios::new(pdev, bar)?;
+ 
+-        let _fwsec_frts = FwsecFirmware::new(
+-            pdev.as_ref(),
+-            &gsp_falcon,
+-            bar,
+-            &bios,
+-            FwsecCommand::Frts {
+-                frts_addr: fb_layout.frts.start,
+-                frts_size: fb_layout.frts.end - fb_layout.frts.start,
+-            },
+-        )?;
++        Self::run_fwsec_frts(pdev.as_ref(), &gsp_falcon, bar, &bios, &fb_layout)?;
+ 
+         Ok(pin_init!(Self {
+             spec,
+diff --git a/drivers/gpu/nova-core/regs.rs b/drivers/gpu/nova-core/regs.rs
+index 8ca7bcb5a93f..ccfaeed55cff 100644
+--- a/drivers/gpu/nova-core/regs.rs
++++ b/drivers/gpu/nova-core/regs.rs
+@@ -42,6 +42,13 @@ pub(crate) fn chipset(self) -> Result<Chipset> {
+     }
+ }
+ 
++/* PBUS */
++
++// TODO: this is an array of registers.
++register!(NV_PBUS_SW_SCRATCH_0E@0x00001438  {
++    31:16   frts_err_code as u16;
++});
++
+ /* PFB */
+ 
+ register!(NV_PFB_NISO_FLUSH_SYSMEM_ADDR @ 0x00100c10 {
+@@ -73,6 +80,30 @@ pub(crate) fn usable_fb_size(self) -> u64 {
+     }
+ }
+ 
++register!(NV_PFB_PRI_MMU_WPR2_ADDR_LO@0x001fa824  {
++    31:4    lo_val as u32, "Bits 12..40 of the lower (inclusive) bound of the WPR2 region";
++});
++
++impl NV_PFB_PRI_MMU_WPR2_ADDR_LO {
++    /// Returns the lower (inclusive) bound of the WPR2 region.
++    pub(crate) fn lower_bound(self) -> u64 {
++        (self.lo_val() as u64) << 12
++    }
++}
++
++register!(NV_PFB_PRI_MMU_WPR2_ADDR_HI@0x001fa828  {
++    31:4    hi_val as u32, "Bits 12..40 of the higher (exclusive) bound of the WPR2 region";
++});
++
++impl NV_PFB_PRI_MMU_WPR2_ADDR_HI {
++    /// Returns the higher (exclusive) bound of the WPR2 region.
++    ///
++    /// A value of zero means the WPR2 region is not set.
++    pub(crate) fn higher_bound(self) -> u64 {
++        (self.hi_val() as u64) << 12
++    }
++}
++
+ /* PGC6 */
+ 
+ register!(NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_PRIV_LEVEL_MASK @ 0x00118128 {
+-- 
+2.52.0
+

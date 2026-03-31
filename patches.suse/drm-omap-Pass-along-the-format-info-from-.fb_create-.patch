@@ -1,0 +1,182 @@
+From f8f6e72fe28595969829d63db93ecaa56a0c2811 Mon Sep 17 00:00:00 2001
+From: Imre Deak <imre.deak@intel.com>
+Date: Tue, 5 Aug 2025 20:57:50 +0300
+Subject: drm/omap: Pass along the format info from .fb_create() to
+ drm_helper_mode_fill_fb_struct()
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: f8f6e72fe28595969829d63db93ecaa56a0c2811
+Patch-mainline: v6.17-rc2
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Plumb the format info from .fb_create() all the way to
+drm_helper_mode_fill_fb_struct() to avoid the redundant
+lookup.
+
+For the fbdev case a manual drm_get_format_info() lookup
+is needed.
+
+The patch is based on the driver parts of the patchset at Link:
+below, which missed converting the omap driver.
+
+Due to the absence of this change in the patchset at Link:, after the
+Fixed: commit below, omap_framebuffer_init() ->
+drm_helper_mode_fill_fb_struct() set drm_framebuffer::format incorrectly
+to NULL, which lead to the !fb->format WARN() in drm_framebuffer_init()
+and causing framebuffer creation to fail. This patch fixes both of these
+issues.
+
+V2: Amend the commit log mentioning the functional issues the patch
+    fixes. (Tomi)
+
+Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Cc: Tomi Valkeinen <tomi.valkeinen@ideasonboard.com>
+Cc: Thomas Zimmermann <tzimmermann@suse.de>
+Cc: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Cc: Maxime Ripard <mripard@kernel.org>
+Fixes: 41ab92d35ccd ("drm: Make passing of format info to drm_helper_mode_fill_fb_struct() mandatory")
+Reported-by: Mark Brown <broonie@kernel.org>
+Closes: https://lore.kernel.org/all/98b3a62c-91ff-4f91-a58b-e1265f84180b@sirena.org.uk
+Link: https://lore.kernel.org/all/20250701090722.13645-1-ville.syrjala@linux.intel.com
+Tested-by: Mark Brown <broonie@kernel.org>
+Tested-by: Linux Kernel Functional Testing <lkft@linaro.org>
+Acked-by: Alex Deucher <alexander.deucher@amd.com>
+Reviewed-by: Tomi Valkeinen <tomi.valkeinen@ideasonboard.com>
+Signed-off-by: Imre Deak <imre.deak@intel.com>
+Link: https://lore.kernel.org/r/20250805175752.690504-2-imre.deak@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/omapdrm/omap_fb.c    | 23 ++++++++++-------------
+ drivers/gpu/drm/omapdrm/omap_fb.h    |  2 ++
+ drivers/gpu/drm/omapdrm/omap_fbdev.c |  5 ++++-
+ 3 files changed, 16 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/gpu/drm/omapdrm/omap_fb.c b/drivers/gpu/drm/omapdrm/omap_fb.c
+index 30c81e2e5d6b..bb3105556f19 100644
+--- a/drivers/gpu/drm/omapdrm/omap_fb.c
++++ b/drivers/gpu/drm/omapdrm/omap_fb.c
+@@ -351,7 +351,7 @@ struct drm_framebuffer *omap_framebuffer_create(struct drm_device *dev,
+ 		}
+ 	}
+ 
+-	fb = omap_framebuffer_init(dev, mode_cmd, bos);
++	fb = omap_framebuffer_init(dev, info, mode_cmd, bos);
+ 	if (IS_ERR(fb))
+ 		goto error;
+ 
+@@ -365,9 +365,9 @@ struct drm_framebuffer *omap_framebuffer_create(struct drm_device *dev,
+ }
+ 
+ struct drm_framebuffer *omap_framebuffer_init(struct drm_device *dev,
++		const struct drm_format_info *info,
+ 		const struct drm_mode_fb_cmd2 *mode_cmd, struct drm_gem_object **bos)
+ {
+-	const struct drm_format_info *format = NULL;
+ 	struct omap_framebuffer *omap_fb = NULL;
+ 	struct drm_framebuffer *fb = NULL;
+ 	unsigned int pitch = mode_cmd->pitches[0];
+@@ -377,15 +377,12 @@ struct drm_framebuffer *omap_framebuffer_init(struct drm_device *dev,
+ 			dev, mode_cmd, mode_cmd->width, mode_cmd->height,
+ 			(char *)&mode_cmd->pixel_format);
+ 
+-	format = drm_get_format_info(dev, mode_cmd->pixel_format,
+-				     mode_cmd->modifier[0]);
+-
+ 	for (i = 0; i < ARRAY_SIZE(formats); i++) {
+ 		if (formats[i] == mode_cmd->pixel_format)
+ 			break;
+ 	}
+ 
+-	if (!format || i == ARRAY_SIZE(formats)) {
++	if (i == ARRAY_SIZE(formats)) {
+ 		dev_dbg(dev->dev, "unsupported pixel format: %4.4s\n",
+ 			(char *)&mode_cmd->pixel_format);
+ 		ret = -EINVAL;
+@@ -399,7 +396,7 @@ struct drm_framebuffer *omap_framebuffer_init(struct drm_device *dev,
+ 	}
+ 
+ 	fb = &omap_fb->base;
+-	omap_fb->format = format;
++	omap_fb->format = info;
+ 	mutex_init(&omap_fb->lock);
+ 
+ 	/*
+@@ -407,23 +404,23 @@ struct drm_framebuffer *omap_framebuffer_init(struct drm_device *dev,
+ 	 * that the two planes of multiplane formats need the same number of
+ 	 * bytes per pixel.
+ 	 */
+-	if (format->num_planes == 2 && pitch != mode_cmd->pitches[1]) {
++	if (info->num_planes == 2 && pitch != mode_cmd->pitches[1]) {
+ 		dev_dbg(dev->dev, "pitches differ between planes 0 and 1\n");
+ 		ret = -EINVAL;
+ 		goto fail;
+ 	}
+ 
+-	if (pitch % format->cpp[0]) {
++	if (pitch % info->cpp[0]) {
+ 		dev_dbg(dev->dev,
+ 			"buffer pitch (%u bytes) is not a multiple of pixel size (%u bytes)\n",
+-			pitch, format->cpp[0]);
++			pitch, info->cpp[0]);
+ 		ret = -EINVAL;
+ 		goto fail;
+ 	}
+ 
+-	for (i = 0; i < format->num_planes; i++) {
++	for (i = 0; i < info->num_planes; i++) {
+ 		struct plane *plane = &omap_fb->planes[i];
+-		unsigned int vsub = i == 0 ? 1 : format->vsub;
++		unsigned int vsub = i == 0 ? 1 : info->vsub;
+ 		unsigned int size;
+ 
+ 		size = pitch * mode_cmd->height / vsub;
+@@ -440,7 +437,7 @@ struct drm_framebuffer *omap_framebuffer_init(struct drm_device *dev,
+ 		plane->dma_addr  = 0;
+ 	}
+ 
+-	drm_helper_mode_fill_fb_struct(dev, fb, NULL, mode_cmd);
++	drm_helper_mode_fill_fb_struct(dev, fb, info, mode_cmd);
+ 
+ 	ret = drm_framebuffer_init(dev, fb, &omap_framebuffer_funcs);
+ 	if (ret) {
+diff --git a/drivers/gpu/drm/omapdrm/omap_fb.h b/drivers/gpu/drm/omapdrm/omap_fb.h
+index 0873f953cf1d..e6010302a22b 100644
+--- a/drivers/gpu/drm/omapdrm/omap_fb.h
++++ b/drivers/gpu/drm/omapdrm/omap_fb.h
+@@ -13,6 +13,7 @@ struct drm_connector;
+ struct drm_device;
+ struct drm_file;
+ struct drm_framebuffer;
++struct drm_format_info;
+ struct drm_gem_object;
+ struct drm_mode_fb_cmd2;
+ struct drm_plane_state;
+@@ -23,6 +24,7 @@ struct drm_framebuffer *omap_framebuffer_create(struct drm_device *dev,
+ 		struct drm_file *file, const struct drm_format_info *info,
+ 		const struct drm_mode_fb_cmd2 *mode_cmd);
+ struct drm_framebuffer *omap_framebuffer_init(struct drm_device *dev,
++		const struct drm_format_info *info,
+ 		const struct drm_mode_fb_cmd2 *mode_cmd, struct drm_gem_object **bos);
+ int omap_framebuffer_pin(struct drm_framebuffer *fb);
+ void omap_framebuffer_unpin(struct drm_framebuffer *fb);
+diff --git a/drivers/gpu/drm/omapdrm/omap_fbdev.c b/drivers/gpu/drm/omapdrm/omap_fbdev.c
+index 7b6396890681..948af7ec1130 100644
+--- a/drivers/gpu/drm/omapdrm/omap_fbdev.c
++++ b/drivers/gpu/drm/omapdrm/omap_fbdev.c
+@@ -197,7 +197,10 @@ int omap_fbdev_driver_fbdev_probe(struct drm_fb_helper *helper,
+ 		goto fail;
+ 	}
+ 
+-	fb = omap_framebuffer_init(dev, &mode_cmd, &bo);
++	fb = omap_framebuffer_init(dev,
++				   drm_get_format_info(dev, mode_cmd.pixel_format,
++						       mode_cmd.modifier[0]),
++				   &mode_cmd, &bo);
+ 	if (IS_ERR(fb)) {
+ 		dev_err(dev->dev, "failed to allocate fb\n");
+ 		/* note: if fb creation failed, we can't rely on fb destroy
+-- 
+2.52.0
+

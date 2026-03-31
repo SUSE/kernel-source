@@ -1,0 +1,168 @@
+From 3e4e1f2543c060cd8cf8ededc68ea50c49b4b28a Mon Sep 17 00:00:00 2001
+From: Aradhya Bhatia <a-bhatia1@ti.com>
+Date: Thu, 5 Jun 2025 22:45:24 +0530
+Subject: drm/bridge: cdns-dsi: Use pre_enable/post_disable to enable/disable
+Git-commit: 3e4e1f2543c060cd8cf8ededc68ea50c49b4b28a
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+The cdns-dsi controller requires that it be turned on completely before
+the input DPI's source has begun streaming[0]. Not having that, allows
+for a small window before cdns-dsi enable and after cdns-dsi disable
+where the previous entity (in this case tidss's videoport) to continue
+streaming DPI video signals. This small window where cdns-dsi is
+disabled but is still receiving signals causes the input FIFO of
+cdns-dsi to get corrupted. This causes the colors to shift on the output
+display. The colors can either shift by one color component (R->G, G->B,
+B->R), or by two color components (R->B, G->R, B->G).
+
+Since tidss's videoport starts streaming via crtc enable hooks, we need
+cdns-dsi to be up and running before that. Now that the bridges are
+pre_enabled before crtc is enabled, and post_disabled after crtc is
+disabled, use the pre_enable and post_disable hooks to get cdns-dsi
+ready and running before the tidss videoport to get pass the color shift
+issues.
+
+[0]: See section 12.6.5.7.3 "Start-up Procedure" in J721E SoC TRM
+     TRM Link: http://www.ti.com/lit/pdf/spruil1
+
+Reviewed-by: Tomi Valkeinen <tomi.valkeinen@ideasonboard.com>
+Tested-by: Tomi Valkeinen <tomi.valkeinen@ideasonboard.com>
+Signed-off-by: Aradhya Bhatia <a-bhatia1@ti.com>
+Signed-off-by: Aradhya Bhatia <aradhya.bhatia@linux.dev>
+Tested-by: Devarsh Thakkar <devarsht@ti.com>
+Link: https://lore.kernel.org/r/20250605171524.27222-5-aradhya.bhatia@linux.dev
+Signed-off-by: Maxime Ripard <mripard@kernel.org>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ .../gpu/drm/bridge/cadence/cdns-dsi-core.c    | 64 ++++++++++---------
+ 1 file changed, 35 insertions(+), 29 deletions(-)
+
+diff --git a/drivers/gpu/drm/bridge/cadence/cdns-dsi-core.c b/drivers/gpu/drm/bridge/cadence/cdns-dsi-core.c
+index acbbed0d4702..0d5b9628729b 100644
+--- a/drivers/gpu/drm/bridge/cadence/cdns-dsi-core.c
++++ b/drivers/gpu/drm/bridge/cadence/cdns-dsi-core.c
+@@ -670,13 +670,28 @@ cdns_dsi_bridge_mode_valid(struct drm_bridge *bridge,
+ 	return MODE_OK;
+ }
+ 
+-static void cdns_dsi_bridge_atomic_disable(struct drm_bridge *bridge,
+-					   struct drm_atomic_state *state)
++static void cdns_dsi_bridge_atomic_post_disable(struct drm_bridge *bridge,
++						struct drm_atomic_state *state)
+ {
+ 	struct cdns_dsi_input *input = bridge_to_cdns_dsi_input(bridge);
+ 	struct cdns_dsi *dsi = input_to_dsi(input);
+ 	u32 val;
+ 
++	/*
++	 * The cdns-dsi controller needs to be disabled after it's DPI source
++	 * has stopped streaming. If this is not followed, there is a brief
++	 * window before DPI source is disabled and after cdns-dsi controller
++	 * has been disabled where the DPI stream is still on, but the cdns-dsi
++	 * controller is not ready anymore to accept the incoming signals. This
++	 * is one of the reasons why a shift in pixel colors is observed on
++	 * displays that have cdns-dsi as one of the bridges.
++	 *
++	 * To mitigate this, disable this bridge from the bridge post_disable()
++	 * hook, instead of the bridge _disable() hook. The bridge post_disable()
++	 * hook gets called after the CRTC disable, where often many DPI sources
++	 * disable their streams.
++	 */
++
+ 	val = readl(dsi->regs + MCTL_MAIN_DATA_CTL);
+ 	val &= ~(IF_VID_SELECT_MASK | IF_VID_MODE | VID_EN | HOST_EOT_GEN |
+ 		 DISP_EOT_GEN);
+@@ -688,15 +703,6 @@ static void cdns_dsi_bridge_atomic_disable(struct drm_bridge *bridge,
+ 	if (dsi->platform_ops && dsi->platform_ops->disable)
+ 		dsi->platform_ops->disable(dsi);
+ 
+-	pm_runtime_put(dsi->base.dev);
+-}
+-
+-static void cdns_dsi_bridge_atomic_post_disable(struct drm_bridge *bridge,
+-						struct drm_atomic_state *state)
+-{
+-	struct cdns_dsi_input *input = bridge_to_cdns_dsi_input(bridge);
+-	struct cdns_dsi *dsi = input_to_dsi(input);
+-
+ 	dsi->phy_initialized = false;
+ 	dsi->link_initialized = false;
+ 	phy_power_off(dsi->dphy);
+@@ -774,8 +780,8 @@ static void cdns_dsi_init_link(struct cdns_dsi *dsi)
+ 	dsi->link_initialized = true;
+ }
+ 
+-static void cdns_dsi_bridge_atomic_enable(struct drm_bridge *bridge,
+-					  struct drm_atomic_state *state)
++static void cdns_dsi_bridge_atomic_pre_enable(struct drm_bridge *bridge,
++					      struct drm_atomic_state *state)
+ {
+ 	struct cdns_dsi_input *input = bridge_to_cdns_dsi_input(bridge);
+ 	struct cdns_dsi *dsi = input_to_dsi(input);
+@@ -792,6 +798,21 @@ static void cdns_dsi_bridge_atomic_enable(struct drm_bridge *bridge,
+ 	u32 tmp, reg_wakeup, div, status;
+ 	int nlanes;
+ 
++	/*
++	 * The cdns-dsi controller needs to be enabled before it's DPI source
++	 * has begun streaming. If this is not followed, there is a brief window
++	 * after DPI source enable and before cdns-dsi controller enable where
++	 * the DPI stream is on, but the cdns-dsi controller is not ready to
++	 * accept the incoming signals. This is one of the reasons why a shift
++	 * in pixel colors is observed on displays that have cdns-dsi as one of
++	 * the bridges.
++	 *
++	 * To mitigate this, enable this bridge from the bridge pre_enable()
++	 * hook, instead of the bridge _enable() hook. The bridge pre_enable()
++	 * hook gets called before the CRTC enable, where often many DPI sources
++	 * enable their streams.
++	 */
++
+ 	if (WARN_ON(pm_runtime_get_sync(dsi->base.dev) < 0))
+ 		return;
+ 
+@@ -811,8 +832,8 @@ static void cdns_dsi_bridge_atomic_enable(struct drm_bridge *bridge,
+ 	mode = &crtc_state->adjusted_mode;
+ 	nlanes = output->dev->lanes;
+ 
+-	cdns_dsi_hs_init(dsi);
+ 	cdns_dsi_init_link(dsi);
++	cdns_dsi_hs_init(dsi);
+ 
+ 	/*
+ 	 * Now that the DSI Link and DSI Phy are initialized,
+@@ -941,19 +962,6 @@ static void cdns_dsi_bridge_atomic_enable(struct drm_bridge *bridge,
+ 	writel(tmp, dsi->regs + MCTL_MAIN_EN);
+ }
+ 
+-static void cdns_dsi_bridge_atomic_pre_enable(struct drm_bridge *bridge,
+-					      struct drm_atomic_state *state)
+-{
+-	struct cdns_dsi_input *input = bridge_to_cdns_dsi_input(bridge);
+-	struct cdns_dsi *dsi = input_to_dsi(input);
+-
+-	if (WARN_ON(pm_runtime_get_sync(dsi->base.dev) < 0))
+-		return;
+-
+-	cdns_dsi_init_link(dsi);
+-	cdns_dsi_hs_init(dsi);
+-}
+-
+ static u32 *cdns_dsi_bridge_get_input_bus_fmts(struct drm_bridge *bridge,
+ 					       struct drm_bridge_state *bridge_state,
+ 					       struct drm_crtc_state *crtc_state,
+@@ -1048,9 +1056,7 @@ cdns_dsi_bridge_atomic_reset(struct drm_bridge *bridge)
+ static const struct drm_bridge_funcs cdns_dsi_bridge_funcs = {
+ 	.attach = cdns_dsi_bridge_attach,
+ 	.mode_valid = cdns_dsi_bridge_mode_valid,
+-	.atomic_disable = cdns_dsi_bridge_atomic_disable,
+ 	.atomic_pre_enable = cdns_dsi_bridge_atomic_pre_enable,
+-	.atomic_enable = cdns_dsi_bridge_atomic_enable,
+ 	.atomic_post_disable = cdns_dsi_bridge_atomic_post_disable,
+ 	.atomic_check = cdns_dsi_bridge_atomic_check,
+ 	.atomic_reset = cdns_dsi_bridge_atomic_reset,
+-- 
+2.52.0
+

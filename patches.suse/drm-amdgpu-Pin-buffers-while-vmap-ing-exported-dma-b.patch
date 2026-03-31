@@ -1,0 +1,148 @@
+From 08fb45446ebf1e2e435f95163c59d692acb0b514 Mon Sep 17 00:00:00 2001
+From: Thomas Zimmermann <tzimmermann@suse.de>
+Date: Thu, 21 Aug 2025 08:40:12 +0200
+Subject: drm/amdgpu: Pin buffers while vmap'ing exported dma-buf objects
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 08fb45446ebf1e2e435f95163c59d692acb0b514
+Patch-mainline: v6.17-rc4
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Current dma-buf vmap semantics require that the mapped buffer remains
+in place until the corresponding vunmap has completed.
+
+For GEM-SHMEM, this used to be guaranteed by a pin operation while creating
+an S/G table in import. GEM-SHMEN can now import dma-buf objects without
+creating the S/G table, so the pin is missing. Leads to page-fault errors,
+such as the one shown below.
+
+[  102.101726] BUG: unable to handle page fault for address: ffffc90127000000
+[...]
+[  102.157102] RIP: 0010:udl_compress_hline16+0x219/0x940 [udl]
+[...]
+[  102.243250] Call Trace:
+[  102.245695]  <TASK>
+[  102.2477V95]  ? validate_chain+0x24e/0x5e0
+[  102.251805]  ? __lock_acquire+0x568/0xae0
+[  102.255807]  udl_render_hline+0x165/0x341 [udl]
+[  102.260338]  ? __pfx_udl_render_hline+0x10/0x10 [udl]
+[  102.265379]  ? local_clock_noinstr+0xb/0x100
+[  102.269642]  ? __lock_release.isra.0+0x16c/0x2e0
+[  102.274246]  ? mark_held_locks+0x40/0x70
+[  102.278177]  udl_primary_plane_helper_atomic_update+0x43e/0x680 [udl]
+[  102.284606]  ? __pfx_udl_primary_plane_helper_atomic_update+0x10/0x10 [udl]
+[  102.291551]  ? lockdep_hardirqs_on_prepare.part.0+0x92/0x170
+[  102.297208]  ? lockdep_hardirqs_on+0x88/0x130
+[  102.301554]  ? _raw_spin_unlock_irq+0x24/0x50
+[  102.305901]  ? wait_for_completion_timeout+0x2bb/0x3a0
+[  102.311028]  ? drm_atomic_helper_calc_timestamping_constants+0x141/0x200
+[  102.317714]  ? drm_atomic_helper_commit_planes+0x3b6/0x1030
+[  102.323279]  drm_atomic_helper_commit_planes+0x3b6/0x1030
+[  102.328664]  drm_atomic_helper_commit_tail+0x41/0xb0
+[  102.333622]  commit_tail+0x204/0x330
+[...]
+[  102.529946] ---[ end trace 0000000000000000 ]---
+[  102.651980] RIP: 0010:udl_compress_hline16+0x219/0x940 [udl]
+
+In this stack strace, udl (based on GEM-SHMEM) imported and vmap'ed a
+dma-buf from amdgpu. Amdgpu relocated the buffer, thereby invalidating the
+mapping.
+
+Provide a custom dma-buf vmap method in amdgpu that pins the object before
+mapping it's buffer's pages into kernel address space. Do the opposite in
+vunmap.
+
+Note that dma-buf vmap differs from GEM vmap in how it handles relocation.
+While dma-buf vmap keeps the buffer in place, GEM vmap requires the caller
+to keep the buffer in place. Hence, this fix is in amdgpu's dma-buf code
+instead of its GEM code.
+
+A discussion of various approaches to solving the problem is available
+at [1].
+
+V3: 
+- try (GTT | VRAM); drop CPU domain (Christian)
+V2: 
+- only use mapable domains (Christian)
+- try pinning to domains in preferred order
+
+Signed-off-by: Thomas Zimmermann <tzimmermann@suse.de>
+Fixes: 660cd44659a0 ("drm/shmem-helper: Import dmabuf without mapping its sg_table")
+Reported-by: Thomas Zimmermann <tzimmermann@suse.de>
+Closes: https://lore.kernel.org/dri-devel/ba1bdfb8-dbf7-4372-bdcb-df7e0511c702@suse.de/
+Cc: Shixiong Ou <oushixiong@kylinos.cn>
+Cc: Thomas Zimmermann <tzimmermann@suse.de>
+Cc: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Cc: Maxime Ripard <mripard@kernel.org>
+Cc: David Airlie <airlied@gmail.com>
+Cc: Simona Vetter <simona@ffwll.ch>
+Cc: Sumit Semwal <sumit.semwal@linaro.org>
+Cc: "Christian König" <christian.koenig@amd.com>
+Cc: dri-devel@lists.freedesktop.org
+Cc: linux-media@vger.kernel.org
+Cc: linaro-mm-sig@lists.linaro.org
+Link: https://lore.kernel.org/dri-devel/9792c6c3-a2b8-4b2b-b5ba-fba19b153e21@suse.de/ # [1]
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Link: https://lore.kernel.org/r/20250821064031.39090-1-tzimmermann@suse.de
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c | 34 +++++++++++++++++++--
+ 1 file changed, 32 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c
+index 5743ebb2f1b7..ce27cb5bb05e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c
+@@ -285,6 +285,36 @@ static int amdgpu_dma_buf_begin_cpu_access(struct dma_buf *dma_buf,
+ 	return ret;
+ }
+ 
++static int amdgpu_dma_buf_vmap(struct dma_buf *dma_buf, struct iosys_map *map)
++{
++	struct drm_gem_object *obj = dma_buf->priv;
++	struct amdgpu_bo *bo = gem_to_amdgpu_bo(obj);
++	int ret;
++
++	/*
++	 * Pin to keep buffer in place while it's vmap'ed. The actual
++	 * domain is not that important as long as it's mapable. Using
++	 * GTT and VRAM should be compatible with most use cases.
++	 */
++	ret = amdgpu_bo_pin(bo, AMDGPU_GEM_DOMAIN_GTT | AMDGPU_GEM_DOMAIN_VRAM);
++	if (ret)
++		return ret;
++	ret = drm_gem_dmabuf_vmap(dma_buf, map);
++	if (ret)
++		amdgpu_bo_unpin(bo);
++
++	return ret;
++}
++
++static void amdgpu_dma_buf_vunmap(struct dma_buf *dma_buf, struct iosys_map *map)
++{
++	struct drm_gem_object *obj = dma_buf->priv;
++	struct amdgpu_bo *bo = gem_to_amdgpu_bo(obj);
++
++	drm_gem_dmabuf_vunmap(dma_buf, map);
++	amdgpu_bo_unpin(bo);
++}
++
+ const struct dma_buf_ops amdgpu_dmabuf_ops = {
+ 	.attach = amdgpu_dma_buf_attach,
+ 	.pin = amdgpu_dma_buf_pin,
+@@ -294,8 +324,8 @@ const struct dma_buf_ops amdgpu_dmabuf_ops = {
+ 	.release = drm_gem_dmabuf_release,
+ 	.begin_cpu_access = amdgpu_dma_buf_begin_cpu_access,
+ 	.mmap = drm_gem_dmabuf_mmap,
+-	.vmap = drm_gem_dmabuf_vmap,
+-	.vunmap = drm_gem_dmabuf_vunmap,
++	.vmap = amdgpu_dma_buf_vmap,
++	.vunmap = amdgpu_dma_buf_vunmap,
+ };
+ 
+ /**
+-- 
+2.52.0
+

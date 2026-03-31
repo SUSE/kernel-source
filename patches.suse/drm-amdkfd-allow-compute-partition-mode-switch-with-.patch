@@ -1,0 +1,217 @@
+From 96f75f9594466f92b10873cc3a49267cfe15ee49 Mon Sep 17 00:00:00 2001
+From: Jonathan Kim <jonathan.kim@amd.com>
+Date: Wed, 14 May 2025 17:00:46 -0400
+Subject: drm/amdkfd: allow compute partition mode switch with cgroup
+ exclusions
+Git-commit: 96f75f9594466f92b10873cc3a49267cfe15ee49
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+The KFD currently bars a compute partition mode switch while a KFD
+process exists.
+
+Since cgroup excluded devices remain excluded for the lifetime of a KFD
+process and user space is able to mode switch single devices, allow
+users to mode switch a device with any running process that has been
+cgroup excluded from this device.
+
+Signed-off-by: Jonathan Kim <jonathan.kim@amd.com>
+Reviewed-by: Harish Kasiviswanathan <harish.kasiviswanathan@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c |  4 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h |  8 +--
+ drivers/gpu/drm/amd/amdkfd/kfd_device.c    | 69 ++++++++++++++++++----
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h      |  5 +-
+ drivers/gpu/drm/amd/amdkfd/kfd_process.c   |  2 +-
+ 5 files changed, 70 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
+index 55161e5cdc30..36015249fbad 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
+@@ -749,12 +749,12 @@ int amdgpu_amdkfd_send_close_event_drain_irq(struct amdgpu_device *adev,
+ 
+ int amdgpu_amdkfd_check_and_lock_kfd(struct amdgpu_device *adev)
+ {
+-	return kgd2kfd_check_and_lock_kfd();
++	return kgd2kfd_check_and_lock_kfd(adev->kfd.dev);
+ }
+ 
+ void amdgpu_amdkfd_unlock_kfd(struct amdgpu_device *adev)
+ {
+-	kgd2kfd_unlock_kfd();
++	kgd2kfd_unlock_kfd(adev->kfd.dev);
+ }
+ 
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+index b6ca41859b53..3d5812269ea0 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+@@ -419,8 +419,8 @@ int kgd2kfd_post_reset(struct kfd_dev *kfd);
+ void kgd2kfd_interrupt(struct kfd_dev *kfd, const void *ih_ring_entry);
+ void kgd2kfd_set_sram_ecc_flag(struct kfd_dev *kfd);
+ void kgd2kfd_smi_event_throttle(struct kfd_dev *kfd, uint64_t throttle_bitmask);
+-int kgd2kfd_check_and_lock_kfd(void);
+-void kgd2kfd_unlock_kfd(void);
++int kgd2kfd_check_and_lock_kfd(struct kfd_dev *kfd);
++void kgd2kfd_unlock_kfd(struct kfd_dev *kfd);
+ int kgd2kfd_start_sched(struct kfd_dev *kfd, uint32_t node_id);
+ int kgd2kfd_stop_sched(struct kfd_dev *kfd, uint32_t node_id);
+ bool kgd2kfd_compute_active(struct kfd_dev *kfd, uint32_t node_id);
+@@ -489,12 +489,12 @@ void kgd2kfd_smi_event_throttle(struct kfd_dev *kfd, uint64_t throttle_bitmask)
+ {
+ }
+ 
+-static inline int kgd2kfd_check_and_lock_kfd(void)
++static inline int kgd2kfd_check_and_lock_kfd(struct kfd_dev *kfd)
+ {
+ 	return 0;
+ }
+ 
+-static inline void kgd2kfd_unlock_kfd(void)
++static inline void kgd2kfd_unlock_kfd(struct kfd_dev *kfd)
+ {
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device.c b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+index bf0854bd5555..a12e1433943d 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+@@ -1013,10 +1013,30 @@ int kgd2kfd_post_reset(struct kfd_dev *kfd)
+ 	return 0;
+ }
+ 
+-bool kfd_is_locked(void)
++bool kfd_is_locked(struct kfd_dev *kfd)
+ {
++	uint8_t id  = 0;
++	struct kfd_node *dev;
++
+ 	lockdep_assert_held(&kfd_processes_mutex);
+-	return  (kfd_locked > 0);
++
++	/* check reset/suspend lock */
++	if (kfd_locked > 0)
++		return true;
++
++	if (kfd)
++		return kfd->kfd_dev_lock > 0;
++
++	/* check lock on all cgroup accessible devices */
++	while (kfd_topology_enum_kfd_devices(id++, &dev) == 0) {
++		if (!dev || kfd_devcgroup_check_permission(dev))
++			continue;
++
++		if (dev->kfd->kfd_dev_lock > 0)
++			return true;
++	}
++
++	return false;
+ }
+ 
+ void kgd2kfd_suspend(struct kfd_dev *kfd, bool run_pm)
+@@ -1442,24 +1462,53 @@ unsigned int kfd_get_num_xgmi_sdma_engines(struct kfd_node *node)
+ 		kfd_get_num_sdma_engines(node);
+ }
+ 
+-int kgd2kfd_check_and_lock_kfd(void)
++int kgd2kfd_check_and_lock_kfd(struct kfd_dev *kfd)
+ {
++	struct kfd_process *p;
++	int r = 0, temp, idx;
++
+ 	mutex_lock(&kfd_processes_mutex);
+-	if (!hash_empty(kfd_processes_table) || kfd_is_locked()) {
+-		mutex_unlock(&kfd_processes_mutex);
+-		return -EBUSY;
++
++	if (hash_empty(kfd_processes_table) && !kfd_is_locked(kfd))
++		goto out;
++
++	/* fail under system reset/resume or kfd device is partition switching. */
++	if (kfd_is_locked(kfd)) {
++		r = -EBUSY;
++		goto out;
++	}
++
++	/*
++	 * ensure all running processes are cgroup excluded from device before mode switch.
++	 * i.e. no pdd was created on the process socket.
++	 */
++	idx = srcu_read_lock(&kfd_processes_srcu);
++	hash_for_each_rcu(kfd_processes_table, temp, p, kfd_processes) {
++		int i;
++
++		for (i = 0; i < p->n_pdds; i++) {
++			if (p->pdds[i]->dev->kfd != kfd)
++				continue;
++
++			r = -EBUSY;
++			goto proc_check_unlock;
++		}
+ 	}
+ 
+-	++kfd_locked;
++proc_check_unlock:
++	srcu_read_unlock(&kfd_processes_srcu, idx);
++out:
++	if (!r)
++		++kfd->kfd_dev_lock;
+ 	mutex_unlock(&kfd_processes_mutex);
+ 
+-	return 0;
++	return r;
+ }
+ 
+-void kgd2kfd_unlock_kfd(void)
++void kgd2kfd_unlock_kfd(struct kfd_dev *kfd)
+ {
+ 	mutex_lock(&kfd_processes_mutex);
+-	--kfd_locked;
++	--kfd->kfd_dev_lock;
+ 	mutex_unlock(&kfd_processes_mutex);
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index d221c58dccc3..67694bcd9464 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -372,6 +372,9 @@ struct kfd_dev {
+ 
+ 	/* bitmap for dynamic doorbell allocation from doorbell object */
+ 	unsigned long *doorbell_bitmap;
++
++	/* for dynamic partitioning */
++	int kfd_dev_lock;
+ };
+ 
+ enum kfd_mempool {
+@@ -1536,7 +1539,7 @@ static inline bool kfd_flush_tlb_after_unmap(struct kfd_dev *dev)
+ int kfd_send_exception_to_runtime(struct kfd_process *p,
+ 				unsigned int queue_id,
+ 				uint64_t error_reason);
+-bool kfd_is_locked(void);
++bool kfd_is_locked(struct kfd_dev *kfd);
+ 
+ /* Compute profile */
+ void kfd_inc_compute_active(struct kfd_node *dev);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process.c b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+index 722ac1662bdc..5be28c6c4f6a 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@ -854,7 +854,7 @@ struct kfd_process *kfd_create_process(struct task_struct *thread)
+ 	 */
+ 	mutex_lock(&kfd_processes_mutex);
+ 
+-	if (kfd_is_locked()) {
++	if (kfd_is_locked(NULL)) {
+ 		pr_debug("KFD is locked! Cannot create process");
+ 		process = ERR_PTR(-EINVAL);
+ 		goto out;
+-- 
+2.52.0
+

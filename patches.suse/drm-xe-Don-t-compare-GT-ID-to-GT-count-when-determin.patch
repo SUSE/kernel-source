@@ -1,0 +1,110 @@
+From 457123d5a0351792280c7441107db49560bdd3c3 Mon Sep 17 00:00:00 2001
+From: Matt Roper <matthew.d.roper@intel.com>
+Date: Tue, 1 Jul 2025 13:13:27 -0700
+Subject: drm/xe: Don't compare GT ID to GT count when determining valid GTs
+Git-commit: 457123d5a0351792280c7441107db49560bdd3c3
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+On current platforms with multiple GTs, all of the GT IDs are
+consecutive; as a result we know that the GT IDs range from 0 to
+gt_count-1 and can determine if a GT ID is valid by comparing against
+the count.  The consecutive nature of GT IDs may not hold true on future
+platforms if/when we have platforms that are both multi-tile and have
+multiple GTs within each tile.  Once such platforms exist, it's quite
+possible that we could wind up with something like a GT list composed of
+IDs 0, 2, and 3 with no GT 1 (which would be a 2-tile platform with
+media only on the second tile).
+
+To future-proof the code we should stop comparing against the GT count
+to determine whether a GT ID is valid or not.  Instead we should do an
+actual lookup of the ID to determine whether the GT exists.  This also
+means that our GT loop macro should not end at the GT count, but should
+rather examine the entire space up to (# of tiles) * (max GT per tile)
+to ensure it doesn't stop prematurely.
+
+Reviewed-by: Jonathan Cavitt <jonathan.cavitt@intel.com>
+Link: https://lore.kernel.org/r/20250701201320.2514369-15-matthew.d.roper@intel.com
+Signed-off-by: Matt Roper <matthew.d.roper@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/xe/xe_device.h     | 6 +-----
+ drivers/gpu/drm/xe/xe_eu_stall.c   | 6 ++++--
+ drivers/gpu/drm/xe/xe_exec_queue.c | 2 +-
+ drivers/gpu/drm/xe/xe_hw_engine.c  | 3 ++-
+ 4 files changed, 8 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_device.h b/drivers/gpu/drm/xe/xe_device.h
+index 4e719d398c88..f0eb8150f185 100644
+--- a/drivers/gpu/drm/xe/xe_device.h
++++ b/drivers/gpu/drm/xe/xe_device.h
+@@ -127,12 +127,8 @@ static inline bool xe_device_uc_enabled(struct xe_device *xe)
+ 	for ((id__) = 1; (id__) < (xe__)->info.tile_count; (id__)++) \
+ 		for_each_if((tile__) = &(xe__)->tiles[(id__)])
+ 
+-/*
+- * FIXME: This only works for now since multi-tile and standalone media
+- * happen to be mutually exclusive.  Future platforms may change this...
+- */
+ #define for_each_gt(gt__, xe__, id__) \
+-	for ((id__) = 0; (id__) < (xe__)->info.gt_count; (id__)++) \
++	for ((id__) = 0; (id__) < (xe__)->info.tile_count * (xe__)->info.max_gt_per_tile; (id__)++) \
+ 		for_each_if((gt__) = xe_device_get_gt((xe__), (id__)))
+ 
+ static inline struct xe_force_wake *gt_to_fw(struct xe_gt *gt)
+diff --git a/drivers/gpu/drm/xe/xe_eu_stall.c b/drivers/gpu/drm/xe/xe_eu_stall.c
+index 96732613b4b7..af7916315ac6 100644
+--- a/drivers/gpu/drm/xe/xe_eu_stall.c
++++ b/drivers/gpu/drm/xe/xe_eu_stall.c
+@@ -258,11 +258,13 @@ static int set_prop_eu_stall_wait_num_reports(struct xe_device *xe, u64 value,
+ static int set_prop_eu_stall_gt_id(struct xe_device *xe, u64 value,
+ 				   struct eu_stall_open_properties *props)
+ {
+-	if (value >= xe->info.gt_count) {
++	struct xe_gt *gt = xe_device_get_gt(xe, value);
++
++	if (!gt) {
+ 		drm_dbg(&xe->drm, "Invalid GT ID %llu for EU stall sampling\n", value);
+ 		return -EINVAL;
+ 	}
+-	props->gt = xe_device_get_gt(xe, value);
++	props->gt = gt;
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/xe/xe_exec_queue.c b/drivers/gpu/drm/xe/xe_exec_queue.c
+index 25de8d81ad13..d9a73c369d48 100644
+--- a/drivers/gpu/drm/xe/xe_exec_queue.c
++++ b/drivers/gpu/drm/xe/xe_exec_queue.c
+@@ -610,7 +610,7 @@ int xe_exec_queue_create_ioctl(struct drm_device *dev, void *data,
+ 	if (XE_IOCTL_DBG(xe, err))
+ 		return -EFAULT;
+ 
+-	if (XE_IOCTL_DBG(xe, eci[0].gt_id >= xe->info.gt_count))
++	if (XE_IOCTL_DBG(xe, !xe_device_get_gt(xe, eci[0].gt_id)))
+ 		return -EINVAL;
+ 
+ 	if (args->flags & DRM_XE_EXEC_QUEUE_LOW_LATENCY_HINT)
+diff --git a/drivers/gpu/drm/xe/xe_hw_engine.c b/drivers/gpu/drm/xe/xe_hw_engine.c
+index 3439c8522d01..796ba8c34a16 100644
+--- a/drivers/gpu/drm/xe/xe_hw_engine.c
++++ b/drivers/gpu/drm/xe/xe_hw_engine.c
+@@ -1059,12 +1059,13 @@ struct xe_hw_engine *
+ xe_hw_engine_lookup(struct xe_device *xe,
+ 		    struct drm_xe_engine_class_instance eci)
+ {
++	struct xe_gt *gt = xe_device_get_gt(xe, eci.gt_id);
+ 	unsigned int idx;
+ 
+ 	if (eci.engine_class >= ARRAY_SIZE(user_to_xe_engine_class))
+ 		return NULL;
+ 
+-	if (eci.gt_id >= xe->info.gt_count)
++	if (!gt)
+ 		return NULL;
+ 
+ 	idx = array_index_nospec(eci.engine_class,
+-- 
+2.52.0
+

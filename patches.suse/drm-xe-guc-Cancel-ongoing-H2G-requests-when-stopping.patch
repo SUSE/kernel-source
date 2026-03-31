@@ -1,0 +1,99 @@
+From 94de94d24ea8cf567ec7254a723c3192c72c2ca6 Mon Sep 17 00:00:00 2001
+From: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Date: Wed, 9 Jul 2025 19:40:38 +0200
+Subject: drm/xe/guc: Cancel ongoing H2G requests when stopping CT
+Git-commit: 94de94d24ea8cf567ec7254a723c3192c72c2ca6
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Once we have started a GT reset sequence, which includes stopping
+GuC CTB communication, we should also cancel all ongoing H2G send-
+recv requests, as either GuC is already dead, or due to imminent
+reset GuC will not be able to reply, or due to internal cleanup
+we will lose pending fences. With this we will report dedicated
+-ECANCELED error instead of misleading -ETIME.
+
+Signed-off-by: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Cc: Matthew Brost <matthew.brost@intel.com>
+Reviewed-by: Jonathan Cavitt <jonathan.cavitt@intel.com>
+Acked-by: Matthew Brost <matthew.brost@intel.com>
+Link: https://lore.kernel.org/r/20250709174038.1876-4-michal.wajdeczko@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/xe/xe_guc_ct.c | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/drivers/gpu/drm/xe/xe_guc_ct.c b/drivers/gpu/drm/xe/xe_guc_ct.c
+index 17e5870baf33..b6acccfcd351 100644
+--- a/drivers/gpu/drm/xe/xe_guc_ct.c
++++ b/drivers/gpu/drm/xe/xe_guc_ct.c
+@@ -85,6 +85,7 @@ struct g2h_fence {
+ 	u16 error;
+ 	u16 hint;
+ 	u16 reason;
++	bool cancel;
+ 	bool retry;
+ 	bool fail;
+ 	bool done;
+@@ -103,6 +104,13 @@ static void g2h_fence_init(struct g2h_fence *g2h_fence, u32 *response_buffer)
+ 	g2h_fence->seqno = ~0x0;
+ }
+ 
++static void g2h_fence_cancel(struct g2h_fence *g2h_fence)
++{
++	g2h_fence->cancel = true;
++	g2h_fence->fail = true;
++	g2h_fence->done = true;
++}
++
+ static bool g2h_fence_needs_alloc(struct g2h_fence *g2h_fence)
+ {
+ 	return g2h_fence->seqno == ~0x0;
+@@ -388,6 +396,8 @@ static void guc_ct_change_state(struct xe_guc_ct *ct,
+ 				enum xe_guc_ct_state state)
+ {
+ 	struct xe_gt *gt = ct_to_gt(ct);
++	struct g2h_fence *g2h_fence;
++	unsigned long idx;
+ 
+ 	mutex_lock(&ct->lock);		/* Serialise dequeue_one_g2h() */
+ 	spin_lock_irq(&ct->fast_lock);	/* Serialise CT fast-path */
+@@ -406,6 +416,14 @@ static void guc_ct_change_state(struct xe_guc_ct *ct,
+ 
+ 	spin_unlock_irq(&ct->fast_lock);
+ 
++	/* cancel all in-flight send-recv requests */
++	xa_for_each(&ct->fence_lookup, idx, g2h_fence)
++		g2h_fence_cancel(g2h_fence);
++
++	/* make sure guc_ct_send_recv() will see g2h_fence changes */
++	smp_mb();
++	wake_up_all(&ct->g2h_fence_wq);
++
+ 	/*
+ 	 * Lockdep doesn't like this under the fast lock and he destroy only
+ 	 * needs to be serialized with the send path which ct lock provides.
+@@ -1098,6 +1116,11 @@ static int guc_ct_send_recv(struct xe_guc_ct *ct, const u32 *action, u32 len,
+ 		goto retry;
+ 	}
+ 	if (g2h_fence.fail) {
++		if (g2h_fence.cancel) {
++			xe_gt_dbg(gt, "H2G request %#x canceled!\n", action[0]);
++			ret = -ECANCELED;
++			goto unlock;
++		}
+ 		xe_gt_err(gt, "H2G request %#x failed: error %#x hint %#x\n",
+ 			  action[0], g2h_fence.error, g2h_fence.hint);
+ 		ret = -EIO;
+@@ -1106,6 +1129,7 @@ static int guc_ct_send_recv(struct xe_guc_ct *ct, const u32 *action, u32 len,
+ 	if (ret > 0)
+ 		ret = response_buffer ? g2h_fence.response_len : g2h_fence.response_data;
+ 
++unlock:
+ 	mutex_unlock(&ct->lock);
+ 
+ 	return ret;
+-- 
+2.52.0
+

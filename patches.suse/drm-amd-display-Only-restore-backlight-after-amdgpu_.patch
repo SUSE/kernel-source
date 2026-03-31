@@ -1,0 +1,119 @@
+From 44b0fed0a5947f54fd14255cd0766df952267bc5 Mon Sep 17 00:00:00 2001
+From: Matthew Schwartz <matthew.schwartz@linux.dev>
+Date: Thu, 11 Sep 2025 10:48:51 -0700
+Subject: drm/amd/display: Only restore backlight after amdgpu_dm_init or
+ dm_resume
+Git-commit: 44b0fed0a5947f54fd14255cd0766df952267bc5
+Patch-mainline: v6.17
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+On clients that utilize AMD_PRIVATE_COLOR properties for HDR support,
+brightness sliders can include a hardware controlled portion and a
+gamma-based portion. This is the case on the Steam Deck OLED when using
+gamescope with Steam as a client.
+
+When a user sets a brightness level while HDR is active, the gamma-based
+portion and/or hardware portion are adjusted to achieve the desired
+brightness. However, when a modeset takes place while the gamma-based
+portion is in-use, restoring the hardware brightness level overrides the
+user's overall brightness level and results in a mismatch between what
+the slider reports and the display's current brightness.
+
+To avoid overriding gamma-based brightness, only restore HW backlight
+level after boot or resume. This ensures that the backlight level is
+set correctly after the DC layer resets it while avoiding interference
+with subsequent modesets.
+
+Fixes: 7875afafba84 ("drm/amd/display: Fix brightness level not retained over reboot")
+Closes: https://gitlab.freedesktop.org/drm/amd/-/issues/4551
+Signed-off-by: Matthew Schwartz <matthew.schwartz@linux.dev>
+Reviewed-by: Mario Limonciello <mario.limonciello@amd.com>
+Signed-off-by: Mario Limonciello <mario.limonciello@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+(cherry picked from commit a490c8d77d500b5981e739be3d59c60cfe382536)
+
+Cc: stable@vger.kernel.org
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 12 ++++++++----
+ drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h |  7 +++++++
+ 2 files changed, 15 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 97d9eba17963..ef026143dc1c 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -2037,6 +2037,8 @@ static int amdgpu_dm_init(struct amdgpu_device *adev)
+ 
+ 	dc_hardware_init(adev->dm.dc);
+ 
++	adev->dm.restore_backlight = true;
++
+ 	adev->dm.hpd_rx_offload_wq = hpd_rx_irq_create_workqueue(adev);
+ 	if (!adev->dm.hpd_rx_offload_wq) {
+ 		drm_err(adev_to_drm(adev), "failed to create hpd rx offload workqueue.\n");
+@@ -3399,6 +3401,7 @@ static int dm_resume(struct amdgpu_ip_block *ip_block)
+ 		dc_set_power_state(dm->dc, DC_ACPI_CM_POWER_STATE_D0);
+ 
+ 		dc_resume(dm->dc);
++		adev->dm.restore_backlight = true;
+ 
+ 		amdgpu_dm_irq_resume_early(adev);
+ 
+@@ -9829,7 +9832,6 @@ static void amdgpu_dm_commit_streams(struct drm_atomic_state *state,
+ 	bool mode_set_reset_required = false;
+ 	u32 i;
+ 	struct dc_commit_streams_params params = {dc_state->streams, dc_state->stream_count};
+-	bool set_backlight_level = false;
+ 
+ 	/* Disable writeback */
+ 	for_each_old_connector_in_state(state, connector, old_con_state, i) {
+@@ -9949,7 +9951,6 @@ static void amdgpu_dm_commit_streams(struct drm_atomic_state *state,
+ 			acrtc->hw_mode = new_crtc_state->mode;
+ 			crtc->hwmode = new_crtc_state->mode;
+ 			mode_set_reset_required = true;
+-			set_backlight_level = true;
+ 		} else if (modereset_required(new_crtc_state)) {
+ 			drm_dbg_atomic(dev,
+ 				       "Atomic commit: RESET. crtc id %d:[%p]\n",
+@@ -10006,13 +10007,16 @@ static void amdgpu_dm_commit_streams(struct drm_atomic_state *state,
+ 	 * to fix a flicker issue.
+ 	 * It will cause the dm->actual_brightness is not the current panel brightness
+ 	 * level. (the dm->brightness is the correct panel level)
+-	 * So we set the backlight level with dm->brightness value after set mode
++	 * So we set the backlight level with dm->brightness value after initial
++	 * set mode. Use restore_backlight flag to avoid setting backlight level
++	 * for every subsequent mode set.
+ 	 */
+-	if (set_backlight_level) {
++	if (dm->restore_backlight) {
+ 		for (i = 0; i < dm->num_of_edps; i++) {
+ 			if (dm->backlight_dev[i])
+ 				amdgpu_dm_backlight_set_level(dm, i, dm->brightness[i]);
+ 		}
++		dm->restore_backlight = false;
+ 	}
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+index b937da0a4e4a..6aae51c1beb3 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+@@ -610,6 +610,13 @@ struct amdgpu_display_manager {
+ 	 */
+ 	u32 actual_brightness[AMDGPU_DM_MAX_NUM_EDP];
+ 
++	/**
++	 * @restore_backlight:
++	 *
++	 * Flag to indicate whether to restore backlight after modeset.
++	 */
++	bool restore_backlight;
++
+ 	/**
+ 	 * @aux_hpd_discon_quirk:
+ 	 *
+-- 
+2.52.0
+

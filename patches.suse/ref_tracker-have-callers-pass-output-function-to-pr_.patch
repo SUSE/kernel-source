@@ -1,0 +1,144 @@
+From 49c94af071fc6c9f5e1db52b3031dec28daa90c3 Mon Sep 17 00:00:00 2001
+From: Jeff Layton <jlayton@kernel.org>
+Date: Wed, 18 Jun 2025 10:24:16 -0400
+Subject: ref_tracker: have callers pass output function to pr_ostream()
+Git-commit: 49c94af071fc6c9f5e1db52b3031dec28daa90c3
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+In a later patch, we'll be adding a 3rd mechanism for outputting
+ref_tracker info via seq_file. Instead of a conditional, have the caller
+set a pointer to an output function in struct ostream. As part of this,
+the log prefix must be explicitly passed in, as it's too late for the
+pr_fmt macro.
+
+Reviewed-by: Andrew Lunn <andrew@lunn.ch>
+Signed-off-by: Jeff Layton <jlayton@kernel.org>
+Link: https://patch.msgid.link/20250618-reftrack-dbgfs-v15-3-24fc37ead144@kernel.org
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ include/linux/ref_tracker.h |  2 ++
+ lib/ref_tracker.c           | 52 ++++++++++++++++++++++++++-----------
+ 2 files changed, 39 insertions(+), 15 deletions(-)
+
+diff --git a/include/linux/ref_tracker.h b/include/linux/ref_tracker.h
+index 8eac4f3d5254..a0a1ee43724f 100644
+--- a/include/linux/ref_tracker.h
++++ b/include/linux/ref_tracker.h
+@@ -6,6 +6,8 @@
+ #include <linux/spinlock.h>
+ #include <linux/stackdepot.h>
+ 
++#define __ostream_printf __printf(2, 3)
++
+ struct ref_tracker;
+ 
+ struct ref_tracker_dir {
+diff --git a/lib/ref_tracker.c b/lib/ref_tracker.c
+index d374e5273e14..42872f406b2a 100644
+--- a/lib/ref_tracker.c
++++ b/lib/ref_tracker.c
+@@ -63,21 +63,38 @@ ref_tracker_get_stats(struct ref_tracker_dir *dir, unsigned int limit)
+ }
+ 
+ struct ostream {
++	void __ostream_printf (*func)(struct ostream *stream, char *fmt, ...);
++	char *prefix;
+ 	char *buf;
+ 	int size, used;
+ };
+ 
++static void __ostream_printf pr_ostream_log(struct ostream *stream, char *fmt, ...)
++{
++	va_list args;
++
++	va_start(args, fmt);
++	vprintk(fmt, args);
++	va_end(args);
++}
++
++static void __ostream_printf pr_ostream_buf(struct ostream *stream, char *fmt, ...)
++{
++	int ret, len = stream->size - stream->used;
++	va_list args;
++
++	va_start(args, fmt);
++	ret = vsnprintf(stream->buf + stream->used, len, fmt, args);
++	va_end(args);
++	if (ret > 0)
++		stream->used += min(ret, len);
++}
++
+ #define pr_ostream(stream, fmt, args...) \
+ ({ \
+ 	struct ostream *_s = (stream); \
+ \
+-	if (!_s->buf) { \
+-		pr_err(fmt, ##args); \
+-	} else { \
+-		int ret, len = _s->size - _s->used; \
+-		ret = snprintf(_s->buf + _s->used, len, pr_fmt(fmt), ##args); \
+-		_s->used += min(ret, len); \
+-	} \
++	_s->func(_s, fmt, ##args); \
+ })
+ 
+ static void
+@@ -96,8 +113,8 @@ __ref_tracker_dir_pr_ostream(struct ref_tracker_dir *dir,
+ 
+ 	stats = ref_tracker_get_stats(dir, display_limit);
+ 	if (IS_ERR(stats)) {
+-		pr_ostream(s, "%s@%p: couldn't get stats, error %pe\n",
+-			   dir->name, dir, stats);
++		pr_ostream(s, "%s%s@%p: couldn't get stats, error %pe\n",
++			   s->prefix, dir->name, dir, stats);
+ 		return;
+ 	}
+ 
+@@ -107,14 +124,15 @@ __ref_tracker_dir_pr_ostream(struct ref_tracker_dir *dir,
+ 		stack = stats->stacks[i].stack_handle;
+ 		if (sbuf && !stack_depot_snprint(stack, sbuf, STACK_BUF_SIZE, 4))
+ 			sbuf[0] = 0;
+-		pr_ostream(s, "%s@%p has %d/%d users at\n%s\n", dir->name, dir,
+-			   stats->stacks[i].count, stats->total, sbuf);
++		pr_ostream(s, "%s%s@%p has %d/%d users at\n%s\n", s->prefix,
++			   dir->name, dir, stats->stacks[i].count,
++			   stats->total, sbuf);
+ 		skipped -= stats->stacks[i].count;
+ 	}
+ 
+ 	if (skipped)
+-		pr_ostream(s, "%s@%p skipped reports about %d/%d users.\n",
+-			   dir->name, dir, skipped, stats->total);
++		pr_ostream(s, "%s%s@%p skipped reports about %d/%d users.\n",
++			   s->prefix, dir->name, dir, skipped, stats->total);
+ 
+ 	kfree(sbuf);
+ 
+@@ -124,7 +142,8 @@ __ref_tracker_dir_pr_ostream(struct ref_tracker_dir *dir,
+ void ref_tracker_dir_print_locked(struct ref_tracker_dir *dir,
+ 				  unsigned int display_limit)
+ {
+-	struct ostream os = {};
++	struct ostream os = { .func = pr_ostream_log,
++			      .prefix = "ref_tracker: " };
+ 
+ 	__ref_tracker_dir_pr_ostream(dir, display_limit, &os);
+ }
+@@ -143,7 +162,10 @@ EXPORT_SYMBOL(ref_tracker_dir_print);
+ 
+ int ref_tracker_dir_snprint(struct ref_tracker_dir *dir, char *buf, size_t size)
+ {
+-	struct ostream os = { .buf = buf, .size = size };
++	struct ostream os = { .func = pr_ostream_buf,
++			      .prefix = "ref_tracker: ",
++			      .buf = buf,
++			      .size = size };
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&dir->lock, flags);
+-- 
+2.52.0
+

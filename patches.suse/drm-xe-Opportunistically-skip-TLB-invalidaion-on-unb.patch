@@ -1,0 +1,85 @@
+From bcc287203ca777721fecfe47f3f9fa9aa7d5993d Mon Sep 17 00:00:00 2001
+From: Matthew Brost <matthew.brost@intel.com>
+Date: Sun, 15 Jun 2025 23:30:24 -0700
+Subject: drm/xe: Opportunistically skip TLB invalidaion on unbind
+Git-commit: bcc287203ca777721fecfe47f3f9fa9aa7d5993d
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+If a range or VMA is invalidated and scratch page is disabled, there
+is no reason to issue a TLB invalidation on unbind, skip TLB
+innvalidation is this condition is true. This is an opportunistic check
+as it is done without the notifier lock, thus it possible for the range
+to be invalidated after this check is performed.
+
+This should improve performance of the SVM garbage collector, for
+example, xe_exec_system_allocator --r many-stride-new-prefetch, went
+~20s to ~9.5s on a BMG.
+
+V2: - Use helper for valid check (Thomas)
+V3: - Avoid skipping TLB invalidation if PTEs are removed at a higher
+   level than the range
+ - Never skip TLB invalidations for VMA
+ - Drop Himal's RB
+
+Signed-off-by: Matthew Brost <matthew.brost@intel.com>
+Reviewed-by: Himal Prasad Ghimiray <himal.prasad.ghimiray@intel.com>
+Link: https://lore.kernel.org/r/20250616063024.2059829-3-matthew.brost@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/xe/xe_pt.c | 31 ++++++++++++++++++++++++++++++-
+ 1 file changed, 30 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_pt.c b/drivers/gpu/drm/xe/xe_pt.c
+index ef39b01f3519..c8e63bd23300 100644
+--- a/drivers/gpu/drm/xe/xe_pt.c
++++ b/drivers/gpu/drm/xe/xe_pt.c
+@@ -1995,6 +1995,32 @@ static int unbind_op_prepare(struct xe_tile *tile,
+ 	return 0;
+ }
+ 
++static bool
++xe_pt_op_check_range_skip_invalidation(struct xe_vm_pgtable_update_op *pt_op,
++				       struct xe_svm_range *range)
++{
++	struct xe_vm_pgtable_update *update = pt_op->entries;
++
++	XE_WARN_ON(!pt_op->num_entries);
++
++	/*
++	 * We can't skip the invalidation if we are removing PTEs that span more
++	 * than the range, do some checks to ensure we are removing PTEs that
++	 * are invalid.
++	 */
++
++	if (pt_op->num_entries > 1)
++		return false;
++
++	if (update->pt->level == 0)
++		return true;
++
++	if (update->pt->level == 1)
++		return xe_svm_range_size(range) >= SZ_2M;
++
++	return false;
++}
++
+ static int unbind_range_prepare(struct xe_vm *vm,
+ 				struct xe_tile *tile,
+ 				struct xe_vm_pgtable_update_ops *pt_update_ops,
+@@ -2023,7 +2049,10 @@ static int unbind_range_prepare(struct xe_vm *vm,
+ 					 range->base.itree.last + 1);
+ 	++pt_update_ops->current_op;
+ 	pt_update_ops->needs_svm_lock = true;
+-	pt_update_ops->needs_invalidation = true;
++	pt_update_ops->needs_invalidation |= xe_vm_has_scratch(vm) ||
++		xe_vm_has_valid_gpu_mapping(tile, range->tile_present,
++					    range->tile_invalidated) ||
++		!xe_pt_op_check_range_skip_invalidation(pt_op, range);
+ 
+ 	xe_pt_commit_prepare_unbind(XE_INVALID_VMA, pt_op->entries,
+ 				    pt_op->num_entries);
+-- 
+2.52.0
+

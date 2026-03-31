@@ -1,0 +1,157 @@
+From b83e8fe4fae981d35a362109053b7447ebd037d4 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Fri, 13 Jun 2025 15:50:41 +0200
+Subject: Revert "drm/prime: remove drm_prime_lookup_buf_by_handle"
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: b83e8fe4fae981d35a362109053b7447ebd037d4
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+This reverts commit c2aa5603af309968a10f8e0d929ec7662ada5f78.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Acked-by: Simona Vetter <simona.vetter@ffwll.ch>
+Link: https://lore.kernel.org/r/aEwls5hPP9p-DPtt@phenom.ffwll.local
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/drm_gem.c      |  2 +-
+ drivers/gpu/drm/drm_internal.h |  1 -
+ drivers/gpu/drm/drm_prime.c    | 56 +++++++++++++++++++++++++++++-----
+ 3 files changed, 49 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_gem.c b/drivers/gpu/drm/drm_gem.c
+index a322dc5b5eed..e791058e02cc 100644
+--- a/drivers/gpu/drm/drm_gem.c
++++ b/drivers/gpu/drm/drm_gem.c
+@@ -331,7 +331,7 @@ drm_gem_object_release_handle(int id, void *ptr, void *data)
+ 	if (obj->funcs->close)
+ 		obj->funcs->close(obj, file_priv);
+ 
+-	drm_prime_remove_buf_handle(&file_priv->prime, obj->dma_buf, id);
++	drm_prime_remove_buf_handle(&file_priv->prime, id);
+ 	drm_vma_node_revoke(&obj->vma_node, file_priv);
+ 
+ 	drm_gem_object_handle_put_unlocked(obj);
+diff --git a/drivers/gpu/drm/drm_internal.h b/drivers/gpu/drm/drm_internal.h
+index 8c901a61c046..1c2b22ea13c1 100644
+--- a/drivers/gpu/drm/drm_internal.h
++++ b/drivers/gpu/drm/drm_internal.h
+@@ -86,7 +86,6 @@ int drm_prime_fd_to_handle_ioctl(struct drm_device *dev, void *data,
+ void drm_prime_init_file_private(struct drm_prime_file_private *prime_fpriv);
+ void drm_prime_destroy_file_private(struct drm_prime_file_private *prime_fpriv);
+ void drm_prime_remove_buf_handle(struct drm_prime_file_private *prime_fpriv,
+-				 struct dma_buf *dma_buf,
+ 				 uint32_t handle);
+ 
+ /* drm_managed.c */
+diff --git a/drivers/gpu/drm/drm_prime.c b/drivers/gpu/drm/drm_prime.c
+index 48f3f82e6c2e..846692685e39 100644
+--- a/drivers/gpu/drm/drm_prime.c
++++ b/drivers/gpu/drm/drm_prime.c
+@@ -90,6 +90,7 @@ struct drm_prime_member {
+ 	uint32_t handle;
+ 
+ 	struct rb_node dmabuf_rb;
++	struct rb_node handle_rb;
+ };
+ 
+ static int drm_prime_add_buf_handle(struct drm_prime_file_private *prime_fpriv,
+@@ -121,9 +122,45 @@ static int drm_prime_add_buf_handle(struct drm_prime_file_private *prime_fpriv,
+ 	rb_link_node(&member->dmabuf_rb, rb, p);
+ 	rb_insert_color(&member->dmabuf_rb, &prime_fpriv->dmabufs);
+ 
++	rb = NULL;
++	p = &prime_fpriv->handles.rb_node;
++	while (*p) {
++		struct drm_prime_member *pos;
++
++		rb = *p;
++		pos = rb_entry(rb, struct drm_prime_member, handle_rb);
++		if (handle > pos->handle)
++			p = &rb->rb_right;
++		else
++			p = &rb->rb_left;
++	}
++	rb_link_node(&member->handle_rb, rb, p);
++	rb_insert_color(&member->handle_rb, &prime_fpriv->handles);
++
+ 	return 0;
+ }
+ 
++static struct dma_buf *drm_prime_lookup_buf_by_handle(struct drm_prime_file_private *prime_fpriv,
++						      uint32_t handle)
++{
++	struct rb_node *rb;
++
++	rb = prime_fpriv->handles.rb_node;
++	while (rb) {
++		struct drm_prime_member *member;
++
++		member = rb_entry(rb, struct drm_prime_member, handle_rb);
++		if (member->handle == handle)
++			return member->dma_buf;
++		else if (member->handle < handle)
++			rb = rb->rb_right;
++		else
++			rb = rb->rb_left;
++	}
++
++	return NULL;
++}
++
+ static int drm_prime_lookup_buf_handle(struct drm_prime_file_private *prime_fpriv,
+ 				       struct dma_buf *dma_buf,
+ 				       uint32_t *handle)
+@@ -149,28 +186,25 @@ static int drm_prime_lookup_buf_handle(struct drm_prime_file_private *prime_fpri
+ }
+ 
+ void drm_prime_remove_buf_handle(struct drm_prime_file_private *prime_fpriv,
+-				 struct dma_buf *dma_buf,
+ 				 uint32_t handle)
+ {
+ 	struct rb_node *rb;
+ 
+-	if (!dma_buf)
+-		return;
+-
+ 	mutex_lock(&prime_fpriv->lock);
+ 
+-	rb = prime_fpriv->dmabufs.rb_node;
++	rb = prime_fpriv->handles.rb_node;
+ 	while (rb) {
+ 		struct drm_prime_member *member;
+ 
+-		member = rb_entry(rb, struct drm_prime_member, dmabuf_rb);
+-		if (member->dma_buf == dma_buf && member->handle == handle) {
++		member = rb_entry(rb, struct drm_prime_member, handle_rb);
++		if (member->handle == handle) {
++			rb_erase(&member->handle_rb, &prime_fpriv->handles);
+ 			rb_erase(&member->dmabuf_rb, &prime_fpriv->dmabufs);
+ 
+ 			dma_buf_put(member->dma_buf);
+ 			kfree(member);
+ 			break;
+-		} else if (member->dma_buf < dma_buf) {
++		} else if (member->handle < handle) {
+ 			rb = rb->rb_right;
+ 		} else {
+ 			rb = rb->rb_left;
+@@ -412,6 +446,12 @@ struct dma_buf *drm_gem_prime_handle_to_dmabuf(struct drm_device *dev,
+ 		goto out_unlock;
+ 	}
+ 
++	dmabuf = drm_prime_lookup_buf_by_handle(&file_priv->prime, handle);
++	if (dmabuf) {
++		get_dma_buf(dmabuf);
++		goto out;
++	}
++
+ 	mutex_lock(&dev->object_name_lock);
+ 	/* re-export the original imported object */
+ 	if (obj->import_attach) {
+-- 
+2.52.0
+

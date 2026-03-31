@@ -1,0 +1,138 @@
+From bead8800222768dab1a421206350d530b0c45254 Mon Sep 17 00:00:00 2001
+From: Philipp Stanner <phasta@kernel.org>
+Date: Thu, 10 Jul 2025 14:54:12 +0200
+Subject: drm/nouveau: Remove waitque for sched teardown
+Git-commit: bead8800222768dab1a421206350d530b0c45254
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+struct nouveau_sched contains a waitque needed to prevent
+drm_sched_fini() from being called while there are still jobs pending.
+Doing so so far would have caused memory leaks.
+
+With the new memleak-free mode of operation switched on in
+drm_sched_fini() by providing the callback nouveau_sched_cancel_job()
+the waitque is not necessary anymore.
+
+Remove the waitque.
+
+Acked-by: Danilo Krummrich <dakr@kernel.org>
+Signed-off-by: Philipp Stanner <phasta@kernel.org>
+Link: https://lore.kernel.org/r/20250710125412.128476-10-phasta@kernel.org
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/nouveau/nouveau_sched.c | 20 +++++++-------------
+ drivers/gpu/drm/nouveau/nouveau_sched.h |  9 +++------
+ drivers/gpu/drm/nouveau/nouveau_uvmm.c  |  8 ++++----
+ 3 files changed, 14 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/nouveau_sched.c b/drivers/gpu/drm/nouveau/nouveau_sched.c
+index 2ec62059c351..7d9c3418e76b 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_sched.c
++++ b/drivers/gpu/drm/nouveau/nouveau_sched.c
+@@ -122,11 +122,9 @@ nouveau_job_done(struct nouveau_job *job)
+ {
+ 	struct nouveau_sched *sched = job->sched;
+ 
+-	spin_lock(&sched->job.list.lock);
++	spin_lock(&sched->job_list.lock);
+ 	list_del(&job->entry);
+-	spin_unlock(&sched->job.list.lock);
+-
+-	wake_up(&sched->job.wq);
++	spin_unlock(&sched->job_list.lock);
+ }
+ 
+ void
+@@ -307,9 +305,9 @@ nouveau_job_submit(struct nouveau_job *job)
+ 	}
+ 
+ 	/* Submit was successful; add the job to the schedulers job list. */
+-	spin_lock(&sched->job.list.lock);
+-	list_add(&job->entry, &sched->job.list.head);
+-	spin_unlock(&sched->job.list.lock);
++	spin_lock(&sched->job_list.lock);
++	list_add(&job->entry, &sched->job_list.head);
++	spin_unlock(&sched->job_list.lock);
+ 
+ 	drm_sched_job_arm(&job->base);
+ 	job->done_fence = dma_fence_get(&job->base.s_fence->finished);
+@@ -460,9 +458,8 @@ nouveau_sched_init(struct nouveau_sched *sched, struct nouveau_drm *drm,
+ 		goto fail_sched;
+ 
+ 	mutex_init(&sched->mutex);
+-	spin_lock_init(&sched->job.list.lock);
+-	INIT_LIST_HEAD(&sched->job.list.head);
+-	init_waitqueue_head(&sched->job.wq);
++	spin_lock_init(&sched->job_list.lock);
++	INIT_LIST_HEAD(&sched->job_list.head);
+ 
+ 	return 0;
+ 
+@@ -502,9 +499,6 @@ nouveau_sched_fini(struct nouveau_sched *sched)
+ 	struct drm_gpu_scheduler *drm_sched = &sched->base;
+ 	struct drm_sched_entity *entity = &sched->entity;
+ 
+-	rmb(); /* for list_empty to work without lock */
+-	wait_event(sched->job.wq, list_empty(&sched->job.list.head));
+-
+ 	drm_sched_entity_fini(entity);
+ 	drm_sched_fini(drm_sched);
+ 
+diff --git a/drivers/gpu/drm/nouveau/nouveau_sched.h b/drivers/gpu/drm/nouveau/nouveau_sched.h
+index 20cd1da8db73..b98c3f0bef30 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_sched.h
++++ b/drivers/gpu/drm/nouveau/nouveau_sched.h
+@@ -103,12 +103,9 @@ struct nouveau_sched {
+ 	struct mutex mutex;
+ 
+ 	struct {
+-		struct {
+-			struct list_head head;
+-			spinlock_t lock;
+-		} list;
+-		struct wait_queue_head wq;
+-	} job;
++		struct list_head head;
++		spinlock_t lock;
++	} job_list;
+ };
+ 
+ int nouveau_sched_create(struct nouveau_sched **psched, struct nouveau_drm *drm,
+diff --git a/drivers/gpu/drm/nouveau/nouveau_uvmm.c b/drivers/gpu/drm/nouveau/nouveau_uvmm.c
+index 48f105239f42..ddfc46bc1b3e 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_uvmm.c
++++ b/drivers/gpu/drm/nouveau/nouveau_uvmm.c
+@@ -1019,8 +1019,8 @@ bind_validate_map_sparse(struct nouveau_job *job, u64 addr, u64 range)
+ 	u64 end = addr + range;
+ 
+ again:
+-	spin_lock(&sched->job.list.lock);
+-	list_for_each_entry(__job, &sched->job.list.head, entry) {
++	spin_lock(&sched->job_list.lock);
++	list_for_each_entry(__job, &sched->job_list.head, entry) {
+ 		struct nouveau_uvmm_bind_job *bind_job = to_uvmm_bind_job(__job);
+ 
+ 		list_for_each_op(op, &bind_job->ops) {
+@@ -1030,7 +1030,7 @@ bind_validate_map_sparse(struct nouveau_job *job, u64 addr, u64 range)
+ 
+ 				if (!(end <= op_addr || addr >= op_end)) {
+ 					nouveau_uvmm_bind_job_get(bind_job);
+-					spin_unlock(&sched->job.list.lock);
++					spin_unlock(&sched->job_list.lock);
+ 					wait_for_completion(&bind_job->complete);
+ 					nouveau_uvmm_bind_job_put(bind_job);
+ 					goto again;
+@@ -1038,7 +1038,7 @@ bind_validate_map_sparse(struct nouveau_job *job, u64 addr, u64 range)
+ 			}
+ 		}
+ 	}
+-	spin_unlock(&sched->job.list.lock);
++	spin_unlock(&sched->job_list.lock);
+ }
+ 
+ static int
+-- 
+2.52.0
+

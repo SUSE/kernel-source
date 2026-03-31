@@ -1,0 +1,151 @@
+From 2ade36eaa9ac05e4913e9785df19c2cde8f912fb Mon Sep 17 00:00:00 2001
+From: Alex Deucher <alexander.deucher@amd.com>
+Date: Wed, 17 Sep 2025 12:42:09 -0400
+Subject: drm/amdkfd: add proper handling for S0ix
+Git-commit: 2ade36eaa9ac05e4913e9785df19c2cde8f912fb
+Patch-mainline: v6.17-rc7
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+When in S0i3, the GFX state is retained, so all we need to do
+is stop the runlist so GFX can enter gfxoff.
+
+Reviewed-by: Mario Limonciello (AMD) <superm1@kernel.org>
+Tested-by: David Perry <david.perry@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+(cherry picked from commit 4bfa8609934dbf39bbe6e75b4f971469384b50b1)
+
+Cc: stable@vger.kernel.org
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c | 16 +++++++---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h | 12 ++++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_device.c    | 36 ++++++++++++++++++++++
+ 3 files changed, 60 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
+index fbe7616555c8..a2879d2b7c8e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
+@@ -250,16 +250,24 @@ void amdgpu_amdkfd_interrupt(struct amdgpu_device *adev,
+ 
+ void amdgpu_amdkfd_suspend(struct amdgpu_device *adev, bool suspend_proc)
+ {
+-	if (adev->kfd.dev)
+-		kgd2kfd_suspend(adev->kfd.dev, suspend_proc);
++	if (adev->kfd.dev) {
++		if (adev->in_s0ix)
++			kgd2kfd_stop_sched_all_nodes(adev->kfd.dev);
++		else
++			kgd2kfd_suspend(adev->kfd.dev, suspend_proc);
++	}
+ }
+ 
+ int amdgpu_amdkfd_resume(struct amdgpu_device *adev, bool resume_proc)
+ {
+ 	int r = 0;
+ 
+-	if (adev->kfd.dev)
+-		r = kgd2kfd_resume(adev->kfd.dev, resume_proc);
++	if (adev->kfd.dev) {
++		if (adev->in_s0ix)
++			r = kgd2kfd_start_sched_all_nodes(adev->kfd.dev);
++		else
++			r = kgd2kfd_resume(adev->kfd.dev, resume_proc);
++	}
+ 
+ 	return r;
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+index 33eb4826b58b..aa88bad7416b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+@@ -426,7 +426,9 @@ void kgd2kfd_smi_event_throttle(struct kfd_dev *kfd, uint64_t throttle_bitmask);
+ int kgd2kfd_check_and_lock_kfd(struct kfd_dev *kfd);
+ void kgd2kfd_unlock_kfd(struct kfd_dev *kfd);
+ int kgd2kfd_start_sched(struct kfd_dev *kfd, uint32_t node_id);
++int kgd2kfd_start_sched_all_nodes(struct kfd_dev *kfd);
+ int kgd2kfd_stop_sched(struct kfd_dev *kfd, uint32_t node_id);
++int kgd2kfd_stop_sched_all_nodes(struct kfd_dev *kfd);
+ bool kgd2kfd_compute_active(struct kfd_dev *kfd, uint32_t node_id);
+ bool kgd2kfd_vmfault_fast_path(struct amdgpu_device *adev, struct amdgpu_iv_entry *entry,
+ 			       bool retry_fault);
+@@ -516,11 +518,21 @@ static inline int kgd2kfd_start_sched(struct kfd_dev *kfd, uint32_t node_id)
+ 	return 0;
+ }
+ 
++static inline int kgd2kfd_start_sched_all_nodes(struct kfd_dev *kfd)
++{
++	return 0;
++}
++
+ static inline int kgd2kfd_stop_sched(struct kfd_dev *kfd, uint32_t node_id)
+ {
+ 	return 0;
+ }
+ 
++static inline int kgd2kfd_stop_sched_all_nodes(struct kfd_dev *kfd)
++{
++	return 0;
++}
++
+ static inline bool kgd2kfd_compute_active(struct kfd_dev *kfd, uint32_t node_id)
+ {
+ 	return false;
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device.c b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+index 7e749f9b6d69..349c351e242b 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+@@ -1550,6 +1550,25 @@ int kgd2kfd_start_sched(struct kfd_dev *kfd, uint32_t node_id)
+ 	return ret;
+ }
+ 
++int kgd2kfd_start_sched_all_nodes(struct kfd_dev *kfd)
++{
++	struct kfd_node *node;
++	int i, r;
++
++	if (!kfd->init_complete)
++		return 0;
++
++	for (i = 0; i < kfd->num_nodes; i++) {
++		node = kfd->nodes[i];
++		r = node->dqm->ops.unhalt(node->dqm);
++		if (r) {
++			dev_err(kfd_device, "Error in starting scheduler\n");
++			return r;
++		}
++	}
++	return 0;
++}
++
+ int kgd2kfd_stop_sched(struct kfd_dev *kfd, uint32_t node_id)
+ {
+ 	struct kfd_node *node;
+@@ -1567,6 +1586,23 @@ int kgd2kfd_stop_sched(struct kfd_dev *kfd, uint32_t node_id)
+ 	return node->dqm->ops.halt(node->dqm);
+ }
+ 
++int kgd2kfd_stop_sched_all_nodes(struct kfd_dev *kfd)
++{
++	struct kfd_node *node;
++	int i, r;
++
++	if (!kfd->init_complete)
++		return 0;
++
++	for (i = 0; i < kfd->num_nodes; i++) {
++		node = kfd->nodes[i];
++		r = node->dqm->ops.halt(node->dqm);
++		if (r)
++			return r;
++	}
++	return 0;
++}
++
+ bool kgd2kfd_compute_active(struct kfd_dev *kfd, uint32_t node_id)
+ {
+ 	struct kfd_node *node;
+-- 
+2.52.0
+

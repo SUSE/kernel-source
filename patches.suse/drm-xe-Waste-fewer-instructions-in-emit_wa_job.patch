@@ -1,0 +1,234 @@
+From aded26ccaaa87ec9d7665eb7be25be4c70672b28 Mon Sep 17 00:00:00 2001
+From: Tvrtko Ursulin <tvrtko.ursulin@igalia.com>
+Date: Thu, 10 Jul 2025 13:33:52 -0700
+Subject: drm/xe: Waste fewer instructions in emit_wa_job()
+Git-commit: aded26ccaaa87ec9d7665eb7be25be4c70672b28
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+I was debugging some unrelated issue and noticed the current code was
+very verbose. We can improve it easily by using the more common batch
+buffer building pattern.
+
+Before: bb->cs[bb->len++] = MI_LOAD_REGISTER_REG | MI_LRR_DST_CS_MMIO;
+     c4d:       41 8b 56 10             mov    0x10(%r14),%edx
+     c51:       49 8b 4e 08             mov    0x8(%r14),%rcx
+     c55:       8d 72 01                lea    0x1(%rdx),%esi
+     c58:       41 89 76 10             mov    %esi,0x10(%r14)
+     c5c:       c7 04 91 01 00 08 15    movl   $0x15080001,(%rcx,%rdx,4)
+                        bb->cs[bb->len++] = entry->reg.addr;
+     c63:       8b 08                   mov    (%rax),%ecx
+     c65:       41 8b 56 10             mov    0x10(%r14),%edx
+     c69:       49 8b 76 08             mov    0x8(%r14),%rsi
+     c6d:       81 e1 ff ff 3f 00       and    $0x3fffff,%ecx
+     c73:       8d 7a 01                lea    0x1(%rdx),%edi
+     c76:       41 89 7e 10             mov    %edi,0x10(%r14)
+     c7a:       89 0c 96                mov    %ecx,(%rsi,%rdx,4)
+ ..etc..
+
+After: *cs++ = MI_LOAD_REGISTER_REG | MI_LRR_DST_CS_MMIO;
+     c52:       41 c7 04 24 01 00 08    movl   $0x15080001,(%r12)
+     c59:       15
+                        *cs++ = entry->reg.addr;
+     c5a:       8b 10                   mov    (%rax),%edx
+ ..etc..
+
+Resulting in the following binary change:
+
+	add/remove: 0/0 grow/shrink: 0/2 up/down: 0/-348 (-348)
+	Function                                     old     new   delta
+	xe_gt_record_default_lrcs.cold               304     296      -8
+	xe_gt_record_default_lrcs                   2200    1860    -340
+	Total: Before=13554, After=13206, chg -2.57%
+
+Signed-off-by: Tvrtko Ursulin <tvrtko.ursulin@igalia.com>
+Reviewed-by: Lucas De Marchi <lucas.demarchi@intel.com>
+Reviewed-by: Matthew Brost <matthew.brost@intel.com>
+Link: https://lore.kernel.org/r/20250710-lrc-refactors-v2-7-a5e2ca03f6bd@intel.com
+Signed-off-by: Lucas De Marchi <lucas.demarchi@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/xe/xe_gt.c  | 76 ++++++++++++++++++++-----------------
+ drivers/gpu/drm/xe/xe_lrc.c | 12 +++---
+ drivers/gpu/drm/xe/xe_lrc.h |  2 +-
+ 3 files changed, 49 insertions(+), 41 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_gt.c b/drivers/gpu/drm/xe/xe_gt.c
+index 9f90aa3f3d55..c8eda36546d3 100644
+--- a/drivers/gpu/drm/xe/xe_gt.c
++++ b/drivers/gpu/drm/xe/xe_gt.c
+@@ -194,6 +194,7 @@ static int emit_wa_job(struct xe_gt *gt, struct xe_exec_queue *q)
+ 	unsigned long idx;
+ 	struct xe_bb *bb;
+ 	size_t bb_len = 0;
++	u32 *cs;
+ 
+ 	/* count RMW registers as those will be handled separately */
+ 	xa_for_each(&sr->xa, idx, entry) {
+@@ -222,13 +223,15 @@ static int emit_wa_job(struct xe_gt *gt, struct xe_exec_queue *q)
+ 	if (IS_ERR(bb))
+ 		return PTR_ERR(bb);
+ 
++	cs = bb->cs;
++
+ 	if (count) {
+ 		/*
+ 		 * Emit single LRI with all non RMW regs: 1 leading dw + 2dw per
+ 		 * reg + 1
+ 		 */
+ 
+-		bb->cs[bb->len++] = MI_LOAD_REGISTER_IMM | MI_LRI_NUM_REGS(count);
++		*cs++ = MI_LOAD_REGISTER_IMM | MI_LRI_NUM_REGS(count);
+ 
+ 		xa_for_each(&sr->xa, idx, entry) {
+ 			struct xe_reg reg = entry->reg;
+@@ -243,8 +246,8 @@ static int emit_wa_job(struct xe_gt *gt, struct xe_exec_queue *q)
+ 
+ 			val |= entry->set_bits;
+ 
+-			bb->cs[bb->len++] = reg.addr;
+-			bb->cs[bb->len++] = val;
++			*cs++ = reg.addr;
++			*cs++ = val;
+ 			xe_gt_dbg(gt, "REG[0x%x] = 0x%08x", reg.addr, val);
+ 		}
+ 	}
+@@ -256,46 +259,49 @@ static int emit_wa_job(struct xe_gt *gt, struct xe_exec_queue *q)
+ 			if (entry->reg.masked || entry->clr_bits == ~0)
+ 				continue;
+ 
+-			bb->cs[bb->len++] = MI_LOAD_REGISTER_REG | MI_LRR_DST_CS_MMIO;
+-			bb->cs[bb->len++] = entry->reg.addr;
+-			bb->cs[bb->len++] = CS_GPR_REG(0, 0).addr;
+-
+-			bb->cs[bb->len++] = MI_LOAD_REGISTER_IMM | MI_LRI_NUM_REGS(2) |
+-					    MI_LRI_LRM_CS_MMIO;
+-			bb->cs[bb->len++] = CS_GPR_REG(0, 1).addr;
+-			bb->cs[bb->len++] = entry->clr_bits;
+-			bb->cs[bb->len++] = CS_GPR_REG(0, 2).addr;
+-			bb->cs[bb->len++] = entry->set_bits;
+-
+-			bb->cs[bb->len++] = MI_MATH(8);
+-			bb->cs[bb->len++] = CS_ALU_INSTR_LOAD(SRCA, REG0);
+-			bb->cs[bb->len++] = CS_ALU_INSTR_LOADINV(SRCB, REG1);
+-			bb->cs[bb->len++] = CS_ALU_INSTR_AND;
+-			bb->cs[bb->len++] = CS_ALU_INSTR_STORE(REG0, ACCU);
+-			bb->cs[bb->len++] = CS_ALU_INSTR_LOAD(SRCA, REG0);
+-			bb->cs[bb->len++] = CS_ALU_INSTR_LOAD(SRCB, REG2);
+-			bb->cs[bb->len++] = CS_ALU_INSTR_OR;
+-			bb->cs[bb->len++] = CS_ALU_INSTR_STORE(REG0, ACCU);
+-
+-			bb->cs[bb->len++] = MI_LOAD_REGISTER_REG | MI_LRR_SRC_CS_MMIO;
+-			bb->cs[bb->len++] = CS_GPR_REG(0, 0).addr;
+-			bb->cs[bb->len++] = entry->reg.addr;
++			*cs++ = MI_LOAD_REGISTER_REG | MI_LRR_DST_CS_MMIO;
++			*cs++ = entry->reg.addr;
++			*cs++ = CS_GPR_REG(0, 0).addr;
++
++			*cs++ = MI_LOAD_REGISTER_IMM | MI_LRI_NUM_REGS(2) |
++				MI_LRI_LRM_CS_MMIO;
++			*cs++ = CS_GPR_REG(0, 1).addr;
++			*cs++ = entry->clr_bits;
++			*cs++ = CS_GPR_REG(0, 2).addr;
++			*cs++ = entry->set_bits;
++
++			*cs++ = MI_MATH(8);
++			*cs++ = CS_ALU_INSTR_LOAD(SRCA, REG0);
++			*cs++ = CS_ALU_INSTR_LOADINV(SRCB, REG1);
++			*cs++ = CS_ALU_INSTR_AND;
++			*cs++ = CS_ALU_INSTR_STORE(REG0, ACCU);
++			*cs++ = CS_ALU_INSTR_LOAD(SRCA, REG0);
++			*cs++ = CS_ALU_INSTR_LOAD(SRCB, REG2);
++			*cs++ = CS_ALU_INSTR_OR;
++			*cs++ = CS_ALU_INSTR_STORE(REG0, ACCU);
++
++			*cs++ = MI_LOAD_REGISTER_REG | MI_LRR_SRC_CS_MMIO;
++			*cs++ = CS_GPR_REG(0, 0).addr;
++			*cs++ = entry->reg.addr;
+ 
+ 			xe_gt_dbg(gt, "REG[%#x] = ~%#x|%#x\n",
+ 				  entry->reg.addr, entry->clr_bits, entry->set_bits);
+ 		}
+ 
+ 		/* reset used GPR */
+-		bb->cs[bb->len++] = MI_LOAD_REGISTER_IMM | MI_LRI_NUM_REGS(3) | MI_LRI_LRM_CS_MMIO;
+-		bb->cs[bb->len++] = CS_GPR_REG(0, 0).addr;
+-		bb->cs[bb->len++] = 0;
+-		bb->cs[bb->len++] = CS_GPR_REG(0, 1).addr;
+-		bb->cs[bb->len++] = 0;
+-		bb->cs[bb->len++] = CS_GPR_REG(0, 2).addr;
+-		bb->cs[bb->len++] = 0;
++		*cs++ = MI_LOAD_REGISTER_IMM | MI_LRI_NUM_REGS(3) |
++			MI_LRI_LRM_CS_MMIO;
++		*cs++ = CS_GPR_REG(0, 0).addr;
++		*cs++ = 0;
++		*cs++ = CS_GPR_REG(0, 1).addr;
++		*cs++ = 0;
++		*cs++ = CS_GPR_REG(0, 2).addr;
++		*cs++ = 0;
+ 	}
+ 
+-	xe_lrc_emit_hwe_state_instructions(q, bb);
++	cs = xe_lrc_emit_hwe_state_instructions(q, cs);
++
++	bb->len = cs - bb->cs;
+ 
+ 	ret = emit_job_sync(q, bb, HZ);
+ 
+diff --git a/drivers/gpu/drm/xe/xe_lrc.c b/drivers/gpu/drm/xe/xe_lrc.c
+index 8bb2ca3af7d1..3a169011a2ad 100644
+--- a/drivers/gpu/drm/xe/xe_lrc.c
++++ b/drivers/gpu/drm/xe/xe_lrc.c
+@@ -1888,7 +1888,7 @@ static const struct instr_state xe_hpg_svg_state[] = {
+ 	{ .instr = CMD_3DSTATE_DRAWING_RECTANGLE, .num_dw = 4 },
+ };
+ 
+-void xe_lrc_emit_hwe_state_instructions(struct xe_exec_queue *q, struct xe_bb *bb)
++u32 *xe_lrc_emit_hwe_state_instructions(struct xe_exec_queue *q, u32 *cs)
+ {
+ 	struct xe_gt *gt = q->hwe->gt;
+ 	struct xe_device *xe = gt_to_xe(gt);
+@@ -1923,7 +1923,7 @@ void xe_lrc_emit_hwe_state_instructions(struct xe_exec_queue *q, struct xe_bb *b
+ 	if (!state_table) {
+ 		xe_gt_dbg(gt, "No non-register state to emit on graphics ver %d.%02d\n",
+ 			  GRAPHICS_VER(xe), GRAPHICS_VERx100(xe) % 100);
+-		return;
++		return cs;
+ 	}
+ 
+ 	for (int i = 0; i < state_table_size; i++) {
+@@ -1946,12 +1946,14 @@ void xe_lrc_emit_hwe_state_instructions(struct xe_exec_queue *q, struct xe_bb *b
+ 		    instr == CMD_3DSTATE_DRAWING_RECTANGLE)
+ 			instr = CMD_3DSTATE_DRAWING_RECTANGLE_FAST;
+ 
+-		bb->cs[bb->len] = instr;
++		*cs = instr;
+ 		if (!is_single_dw)
+-			bb->cs[bb->len] |= (num_dw - 2);
++			*cs |= (num_dw - 2);
+ 
+-		bb->len += num_dw;
++		cs += num_dw;
+ 	}
++
++	return cs;
+ }
+ 
+ struct xe_lrc_snapshot *xe_lrc_snapshot_capture(struct xe_lrc *lrc)
+diff --git a/drivers/gpu/drm/xe/xe_lrc.h b/drivers/gpu/drm/xe/xe_lrc.h
+index eb6e8de8c939..b6c8053c581b 100644
+--- a/drivers/gpu/drm/xe/xe_lrc.h
++++ b/drivers/gpu/drm/xe/xe_lrc.h
+@@ -112,7 +112,7 @@ void xe_lrc_dump_default(struct drm_printer *p,
+ 			 struct xe_gt *gt,
+ 			 enum xe_engine_class);
+ 
+-void xe_lrc_emit_hwe_state_instructions(struct xe_exec_queue *q, struct xe_bb *bb);
++u32 *xe_lrc_emit_hwe_state_instructions(struct xe_exec_queue *q, u32 *cs);
+ 
+ struct xe_lrc_snapshot *xe_lrc_snapshot_capture(struct xe_lrc *lrc);
+ void xe_lrc_snapshot_capture_delayed(struct xe_lrc_snapshot *snapshot);
+-- 
+2.52.0
+

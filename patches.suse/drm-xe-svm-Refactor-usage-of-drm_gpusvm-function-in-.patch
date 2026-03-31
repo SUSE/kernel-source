@@ -1,0 +1,174 @@
+From e0ff0d7cf928fdd0e52565dd6285c46ccf3bce89 Mon Sep 17 00:00:00 2001
+From: Himal Prasad Ghimiray <himal.prasad.ghimiray@intel.com>
+Date: Tue, 13 May 2025 09:32:22 +0530
+Subject: drm/xe/svm: Refactor usage of drm_gpusvm* function in xe_svm
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: e0ff0d7cf928fdd0e52565dd6285c46ccf3bce89
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Define xe_svm_range_find_or_insert function wrapping
+drm_gpusvm_range_find_or_insert for reusing in prefetch.
+
+Define xe_svm_range_get_pages function wrapping
+drm_gpusvm_range_get_pages for reusing in prefetch.
+
+-v2 pass pagefault defined drm_gpu_svm context as parameter
+in xe_svm_range_find_or_insert(Matthew Brost)
+
+Cc: Matthew Brost <matthew.brost@intel.com>
+Reviewed-by: Matthew Brost <matthew.brost@intel.com>
+Acked-by: Thomas Hellström <thomas.hellstrom@linux.intel.com>
+Link: https://lore.kernel.org/r/20250513040228.470682-10-himal.prasad.ghimiray@intel.com
+Signed-off-by: Himal Prasad Ghimiray <himal.prasad.ghimiray@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/xe/xe_svm.c | 65 ++++++++++++++++++++++++++++++++-----
+ drivers/gpu/drm/xe/xe_svm.h | 21 ++++++++++++
+ 2 files changed, 77 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_svm.c b/drivers/gpu/drm/xe/xe_svm.c
+index 4d46f8b7332e..ae1e3defe907 100644
+--- a/drivers/gpu/drm/xe/xe_svm.c
++++ b/drivers/gpu/drm/xe/xe_svm.c
+@@ -785,7 +785,6 @@ int xe_svm_handle_pagefault(struct xe_vm *vm, struct xe_vma *vma,
+ 			vm->xe->atomic_svm_timeslice_ms : 0,
+ 	};
+ 	struct xe_svm_range *range;
+-	struct drm_gpusvm_range *r;
+ 	struct drm_exec exec;
+ 	struct dma_fence *fence;
+ 	int migrate_try_count = ctx.devmem_only ? 3 : 1;
+@@ -804,16 +803,14 @@ int xe_svm_handle_pagefault(struct xe_vm *vm, struct xe_vma *vma,
+ 	if (err)
+ 		return err;
+ 
+-	r = drm_gpusvm_range_find_or_insert(&vm->svm.gpusvm, fault_addr,
+-					    xe_vma_start(vma), xe_vma_end(vma),
+-					    &ctx);
+-	if (IS_ERR(r))
+-		return PTR_ERR(r);
++	range = xe_svm_range_find_or_insert(vm, fault_addr, vma, &ctx);
+ 
+-	if (ctx.devmem_only && !r->flags.migrate_devmem)
++	if (IS_ERR(range))
++		return PTR_ERR(range);
++
++	if (ctx.devmem_only && !range->base.flags.migrate_devmem)
+ 		return -EACCES;
+ 
+-	range = to_xe_range(r);
+ 	if (xe_svm_range_is_valid(range, tile, ctx.devmem_only))
+ 		return 0;
+ 
+@@ -839,7 +836,7 @@ int xe_svm_handle_pagefault(struct xe_vm *vm, struct xe_vma *vma,
+ 	}
+ 
+ 	range_debug(range, "GET PAGES");
+-	err = drm_gpusvm_range_get_pages(&vm->svm.gpusvm, r, &ctx);
++	err = xe_svm_range_get_pages(vm, range, &ctx);
+ 	/* Corner where CPU mappings have changed */
+ 	if (err == -EOPNOTSUPP || err == -EFAULT || err == -EPERM) {
+ 		ctx.timeslice_ms <<= 1;	/* Double timeslice if we have to retry */
+@@ -930,6 +927,56 @@ int xe_svm_bo_evict(struct xe_bo *bo)
+ 	return drm_gpusvm_evict_to_ram(&bo->devmem_allocation);
+ }
+ 
++/**
++ * xe_svm_range_find_or_insert- Find or insert GPU SVM range
++ * @vm: xe_vm pointer
++ * @addr: address for which range needs to be found/inserted
++ * @vma:  Pointer to struct xe_vma which mirrors CPU
++ * @ctx: GPU SVM context
++ *
++ * This function finds or inserts a newly allocated a SVM range based on the
++ * address.
++ *
++ * Return: Pointer to the SVM range on success, ERR_PTR() on failure.
++ */
++struct xe_svm_range *xe_svm_range_find_or_insert(struct xe_vm *vm, u64 addr,
++						 struct xe_vma *vma, struct drm_gpusvm_ctx *ctx)
++{
++	struct drm_gpusvm_range *r;
++
++	r = drm_gpusvm_range_find_or_insert(&vm->svm.gpusvm, max(addr, xe_vma_start(vma)),
++					    xe_vma_start(vma), xe_vma_end(vma), ctx);
++	if (IS_ERR(r))
++		return ERR_PTR(PTR_ERR(r));
++
++	return to_xe_range(r);
++}
++
++/**
++ * xe_svm_range_get_pages() - Get pages for a SVM range
++ * @vm: Pointer to the struct xe_vm
++ * @range: Pointer to the xe SVM range structure
++ * @ctx: GPU SVM context
++ *
++ * This function gets pages for a SVM range and ensures they are mapped for
++ * DMA access. In case of failure with -EOPNOTSUPP, it evicts the range.
++ *
++ * Return: 0 on success, negative error code on failure.
++ */
++int xe_svm_range_get_pages(struct xe_vm *vm, struct xe_svm_range *range,
++			   struct drm_gpusvm_ctx *ctx)
++{
++	int err = 0;
++
++	err = drm_gpusvm_range_get_pages(&vm->svm.gpusvm, &range->base, ctx);
++	if (err == -EOPNOTSUPP) {
++		range_debug(range, "PAGE FAULT - EVICT PAGES");
++		drm_gpusvm_range_evict(&vm->svm.gpusvm, &range->base);
++	}
++
++	return err;
++}
++
+ #if IS_ENABLED(CONFIG_DRM_XE_DEVMEM_MIRROR)
+ 
+ static struct drm_pagemap_device_addr
+diff --git a/drivers/gpu/drm/xe/xe_svm.h b/drivers/gpu/drm/xe/xe_svm.h
+index a69bbdc73608..e304d147d309 100644
+--- a/drivers/gpu/drm/xe/xe_svm.h
++++ b/drivers/gpu/drm/xe/xe_svm.h
+@@ -73,6 +73,13 @@ void xe_svm_range_debug(struct xe_svm_range *range, const char *operation);
+ int xe_svm_alloc_vram(struct xe_vm *vm, struct xe_tile *tile,
+ 		      struct xe_svm_range *range,
+ 		      const struct drm_gpusvm_ctx *ctx);
++
++struct xe_svm_range *xe_svm_range_find_or_insert(struct xe_vm *vm, u64 addr,
++						 struct xe_vma *vma, struct drm_gpusvm_ctx *ctx);
++
++int xe_svm_range_get_pages(struct xe_vm *vm, struct xe_svm_range *range,
++			   struct drm_gpusvm_ctx *ctx);
++
+ /**
+  * xe_svm_range_has_dma_mapping() - SVM range has DMA mapping
+  * @range: SVM range
+@@ -227,6 +234,20 @@ int xe_svm_alloc_vram(struct xe_vm *vm, struct xe_tile *tile,
+ 	return -EOPNOTSUPP;
+ }
+ 
++static inline
++struct xe_svm_range *xe_svm_range_find_or_insert(struct xe_vm *vm, u64 addr,
++						 struct xe_vma *vma, struct drm_gpusvm_ctx *ctx)
++{
++	return ERR_PTR(-EINVAL);
++}
++
++static inline
++int xe_svm_range_get_pages(struct xe_vm *vm, struct xe_svm_range *range,
++			   struct drm_gpusvm_ctx *ctx)
++{
++	return -EINVAL;
++}
++
+ static inline struct xe_svm_range *to_xe_range(struct drm_gpusvm_range *r)
+ {
+ 	return NULL;
+-- 
+2.52.0
+

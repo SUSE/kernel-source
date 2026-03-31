@@ -1,0 +1,140 @@
+From a951020202b88cee91feab00b36946c62e5a71d3 Mon Sep 17 00:00:00 2001
+From: "T.J. Mercier" <tjmercier@google.com>
+Date: Thu, 17 Apr 2025 18:09:41 +0000
+Subject: dma-buf: system_heap: No separate allocation for attachment sg_tables
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: a951020202b88cee91feab00b36946c62e5a71d3
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+struct dma_heap_attachment is a separate allocation from the struct
+sg_table it contains, but there is no reason for this. Let's use the
+slab allocator just once instead of twice for dma_heap_attachment.
+
+Signed-off-by: T.J. Mercier <tjmercier@google.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Sumit Semwal <sumit.semwal@linaro.org>
+Link: https://lore.kernel.org/r/20250417180943.1559755-1-tjmercier@google.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/dma-buf/heaps/system_heap.c | 43 ++++++++++++-----------------
+ 1 file changed, 17 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/dma-buf/heaps/system_heap.c b/drivers/dma-buf/heaps/system_heap.c
+index 82b1b714300d..bbe7881f1360 100644
+--- a/drivers/dma-buf/heaps/system_heap.c
++++ b/drivers/dma-buf/heaps/system_heap.c
+@@ -33,7 +33,7 @@ struct system_heap_buffer {
+ 
+ struct dma_heap_attachment {
+ 	struct device *dev;
+-	struct sg_table *table;
++	struct sg_table table;
+ 	struct list_head list;
+ 	bool mapped;
+ };
+@@ -52,29 +52,22 @@ static gfp_t order_flags[] = {HIGH_ORDER_GFP, HIGH_ORDER_GFP, LOW_ORDER_GFP};
+ static const unsigned int orders[] = {8, 4, 0};
+ #define NUM_ORDERS ARRAY_SIZE(orders)
+ 
+-static struct sg_table *dup_sg_table(struct sg_table *table)
++static int dup_sg_table(struct sg_table *from, struct sg_table *to)
+ {
+-	struct sg_table *new_table;
+-	int ret, i;
+ 	struct scatterlist *sg, *new_sg;
++	int ret, i;
+ 
+-	new_table = kzalloc(sizeof(*new_table), GFP_KERNEL);
+-	if (!new_table)
+-		return ERR_PTR(-ENOMEM);
+-
+-	ret = sg_alloc_table(new_table, table->orig_nents, GFP_KERNEL);
+-	if (ret) {
+-		kfree(new_table);
+-		return ERR_PTR(-ENOMEM);
+-	}
++	ret = sg_alloc_table(to, from->orig_nents, GFP_KERNEL);
++	if (ret)
++		return ret;
+ 
+-	new_sg = new_table->sgl;
+-	for_each_sgtable_sg(table, sg, i) {
++	new_sg = to->sgl;
++	for_each_sgtable_sg(from, sg, i) {
+ 		sg_set_page(new_sg, sg_page(sg), sg->length, sg->offset);
+ 		new_sg = sg_next(new_sg);
+ 	}
+ 
+-	return new_table;
++	return 0;
+ }
+ 
+ static int system_heap_attach(struct dma_buf *dmabuf,
+@@ -82,19 +75,18 @@ static int system_heap_attach(struct dma_buf *dmabuf,
+ {
+ 	struct system_heap_buffer *buffer = dmabuf->priv;
+ 	struct dma_heap_attachment *a;
+-	struct sg_table *table;
++	int ret;
+ 
+ 	a = kzalloc(sizeof(*a), GFP_KERNEL);
+ 	if (!a)
+ 		return -ENOMEM;
+ 
+-	table = dup_sg_table(&buffer->sg_table);
+-	if (IS_ERR(table)) {
++	ret = dup_sg_table(&buffer->sg_table, &a->table);
++	if (ret) {
+ 		kfree(a);
+-		return -ENOMEM;
++		return ret;
+ 	}
+ 
+-	a->table = table;
+ 	a->dev = attachment->dev;
+ 	INIT_LIST_HEAD(&a->list);
+ 	a->mapped = false;
+@@ -118,8 +110,7 @@ static void system_heap_detach(struct dma_buf *dmabuf,
+ 	list_del(&a->list);
+ 	mutex_unlock(&buffer->lock);
+ 
+-	sg_free_table(a->table);
+-	kfree(a->table);
++	sg_free_table(&a->table);
+ 	kfree(a);
+ }
+ 
+@@ -127,7 +118,7 @@ static struct sg_table *system_heap_map_dma_buf(struct dma_buf_attachment *attac
+ 						enum dma_data_direction direction)
+ {
+ 	struct dma_heap_attachment *a = attachment->priv;
+-	struct sg_table *table = a->table;
++	struct sg_table *table = &a->table;
+ 	int ret;
+ 
+ 	ret = dma_map_sgtable(attachment->dev, table, direction, 0);
+@@ -162,7 +153,7 @@ static int system_heap_dma_buf_begin_cpu_access(struct dma_buf *dmabuf,
+ 	list_for_each_entry(a, &buffer->attachments, list) {
+ 		if (!a->mapped)
+ 			continue;
+-		dma_sync_sgtable_for_cpu(a->dev, a->table, direction);
++		dma_sync_sgtable_for_cpu(a->dev, &a->table, direction);
+ 	}
+ 	mutex_unlock(&buffer->lock);
+ 
+@@ -183,7 +174,7 @@ static int system_heap_dma_buf_end_cpu_access(struct dma_buf *dmabuf,
+ 	list_for_each_entry(a, &buffer->attachments, list) {
+ 		if (!a->mapped)
+ 			continue;
+-		dma_sync_sgtable_for_device(a->dev, a->table, direction);
++		dma_sync_sgtable_for_device(a->dev, &a->table, direction);
+ 	}
+ 	mutex_unlock(&buffer->lock);
+ 
+-- 
+2.52.0
+

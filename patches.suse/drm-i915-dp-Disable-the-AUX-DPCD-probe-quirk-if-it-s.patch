@@ -1,0 +1,156 @@
+From ed3648b9ec4c040d5eebc9e4b8b9083a68628022 Mon Sep 17 00:00:00 2001
+From: Imre Deak <imre.deak@intel.com>
+Date: Mon, 9 Jun 2025 15:55:56 +0300
+Subject: drm/i915/dp: Disable the AUX DPCD probe quirk if it's not required
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: ed3648b9ec4c040d5eebc9e4b8b9083a68628022
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Reading DPCD registers has side-effects and some of these can cause a
+problem for instance during link training. Based on this it's better to
+avoid the probing quirk done before each DPCD register read, limiting
+this to the monitor which requires it. The only known problematic
+monitor is an external SST sink, so keep the quirk disabled always for
+eDP and MST sinks. Reenable the quirk after a hotplug event and after
+resuming from a power state without hotplug support, until the
+subsequent EDID based detection.
+
+V2: Add a helper for determining the need/setting the probing. (Jani)
+
+Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Cc: Jani Nikula <jani.nikula@linux.intel.com>
+Reviewed-by: Mika Kahola <mika.kahola@intel.com>
+Acked-by: Jani Nikula <jani.nikula@intel.com>
+Signed-off-by: Imre Deak <imre.deak@intel.com>
+Link: https://lore.kernel.org/r/20250609125556.109538-2-imre.deak@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/intel_dp.c      | 31 ++++++++++++++++++--
+ drivers/gpu/drm/i915/display/intel_dp.h      |  1 +
+ drivers/gpu/drm/i915/display/intel_dp_aux.c  |  2 ++
+ drivers/gpu/drm/i915/display/intel_hotplug.c |  6 ++++
+ 4 files changed, 38 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_dp.c b/drivers/gpu/drm/i915/display/intel_dp.c
+index 499ee72bc6b5..b69950319d67 100644
+--- a/drivers/gpu/drm/i915/display/intel_dp.c
++++ b/drivers/gpu/drm/i915/display/intel_dp.c
+@@ -5796,6 +5796,28 @@ intel_dp_detect_sdp_caps(struct intel_dp *intel_dp)
+ 		drm_dp_as_sdp_supported(&intel_dp->aux, intel_dp->dpcd);
+ }
+ 
++static bool intel_dp_needs_dpcd_probe(struct intel_dp *intel_dp, bool force_on_external)
++{
++	struct intel_connector *connector = intel_dp->attached_connector;
++
++	if (intel_dp_is_edp(intel_dp))
++		return false;
++
++	if (force_on_external)
++		return true;
++
++	if (intel_dp->is_mst)
++		return false;
++
++	return drm_edid_has_quirk(&connector->base, DRM_EDID_QUIRK_DP_DPCD_PROBE);
++}
++
++void intel_dp_dpcd_set_probe(struct intel_dp *intel_dp, bool force_on_external)
++{
++	drm_dp_dpcd_set_probe(&intel_dp->aux,
++			      intel_dp_needs_dpcd_probe(intel_dp, force_on_external));
++}
++
+ static int
+ intel_dp_detect(struct drm_connector *_connector,
+ 		struct drm_modeset_acquire_ctx *ctx,
+@@ -5924,6 +5946,8 @@ intel_dp_detect(struct drm_connector *_connector,
+ 	if (status != connector_status_connected && !intel_dp->is_mst)
+ 		intel_dp_unset_edid(intel_dp);
+ 
++	intel_dp_dpcd_set_probe(intel_dp, false);
++
+ 	if (!intel_dp_is_edp(intel_dp))
+ 		drm_dp_set_subconnector_property(&connector->base,
+ 						 status,
+@@ -5954,6 +5978,8 @@ intel_dp_force(struct drm_connector *_connector)
+ 		return;
+ 
+ 	intel_dp_set_edid(intel_dp);
++
++	intel_dp_dpcd_set_probe(intel_dp, false);
+ }
+ 
+ static int intel_dp_get_modes(struct drm_connector *_connector)
+@@ -6326,10 +6352,11 @@ intel_dp_hpd_pulse(struct intel_digital_port *dig_port, bool long_hpd)
+ 	 * complete the DP tunnel BW request for the latter connector/encoder
+ 	 * waiting for this encoder's DPRX read, perform a dummy read here.
+ 	 */
+-	if (long_hpd)
++	if (long_hpd) {
++		intel_dp_dpcd_set_probe(intel_dp, true);
++
+ 		intel_dp_read_dprx_caps(intel_dp, dpcd);
+ 
+-	if (long_hpd) {
+ 		intel_dp->reset_link_params = true;
+ 		intel_dp_invalidate_source_oui(intel_dp);
+ 
+diff --git a/drivers/gpu/drm/i915/display/intel_dp.h b/drivers/gpu/drm/i915/display/intel_dp.h
+index eff3414c05db..0657f5681196 100644
+--- a/drivers/gpu/drm/i915/display/intel_dp.h
++++ b/drivers/gpu/drm/i915/display/intel_dp.h
+@@ -213,5 +213,6 @@ int intel_dp_compute_min_hblank(struct intel_crtc_state *crtc_state,
+ 				const struct drm_connector_state *conn_state);
+ 
+ int intel_dp_dsc_bpp_step_x16(const struct intel_connector *connector);
++void intel_dp_dpcd_set_probe(struct intel_dp *intel_dp, bool force_on_external);
+ 
+ #endif /* __INTEL_DP_H__ */
+diff --git a/drivers/gpu/drm/i915/display/intel_dp_aux.c b/drivers/gpu/drm/i915/display/intel_dp_aux.c
+index 411cf4474776..829a7c0fbe4f 100644
+--- a/drivers/gpu/drm/i915/display/intel_dp_aux.c
++++ b/drivers/gpu/drm/i915/display/intel_dp_aux.c
+@@ -834,6 +834,8 @@ void intel_dp_aux_init(struct intel_dp *intel_dp)
+ 
+ 	intel_dp->aux.transfer = intel_dp_aux_transfer;
+ 	cpu_latency_qos_add_request(&intel_dp->pm_qos, PM_QOS_DEFAULT_VALUE);
++
++	intel_dp_dpcd_set_probe(intel_dp, true);
+ }
+ 
+ static enum aux_ch default_aux_ch(struct intel_encoder *encoder)
+diff --git a/drivers/gpu/drm/i915/display/intel_hotplug.c b/drivers/gpu/drm/i915/display/intel_hotplug.c
+index 74fe398663d6..901fda434af1 100644
+--- a/drivers/gpu/drm/i915/display/intel_hotplug.c
++++ b/drivers/gpu/drm/i915/display/intel_hotplug.c
+@@ -33,6 +33,7 @@
+ #include "intel_display_core.h"
+ #include "intel_display_rpm.h"
+ #include "intel_display_types.h"
++#include "intel_dp.h"
+ #include "intel_hdcp.h"
+ #include "intel_hotplug.h"
+ #include "intel_hotplug_irq.h"
+@@ -906,9 +907,14 @@ void intel_hpd_poll_enable(struct intel_display *display)
+  */
+ void intel_hpd_poll_disable(struct intel_display *display)
+ {
++	struct intel_encoder *encoder;
++
+ 	if (!HAS_DISPLAY(display))
+ 		return;
+ 
++	for_each_intel_dp(display->drm, encoder)
++		intel_dp_dpcd_set_probe(enc_to_intel_dp(encoder), true);
++
+ 	WRITE_ONCE(display->hotplug.poll_enabled, false);
+ 
+ 	spin_lock_irq(&display->irq.lock);
+-- 
+2.52.0
+

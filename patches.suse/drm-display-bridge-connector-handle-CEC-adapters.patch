@@ -1,0 +1,203 @@
+From a74288c8ded7c34624e50b4aa8ca37ae6cc03df4 Mon Sep 17 00:00:00 2001
+From: Dmitry Baryshkov <dmitry.baryshkov@oss.qualcomm.com>
+Date: Sat, 17 May 2025 04:59:45 +0300
+Subject: drm/display: bridge-connector: handle CEC adapters
+Git-commit: a74288c8ded7c34624e50b4aa8ca37ae6cc03df4
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Implement necessary glue code to let DRM bridge drivers to implement CEC
+adapters support.
+
+Signed-off-by: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Reviewed-by: Maxime Ripard <mripard@kernel.org>
+Link: https://lore.kernel.org/r/20250517-drm-hdmi-connector-cec-v6-9-35651db6f19b@oss.qualcomm.com
+Signed-off-by: Dmitry Baryshkov <dmitry.baryshkov@oss.qualcomm.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/display/Kconfig               |  1 +
+ .../gpu/drm/display/drm_bridge_connector.c    | 82 +++++++++++++++++++
+ include/drm/drm_bridge.h                      | 26 ++++++
+ 3 files changed, 109 insertions(+)
+
+diff --git a/drivers/gpu/drm/display/Kconfig b/drivers/gpu/drm/display/Kconfig
+index 6376ea01ec30..df09cf9a8ca1 100644
+--- a/drivers/gpu/drm/display/Kconfig
++++ b/drivers/gpu/drm/display/Kconfig
+@@ -17,6 +17,7 @@ if DRM_DISPLAY_HELPER
+ config DRM_BRIDGE_CONNECTOR
+ 	bool
+ 	select DRM_DISPLAY_HDMI_AUDIO_HELPER
++	select DRM_DISPLAY_HDMI_CEC_HELPER
+ 	select DRM_DISPLAY_HDMI_STATE_HELPER
+ 	help
+ 	  DRM connector implementation terminating DRM bridge chains.
+diff --git a/drivers/gpu/drm/display/drm_bridge_connector.c b/drivers/gpu/drm/display/drm_bridge_connector.c
+index a220189f737c..fb59ee2818df 100644
+--- a/drivers/gpu/drm/display/drm_bridge_connector.c
++++ b/drivers/gpu/drm/display/drm_bridge_connector.c
+@@ -554,6 +554,65 @@ static const struct drm_connector_hdmi_audio_funcs drm_bridge_connector_hdmi_aud
+ 	.mute_stream = drm_bridge_connector_audio_mute_stream,
+ };
+ 
++static int drm_bridge_connector_hdmi_cec_enable(struct drm_connector *connector, bool enable)
++{
++	struct drm_bridge_connector *bridge_connector =
++		to_drm_bridge_connector(connector);
++	struct drm_bridge *bridge;
++
++	bridge = bridge_connector->bridge_hdmi_cec;
++
++	return bridge->funcs->hdmi_cec_enable(bridge, enable);
++}
++
++static int drm_bridge_connector_hdmi_cec_log_addr(struct drm_connector *connector, u8 logical_addr)
++{
++	struct drm_bridge_connector *bridge_connector =
++		to_drm_bridge_connector(connector);
++	struct drm_bridge *bridge;
++
++	bridge = bridge_connector->bridge_hdmi_cec;
++
++	return bridge->funcs->hdmi_cec_log_addr(bridge, logical_addr);
++}
++
++static int drm_bridge_connector_hdmi_cec_transmit(struct drm_connector *connector,
++						  u8 attempts,
++						  u32 signal_free_time,
++						  struct cec_msg *msg)
++{
++	struct drm_bridge_connector *bridge_connector =
++		to_drm_bridge_connector(connector);
++	struct drm_bridge *bridge;
++
++	bridge = bridge_connector->bridge_hdmi_cec;
++
++	return bridge->funcs->hdmi_cec_transmit(bridge, attempts,
++						signal_free_time,
++						msg);
++}
++
++static int drm_bridge_connector_hdmi_cec_init(struct drm_connector *connector)
++{
++	struct drm_bridge_connector *bridge_connector =
++		to_drm_bridge_connector(connector);
++	struct drm_bridge *bridge;
++
++	bridge = bridge_connector->bridge_hdmi_cec;
++
++	if (!bridge->funcs->hdmi_cec_init)
++		return 0;
++
++	return bridge->funcs->hdmi_cec_init(connector, bridge);
++}
++
++static const struct drm_connector_hdmi_cec_funcs drm_bridge_connector_hdmi_cec_funcs = {
++	.init = drm_bridge_connector_hdmi_cec_init,
++	.enable = drm_bridge_connector_hdmi_cec_enable,
++	.log_addr = drm_bridge_connector_hdmi_cec_log_addr,
++	.transmit = drm_bridge_connector_hdmi_cec_transmit,
++};
++
+ /* -----------------------------------------------------------------------------
+  * Bridge Connector Initialisation
+  */
+@@ -677,6 +736,18 @@ struct drm_connector *drm_bridge_connector_init(struct drm_device *drm,
+ 			bridge_connector->bridge_hdmi_cec = bridge;
+ 		}
+ 
++		if (bridge->ops & DRM_BRIDGE_OP_HDMI_CEC_ADAPTER) {
++			if (bridge_connector->bridge_hdmi_cec)
++				return ERR_PTR(-EBUSY);
++
++			bridge_connector->bridge_hdmi_cec = bridge;
++
++			if (!bridge->funcs->hdmi_cec_enable ||
++			    !bridge->funcs->hdmi_cec_log_addr ||
++			    !bridge->funcs->hdmi_cec_transmit)
++				return ERR_PTR(-EINVAL);
++		}
++
+ 		if (!drm_bridge_get_next_bridge(bridge))
+ 			connector_type = bridge->type;
+ 
+@@ -751,6 +822,17 @@ struct drm_connector *drm_bridge_connector_init(struct drm_device *drm,
+ 			return ERR_PTR(ret);
+ 	}
+ 
++	if (bridge_connector->bridge_hdmi_cec &&
++	    bridge_connector->bridge_hdmi_cec->ops & DRM_BRIDGE_OP_HDMI_CEC_ADAPTER) {
++		ret = drmm_connector_hdmi_cec_register(connector,
++						       &drm_bridge_connector_hdmi_cec_funcs,
++						       bridge->hdmi_cec_adapter_name,
++						       bridge->hdmi_cec_available_las,
++						       bridge->hdmi_cec_dev);
++		if (ret)
++			return ERR_PTR(ret);
++	}
++
+ 	drm_connector_helper_add(connector, &drm_bridge_connector_helper_funcs);
+ 
+ 	if (bridge_connector->bridge_hpd)
+diff --git a/include/drm/drm_bridge.h b/include/drm/drm_bridge.h
+index 0e5f6a007d53..cc9f7df38102 100644
+--- a/include/drm/drm_bridge.h
++++ b/include/drm/drm_bridge.h
+@@ -32,6 +32,7 @@
+ #include <drm/drm_mode_object.h>
+ #include <drm/drm_modes.h>
+ 
++struct cec_msg;
+ struct device_node;
+ 
+ struct drm_bridge;
+@@ -737,6 +738,16 @@ struct drm_bridge_funcs {
+ 				      struct drm_bridge *bridge,
+ 				      bool enable, int direction);
+ 
++	int (*hdmi_cec_init)(struct drm_connector *connector,
++			     struct drm_bridge *bridge);
++
++	int (*hdmi_cec_enable)(struct drm_bridge *bridge, bool enable);
++
++	int (*hdmi_cec_log_addr)(struct drm_bridge *bridge, u8 logical_addr);
++
++	int (*hdmi_cec_transmit)(struct drm_bridge *bridge, u8 attempts,
++				 u32 signal_free_time, struct cec_msg *msg);
++
+ 	/**
+ 	 * @dp_audio_startup:
+ 	 *
+@@ -912,6 +923,11 @@ enum drm_bridge_ops {
+ 	 * to be present.
+ 	 */
+ 	DRM_BRIDGE_OP_HDMI_CEC_NOTIFIER = BIT(7),
++	/**
++	 * @DRM_BRIDGE_OP_HDMI_CEC_ADAPTER: The bridge requires CEC notifier
++	 * to be present.
++	 */
++	DRM_BRIDGE_OP_HDMI_CEC_ADAPTER = BIT(8),
+ };
+ 
+ /**
+@@ -1048,6 +1064,16 @@ struct drm_bridge {
+ 	 */
+ 	int hdmi_audio_dai_port;
+ 
++	/**
++	 * @hdmi_cec_adapter_name: the name of the adapter to register
++	 */
++	const char *hdmi_cec_adapter_name;
++
++	/**
++	 * @hdmi_cec_available_las: number of logical addresses, CEC_MAX_LOG_ADDRS if unset
++	 */
++	u8 hdmi_cec_available_las;
++
+ 	/** private: */
+ 	/**
+ 	 * @hpd_mutex: Protects the @hpd_cb and @hpd_data fields.
+-- 
+2.52.0
+

@@ -1,0 +1,177 @@
+From 7e9f0cc24bb6a2121a6abaef401d429f94ea2e8b Mon Sep 17 00:00:00 2001
+From: Jani Nikula <jani.nikula@intel.com>
+Date: Mon, 12 May 2025 17:56:53 +0300
+Subject: drm/i915: add generic read/write functions for VLV IOSF SB
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 7e9f0cc24bb6a2121a6abaef401d429f94ea2e8b
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+The read/write functions will be helpful for rewriting the unit specific
+functions.
+
+V2: Fix checkpatch complaint on indent
+
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://lore.kernel.org/r/babe42609c7a2056aff301320efbda534d20ad82.1747061743.git.jani.nikula@intel.com
+Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/vlv_iosf_sb.c            | 73 +++++++++++++++++++
+ drivers/gpu/drm/i915/vlv_iosf_sb.h            |  6 +-
+ .../drm/xe/compat-i915-headers/vlv_iosf_sb.h  |  9 ++-
+ 3 files changed, 83 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/vlv_iosf_sb.c b/drivers/gpu/drm/i915/vlv_iosf_sb.c
+index 91703c6c478c..aaed876a1f2e 100644
+--- a/drivers/gpu/drm/i915/vlv_iosf_sb.c
++++ b/drivers/gpu/drm/i915/vlv_iosf_sb.c
+@@ -123,6 +123,79 @@ static int vlv_sideband_rw(struct drm_i915_private *i915,
+ 	return err;
+ }
+ 
++static u32 unit_to_devfn(enum vlv_iosf_sb_unit unit)
++{
++	if (unit == VLV_IOSF_SB_DPIO || unit == VLV_IOSF_SB_DPIO_2 ||
++	    unit == VLV_IOSF_SB_FLISDSI)
++		return DPIO_DEVFN;
++	else
++		return PCI_DEVFN(0, 0);
++}
++
++static u32 unit_to_port(enum vlv_iosf_sb_unit unit)
++{
++	switch (unit) {
++	case VLV_IOSF_SB_BUNIT:
++		return IOSF_PORT_BUNIT;
++	case VLV_IOSF_SB_CCK:
++		return IOSF_PORT_CCK;
++	case VLV_IOSF_SB_CCU:
++		return IOSF_PORT_CCU;
++	case VLV_IOSF_SB_DPIO:
++		return IOSF_PORT_DPIO;
++	case VLV_IOSF_SB_DPIO_2:
++		return IOSF_PORT_DPIO_2;
++	case VLV_IOSF_SB_FLISDSI:
++		return IOSF_PORT_FLISDSI;
++	case VLV_IOSF_SB_GPIO:
++		return 0; /* FIXME: unused */
++	case VLV_IOSF_SB_NC:
++		return IOSF_PORT_NC;
++	case VLV_IOSF_SB_PUNIT:
++		return IOSF_PORT_PUNIT;
++	default:
++		return 0;
++	}
++}
++
++static u32 unit_to_opcode(enum vlv_iosf_sb_unit unit, bool write)
++{
++	if (unit == VLV_IOSF_SB_DPIO || unit == VLV_IOSF_SB_DPIO_2)
++		return write ? SB_MWR_NP : SB_MRD_NP;
++	else
++		return write ? SB_CRWRDA_NP : SB_CRRDDA_NP;
++}
++
++u32 vlv_iosf_sb_read(struct drm_i915_private *i915, enum vlv_iosf_sb_unit unit, u32 addr)
++{
++	u32 devfn, port, opcode, val = 0;
++
++	devfn = unit_to_devfn(unit);
++	port = unit_to_port(unit);
++	opcode = unit_to_opcode(unit, false);
++
++	if (drm_WARN_ONCE(&i915->drm, !port, "invalid unit %d\n", unit))
++		return 0;
++
++	vlv_sideband_rw(i915, devfn, port, opcode, addr, &val);
++
++	return val;
++}
++
++int vlv_iosf_sb_write(struct drm_i915_private *i915, enum vlv_iosf_sb_unit unit, u32 addr, u32 val)
++{
++	u32 devfn, port, opcode;
++
++	devfn = unit_to_devfn(unit);
++	port = unit_to_port(unit);
++	opcode = unit_to_opcode(unit, true);
++
++	if (drm_WARN_ONCE(&i915->drm, !port, "invalid unit %d\n", unit))
++		return -EINVAL;
++
++	return vlv_sideband_rw(i915, devfn, port, opcode, addr, &val);
++}
++
+ u32 vlv_punit_read(struct drm_i915_private *i915, u32 addr)
+ {
+ 	u32 val = 0;
+diff --git a/drivers/gpu/drm/i915/vlv_iosf_sb.h b/drivers/gpu/drm/i915/vlv_iosf_sb.h
+index 380b96089cda..26af3aa973f8 100644
+--- a/drivers/gpu/drm/i915/vlv_iosf_sb.h
++++ b/drivers/gpu/drm/i915/vlv_iosf_sb.h
+@@ -14,11 +14,12 @@
+ enum dpio_phy;
+ struct drm_i915_private;
+ 
+-enum {
++enum vlv_iosf_sb_unit {
+ 	VLV_IOSF_SB_BUNIT,
+ 	VLV_IOSF_SB_CCK,
+ 	VLV_IOSF_SB_CCU,
+ 	VLV_IOSF_SB_DPIO,
++	VLV_IOSF_SB_DPIO_2,
+ 	VLV_IOSF_SB_FLISDSI,
+ 	VLV_IOSF_SB_GPIO,
+ 	VLV_IOSF_SB_NC,
+@@ -31,6 +32,9 @@ void vlv_iosf_sb_fini(struct drm_i915_private *i915);
+ void vlv_iosf_sb_get(struct drm_i915_private *i915, unsigned long ports);
+ void vlv_iosf_sb_put(struct drm_i915_private *i915, unsigned long ports);
+ 
++u32 vlv_iosf_sb_read(struct drm_i915_private *i915, enum vlv_iosf_sb_unit unit, u32 addr);
++int vlv_iosf_sb_write(struct drm_i915_private *i915, enum vlv_iosf_sb_unit unit, u32 addr, u32 val);
++
+ static inline void vlv_bunit_get(struct drm_i915_private *i915)
+ {
+ 	vlv_iosf_sb_get(i915, BIT(VLV_IOSF_SB_BUNIT));
+diff --git a/drivers/gpu/drm/xe/compat-i915-headers/vlv_iosf_sb.h b/drivers/gpu/drm/xe/compat-i915-headers/vlv_iosf_sb.h
+index b42a518a79e0..57f7dde90ced 100644
+--- a/drivers/gpu/drm/xe/compat-i915-headers/vlv_iosf_sb.h
++++ b/drivers/gpu/drm/xe/compat-i915-headers/vlv_iosf_sb.h
+@@ -13,11 +13,12 @@
+ enum pipe;
+ struct drm_i915_private;
+ 
+-enum {
++enum vlv_iosf_sb_unit {
+ 	VLV_IOSF_SB_BUNIT,
+ 	VLV_IOSF_SB_CCK,
+ 	VLV_IOSF_SB_CCU,
+ 	VLV_IOSF_SB_DPIO,
++	VLV_IOSF_SB_DPIO_2,
+ 	VLV_IOSF_SB_FLISDSI,
+ 	VLV_IOSF_SB_GPIO,
+ 	VLV_IOSF_SB_NC,
+@@ -27,13 +28,13 @@ enum {
+ static inline void vlv_iosf_sb_get(struct drm_i915_private *i915, unsigned long ports)
+ {
+ }
+-static inline u32 vlv_iosf_sb_read(struct drm_i915_private *i915, u8 port, u32 reg)
++static inline u32 vlv_iosf_sb_read(struct drm_i915_private *i915, enum vlv_iosf_sb_unit unit, u32 addr)
+ {
+ 	return 0;
+ }
+-static inline void vlv_iosf_sb_write(struct drm_i915_private *i915,
+-				     u8 port, u32 reg, u32 val)
++static inline int vlv_iosf_sb_write(struct drm_i915_private *i915, enum vlv_iosf_sb_unit unit, u32 addr, u32 val)
+ {
++	return 0;
+ }
+ static inline void vlv_iosf_sb_put(struct drm_i915_private *i915, unsigned long ports)
+ {
+-- 
+2.52.0
+

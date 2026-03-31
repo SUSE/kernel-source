@@ -1,0 +1,136 @@
+From 854acbe75ff406ea2c72ef3048578dfd99425ba9 Mon Sep 17 00:00:00 2001
+From: Jared Kangas <jkangas@redhat.com>
+Date: Tue, 10 Jun 2025 06:12:31 -0700
+Subject: dma-buf: heaps: Give default CMA heap a fixed name
+Git-commit: 854acbe75ff406ea2c72ef3048578dfd99425ba9
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+The CMA heap's name in devtmpfs can vary depending on how the heap is
+defined. Its name defaults to "reserved", but if a CMA area is defined
+in the devicetree, the heap takes on the devicetree node's name, such as
+"default-pool" or "linux,cma". To simplify naming, unconditionally name
+it "default_cma_region", but keep a legacy node in place backed by the
+same underlying allocator for backwards compatibility.
+
+Reviewed-by: Maxime Ripard <mripard@kernel.org>
+Signed-off-by: Jared Kangas <jkangas@redhat.com>
+Signed-off-by: Sumit Semwal <sumit.semwal@linaro.org>
+Link: https://lore.kernel.org/r/20250610131231.1724627-4-jkangas@redhat.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ Documentation/userspace-api/dma-buf-heaps.rst | 28 +++++++++++++++++++
+ drivers/dma-buf/heaps/Kconfig                 | 10 +++++++
+ drivers/dma-buf/heaps/cma_heap.c              | 20 ++++++++++++-
+ 3 files changed, 57 insertions(+), 1 deletion(-)
+ create mode 100644 Documentation/userspace-api/dma-buf-heaps.rst
+
+diff --git a/Documentation/userspace-api/dma-buf-heaps.rst b/Documentation/userspace-api/dma-buf-heaps.rst
+new file mode 100644
+index 000000000000..1dfe5e7acd5a
+--- /dev/null
++++ b/Documentation/userspace-api/dma-buf-heaps.rst
+@@ -0,0 +1,28 @@
++.. SPDX-License-Identifier: GPL-2.0
++
++==============================
++Allocating dma-buf using heaps
++==============================
++
++Dma-buf Heaps are a way for userspace to allocate dma-buf objects. They are
++typically used to allocate buffers from a specific allocation pool, or to share
++buffers across frameworks.
++
++Heaps
++=====
++
++A heap represents a specific allocator. The Linux kernel currently supports the
++following heaps:
++
++ - The ``system`` heap allocates virtually contiguous, cacheable, buffers.
++
++ - The ``cma`` heap allocates physically contiguous, cacheable,
++   buffers. Only present if a CMA region is present. Such a region is
++   usually created either through the kernel commandline through the
++   ``cma`` parameter, a memory region Device-Tree node with the
++   ``linux,cma-default`` property set, or through the ``CMA_SIZE_MBYTES`` or
++   ``CMA_SIZE_PERCENTAGE`` Kconfig options. The heap's name in devtmpfs is
++   ``default_cma_region``. For backwards compatibility, when the
++   ``DMABUF_HEAPS_CMA_LEGACY`` Kconfig option is set, a duplicate node is
++   created following legacy naming conventions; the legacy name might be
++   ``reserved``, ``linux,cma``, or ``default-pool``.
+diff --git a/drivers/dma-buf/heaps/Kconfig b/drivers/dma-buf/heaps/Kconfig
+index a5eef06c4226..bb369b38b001 100644
+--- a/drivers/dma-buf/heaps/Kconfig
++++ b/drivers/dma-buf/heaps/Kconfig
+@@ -12,3 +12,13 @@ config DMABUF_HEAPS_CMA
+ 	  Choose this option to enable dma-buf CMA heap. This heap is backed
+ 	  by the Contiguous Memory Allocator (CMA). If your system has these
+ 	  regions, you should say Y here.
++
++config DMABUF_HEAPS_CMA_LEGACY
++	bool "Legacy DMA-BUF CMA Heap"
++	default y
++	depends on DMABUF_HEAPS_CMA
++	help
++	  Add a duplicate CMA-backed dma-buf heap with legacy naming derived
++	  from the CMA area's devicetree node, or "reserved" if the area is not
++	  defined in the devicetree. This uses the same underlying allocator as
++	  CONFIG_DMABUF_HEAPS_CMA.
+diff --git a/drivers/dma-buf/heaps/cma_heap.c b/drivers/dma-buf/heaps/cma_heap.c
+index e998d8ccd1dc..0df007111975 100644
+--- a/drivers/dma-buf/heaps/cma_heap.c
++++ b/drivers/dma-buf/heaps/cma_heap.c
+@@ -9,6 +9,9 @@
+  * Copyright (C) 2019 Texas Instruments Incorporated - http://www.ti.com/
+  *	Andrew F. Davis <afd@ti.com>
+  */
++
++#define pr_fmt(fmt) "cma_heap: " fmt
++
+ #include <linux/cma.h>
+ #include <linux/dma-buf.h>
+ #include <linux/dma-heap.h>
+@@ -22,6 +25,7 @@
+ #include <linux/slab.h>
+ #include <linux/vmalloc.h>
+ 
++#define DEFAULT_CMA_NAME "default_cma_region"
+ 
+ struct cma_heap {
+ 	struct dma_heap *heap;
+@@ -394,15 +398,29 @@ static int __init __add_cma_heap(struct cma *cma, const char *name)
+ static int __init add_default_cma_heap(void)
+ {
+ 	struct cma *default_cma = dev_get_cma_area(NULL);
++	const char *legacy_cma_name;
+ 	int ret;
+ 
+ 	if (!default_cma)
+ 		return 0;
+ 
+-	ret = __add_cma_heap(default_cma, cma_get_name(default_cma));
++	ret = __add_cma_heap(default_cma, DEFAULT_CMA_NAME);
+ 	if (ret)
+ 		return ret;
+ 
++	if (IS_ENABLED(CONFIG_DMABUF_HEAPS_CMA_LEGACY)) {
++		legacy_cma_name = cma_get_name(default_cma);
++		if (!strcmp(legacy_cma_name, DEFAULT_CMA_NAME)) {
++			pr_warn("legacy name and default name are the same, skipping legacy heap\n");
++			return 0;
++		}
++
++		ret = __add_cma_heap(default_cma, legacy_cma_name);
++		if (ret)
++			pr_warn("failed to add legacy heap: %pe\n",
++				ERR_PTR(ret));
++	}
++
+ 	return 0;
+ }
+ module_init(add_default_cma_heap);
+-- 
+2.52.0
+

@@ -1,0 +1,158 @@
+From bbe5db761086e870678697f8920db518a6297a18 Mon Sep 17 00:00:00 2001
+From: Alexandre Courbot <acourbot@nvidia.com>
+Date: Thu, 19 Jun 2025 22:23:56 +0900
+Subject: gpu: nova-core: wait for GFW_BOOT completion
+Git-commit: bbe5db761086e870678697f8920db518a6297a18
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Upon reset, the GPU executes the GFW (GPU Firmware) in order to
+initialize its base parameters such as clocks. The driver must ensure
+that this step is completed before using the hardware.
+
+Signed-off-by: Alexandre Courbot <acourbot@nvidia.com>
+Link: https://lore.kernel.org/r/20250619-nova-frts-v6-12-ecf41ef99252@nvidia.com
+[ Slightly adjust comments in wait_gfw_boot_completion(). - Danilo ]
+
+Signed-off-by: Danilo Krummrich <dakr@kernel.org>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/nova-core/gfw.rs       | 41 ++++++++++++++++++++++++++++++
+ drivers/gpu/nova-core/gpu.rs       |  5 ++++
+ drivers/gpu/nova-core/nova_core.rs |  1 +
+ drivers/gpu/nova-core/regs.rs      | 25 ++++++++++++++++++
+ drivers/gpu/nova-core/util.rs      |  1 -
+ 5 files changed, 72 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/gpu/nova-core/gfw.rs
+
+diff --git a/drivers/gpu/nova-core/gfw.rs b/drivers/gpu/nova-core/gfw.rs
+new file mode 100644
+index 000000000000..937e820e00fc
+--- /dev/null
++++ b/drivers/gpu/nova-core/gfw.rs
+@@ -0,0 +1,41 @@
++// SPDX-License-Identifier: GPL-2.0
++
++//! GPU Firmware (GFW) support.
++//!
++//! Upon reset, the GPU runs some firmware code from the BIOS to setup its core parameters. Most of
++//! the GPU is considered unusable until this step is completed, so we must wait on it before
++//! performing driver initialization.
++
++use core::time::Duration;
++
++use kernel::bindings;
++use kernel::prelude::*;
++
++use crate::driver::Bar0;
++use crate::regs;
++use crate::util;
++
++/// Wait until `GFW` (GPU Firmware) completes, or a 4 seconds timeout elapses.
++pub(crate) fn wait_gfw_boot_completion(bar: &Bar0) -> Result {
++    // TIMEOUT: arbitrarily large value. GFW starts running immediately after the GPU is put out of
++    // reset, and should complete in less time than that.
++    util::wait_on(Duration::from_secs(4), || {
++        // Check that FWSEC has lowered its protection level before reading the GFW_BOOT
++        // status.
++        let gfw_booted = regs::NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_PRIV_LEVEL_MASK::read(bar)
++            .read_protection_level0()
++            && regs::NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_0_GFW_BOOT::read(bar).completed();
++
++        if gfw_booted {
++            Some(())
++        } else {
++            // TODO: replace with [1] once merged.
++            // [1] https://lore.kernel.org/rust-for-linux/20250423192857.199712-6-fujita.tomonori@gmail.com/
++            //
++            // SAFETY: `msleep()` is safe to call with any parameter.
++            unsafe { bindings::msleep(1) };
++
++            None
++        }
++    })
++}
+diff --git a/drivers/gpu/nova-core/gpu.rs b/drivers/gpu/nova-core/gpu.rs
+index 60b86f370284..e44ff6fa0714 100644
+--- a/drivers/gpu/nova-core/gpu.rs
++++ b/drivers/gpu/nova-core/gpu.rs
+@@ -4,6 +4,7 @@
+ 
+ use crate::driver::Bar0;
+ use crate::firmware::{Firmware, FIRMWARE_VERSION};
++use crate::gfw;
+ use crate::regs;
+ use crate::util;
+ use core::fmt;
+@@ -182,6 +183,10 @@ pub(crate) fn new(
+             spec.revision
+         );
+ 
++        // We must wait for GFW_BOOT completion before doing any significant setup on the GPU.
++        gfw::wait_gfw_boot_completion(bar)
++            .inspect_err(|_| dev_err!(pdev.as_ref(), "GFW boot did not complete"))?;
++
+         Ok(pin_init!(Self {
+             spec,
+             bar: devres_bar,
+diff --git a/drivers/gpu/nova-core/nova_core.rs b/drivers/gpu/nova-core/nova_core.rs
+index 618632f0abcc..c3fde3e132ea 100644
+--- a/drivers/gpu/nova-core/nova_core.rs
++++ b/drivers/gpu/nova-core/nova_core.rs
+@@ -4,6 +4,7 @@
+ 
+ mod driver;
+ mod firmware;
++mod gfw;
+ mod gpu;
+ mod regs;
+ mod util;
+diff --git a/drivers/gpu/nova-core/regs.rs b/drivers/gpu/nova-core/regs.rs
+index 5a1273230306..cba442da5118 100644
+--- a/drivers/gpu/nova-core/regs.rs
++++ b/drivers/gpu/nova-core/regs.rs
+@@ -37,3 +37,28 @@ pub(crate) fn chipset(self) -> Result<Chipset> {
+             .and_then(Chipset::try_from)
+     }
+ }
++
++/* PGC6 */
++
++register!(NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_PRIV_LEVEL_MASK @ 0x00118128 {
++    0:0     read_protection_level0 as bool, "Set after FWSEC lowers its protection level";
++});
++
++// TODO: This is an array of registers.
++register!(NV_PGC6_AON_SECURE_SCRATCH_GROUP_05 @ 0x00118234 {
++    31:0    value as u32;
++});
++
++register!(
++    NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_0_GFW_BOOT => NV_PGC6_AON_SECURE_SCRATCH_GROUP_05,
++    "Scratch group 05 register 0 used as GFW boot progress indicator" {
++        7:0    progress as u8, "Progress of GFW boot (0xff means completed)";
++    }
++);
++
++impl NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_0_GFW_BOOT {
++    /// Returns `true` if GFW boot is completed.
++    pub(crate) fn completed(self) -> bool {
++        self.progress() == 0xff
++    }
++}
+diff --git a/drivers/gpu/nova-core/util.rs b/drivers/gpu/nova-core/util.rs
+index c50bfa5ab7fe..69f29238b25e 100644
+--- a/drivers/gpu/nova-core/util.rs
++++ b/drivers/gpu/nova-core/util.rs
+@@ -34,7 +34,6 @@ pub(crate) const fn const_bytes_to_str(bytes: &[u8]) -> &str {
+ ///
+ /// TODO: replace with `read_poll_timeout` once it is available.
+ /// (https://lore.kernel.org/lkml/20250220070611.214262-8-fujita.tomonori@gmail.com/)
+-#[expect(dead_code)]
+ pub(crate) fn wait_on<R, F: Fn() -> Option<R>>(timeout: Duration, cond: F) -> Result<R> {
+     let start_time = Instant::now();
+ 
+-- 
+2.52.0
+

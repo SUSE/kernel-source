@@ -1,0 +1,80 @@
+From e6565e76e977422cb9e51fe872a2bcfdbc321b7b Mon Sep 17 00:00:00 2001
+From: Luca Ceresoli <luca.ceresoli@bootlin.com>
+Date: Fri, 20 Jun 2025 17:59:55 +0200
+Subject: drm/bridge: add warning for bridges not using devm_drm_bridge_alloc()
+Git-commit: e6565e76e977422cb9e51fe872a2bcfdbc321b7b
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+To the best of my knowledge, all drivers in the mainline kernel adding a
+DRM bridge are now converted to using devm_drm_bridge_alloc() for
+allocation and initialization. Among others this ensures initialization of
+the bridge refcount, allowing dynamic allocation lifetime.
+
+devm_drm_bridge_alloc() is now mandatory for all new bridges. Code using
+the old pattern ([devm_]kzalloc + filling the struct fields +
+drm_bridge_add) is not allowed anymore.
+
+Any drivers that might have been missed during the conversion, patches in
+flight towards mainline and out-of-tre drivers still using the old pattern
+will already be caught by a warning looking like:
+
+  ------------[ cut here ]------------
+  refcount_t: addition on 0; use-after-free.
+  WARNING: CPU: 2 PID: 83 at lib/refcount.c:25 refcount_warn_saturate+0x120/0x148
+  [...]
+  Call trace:
+   refcount_warn_saturate+0x120/0x148 (P)
+   drm_bridge_get.part.0+0x70/0x98 [drm]
+   drm_bridge_add+0x34/0x108 [drm]
+   sn65dsi83_probe+0x200/0x480 [ti_sn65dsi83]
+   [...]
+
+This warning comes from the refcount code and happens because
+drm_bridge_add() is increasing the refcount, which is uninitialized and
+thus initially zero.
+
+Having a warning and the corresponding stack trace is surely useful, but
+the warning text does not clarify the root problem nor how to fix it.
+
+Add a DRM_WARN() just before increasing the refcount, so the log will be
+much more readable:
+
+  [drm] DRM bridge corrupted or not allocated by devm_drm_bridge_alloc()
+  ------------[ cut here ]------------
+  refcount_t: addition on 0; use-after-free.
+  [...etc...]
+
+A DRM_WARN is used because drm_warn and drm_WARN require a struct
+drm_device pointer which is not yet available when adding a bridge.
+
+Do not print the dev_name() in the warning because struct drm_bridge has no
+pointer to the struct device. The affected driver should be easy to catch
+based on the following stack trace however.
+
+Reviewed-by: Maxime Ripard <mripard@kernel.org>
+Link: https://lore.kernel.org/r/20250620-drm-bridge-alloc-getput-drm-bridge-c-v9-3-ca53372c9a84@bootlin.com
+Signed-off-by: Luca Ceresoli <luca.ceresoli@bootlin.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/drm_bridge.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/drivers/gpu/drm/drm_bridge.c b/drivers/gpu/drm/drm_bridge.c
+index f001bbe95559..0b450b334afd 100644
+--- a/drivers/gpu/drm/drm_bridge.c
++++ b/drivers/gpu/drm/drm_bridge.c
+@@ -295,6 +295,9 @@ EXPORT_SYMBOL(__devm_drm_bridge_alloc);
+  */
+ void drm_bridge_add(struct drm_bridge *bridge)
+ {
++	if (!bridge->container)
++		DRM_WARN("DRM bridge corrupted or not allocated by devm_drm_bridge_alloc()\n");
++
+ 	drm_bridge_get(bridge);
+ 
+ 	mutex_init(&bridge->hpd_mutex);
+-- 
+2.52.0
+

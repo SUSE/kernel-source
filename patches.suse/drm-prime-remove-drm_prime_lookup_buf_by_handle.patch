@@ -1,0 +1,182 @@
+From c2aa5603af309968a10f8e0d929ec7662ada5f78 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Wed, 4 Jun 2025 13:00:38 +0200
+Subject: drm/prime: remove drm_prime_lookup_buf_by_handle
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: c2aa5603af309968a10f8e0d929ec7662ada5f78
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+This was added by Sima +10 years ago as a solution to avoid exporting
+multiple dma-bufs for the same GEM object. I tried to remove it before,
+but wasn't 100% sure about all the side effects.
+
+Now Thomas recent modified drm_gem_prime_handle_to_dmabuf() which makes
+it obvious that this is a superflous step. We try to look up the DMA-buf
+by handle handle and if that fails for some reason (must likely because
+the handle is a duplicate) the code just use the DMA-buf from the GEM
+object.
+
+Just using the DMA-buf from the GEM object in the first place has the
+same effect as far as I can see.
+
+Some more history from Sima:
+
+In d0b2c5334f41 ("drm/prime: Always add exported buffers to the handle
+cache") I added this additional lookup. It wasn't part of the bugfix,
+but back then the handle list was just a linked list and you could do
+lookups in either direction. And I guess I felt like doing a quick lookup
+before we grab the next lock makes sense. Premature optimization, I'm
+confessing to the crime guilty as charged :-/
+
+Then Chris Wilson in 077675c1e8a1 ("drm: Convert prime dma-buf <-> handle
+to rbtree") and added 2 rb trees to support both directions. At that point
+that handle2buf lookup really didn't make much sense anymore, but we just
+kept it and it's been in the tree confusing people ever since.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Simona Vetter <simona.vetter@ffwll.ch>
+Link: https://lore.kernel.org/r/20250604113234.2520-1-christian.koenig@amd.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/drm_gem.c      |  2 +-
+ drivers/gpu/drm/drm_internal.h |  1 +
+ drivers/gpu/drm/drm_prime.c    | 56 +++++-----------------------------
+ 3 files changed, 10 insertions(+), 49 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_gem.c b/drivers/gpu/drm/drm_gem.c
+index e791058e02cc..a322dc5b5eed 100644
+--- a/drivers/gpu/drm/drm_gem.c
++++ b/drivers/gpu/drm/drm_gem.c
+@@ -331,7 +331,7 @@ drm_gem_object_release_handle(int id, void *ptr, void *data)
+ 	if (obj->funcs->close)
+ 		obj->funcs->close(obj, file_priv);
+ 
+-	drm_prime_remove_buf_handle(&file_priv->prime, id);
++	drm_prime_remove_buf_handle(&file_priv->prime, obj->dma_buf, id);
+ 	drm_vma_node_revoke(&obj->vma_node, file_priv);
+ 
+ 	drm_gem_object_handle_put_unlocked(obj);
+diff --git a/drivers/gpu/drm/drm_internal.h b/drivers/gpu/drm/drm_internal.h
+index 1c2b22ea13c1..8c901a61c046 100644
+--- a/drivers/gpu/drm/drm_internal.h
++++ b/drivers/gpu/drm/drm_internal.h
+@@ -86,6 +86,7 @@ int drm_prime_fd_to_handle_ioctl(struct drm_device *dev, void *data,
+ void drm_prime_init_file_private(struct drm_prime_file_private *prime_fpriv);
+ void drm_prime_destroy_file_private(struct drm_prime_file_private *prime_fpriv);
+ void drm_prime_remove_buf_handle(struct drm_prime_file_private *prime_fpriv,
++				 struct dma_buf *dma_buf,
+ 				 uint32_t handle);
+ 
+ /* drm_managed.c */
+diff --git a/drivers/gpu/drm/drm_prime.c b/drivers/gpu/drm/drm_prime.c
+index 846692685e39..48f3f82e6c2e 100644
+--- a/drivers/gpu/drm/drm_prime.c
++++ b/drivers/gpu/drm/drm_prime.c
+@@ -90,7 +90,6 @@ struct drm_prime_member {
+ 	uint32_t handle;
+ 
+ 	struct rb_node dmabuf_rb;
+-	struct rb_node handle_rb;
+ };
+ 
+ static int drm_prime_add_buf_handle(struct drm_prime_file_private *prime_fpriv,
+@@ -122,45 +121,9 @@ static int drm_prime_add_buf_handle(struct drm_prime_file_private *prime_fpriv,
+ 	rb_link_node(&member->dmabuf_rb, rb, p);
+ 	rb_insert_color(&member->dmabuf_rb, &prime_fpriv->dmabufs);
+ 
+-	rb = NULL;
+-	p = &prime_fpriv->handles.rb_node;
+-	while (*p) {
+-		struct drm_prime_member *pos;
+-
+-		rb = *p;
+-		pos = rb_entry(rb, struct drm_prime_member, handle_rb);
+-		if (handle > pos->handle)
+-			p = &rb->rb_right;
+-		else
+-			p = &rb->rb_left;
+-	}
+-	rb_link_node(&member->handle_rb, rb, p);
+-	rb_insert_color(&member->handle_rb, &prime_fpriv->handles);
+-
+ 	return 0;
+ }
+ 
+-static struct dma_buf *drm_prime_lookup_buf_by_handle(struct drm_prime_file_private *prime_fpriv,
+-						      uint32_t handle)
+-{
+-	struct rb_node *rb;
+-
+-	rb = prime_fpriv->handles.rb_node;
+-	while (rb) {
+-		struct drm_prime_member *member;
+-
+-		member = rb_entry(rb, struct drm_prime_member, handle_rb);
+-		if (member->handle == handle)
+-			return member->dma_buf;
+-		else if (member->handle < handle)
+-			rb = rb->rb_right;
+-		else
+-			rb = rb->rb_left;
+-	}
+-
+-	return NULL;
+-}
+-
+ static int drm_prime_lookup_buf_handle(struct drm_prime_file_private *prime_fpriv,
+ 				       struct dma_buf *dma_buf,
+ 				       uint32_t *handle)
+@@ -186,25 +149,28 @@ static int drm_prime_lookup_buf_handle(struct drm_prime_file_private *prime_fpri
+ }
+ 
+ void drm_prime_remove_buf_handle(struct drm_prime_file_private *prime_fpriv,
++				 struct dma_buf *dma_buf,
+ 				 uint32_t handle)
+ {
+ 	struct rb_node *rb;
+ 
++	if (!dma_buf)
++		return;
++
+ 	mutex_lock(&prime_fpriv->lock);
+ 
+-	rb = prime_fpriv->handles.rb_node;
++	rb = prime_fpriv->dmabufs.rb_node;
+ 	while (rb) {
+ 		struct drm_prime_member *member;
+ 
+-		member = rb_entry(rb, struct drm_prime_member, handle_rb);
+-		if (member->handle == handle) {
+-			rb_erase(&member->handle_rb, &prime_fpriv->handles);
++		member = rb_entry(rb, struct drm_prime_member, dmabuf_rb);
++		if (member->dma_buf == dma_buf && member->handle == handle) {
+ 			rb_erase(&member->dmabuf_rb, &prime_fpriv->dmabufs);
+ 
+ 			dma_buf_put(member->dma_buf);
+ 			kfree(member);
+ 			break;
+-		} else if (member->handle < handle) {
++		} else if (member->dma_buf < dma_buf) {
+ 			rb = rb->rb_right;
+ 		} else {
+ 			rb = rb->rb_left;
+@@ -446,12 +412,6 @@ struct dma_buf *drm_gem_prime_handle_to_dmabuf(struct drm_device *dev,
+ 		goto out_unlock;
+ 	}
+ 
+-	dmabuf = drm_prime_lookup_buf_by_handle(&file_priv->prime, handle);
+-	if (dmabuf) {
+-		get_dma_buf(dmabuf);
+-		goto out;
+-	}
+-
+ 	mutex_lock(&dev->object_name_lock);
+ 	/* re-export the original imported object */
+ 	if (obj->import_attach) {
+-- 
+2.52.0
+

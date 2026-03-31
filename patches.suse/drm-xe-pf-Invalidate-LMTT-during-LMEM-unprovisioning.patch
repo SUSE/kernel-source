@@ -1,0 +1,197 @@
+From e497957fee3025ef72090b2ab29dd1070602bf6e Mon Sep 17 00:00:00 2001
+From: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Date: Fri, 11 Jul 2025 21:33:15 +0200
+Subject: drm/xe/pf: Invalidate LMTT during LMEM unprovisioning
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: e497957fee3025ef72090b2ab29dd1070602bf6e
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Invalidate LMTT immediately after removing VF's LMTT page tables
+and clearing root PTE in the LMTT PD to avoid any invalid access
+by the hardware (and VF) due to stale data.
+
+Signed-off-by: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Cc: Michał Winiarski <michal.winiarski@intel.com>
+Cc: Piotr Piórkowski <piotr.piorkowski@intel.com>
+Cc: Matthew Brost <matthew.brost@intel.com>
+Reviewed-by: Matthew Brost <matthew.brost@intel.com>
+Link: https://lore.kernel.org/r/20250711193316.1920-6-michal.wajdeczko@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/xe/xe_device.h              |  4 ++
+ drivers/gpu/drm/xe/xe_gt_tlb_invalidation.c | 34 +++++++++++++
+ drivers/gpu/drm/xe/xe_gt_tlb_invalidation.h |  1 +
+ drivers/gpu/drm/xe/xe_lmtt.c                | 54 +++++++++++++++++++++
+ drivers/gpu/drm/xe/xe_lmtt.h                |  1 +
+ 5 files changed, 94 insertions(+)
+
+diff --git a/drivers/gpu/drm/xe/xe_device.h b/drivers/gpu/drm/xe/xe_device.h
+index f0eb8150f185..bc802e066a7d 100644
+--- a/drivers/gpu/drm/xe/xe_device.h
++++ b/drivers/gpu/drm/xe/xe_device.h
+@@ -131,6 +131,10 @@ static inline bool xe_device_uc_enabled(struct xe_device *xe)
+ 	for ((id__) = 0; (id__) < (xe__)->info.tile_count * (xe__)->info.max_gt_per_tile; (id__)++) \
+ 		for_each_if((gt__) = xe_device_get_gt((xe__), (id__)))
+ 
++#define for_each_gt_on_tile(gt__, tile__, id__) \
++	for_each_gt((gt__), (tile__)->xe, (id__)) \
++		for_each_if((gt__)->tile == (tile__))
++
+ static inline struct xe_force_wake *gt_to_fw(struct xe_gt *gt)
+ {
+ 	return &gt->pm.fw;
+diff --git a/drivers/gpu/drm/xe/xe_gt_tlb_invalidation.c b/drivers/gpu/drm/xe/xe_gt_tlb_invalidation.c
+index 6088df8e159c..086c12ee3d9d 100644
+--- a/drivers/gpu/drm/xe/xe_gt_tlb_invalidation.c
++++ b/drivers/gpu/drm/xe/xe_gt_tlb_invalidation.c
+@@ -330,6 +330,40 @@ int xe_gt_tlb_invalidation_ggtt(struct xe_gt *gt)
+ 	return 0;
+ }
+ 
++static int send_tlb_invalidation_all(struct xe_gt *gt,
++				     struct xe_gt_tlb_invalidation_fence *fence)
++{
++	u32 action[] = {
++		XE_GUC_ACTION_TLB_INVALIDATION_ALL,
++		0,  /* seqno, replaced in send_tlb_invalidation */
++		MAKE_INVAL_OP(XE_GUC_TLB_INVAL_FULL),
++	};
++
++	return send_tlb_invalidation(&gt->uc.guc, fence, action, ARRAY_SIZE(action));
++}
++
++/**
++ * xe_gt_tlb_invalidation_all - Invalidate all TLBs across PF and all VFs.
++ * @gt: the &xe_gt structure
++ * @fence: the &xe_gt_tlb_invalidation_fence to be signaled on completion
++ *
++ * Send a request to invalidate all TLBs across PF and all VFs.
++ *
++ * Return: 0 on success, negative error code on error
++ */
++int xe_gt_tlb_invalidation_all(struct xe_gt *gt, struct xe_gt_tlb_invalidation_fence *fence)
++{
++	int err;
++
++	xe_gt_assert(gt, gt == fence->gt);
++
++	err = send_tlb_invalidation_all(gt, fence);
++	if (err)
++		xe_gt_err(gt, "TLB invalidation request failed (%pe)", ERR_PTR(err));
++
++	return err;
++}
++
+ /*
+  * Ensure that roundup_pow_of_two(length) doesn't overflow.
+  * Note that roundup_pow_of_two() operates on unsigned long,
+diff --git a/drivers/gpu/drm/xe/xe_gt_tlb_invalidation.h b/drivers/gpu/drm/xe/xe_gt_tlb_invalidation.h
+index 31072dbcad8e..f7f0f2eaf4b5 100644
+--- a/drivers/gpu/drm/xe/xe_gt_tlb_invalidation.h
++++ b/drivers/gpu/drm/xe/xe_gt_tlb_invalidation.h
+@@ -20,6 +20,7 @@ int xe_gt_tlb_invalidation_init_early(struct xe_gt *gt);
+ void xe_gt_tlb_invalidation_reset(struct xe_gt *gt);
+ int xe_gt_tlb_invalidation_ggtt(struct xe_gt *gt);
+ void xe_gt_tlb_invalidation_vm(struct xe_gt *gt, struct xe_vm *vm);
++int xe_gt_tlb_invalidation_all(struct xe_gt *gt, struct xe_gt_tlb_invalidation_fence *fence);
+ int xe_gt_tlb_invalidation_range(struct xe_gt *gt,
+ 				 struct xe_gt_tlb_invalidation_fence *fence,
+ 				 u64 start, u64 end, u32 asid);
+diff --git a/drivers/gpu/drm/xe/xe_lmtt.c b/drivers/gpu/drm/xe/xe_lmtt.c
+index 381f576036d0..a2000307d5bf 100644
+--- a/drivers/gpu/drm/xe/xe_lmtt.c
++++ b/drivers/gpu/drm/xe/xe_lmtt.c
+@@ -11,6 +11,7 @@
+ 
+ #include "xe_assert.h"
+ #include "xe_bo.h"
++#include "xe_gt_tlb_invalidation.h"
+ #include "xe_lmtt.h"
+ #include "xe_map.h"
+ #include "xe_mmio.h"
+@@ -222,6 +223,58 @@ void xe_lmtt_init_hw(struct xe_lmtt *lmtt)
+ 	lmtt_setup_dir_ptr(lmtt);
+ }
+ 
++static int lmtt_invalidate_hw(struct xe_lmtt *lmtt)
++{
++	struct xe_gt_tlb_invalidation_fence fences[XE_MAX_GT_PER_TILE];
++	struct xe_gt_tlb_invalidation_fence *fence = fences;
++	struct xe_tile *tile = lmtt_to_tile(lmtt);
++	struct xe_gt *gt;
++	int result = 0;
++	int err;
++	u8 id;
++
++	for_each_gt_on_tile(gt, tile, id) {
++		xe_gt_tlb_invalidation_fence_init(gt, fence, true);
++		err = xe_gt_tlb_invalidation_all(gt, fence);
++		result = result ?: err;
++		fence++;
++	}
++
++	lmtt_debug(lmtt, "num_fences=%d err=%d\n", (int)(fence - fences), result);
++
++	/*
++	 * It is fine to wait for all fences, even for those which covers the
++	 * invalidation request that failed, as such fence should be already
++	 * marked as signaled.
++	 */
++	fence = fences;
++	for_each_gt_on_tile(gt, tile, id)
++		xe_gt_tlb_invalidation_fence_wait(fence++);
++
++	return result;
++}
++
++/**
++ * xe_lmtt_invalidate_hw - Invalidate LMTT hardware.
++ * @lmtt: the &xe_lmtt to invalidate
++ *
++ * Send requests to all GuCs on this tile to invalidate all TLBs.
++ *
++ * This function should be called only when running as a PF driver.
++ */
++void xe_lmtt_invalidate_hw(struct xe_lmtt *lmtt)
++{
++	struct xe_device *xe = lmtt_to_xe(lmtt);
++	int err;
++
++	lmtt_assert(lmtt, IS_SRIOV_PF(xe));
++
++	err = lmtt_invalidate_hw(lmtt);
++	if (err)
++		xe_sriov_warn(xe, "LMTT%u invalidation failed (%pe)",
++			      lmtt_to_tile(lmtt)->id, ERR_PTR(err));
++}
++
+ static void lmtt_write_pte(struct xe_lmtt *lmtt, struct xe_lmtt_pt *pt,
+ 			   u64 pte, unsigned int idx)
+ {
+@@ -276,6 +329,7 @@ static void lmtt_drop_pages(struct xe_lmtt *lmtt, unsigned int vfid)
+ 		return;
+ 
+ 	lmtt_write_pte(lmtt, pd, LMTT_PTE_INVALID, vfid);
++	lmtt_invalidate_hw(lmtt);
+ 
+ 	lmtt_assert(lmtt, pd->level > 0);
+ 	lmtt_assert(lmtt, pt->level == pd->level - 1);
+diff --git a/drivers/gpu/drm/xe/xe_lmtt.h b/drivers/gpu/drm/xe/xe_lmtt.h
+index cb10ef994db6..75a234fbf367 100644
+--- a/drivers/gpu/drm/xe/xe_lmtt.h
++++ b/drivers/gpu/drm/xe/xe_lmtt.h
+@@ -15,6 +15,7 @@ struct xe_lmtt_ops;
+ #ifdef CONFIG_PCI_IOV
+ int xe_lmtt_init(struct xe_lmtt *lmtt);
+ void xe_lmtt_init_hw(struct xe_lmtt *lmtt);
++void xe_lmtt_invalidate_hw(struct xe_lmtt *lmtt);
+ int xe_lmtt_prepare_pages(struct xe_lmtt *lmtt, unsigned int vfid, u64 range);
+ int xe_lmtt_populate_pages(struct xe_lmtt *lmtt, unsigned int vfid, struct xe_bo *bo, u64 offset);
+ void xe_lmtt_drop_pages(struct xe_lmtt *lmtt, unsigned int vfid);
+-- 
+2.52.0
+

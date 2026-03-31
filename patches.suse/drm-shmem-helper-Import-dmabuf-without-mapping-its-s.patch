@@ -1,0 +1,211 @@
+From 660cd44659a05c5fbfce6d2bb1ce448aa0f35594 Mon Sep 17 00:00:00 2001
+From: Shixiong Ou <oushixiong@kylinos.cn>
+Date: Thu, 22 May 2025 15:07:12 +0800
+Subject: drm/shmem-helper: Import dmabuf without mapping its sg_table
+Git-commit: 660cd44659a05c5fbfce6d2bb1ce448aa0f35594
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+[WHY]
+1. Drivers using DRM_GEM_SHADOW_PLANE_HELPER_FUNCS and
+   DRM_GEM_SHMEM_DRIVER_OPS (e.g., udl, ast) do not require
+   sg_table import.
+   They only need dma_buf_vmap() to access the shared buffer's
+   kernel virtual address.
+
+2. On certain Aspeed-based boards, a dma_mask of 0xffff_ffff may
+   trigger SWIOTLB during dmabuf import. However, IO_TLB_SEGSIZE
+   restricts the maximum DMA streaming mapping memory, resulting in
+   errors like:
+
+   ast 0000:07:00.0: swiotlb buffer is full (sz: 3145728 bytes), total 32768 (slots), used 0 (slots)
+
+[HOW]
+Provide a gem_prime_import implementation without sg_table mapping
+to avoid issues (e.g., "swiotlb buffer is full"). Drivers that do not
+require sg_table can adopt this.
+
+Signed-off-by: Shixiong Ou <oushixiong@kylinos.cn>
+Acked-by: Thomas Zimmermann <tzimmermann@suse.de>
+Signed-off-by: Thomas Zimmermann <tzimmermann@suse.de>
+Link: https://lore.kernel.org/r/20250522070714.439824-1-oushixiong1025@163.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/drm_gem_shmem_helper.c | 57 ++++++++++++++++++++++++++
+ drivers/gpu/drm/drm_prime.c            | 36 ++++++++++++----
+ include/drm/drm_gem_shmem_helper.h     | 15 +++++++
+ include/drm/drm_prime.h                |  3 ++
+ 4 files changed, 102 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_gem_shmem_helper.c b/drivers/gpu/drm/drm_gem_shmem_helper.c
+index bc7b62f48ef3..4e2174584bf4 100644
+--- a/drivers/gpu/drm/drm_gem_shmem_helper.c
++++ b/drivers/gpu/drm/drm_gem_shmem_helper.c
+@@ -804,6 +804,63 @@ drm_gem_shmem_prime_import_sg_table(struct drm_device *dev,
+ }
+ EXPORT_SYMBOL_GPL(drm_gem_shmem_prime_import_sg_table);
+ 
++/**
++ * drm_gem_shmem_prime_import_no_map - Import dmabuf without mapping its sg_table
++ * @dev: Device to import into
++ * @dma_buf: dma-buf object to import
++ *
++ * Drivers that use the shmem helpers but also wants to import dmabuf without
++ * mapping its sg_table can use this as their &drm_driver.gem_prime_import
++ * implementation.
++ */
++struct drm_gem_object *drm_gem_shmem_prime_import_no_map(struct drm_device *dev,
++							 struct dma_buf *dma_buf)
++{
++	struct dma_buf_attachment *attach;
++	struct drm_gem_shmem_object *shmem;
++	struct drm_gem_object *obj;
++	size_t size;
++	int ret;
++
++	if (drm_gem_is_prime_exported_dma_buf(dev, dma_buf)) {
++		/*
++		 * Importing dmabuf exported from our own gem increases
++		 * refcount on gem itself instead of f_count of dmabuf.
++		 */
++		obj = dma_buf->priv;
++		drm_gem_object_get(obj);
++		return obj;
++	}
++
++	attach = dma_buf_attach(dma_buf, dev->dev);
++	if (IS_ERR(attach))
++		return ERR_CAST(attach);
++
++	get_dma_buf(dma_buf);
++
++	size = PAGE_ALIGN(attach->dmabuf->size);
++
++	shmem = __drm_gem_shmem_create(dev, size, true, NULL);
++	if (IS_ERR(shmem)) {
++		ret = PTR_ERR(shmem);
++		goto fail_detach;
++	}
++
++	drm_dbg_prime(dev, "size = %zu\n", size);
++
++	shmem->base.import_attach = attach;
++	shmem->base.resv = dma_buf->resv;
++
++	return &shmem->base;
++
++fail_detach:
++	dma_buf_detach(dma_buf, attach);
++	dma_buf_put(dma_buf);
++
++	return ERR_PTR(ret);
++}
++EXPORT_SYMBOL_GPL(drm_gem_shmem_prime_import_no_map);
++
+ MODULE_DESCRIPTION("DRM SHMEM memory-management helpers");
+ MODULE_IMPORT_NS(DMA_BUF);
+ MODULE_LICENSE("GPL v2");
+diff --git a/drivers/gpu/drm/drm_prime.c b/drivers/gpu/drm/drm_prime.c
+index 01646ad3207c..846692685e39 100644
+--- a/drivers/gpu/drm/drm_prime.c
++++ b/drivers/gpu/drm/drm_prime.c
+@@ -934,6 +934,26 @@ struct dma_buf *drm_gem_prime_export(struct drm_gem_object *obj,
+ }
+ EXPORT_SYMBOL(drm_gem_prime_export);
+ 
++
++/**
++ * drm_gem_is_prime_exported_dma_buf -
++ * checks if the DMA-BUF was exported from a GEM object belonging to @dev.
++ * @dev: drm_device to check against
++ * @dma_buf: dma-buf object to import
++ *
++ * Return: true if the DMA-BUF was exported from a GEM object belonging
++ * to @dev, false otherwise.
++ */
++
++bool drm_gem_is_prime_exported_dma_buf(struct drm_device *dev,
++				       struct dma_buf *dma_buf)
++{
++	struct drm_gem_object *obj = dma_buf->priv;
++
++	return (dma_buf->ops == &drm_gem_prime_dmabuf_ops) && (obj->dev == dev);
++}
++EXPORT_SYMBOL(drm_gem_is_prime_exported_dma_buf);
++
+ /**
+  * drm_gem_prime_import_dev - core implementation of the import callback
+  * @dev: drm_device to import into
+@@ -957,16 +977,14 @@ struct drm_gem_object *drm_gem_prime_import_dev(struct drm_device *dev,
+ 	struct drm_gem_object *obj;
+ 	int ret;
+ 
+-	if (dma_buf->ops == &drm_gem_prime_dmabuf_ops) {
++	if (drm_gem_is_prime_exported_dma_buf(dev, dma_buf)) {
++		/*
++		 * Importing dmabuf exported from our own gem increases
++		 * refcount on gem itself instead of f_count of dmabuf.
++		 */
+ 		obj = dma_buf->priv;
+-		if (obj->dev == dev) {
+-			/*
+-			 * Importing dmabuf exported from our own gem increases
+-			 * refcount on gem itself instead of f_count of dmabuf.
+-			 */
+-			drm_gem_object_get(obj);
+-			return obj;
+-		}
++		drm_gem_object_get(obj);
++		return obj;
+ 	}
+ 
+ 	if (!dev->driver->gem_prime_import_sg_table)
+diff --git a/include/drm/drm_gem_shmem_helper.h b/include/drm/drm_gem_shmem_helper.h
+index b4f993da3cae..35f7466dca84 100644
+--- a/include/drm/drm_gem_shmem_helper.h
++++ b/include/drm/drm_gem_shmem_helper.h
+@@ -287,6 +287,8 @@ drm_gem_shmem_prime_import_sg_table(struct drm_device *dev,
+ 				    struct sg_table *sgt);
+ int drm_gem_shmem_dumb_create(struct drm_file *file, struct drm_device *dev,
+ 			      struct drm_mode_create_dumb *args);
++struct drm_gem_object *drm_gem_shmem_prime_import_no_map(struct drm_device *dev,
++							 struct dma_buf *buf);
+ 
+ /**
+  * DRM_GEM_SHMEM_DRIVER_OPS - Default shmem GEM operations
+@@ -298,4 +300,17 @@ int drm_gem_shmem_dumb_create(struct drm_file *file, struct drm_device *dev,
+ 	.gem_prime_import_sg_table = drm_gem_shmem_prime_import_sg_table, \
+ 	.dumb_create		   = drm_gem_shmem_dumb_create
+ 
++/**
++ * DRM_GEM_SHMEM_DRIVER_OPS_NO_MAP_SGT - shmem GEM operations
++ *                                       without mapping sg_table on
++ *                                       imported buffer.
++ *
++ * This macro provides a shortcut for setting the shmem GEM operations in
++ * the &drm_driver structure for drivers that do not require a sg_table on
++ * imported buffers.
++ */
++#define DRM_GEM_SHMEM_DRIVER_OPS_NO_MAP_SGT \
++	.gem_prime_import       = drm_gem_shmem_prime_import_no_map, \
++	.dumb_create            = drm_gem_shmem_dumb_create
++
+ #endif /* __DRM_GEM_SHMEM_HELPER_H__ */
+diff --git a/include/drm/drm_prime.h b/include/drm/drm_prime.h
+index fa085c44d4ca..f50f862f0d8b 100644
+--- a/include/drm/drm_prime.h
++++ b/include/drm/drm_prime.h
+@@ -100,6 +100,9 @@ struct dma_buf *drm_gem_prime_export(struct drm_gem_object *obj,
+ unsigned long drm_prime_get_contiguous_size(struct sg_table *sgt);
+ 
+ /* helper functions for importing */
++bool drm_gem_is_prime_exported_dma_buf(struct drm_device *dev,
++				       struct dma_buf *dma_buf);
++
+ struct drm_gem_object *drm_gem_prime_import_dev(struct drm_device *dev,
+ 						struct dma_buf *dma_buf,
+ 						struct device *attach_dev);
+-- 
+2.52.0
+

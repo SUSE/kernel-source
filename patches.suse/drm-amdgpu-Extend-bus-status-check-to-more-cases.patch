@@ -1,0 +1,117 @@
+From 04141c05f36afe6d053a964fd2c609d4744d19e5 Mon Sep 17 00:00:00 2001
+From: Lijo Lazar <lijo.lazar@amd.com>
+Date: Fri, 13 Jun 2025 16:30:30 +0530
+Subject: drm/amdgpu: Extend bus status check to more cases
+Git-commit: 04141c05f36afe6d053a964fd2c609d4744d19e5
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+In case of unexpected errors, check if device is alive on the bus.
+
+Signed-off-by: Lijo Lazar <lijo.lazar@amd.com>
+Reviewed-by: Asad Kamal <asad.kamal@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h        | 15 +++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c |  7 +------
+ drivers/gpu/drm/amd/amdgpu/aqua_vanjaram.c |  5 ++++-
+ drivers/gpu/drm/amd/pm/swsmu/smu_cmn.c     | 10 ++++++++++
+ 4 files changed, 30 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 5e2f086d2c99..42278e9a2d75 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1762,4 +1762,19 @@ extern const struct attribute_group amdgpu_flash_attr_group;
+ 
+ void amdgpu_set_init_level(struct amdgpu_device *adev,
+ 			   enum amdgpu_init_lvl_id lvl);
++
++static inline int amdgpu_device_bus_status_check(struct amdgpu_device *adev)
++{
++       u32 status;
++       int r;
++
++       r = pci_read_config_dword(adev->pdev, PCI_COMMAND, &status);
++       if (r || PCI_POSSIBLE_ERROR(status)) {
++		dev_err(adev->dev, "device lost from bus!");
++		return -ENODEV;
++       }
++
++       return 0;
++}
++
+ #endif
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 88b51b34f5b1..aca0700962aa 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -6073,14 +6073,9 @@ static int amdgpu_device_health_check(struct list_head *device_list_handle)
+ {
+ 	struct amdgpu_device *tmp_adev;
+ 	int ret = 0;
+-	u32 status;
+ 
+ 	list_for_each_entry(tmp_adev, device_list_handle, reset_list) {
+-		pci_read_config_dword(tmp_adev->pdev, PCI_COMMAND, &status);
+-		if (PCI_POSSIBLE_ERROR(status)) {
+-			dev_err(tmp_adev->dev, "device lost from bus!");
+-			ret = -ENODEV;
+-		}
++		ret |= amdgpu_device_bus_status_check(tmp_adev);
+ 	}
+ 
+ 	return ret;
+diff --git a/drivers/gpu/drm/amd/amdgpu/aqua_vanjaram.c b/drivers/gpu/drm/amd/amdgpu/aqua_vanjaram.c
+index 1c083304ae77..41acc1ce0b3e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/aqua_vanjaram.c
++++ b/drivers/gpu/drm/amd/amdgpu/aqua_vanjaram.c
+@@ -353,11 +353,14 @@ static int aqua_vanjaram_query_partition_mode(struct amdgpu_xcp_mgr *xcp_mgr)
+ 
+ 	if (adev->nbio.funcs->get_compute_partition_mode) {
+ 		mode = adev->nbio.funcs->get_compute_partition_mode(adev);
+-		if (mode != derv_mode)
++		if (mode != derv_mode) {
+ 			dev_warn(
+ 				adev->dev,
+ 				"Mismatch in compute partition mode - reported : %d derived : %d",
+ 				mode, derv_mode);
++			if (derv_mode == AMDGPU_UNKNOWN_COMPUTE_PARTITION_MODE)
++				amdgpu_device_bus_status_check(adev);
++		}
+ 	}
+ 
+ 	return mode;
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/smu_cmn.c b/drivers/gpu/drm/amd/pm/swsmu/smu_cmn.c
+index 7eaf58fd7f9a..59f9abd0f7b8 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/smu_cmn.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/smu_cmn.c
+@@ -86,6 +86,7 @@ static void smu_cmn_read_arg(struct smu_context *smu,
+ #define SMU_RESP_BUSY_OTHER     0xFC
+ #define SMU_RESP_DEBUG_END      0xFB
+ 
++#define SMU_RESP_UNEXP (~0U)
+ /**
+  * __smu_cmn_poll_stat -- poll for a status from the SMU
+  * @smu: a pointer to SMU context
+@@ -171,6 +172,15 @@ static void __smu_cmn_reg_print_error(struct smu_context *smu,
+ 		dev_err_ratelimited(adev->dev,
+ 				    "SMU: I'm debugging!");
+ 		break;
++	case SMU_RESP_UNEXP:
++		if (amdgpu_device_bus_status_check(smu->adev)) {
++			/* print error immediately if device is off the bus */
++			dev_err(adev->dev,
++				"SMU: response:0x%08X for index:%d param:0x%08X message:%s?",
++				reg_c2pmsg_90, msg_index, param, message);
++			break;
++		}
++		fallthrough;
+ 	default:
+ 		dev_err_ratelimited(adev->dev,
+ 				    "SMU: response:0x%08X for index:%d param:0x%08X message:%s?",
+-- 
+2.52.0
+

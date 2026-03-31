@@ -1,0 +1,339 @@
+From 6554ad65b5891e52689061606e277a69e44462c4 Mon Sep 17 00:00:00 2001
+From: Alexandre Courbot <acourbot@nvidia.com>
+Date: Thu, 19 Jun 2025 22:23:58 +0900
+Subject: gpu: nova-core: register sysmem flush page
+Git-commit: 6554ad65b5891e52689061606e277a69e44462c4
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Reserve a page of system memory so sysmembar can perform a read on it if
+a system write occurred since the last flush. Do this early as it can be
+required to e.g. reset the GPU falcons.
+
+Chipsets capabilities differ in that respect, so this commit also
+introduces the FB HAL.
+
+Signed-off-by: Alexandre Courbot <acourbot@nvidia.com>
+Link: https://lore.kernel.org/r/20250619-nova-frts-v6-14-ecf41ef99252@nvidia.com
+[ * Use kernel::page::PAGE_SIZE instead of kernel::bindings::PAGE_SIZE.
+  * Get rid of the Option for SysmemFlush.
+  * Slightly reword SysmemFlush doc-comments.
+
+  - Danilo ]
+
+Signed-off-by: Danilo Krummrich <dakr@kernel.org>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/nova-core/fb.rs           | 67 +++++++++++++++++++++++++++
+ drivers/gpu/nova-core/fb/hal.rs       | 31 +++++++++++++
+ drivers/gpu/nova-core/fb/hal/ga100.rs | 45 ++++++++++++++++++
+ drivers/gpu/nova-core/fb/hal/tu102.rs | 42 +++++++++++++++++
+ drivers/gpu/nova-core/gpu.rs          | 21 ++++++++-
+ drivers/gpu/nova-core/nova_core.rs    |  1 +
+ drivers/gpu/nova-core/regs.rs         | 10 ++++
+ 7 files changed, 215 insertions(+), 2 deletions(-)
+ create mode 100644 drivers/gpu/nova-core/fb.rs
+ create mode 100644 drivers/gpu/nova-core/fb/hal.rs
+ create mode 100644 drivers/gpu/nova-core/fb/hal/ga100.rs
+ create mode 100644 drivers/gpu/nova-core/fb/hal/tu102.rs
+
+diff --git a/drivers/gpu/nova-core/fb.rs b/drivers/gpu/nova-core/fb.rs
+new file mode 100644
+index 000000000000..bfe3ed063572
+--- /dev/null
++++ b/drivers/gpu/nova-core/fb.rs
+@@ -0,0 +1,67 @@
++// SPDX-License-Identifier: GPL-2.0
++
++use kernel::prelude::*;
++use kernel::types::ARef;
++use kernel::{dev_warn, device};
++
++use crate::dma::DmaObject;
++use crate::driver::Bar0;
++use crate::gpu::Chipset;
++
++mod hal;
++
++/// Type holding the sysmem flush memory page, a page of memory to be written into the
++/// `NV_PFB_NISO_FLUSH_SYSMEM_ADDR*` registers and used to maintain memory coherency.
++///
++/// Users are responsible for manually calling [`Self::unregister`] before dropping this object,
++/// otherwise the GPU might still use it even after it has been freed.
++pub(crate) struct SysmemFlush {
++    /// Chipset we are operating on.
++    chipset: Chipset,
++    device: ARef<device::Device>,
++    /// Keep the page alive as long as we need it.
++    page: DmaObject,
++}
++
++impl SysmemFlush {
++    /// Allocate a memory page and register it as the sysmem flush page.
++    pub(crate) fn register(
++        dev: &device::Device<device::Bound>,
++        bar: &Bar0,
++        chipset: Chipset,
++    ) -> Result<Self> {
++        let page = DmaObject::new(dev, kernel::page::PAGE_SIZE)?;
++
++        hal::fb_hal(chipset).write_sysmem_flush_page(bar, page.dma_handle())?;
++
++        Ok(Self {
++            chipset,
++            device: dev.into(),
++            page,
++        })
++    }
++
++    /// Unregister the managed sysmem flush page.
++    ///
++    /// In order to gracefully tear down the GPU, users must make sure to call this method before
++    /// dropping the object.
++    pub(crate) fn unregister(&self, bar: &Bar0) {
++        let hal = hal::fb_hal(self.chipset);
++
++        if hal.read_sysmem_flush_page(bar) == self.page.dma_handle() {
++            let _ = hal.write_sysmem_flush_page(bar, 0).inspect_err(|e| {
++                dev_warn!(
++                    &self.device,
++                    "failed to unregister sysmem flush page: {:?}",
++                    e
++                )
++            });
++        } else {
++            // Another page has been registered after us for some reason - warn as this is a bug.
++            dev_warn!(
++                &self.device,
++                "attempt to unregister a sysmem flush page that is not active\n"
++            );
++        }
++    }
++}
+diff --git a/drivers/gpu/nova-core/fb/hal.rs b/drivers/gpu/nova-core/fb/hal.rs
+new file mode 100644
+index 000000000000..23eab57eec9f
+--- /dev/null
++++ b/drivers/gpu/nova-core/fb/hal.rs
+@@ -0,0 +1,31 @@
++// SPDX-License-Identifier: GPL-2.0
++
++use kernel::prelude::*;
++
++use crate::driver::Bar0;
++use crate::gpu::Chipset;
++
++mod ga100;
++mod tu102;
++
++pub(crate) trait FbHal {
++    /// Returns the address of the currently-registered sysmem flush page.
++    fn read_sysmem_flush_page(&self, bar: &Bar0) -> u64;
++
++    /// Register `addr` as the address of the sysmem flush page.
++    ///
++    /// This might fail if the address is too large for the receiving register.
++    fn write_sysmem_flush_page(&self, bar: &Bar0, addr: u64) -> Result;
++}
++
++/// Returns the HAL corresponding to `chipset`.
++pub(super) fn fb_hal(chipset: Chipset) -> &'static dyn FbHal {
++    use Chipset::*;
++
++    match chipset {
++        TU102 | TU104 | TU106 | TU117 | TU116 => tu102::TU102_HAL,
++        GA100 | GA102 | GA103 | GA104 | GA106 | GA107 | AD102 | AD103 | AD104 | AD106 | AD107 => {
++            ga100::GA100_HAL
++        }
++    }
++}
+diff --git a/drivers/gpu/nova-core/fb/hal/ga100.rs b/drivers/gpu/nova-core/fb/hal/ga100.rs
+new file mode 100644
+index 000000000000..7c10436c1c59
+--- /dev/null
++++ b/drivers/gpu/nova-core/fb/hal/ga100.rs
+@@ -0,0 +1,45 @@
++// SPDX-License-Identifier: GPL-2.0
++
++struct Ga100;
++
++use kernel::prelude::*;
++
++use crate::driver::Bar0;
++use crate::fb::hal::FbHal;
++use crate::regs;
++
++use super::tu102::FLUSH_SYSMEM_ADDR_SHIFT;
++
++pub(super) fn read_sysmem_flush_page_ga100(bar: &Bar0) -> u64 {
++    (regs::NV_PFB_NISO_FLUSH_SYSMEM_ADDR::read(bar).adr_39_08() as u64) << FLUSH_SYSMEM_ADDR_SHIFT
++        | (regs::NV_PFB_NISO_FLUSH_SYSMEM_ADDR_HI::read(bar).adr_63_40() as u64)
++            << FLUSH_SYSMEM_ADDR_SHIFT_HI
++}
++
++pub(super) fn write_sysmem_flush_page_ga100(bar: &Bar0, addr: u64) {
++    regs::NV_PFB_NISO_FLUSH_SYSMEM_ADDR_HI::default()
++        .set_adr_63_40((addr >> FLUSH_SYSMEM_ADDR_SHIFT_HI) as u32)
++        .write(bar);
++    regs::NV_PFB_NISO_FLUSH_SYSMEM_ADDR::default()
++        .set_adr_39_08((addr >> FLUSH_SYSMEM_ADDR_SHIFT) as u32)
++        .write(bar);
++}
++
++/// Shift applied to the sysmem address before it is written into
++/// `NV_PFB_NISO_FLUSH_SYSMEM_ADDR_HI`,
++const FLUSH_SYSMEM_ADDR_SHIFT_HI: u32 = 40;
++
++impl FbHal for Ga100 {
++    fn read_sysmem_flush_page(&self, bar: &Bar0) -> u64 {
++        read_sysmem_flush_page_ga100(bar)
++    }
++
++    fn write_sysmem_flush_page(&self, bar: &Bar0, addr: u64) -> Result {
++        write_sysmem_flush_page_ga100(bar, addr);
++
++        Ok(())
++    }
++}
++
++const GA100: Ga100 = Ga100;
++pub(super) const GA100_HAL: &dyn FbHal = &GA100;
+diff --git a/drivers/gpu/nova-core/fb/hal/tu102.rs b/drivers/gpu/nova-core/fb/hal/tu102.rs
+new file mode 100644
+index 000000000000..048859f9fd9d
+--- /dev/null
++++ b/drivers/gpu/nova-core/fb/hal/tu102.rs
+@@ -0,0 +1,42 @@
++// SPDX-License-Identifier: GPL-2.0
++
++use crate::driver::Bar0;
++use crate::fb::hal::FbHal;
++use crate::regs;
++use kernel::prelude::*;
++
++/// Shift applied to the sysmem address before it is written into `NV_PFB_NISO_FLUSH_SYSMEM_ADDR`,
++/// to be used by HALs.
++pub(super) const FLUSH_SYSMEM_ADDR_SHIFT: u32 = 8;
++
++pub(super) fn read_sysmem_flush_page_gm107(bar: &Bar0) -> u64 {
++    (regs::NV_PFB_NISO_FLUSH_SYSMEM_ADDR::read(bar).adr_39_08() as u64) << FLUSH_SYSMEM_ADDR_SHIFT
++}
++
++pub(super) fn write_sysmem_flush_page_gm107(bar: &Bar0, addr: u64) -> Result {
++    // Check that the address doesn't overflow the receiving 32-bit register.
++    if addr >> (u32::BITS + FLUSH_SYSMEM_ADDR_SHIFT) == 0 {
++        regs::NV_PFB_NISO_FLUSH_SYSMEM_ADDR::default()
++            .set_adr_39_08((addr >> FLUSH_SYSMEM_ADDR_SHIFT) as u32)
++            .write(bar);
++
++        Ok(())
++    } else {
++        Err(EINVAL)
++    }
++}
++
++struct Tu102;
++
++impl FbHal for Tu102 {
++    fn read_sysmem_flush_page(&self, bar: &Bar0) -> u64 {
++        read_sysmem_flush_page_gm107(bar)
++    }
++
++    fn write_sysmem_flush_page(&self, bar: &Bar0, addr: u64) -> Result {
++        write_sysmem_flush_page_gm107(bar, addr)
++    }
++}
++
++const TU102: Tu102 = Tu102;
++pub(super) const TU102_HAL: &dyn FbHal = &TU102;
+diff --git a/drivers/gpu/nova-core/gpu.rs b/drivers/gpu/nova-core/gpu.rs
+index e44ff6fa0714..992840f6b108 100644
+--- a/drivers/gpu/nova-core/gpu.rs
++++ b/drivers/gpu/nova-core/gpu.rs
+@@ -3,6 +3,7 @@
+ use kernel::{device, devres::Devres, error::code::*, pci, prelude::*};
+ 
+ use crate::driver::Bar0;
++use crate::fb::SysmemFlush;
+ use crate::firmware::{Firmware, FIRMWARE_VERSION};
+ use crate::gfw;
+ use crate::regs;
+@@ -158,12 +159,24 @@ fn new(bar: &Bar0) -> Result<Spec> {
+ }
+ 
+ /// Structure holding the resources required to operate the GPU.
+-#[pin_data]
++#[pin_data(PinnedDrop)]
+ pub(crate) struct Gpu {
+     spec: Spec,
+     /// MMIO mapping of PCI BAR 0
+     bar: Devres<Bar0>,
+     fw: Firmware,
++    /// System memory page required for flushing all pending GPU-side memory writes done through
++    /// PCIE into system memory.
++    sysmem_flush: SysmemFlush,
++}
++
++#[pinned_drop]
++impl PinnedDrop for Gpu {
++    fn drop(self: Pin<&mut Self>) {
++        // Unregister the sysmem flush page before we release it.
++        self.bar
++            .try_access_with(|b| self.sysmem_flush.unregister(b));
++    }
+ }
+ 
+ impl Gpu {
+@@ -187,10 +200,14 @@ pub(crate) fn new(
+         gfw::wait_gfw_boot_completion(bar)
+             .inspect_err(|_| dev_err!(pdev.as_ref(), "GFW boot did not complete"))?;
+ 
++        // System memory page required for sysmembar to properly flush into system memory.
++        let sysmem_flush = SysmemFlush::register(pdev.as_ref(), bar, spec.chipset)?;
++
+         Ok(pin_init!(Self {
+             spec,
+             bar: devres_bar,
+-            fw
++            fw,
++            sysmem_flush,
+         }))
+     }
+ }
+diff --git a/drivers/gpu/nova-core/nova_core.rs b/drivers/gpu/nova-core/nova_core.rs
+index 121fe5c11044..8ac04b8586e7 100644
+--- a/drivers/gpu/nova-core/nova_core.rs
++++ b/drivers/gpu/nova-core/nova_core.rs
+@@ -4,6 +4,7 @@
+ 
+ mod dma;
+ mod driver;
++mod fb;
+ mod firmware;
+ mod gfw;
+ mod gpu;
+diff --git a/drivers/gpu/nova-core/regs.rs b/drivers/gpu/nova-core/regs.rs
+index cba442da5118..b599e7ddad57 100644
+--- a/drivers/gpu/nova-core/regs.rs
++++ b/drivers/gpu/nova-core/regs.rs
+@@ -38,6 +38,16 @@ pub(crate) fn chipset(self) -> Result<Chipset> {
+     }
+ }
+ 
++/* PFB */
++
++register!(NV_PFB_NISO_FLUSH_SYSMEM_ADDR @ 0x00100c10 {
++    31:0    adr_39_08 as u32;
++});
++
++register!(NV_PFB_NISO_FLUSH_SYSMEM_ADDR_HI @ 0x00100c40 {
++    23:0    adr_63_40 as u32;
++});
++
+ /* PGC6 */
+ 
+ register!(NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_PRIV_LEVEL_MASK @ 0x00118128 {
+-- 
+2.52.0
+

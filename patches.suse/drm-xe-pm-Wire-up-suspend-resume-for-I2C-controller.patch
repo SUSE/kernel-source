@@ -1,0 +1,163 @@
+From 0ea07b69517a16808ea700b3226ddfa4484f23b9 Mon Sep 17 00:00:00 2001
+From: Raag Jadav <raag.jadav@intel.com>
+Date: Tue, 1 Jul 2025 15:22:51 +0300
+Subject: drm/xe/pm: Wire up suspend/resume for I2C controller
+Git-commit: 0ea07b69517a16808ea700b3226ddfa4484f23b9
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Wire up suspend/resume handles for I2C controller to match its power
+state with SGUnit.
+
+Signed-off-by: Raag Jadav <raag.jadav@intel.com>
+Signed-off-by: Heikki Krogerus <heikki.krogerus@linux.intel.com>
+Reviewed-by: Karthik Poosa <karthik.poosa@intel.com>
+Reviewed-by: Andi Shyti <andi.shyti@linux.intel.com>
+Link: https://lore.kernel.org/r/20250701122252.2590230-5-heikki.krogerus@linux.intel.com
+Signed-off-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/xe/regs/xe_i2c_regs.h |  5 +++++
+ drivers/gpu/drm/xe/xe_i2c.c           | 29 +++++++++++++++++++++++++++
+ drivers/gpu/drm/xe/xe_i2c.h           |  4 ++++
+ drivers/gpu/drm/xe/xe_pm.c            |  9 +++++++++
+ 4 files changed, 47 insertions(+)
+
+diff --git a/drivers/gpu/drm/xe/regs/xe_i2c_regs.h b/drivers/gpu/drm/xe/regs/xe_i2c_regs.h
+index 92dae4487614..af781c8e4a80 100644
+--- a/drivers/gpu/drm/xe/regs/xe_i2c_regs.h
++++ b/drivers/gpu/drm/xe/regs/xe_i2c_regs.h
+@@ -2,6 +2,8 @@
+ #ifndef _XE_I2C_REGS_H_
+ #define _XE_I2C_REGS_H_
+ 
++#include <linux/pci_regs.h>
++
+ #include "xe_reg_defs.h"
+ #include "xe_regs.h"
+ 
+@@ -12,4 +14,7 @@
+ #define REG_SG_REMAP_ADDR_PREFIX	XE_REG(SOC_BASE + 0x0164)
+ #define REG_SG_REMAP_ADDR_POSTFIX	XE_REG(SOC_BASE + 0x0168)
+ 
++#define I2C_CONFIG_CMD			XE_REG(I2C_CONFIG_SPACE_OFFSET + PCI_COMMAND)
++#define I2C_CONFIG_PMCSR		XE_REG(I2C_CONFIG_SPACE_OFFSET + 0x84)
++
+ #endif /* _XE_I2C_REGS_H_ */
+diff --git a/drivers/gpu/drm/xe/xe_i2c.c b/drivers/gpu/drm/xe/xe_i2c.c
+index 6f05142a8abf..db9c0340be5c 100644
+--- a/drivers/gpu/drm/xe/xe_i2c.c
++++ b/drivers/gpu/drm/xe/xe_i2c.c
+@@ -226,6 +226,31 @@ static const struct regmap_config i2c_regmap_config = {
+ 	.fast_io = true,
+ };
+ 
++void xe_i2c_pm_suspend(struct xe_device *xe)
++{
++	struct xe_mmio *mmio = xe_root_tile_mmio(xe);
++
++	if (!xe->i2c || xe->i2c->ep.cookie != XE_I2C_EP_COOKIE_DEVICE)
++		return;
++
++	xe_mmio_rmw32(mmio, I2C_CONFIG_PMCSR, PCI_PM_CTRL_STATE_MASK, (__force u32)PCI_D3hot);
++	drm_dbg(&xe->drm, "pmcsr: 0x%08x\n", xe_mmio_read32(mmio, I2C_CONFIG_PMCSR));
++}
++
++void xe_i2c_pm_resume(struct xe_device *xe, bool d3cold)
++{
++	struct xe_mmio *mmio = xe_root_tile_mmio(xe);
++
++	if (!xe->i2c || xe->i2c->ep.cookie != XE_I2C_EP_COOKIE_DEVICE)
++		return;
++
++	if (d3cold)
++		xe_mmio_rmw32(mmio, I2C_CONFIG_CMD, 0, PCI_COMMAND_MEMORY);
++
++	xe_mmio_rmw32(mmio, I2C_CONFIG_PMCSR, PCI_PM_CTRL_STATE_MASK, (__force u32)PCI_D0);
++	drm_dbg(&xe->drm, "pmcsr: 0x%08x\n", xe_mmio_read32(mmio, I2C_CONFIG_PMCSR));
++}
++
+ static void xe_i2c_remove(void *data)
+ {
+ 	struct xe_i2c *i2c = data;
+@@ -270,6 +295,10 @@ int xe_i2c_probe(struct xe_device *xe)
+ 	i2c->mmio = xe_root_tile_mmio(xe);
+ 	i2c->drm_dev = drm_dev;
+ 	i2c->ep = ep;
++	xe->i2c = i2c;
++
++	/* PCI PM isn't aware of this device, bring it up and match it with SGUnit state. */
++	xe_i2c_pm_resume(xe, true);
+ 
+ 	regmap = devm_regmap_init(drm_dev, NULL, i2c, &i2c_regmap_config);
+ 	if (IS_ERR(regmap))
+diff --git a/drivers/gpu/drm/xe/xe_i2c.h b/drivers/gpu/drm/xe/xe_i2c.h
+index 7ea40f4e4aa4..b767ed8ce52b 100644
+--- a/drivers/gpu/drm/xe/xe_i2c.h
++++ b/drivers/gpu/drm/xe/xe_i2c.h
+@@ -50,9 +50,13 @@ struct xe_i2c {
+ #if IS_ENABLED(CONFIG_I2C)
+ int xe_i2c_probe(struct xe_device *xe);
+ void xe_i2c_irq_handler(struct xe_device *xe, u32 master_ctl);
++void xe_i2c_pm_suspend(struct xe_device *xe);
++void xe_i2c_pm_resume(struct xe_device *xe, bool d3cold);
+ #else
+ static inline int xe_i2c_probe(struct xe_device *xe) { return 0; }
+ static inline void xe_i2c_irq_handler(struct xe_device *xe, u32 master_ctl) { }
++static inline void xe_i2c_pm_suspend(struct xe_device *xe) { }
++static inline void xe_i2c_pm_resume(struct xe_device *xe, bool d3cold) { }
+ #endif
+ 
+ #endif
+diff --git a/drivers/gpu/drm/xe/xe_pm.c b/drivers/gpu/drm/xe/xe_pm.c
+index ad263de44111..e279b47ba03b 100644
+--- a/drivers/gpu/drm/xe/xe_pm.c
++++ b/drivers/gpu/drm/xe/xe_pm.c
+@@ -19,6 +19,7 @@
+ #include "xe_ggtt.h"
+ #include "xe_gt.h"
+ #include "xe_guc.h"
++#include "xe_i2c.h"
+ #include "xe_irq.h"
+ #include "xe_pcode.h"
+ #include "xe_pxp.h"
+@@ -146,6 +147,8 @@ int xe_pm_suspend(struct xe_device *xe)
+ 
+ 	xe_display_pm_suspend_late(xe);
+ 
++	xe_i2c_pm_suspend(xe);
++
+ 	drm_dbg(&xe->drm, "Device suspended\n");
+ 	return 0;
+ 
+@@ -190,6 +193,8 @@ int xe_pm_resume(struct xe_device *xe)
+ 	if (err)
+ 		goto err;
+ 
++	xe_i2c_pm_resume(xe, xe->d3cold.allowed);
++
+ 	xe_irq_resume(xe);
+ 
+ 	for_each_gt(gt, xe, id)
+@@ -487,6 +492,8 @@ int xe_pm_runtime_suspend(struct xe_device *xe)
+ 
+ 	xe_display_pm_runtime_suspend_late(xe);
+ 
++	xe_i2c_pm_suspend(xe);
++
+ 	xe_rpm_lockmap_release(xe);
+ 	xe_pm_write_callback_task(xe, NULL);
+ 	return 0;
+@@ -534,6 +541,8 @@ int xe_pm_runtime_resume(struct xe_device *xe)
+ 			goto out;
+ 	}
+ 
++	xe_i2c_pm_resume(xe, xe->d3cold.allowed);
++
+ 	xe_irq_resume(xe);
+ 
+ 	for_each_gt(gt, xe, id)
+-- 
+2.52.0
+

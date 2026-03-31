@@ -1,0 +1,338 @@
+From 7fb3a1f7a48d9512f092d2b18bd4b9361ff88e51 Mon Sep 17 00:00:00 2001
+From: Jani Nikula <jani.nikula@intel.com>
+Date: Tue, 27 May 2025 13:59:07 +0300
+Subject: drm/i915/sbi: move intel_sbi.[ch] under display/
+Git-commit: 7fb3a1f7a48d9512f092d2b18bd4b9361ff88e51
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+The LPT/WPT SBI is arguably part of south display, and it's only used by
+intel_pch_refclk.c anyway. Move it under display/.
+
+Reviewed-by: Luca Coelho <luciano.coelho@intel.com>
+Link: https://lore.kernel.org/r/341268d633e9705bc582f1cc985dc4554e39d87d.1748343520.git.jani.nikula@intel.com
+Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/Makefile            |  2 +-
+ drivers/gpu/drm/i915/display/intel_sbi.c | 94 ++++++++++++++++++++++++
+ drivers/gpu/drm/i915/display/intel_sbi.h | 27 +++++++
+ drivers/gpu/drm/i915/i915_driver.c       |  2 +-
+ drivers/gpu/drm/i915/intel_sbi.c         | 94 ------------------------
+ drivers/gpu/drm/i915/intel_sbi.h         | 27 -------
+ 6 files changed, 123 insertions(+), 123 deletions(-)
+ create mode 100644 drivers/gpu/drm/i915/display/intel_sbi.c
+ create mode 100644 drivers/gpu/drm/i915/display/intel_sbi.h
+ delete mode 100644 drivers/gpu/drm/i915/intel_sbi.c
+ delete mode 100644 drivers/gpu/drm/i915/intel_sbi.h
+
+diff --git a/drivers/gpu/drm/i915/Makefile b/drivers/gpu/drm/i915/Makefile
+index 6b2378aad574..7c6075bc483c 100644
+--- a/drivers/gpu/drm/i915/Makefile
++++ b/drivers/gpu/drm/i915/Makefile
+@@ -40,7 +40,6 @@ i915-y += \
+ 	intel_pcode.o \
+ 	intel_region_ttm.o \
+ 	intel_runtime_pm.o \
+-	intel_sbi.o \
+ 	intel_step.o \
+ 	intel_uncore.o \
+ 	intel_uncore_trace.o \
+@@ -288,6 +287,7 @@ i915-y += \
+ 	display/intel_pmdemand.o \
+ 	display/intel_psr.o \
+ 	display/intel_quirks.o \
++	display/intel_sbi.o \
+ 	display/intel_sprite.o \
+ 	display/intel_sprite_uapi.o \
+ 	display/intel_tc.o \
+diff --git a/drivers/gpu/drm/i915/display/intel_sbi.c b/drivers/gpu/drm/i915/display/intel_sbi.c
+new file mode 100644
+index 000000000000..41e85ac773dc
+--- /dev/null
++++ b/drivers/gpu/drm/i915/display/intel_sbi.c
+@@ -0,0 +1,94 @@
++// SPDX-License-Identifier: MIT
++/*
++ * Copyright © 2013-2021 Intel Corporation
++ *
++ * LPT/WPT IOSF sideband.
++ */
++
++#include "i915_drv.h"
++#include "intel_sbi.h"
++#include "i915_reg.h"
++
++/* SBI access */
++static int intel_sbi_rw(struct drm_i915_private *i915, u16 reg,
++			enum intel_sbi_destination destination,
++			u32 *val, bool is_read)
++{
++	struct intel_uncore *uncore = &i915->uncore;
++	u32 cmd;
++
++	lockdep_assert_held(&i915->sbi_lock);
++
++	if (intel_wait_for_register_fw(uncore,
++				       SBI_CTL_STAT, SBI_BUSY, 0,
++				       100)) {
++		drm_err(&i915->drm,
++			"timeout waiting for SBI to become ready\n");
++		return -EBUSY;
++	}
++
++	intel_uncore_write_fw(uncore, SBI_ADDR, (u32)reg << 16);
++	intel_uncore_write_fw(uncore, SBI_DATA, is_read ? 0 : *val);
++
++	if (destination == SBI_ICLK)
++		cmd = SBI_CTL_DEST_ICLK | SBI_CTL_OP_CRRD;
++	else
++		cmd = SBI_CTL_DEST_MPHY | SBI_CTL_OP_IORD;
++	if (!is_read)
++		cmd |= BIT(8);
++	intel_uncore_write_fw(uncore, SBI_CTL_STAT, cmd | SBI_BUSY);
++
++	if (__intel_wait_for_register_fw(uncore,
++					 SBI_CTL_STAT, SBI_BUSY, 0,
++					 100, 100, &cmd)) {
++		drm_err(&i915->drm,
++			"timeout waiting for SBI to complete read\n");
++		return -ETIMEDOUT;
++	}
++
++	if (cmd & SBI_RESPONSE_FAIL) {
++		drm_err(&i915->drm, "error during SBI read of reg %x\n", reg);
++		return -ENXIO;
++	}
++
++	if (is_read)
++		*val = intel_uncore_read_fw(uncore, SBI_DATA);
++
++	return 0;
++}
++
++void intel_sbi_lock(struct drm_i915_private *i915)
++{
++	mutex_lock(&i915->sbi_lock);
++}
++
++void intel_sbi_unlock(struct drm_i915_private *i915)
++{
++	mutex_unlock(&i915->sbi_lock);
++}
++
++u32 intel_sbi_read(struct drm_i915_private *i915, u16 reg,
++		   enum intel_sbi_destination destination)
++{
++	u32 result = 0;
++
++	intel_sbi_rw(i915, reg, destination, &result, true);
++
++	return result;
++}
++
++void intel_sbi_write(struct drm_i915_private *i915, u16 reg, u32 value,
++		     enum intel_sbi_destination destination)
++{
++	intel_sbi_rw(i915, reg, destination, &value, false);
++}
++
++void intel_sbi_init(struct drm_i915_private *i915)
++{
++	mutex_init(&i915->sbi_lock);
++}
++
++void intel_sbi_fini(struct drm_i915_private *i915)
++{
++	mutex_destroy(&i915->sbi_lock);
++}
+diff --git a/drivers/gpu/drm/i915/display/intel_sbi.h b/drivers/gpu/drm/i915/display/intel_sbi.h
+new file mode 100644
+index 000000000000..85161a4f13b8
+--- /dev/null
++++ b/drivers/gpu/drm/i915/display/intel_sbi.h
+@@ -0,0 +1,27 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * Copyright © 2013-2021 Intel Corporation
++ */
++
++#ifndef _INTEL_SBI_H_
++#define _INTEL_SBI_H_
++
++#include <linux/types.h>
++
++struct drm_i915_private;
++
++enum intel_sbi_destination {
++	SBI_ICLK,
++	SBI_MPHY,
++};
++
++void intel_sbi_init(struct drm_i915_private *i915);
++void intel_sbi_fini(struct drm_i915_private *i915);
++void intel_sbi_lock(struct drm_i915_private *i915);
++void intel_sbi_unlock(struct drm_i915_private *i915);
++u32 intel_sbi_read(struct drm_i915_private *i915, u16 reg,
++		   enum intel_sbi_destination destination);
++void intel_sbi_write(struct drm_i915_private *i915, u16 reg, u32 value,
++		     enum intel_sbi_destination destination);
++
++#endif /* _INTEL_SBI_H_ */
+diff --git a/drivers/gpu/drm/i915/i915_driver.c b/drivers/gpu/drm/i915/i915_driver.c
+index 3b0bda74697d..a77afea47202 100644
+--- a/drivers/gpu/drm/i915/i915_driver.c
++++ b/drivers/gpu/drm/i915/i915_driver.c
+@@ -63,6 +63,7 @@
+ #include "display/intel_overlay.h"
+ #include "display/intel_pch_refclk.h"
+ #include "display/intel_pps.h"
++#include "display/intel_sbi.h"
+ #include "display/intel_sprite_uapi.h"
+ #include "display/skl_watermark.h"
+ 
+@@ -109,7 +110,6 @@
+ #include "intel_pci_config.h"
+ #include "intel_pcode.h"
+ #include "intel_region_ttm.h"
+-#include "intel_sbi.h"
+ #include "vlv_iosf_sb.h"
+ #include "vlv_suspend.h"
+ 
+diff --git a/drivers/gpu/drm/i915/intel_sbi.c b/drivers/gpu/drm/i915/intel_sbi.c
+deleted file mode 100644
+index 41e85ac773dc..000000000000
+--- a/drivers/gpu/drm/i915/intel_sbi.c
++++ /dev/null
+@@ -1,94 +0,0 @@
+-// SPDX-License-Identifier: MIT
+-/*
+- * Copyright © 2013-2021 Intel Corporation
+- *
+- * LPT/WPT IOSF sideband.
+- */
+-
+-#include "i915_drv.h"
+-#include "intel_sbi.h"
+-#include "i915_reg.h"
+-
+-/* SBI access */
+-static int intel_sbi_rw(struct drm_i915_private *i915, u16 reg,
+-			enum intel_sbi_destination destination,
+-			u32 *val, bool is_read)
+-{
+-	struct intel_uncore *uncore = &i915->uncore;
+-	u32 cmd;
+-
+-	lockdep_assert_held(&i915->sbi_lock);
+-
+-	if (intel_wait_for_register_fw(uncore,
+-				       SBI_CTL_STAT, SBI_BUSY, 0,
+-				       100)) {
+-		drm_err(&i915->drm,
+-			"timeout waiting for SBI to become ready\n");
+-		return -EBUSY;
+-	}
+-
+-	intel_uncore_write_fw(uncore, SBI_ADDR, (u32)reg << 16);
+-	intel_uncore_write_fw(uncore, SBI_DATA, is_read ? 0 : *val);
+-
+-	if (destination == SBI_ICLK)
+-		cmd = SBI_CTL_DEST_ICLK | SBI_CTL_OP_CRRD;
+-	else
+-		cmd = SBI_CTL_DEST_MPHY | SBI_CTL_OP_IORD;
+-	if (!is_read)
+-		cmd |= BIT(8);
+-	intel_uncore_write_fw(uncore, SBI_CTL_STAT, cmd | SBI_BUSY);
+-
+-	if (__intel_wait_for_register_fw(uncore,
+-					 SBI_CTL_STAT, SBI_BUSY, 0,
+-					 100, 100, &cmd)) {
+-		drm_err(&i915->drm,
+-			"timeout waiting for SBI to complete read\n");
+-		return -ETIMEDOUT;
+-	}
+-
+-	if (cmd & SBI_RESPONSE_FAIL) {
+-		drm_err(&i915->drm, "error during SBI read of reg %x\n", reg);
+-		return -ENXIO;
+-	}
+-
+-	if (is_read)
+-		*val = intel_uncore_read_fw(uncore, SBI_DATA);
+-
+-	return 0;
+-}
+-
+-void intel_sbi_lock(struct drm_i915_private *i915)
+-{
+-	mutex_lock(&i915->sbi_lock);
+-}
+-
+-void intel_sbi_unlock(struct drm_i915_private *i915)
+-{
+-	mutex_unlock(&i915->sbi_lock);
+-}
+-
+-u32 intel_sbi_read(struct drm_i915_private *i915, u16 reg,
+-		   enum intel_sbi_destination destination)
+-{
+-	u32 result = 0;
+-
+-	intel_sbi_rw(i915, reg, destination, &result, true);
+-
+-	return result;
+-}
+-
+-void intel_sbi_write(struct drm_i915_private *i915, u16 reg, u32 value,
+-		     enum intel_sbi_destination destination)
+-{
+-	intel_sbi_rw(i915, reg, destination, &value, false);
+-}
+-
+-void intel_sbi_init(struct drm_i915_private *i915)
+-{
+-	mutex_init(&i915->sbi_lock);
+-}
+-
+-void intel_sbi_fini(struct drm_i915_private *i915)
+-{
+-	mutex_destroy(&i915->sbi_lock);
+-}
+diff --git a/drivers/gpu/drm/i915/intel_sbi.h b/drivers/gpu/drm/i915/intel_sbi.h
+deleted file mode 100644
+index 85161a4f13b8..000000000000
+--- a/drivers/gpu/drm/i915/intel_sbi.h
++++ /dev/null
+@@ -1,27 +0,0 @@
+-/* SPDX-License-Identifier: MIT */
+-/*
+- * Copyright © 2013-2021 Intel Corporation
+- */
+-
+-#ifndef _INTEL_SBI_H_
+-#define _INTEL_SBI_H_
+-
+-#include <linux/types.h>
+-
+-struct drm_i915_private;
+-
+-enum intel_sbi_destination {
+-	SBI_ICLK,
+-	SBI_MPHY,
+-};
+-
+-void intel_sbi_init(struct drm_i915_private *i915);
+-void intel_sbi_fini(struct drm_i915_private *i915);
+-void intel_sbi_lock(struct drm_i915_private *i915);
+-void intel_sbi_unlock(struct drm_i915_private *i915);
+-u32 intel_sbi_read(struct drm_i915_private *i915, u16 reg,
+-		   enum intel_sbi_destination destination);
+-void intel_sbi_write(struct drm_i915_private *i915, u16 reg, u32 value,
+-		     enum intel_sbi_destination destination);
+-
+-#endif /* _INTEL_SBI_H_ */
+-- 
+2.52.0
+

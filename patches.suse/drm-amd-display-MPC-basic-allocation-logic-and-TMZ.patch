@@ -1,0 +1,276 @@
+From 26ad78fffc66886207d793527775120b45166200 Mon Sep 17 00:00:00 2001
+From: Yihan Zhu <Yihan.Zhu@amd.com>
+Date: Thu, 19 Jun 2025 15:26:30 -0400
+Subject: drm/amd/display: MPC basic allocation logic and TMZ
+Git-commit: 26ad78fffc66886207d793527775120b45166200
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+[WHY & HOW]
+Adding basic logic to allocate unused RMCM block and TMZ support.
+
+Reviewed-by: Krunoslav Kovac <krunoslav.kovac@amd.com>
+Signed-off-by: Yihan Zhu <Yihan.Zhu@amd.com>
+Signed-off-by: Ivan Lipski <ivan.lipski@amd.com>
+Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c      |  2 +
+ .../gpu/drm/amd/display/dc/core/dc_state.c    |  2 +
+ .../gpu/drm/amd/display/dc/core/dc_stream.c   | 67 +++++++++++++++++++
+ drivers/gpu/drm/amd/display/dc/dc.h           |  7 ++
+ drivers/gpu/drm/amd/display/dc/dc_stream.h    | 11 +++
+ drivers/gpu/drm/amd/display/dc/dc_types.h     |  1 +
+ .../amd/display/dc/hubp/dcn401/dcn401_hubp.c  |  4 +-
+ .../amd/display/dc/hubp/dcn401/dcn401_hubp.h  |  2 +-
+ .../amd/display/dc/hwss/dcn10/dcn10_hwseq.c   |  2 +-
+ .../gpu/drm/amd/display/dc/inc/core_types.h   |  3 +
+ drivers/gpu/drm/amd/display/dc/inc/hw/hubp.h  |  2 +-
+ 11 files changed, 98 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index c744aa9d830f..f37ed24b2430 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -976,6 +976,8 @@ static bool dc_construct_ctx(struct dc *dc,
+ 	if (!dc_ctx)
+ 		return false;
+ 
++	dc_stream_init_rmcm_3dlut(dc);
++
+ 	dc_ctx->cgs_device = init_params->cgs_device;
+ 	dc_ctx->driver_context = init_params->driver;
+ 	dc_ctx->dc = dc;
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_state.c b/drivers/gpu/drm/amd/display/dc/core/dc_state.c
+index 47712a4aec55..883054bb18e7 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_state.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_state.c
+@@ -427,6 +427,8 @@ enum dc_status dc_state_remove_stream(
+ 		return DC_ERROR_UNEXPECTED;
+ 	}
+ 
++	dc_stream_release_3dlut_for_stream(dc, stream);
++
+ 	dc_stream_release(state->streams[i]);
+ 	state->stream_count--;
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_stream.c b/drivers/gpu/drm/amd/display/dc/core/dc_stream.c
+index b883fb24fa12..4d6bc9fd4faa 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_stream.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_stream.c
+@@ -856,6 +856,73 @@ void dc_stream_log(const struct dc *dc, const struct dc_stream_state *stream)
+ 	}
+ }
+ 
++/*
++*	dc_stream_get_3dlut()
++*	Requirements:
++*	1. Is stream already owns an RMCM instance, return it.
++*	2. If it doesn't and we don't need to allocate, return NULL.
++*	3. If there's a free RMCM instance, assign to stream and return it.
++*	4. If no free RMCM instances, return NULL.
++*/
++
++struct dc_rmcm_3dlut *dc_stream_get_3dlut_for_stream(
++	const struct dc *dc,
++	const struct dc_stream_state *stream,
++	bool allocate_one)
++{
++	unsigned int num_rmcm = dc->caps.color.mpc.num_rmcm_3dluts;
++
++	// see if one is allocated for this stream
++	for (int i = 0; i < num_rmcm; i++) {
++		if (dc->res_pool->rmcm_3dlut[i].isInUse &&
++			dc->res_pool->rmcm_3dlut[i].stream == stream)
++			return &dc->res_pool->rmcm_3dlut[i];
++	}
++
++	//case: not found one, and dont need to allocate
++	if (!allocate_one)
++		return NULL;
++
++	//see if there is an unused 3dlut, allocate
++	for (int i = 0; i < num_rmcm; i++) {
++		if (!dc->res_pool->rmcm_3dlut[i].isInUse) {
++			dc->res_pool->rmcm_3dlut[i].isInUse = true;
++			dc->res_pool->rmcm_3dlut[i].stream = stream;
++			return &dc->res_pool->rmcm_3dlut[i];
++		}
++	}
++
++	//dont have a 3dlut
++	return NULL;
++}
++
++
++void dc_stream_release_3dlut_for_stream(
++	const struct dc *dc,
++	const struct dc_stream_state *stream)
++{
++	struct dc_rmcm_3dlut *rmcm_3dlut =
++		dc_stream_get_3dlut_for_stream(dc, stream, false);
++
++	if (rmcm_3dlut) {
++		rmcm_3dlut->isInUse = false;
++		rmcm_3dlut->stream  = NULL;
++		rmcm_3dlut->protection_bits = 0;
++	}
++}
++
++
++void dc_stream_init_rmcm_3dlut(struct dc *dc)
++{
++	unsigned int num_rmcm = dc->caps.color.mpc.num_rmcm_3dluts;
++
++	for (int i = 0; i < num_rmcm; i++) {
++		dc->res_pool->rmcm_3dlut[i].isInUse = false;
++		dc->res_pool->rmcm_3dlut[i].stream = NULL;
++		dc->res_pool->rmcm_3dlut[i].protection_bits = 0;
++	}
++}
++
+ /*
+  * Finds the greatest index in refresh_rate_hz that contains a value <= refresh
+  */
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index ce1957c7862f..6825b8a9af59 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -246,6 +246,7 @@ struct mpc_color_caps {
+ 	uint16_t ogam_ram : 1;
+ 	uint16_t ocsc : 1;
+ 	uint16_t num_3dluts : 3;
++	uint16_t num_rmcm_3dluts : 3;
+ 	uint16_t shared_3d_lut:1;
+ 	struct rom_curve_caps ogam_rom_caps;
+ 	struct lut3d_caps mcm_3d_lut_caps;
+@@ -1294,6 +1295,12 @@ union dc_3dlut_state {
+ };
+ 
+ 
++struct dc_rmcm_3dlut {
++	bool isInUse;
++	const struct dc_stream_state *stream;
++	uint8_t protection_bits;
++};
++
+ struct dc_3dlut {
+ 	struct kref refcount;
+ 	struct tetrahedral_params lut_3d;
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_stream.h b/drivers/gpu/drm/amd/display/dc/dc_stream.h
+index 341d2ffb64b1..5fc6fea211de 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_stream.h
++++ b/drivers/gpu/drm/amd/display/dc/dc_stream.h
+@@ -579,6 +579,17 @@ bool dc_stream_set_gamut_remap(struct dc *dc,
+ bool dc_stream_program_csc_matrix(struct dc *dc,
+ 				  struct dc_stream_state *stream);
+ 
++struct dc_rmcm_3dlut *dc_stream_get_3dlut_for_stream(
++	const struct dc *dc,
++	const struct dc_stream_state *stream,
++	bool allocate_one);
++
++void dc_stream_release_3dlut_for_stream(
++	const struct dc *dc,
++	const struct dc_stream_state *stream);
++
++void dc_stream_init_rmcm_3dlut(struct dc *dc);
++
+ struct pipe_ctx *dc_stream_get_pipe_ctx(struct dc_stream_state *stream);
+ 
+ void dc_dmub_update_dirty_rect(struct dc *dc,
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_types.h b/drivers/gpu/drm/amd/display/dc/dc_types.h
+index b203ed020cd5..a0829bc0708a 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_types.h
++++ b/drivers/gpu/drm/amd/display/dc/dc_types.h
+@@ -1313,6 +1313,7 @@ struct dc_cm2_func_luts {
+ 		bool mpc_3dlut_enable;
+ 		bool rmcm_3dlut_enable;
+ 		bool mpc_mcm_post_blend;
++		uint8_t rmcm_tmz;
+ 	} lut3d_data;
+ 	const struct dc_transfer_func *lut1d_func;
+ };
+diff --git a/drivers/gpu/drm/amd/display/dc/hubp/dcn401/dcn401_hubp.c b/drivers/gpu/drm/amd/display/dc/hubp/dcn401/dcn401_hubp.c
+index baed31611477..705b98b1b6cc 100644
+--- a/drivers/gpu/drm/amd/display/dc/hubp/dcn401/dcn401_hubp.c
++++ b/drivers/gpu/drm/amd/display/dc/hubp/dcn401/dcn401_hubp.c
+@@ -86,11 +86,11 @@ void hubp401_program_3dlut_fl_width(struct hubp *hubp, enum hubp_3dlut_fl_width
+ 	REG_UPDATE(HUBP_3DLUT_CONTROL, HUBP_3DLUT_WIDTH, width);
+ }
+ 
+-void hubp401_program_3dlut_fl_tmz_protected(struct hubp *hubp, bool protection_enabled)
++void hubp401_program_3dlut_fl_tmz_protected(struct hubp *hubp, uint8_t protection_bits)
+ {
+ 	struct dcn20_hubp *hubp2 = TO_DCN20_HUBP(hubp);
+ 
+-	REG_UPDATE(HUBP_3DLUT_CONTROL, HUBP_3DLUT_TMZ, protection_enabled ? 1 : 0);
++	REG_UPDATE(HUBP_3DLUT_CONTROL, HUBP_3DLUT_TMZ, protection_bits);
+ }
+ 
+ void hubp401_program_3dlut_fl_crossbar(struct hubp *hubp,
+diff --git a/drivers/gpu/drm/amd/display/dc/hubp/dcn401/dcn401_hubp.h b/drivers/gpu/drm/amd/display/dc/hubp/dcn401/dcn401_hubp.h
+index 6e1d4c90ddd4..608e6153fa68 100644
+--- a/drivers/gpu/drm/amd/display/dc/hubp/dcn401/dcn401_hubp.h
++++ b/drivers/gpu/drm/amd/display/dc/hubp/dcn401/dcn401_hubp.h
+@@ -333,7 +333,7 @@ void hubp401_program_3dlut_fl_crossbar(struct hubp *hubp,
+ 	enum hubp_3dlut_fl_crossbar_bit_slice bit_slice_cb_b,
+ 	enum hubp_3dlut_fl_crossbar_bit_slice bit_slice_cr_r);
+ 
+-void hubp401_program_3dlut_fl_tmz_protected(struct hubp *hubp, bool protection_enabled);
++void hubp401_program_3dlut_fl_tmz_protected(struct hubp *hubp, uint8_t protection_bits);
+ 
+ void hubp401_program_3dlut_fl_width(struct hubp *hubp, enum hubp_3dlut_fl_width width);
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/hwss/dcn10/dcn10_hwseq.c b/drivers/gpu/drm/amd/display/dc/hwss/dcn10/dcn10_hwseq.c
+index 9ad29be925e2..39910f73ecd0 100644
+--- a/drivers/gpu/drm/amd/display/dc/hwss/dcn10/dcn10_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/hwss/dcn10/dcn10_hwseq.c
+@@ -335,7 +335,7 @@ static void dcn10_log_hubp_states(struct dc *dc, void *log_ctx)
+ 		struct dcn_fl_regs_st *fl_regs = &s->fl_regs;
+ 
+ 		if (!s->blank_en) {
+-			DTN_INFO("[%2d]:  %5xh  %6xh  %5d  %6d  %2xh  %2xh  %6xh  %6d  %8d  %8d  %7d  %8xh %5x %5x %5x",
++			DTN_INFO("[%2d]:  %5xh  %6xh  %5d  %6d  %8xh  %2xh  %6xh  %6d  %8d  %8d  %7d  %8xh %5x %5x %5x",
+ 					pool->hubps[i]->inst,
+ 					fl_regs->lut_enable,
+ 					fl_regs->lut_done,
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/core_types.h b/drivers/gpu/drm/amd/display/dc/inc/core_types.h
+index c9454fe1cd05..f0d7185153b2 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/core_types.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/core_types.h
+@@ -67,6 +67,8 @@ struct resource_context;
+ struct clk_bw_params;
+ struct dc_mcache_params;
+ 
++#define MAX_RMCM_INST  2
++
+ struct resource_funcs {
+ 	enum engine_id (*get_preferred_eng_id_dpia)(unsigned int dpia_index);
+ 	void (*destroy)(struct resource_pool **pool);
+@@ -286,6 +288,7 @@ struct resource_pool {
+ 	struct hpo_dp_link_encoder *hpo_dp_link_enc[MAX_HPO_DP2_LINK_ENCODERS];
+ 	struct dc_3dlut *mpc_lut[MAX_PIPES];
+ 	struct dc_transfer_func *mpc_shaper[MAX_PIPES];
++	struct dc_rmcm_3dlut rmcm_3dlut[MAX_RMCM_INST];
+ 
+ 	struct {
+ 		unsigned int xtalin_clock_inKhz;
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/hubp.h b/drivers/gpu/drm/amd/display/dc/inc/hw/hubp.h
+index b610beb075d5..cee29e89ec5c 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/hubp.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/hubp.h
+@@ -282,7 +282,7 @@ struct hubp_funcs {
+ 	void (*hubp_enable_3dlut_fl)(struct hubp *hubp, bool enable);
+ 	void (*hubp_program_3dlut_fl_addressing_mode)(struct hubp *hubp, enum hubp_3dlut_fl_addressing_mode addr_mode);
+ 	void (*hubp_program_3dlut_fl_width)(struct hubp *hubp, enum hubp_3dlut_fl_width width);
+-	void (*hubp_program_3dlut_fl_tmz_protected)(struct hubp *hubp, bool protection_enabled);
++	void (*hubp_program_3dlut_fl_tmz_protected)(struct hubp *hubp, uint8_t protection_bits);
+ 	void (*hubp_program_3dlut_fl_crossbar)(struct hubp *hubp,
+ 			enum hubp_3dlut_fl_crossbar_bit_slice bit_slice_y_g,
+ 			enum hubp_3dlut_fl_crossbar_bit_slice bit_slice_cb_b,
+-- 
+2.52.0
+

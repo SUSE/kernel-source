@@ -1,0 +1,87 @@
+From 6e3a1433fa41e9b321ff66253501ba22aad26c0f Mon Sep 17 00:00:00 2001
+From: Jani Nikula <jani.nikula@intel.com>
+Date: Fri, 6 Jun 2025 12:05:12 +0300
+Subject: drm/i915/panel: sync panel prepared state at register
+Git-commit: 6e3a1433fa41e9b321ff66253501ba22aad26c0f
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+If the panel is enabled at probe, and we take over the hardware state,
+the drm_panel prepared state will be out of sync. We'll need to notify
+drm_panel framework about the state at probe, so it can in turn notify
+the panel followers.
+
+Cc: Lee Shawn C <shawn.c.lee@intel.com>
+Tested-by: Lee Shawn C <shawn.c.lee@intel.com>
+Reviewed-by: Arun R Murthy <arun.r.murthy@intel.com>
+Reviewed-by: Maxime Ripard <mripard@kernel.org>
+Link: https://lore.kernel.org/r/a33e4fe5e9970aed9c4aef8c426c00a189149c32.1749199013.git.jani.nikula@intel.com
+Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/intel_panel.c | 41 ++++++++++++++++++++++
+ 1 file changed, 41 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_panel.c b/drivers/gpu/drm/i915/display/intel_panel.c
+index b1d549e6cf53..f956919dc648 100644
+--- a/drivers/gpu/drm/i915/display/intel_panel.c
++++ b/drivers/gpu/drm/i915/display/intel_panel.c
+@@ -463,6 +463,45 @@ void intel_panel_fini(struct intel_connector *connector)
+ 	}
+ }
+ 
++/*
++ * If the panel was already enabled at probe, and we took over the state, the
++ * panel prepared state is out of sync, and the panel followers won't be
++ * notified. We need to call drm_panel_prepare() on enabled panels.
++ *
++ * It would be natural to handle this e.g. in the connector ->sync_state hook at
++ * intel_modeset_readout_hw_state(), but that's unfortunately too early. We
++ * don't have drm_connector::kdev at that time. For now, figure out the state at
++ * ->late_register, and sync there.
++ */
++static void intel_panel_sync_state(struct intel_connector *connector)
++{
++	struct intel_display *display = to_intel_display(connector);
++	struct drm_connector_state *conn_state;
++	struct intel_crtc *crtc;
++	int ret;
++
++	ret = drm_modeset_lock(&display->drm->mode_config.connection_mutex, NULL);
++	if (ret)
++		return;
++
++	conn_state = connector->base.state;
++
++	crtc = to_intel_crtc(conn_state->crtc);
++	if (crtc) {
++		struct intel_crtc_state *crtc_state;
++
++		crtc_state = to_intel_crtc_state(crtc->base.state);
++
++		if (crtc_state->hw.active) {
++			drm_dbg_kms(display->drm, "[CONNECTOR:%d:%s] Panel prepare\n",
++				    connector->base.base.id, connector->base.name);
++			intel_panel_prepare(crtc_state, conn_state);
++		}
++	}
++
++	drm_modeset_unlock(&display->drm->mode_config.connection_mutex);
++}
++
+ const struct drm_panel_funcs dummy_panel_funcs = {
+ };
+ 
+@@ -513,6 +552,8 @@ int intel_panel_register(struct intel_connector *connector)
+ 		drm_dbg_kms(display->drm, "[CONNECTOR:%d:%s] Registered panel device '%s', has fwnode: %s\n",
+ 			    connector->base.base.id, connector->base.name,
+ 			    dev_name(dev), str_yes_no(dev_fwnode(dev)));
++
++		intel_panel_sync_state(connector);
+ 	}
+ 
+ out:
+-- 
+2.52.0
+

@@ -1,0 +1,141 @@
+From 70349f275f2aecd1a9ff9440182b24defe8a5e77 Mon Sep 17 00:00:00 2001
+From: Jani Nikula <jani.nikula@intel.com>
+Date: Wed, 25 Jun 2025 13:32:19 +0300
+Subject: drm/i915/wm: abstract intel_dbuf_pmdemand_needs_update()
+Git-commit: 70349f275f2aecd1a9ff9440182b24defe8a5e77
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Add intel_dbuf_pmdemand_needs_update() helper to avoid looking at struct
+intel_dbuf_state internals outside of skl_watermark.c.
+
+With this, we can also move to_intel_dbuf_state(),
+intel_atomic_get_old_dbuf_state(), and intel_atomic_get_new_dbuf_state()
+inside skl_watermark.c.
+
+Reviewed-by: Imre Deak <imre.deak@intel.com>
+Link: https://lore.kernel.org/r/b493f259d0d3db047151fee18d7e801ad469fa88.1750847509.git.jani.nikula@intel.com
+Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/display/intel_pmdemand.c | 14 +--------
+ drivers/gpu/drm/i915/display/skl_watermark.c  | 30 +++++++++++++++++++
+ drivers/gpu/drm/i915/display/skl_watermark.h  | 10 ++-----
+ 3 files changed, 33 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_pmdemand.c b/drivers/gpu/drm/i915/display/intel_pmdemand.c
+index 93d5ee36fff1..0f1501c456df 100644
+--- a/drivers/gpu/drm/i915/display/intel_pmdemand.c
++++ b/drivers/gpu/drm/i915/display/intel_pmdemand.c
+@@ -294,11 +294,9 @@ intel_pmdemand_connector_needs_update(struct intel_atomic_state *state)
+ 
+ static bool intel_pmdemand_needs_update(struct intel_atomic_state *state)
+ {
+-	struct intel_display *display = to_intel_display(state);
+ 	const struct intel_bw_state *new_bw_state, *old_bw_state;
+ 	const struct intel_cdclk_state *new_cdclk_state, *old_cdclk_state;
+ 	const struct intel_crtc_state *new_crtc_state, *old_crtc_state;
+-	const struct intel_dbuf_state *new_dbuf_state, *old_dbuf_state;
+ 	struct intel_crtc *crtc;
+ 	int i;
+ 
+@@ -308,19 +306,9 @@ static bool intel_pmdemand_needs_update(struct intel_atomic_state *state)
+ 	    old_bw_state->qgv_point_peakbw)
+ 		return true;
+ 
+-	new_dbuf_state = intel_atomic_get_new_dbuf_state(state);
+-	old_dbuf_state = intel_atomic_get_old_dbuf_state(state);
+-	if (new_dbuf_state &&
+-	    new_dbuf_state->active_pipes != old_dbuf_state->active_pipes)
++	if (intel_dbuf_pmdemand_needs_update(state))
+ 		return true;
+ 
+-	if (DISPLAY_VER(display) < 30) {
+-		if (new_dbuf_state &&
+-		    new_dbuf_state->enabled_slices !=
+-		    old_dbuf_state->enabled_slices)
+-			return true;
+-	}
+-
+ 	new_cdclk_state = intel_atomic_get_new_cdclk_state(state);
+ 	old_cdclk_state = intel_atomic_get_old_cdclk_state(state);
+ 	if (new_cdclk_state &&
+diff --git a/drivers/gpu/drm/i915/display/skl_watermark.c b/drivers/gpu/drm/i915/display/skl_watermark.c
+index d39fabd09938..9ae9f02b11ca 100644
+--- a/drivers/gpu/drm/i915/display/skl_watermark.c
++++ b/drivers/gpu/drm/i915/display/skl_watermark.c
+@@ -39,6 +39,14 @@
+  */
+ #define DSB_EXE_TIME 100
+ 
++#define to_intel_dbuf_state(global_state) \
++	container_of_const((global_state), struct intel_dbuf_state, base)
++
++#define intel_atomic_get_old_dbuf_state(state) \
++	to_intel_dbuf_state(intel_atomic_get_old_global_obj_state(state, &to_intel_display(state)->dbuf.obj))
++#define intel_atomic_get_new_dbuf_state(state) \
++	to_intel_dbuf_state(intel_atomic_get_new_global_obj_state(state, &to_intel_display(state)->dbuf.obj))
++
+ static void skl_sagv_disable(struct intel_display *display);
+ 
+ /* Stores plane specific WM parameters */
+@@ -3696,6 +3704,28 @@ void intel_dbuf_post_plane_update(struct intel_atomic_state *state)
+ 	gen9_dbuf_slices_update(display, new_slices);
+ }
+ 
++bool intel_dbuf_pmdemand_needs_update(struct intel_atomic_state *state)
++{
++	struct intel_display *display = to_intel_display(state);
++	const struct intel_dbuf_state *new_dbuf_state, *old_dbuf_state;
++
++	new_dbuf_state = intel_atomic_get_new_dbuf_state(state);
++	old_dbuf_state = intel_atomic_get_old_dbuf_state(state);
++
++	if (new_dbuf_state &&
++	    new_dbuf_state->active_pipes != old_dbuf_state->active_pipes)
++		return true;
++
++	if (DISPLAY_VER(display) < 30) {
++		if (new_dbuf_state &&
++		    new_dbuf_state->enabled_slices !=
++		    old_dbuf_state->enabled_slices)
++			return true;
++	}
++
++	return false;
++}
++
+ static void skl_mbus_sanitize(struct intel_display *display)
+ {
+ 	struct intel_dbuf_state *dbuf_state =
+diff --git a/drivers/gpu/drm/i915/display/skl_watermark.h b/drivers/gpu/drm/i915/display/skl_watermark.h
+index 95b0b599d5c3..3b9a0b254cff 100644
+--- a/drivers/gpu/drm/i915/display/skl_watermark.h
++++ b/drivers/gpu/drm/i915/display/skl_watermark.h
+@@ -78,14 +78,6 @@ struct intel_dbuf_state {
+ struct intel_dbuf_state *
+ intel_atomic_get_dbuf_state(struct intel_atomic_state *state);
+ 
+-#define to_intel_dbuf_state(global_state) \
+-	container_of_const((global_state), struct intel_dbuf_state, base)
+-
+-#define intel_atomic_get_old_dbuf_state(state) \
+-	to_intel_dbuf_state(intel_atomic_get_old_global_obj_state(state, &to_intel_display(state)->dbuf.obj))
+-#define intel_atomic_get_new_dbuf_state(state) \
+-	to_intel_dbuf_state(intel_atomic_get_new_global_obj_state(state, &to_intel_display(state)->dbuf.obj))
+-
+ int intel_dbuf_init(struct intel_display *display);
+ int intel_dbuf_state_set_mdclk_cdclk_ratio(struct intel_atomic_state *state,
+ 					   int ratio);
+@@ -98,5 +90,7 @@ void intel_dbuf_mbus_pre_ddb_update(struct intel_atomic_state *state);
+ void intel_dbuf_mbus_post_ddb_update(struct intel_atomic_state *state);
+ void intel_program_dpkgc_latency(struct intel_atomic_state *state);
+ 
++bool intel_dbuf_pmdemand_needs_update(struct intel_atomic_state *state);
++
+ #endif /* __SKL_WATERMARK_H__ */
+ 
+-- 
+2.52.0
+

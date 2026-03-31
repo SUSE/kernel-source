@@ -1,0 +1,185 @@
+From 18b66a6c2a3f661d8ce29c61cf79c4c1a0a96839 Mon Sep 17 00:00:00 2001
+From: Samuel Zhang <guoqing.zhang@amd.com>
+Date: Fri, 11 Apr 2025 16:10:20 +0800
+Subject: drm/amdgpu: update GPU addresses for SMU and PSP
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 18b66a6c2a3f661d8ce29c61cf79c4c1a0a96839
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+add amdgpu_bo_fb_aper_addr() and update the cached GPU addresses to use
+the FB aperture address for SMU and PSP.
+
+2 reasons for this change:
+1. when pdb0 is enabled, gpu addr from amdgpu_bo_create_kernel() is GART
+aperture address, it is not compatible with SMU and PSP, it need to be
+updated to use FB aperture address.
+2. Since FB aperture address will change after switching to new GPU
+index after hibernation, it need to be updated on resume.
+
+Signed-off-by: Jiang Liu <gerry@linux.alibaba.com>
+Signed-off-by: Samuel Zhang <guoqing.zhang@amd.com>
+Acked-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Lijo Lazar <lijo.lazar@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_object.c | 20 +++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_object.h |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c    | 23 ++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ucode.c  |  3 +++
+ drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c  | 18 +++++++++++++++++
+ 5 files changed, 65 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+index 73403744331a..3ac52d9b9d30 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+@@ -1472,6 +1472,26 @@ u64 amdgpu_bo_gpu_offset(struct amdgpu_bo *bo)
+ 	return amdgpu_bo_gpu_offset_no_check(bo);
+ }
+ 
++/**
++ * amdgpu_bo_fb_aper_addr - return FB aperture GPU offset of the VRAM bo
++ * @bo:	amdgpu VRAM buffer object for which we query the offset
++ *
++ * Returns:
++ * current FB aperture GPU offset of the object.
++ */
++u64 amdgpu_bo_fb_aper_addr(struct amdgpu_bo *bo)
++{
++	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
++	uint64_t offset, fb_base;
++
++	WARN_ON_ONCE(bo->tbo.resource->mem_type != TTM_PL_VRAM);
++
++	fb_base = adev->gmc.fb_start;
++	fb_base += adev->gmc.xgmi.physical_node_id * adev->gmc.xgmi.node_segment_size;
++	offset = (bo->tbo.resource->start << PAGE_SHIFT) + fb_base;
++	return amdgpu_gmc_sign_extend(offset);
++}
++
+ /**
+  * amdgpu_bo_gpu_offset_no_check - return GPU offset of bo
+  * @bo:	amdgpu object for which we query the offset
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
+index 375448627f7b..c316920f3450 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
+@@ -304,6 +304,7 @@ int amdgpu_bo_sync_wait_resv(struct amdgpu_device *adev, struct dma_resv *resv,
+ 			     bool intr);
+ int amdgpu_bo_sync_wait(struct amdgpu_bo *bo, void *owner, bool intr);
+ u64 amdgpu_bo_gpu_offset(struct amdgpu_bo *bo);
++u64 amdgpu_bo_fb_aper_addr(struct amdgpu_bo *bo);
+ u64 amdgpu_bo_gpu_offset_no_check(struct amdgpu_bo *bo);
+ uint32_t amdgpu_bo_mem_stats_placement(struct amdgpu_bo *bo);
+ uint32_t amdgpu_bo_get_preferred_domain(struct amdgpu_device *adev,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
+index a43a3458556a..e3c8fe2801d8 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
+@@ -872,6 +872,8 @@ static int psp_tmr_init(struct psp_context *psp)
+ 					      &psp->tmr_bo, &psp->tmr_mc_addr,
+ 					      pptr);
+ 	}
++	if (amdgpu_virt_xgmi_migrate_enabled(psp->adev) && psp->tmr_bo)
++		psp->tmr_mc_addr = amdgpu_bo_fb_aper_addr(psp->tmr_bo);
+ 
+ 	return ret;
+ }
+@@ -1271,6 +1273,11 @@ int psp_ta_load(struct psp_context *psp, struct ta_context *context)
+ 	psp_copy_fw(psp, context->bin_desc.start_addr,
+ 		    context->bin_desc.size_bytes);
+ 
++	if (amdgpu_virt_xgmi_migrate_enabled(psp->adev) &&
++		context->mem_context.shared_bo)
++		context->mem_context.shared_mc_addr =
++			amdgpu_bo_fb_aper_addr(context->mem_context.shared_bo);
++
+ 	psp_prep_ta_load_cmd_buf(cmd, psp->fw_pri_mc_addr, context);
+ 
+ 	ret = psp_cmd_submit_buf(psp, NULL, cmd,
+@@ -2338,11 +2345,27 @@ bool amdgpu_psp_tos_reload_needed(struct amdgpu_device *adev)
+ 	return false;
+ }
+ 
++static void psp_update_gpu_addresses(struct amdgpu_device *adev)
++{
++	struct psp_context *psp = &adev->psp;
++
++	if (psp->cmd_buf_bo && psp->cmd_buf_mem) {
++		psp->fw_pri_mc_addr = amdgpu_bo_fb_aper_addr(psp->fw_pri_bo);
++		psp->fence_buf_mc_addr = amdgpu_bo_fb_aper_addr(psp->fence_buf_bo);
++		psp->cmd_buf_mc_addr = amdgpu_bo_fb_aper_addr(psp->cmd_buf_bo);
++	}
++	if (adev->firmware.rbuf && psp->km_ring.ring_mem)
++		psp->km_ring.ring_mem_mc_addr = amdgpu_bo_fb_aper_addr(adev->firmware.rbuf);
++}
++
+ static int psp_hw_start(struct psp_context *psp)
+ {
+ 	struct amdgpu_device *adev = psp->adev;
+ 	int ret;
+ 
++	if (amdgpu_virt_xgmi_migrate_enabled(adev))
++		psp_update_gpu_addresses(adev);
++
+ 	if (!amdgpu_sriov_vf(adev)) {
+ 		if ((is_psp_fw_valid(psp->kdb)) &&
+ 		    (psp->funcs->bootloader_load_kdb != NULL)) {
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ucode.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ucode.c
+index eaddc441c51a..d777c049747e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ucode.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ucode.c
+@@ -1159,6 +1159,9 @@ int amdgpu_ucode_init_bo(struct amdgpu_device *adev)
+ 		adev->firmware.max_ucodes = AMDGPU_UCODE_ID_MAXIMUM;
+ 	}
+ 
++	if (amdgpu_virt_xgmi_migrate_enabled(adev) && adev->firmware.fw_buf)
++		adev->firmware.fw_buf_mc = amdgpu_bo_fb_aper_addr(adev->firmware.fw_buf);
++
+ 	for (i = 0; i < adev->firmware.max_ucodes; i++) {
+ 		ucode = &adev->firmware.ucode[i];
+ 		if (ucode->fw) {
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c b/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c
+index d79a1d94661a..aedb209c75da 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c
+@@ -1004,6 +1004,21 @@ static int smu_fini_fb_allocations(struct smu_context *smu)
+ 	return 0;
+ }
+ 
++static void smu_update_gpu_addresses(struct smu_context *smu)
++{
++	struct smu_table_context *smu_table = &smu->smu_table;
++	struct smu_table *pm_status_table = smu_table->tables + SMU_TABLE_PMSTATUSLOG;
++	struct smu_table *driver_table = &(smu_table->driver_table);
++	struct smu_table *dummy_read_1_table = &smu_table->dummy_read_1_table;
++
++	if (pm_status_table->bo)
++		pm_status_table->mc_address = amdgpu_bo_fb_aper_addr(pm_status_table->bo);
++	if (driver_table->bo)
++		driver_table->mc_address = amdgpu_bo_fb_aper_addr(driver_table->bo);
++	if (dummy_read_1_table->bo)
++		dummy_read_1_table->mc_address = amdgpu_bo_fb_aper_addr(dummy_read_1_table->bo);
++}
++
+ /**
+  * smu_alloc_memory_pool - allocate memory pool in the system memory
+  *
+@@ -1780,6 +1795,9 @@ static int smu_start_smc_engine(struct smu_context *smu)
+ 	struct amdgpu_device *adev = smu->adev;
+ 	int ret = 0;
+ 
++	if (amdgpu_virt_xgmi_migrate_enabled(adev))
++		smu_update_gpu_addresses(smu);
++
+ 	smu->smc_fw_state = SMU_FW_INIT;
+ 
+ 	if (adev->firmware.load_type != AMDGPU_FW_LOAD_PSP) {
+-- 
+2.52.0
+

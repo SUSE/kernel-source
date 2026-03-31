@@ -1,0 +1,106 @@
+From c371161086153623796dff9de713e98c47f4c586 Mon Sep 17 00:00:00 2001
+From: Arnd Bergmann <arnd@arndb.de>
+Date: Fri, 20 Jun 2025 13:36:38 +0200
+Subject: drm/i915: reduce stack usage in igt_vma_pin1()
+Git-commit: c371161086153623796dff9de713e98c47f4c586
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+The igt_vma_pin1() function has a rather high stack usage, which gets
+in the way of reducing the default warning limit:
+
+In file included from drivers/gpu/drm/i915/i915_vma.c:2285:
+drivers/gpu/drm/i915/selftests/i915_vma.c:257:12: error: stack frame size (1288) exceeds limit (1280) in 'igt_vma_pin1' [-Werror,-Wframe-larger-than]
+
+There are two things going on here:
+
+ - The on-stack modes[] array is really large itself and gets constructed
+   for every call, using around 1000 bytes itself depending on the configuration.
+
+ - The call to i915_vma_pin() gets inlined and adds another 200 bytes for
+   the i915_gem_ww_ctx structure since commit 7d1c2618eac5 ("drm/i915: Take
+   reservation lock around i915_vma_pin.")
+
+The second one is easy enough to change, by moving the function into the
+appropriate .c file. Since it is already large enough to not always be
+inlined, this seems like a good idea regardless, reducing both the code size
+and the internal stack usage of each of its 67 callers.
+
+Reviewed-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+Link: https://lore.kernel.org/r/20250620113644.3844552-1-arnd@kernel.org
+Signed-off-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/i915/i915_vma.c | 20 ++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_vma.h | 22 ++--------------------
+ 2 files changed, 22 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_vma.c b/drivers/gpu/drm/i915/i915_vma.c
+index 632e316f8b05..25e97031d76e 100644
+--- a/drivers/gpu/drm/i915/i915_vma.c
++++ b/drivers/gpu/drm/i915/i915_vma.c
+@@ -1607,6 +1607,26 @@ int i915_vma_pin_ww(struct i915_vma *vma, struct i915_gem_ww_ctx *ww,
+ 	return err;
+ }
+ 
++int i915_vma_pin(struct i915_vma *vma, u64 size, u64 alignment, u64 flags)
++{
++	struct i915_gem_ww_ctx ww;
++	int err;
++
++	i915_gem_ww_ctx_init(&ww, true);
++retry:
++	err = i915_gem_object_lock(vma->obj, &ww);
++	if (!err)
++		err = i915_vma_pin_ww(vma, &ww, size, alignment, flags);
++	if (err == -EDEADLK) {
++		err = i915_gem_ww_ctx_backoff(&ww);
++		if (!err)
++			goto retry;
++	}
++	i915_gem_ww_ctx_fini(&ww);
++
++	return err;
++}
++
+ static void flush_idle_contexts(struct intel_gt *gt)
+ {
+ 	struct intel_engine_cs *engine;
+diff --git a/drivers/gpu/drm/i915/i915_vma.h b/drivers/gpu/drm/i915/i915_vma.h
+index 6a6be8048aa8..14ccbd0636bb 100644
+--- a/drivers/gpu/drm/i915/i915_vma.h
++++ b/drivers/gpu/drm/i915/i915_vma.h
+@@ -289,26 +289,8 @@ int __must_check
+ i915_vma_pin_ww(struct i915_vma *vma, struct i915_gem_ww_ctx *ww,
+ 		u64 size, u64 alignment, u64 flags);
+ 
+-static inline int __must_check
+-i915_vma_pin(struct i915_vma *vma, u64 size, u64 alignment, u64 flags)
+-{
+-	struct i915_gem_ww_ctx ww;
+-	int err;
+-
+-	i915_gem_ww_ctx_init(&ww, true);
+-retry:
+-	err = i915_gem_object_lock(vma->obj, &ww);
+-	if (!err)
+-		err = i915_vma_pin_ww(vma, &ww, size, alignment, flags);
+-	if (err == -EDEADLK) {
+-		err = i915_gem_ww_ctx_backoff(&ww);
+-		if (!err)
+-			goto retry;
+-	}
+-	i915_gem_ww_ctx_fini(&ww);
+-
+-	return err;
+-}
++int __must_check
++i915_vma_pin(struct i915_vma *vma, u64 size, u64 alignment, u64 flags);
+ 
+ int i915_ggtt_pin(struct i915_vma *vma, struct i915_gem_ww_ctx *ww,
+ 		  u32 align, unsigned int flags);
+-- 
+2.52.0
+

@@ -1,0 +1,127 @@
+From 58b51df807d7394a09ddb95b47099d59465e3777 Mon Sep 17 00:00:00 2001
+From: Lucas De Marchi <lucas.demarchi@intel.com>
+Date: Wed, 28 May 2025 14:54:06 -0700
+Subject: drm/xe: Allow to disable engines
+Git-commit: 58b51df807d7394a09ddb95b47099d59465e3777
+Patch-mainline: v6.17-rc1
+References: jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
+
+Sometimes it's useful to load the driver with a smaller set of engines
+to allow more targeted debugging, particularly on early enabling.
+
+Besides checking what is fused off in hardware, add similar logic to
+disable engines in software. This will use configfs to allow users
+to set what engine to disable, so already add prepare for that. The
+exact configfs interface will be added later.
+
+Reviewed-by: Matt Roper <matthew.d.roper@intel.com>
+Link: https://lore.kernel.org/r/20250528-engine-mask-v4-3-f4636d2a890a@intel.com
+Signed-off-by: Lucas De Marchi <lucas.demarchi@intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+
+---
+ drivers/gpu/drm/xe/xe_configfs.c  | 15 +++++++++++++++
+ drivers/gpu/drm/xe/xe_configfs.h  |  3 +++
+ drivers/gpu/drm/xe/xe_hw_engine.c | 20 ++++++++++++++++++++
+ 3 files changed, 38 insertions(+)
+
+diff --git a/drivers/gpu/drm/xe/xe_configfs.c b/drivers/gpu/drm/xe/xe_configfs.c
+index cb9f175c89a1..8320d57ef5a8 100644
+--- a/drivers/gpu/drm/xe/xe_configfs.c
++++ b/drivers/gpu/drm/xe/xe_configfs.c
+@@ -226,6 +226,21 @@ void xe_configfs_clear_survivability_mode(struct pci_dev *pdev)
+ 	config_item_put(&dev->group.cg_item);
+ }
+ 
++/**
++ * xe_configfs_get_engines_allowed - get engine allowed mask from configfs
++ * @pdev: pci device
++ *
++ * Find the configfs group that belongs to the pci device and return
++ * the mask of engines allowed to be used.
++ *
++ * Return: engine mask with allowed engines
++ */
++u64 xe_configfs_get_engines_allowed(struct pci_dev *pdev)
++{
++	/* dummy implementation */
++	return U64_MAX;
++}
++
+ int __init xe_configfs_init(void)
+ {
+ 	struct config_group *root = &xe_configfs.su_group;
+diff --git a/drivers/gpu/drm/xe/xe_configfs.h b/drivers/gpu/drm/xe/xe_configfs.h
+index ef6d231b3024..fb8764008089 100644
+--- a/drivers/gpu/drm/xe/xe_configfs.h
++++ b/drivers/gpu/drm/xe/xe_configfs.h
+@@ -5,6 +5,7 @@
+ #ifndef _XE_CONFIGFS_H_
+ #define _XE_CONFIGFS_H_
+ 
++#include <linux/limits.h>
+ #include <linux/types.h>
+ 
+ struct pci_dev;
+@@ -14,11 +15,13 @@ int xe_configfs_init(void);
+ void xe_configfs_exit(void);
+ bool xe_configfs_get_survivability_mode(struct pci_dev *pdev);
+ void xe_configfs_clear_survivability_mode(struct pci_dev *pdev);
++u64 xe_configfs_get_engines_allowed(struct pci_dev *pdev);
+ #else
+ static inline int xe_configfs_init(void) { return 0; }
+ static inline void xe_configfs_exit(void) { }
+ static inline bool xe_configfs_get_survivability_mode(struct pci_dev *pdev) { return false; }
+ static inline void xe_configfs_clear_survivability_mode(struct pci_dev *pdev) { }
++static inline u64 xe_configfs_get_engines_allowed(struct pci_dev *pdev) { return U64_MAX; }
+ #endif
+ 
+ #endif
+diff --git a/drivers/gpu/drm/xe/xe_hw_engine.c b/drivers/gpu/drm/xe/xe_hw_engine.c
+index 33681169b857..3439c8522d01 100644
+--- a/drivers/gpu/drm/xe/xe_hw_engine.c
++++ b/drivers/gpu/drm/xe/xe_hw_engine.c
+@@ -17,6 +17,7 @@
+ #include "regs/xe_irq_regs.h"
+ #include "xe_assert.h"
+ #include "xe_bo.h"
++#include "xe_configfs.h"
+ #include "xe_device.h"
+ #include "xe_execlist.h"
+ #include "xe_force_wake.h"
+@@ -805,6 +806,24 @@ static void check_gsc_availability(struct xe_gt *gt)
+ 	}
+ }
+ 
++static void check_sw_disable(struct xe_gt *gt)
++{
++	struct xe_device *xe = gt_to_xe(gt);
++	u64 sw_allowed = xe_configfs_get_engines_allowed(to_pci_dev(xe->drm.dev));
++	enum xe_hw_engine_id id;
++
++	for (id = 0; id < XE_NUM_HW_ENGINES; ++id) {
++		if (!(gt->info.engine_mask & BIT(id)))
++			continue;
++
++		if (!(sw_allowed & BIT(id))) {
++			gt->info.engine_mask &= ~BIT(id);
++			xe_gt_info(gt, "%s disabled via configfs\n",
++				   engine_infos[id].name);
++		}
++	}
++}
++
+ int xe_hw_engines_init_early(struct xe_gt *gt)
+ {
+ 	int i;
+@@ -813,6 +832,7 @@ int xe_hw_engines_init_early(struct xe_gt *gt)
+ 	read_copy_fuses(gt);
+ 	read_compute_fuses(gt);
+ 	check_gsc_availability(gt);
++	check_sw_disable(gt);
+ 
+ 	BUILD_BUG_ON(XE_HW_ENGINE_PREEMPT_TIMEOUT < XE_HW_ENGINE_PREEMPT_TIMEOUT_MIN);
+ 	BUILD_BUG_ON(XE_HW_ENGINE_PREEMPT_TIMEOUT > XE_HW_ENGINE_PREEMPT_TIMEOUT_MAX);
+-- 
+2.52.0
+
