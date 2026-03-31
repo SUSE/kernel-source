@@ -200,10 +200,12 @@ class OBSAPI(api.API):
         return self.check_put('/'.join(['/source', project, package, file]), headers={'Content-type': content_type}, data=data)
 
     def package_scmsync(self, project, package):
-        return urllib.parse.urlparse(self.package_meta(project, package).find('scmsync').text)
+        sync = self.package_meta(project, package).find('scmsync')
+        return urllib.parse.urlparse(sync.text) if sync is not None else None
 
     def project_scmsync(self, project):
-        return urllib.parse.urlparse(self.project_meta(project).find('scmsync').text)
+        sync = self.project_meta(project).find('scmsync')
+        return urllib.parse.urlparse(sync.text) if sync is not None else None
 
     def project_repo(self, project):
         if self.project_exists(project) and self.project_meta(project).find('scmsync') != None:
