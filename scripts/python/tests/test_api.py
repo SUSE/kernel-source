@@ -423,7 +423,7 @@ class TestOBS(unittest.TestCase):
                                  commit='b20dbdf296c74a2897e61205e5c9edcb7f85340ede6bbfd18c05dbfce87c267b'))
         self.assertTrue(st.data_consumed)
 
-    def test_pkgrepo_defalt(self):
+    def test_pkgrepo_default(self):
         st = ServerThread('tests/api/obsapi_pkgrepo_no_scmsync')
         st.start_server(obsconfig=self.config)
         api = OBSAPI(st.url(), config=self.config, cookiejar=self.cookiejar, ca=st.servercert)
