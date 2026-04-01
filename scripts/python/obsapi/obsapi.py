@@ -123,9 +123,17 @@ class OBSAPI(api.API):
             fn = os.path.join(td, 'data')
             with open(fn, 'w') as f:
                 f.write('(created): ' + str(created))
-            subprocess.check_call(['ssh-keygen', '-Y', 'sign', '-f', sshkey, '-n', realm, '-q', fn])
-            with open(fn + '.sig', 'r') as f:
-                sig = f.read().splitlines()
+            for i in range(0,3):
+                try:
+                    subprocess.check_call(['ssh-keygen', '-Y', 'sign', '-f', sshkey, '-n', realm, '-q', fn])
+                    break
+                except subprocess.CalledProcessError as e:
+                    print(e, file=sys.stderr)
+            try:
+                with open(fn + '.sig', 'r') as f:
+                    sig = f.read().splitlines()
+            except FileNotFoundError:
+                raise RuntimeError('Failed to create a SSH signature')
             if sig[0] != '-----BEGIN SSH SIGNATURE-----' or sig[-1] != '-----END SSH SIGNATURE-----':
                 raise RuntimeError('Failed to create a SSH signature')
         sig = ''.join(sig[1:-1])
