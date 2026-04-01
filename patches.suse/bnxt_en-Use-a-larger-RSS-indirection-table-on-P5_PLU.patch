@@ -1,0 +1,99 @@
+From cb71664d9761235f9eb54f026f3c173a0cac936f Mon Sep 17 00:00:00 2001
+From: Michael Chan <michael.chan@broadcom.com>
+Date: Thu, 8 Jan 2026 10:35:20 -0800
+Subject: bnxt_en: Use a larger RSS indirection table on P5_PLUS chips
+Patch-mainline: v7.0-rc1
+Git-commit: 51b9d3f948b8182a52c1711755ca41b9e9fd166f
+References: jsc#PED-15498
+
+The driver currently uses a chip supported RSS indirection table size
+just big enough to cover the number of RX rings.  Each table with 64
+entries requires one HW RSS context.  The HW supported table sizes are
+64, 128, 256, and 512 entries.  Using the smallest table size can cause
+unbalanced RSS packet distributions.  For example, if the number of
+rings is 48, the table size using existing logic will be 64.  32 rings
+will have a weight of 1 and 16 rings will have a weight of 2 when
+set to default even distribution.  This represents a 100% difference in
+weights between some of the rings.
+
+Newer FW has increased the RSS indirection table resource.  When the
+increased resource is detected, use the largest RSS indirection table
+size (512 entries) supported by the chip.  Using the same example
+above, the weights of the 48 rings will be either 10 or 11 when set to
+default even distribution.  The weight difference is only 10%.
+
+If there are thousands of VFs, there is a possiblity that we may not
+be able to allocate this larger RSS indirection table from the FW, so
+we add a check to fall back to the legacy scheme.
+
+Reviewed-by: Somnath Kotur <somnath.kotur@broadcom.com>
+Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+Link: https://patch.msgid.link/20260108183521.215610-6-michael.chan@broadcom.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Steffen Jaeckel <sjaeckel@suse.de>
+---
+ drivers/net/ethernet/broadcom/bnxt/bnxt.c | 12 ++++++++++++
+ drivers/net/ethernet/broadcom/bnxt/bnxt.h |  3 +++
+ 2 files changed, 15 insertions(+)
+
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.c b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index 9842fa1208a6..6d951ab476be 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@ -6549,6 +6549,9 @@ int bnxt_get_nr_rss_ctxs(struct bnxt *bp, int rx_rings)
+ 	if (bp->flags & BNXT_FLAG_CHIP_P5_PLUS) {
+ 		if (!rx_rings)
+ 			return 0;
++		if (bp->rss_cap & BNXT_RSS_CAP_LARGE_RSS_CTX)
++			return BNXT_RSS_TABLE_MAX_TBL_P5;
++
+ 		return bnxt_calc_nr_ring_pages(rx_rings - 1,
+ 					       BNXT_RSS_TABLE_ENTRIES_P5);
+ 	}
+@@ -8057,6 +8060,11 @@ static int __bnxt_reserve_rings(struct bnxt *bp)
+ 	bp->rx_nr_rings = rx_rings;
+ 	bp->cp_nr_rings = hwr.cp;
+ 
++	/* Fall back if we cannot reserve enough HW RSS contexts */
++	if ((bp->rss_cap & BNXT_RSS_CAP_LARGE_RSS_CTX) &&
++	    hwr.rss_ctx < bnxt_get_total_rss_ctxs(bp, &hwr))
++		bp->rss_cap &= ~BNXT_RSS_CAP_LARGE_RSS_CTX;
++
+ 	if (!bnxt_rings_ok(bp, &hwr))
+ 		return -ENOMEM;
+ 
+@@ -9547,6 +9555,10 @@ int bnxt_hwrm_func_resc_qcaps(struct bnxt *bp, bool all)
+ 	hw_resc->min_stat_ctxs = le16_to_cpu(resp->min_stat_ctx);
+ 	hw_resc->max_stat_ctxs = le16_to_cpu(resp->max_stat_ctx);
+ 
++	if (hw_resc->max_rsscos_ctxs >=
++	    hw_resc->max_vnics * BNXT_LARGE_RSS_TO_VNIC_RATIO)
++		bp->rss_cap |= BNXT_RSS_CAP_LARGE_RSS_CTX;
++
+ 	if (bp->flags & BNXT_FLAG_CHIP_P5_PLUS) {
+ 		u16 max_msix = le16_to_cpu(resp->max_msix);
+ 
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.h b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+index e776f118ea44..2c643223d61c 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@ -1367,6 +1367,8 @@ struct bnxt_hw_resc {
+ 	u32	max_rx_wm_flows;
+ };
+ 
++#define BNXT_LARGE_RSS_TO_VNIC_RATIO	7
++
+ #if defined(CONFIG_BNXT_SRIOV)
+ struct bnxt_vf_info {
+ 	u16	fw_fid;
+@@ -2409,6 +2411,7 @@ struct bnxt {
+ #define BNXT_RSS_CAP_ESP_V4_RSS_CAP		BIT(6)
+ #define BNXT_RSS_CAP_ESP_V6_RSS_CAP		BIT(7)
+ #define BNXT_RSS_CAP_MULTI_RSS_CTX		BIT(8)
++#define BNXT_RSS_CAP_LARGE_RSS_CTX		BIT(10)
+ 
+ 	u8			rss_hash_key[HW_HASH_KEY_SIZE];
+ 	u8			rss_hash_key_valid:1;
+-- 
+2.53.0
+

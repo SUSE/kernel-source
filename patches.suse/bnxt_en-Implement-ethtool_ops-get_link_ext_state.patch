@@ -1,0 +1,152 @@
+From: Michael Chan <michael.chan@broadcom.com>
+Date: Thu, 8 Jan 2026 10:35:21 -0800
+Subject: bnxt_en: Implement ethtool_ops -> get_link_ext_state()
+Patch-mainline: v7.0-rc1
+Git-commit: bc87b14594e30720a5c1546c24e0f5f08d34eb40
+References: jsc#PED-15498
+
+Map the link_down_reason from the FW to the ethtool link_ext_state
+when it is available.  Also log it to the link down dmesg when it is
+available.  Add 2 new link_ext_state enums to the UAPI:
+
+ETHTOOL_LINK_EXT_STATE_OTP_SPEED_VIOLATION
+ETHTOOL_LINK_EXT_STATE_BMC_REQUEST_DOWN
+
+to cover OTP (one-time-programmable) speed restrictions and
+BMC (Baseboard management controller) forcing the link down.
+
+Reviewed-by: Andy Gospodarek <andrew.gospodarek@broadcom.com>
+Reviewed-by: Kalesh AP <kalesh-anakkur.purayil@broadcom.com>
+Reviewed-by: Pavan Chebbi <pavan.chebbi@broadcom.com>
+Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+Link: https://patch.msgid.link/20260108183521.215610-7-michael.chan@broadcom.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Steffen Jaeckel <sjaeckel@suse.de>
+---
+ drivers/net/ethernet/broadcom/bnxt/bnxt.c         |   25 +++++++++++++++
+ drivers/net/ethernet/broadcom/bnxt/bnxt.h         |    1 
+ drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c |   35 ++++++++++++++++++++++
+ include/uapi/linux/ethtool.h                      |    2 +
+ 4 files changed, 62 insertions(+), 1 deletion(-)
+
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@ -11857,6 +11857,26 @@ static char *bnxt_report_fec(struct bnxt
+ 	}
+ }
+ 
++static char *bnxt_link_down_reason(struct bnxt_link_info *link_info)
++{
++	u8 reason = link_info->link_down_reason;
++
++	/* Multiple bits can be set, we report 1 bit only in order of
++	 * priority.
++	 */
++	if (reason & PORT_PHY_QCFG_RESP_LINK_DOWN_REASON_RF)
++		return "(Remote fault)";
++	if (reason & PORT_PHY_QCFG_RESP_LINK_DOWN_REASON_OTP_SPEED_VIOLATION)
++		return "(OTP Speed limit violation)";
++	if (reason & PORT_PHY_QCFG_RESP_LINK_DOWN_REASON_CABLE_REMOVED)
++		return "(Cable removed)";
++	if (reason & PORT_PHY_QCFG_RESP_LINK_DOWN_REASON_MODULE_FAULT)
++		return "(Module fault)";
++	if (reason & PORT_PHY_QCFG_RESP_LINK_DOWN_REASON_BMC_REQUEST)
++		return "(BMC request down)";
++	return "";
++}
++
+ void bnxt_report_link(struct bnxt *bp)
+ {
+ 	if (BNXT_LINK_IS_UP(bp)) {
+@@ -11914,8 +11934,10 @@ void bnxt_report_link(struct bnxt *bp)
+ 				    (fec & BNXT_FEC_AUTONEG) ? "on" : "off",
+ 				    bnxt_report_fec(&bp->link_info));
+ 	} else {
++		char *str = bnxt_link_down_reason(&bp->link_info);
++
+ 		netif_carrier_off(bp->dev);
+-		netdev_err(bp->dev, "NIC Link is Down\n");
++		netdev_err(bp->dev, "NIC Link is Down %s\n", str);
+ 	}
+ }
+ 
+@@ -12115,6 +12137,7 @@ int bnxt_update_link(struct bnxt *bp, bo
+ 	link_info->phy_addr = resp->eee_config_phy_addr &
+ 			      PORT_PHY_QCFG_RESP_PHY_ADDR_MASK;
+ 	link_info->module_status = resp->module_status;
++	link_info->link_down_reason = resp->link_down_reason;
+ 
+ 	if (bp->phy_flags & BNXT_PHY_FL_EEE_CAP) {
+ 		struct ethtool_keee *eee = &bp->eee;
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@ -1552,6 +1552,7 @@ struct bnxt_link_info {
+ #define BNXT_LINK_STATE_DOWN	1
+ #define BNXT_LINK_STATE_UP	2
+ #define BNXT_LINK_IS_UP(bp)	((bp)->link_info.link_state == BNXT_LINK_STATE_UP)
++	u8			link_down_reason;
+ 	u8			active_lanes;
+ 	u8			duplex;
+ #define BNXT_LINK_DUPLEX_HALF	PORT_PHY_QCFG_RESP_DUPLEX_STATE_HALF
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
+@@ -3365,6 +3365,40 @@ static u32 bnxt_get_link(struct net_devi
+ 	return BNXT_LINK_IS_UP(bp);
+ }
+ 
++static int bnxt_get_link_ext_state(struct net_device *dev,
++				   struct ethtool_link_ext_state_info *info)
++{
++	struct bnxt *bp = netdev_priv(dev);
++	u8 reason;
++
++	if (BNXT_LINK_IS_UP(bp))
++		return -ENODATA;
++
++	reason = bp->link_info.link_down_reason;
++	if (reason & PORT_PHY_QCFG_RESP_LINK_DOWN_REASON_RF) {
++		info->link_ext_state = ETHTOOL_LINK_EXT_STATE_LINK_TRAINING_FAILURE;
++		info->link_training = ETHTOOL_LINK_EXT_SUBSTATE_LT_REMOTE_FAULT;
++		return 0;
++	}
++	if (reason & PORT_PHY_QCFG_RESP_LINK_DOWN_REASON_CABLE_REMOVED) {
++		info->link_ext_state = ETHTOOL_LINK_EXT_STATE_NO_CABLE;
++		return 0;
++	}
++	if (reason & PORT_PHY_QCFG_RESP_LINK_DOWN_REASON_OTP_SPEED_VIOLATION) {
++		info->link_ext_state = ETHTOOL_LINK_EXT_STATE_OTP_SPEED_VIOLATION;
++		return 0;
++	}
++	if (reason & PORT_PHY_QCFG_RESP_LINK_DOWN_REASON_MODULE_FAULT) {
++		info->link_ext_state = ETHTOOL_LINK_EXT_STATE_MODULE;
++		return 0;
++	}
++	if (reason & PORT_PHY_QCFG_RESP_LINK_DOWN_REASON_BMC_REQUEST) {
++		info->link_ext_state = ETHTOOL_LINK_EXT_STATE_BMC_REQUEST_DOWN;
++		return 0;
++	}
++	return -ENODATA;
++}
++
+ int bnxt_hwrm_nvm_get_dev_info(struct bnxt *bp,
+ 			       struct hwrm_nvm_get_dev_info_output *nvm_dev_info)
+ {
+@@ -5597,6 +5631,7 @@ const struct ethtool_ops bnxt_ethtool_op
+ 	.get_eeprom             = bnxt_get_eeprom,
+ 	.set_eeprom		= bnxt_set_eeprom,
+ 	.get_link		= bnxt_get_link,
++	.get_link_ext_state	= bnxt_get_link_ext_state,
+ 	.get_link_ext_stats	= bnxt_get_link_ext_stats,
+ 	.get_eee		= bnxt_get_eee,
+ 	.set_eee		= bnxt_set_eee,
+--- a/include/uapi/linux/ethtool.h
++++ b/include/uapi/linux/ethtool.h
+@@ -603,6 +603,8 @@ enum ethtool_link_ext_state {
+ 	ETHTOOL_LINK_EXT_STATE_POWER_BUDGET_EXCEEDED,
+ 	ETHTOOL_LINK_EXT_STATE_OVERHEAT,
+ 	ETHTOOL_LINK_EXT_STATE_MODULE,
++	ETHTOOL_LINK_EXT_STATE_OTP_SPEED_VIOLATION,
++	ETHTOOL_LINK_EXT_STATE_BMC_REQUEST_DOWN,
+ };
+ 
+ /* More information in addition to ETHTOOL_LINK_EXT_STATE_AUTONEG. */
