@@ -1,0 +1,61 @@
+From 4b9748055457ac3a0710bf210c229d01ea1b01b9 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Sun, 18 Jan 2026 19:48:01 -0700
+Subject: [PATCH] io_uring/rw: free potentially allocated iovec on cache put
+ failure
+Git-commit: 4b9748055457ac3a0710bf210c229d01ea1b01b9
+Patch-mainline: v6.19-rc7
+References: CVE-2026-23259 bsc#1259866
+
+If a read/write request goes through io_req_rw_cleanup() and has an
+allocated iovec attached and fails to put to the rw_cache, then it may
+end up with an unaccounted iovec pointer. Have io_rw_recycle() return
+whether it recycled the request or not, and use that to gauge whether to
+free a potential iovec or not.
+
+Reviewed-by: Nitesh Shetty <nj.shetty@samsung.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Gabriel Krisman Bertazi <krisman@suse.de>
+---
+ io_uring/rw.c |   13 ++++++++++---
+ 1 file changed, 10 insertions(+), 3 deletions(-)
+
+--- a/io_uring/rw.c
++++ b/io_uring/rw.c
+@@ -144,18 +144,20 @@ static inline int io_import_rw_buffer(in
+ 	return 0;
+ }
+ 
+-static void io_rw_recycle(struct io_kiocb *req, unsigned int issue_flags)
++static bool io_rw_recycle(struct io_kiocb *req, unsigned int issue_flags)
+ {
+ 	struct io_async_rw *rw = req->async_data;
+ 
+ 	if (unlikely(issue_flags & IO_URING_F_UNLOCKED))
+-		return;
++		return false;
+ 
+ 	io_alloc_cache_kasan(&rw->free_iovec, &rw->free_iov_nr);
+ 	if (io_alloc_cache_put(&req->ctx->rw_cache, rw)) {
+ 		req->async_data = NULL;
+ 		req->flags &= ~REQ_F_ASYNC_DATA;
++		return true;
+ 	}
++	return false;
+ }
+ 
+ static void io_req_rw_cleanup(struct io_kiocb *req, unsigned int issue_flags)
+@@ -189,7 +191,12 @@ static void io_req_rw_cleanup(struct io_
+ 	 */
+ 	if (!(req->flags & (REQ_F_REISSUE | REQ_F_REFCOUNT))) {
+ 		req->flags &= ~REQ_F_NEED_CLEANUP;
+-		io_rw_recycle(req, issue_flags);
++		if (!io_rw_recycle(req, issue_flags)) {
++			struct io_async_rw *rw = req->async_data;
++			kfree(rw->free_iovec);
++			rw->free_iov_nr = 0;
++			rw->free_iovec = NULL;
++		}
+ 	}
+ }
+ 
