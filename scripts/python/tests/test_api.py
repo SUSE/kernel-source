@@ -395,7 +395,7 @@ class TestOBS(unittest.TestCase):
         self.assertFalse(st.data_consumed)
 
     def test_Y(self):
-        st = ServerThread('tests/api/obsapi_log_in')
+        st = ServerThread('tests/api/obsapi_log_in_ssh')
         st.start_server(obsconfig=self.config)
         os.unlink(self.cookiejar)
         config = configparser.ConfigParser(delimiters=('='), interpolation=None)
