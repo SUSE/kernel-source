@@ -1,0 +1,66 @@
+From: Jan Kara <jack@suse.cz>
+Date: Thu, 5 Feb 2026 10:22:24 +0100
+Subject: [PATCH] ext4: fix stale xarray tags after writeback
+References: bsc#1012628
+Patch-mainline: 6.19.11
+Git-commit: f4a2b42e78914ff15630e71289adc589c3a8eb45
+
+commit f4a2b42e78914ff15630e71289adc589c3a8eb45 upstream.
+
+There are cases where ext4_bio_write_page() gets called for a page which
+has no buffers to submit. This happens e.g. when the part of the file is
+actually a hole, when we cannot allocate blocks due to being called from
+jbd2, or in data=journal mode when checkpointing writes the buffers
+earlier. In these cases we just return from ext4_bio_write_page()
+however if the page didn't need redirtying, we will leave stale DIRTY
+and/or TOWRITE tags in xarray because those get cleared only in
+__folio_start_writeback(). As a result we can leave these tags set in
+mappings even after a final sync on filesystem that's getting remounted
+read-only or that's being frozen. Various assertions can then get upset
+when writeback is started on such filesystems (Gerald reported assertion
+in ext4_journal_check_start() firing).
+
+Fix the problem by cycling the page through writeback state even if we
+decide nothing needs to be written for it so that xarray tags get
+properly updated. This is slightly silly (we could update the xarray
+tags directly) but I don't think a special helper messing with xarray
+tags is really worth it in this relatively rare corner case.
+
+Reported-by: Gerald Yang <gerald.yang@canonical.com>
+Link: https://lore.kernel.org/all/20260128074515.2028982-1-gerald.yang@canonical.com
+Fixes: dff4ac75eeee ("ext4: move keep_towrite handling to ext4_bio_write_page()")
+Signed-off-by: Jan Kara <jack@suse.cz>
+Link: https://patch.msgid.link/20260205092223.21287-2-jack@suse.cz
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Cc: stable@kernel.org
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ fs/ext4/page-io.c | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/fs/ext4/page-io.c b/fs/ext4/page-io.c
+index 39abfeec5f36..0a3ef9bd6803 100644
+--- a/fs/ext4/page-io.c
++++ b/fs/ext4/page-io.c
+@@ -523,9 +523,15 @@ int ext4_bio_write_folio(struct ext4_io_submit *io, struct folio *folio,
+ 		nr_to_submit++;
+ 	} while ((bh = bh->b_this_page) != head);
+ 
+-	/* Nothing to submit? Just unlock the folio... */
+-	if (!nr_to_submit)
++	if (!nr_to_submit) {
++		/*
++		 * We have nothing to submit. Just cycle the folio through
++		 * writeback state to properly update xarray tags.
++		 */
++		__folio_start_writeback(folio, keep_towrite);
++		folio_end_writeback(folio);
+ 		return 0;
++	}
+ 
+ 	bh = head = folio_buffers(folio);
+ 
+-- 
+2.53.0
+

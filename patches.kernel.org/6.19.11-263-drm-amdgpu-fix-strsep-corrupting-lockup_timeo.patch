@@ -1,0 +1,86 @@
+From: Ruijing Dong <ruijing.dong@amd.com>
+Date: Tue, 17 Mar 2026 13:54:11 -0400
+Subject: [PATCH] drm/amdgpu: fix strsep() corrupting lockup_timeout on
+ multi-GPU (v3)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+References: bsc#1012628
+Patch-mainline: 6.19.11
+Git-commit: 2d300ebfc411205fa31ba7741c5821d381912381
+
+commit 2d300ebfc411205fa31ba7741c5821d381912381 upstream.
+
+amdgpu_device_get_job_timeout_settings() passes a pointer directly
+to the global amdgpu_lockup_timeout[] buffer into strsep().
+strsep() destructively replaces delimiter characters with '\0'
+in-place.
+
+On multi-GPU systems, this function is called once per device.
+When a multi-value setting like "0,0,0,-1" is used, the first
+GPU's call transforms the global buffer into "0\00\00\0-1". The
+second GPU then sees only "0" (terminated at the first '\0'),
+parses a single value, hits the single-value fallthrough
+(index == 1), and applies timeout=0 to all rings — causing
+immediate false job timeouts.
+
+Fix this by copying into a stack-local array before calling
+strsep(), so the global module parameter buffer remains intact
+across calls. The buffer is AMDGPU_MAX_TIMEOUT_PARAM_LENGTH
+(256) bytes, which is safe for the stack.
+
+v2: wrap commit message to 72 columns, add Assisted-by tag.
+v3: use stack array with strscpy() instead of kstrdup()/kfree()
+    to avoid unnecessary heap allocation (Christian).
+
+This patch was developed with assistance from Claude (claude-opus-4-6).
+
+Assisted-by: Claude:claude-opus-4-6
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Ruijing Dong <ruijing.dong@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+(cherry picked from commit 94d79f51efecb74be1d88dde66bdc8bfcca17935)
+Cc: stable@vger.kernel.org
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 1726f6262f33..cd8a49e32e77 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -4361,7 +4361,8 @@ static void amdgpu_device_xgmi_reset_func(struct work_struct *__work)
+ 
+ static int amdgpu_device_get_job_timeout_settings(struct amdgpu_device *adev)
+ {
+-	char *input = amdgpu_lockup_timeout;
++	char buf[AMDGPU_MAX_TIMEOUT_PARAM_LENGTH];
++	char *input = buf;
+ 	char *timeout_setting = NULL;
+ 	int index = 0;
+ 	long timeout;
+@@ -4371,9 +4372,17 @@ static int amdgpu_device_get_job_timeout_settings(struct amdgpu_device *adev)
+ 	adev->gfx_timeout = adev->compute_timeout = adev->sdma_timeout =
+ 		adev->video_timeout = msecs_to_jiffies(2000);
+ 
+-	if (!strnlen(input, AMDGPU_MAX_TIMEOUT_PARAM_LENGTH))
++	if (!strnlen(amdgpu_lockup_timeout, AMDGPU_MAX_TIMEOUT_PARAM_LENGTH))
+ 		return 0;
+ 
++	/*
++	 * strsep() destructively modifies its input by replacing delimiters
++	 * with '\0'. Use a stack copy so the global module parameter buffer
++	 * remains intact for multi-GPU systems where this function is called
++	 * once per device.
++	 */
++	strscpy(buf, amdgpu_lockup_timeout, sizeof(buf));
++
+ 	while ((timeout_setting = strsep(&input, ",")) &&
+ 	       strnlen(timeout_setting, AMDGPU_MAX_TIMEOUT_PARAM_LENGTH)) {
+ 		ret = kstrtol(timeout_setting, 0, &timeout);
+-- 
+2.53.0
+

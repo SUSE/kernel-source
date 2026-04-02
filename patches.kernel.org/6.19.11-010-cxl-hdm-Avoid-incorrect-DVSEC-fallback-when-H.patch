@@ -1,0 +1,103 @@
+From: Smita Koralahalli <Smita.KoralahalliChannabasappa@amd.com>
+Date: Mon, 16 Mar 2026 20:19:49 +0000
+Subject: [PATCH] cxl/hdm: Avoid incorrect DVSEC fallback when HDM decoders are
+ enabled
+References: bsc#1012628
+Patch-mainline: 6.19.11
+Git-commit: 75cea0776de502f2a1be5ca02d37c586dc81887e
+
+[ Upstream commit 75cea0776de502f2a1be5ca02d37c586dc81887e ]
+
+Check the global CXL_HDM_DECODER_ENABLE bit instead of looping over
+per-decoder COMMITTED bits to determine whether to fall back to DVSEC
+range emulation. When the HDM decoder capability is globally enabled,
+ignore DVSEC range registers regardless of individual decoder commit
+state.
+
+should_emulate_decoders() currently loops over per-decoder COMMITTED
+bits, which leads to an incorrect DVSEC fallback when those bits are
+zero. One way to trigger this is to destroy a region and bounce the
+memdev:
+
+  cxl disable-region region0
+  cxl destroy-region region0
+  cxl disable-memdev mem0
+  cxl enable-memdev mem0
+
+Region teardown zeroes the HDM decoder registers including the committed
+bits. The subsequent memdev re-probe finds uncommitted decoders and falls
+back to DVSEC emulation, even though HDM remains globally enabled.
+
+Observed failures:
+
+  should_emulate_decoders: cxl_port endpoint6: decoder6.0: committed: 0 base: 0x0_00000000 size: 0x0_00000000
+  devm_cxl_setup_hdm: cxl_port endpoint6: Fallback map 1 range register
+  ..
+  devm_cxl_add_region: cxl_acpi ACPI0017:00: decoder0.0: created region0
+  __construct_region: cxl_pci 0000:e1:00.0: mem1:decoder6.0:
+  __construct_region region0 res: [mem 0x850000000-0x284fffffff flags 0x200] iw: 1 ig: 4096
+  cxl region0: pci0000:e0:port1 cxl_port_setup_targets expected iw: 1 ig: 4096 ..
+  cxl region0: pci0000:e0:port1 cxl_port_setup_targets got iw: 1 ig: 256 state: disabled ..
+  cxl_port endpoint6: failed to attach decoder6.0 to region0: -6
+  ..
+  devm_cxl_add_region: cxl_acpi ACPI0017:00: decoder0.0: created region4
+  alloc_hpa: cxl region4: HPA allocation error (-34) ..
+
+Fixes: 52cc48ad2a76 ("cxl/hdm: Limit emulation to the number of range registers")
+Signed-off-by: Smita Koralahalli <Smita.KoralahalliChannabasappa@amd.com>
+Reviewed-by: Dan Williams <dan.j.williams@intel.com>
+Link: https://patch.msgid.link/20260316201950.224567-1-Smita.KoralahalliChannabasappa@amd.com
+Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/cxl/core/hdm.c | 25 +++++++++----------------
+ 1 file changed, 9 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/cxl/core/hdm.c b/drivers/cxl/core/hdm.c
+index bc4b0c860725..ce27074bb5c7 100644
+--- a/drivers/cxl/core/hdm.c
++++ b/drivers/cxl/core/hdm.c
+@@ -94,7 +94,6 @@ static bool should_emulate_decoders(struct cxl_endpoint_dvsec_info *info)
+ 	struct cxl_hdm *cxlhdm;
+ 	void __iomem *hdm;
+ 	u32 ctrl;
+-	int i;
+ 
+ 	if (!info)
+ 		return false;
+@@ -113,22 +112,16 @@ static bool should_emulate_decoders(struct cxl_endpoint_dvsec_info *info)
+ 		return false;
+ 
+ 	/*
+-	 * If any decoders are committed already, there should not be any
+-	 * emulated DVSEC decoders.
++	 * If HDM decoders are globally enabled, do not fall back to DVSEC
++	 * range emulation. Zeroed decoder registers after region teardown
++	 * do not imply absence of HDM capability.
++	 *
++	 * Falling back to DVSEC here would treat the decoder as AUTO and
++	 * may incorrectly latch default interleave settings.
+ 	 */
+-	for (i = 0; i < cxlhdm->decoder_count; i++) {
+-		ctrl = readl(hdm + CXL_HDM_DECODER0_CTRL_OFFSET(i));
+-		dev_dbg(&info->port->dev,
+-			"decoder%d.%d: committed: %ld base: %#x_%.8x size: %#x_%.8x\n",
+-			info->port->id, i,
+-			FIELD_GET(CXL_HDM_DECODER0_CTRL_COMMITTED, ctrl),
+-			readl(hdm + CXL_HDM_DECODER0_BASE_HIGH_OFFSET(i)),
+-			readl(hdm + CXL_HDM_DECODER0_BASE_LOW_OFFSET(i)),
+-			readl(hdm + CXL_HDM_DECODER0_SIZE_HIGH_OFFSET(i)),
+-			readl(hdm + CXL_HDM_DECODER0_SIZE_LOW_OFFSET(i)));
+-		if (FIELD_GET(CXL_HDM_DECODER0_CTRL_COMMITTED, ctrl))
+-			return false;
+-	}
++	ctrl = readl(hdm + CXL_HDM_DECODER_CTRL_OFFSET);
++	if (ctrl & CXL_HDM_DECODER_ENABLE)
++		return false;
+ 
+ 	return true;
+ }
+-- 
+2.53.0
+

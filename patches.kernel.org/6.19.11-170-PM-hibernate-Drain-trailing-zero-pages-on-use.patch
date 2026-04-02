@@ -1,0 +1,65 @@
+From: Alberto Garcia <berto@igalia.com>
+Date: Mon, 9 Mar 2026 18:39:41 +0100
+Subject: [PATCH] PM: hibernate: Drain trailing zero pages on userspace restore
+References: bsc#1012628
+Patch-mainline: 6.19.11
+Git-commit: 734eba62cd32cb9ceffa09e57cdc03d761528525
+
+[ Upstream commit 734eba62cd32cb9ceffa09e57cdc03d761528525 ]
+
+Commit 005e8dddd497 ("PM: hibernate: don't store zero pages in the
+image file") added an optimization to skip zero-filled pages in the
+hibernation image. On restore, zero pages are handled internally by
+snapshot_write_next() in a loop that processes them without returning
+to the caller.
+
+With the userspace restore interface, writing the last non-zero page
+to /dev/snapshot is followed by the SNAPSHOT_ATOMIC_RESTORE ioctl. At
+this point there are no more calls to snapshot_write_next() so any
+trailing zero pages are not processed, snapshot_image_loaded() fails
+because handle->cur is smaller than expected, the ioctl returns -EPERM
+and the image is not restored.
+
+The in-kernel restore path is not affected by this because the loop in
+load_image() in swap.c calls snapshot_write_next() until it returns 0.
+It is this final call that drains any trailing zero pages.
+
+Fixed by calling snapshot_write_next() in snapshot_write_finalize(),
+giving the kernel the chance to drain any trailing zero pages.
+
+Fixes: 005e8dddd497 ("PM: hibernate: don't store zero pages in the image file")
+Signed-off-by: Alberto Garcia <berto@igalia.com>
+Acked-by: Brian Geffon <bgeffon@google.com>
+Link: https://patch.msgid.link/ef5a7c5e3e3dbd17dcb20efaa0c53a47a23498bb.1773075892.git.berto@igalia.com
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ kernel/power/snapshot.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/kernel/power/snapshot.c b/kernel/power/snapshot.c
+index 0a946932d5c1..5706287e7230 100644
+--- a/kernel/power/snapshot.c
++++ b/kernel/power/snapshot.c
+@@ -2855,6 +2855,17 @@ int snapshot_write_finalize(struct snapshot_handle *handle)
+ {
+ 	int error;
+ 
++	/*
++	 * Call snapshot_write_next() to drain any trailing zero pages,
++	 * but make sure we're in the data page region first.
++	 * This function can return PAGE_SIZE if the kernel was expecting
++	 * another copy page. Return -ENODATA in that situation.
++	 */
++	if (handle->cur > nr_meta_pages + 1) {
++		error = snapshot_write_next(handle);
++		if (error)
++			return error > 0 ? -ENODATA : error;
++	}
+ 	copy_last_highmem_page();
+ 	error = hibernate_restore_protect_page(handle->buffer);
+ 	/* Do that only if we have loaded the image entirely */
+-- 
+2.53.0
+

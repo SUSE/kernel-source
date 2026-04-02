@@ -1,0 +1,129 @@
+From: SeongJae Park <sj@kernel.org>
+Date: Thu, 19 Mar 2026 07:52:17 -0700
+Subject: [PATCH] mm/damon/core: avoid use of half-online-committed context
+References: bsc#1012628
+Patch-mainline: 6.19.11
+Git-commit: 26f775a054c3cda86ad465a64141894a90a9e145
+
+commit 26f775a054c3cda86ad465a64141894a90a9e145 upstream.
+
+One major usage of damon_call() is online DAMON parameters update.  It is
+done by calling damon_commit_ctx() inside the damon_call() callback
+function.  damon_commit_ctx() can fail for two reasons: 1) invalid
+parameters and 2) internal memory allocation failures.  In case of
+failures, the damon_ctx that attempted to be updated (commit destination)
+can be partially updated (or, corrupted from a perspective), and therefore
+shouldn't be used anymore.  The function only ensures the damon_ctx object
+can safely deallocated using damon_destroy_ctx().
+
+The API callers are, however, calling damon_commit_ctx() only after
+asserting the parameters are valid, to avoid damon_commit_ctx() fails due
+to invalid input parameters.  But it can still theoretically fail if the
+internal memory allocation fails.  In the case, DAMON may run with the
+partially updated damon_ctx.  This can result in unexpected behaviors
+including even NULL pointer dereference in case of damos_commit_dests()
+failure [1].  Such allocation failure is arguably too small to fail, so
+the real world impact would be rare.  But, given the bad consequence, this
+needs to be fixed.
+
+Avoid such partially-committed (maybe-corrupted) damon_ctx use by saving
+the damon_commit_ctx() failure on the damon_ctx object.  For this,
+introduce damon_ctx->maybe_corrupted field.  damon_commit_ctx() sets it
+when it is failed.  kdamond_call() checks if the field is set after each
+damon_call_control->fn() is executed.  If it is set, ignore remaining
+callback requests and return.  All kdamond_call() callers including
+kdamond_fn() also check the maybe_corrupted field right after
+kdamond_call() invocations.  If the field is set, break the kdamond_fn()
+main loop so that DAMON sill doesn't use the context that might be
+corrupted.
+
+[sj@kernel.org: let kdamond_call() with cancel regardless of maybe_corrupted]
+  Link: https://lkml.kernel.org/r/20260320031553.2479-1-sj@kernel.org
+  Link: https://sashiko.dev/#/patchset/20260319145218.86197-1-sj%40kernel.org
+Link: https://lkml.kernel.org/r/20260319145218.86197-1-sj@kernel.org
+Link: https://lore.kernel.org/20260319043309.97966-1-sj@kernel.org [1]
+Fixes: 3301f1861d34 ("mm/damon/sysfs: handle commit command using damon_call()")
+Signed-off-by: SeongJae Park <sj@kernel.org>
+Cc: <stable@vger.kernel.org>	[6.15+]
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: SeongJae Park <sj@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ include/linux/damon.h | 7 +++++++
+ mm/damon/core.c       | 9 ++++++++-
+ 2 files changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/include/linux/damon.h b/include/linux/damon.h
+index 33e59d53d9f1..e44ec9d76771 100644
+--- a/include/linux/damon.h
++++ b/include/linux/damon.h
+@@ -806,7 +806,14 @@ struct damon_ctx {
+ 	struct damos_walk_control *walk_control;
+ 	struct mutex walk_control_lock;
+ 
++	/*
++	 * indicate if this may be corrupted.  Currentonly this is set only for
++	 * damon_commit_ctx() failure.
++	 */
++	bool maybe_corrupted;
++
+ /* public: */
++	/* Working thread of the given DAMON context */
+ 	struct task_struct *kdamond;
+ 	struct mutex kdamond_lock;
+ 
+diff --git a/mm/damon/core.c b/mm/damon/core.c
+index ba3b7ff8ecf4..0464ef163b7c 100644
+--- a/mm/damon/core.c
++++ b/mm/damon/core.c
+@@ -1241,6 +1241,7 @@ int damon_commit_ctx(struct damon_ctx *dst, struct damon_ctx *src)
+ {
+ 	int err;
+ 
++	dst->maybe_corrupted = true;
+ 	if (!is_power_of_2(src->min_region_sz))
+ 		return -EINVAL;
+ 
+@@ -1266,6 +1267,7 @@ int damon_commit_ctx(struct damon_ctx *dst, struct damon_ctx *src)
+ 	dst->addr_unit = src->addr_unit;
+ 	dst->min_region_sz = src->min_region_sz;
+ 
++	dst->maybe_corrupted = false;
+ 	return 0;
+ }
+ 
+@@ -2610,10 +2612,11 @@ static void kdamond_call(struct damon_ctx *ctx, bool cancel)
+ 			complete(&control->completion);
+ 		} else if (control->canceled && control->dealloc_on_cancel) {
+ 			kfree(control);
+-			continue;
+ 		} else {
+ 			list_add(&control->list, &repeat_controls);
+ 		}
++		if (!cancel && ctx->maybe_corrupted)
++			break;
+ 	}
+ 	control = list_first_entry_or_null(&repeat_controls,
+ 			struct damon_call_control, list);
+@@ -2646,6 +2649,8 @@ static int kdamond_wait_activation(struct damon_ctx *ctx)
+ 		kdamond_usleep(min_wait_time);
+ 
+ 		kdamond_call(ctx, false);
++		if (ctx->maybe_corrupted)
++			return -EINVAL;
+ 		damos_walk_cancel(ctx);
+ 	}
+ 	return -EBUSY;
+@@ -2731,6 +2736,8 @@ static int kdamond_fn(void *data)
+ 		 * kdamond_merge_regions() if possible, to reduce overhead
+ 		 */
+ 		kdamond_call(ctx, false);
++		if (ctx->maybe_corrupted)
++			break;
+ 		if (!list_empty(&ctx->schemes))
+ 			kdamond_apply_schemes(ctx);
+ 		else
+-- 
+2.53.0
+

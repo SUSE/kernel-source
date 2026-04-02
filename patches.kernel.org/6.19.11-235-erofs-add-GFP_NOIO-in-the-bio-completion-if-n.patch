@@ -1,0 +1,68 @@
+From: Jiucheng Xu <jiucheng.xu@amlogic.com>
+Date: Wed, 11 Mar 2026 17:11:31 +0800
+Subject: [PATCH] erofs: add GFP_NOIO in the bio completion if needed
+References: bsc#1012628
+Patch-mainline: 6.19.11
+Git-commit: c23df30915f83e7257c8625b690a1cece94142a0
+
+commit c23df30915f83e7257c8625b690a1cece94142a0 upstream.
+
+The bio completion path in the process context (e.g. dm-verity)
+will directly call into decompression rather than trigger another
+workqueue context for minimal scheduling latencies, which can
+then call vm_map_ram() with GFP_KERNEL.
+
+Due to insufficient memory, vm_map_ram() may generate memory
+swapping I/O, which can cause submit_bio_wait to deadlock
+in some scenarios.
+
+Trimmed down the call stack, as follows:
+
+f2fs_submit_read_io
+  submit_bio                      //bio_list is initialized.
+    mmc_blk_mq_recovery
+      z_erofs_endio
+        vm_map_ram
+          __pte_alloc_kernel
+            __alloc_pages_direct_reclaim
+              shrink_folio_list
+                __swap_writepage
+                  submit_bio_wait  //bio_list is non-NULL, hang!!!
+
+Use memalloc_noio_{save,restore}() to wrap up this path.
+
+Reviewed-by: Gao Xiang <hsiangkao@linux.alibaba.com>
+Signed-off-by: Jiucheng Xu <jiucheng.xu@amlogic.com>
+Reviewed-by: Chao Yu <chao@kernel.org>
+Signed-off-by: Gao Xiang <hsiangkao@linux.alibaba.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ fs/erofs/zdata.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/fs/erofs/zdata.c b/fs/erofs/zdata.c
+index b71fcf4be484..8ba409df1ca7 100644
+--- a/fs/erofs/zdata.c
++++ b/fs/erofs/zdata.c
+@@ -1459,6 +1459,7 @@ static void z_erofs_decompress_kickoff(struct z_erofs_decompressqueue *io,
+ 				       int bios)
+ {
+ 	struct erofs_sb_info *const sbi = EROFS_SB(io->sb);
++	int gfp_flag;
+ 
+ 	/* wake up the caller thread for sync decompression */
+ 	if (io->sync) {
+@@ -1491,7 +1492,9 @@ static void z_erofs_decompress_kickoff(struct z_erofs_decompressqueue *io,
+ 			sbi->opt.sync_decompress = EROFS_SYNC_DECOMPRESS_FORCE_ON;
+ 		return;
+ 	}
++	gfp_flag = memalloc_noio_save();
+ 	z_erofs_decompressqueue_work(&io->u.work);
++	memalloc_noio_restore(gfp_flag);
+ }
+ 
+ static void z_erofs_fill_bio_vec(struct bio_vec *bvec,
+-- 
+2.53.0
+
