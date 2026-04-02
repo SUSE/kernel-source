@@ -1,0 +1,101 @@
+From: Petr Oros <poros@redhat.com>
+Date: Thu, 12 Feb 2026 08:53:11 +0100
+Subject: [PATCH] ice: use ice_update_eth_stats() for representor stats
+References: bsc#1258210
+Patch-mainline: 6.18.21
+Git-commit: 2526e440df2725e7328d59b835a164826f179b93
+
+[ Upstream commit 2526e440df2725e7328d59b835a164826f179b93 ]
+
+ice_repr_get_stats64() and __ice_get_ethtool_stats() call
+ice_update_vsi_stats() on the VF's src_vsi. This always returns early
+because ICE_VSI_DOWN is permanently set for VF VSIs - ice_up() is never
+called on them since queues are managed by iavf through virtchnl.
+
+In __ice_get_ethtool_stats() the original code called
+ice_update_vsi_stats() for all VSIs including representors, iterated
+over ice_gstrings_vsi_stats[] to populate the data, and then bailed out
+with an early return before the per-queue ring stats section. That early
+return was necessary because representor VSIs have no rings on the PF
+side - the rings belong to the VF driver (iavf), so accessing per-queue
+stats would be invalid.
+
+Move the representor handling to the top of __ice_get_ethtool_stats()
+and call ice_update_eth_stats() directly to read the hardware GLV_*
+counters. This matches ice_get_vf_stats() which already uses
+ice_update_eth_stats() for the same VF VSI in legacy mode. Apply the
+same fix to ice_repr_get_stats64().
+
+Note that ice_gstrings_vsi_stats[] contains five software ring counters
+(rx_buf_failed, rx_page_failed, tx_linearize, tx_busy, tx_restart) that
+are always zero for representors since the PF never processes packets on
+VF rings. This is pre-existing behavior unchanged by this patch.
+
+Fixes: 7aae80cef7ba ("ice: add port representor ethtool ops and stats")
+Signed-off-by: Petr Oros <poros@redhat.com>
+Reviewed-by: Aleksandr Loktionov <aleksandr.loktionov@intel.com>
+Tested-by: Patryk Holda <patryk.holda@intel.com>
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/net/ethernet/intel/ice/ice_ethtool.c | 14 +++++++++++---
+ drivers/net/ethernet/intel/ice/ice_repr.c    |  3 ++-
+ 2 files changed, 13 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/ethernet/intel/ice/ice_ethtool.c b/drivers/net/ethernet/intel/ice/ice_ethtool.c
+index 5396ddd66ef7..b52fcf7b899f 100644
+--- a/drivers/net/ethernet/intel/ice/ice_ethtool.c
++++ b/drivers/net/ethernet/intel/ice/ice_ethtool.c
+@@ -1940,6 +1940,17 @@ __ice_get_ethtool_stats(struct net_device *netdev,
+ 	int i = 0;
+ 	char *p;
+ 
++	if (ice_is_port_repr_netdev(netdev)) {
++		ice_update_eth_stats(vsi);
++
++		for (j = 0; j < ICE_VSI_STATS_LEN; j++) {
++			p = (char *)vsi + ice_gstrings_vsi_stats[j].stat_offset;
++			data[i++] = (ice_gstrings_vsi_stats[j].sizeof_stat ==
++				     sizeof(u64)) ? *(u64 *)p : *(u32 *)p;
++		}
++		return;
++	}
++
+ 	ice_update_pf_stats(pf);
+ 	ice_update_vsi_stats(vsi);
+ 
+@@ -1949,9 +1960,6 @@ __ice_get_ethtool_stats(struct net_device *netdev,
+ 			     sizeof(u64)) ? *(u64 *)p : *(u32 *)p;
+ 	}
+ 
+-	if (ice_is_port_repr_netdev(netdev))
+-		return;
+-
+ 	/* populate per queue stats */
+ 	rcu_read_lock();
+ 
+diff --git a/drivers/net/ethernet/intel/ice/ice_repr.c b/drivers/net/ethernet/intel/ice/ice_repr.c
+index 2a84f6564058..f1e82ba155cf 100644
+--- a/drivers/net/ethernet/intel/ice/ice_repr.c
++++ b/drivers/net/ethernet/intel/ice/ice_repr.c
+@@ -2,6 +2,7 @@
+ /* Copyright (C) 2019-2021, Intel Corporation. */
+ 
+ #include "ice.h"
++#include "ice_lib.h"
+ #include "ice_eswitch.h"
+ #include "devlink/devlink.h"
+ #include "devlink/port.h"
+@@ -67,7 +68,7 @@ ice_repr_get_stats64(struct net_device *netdev, struct rtnl_link_stats64 *stats)
+ 		return;
+ 	vsi = repr->src_vsi;
+ 
+-	ice_update_vsi_stats(vsi);
++	ice_update_eth_stats(vsi);
+ 	eth_stats = &vsi->eth_stats;
+ 
+ 	stats->tx_packets = eth_stats->tx_unicast + eth_stats->tx_broadcast +
+-- 
+2.51.0
+
