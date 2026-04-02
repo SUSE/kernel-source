@@ -1,0 +1,96 @@
+From: Filipe Manana <fdmanana@suse.com>
+Date: Tue, 3 Mar 2026 16:57:43 +0000
+Subject: [PATCH] btrfs: log new dentries when logging parent dir of a
+ conflicting inode
+Git-commit: 9573a365ff9ff45da9222d3fe63695ce562beb24
+Patch-mainline: v7.0-rc5
+References: git-fixes
+
+If we log the parent directory of a conflicting inode, we are not logging
+the new dentries of the directory, so when we finish we have the parent
+directory's inode marked as logged but we did not log its new dentries.
+As a consequence if the parent directory is explicitly fsynced later and
+it does not have any new changes since we logged it, the fsync is a no-op
+and after a power failure the new dentries are missing.
+
+Example scenario:
+
+  $ mkdir foo
+
+  $ sync
+
+  $rmdir foo
+
+  $ mkdir dir1
+  $ mkdir dir2
+
+  # A file with the same name and parent as the directory we just deleted
+  # and was persisted in a past transaction. So the deleted directory's
+  # inode is a conflicting inode of this new file's inode.
+  $ touch foo
+
+  $ ln foo dir2/link
+
+  # The fsync on dir2 will log the parent directory (".") because the
+  # conflicting inode (deleted directory) does not exists anymore, but it
+  # it does not log its new dentries (dir1).
+  $ xfs_io -c "fsync" dir2
+
+  # This fsync on the parent directory is no-op, since the previous fsync
+  # logged it (but without logging its new dentries).
+  $ xfs_io -c "fsync" .
+
+  <power failure>
+
+  # After log replay dir1 is missing.
+
+Fix this by ensuring we log new dir dentries whenever we log the parent
+directory of a no longer existing conflicting inode.
+
+A test case for fstests will follow soon.
+
+Reported-by: Vyacheslav Kovalevsky <slava.kovalevskiy.2014@gmail.com>
+Link: https://lore.kernel.org/linux-btrfs/182055fa-e9ce-4089-9f5f-4b8a23e8dd91@gmail.com/
+Fixes: a3baaf0d786e ("Btrfs: fix fsync after succession of renames and unlink/rmdir")
+Reviewed-by: Boris Burkov <boris@bur.io>
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/tree-log.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/fs/btrfs/tree-log.c b/fs/btrfs/tree-log.c
+index e1bd03ebfd981..37c272df52b05 100644
+--- a/fs/btrfs/tree-log.c
++++ b/fs/btrfs/tree-log.c
+@@ -6195,6 +6195,7 @@ static int log_conflicting_inodes(struct btrfs_trans_handle *trans,
+ 				  struct btrfs_root *root,
+ 				  struct btrfs_log_ctx *ctx)
+ {
++	const bool orig_log_new_dentries = ctx->log_new_dentries;
+ 	int ret = 0;
+ 
+ 	/*
+@@ -6256,7 +6257,11 @@ static int log_conflicting_inodes(struct btrfs_trans_handle *trans,
+ 			 * dir index key range logged for the directory. So we
+ 			 * must make sure the deletion is recorded.
+ 			 */
++			ctx->log_new_dentries = false;
+ 			ret = btrfs_log_inode(trans, inode, LOG_INODE_ALL, ctx);
++			if (!ret && ctx->log_new_dentries)
++				ret = log_new_dir_dentries(trans, inode, ctx);
++
+ 			btrfs_add_delayed_iput(inode);
+ 			if (ret)
+ 				break;
+@@ -6291,6 +6296,7 @@ static int log_conflicting_inodes(struct btrfs_trans_handle *trans,
+ 			break;
+ 	}
+ 
++	ctx->log_new_dentries = orig_log_new_dentries;
+ 	ctx->logging_conflict_inodes = false;
+ 	if (ret)
+ 		free_conflicting_inodes(ctx);
+-- 
+2.35.3
+
