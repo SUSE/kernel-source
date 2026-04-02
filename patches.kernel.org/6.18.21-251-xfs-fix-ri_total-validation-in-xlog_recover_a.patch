@@ -1,0 +1,68 @@
+From: Long Li <leo.lilong@huawei.com>
+Date: Fri, 20 Mar 2026 10:11:29 +0800
+Subject: [PATCH] xfs: fix ri_total validation in
+ xlog_recover_attri_commit_pass2
+References: bsc#1258210
+Patch-mainline: 6.18.21
+Git-commit: d72f2084e30966097c8eae762e31986a33c3c0ae
+
+commit d72f2084e30966097c8eae762e31986a33c3c0ae upstream.
+
+The ri_total checks for SET/REPLACE operations are hardcoded to 3,
+but xfs_attri_item_size() only emits a value iovec when value_len > 0,
+so ri_total is 2 when value_len == 0.
+
+For PPTR_SET/PPTR_REMOVE/PPTR_REPLACE, value_len is validated by
+xfs_attri_validate() to be exactly sizeof(struct xfs_parent_rec) and
+is never zero, so their hardcoded checks remain correct.
+
+This problem may cause log recovery failures. The following script can be
+used to reproduce the problem:
+
+ #!/bin/bash
+ mkfs.xfs -f /dev/sda
+ mount /dev/sda /mnt/test/
+ touch /mnt/test/file
+ for i in {1..200}; do
+         attr -s "user.attr_$i" -V "value_$i" /mnt/test/file > /dev/null
+ done
+ echo 1 > /sys/fs/xfs/debug/larp
+ echo 1 > /sys/fs/xfs/sda/errortag/larp
+ attr -s "user.zero" -V "" /mnt/test/file
+ echo 0 > /sys/fs/xfs/sda/errortag/larp
+ umount /mnt/test
+ mount /dev/sda /mnt/test/  # mount failed
+
+Fix this by deriving the expected count dynamically as "2 + !!value_len"
+for SET/REPLACE operations.
+
+Cc: stable@vger.kernel.org # v6.9
+Fixes: ad206ae50eca ("xfs: check opcode and iovec count match in xlog_recover_attri_commit_pass2")
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Signed-off-by: Long Li <leo.lilong@huawei.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Carlos Maiolino <cem@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ fs/xfs/xfs_attr_item.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/fs/xfs/xfs_attr_item.c b/fs/xfs/xfs_attr_item.c
+index e8fa326ac995..9adc71c0b1ad 100644
+--- a/fs/xfs/xfs_attr_item.c
++++ b/fs/xfs/xfs_attr_item.c
+@@ -1050,8 +1050,8 @@ xlog_recover_attri_commit_pass2(
+ 		break;
+ 	case XFS_ATTRI_OP_FLAGS_SET:
+ 	case XFS_ATTRI_OP_FLAGS_REPLACE:
+-		/* Log item, attr name, attr value */
+-		if (item->ri_total != 3) {
++		/* Log item, attr name, optional attr value */
++		if (item->ri_total != 2 + !!attri_formatp->alfi_value_len) {
+ 			XFS_CORRUPTION_ERROR(__func__, XFS_ERRLEVEL_LOW, mp,
+ 					     attri_formatp, len);
+ 			return -EFSCORRUPTED;
+-- 
+2.51.0
+
