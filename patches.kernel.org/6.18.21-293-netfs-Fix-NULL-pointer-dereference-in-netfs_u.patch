@@ -1,0 +1,66 @@
+From: Deepanshu Kartikey <kartikey406@gmail.com>
+Date: Sat, 7 Mar 2026 10:09:47 +0530
+Subject: [PATCH] netfs: Fix NULL pointer dereference in
+ netfs_unbuffered_write() on retry
+References: bsc#1258210
+Patch-mainline: 6.18.21
+Git-commit: e9075e420a1eb3b52c60f3b95893a55e77419ce8
+
+[ Upstream commit e9075e420a1eb3b52c60f3b95893a55e77419ce8 ]
+
+When a write subrequest is marked NETFS_SREQ_NEED_RETRY, the retry path
+in netfs_unbuffered_write() unconditionally calls stream->prepare_write()
+without checking if it is NULL.
+
+Filesystems such as 9P do not set the prepare_write operation, so
+stream->prepare_write remains NULL. When get_user_pages() fails with
+-EFAULT and the subrequest is flagged for retry, this results in a NULL
+pointer dereference at fs/netfs/direct_write.c:189.
+
+Fix this by mirroring the pattern already used in write_retry.c: if
+stream->prepare_write is NULL, skip renegotiation and directly reissue
+the subrequest via netfs_reissue_write(), which handles iterator reset,
+IN_PROGRESS flag, stats update and reissue internally.
+
+Fixes: a0b4c7a49137 ("netfs: Fix unbuffered/DIO writes to dispatch subrequests in strict sequence")
+Reported-by: syzbot+7227db0fbac9f348dba0@syzkaller.appspotmail.com
+Closes: https://syzkaller.appspot.com/bug?extid=7227db0fbac9f348dba0
+Signed-off-by: Deepanshu Kartikey <Kartikey406@gmail.com>
+Link: https://patch.msgid.link/20260307043947.347092-1-kartikey406@gmail.com
+Tested-by: syzbot+7227db0fbac9f348dba0@syzkaller.appspotmail.com
+Signed-off-by: Christian Brauner <brauner@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ fs/netfs/direct_write.c | 14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/fs/netfs/direct_write.c b/fs/netfs/direct_write.c
+index dd1451bf7543..4d9760e36c11 100644
+--- a/fs/netfs/direct_write.c
++++ b/fs/netfs/direct_write.c
+@@ -186,10 +186,18 @@ static int netfs_unbuffered_write(struct netfs_io_request *wreq)
+ 		stream->sreq_max_segs	= INT_MAX;
+ 
+ 		netfs_get_subrequest(subreq, netfs_sreq_trace_get_resubmit);
+-		stream->prepare_write(subreq);
+ 
+-		__set_bit(NETFS_SREQ_IN_PROGRESS, &subreq->flags);
+-		netfs_stat(&netfs_n_wh_retry_write_subreq);
++		if (stream->prepare_write) {
++			stream->prepare_write(subreq);
++			__set_bit(NETFS_SREQ_IN_PROGRESS, &subreq->flags);
++			netfs_stat(&netfs_n_wh_retry_write_subreq);
++		} else {
++			struct iov_iter source;
++
++			netfs_reset_iter(subreq);
++			source = subreq->io_iter;
++			netfs_reissue_write(stream, subreq, &source);
++		}
+ 	}
+ 
+ 	netfs_unbuffered_write_done(wreq);
+-- 
+2.51.0
+
