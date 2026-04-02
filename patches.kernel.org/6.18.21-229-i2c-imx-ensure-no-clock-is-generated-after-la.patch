@@ -1,0 +1,137 @@
+From: Stefan Eichenberger <stefan.eichenberger@toradex.com>
+Date: Wed, 18 Feb 2026 16:08:50 +0100
+Subject: [PATCH] i2c: imx: ensure no clock is generated after last read
+References: bsc#1258210
+Patch-mainline: 6.18.21
+Git-commit: 13101db735bdb29c5f60e95fb578690bd178b30f
+
+commit 13101db735bdb29c5f60e95fb578690bd178b30f upstream.
+
+When reading from the I2DR register, right after releasing the bus by
+clearing MSTA and MTX, the I2C controller might still generate an
+additional clock cycle which can cause devices to misbehave. Ensure to
+only read from I2DR after the bus is not busy anymore. Because this
+requires polling, the read of the last byte is moved outside of the
+interrupt handler.
+
+An example for such a failing transfer is this:
+i2ctransfer -y -a 0 w1@0x00 0x02 r1
+Error: Sending messages failed: Connection timed out
+It does not happen with every device because not all devices react to
+the additional clock cycle.
+
+Fixes: 5f5c2d4579ca ("i2c: imx: prevent rescheduling in non dma mode")
+Cc: stable@vger.kernel.org # v6.13+
+Signed-off-by: Stefan Eichenberger <stefan.eichenberger@toradex.com>
+Signed-off-by: Andi Shyti <andi.shyti@kernel.org>
+Link: https://lore.kernel.org/r/20260218150940.131354-3-eichest@gmail.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/i2c/busses/i2c-imx.c | 51 ++++++++++++++++++++++--------------
+ 1 file changed, 32 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/i2c/busses/i2c-imx.c b/drivers/i2c/busses/i2c-imx.c
+index 56e2a14495a9..452d120a210b 100644
+--- a/drivers/i2c/busses/i2c-imx.c
++++ b/drivers/i2c/busses/i2c-imx.c
+@@ -1018,8 +1018,9 @@ static inline int i2c_imx_isr_read(struct imx_i2c_struct *i2c_imx)
+ 	return 0;
+ }
+ 
+-static inline void i2c_imx_isr_read_continue(struct imx_i2c_struct *i2c_imx)
++static inline enum imx_i2c_state i2c_imx_isr_read_continue(struct imx_i2c_struct *i2c_imx)
+ {
++	enum imx_i2c_state next_state = IMX_I2C_STATE_READ_CONTINUE;
+ 	unsigned int temp;
+ 
+ 	if ((i2c_imx->msg->len - 1) == i2c_imx->msg_buf_idx) {
+@@ -1033,18 +1034,20 @@ static inline void i2c_imx_isr_read_continue(struct imx_i2c_struct *i2c_imx)
+ 				i2c_imx->stopped =  1;
+ 			temp &= ~(I2CR_MSTA | I2CR_MTX);
+ 			imx_i2c_write_reg(temp, i2c_imx, IMX_I2C_I2CR);
+-		} else {
+-			/*
+-			 * For i2c master receiver repeat restart operation like:
+-			 * read -> repeat MSTA -> read/write
+-			 * The controller must set MTX before read the last byte in
+-			 * the first read operation, otherwise the first read cost
+-			 * one extra clock cycle.
+-			 */
+-			temp = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2CR);
+-			temp |= I2CR_MTX;
+-			imx_i2c_write_reg(temp, i2c_imx, IMX_I2C_I2CR);
++
++			return IMX_I2C_STATE_DONE;
+ 		}
++		/*
++		 * For i2c master receiver repeat restart operation like:
++		 * read -> repeat MSTA -> read/write
++		 * The controller must set MTX before read the last byte in
++		 * the first read operation, otherwise the first read cost
++		 * one extra clock cycle.
++		 */
++		temp = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2CR);
++		temp |= I2CR_MTX;
++		imx_i2c_write_reg(temp, i2c_imx, IMX_I2C_I2CR);
++		next_state = IMX_I2C_STATE_DONE;
+ 	} else if (i2c_imx->msg_buf_idx == (i2c_imx->msg->len - 2)) {
+ 		temp = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2CR);
+ 		temp |= I2CR_TXAK;
+@@ -1052,6 +1055,7 @@ static inline void i2c_imx_isr_read_continue(struct imx_i2c_struct *i2c_imx)
+ 	}
+ 
+ 	i2c_imx->msg->buf[i2c_imx->msg_buf_idx++] = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2DR);
++	return next_state;
+ }
+ 
+ static inline void i2c_imx_isr_read_block_data_len(struct imx_i2c_struct *i2c_imx)
+@@ -1088,11 +1092,9 @@ static irqreturn_t i2c_imx_master_isr(struct imx_i2c_struct *i2c_imx, unsigned i
+ 		break;
+ 
+ 	case IMX_I2C_STATE_READ_CONTINUE:
+-		i2c_imx_isr_read_continue(i2c_imx);
+-		if (i2c_imx->msg_buf_idx == i2c_imx->msg->len) {
+-			i2c_imx->state = IMX_I2C_STATE_DONE;
++		i2c_imx->state = i2c_imx_isr_read_continue(i2c_imx);
++		if (i2c_imx->state == IMX_I2C_STATE_DONE)
+ 			wake_up(&i2c_imx->queue);
+-		}
+ 		break;
+ 
+ 	case IMX_I2C_STATE_READ_BLOCK_DATA:
+@@ -1490,6 +1492,7 @@ static int i2c_imx_read(struct imx_i2c_struct *i2c_imx, struct i2c_msg *msgs,
+ 			bool is_lastmsg)
+ {
+ 	int block_data = msgs->flags & I2C_M_RECV_LEN;
++	int ret = 0;
+ 
+ 	dev_dbg(&i2c_imx->adapter.dev,
+ 		"<%s> write slave address: addr=0x%x\n",
+@@ -1522,10 +1525,20 @@ static int i2c_imx_read(struct imx_i2c_struct *i2c_imx, struct i2c_msg *msgs,
+ 		dev_err(&i2c_imx->adapter.dev, "<%s> read timedout\n", __func__);
+ 		return -ETIMEDOUT;
+ 	}
+-	if (i2c_imx->is_lastmsg && !i2c_imx->stopped)
+-		return i2c_imx_bus_busy(i2c_imx, 0, false);
++	if (i2c_imx->is_lastmsg) {
++		if (!i2c_imx->stopped)
++			ret = i2c_imx_bus_busy(i2c_imx, 0, false);
++		/*
++		 * Only read the last byte of the last message after the bus is
++		 * not busy. Else the controller generates another clock which
++		 * might confuse devices.
++		 */
++		if (!ret)
++			i2c_imx->msg->buf[i2c_imx->msg_buf_idx++] = imx_i2c_read_reg(i2c_imx,
++										     IMX_I2C_I2DR);
++	}
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ static int i2c_imx_xfer_common(struct i2c_adapter *adapter,
+-- 
+2.51.0
+

@@ -1,0 +1,81 @@
+From: Xuan Zhuo <xuanzhuo@linux.alibaba.com>
+Date: Fri, 20 Mar 2026 10:18:18 +0800
+Subject: [PATCH] virtio-net: correct hdr_len handling for tunnel gso
+References: bsc#1258210
+Patch-mainline: 6.18.21
+Git-commit: 6c860dc02a8e60b438e26940227dfa641fcdb66a
+
+[ Upstream commit 6c860dc02a8e60b438e26940227dfa641fcdb66a ]
+
+The commit a2fb4bc4e2a6a03 ("net: implement virtio helpers to handle UDP
+GSO tunneling.") introduces support for the UDP GSO tunnel feature in
+virtio-net.
+
+The virtio spec says:
+
+    If the \field{gso_type} has the VIRTIO_NET_HDR_GSO_UDP_TUNNEL_IPV4 bit or
+    VIRTIO_NET_HDR_GSO_UDP_TUNNEL_IPV6 bit set, \field{hdr_len} accounts for
+    all the headers up to and including the inner transport.
+
+The commit did not update the hdr_len to include the inner transport.
+
+I observed that the "hdr_len" is 116 for this packet:
+
+    17:36:18.241105 52:55:00:d1:27:0a > 2e:2c:df:46:a9:e1, ethertype IPv4 (0x0800), length 2912: (tos 0x0, ttl 64, id 45197, offset 0, flags [none], proto UDP (17), length 2898)
+        192.168.122.100.50613 > 192.168.122.1.4789: [bad udp cksum 0x8106 -> 0x26a0!] VXLAN, flags [I] (0x08), vni 1
+    fa:c3:ba:82:05:ee > ce:85:0c:31:77:e5, ethertype IPv4 (0x0800), length 2862: (tos 0x0, ttl 64, id 14678, offset 0, flags [DF], proto TCP (6), length 2848)
+        192.168.3.1.49880 > 192.168.3.2.9898: Flags [P.], cksum 0x9266 (incorrect -> 0xaa20), seq 515667:518463, ack 1, win 64, options [nop,nop,TS val 2990048824 ecr 2798801412], length 2796
+
+116 = 14(mac) + 20(ip) + 8(udp) + 8(vxlan) + 14(inner mac) + 20(inner ip) + 32(innner tcp)
+
+Fixes: a2fb4bc4e2a6a03 ("net: implement virtio helpers to handle UDP GSO tunneling.")
+Signed-off-by: Xuan Zhuo <xuanzhuo@linux.alibaba.com>
+Link: https://patch.msgid.link/20260320021818.111741-3-xuanzhuo@linux.alibaba.com
+Acked-by: Michael S. Tsirkin <mst@redhat.com>
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ include/linux/virtio_net.h | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/include/linux/virtio_net.h b/include/linux/virtio_net.h
+index 361b60c8be68..f36d21b5bc19 100644
+--- a/include/linux/virtio_net.h
++++ b/include/linux/virtio_net.h
+@@ -224,6 +224,22 @@ static inline void __virtio_net_set_hdrlen(const struct sk_buff *skb,
+ 	hdr->hdr_len = __cpu_to_virtio16(little_endian, hdr_len);
+ }
+ 
++/* This function must be called after virtio_net_hdr_from_skb(). */
++static inline void __virtio_net_set_tnl_hdrlen(const struct sk_buff *skb,
++					       struct virtio_net_hdr *hdr)
++{
++	u16 hdr_len;
++
++	hdr_len = skb_inner_transport_offset(skb);
++
++	if (hdr->gso_type == VIRTIO_NET_HDR_GSO_UDP_L4)
++		hdr_len += sizeof(struct udphdr);
++	else
++		hdr_len += inner_tcp_hdrlen(skb);
++
++	hdr->hdr_len = __cpu_to_virtio16(true, hdr_len);
++}
++
+ static inline int virtio_net_hdr_from_skb(const struct sk_buff *skb,
+ 					  struct virtio_net_hdr *hdr,
+ 					  bool little_endian,
+@@ -440,6 +456,9 @@ virtio_net_hdr_tnl_from_skb(const struct sk_buff *skb,
+ 	if (ret)
+ 		return ret;
+ 
++	if (feature_hdrlen && hdr->hdr_len)
++		__virtio_net_set_tnl_hdrlen(skb, hdr);
++
+ 	if (skb->protocol == htons(ETH_P_IPV6))
+ 		hdr->gso_type |= VIRTIO_NET_HDR_GSO_UDP_TUNNEL_IPV6;
+ 	else
+-- 
+2.51.0
+
