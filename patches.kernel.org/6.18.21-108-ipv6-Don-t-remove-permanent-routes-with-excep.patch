@@ -1,0 +1,145 @@
+From: Kuniyuki Iwashima <kuniyu@google.com>
+Date: Fri, 20 Mar 2026 07:23:00 +0000
+Subject: [PATCH] ipv6: Don't remove permanent routes with exceptions from
+ tb6_gc_hlist.
+References: bsc#1258210
+Patch-mainline: 6.18.21
+Git-commit: 4be7b99c253f0c85a255cc1db7127ba3232dfa30
+
+[ Upstream commit 4be7b99c253f0c85a255cc1db7127ba3232dfa30 ]
+
+The cited commit mechanically put fib6_remove_gc_list()
+just after every fib6_clean_expires() call.
+
+When a temporary route is promoted to a permanent route,
+there may already be exception routes tied to it.
+
+If fib6_remove_gc_list() removes the route from tb6_gc_hlist,
+such exception routes will no longer be aged.
+
+Let's replace fib6_remove_gc_list() with a new helper
+fib6_may_remove_gc_list() and use fib6_age_exceptions() there.
+
+Note that net->ipv6 is only compiled when CONFIG_IPV6 is
+enabled, so fib6_{add,remove,may_remove}_gc_list() are guarded.
+
+Fixes: 5eb902b8e719 ("net/ipv6: Remove expired routes with a separated list of routes.")
+Signed-off-by: Kuniyuki Iwashima <kuniyu@google.com>
+Reviewed-by: David Ahern <dsahern@kernel.org>
+Link: https://patch.msgid.link/20260320072317.2561779-3-kuniyu@google.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ include/net/ip6_fib.h | 21 ++++++++++++++++++++-
+ net/ipv6/addrconf.c   |  4 ++--
+ net/ipv6/ip6_fib.c    |  6 +++---
+ net/ipv6/route.c      |  2 +-
+ 4 files changed, 26 insertions(+), 7 deletions(-)
+
+diff --git a/include/net/ip6_fib.h b/include/net/ip6_fib.h
+index 88b0dd4d8e09..9f8b6814a96a 100644
+--- a/include/net/ip6_fib.h
++++ b/include/net/ip6_fib.h
+@@ -507,12 +507,14 @@ void fib6_rt_update(struct net *net, struct fib6_info *rt,
+ void inet6_rt_notify(int event, struct fib6_info *rt, struct nl_info *info,
+ 		     unsigned int flags);
+ 
++void fib6_age_exceptions(struct fib6_info *rt, struct fib6_gc_args *gc_args,
++			 unsigned long now);
+ void fib6_run_gc(unsigned long expires, struct net *net, bool force);
+-
+ void fib6_gc_cleanup(void);
+ 
+ int fib6_init(void);
+ 
++#if IS_ENABLED(CONFIG_IPV6)
+ /* Add the route to the gc list if it is not already there
+  *
+  * The callers should hold f6i->fib6_table->tb6_lock.
+@@ -545,6 +547,23 @@ static inline void fib6_remove_gc_list(struct fib6_info *f6i)
+ 		hlist_del_init(&f6i->gc_link);
+ }
+ 
++static inline void fib6_may_remove_gc_list(struct net *net,
++					   struct fib6_info *f6i)
++{
++	struct fib6_gc_args gc_args;
++
++	if (hlist_unhashed(&f6i->gc_link))
++		return;
++
++	gc_args.timeout = READ_ONCE(net->ipv6.sysctl.ip6_rt_gc_interval);
++	gc_args.more = 0;
++
++	rcu_read_lock();
++	fib6_age_exceptions(f6i, &gc_args, jiffies);
++	rcu_read_unlock();
++}
++#endif
++
+ struct ipv6_route_iter {
+ 	struct seq_net_private p;
+ 	struct fib6_walker w;
+diff --git a/net/ipv6/addrconf.c b/net/ipv6/addrconf.c
+index cad5e4ab8c3d..4a745566b760 100644
+--- a/net/ipv6/addrconf.c
++++ b/net/ipv6/addrconf.c
+@@ -2863,7 +2863,7 @@ void addrconf_prefix_rcv(struct net_device *dev, u8 *opt, int len, bool sllao)
+ 					fib6_add_gc_list(rt);
+ 				} else {
+ 					fib6_clean_expires(rt);
+-					fib6_remove_gc_list(rt);
++					fib6_may_remove_gc_list(net, rt);
+ 				}
+ 
+ 				spin_unlock_bh(&table->tb6_lock);
+@@ -4836,7 +4836,7 @@ static int modify_prefix_route(struct net *net, struct inet6_ifaddr *ifp,
+ 
+ 		if (!(flags & RTF_EXPIRES)) {
+ 			fib6_clean_expires(f6i);
+-			fib6_remove_gc_list(f6i);
++			fib6_may_remove_gc_list(net, f6i);
+ 		} else {
+ 			fib6_set_expires(f6i, expires);
+ 			fib6_add_gc_list(f6i);
+diff --git a/net/ipv6/ip6_fib.c b/net/ipv6/ip6_fib.c
+index a22af1c8f93a..ffa773359833 100644
+--- a/net/ipv6/ip6_fib.c
++++ b/net/ipv6/ip6_fib.c
+@@ -1133,7 +1133,7 @@ static int fib6_add_rt2node(struct fib6_node *fn, struct fib6_info *rt,
+ 					return -EEXIST;
+ 				if (!(rt->fib6_flags & RTF_EXPIRES)) {
+ 					fib6_clean_expires(iter);
+-					fib6_remove_gc_list(iter);
++					fib6_may_remove_gc_list(info->nl_net, iter);
+ 				} else {
+ 					fib6_set_expires(iter, rt->expires);
+ 					fib6_add_gc_list(iter);
+@@ -2348,8 +2348,8 @@ static void fib6_flush_trees(struct net *net)
+ /*
+  *	Garbage collection
+  */
+-static void fib6_age_exceptions(struct fib6_info *rt, struct fib6_gc_args *gc_args,
+-				unsigned long now)
++void fib6_age_exceptions(struct fib6_info *rt, struct fib6_gc_args *gc_args,
++			 unsigned long now)
+ {
+ 	bool may_expire = rt->fib6_flags & RTF_EXPIRES && rt->expires;
+ 	int old_more = gc_args->more;
+diff --git a/net/ipv6/route.c b/net/ipv6/route.c
+index e01331d96531..446f4de7d6a2 100644
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@ -1033,7 +1033,7 @@ int rt6_route_rcv(struct net_device *dev, u8 *opt, int len,
+ 
+ 		if (!addrconf_finite_timeout(lifetime)) {
+ 			fib6_clean_expires(rt);
+-			fib6_remove_gc_list(rt);
++			fib6_may_remove_gc_list(net, rt);
+ 		} else {
+ 			fib6_set_expires(rt, jiffies + HZ * lifetime);
+ 			fib6_add_gc_list(rt);
+-- 
+2.51.0
+
