@@ -1,0 +1,85 @@
+From: Pratap Nirujogi <pratap.nirujogi@amd.com>
+Date: Fri, 20 Mar 2026 16:12:22 -0400
+Subject: [PATCH] i2c: designware: amdisp: Fix resume-probe race condition
+ issue
+References: bsc#1258210
+Patch-mainline: 6.18.21
+Git-commit: e2f1ada8e089dd5a331bcd8b88125ae2af8d188f
+
+commit e2f1ada8e089dd5a331bcd8b88125ae2af8d188f upstream.
+
+Identified resume-probe race condition in kernel v7.0 with the commit
+38fa29b01a6a ("i2c: designware: Combine the init functions"),but this
+issue existed from the beginning though not detected.
+
+The amdisp i2c device requires ISP to be in power-on state for probe
+to succeed. To meet this requirement, this device is added to genpd
+to control ISP power using runtime PM. The pm_runtime_get_sync() called
+before i2c_dw_probe() triggers PM resume, which powers on ISP and also
+invokes the amdisp i2c runtime resume before the probe completes resulting
+in this race condition and a NULL dereferencing issue in v7.0
+
+Fix this race condition by using the genpd APIs directly during probe:
+  - Call dev_pm_genpd_resume() to Power ON ISP before probe
+  - Call dev_pm_genpd_suspend() to Power OFF ISP after probe
+  - Set the device to suspended state with pm_runtime_set_suspended()
+  - Enable runtime PM only after the device is fully initialized
+
+Fixes: d6263c468a761 ("i2c: amd-isp: Add ISP i2c-designware driver")
+Co-developed-by: Bin Du <bin.du@amd.com>
+Signed-off-by: Bin Du <bin.du@amd.com>
+Signed-off-by: Pratap Nirujogi <pratap.nirujogi@amd.com>
+Cc: <stable@vger.kernel.org> # v6.16+
+Acked-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+Reviewed-by: Mario Limonciello (AMD) <superm1@kernel.org>
+Reviewed-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+Signed-off-by: Andi Shyti <andi.shyti@kernel.org>
+Link: https://lore.kernel.org/r/20260320201302.3490570-1-pratap.nirujogi@amd.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/i2c/busses/i2c-designware-amdisp.c | 11 +++++------
+ 1 file changed, 5 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/i2c/busses/i2c-designware-amdisp.c b/drivers/i2c/busses/i2c-designware-amdisp.c
+index 450793d5f839..e0c3669bab08 100644
+--- a/drivers/i2c/busses/i2c-designware-amdisp.c
++++ b/drivers/i2c/busses/i2c-designware-amdisp.c
+@@ -7,6 +7,7 @@
+ 
+ #include <linux/module.h>
+ #include <linux/platform_device.h>
++#include <linux/pm_domain.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/soc/amd/isp4_misc.h>
+ 
+@@ -82,22 +83,20 @@ static int amd_isp_dw_i2c_plat_probe(struct platform_device *pdev)
+ 	if (isp_i2c_dev->shared_with_punit)
+ 		pm_runtime_get_noresume(&pdev->dev);
+ 
+-	pm_runtime_enable(&pdev->dev);
+-	pm_runtime_get_sync(&pdev->dev);
+-
++	dev_pm_genpd_resume(&pdev->dev);
+ 	ret = i2c_dw_probe(isp_i2c_dev);
+ 	if (ret) {
+ 		dev_err_probe(&pdev->dev, ret, "i2c_dw_probe failed\n");
+ 		goto error_release_rpm;
+ 	}
+-
+-	pm_runtime_put_sync(&pdev->dev);
++	dev_pm_genpd_suspend(&pdev->dev);
++	pm_runtime_set_suspended(&pdev->dev);
++	pm_runtime_enable(&pdev->dev);
+ 
+ 	return 0;
+ 
+ error_release_rpm:
+ 	amd_isp_dw_i2c_plat_pm_cleanup(isp_i2c_dev);
+-	pm_runtime_put_sync(&pdev->dev);
+ 	return ret;
+ }
+ 
+-- 
+2.51.0
+
