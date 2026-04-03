@@ -1,0 +1,273 @@
+From 124722a1f22984f38df1f359356a81c886aed21c Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Fri, 26 Sep 2025 21:43:56 +0200
+Subject: [PATCH] sched/fair: Increase weight bits for avg_vruntime
+
+References: bsc#1234634 (Scheduler functional and performance backports SL-16.1)
+Git-commit: 4823725d9d1d9cc5b36647e0cb8ff616cad6536f
+Patch-mainline: Queued in subsystem maintainer repository
+Git-repo: git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip.git
+
+Due to the zero_vruntime patch, the deltas are now a lot smaller and
+measurement with kernel-build and hackbench runs show about 45 bits
+used.
+
+This ensures avg_vruntime() tracks the full weight range, reducing
+numerical artifacts in reweight and the like.
+
+Also, lets keep the paranoid debug code around fow now.
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Tested-by: K Prateek Nayak <kprateek.nayak@amd.com>
+Tested-by: Shubhang Kaushik <shubhang@os.amperecomputing.com>
+Link: https://patch.msgid.link/20260219080624.942813440%40infradead.org
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+---
+ kernel/sched/debug.c    | 14 +++++++-
+ kernel/sched/fair.c     | 96 +++++++++++++++++++++++++++++++++++++++----------
+ kernel/sched/features.h |  2 ++
+ kernel/sched/sched.h    |  3 +-
+ 4 files changed, 94 insertions(+), 21 deletions(-)
+
+diff --git a/kernel/sched/debug.c b/kernel/sched/debug.c
+index 393491d12521..8c4b6c43b66f 100644
+--- a/kernel/sched/debug.c
++++ b/kernel/sched/debug.c
+@@ -8,6 +8,7 @@
+  */
+ #include <linux/debugfs.h>
+ #include <linux/nmi.h>
++#include <linux/log2.h>
+ #include "sched.h"
+ 
+ /*
+@@ -806,10 +807,13 @@ static void print_rq(struct seq_file *m, struct rq *rq, int rq_cpu)
+ 
+ void print_cfs_rq(struct seq_file *m, int cpu, struct cfs_rq *cfs_rq)
+ {
+-	s64 left_vruntime = -1, zero_vruntime, right_vruntime = -1, left_deadline = -1, spread;
++	s64 left_vruntime = -1, right_vruntime = -1, left_deadline = -1, spread;
++	s64 zero_vruntime = -1, sum_w_vruntime = -1;
+ 	struct sched_entity *last, *first, *root;
+ 	struct rq *rq = cpu_rq(cpu);
++	unsigned int sum_shift;
+ 	unsigned long flags;
++	u64 sum_weight;
+ 
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ 	SEQ_printf(m, "\n");
+@@ -830,6 +834,9 @@ void print_cfs_rq(struct seq_file *m, int cpu, struct cfs_rq *cfs_rq)
+ 	if (last)
+ 		right_vruntime = last->vruntime;
+ 	zero_vruntime = cfs_rq->zero_vruntime;
++	sum_w_vruntime = cfs_rq->sum_w_vruntime;
++	sum_weight = cfs_rq->sum_weight;
++	sum_shift = cfs_rq->sum_shift;
+ 	raw_spin_rq_unlock_irqrestore(rq, flags);
+ 
+ 	SEQ_printf(m, "  .%-30s: %Ld.%06ld\n", "left_deadline",
+@@ -838,6 +845,11 @@ void print_cfs_rq(struct seq_file *m, int cpu, struct cfs_rq *cfs_rq)
+ 			SPLIT_NS(left_vruntime));
+ 	SEQ_printf(m, "  .%-30s: %Ld.%06ld\n", "zero_vruntime",
+ 			SPLIT_NS(zero_vruntime));
++	SEQ_printf(m, "  .%-30s: %Ld (%d bits)\n", "sum_w_vruntime",
++		   sum_w_vruntime, ilog2(abs(sum_w_vruntime)));
++	SEQ_printf(m, "  .%-30s: %Lu\n", "sum_weight",
++		   sum_weight);
++	SEQ_printf(m, "  .%-30s: %u\n", "sum_shift", sum_shift);
+ 	SEQ_printf(m, "  .%-30s: %Ld.%06ld\n", "avg_vruntime",
+ 			SPLIT_NS(avg_vruntime(cfs_rq)));
+ 	SEQ_printf(m, "  .%-30s: %Ld.%06ld\n", "right_vruntime",
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 6016486210f6..c45748658570 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -667,25 +667,83 @@ static inline s64 entity_key(struct cfs_rq *cfs_rq, struct sched_entity *se)
+  * Since zero_vruntime closely tracks the per-task service, these
+  * deltas: (v_i - v0), will be in the order of the maximal (virtual) lag
+  * induced in the system due to quantisation.
+- *
+- * Also, we use scale_load_down() to reduce the size.
+- *
+- * As measured, the max (key * weight) value was ~44 bits for a kernel build.
+  */
++static inline unsigned long avg_vruntime_weight(struct cfs_rq *cfs_rq, unsigned long w)
++{
++#ifdef CONFIG_64BIT
++	if (cfs_rq->sum_shift)
++		w = max(2UL, w >> cfs_rq->sum_shift);
++#endif
++	return w;
++}
++
++static inline void
++__sum_w_vruntime_add(struct cfs_rq *cfs_rq, struct sched_entity *se)
++{
++	unsigned long weight = avg_vruntime_weight(cfs_rq, se->load.weight);
++	s64 w_vruntime, key = entity_key(cfs_rq, se);
++
++	w_vruntime = key * weight;
++	WARN_ON_ONCE((w_vruntime >> 63) != (w_vruntime >> 62));
++
++	cfs_rq->sum_w_vruntime += w_vruntime;
++	cfs_rq->sum_weight += weight;
++}
++
+ static void
+-sum_w_vruntime_add(struct cfs_rq *cfs_rq, struct sched_entity *se)
++sum_w_vruntime_add_paranoid(struct cfs_rq *cfs_rq, struct sched_entity *se)
+ {
+-	unsigned long weight = scale_load_down(se->load.weight);
+-	s64 key = entity_key(cfs_rq, se);
++	unsigned long weight;
++	s64 key, tmp;
++
++again:
++	weight = avg_vruntime_weight(cfs_rq, se->load.weight);
++	key = entity_key(cfs_rq, se);
+ 
+-	cfs_rq->sum_w_vruntime += key * weight;
++	if (check_mul_overflow(key, weight, &key))
++		goto overflow;
++
++	if (check_add_overflow(cfs_rq->sum_w_vruntime, key, &tmp))
++		goto overflow;
++
++	cfs_rq->sum_w_vruntime = tmp;
+ 	cfs_rq->sum_weight += weight;
++	return;
++
++overflow:
++	/*
++	 * There's gotta be a limit -- if we're still failing at this point
++	 * there's really nothing much to be done about things.
++	 */
++	BUG_ON(cfs_rq->sum_shift >= 10);
++	cfs_rq->sum_shift++;
++
++	/*
++	 * Note: \Sum (k_i * (w_i >> 1)) != (\Sum (k_i * w_i)) >> 1
++	 */
++	cfs_rq->sum_w_vruntime = 0;
++	cfs_rq->sum_weight = 0;
++
++	for (struct rb_node *node = cfs_rq->tasks_timeline.rb_leftmost;
++	     node; node = rb_next(node))
++		__sum_w_vruntime_add(cfs_rq, __node_2_se(node));
++
++	goto again;
++}
++
++static void
++sum_w_vruntime_add(struct cfs_rq *cfs_rq, struct sched_entity *se)
++{
++	if (sched_feat(PARANOID_AVG))
++		return sum_w_vruntime_add_paranoid(cfs_rq, se);
++
++	__sum_w_vruntime_add(cfs_rq, se);
+ }
+ 
+ static void
+ sum_w_vruntime_sub(struct cfs_rq *cfs_rq, struct sched_entity *se)
+ {
+-	unsigned long weight = scale_load_down(se->load.weight);
++	unsigned long weight = avg_vruntime_weight(cfs_rq, se->load.weight);
+ 	s64 key = entity_key(cfs_rq, se);
+ 
+ 	cfs_rq->sum_w_vruntime -= key * weight;
+@@ -727,7 +785,7 @@ u64 avg_vruntime(struct cfs_rq *cfs_rq)
+ 		s64 runtime = cfs_rq->sum_w_vruntime;
+ 
+ 		if (curr) {
+-			unsigned long w = scale_load_down(curr->load.weight);
++			unsigned long w = avg_vruntime_weight(cfs_rq, curr->load.weight);
+ 
+ 			runtime += entity_key(cfs_rq, curr) * w;
+ 			weight += w;
+@@ -737,7 +795,7 @@ u64 avg_vruntime(struct cfs_rq *cfs_rq)
+ 		if (runtime < 0)
+ 			runtime -= (weight - 1);
+ 
+-		delta = div_s64(runtime, weight);
++		delta = div64_long(runtime, weight);
+ 	} else if (curr) {
+ 		/*
+ 		 * When there is but one element, it is the average.
+@@ -803,7 +861,7 @@ static int vruntime_eligible(struct cfs_rq *cfs_rq, u64 vruntime)
+ 	long load = cfs_rq->sum_weight;
+ 
+ 	if (curr && curr->on_rq) {
+-		unsigned long weight = scale_load_down(curr->load.weight);
++		unsigned long weight = avg_vruntime_weight(cfs_rq, curr->load.weight);
+ 
+ 		avg += entity_key(cfs_rq, curr) * weight;
+ 		load += weight;
+@@ -3879,12 +3937,12 @@ static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
+ 	 * Because we keep se->vlag = V - v_i, while: lag_i = w_i*(V - v_i),
+ 	 * we need to scale se->vlag when w_i changes.
+ 	 */
+-	se->vlag = div_s64(se->vlag * se->load.weight, weight);
++	se->vlag = div64_long(se->vlag * se->load.weight, weight);
+ 	if (se->rel_deadline)
+-		se->deadline = div_s64(se->deadline * se->load.weight, weight);
++		se->deadline = div64_long(se->deadline * se->load.weight, weight);
+ 
+ 	if (rel_vprot)
+-		vprot = div_s64(vprot * se->load.weight, weight);
++		vprot = div64_long(vprot * se->load.weight, weight);
+ 
+ 	update_load_set(&se->load, weight);
+ 
+@@ -5238,7 +5296,7 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+ 	 */
+ 	if (sched_feat(PLACE_LAG) && cfs_rq->nr_queued && se->vlag) {
+ 		struct sched_entity *curr = cfs_rq->curr;
+-		unsigned long load;
++		long load;
+ 
+ 		lag = se->vlag;
+ 
+@@ -5296,12 +5354,12 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+ 		 */
+ 		load = cfs_rq->sum_weight;
+ 		if (curr && curr->on_rq)
+-			load += scale_load_down(curr->load.weight);
++			load += avg_vruntime_weight(cfs_rq, curr->load.weight);
+ 
+-		lag *= load + scale_load_down(se->load.weight);
++		lag *= load + avg_vruntime_weight(cfs_rq, se->load.weight);
+ 		if (WARN_ON_ONCE(!load))
+ 			load = 1;
+-		lag = div_s64(lag, load);
++		lag = div64_long(lag, load);
+ 	}
+ 
+ 	se->vruntime = vruntime - lag;
+diff --git a/kernel/sched/features.h b/kernel/sched/features.h
+index 37d5928fa6dd..a25f97201ab9 100644
+--- a/kernel/sched/features.h
++++ b/kernel/sched/features.h
+@@ -58,6 +58,8 @@ SCHED_FEAT(CACHE_HOT_BUDDY, true)
+ SCHED_FEAT(DELAY_DEQUEUE, true)
+ SCHED_FEAT(DELAY_ZERO, true)
+ 
++SCHED_FEAT(PARANOID_AVG, false)
++
+ /*
+  * Allow wakeup-time preemption of the current task:
+  */
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 31fe9bc360e4..d700b37a13e2 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -691,8 +691,9 @@ struct cfs_rq {
+ 
+ 	s64			sum_w_vruntime;
+ 	u64			sum_weight;
+-
+ 	u64			zero_vruntime;
++	unsigned int		sum_shift;
++
+ #ifdef CONFIG_SCHED_CORE
+ 	unsigned int		forceidle_seq;
+ 	u64			zero_vruntime_fi;
