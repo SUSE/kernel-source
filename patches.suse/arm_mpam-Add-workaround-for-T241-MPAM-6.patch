@@ -1,0 +1,126 @@
+From: Shanker Donthineni <sdonthineni@nvidia.com>
+Date: Fri, 13 Mar 2026 14:46:15 +0000
+Subject: arm_mpam: Add workaround for T241-MPAM-6
+Git-commit: dc48eb1ff27cc3169c3c5cca5eb20645d04d9e22
+Patch-mainline: v7.0 or v7.0-rc7 (next release)
+References: jsc#PED-15480
+
+The registers MSMON_MBWU_L and MSMON_MBWU return the number of requests
+rather than the number of bytes transferred.
+
+Bandwidth resource monitoring is performed at the last level cache, where
+each request arrive in 64Byte granularity. The current implementation
+returns the number of transactions received at the last level cache but
+does not provide the value in bytes. Scaling by 64 gives an accurate byte
+count to match the MPAM specification for the MSMON_MBWU and MSMON_MBWU_L
+registers. This patch fixes the issue by reporting the actual number of
+bytes instead of the number of transactions from __ris_msmon_read().
+
+Tested-by: Gavin Shan <gshan@redhat.com>
+Tested-by: Shaopeng Tan <tan.shaopeng@jp.fujitsu.com>
+Tested-by: Punit Agrawal <punit.agrawal@oss.qualcomm.com>
+Tested-by: Peter Newman <peternewman@google.com>
+Tested-by: Jesse Chick <jessechick@os.amperecomputing.com>
+Reviewed-by: Zeng Heng <zengheng4@huawei.com>
+Reviewed-by: Shaopeng Tan <tan.shaopeng@jp.fujitsu.com>
+Reviewed-by: Gavin Shan <gshan@redhat.com>
+Signed-off-by: Shanker Donthineni <sdonthineni@nvidia.com>
+Signed-off-by: Ben Horgan <ben.horgan@arm.com>
+Signed-off-by: James Morse <james.morse@arm.com>
+Acked-by: Stanimir Varbanov <svarbanov@suse.de>
+---
+ Documentation/arch/arm64/silicon-errata.rst |  2 ++
+ drivers/resctrl/mpam_devices.c              | 26 ++++++++++++++++++++++++--
+ drivers/resctrl/mpam_internal.h             |  1 +
+ 3 files changed, 27 insertions(+), 2 deletions(-)
+
+diff --git a/Documentation/arch/arm64/silicon-errata.rst b/Documentation/arch/arm64/silicon-errata.rst
+index a4b246655e37..1aa3326bb320 100644
+--- a/Documentation/arch/arm64/silicon-errata.rst
++++ b/Documentation/arch/arm64/silicon-errata.rst
+@@ -251,6 +251,8 @@ stable kernels.
+ +----------------+-----------------+-----------------+-----------------------------+
+ | NVIDIA         | T241 MPAM       | T241-MPAM-4     | N/A                         |
+ +----------------+-----------------+-----------------+-----------------------------+
++| NVIDIA         | T241 MPAM       | T241-MPAM-6     | N/A                         |
+++----------------+-----------------+-----------------+-----------------------------+
+ +----------------+-----------------+-----------------+-----------------------------+
+ | Freescale/NXP  | LS2080A/LS1043A | A-008585        | FSL_ERRATUM_A008585         |
+ +----------------+-----------------+-----------------+-----------------------------+
+diff --git a/drivers/resctrl/mpam_devices.c b/drivers/resctrl/mpam_devices.c
+index 142e7ea960e5..1a92c8c42b59 100644
+--- a/drivers/resctrl/mpam_devices.c
++++ b/drivers/resctrl/mpam_devices.c
+@@ -685,6 +685,12 @@ static const struct mpam_quirk mpam_quirks[] = {
+ 		.iidr_mask  = MPAM_IIDR_MATCH_ONE,
+ 		.workaround = T241_FORCE_MBW_MIN_TO_ONE,
+ 	},
++	{
++		/* NVIDIA t241 erratum T241-MPAM-6 */
++		.iidr       = MPAM_IIDR_NVIDIA_T241,
++		.iidr_mask  = MPAM_IIDR_MATCH_ONE,
++		.workaround = T241_MBW_COUNTER_SCALE_64,
++	},
+ 	{ NULL } /* Sentinel */
+ };
+ 
+@@ -1146,7 +1152,7 @@ static void write_msmon_ctl_flt_vals(struct mon_read *m, u32 ctl_val,
+ 	}
+ }
+ 
+-static u64 mpam_msmon_overflow_val(enum mpam_device_features type)
++static u64 __mpam_msmon_overflow_val(enum mpam_device_features type)
+ {
+ 	/* TODO: implement scaling counters */
+ 	switch (type) {
+@@ -1161,6 +1167,18 @@ static u64 mpam_msmon_overflow_val(enum mpam_device_features type)
+ 	}
+ }
+ 
++static u64 mpam_msmon_overflow_val(enum mpam_device_features type,
++				   struct mpam_msc *msc)
++{
++	u64 overflow_val = __mpam_msmon_overflow_val(type);
++
++	if (mpam_has_quirk(T241_MBW_COUNTER_SCALE_64, msc) &&
++	    type != mpam_feat_msmon_mbwu_63counter)
++		overflow_val *= 64;
++
++	return overflow_val;
++}
++
+ static void __ris_msmon_read(void *arg)
+ {
+ 	u64 now;
+@@ -1251,13 +1269,17 @@ static void __ris_msmon_read(void *arg)
+ 			now = FIELD_GET(MSMON___VALUE, now);
+ 		}
+ 
++		if (mpam_has_quirk(T241_MBW_COUNTER_SCALE_64, msc) &&
++		    m->type != mpam_feat_msmon_mbwu_63counter)
++			now *= 64;
++
+ 		if (nrdy)
+ 			break;
+ 
+ 		mbwu_state = &ris->mbwu_state[ctx->mon];
+ 
+ 		if (overflow)
+-			mbwu_state->correction += mpam_msmon_overflow_val(m->type);
++			mbwu_state->correction += mpam_msmon_overflow_val(m->type, msc);
+ 
+ 		/*
+ 		 * Include bandwidth consumed before the last hardware reset and
+diff --git a/drivers/resctrl/mpam_internal.h b/drivers/resctrl/mpam_internal.h
+index f1adbdad3969..8fea28c5fb85 100644
+--- a/drivers/resctrl/mpam_internal.h
++++ b/drivers/resctrl/mpam_internal.h
+@@ -225,6 +225,7 @@ struct mpam_props {
+ enum mpam_device_quirks {
+ 	T241_SCRUB_SHADOW_REGS,
+ 	T241_FORCE_MBW_MIN_TO_ONE,
++	T241_MBW_COUNTER_SCALE_64,
+ 	MPAM_QUIRK_LAST
+ };
+ 
+
