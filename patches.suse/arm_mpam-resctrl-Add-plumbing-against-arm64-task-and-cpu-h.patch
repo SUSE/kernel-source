@@ -1,0 +1,132 @@
+From: James Morse <james.morse@arm.com>
+Date: Fri, 13 Mar 2026 14:45:56 +0000
+Subject: arm_mpam: resctrl: Add plumbing against arm64 task and cpu hooks
+Git-commit: 9d2e1a99fae58ce992f147bdf83b5d9089f70b27
+Patch-mainline: v7.0 or v7.0-rc7 (next release)
+References: jsc#PED-15480
+
+arm64 provides helpers for changing a task's and a cpu's mpam partid/pmg
+values.
+
+These are used to back a number of resctrl_arch_ functions. Connect them
+up.
+
+Tested-by: Gavin Shan <gshan@redhat.com>
+Tested-by: Shaopeng Tan <tan.shaopeng@jp.fujitsu.com>
+Tested-by: Peter Newman <peternewman@google.com>
+Tested-by: Zeng Heng <zengheng4@huawei.com>
+Tested-by: Punit Agrawal <punit.agrawal@oss.qualcomm.com>
+Tested-by: Jesse Chick <jessechick@os.amperecomputing.com>
+Reviewed-by: Zeng Heng <zengheng4@huawei.com>
+Reviewed-by: Shaopeng Tan <tan.shaopeng@jp.fujitsu.com>
+Reviewed-by: Jonathan Cameron <jonathan.cameron@huawei.com>
+Reviewed-by: Gavin Shan <gshan@redhat.com>
+Co-developed-by: Ben Horgan <ben.horgan@arm.com>
+Signed-off-by: Ben Horgan <ben.horgan@arm.com>
+Signed-off-by: James Morse <james.morse@arm.com>
+Acked-by: Stanimir Varbanov <svarbanov@suse.de>
+---
+ drivers/resctrl/mpam_resctrl.c | 58 ++++++++++++++++++++++++++++++++++++++++++
+ include/linux/arm_mpam.h       |  5 ++++
+ 2 files changed, 63 insertions(+)
+
+diff --git a/drivers/resctrl/mpam_resctrl.c b/drivers/resctrl/mpam_resctrl.c
+index ea60777934ff..9cde5b7e644c 100644
+--- a/drivers/resctrl/mpam_resctrl.c
++++ b/drivers/resctrl/mpam_resctrl.c
+@@ -8,6 +8,7 @@
+ #include <linux/cpu.h>
+ #include <linux/cpumask.h>
+ #include <linux/errno.h>
++#include <linux/limits.h>
+ #include <linux/list.h>
+ #include <linux/printk.h>
+ #include <linux/rculist.h>
+@@ -34,6 +35,8 @@ static struct mpam_resctrl_res mpam_resctrl_controls[RDT_NUM_RESOURCES];
+ /* The lock for modifying resctrl's domain lists from cpuhp callbacks. */
+ static DEFINE_MUTEX(domain_list_lock);
+ 
++static bool cdp_enabled;
++
+ bool resctrl_arch_alloc_capable(void)
+ {
+ 	struct mpam_resctrl_res *res;
+@@ -57,6 +60,61 @@ u32 resctrl_arch_get_num_closid(struct rdt_resource *ignored)
+ 	return mpam_partid_max + 1;
+ }
+ 
++void resctrl_arch_sched_in(struct task_struct *tsk)
++{
++	lockdep_assert_preemption_disabled();
++
++	mpam_thread_switch(tsk);
++}
++
++void resctrl_arch_set_cpu_default_closid_rmid(int cpu, u32 closid, u32 rmid)
++{
++	WARN_ON_ONCE(closid > U16_MAX);
++	WARN_ON_ONCE(rmid > U8_MAX);
++
++	if (!cdp_enabled) {
++		mpam_set_cpu_defaults(cpu, closid, closid, rmid, rmid);
++	} else {
++		/*
++		 * When CDP is enabled, resctrl halves the closid range and we
++		 * use odd/even partid for one closid.
++		 */
++		u32 partid_d = resctrl_get_config_index(closid, CDP_DATA);
++		u32 partid_i = resctrl_get_config_index(closid, CDP_CODE);
++
++		mpam_set_cpu_defaults(cpu, partid_d, partid_i, rmid, rmid);
++	}
++}
++
++void resctrl_arch_sync_cpu_closid_rmid(void *info)
++{
++	struct resctrl_cpu_defaults *r = info;
++
++	lockdep_assert_preemption_disabled();
++
++	if (r) {
++		resctrl_arch_set_cpu_default_closid_rmid(smp_processor_id(),
++							 r->closid, r->rmid);
++	}
++
++	resctrl_arch_sched_in(current);
++}
++
++void resctrl_arch_set_closid_rmid(struct task_struct *tsk, u32 closid, u32 rmid)
++{
++	WARN_ON_ONCE(closid > U16_MAX);
++	WARN_ON_ONCE(rmid > U8_MAX);
++
++	if (!cdp_enabled) {
++		mpam_set_task_partid_pmg(tsk, closid, closid, rmid, rmid);
++	} else {
++		u32 partid_d = resctrl_get_config_index(closid, CDP_DATA);
++		u32 partid_i = resctrl_get_config_index(closid, CDP_CODE);
++
++		mpam_set_task_partid_pmg(tsk, partid_d, partid_i, rmid, rmid);
++	}
++}
++
+ struct rdt_resource *resctrl_arch_get_resource(enum resctrl_res_level l)
+ {
+ 	if (l >= RDT_NUM_RESOURCES)
+diff --git a/include/linux/arm_mpam.h b/include/linux/arm_mpam.h
+index 2c7d1413a401..5a78299ec464 100644
+--- a/include/linux/arm_mpam.h
++++ b/include/linux/arm_mpam.h
+@@ -52,6 +52,11 @@ static inline int mpam_ris_create(struct mpam_msc *msc, u8 ris_idx,
+ bool resctrl_arch_alloc_capable(void);
+ bool resctrl_arch_mon_capable(void);
+ 
++void resctrl_arch_set_cpu_default_closid(int cpu, u32 closid);
++void resctrl_arch_set_closid_rmid(struct task_struct *tsk, u32 closid, u32 rmid);
++void resctrl_arch_set_cpu_default_closid_rmid(int cpu, u32 closid, u32 rmid);
++void resctrl_arch_sched_in(struct task_struct *tsk);
++
+ /**
+  * mpam_register_requestor() - Register a requestor with the MPAM driver
+  * @partid_max:		The maximum PARTID value the requestor can generate.
+
