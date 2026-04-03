@@ -1,0 +1,116 @@
+From 17926cd770ec837ed27d9856cf07f2da8dda4131 Mon Sep 17 00:00:00 2001
+From: Pratyush Yadav <p.yadav@ti.com>
+Date: Tue, 8 Jul 2025 17:16:46 +0800
+Subject: [PATCH] mtd: spi-nor: core: avoid odd length/address writes in 8D-8D-8D mode
+Git-commit: 17926cd770ec837ed27d9856cf07f2da8dda4131
+Patch-mainline: v6.18-rc1
+References: stable-fixes
+
+On Octal DTR capable flashes like Micron Xcella the writes cannot start
+or end at an odd address in Octal DTR mode. Extra 0xff bytes need to be
+appended or prepended to make sure the start address and end address are
+even. 0xff is used because on NOR flashes a program operation can only
+flip bits from 1 to 0, not the other way round. 0 to 1 flip needs to
+happen via erases.
+
+Signed-off-by: Pratyush Yadav <p.yadav@ti.com>
+Reviewed-by: Michael Walle <michael@walle.cc>
+Signed-off-by: Luke Wang <ziniu.wang_1@nxp.com>
+Signed-off-by: Pratyush Yadav <pratyush@kernel.org>
+Link: https://lore.kernel.org/r/20250708091646.292-2-ziniu.wang_1@nxp.com
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/mtd/spi-nor/core.c | 69 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 68 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/mtd/spi-nor/core.c b/drivers/mtd/spi-nor/core.c
+index 1b594f720b6c..20ea80450f22 100644
+--- a/drivers/mtd/spi-nor/core.c
++++ b/drivers/mtd/spi-nor/core.c
+@@ -2128,6 +2128,68 @@ static int spi_nor_read(struct mtd_info *mtd, loff_t from, size_t len,
+ 	return ret;
+ }
+ 
++/*
++ * On Octal DTR capable flashes, writes cannot start or end at an odd address
++ * in Octal DTR mode. Extra 0xff bytes need to be appended or prepended to
++ * make sure the start address and end address are even. 0xff is used because
++ * on NOR flashes a program operation can only flip bits from 1 to 0, not the
++ * other way round. 0 to 1 flip needs to happen via erases.
++ */
++static int spi_nor_octal_dtr_write(struct spi_nor *nor, loff_t to, size_t len,
++				   const u8 *buf)
++{
++	u8 *tmp_buf;
++	size_t bytes_written;
++	loff_t start, end;
++	int ret;
++
++	if (IS_ALIGNED(to, 2) && IS_ALIGNED(len, 2))
++		return spi_nor_write_data(nor, to, len, buf);
++
++	tmp_buf = kmalloc(nor->params->page_size, GFP_KERNEL);
++	if (!tmp_buf)
++		return -ENOMEM;
++
++	memset(tmp_buf, 0xff, nor->params->page_size);
++
++	start = round_down(to, 2);
++	end = round_up(to + len, 2);
++
++	memcpy(tmp_buf + (to - start), buf, len);
++
++	ret = spi_nor_write_data(nor, start, end - start, tmp_buf);
++	if (ret == 0) {
++		ret = -EIO;
++		goto out;
++	}
++	if (ret < 0)
++		goto out;
++
++	/*
++	 * More bytes are written than actually requested, but that number can't
++	 * be reported to the calling function or it will confuse its
++	 * calculations. Calculate how many of the _requested_ bytes were
++	 * written.
++	 */
++	bytes_written = ret;
++
++	if (to != start)
++		ret -= to - start;
++
++	/*
++	 * Only account for extra bytes at the end if they were actually
++	 * written. For example, if for some reason the controller could only
++	 * complete a partial write then the adjustment for the extra bytes at
++	 * the end is not needed.
++	 */
++	if (start + bytes_written == end)
++		ret -= end - (to + len);
++
++out:
++	kfree(tmp_buf);
++	return ret;
++}
++
+ /*
+  * Write an address range to the nor chip.  Data must be written in
+  * FLASH_PAGESIZE chunks.  The address range may be any size provided
+@@ -2164,7 +2226,12 @@ static int spi_nor_write(struct mtd_info *mtd, loff_t to, size_t len,
+ 			goto write_err;
+ 		}
+ 
+-		ret = spi_nor_write_data(nor, addr, page_remain, buf + i);
++		if (nor->write_proto == SNOR_PROTO_8_8_8_DTR)
++			ret = spi_nor_octal_dtr_write(nor, addr, page_remain,
++						      buf + i);
++		else
++			ret = spi_nor_write_data(nor, addr, page_remain,
++						 buf + i);
+ 		spi_nor_unlock_device(nor);
+ 		if (ret < 0)
+ 			goto write_err;
+-- 
+2.53.0
+
