@@ -1,0 +1,143 @@
+From: James Morse <james.morse@arm.com>
+Date: Fri, 13 Mar 2026 14:46:05 +0000
+Subject: arm_mpam: resctrl: Add support for csu counters
+Git-commit: 1458c4f053355f88cc5d190ca02243d2c60fa010
+Patch-mainline: v7.0 or v7.0-rc7 (next release)
+References: jsc#PED-15480
+
+resctrl exposes a counter via a file named llc_occupancy. This isn't really
+a counter as its value goes up and down, this is a snapshot of the cache
+storage usage monitor.
+
+Add some picking code which will only find an L3. The resctrl counter
+file is called llc_occupancy but we don't check it is the last one as
+it is already identified as L3.
+
+Tested-by: Shaopeng Tan <tan.shaopeng@jp.fujitsu.com>
+Tested-by: Zeng Heng <zengheng4@huawei.com>
+Tested-by: Punit Agrawal <punit.agrawal@oss.qualcomm.com>
+Tested-by: Gavin Shan <gshan@redhat.com>
+Tested-by: Jesse Chick <jessechick@os.amperecomputing.com>
+Reviewed-by: Zeng Heng <zengheng4@huawei.com>
+Reviewed-by: Shaopeng Tan <tan.shaopeng@jp.fujitsu.com>
+Reviewed-by: Jonathan Cameron <jonathan.cameron@huawei.com>
+Reviewed-by: Gavin Shan <gshan@redhat.com>
+Co-developed-by: Dave Martin <dave.martin@arm.com>
+Signed-off-by: Dave Martin <dave.martin@arm.com>
+Co-developed-by: Ben Horgan <ben.horgan@arm.com>
+Signed-off-by: Ben Horgan <ben.horgan@arm.com>
+Signed-off-by: James Morse <james.morse@arm.com>
+Acked-by: Stanimir Varbanov <svarbanov@suse.de>
+---
+ drivers/resctrl/mpam_resctrl.c | 83 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 83 insertions(+)
+
+diff --git a/drivers/resctrl/mpam_resctrl.c b/drivers/resctrl/mpam_resctrl.c
+index e03d0f400993..07bb20a01b38 100644
+--- a/drivers/resctrl/mpam_resctrl.c
++++ b/drivers/resctrl/mpam_resctrl.c
+@@ -311,6 +311,28 @@ static bool class_has_usable_mba(struct mpam_props *cprops)
+ 	return mba_class_use_mbw_max(cprops);
+ }
+ 
++static bool cache_has_usable_csu(struct mpam_class *class)
++{
++	struct mpam_props *cprops;
++
++	if (!class)
++		return false;
++
++	cprops = &class->props;
++
++	if (!mpam_has_feature(mpam_feat_msmon_csu, cprops))
++		return false;
++
++	/*
++	 * CSU counters settle on the value, so we can get away with
++	 * having only one.
++	 */
++	if (!cprops->num_csu_mon)
++		return false;
++
++	return true;
++}
++
+ /*
+  * Calculate the worst-case percentage change from each implemented step
+  * in the control.
+@@ -630,6 +652,64 @@ static void mpam_resctrl_pick_mba(void)
+ 	}
+ }
+ 
++static void counter_update_class(enum resctrl_event_id evt_id,
++				 struct mpam_class *class)
++{
++	struct mpam_class *existing_class = mpam_resctrl_counters[evt_id].class;
++
++	if (existing_class) {
++		if (class->level == 3) {
++			pr_debug("Existing class is L3 - L3 wins\n");
++			return;
++		}
++
++		if (existing_class->level < class->level) {
++			pr_debug("Existing class is closer to L3, %u versus %u - closer is better\n",
++				 existing_class->level, class->level);
++			return;
++		}
++	}
++
++	mpam_resctrl_counters[evt_id].class = class;
++}
++
++static void mpam_resctrl_pick_counters(void)
++{
++	struct mpam_class *class;
++
++	lockdep_assert_cpus_held();
++
++	guard(srcu)(&mpam_srcu);
++	list_for_each_entry_srcu(class, &mpam_classes, classes_list,
++				 srcu_read_lock_held(&mpam_srcu)) {
++		/* The name of the resource is L3... */
++		if (class->type == MPAM_CLASS_CACHE && class->level != 3) {
++			pr_debug("class %u is a cache but not the L3", class->level);
++			continue;
++		}
++
++		if (!cpumask_equal(&class->affinity, cpu_possible_mask)) {
++			pr_debug("class %u does not cover all CPUs",
++				 class->level);
++			continue;
++		}
++
++		if (cache_has_usable_csu(class)) {
++			pr_debug("class %u has usable CSU",
++				 class->level);
++
++			/* CSU counters only make sense on a cache. */
++			switch (class->type) {
++			case MPAM_CLASS_CACHE:
++				counter_update_class(QOS_L3_OCCUP_EVENT_ID, class);
++				break;
++			default:
++				break;
++			}
++		}
++	}
++}
++
+ static int mpam_resctrl_control_init(struct mpam_resctrl_res *res)
+ {
+ 	struct mpam_class *class = res->class;
+@@ -1264,6 +1344,9 @@ int mpam_resctrl_setup(void)
+ 		}
+ 	}
+ 
++	/* Find some classes to use for monitors */
++	mpam_resctrl_pick_counters();
++
+ 	for_each_mpam_resctrl_mon(mon, eventid) {
+ 		if (!mon->class)
+ 			continue;	// dummy resource
+
