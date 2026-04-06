@@ -1,0 +1,147 @@
+From: Anshuman Khandual <anshuman.khandual@arm.com>
+Date: Wed, 11 Jun 2025 13:01:13 -0500
+Subject: KVM: arm64: nvhe: Disable branch generation in nVHE guests
+Git-commit: d7567e9b9ba53861390830ee18b9fb2035ca81c4
+Patch-mainline: v6.17-rc1
+References: jsc#PED-15733 jsc#PED-15734
+
+While BRBE can record branches within guests, the host recording
+branches in guests is not supported by perf (though events are).
+Support for BRBE in guests will supported by providing direct access
+to BRBE within the guests. That is how x86 LBR works for guests.
+Therefore, BRBE needs to be disabled on guest entry and restored on
+exit.
+
+For nVHE, this requires explicit handling for guests. Before
+entering a guest, save the BRBE state and disable the it. When
+returning to the host, restore the state.
+
+For VHE, it is not necessary. We initialize
+BRBCR_EL1.{E1BRE,E0BRE}=={0,0} at boot time, and HCR_EL2.TGE==1 while
+running in the host. We configure BRBCR_EL2.{E2BRE,E0HBRE} to enable
+branch recording in the host. When entering the guest, we set
+HCR_EL2.TGE==0 which means BRBCR_EL1 is used instead of BRBCR_EL2.
+Consequently for VHE, BRBE recording is disabled at EL1 and EL0 when
+running a guest.
+
+Should recording in guests (by the host) ever be desired, the perf ABI
+will need to be extended to distinguish guest addresses (struct
+perf_branch_entry.priv) for starters. BRBE records would also need to be
+invalidated on guest entry/exit as guest/host EL1 and EL0 records can't
+be distinguished.
+
+Signed-off-by: Anshuman Khandual <anshuman.khandual@arm.com>
+Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+Co-developed-by: Rob Herring (Arm) <robh@kernel.org>
+Signed-off-by: Rob Herring (Arm) <robh@kernel.org>
+Tested-by: James Clark <james.clark@linaro.org>
+Reviewed-by: Leo Yan <leo.yan@arm.com>
+Reviewed-by: Suzuki K Poulose <suzuki.poulose@arm.com>
+Acked-by: Marc Zyngier <maz@kernel.org>
+Acked-by: Mark Rutland <mark.rutland@arm.com>
+Link: https://lore.kernel.org/r/20250611-arm-brbe-v19-v23-3-e7775563036e@kernel.org
+Signed-off-by: Will Deacon <will@kernel.org>
+Acked-by: Stanimir Varbanov <svarbanov@suse.de>
+---
+ arch/arm64/include/asm/kvm_host.h  |    2 ++
+ arch/arm64/kvm/debug.c             |    4 ++++
+ arch/arm64/kvm/hyp/nvhe/debug-sr.c |   32 ++++++++++++++++++++++++++++++++
+ arch/arm64/kvm/hyp/nvhe/switch.c   |    2 +-
+ 4 files changed, 39 insertions(+), 1 deletion(-)
+
+--- a/arch/arm64/include/asm/kvm_host.h
++++ b/arch/arm64/include/asm/kvm_host.h
+@@ -618,6 +618,7 @@ struct kvm_host_data {
+ #define KVM_HOST_DATA_FLAG_HAS_TRBE			1
+ #define KVM_HOST_DATA_FLAG_TRBE_ENABLED			4
+ #define KVM_HOST_DATA_FLAG_EL1_TRACING_CONFIGURED	5
++#define KVM_HOST_DATA_FLAG_HAS_BRBE			8
+ 	unsigned long flags;
+ 
+ 	struct kvm_cpu_context host_ctxt;
+@@ -651,6 +652,7 @@ struct kvm_host_data {
+ 		u64 trfcr_el1;
+ 		/* Values of trap registers for the host before guest entry. */
+ 		u64 mdcr_el2;
++		u64 brbcr_el1;
+ 	} host_debug_state;
+ 
+ 	/* Guest trace filter value */
+--- a/arch/arm64/kvm/debug.c
++++ b/arch/arm64/kvm/debug.c
+@@ -81,6 +81,10 @@ void kvm_init_host_debug_data(void)
+ 	    !(read_sysreg_s(SYS_PMBIDR_EL1) & PMBIDR_EL1_P))
+ 		host_data_set_flag(HAS_SPE);
+ 
++	/* Check if we have BRBE implemented and available at the host */
++	if (cpuid_feature_extract_unsigned_field(dfr0, ID_AA64DFR0_EL1_BRBE_SHIFT))
++		host_data_set_flag(HAS_BRBE);
++
+ 	if (cpuid_feature_extract_unsigned_field(dfr0, ID_AA64DFR0_EL1_TraceFilt_SHIFT)) {
+ 		/* Force disable trace in protected mode in case of no TRBE */
+ 		if (is_protected_kvm_enabled())
+--- a/arch/arm64/kvm/hyp/nvhe/debug-sr.c
++++ b/arch/arm64/kvm/hyp/nvhe/debug-sr.c
+@@ -92,12 +92,42 @@ static void __trace_switch_to_host(void)
+ 			  *host_data_ptr(host_debug_state.trfcr_el1));
+ }
+ 
++static void __debug_save_brbe(u64 *brbcr_el1)
++{
++	*brbcr_el1 = 0;
++
++	/* Check if the BRBE is enabled */
++	if (!(read_sysreg_el1(SYS_BRBCR) & (BRBCR_ELx_E0BRE | BRBCR_ELx_ExBRE)))
++		return;
++
++	/*
++	 * Prohibit branch record generation while we are in guest.
++	 * Since access to BRBCR_EL1 is trapped, the guest can't
++	 * modify the filtering set by the host.
++	 */
++	*brbcr_el1 = read_sysreg_el1(SYS_BRBCR);
++	write_sysreg_el1(0, SYS_BRBCR);
++}
++
++static void __debug_restore_brbe(u64 brbcr_el1)
++{
++	if (!brbcr_el1)
++		return;
++
++	/* Restore BRBE controls */
++	write_sysreg_el1(brbcr_el1, SYS_BRBCR);
++}
++
+ void __debug_save_host_buffers_nvhe(struct kvm_vcpu *vcpu)
+ {
+ 	/* Disable and flush SPE data generation */
+ 	if (host_data_test_flag(HAS_SPE))
+ 		__debug_save_spe(host_data_ptr(host_debug_state.pmscr_el1));
+ 
++	/* Disable BRBE branch records */
++	if (host_data_test_flag(HAS_BRBE))
++		__debug_save_brbe(host_data_ptr(host_debug_state.brbcr_el1));
++
+ 	if (__trace_needs_switch())
+ 		__trace_switch_to_guest();
+ }
+@@ -111,6 +141,8 @@ void __debug_restore_host_buffers_nvhe(s
+ {
+ 	if (host_data_test_flag(HAS_SPE))
+ 		__debug_restore_spe(*host_data_ptr(host_debug_state.pmscr_el1));
++	if (host_data_test_flag(HAS_BRBE))
++		__debug_restore_brbe(*host_data_ptr(host_debug_state.brbcr_el1));
+ 	if (__trace_needs_switch())
+ 		__trace_switch_to_host();
+ }
+--- a/arch/arm64/kvm/hyp/nvhe/switch.c
++++ b/arch/arm64/kvm/hyp/nvhe/switch.c
+@@ -319,7 +319,7 @@ int __kvm_vcpu_run(struct kvm_vcpu *vcpu
+ 	 * We're about to restore some new MMU state. Make sure
+ 	 * ongoing page-table walks that have started before we
+ 	 * trapped to EL2 have completed. This also synchronises the
+-	 * above disabling of SPE and TRBE.
++	 * above disabling of BRBE, SPE and TRBE.
+ 	 *
+ 	 * See DDI0487I.a D8.1.5 "Out-of-context translation regimes",
+ 	 * rule R_LFHQG and subsequent information statements.
