@@ -1,0 +1,129 @@
+From 8c9006283e4b767003b2d11182d6e90f8b184c3d Mon Sep 17 00:00:00 2001
+From: Ankit Nautiyal <ankit.k.nautiyal@intel.com>
+Date: Thu, 10 Jul 2025 10:50:40 +0530
+Subject: Revert "drm/i915/dp: Reject HBR3 when sink doesn't support TPS4"
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: 8c9006283e4b767003b2d11182d6e90f8b184c3d
+Patch-mainline: v6.18-rc1
+References: git-fixes
+
+This reverts commit 584cf613c24a4250d9be4819efc841aa2624d5b6.
+Commit 584cf613c24a ("drm/i915/dp: Reject HBR3 when sink doesn't support
+TPS4") introduced a blanket rejection of HBR3 link rate when the sink does
+not support TPS4.
+
+While this was intended to address instability observed on certain eDP
+panels [1], there seem to be edp panels that do not follow the
+specification. These eDP panels do not advertise TPS4 support, but require
+HBR3 to operate at their fixed native resolution [2].
+
+As a result, the change causes blank screens on such panels. Apparently,
+Windows driver does not enforce this restriction, and the issue is not seen
+there.
+
+Therefore, revert the commit to restore functionality for such panels,
+and align behaviour with Windows driver.
+
+[1] https://gitlab.freedesktop.org/drm/i915/kernel/-/issues/5969
+[2] https://gitlab.freedesktop.org/drm/i915/kernel/-/issues/14517
+
+v2: Update the commit message with better justification. (Ville)
+
+Closes: https://gitlab.freedesktop.org/drm/i915/kernel/-/issues/14517
+Acked-by: Jani Nikula <jani.nikula@intel.com>
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Signed-off-by: Ankit Nautiyal <ankit.k.nautiyal@intel.com>
+Link: https://lore.kernel.org/r/20250710052041.1238567-2-ankit.k.nautiyal@intel.com
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+---
+ drivers/gpu/drm/i915/display/intel_dp.c | 49 ++++---------------------
+ 1 file changed, 7 insertions(+), 42 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_dp.c b/drivers/gpu/drm/i915/display/intel_dp.c
+index 62b812cc0b67..1819cf1e07ce 100644
+--- a/drivers/gpu/drm/i915/display/intel_dp.c
++++ b/drivers/gpu/drm/i915/display/intel_dp.c
+@@ -173,28 +173,10 @@ int intel_dp_link_symbol_clock(int rate)
+ 
+ static int max_dprx_rate(struct intel_dp *intel_dp)
+ {
+-	struct intel_display *display = to_intel_display(intel_dp);
+-	struct intel_encoder *encoder = &dp_to_dig_port(intel_dp)->base;
+-	int max_rate;
+-
+ 	if (intel_dp_tunnel_bw_alloc_is_enabled(intel_dp))
+-		max_rate = drm_dp_tunnel_max_dprx_rate(intel_dp->tunnel);
+-	else
+-		max_rate = drm_dp_bw_code_to_link_rate(intel_dp->dpcd[DP_MAX_LINK_RATE]);
++		return drm_dp_tunnel_max_dprx_rate(intel_dp->tunnel);
+ 
+-	/*
+-	 * Some broken eDP sinks illegally declare support for
+-	 * HBR3 without TPS4, and are unable to produce a stable
+-	 * output. Reject HBR3 when TPS4 is not available.
+-	 */
+-	if (max_rate >= 810000 && !drm_dp_tps4_supported(intel_dp->dpcd)) {
+-		drm_dbg_kms(display->drm,
+-			    "[ENCODER:%d:%s] Rejecting HBR3 due to missing TPS4 support\n",
+-			    encoder->base.base.id, encoder->base.name);
+-		max_rate = 540000;
+-	}
+-
+-	return max_rate;
++	return drm_dp_bw_code_to_link_rate(intel_dp->dpcd[DP_MAX_LINK_RATE]);
+ }
+ 
+ static int max_dprx_lane_count(struct intel_dp *intel_dp)
+@@ -4278,9 +4260,6 @@ static void intel_edp_mso_init(struct intel_dp *intel_dp)
+ static void
+ intel_edp_set_sink_rates(struct intel_dp *intel_dp)
+ {
+-	struct intel_display *display = to_intel_display(intel_dp);
+-	struct intel_encoder *encoder = &dp_to_dig_port(intel_dp)->base;
+-
+ 	intel_dp->num_sink_rates = 0;
+ 
+ 	if (intel_dp->edp_dpcd[0] >= DP_EDP_14) {
+@@ -4291,7 +4270,10 @@ intel_edp_set_sink_rates(struct intel_dp *intel_dp)
+ 				 sink_rates, sizeof(sink_rates));
+ 
+ 		for (i = 0; i < ARRAY_SIZE(sink_rates); i++) {
+-			int rate;
++			int val = le16_to_cpu(sink_rates[i]);
++
++			if (val == 0)
++				break;
+ 
+ 			/* Value read multiplied by 200kHz gives the per-lane
+ 			 * link rate in kHz. The source rates are, however,
+@@ -4299,24 +4281,7 @@ intel_edp_set_sink_rates(struct intel_dp *intel_dp)
+ 			 * back to symbols is
+ 			 * (val * 200kHz)*(8/10 ch. encoding)*(1/8 bit to Byte)
+ 			 */
+-			rate = le16_to_cpu(sink_rates[i]) * 200 / 10;
+-
+-			if (rate == 0)
+-				break;
+-
+-			/*
+-			 * Some broken eDP sinks illegally declare support for
+-			 * HBR3 without TPS4, and are unable to produce a stable
+-			 * output. Reject HBR3 when TPS4 is not available.
+-			 */
+-			if (rate >= 810000 && !drm_dp_tps4_supported(intel_dp->dpcd)) {
+-				drm_dbg_kms(display->drm,
+-					    "[ENCODER:%d:%s] Rejecting HBR3 due to missing TPS4 support\n",
+-					    encoder->base.base.id, encoder->base.name);
+-				break;
+-			}
+-
+-			intel_dp->sink_rates[i] = rate;
++			intel_dp->sink_rates[i] = (val * 200) / 10;
+ 		}
+ 		intel_dp->num_sink_rates = i;
+ 	}
+-- 
+2.53.0
+
