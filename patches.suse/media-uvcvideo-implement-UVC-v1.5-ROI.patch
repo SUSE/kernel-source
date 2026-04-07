@@ -1,0 +1,231 @@
+From 2dc768d71b45a3a40ea15805667ed662127eeefd Mon Sep 17 00:00:00 2001
+From: Yunke Cao <yunkec@google.com>
+Date: Mon, 3 Feb 2025 11:55:52 +0000
+Subject: [PATCH] media: uvcvideo: implement UVC v1.5 ROI
+Git-commit: 2dc768d71b45a3a40ea15805667ed662127eeefd
+References: jsc#PED-14445
+Patch-mainline: v6.15-rc1
+
+Implement support for ROI as described in UVC 1.5:
+4.2.2.1.20 Digital Region of Interest (ROI) Control
+
+ROI control is implemented using V4L2 control API as
+two UVC-specific controls:
+V4L2_CID_UVC_REGION_OF_INTEREST_RECT and
+V4L2_CID_UVC_REGION_OF_INTEREST_AUTO.
+
+Reviewed-by: Ricardo Ribalda <ribalda@chromium.org>
+Signed-off-by: Yunke Cao <yunkec@google.com>
+Reviewed-by: Yunke Cao <yunkec@google.com>
+Tested-by: Yunke Cao <yunkec@google.com>
+Reviewed-by: Hans de Goede <hdegoede@redhat.com>
+Signed-off-by: Ricardo Ribalda <ribalda@chromium.org>
+Link: https://lore.kernel.org/r/20250203-uvc-roi-v17-16-5900a9fed613@chromium.org
+Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+Signed-off-by: Hans Verkuil <hverkuil@xs4all.nl>
+[hverkuil: fix control names: "Of" -> "of", "Controls" -> "Ctrls"]
+Signed-off-by: Oliver Neukum <oneukum@suse.com>
+
+---
+ drivers/media/usb/uvc/uvc_ctrl.c   | 81 ++++++++++++++++++++++++++++++
+ drivers/media/usb/uvc/uvcvideo.h   |  7 +++
+ include/uapi/linux/usb/video.h     |  1 +
+ include/uapi/linux/uvcvideo.h      | 13 +++++
+ include/uapi/linux/v4l2-controls.h |  7 +++
+ 5 files changed, 109 insertions(+)
+
+diff --git a/drivers/media/usb/uvc/uvc_ctrl.c b/drivers/media/usb/uvc/uvc_ctrl.c
+index 17a7ce525f71..cbf19aa1d823 100644
+--- a/drivers/media/usb/uvc/uvc_ctrl.c
++++ b/drivers/media/usb/uvc/uvc_ctrl.c
+@@ -358,6 +358,24 @@ static const struct uvc_control_info uvc_ctrls[] = {
+ 		.flags		= UVC_CTRL_FLAG_GET_CUR
+ 				| UVC_CTRL_FLAG_AUTO_UPDATE,
+ 	},
++	/*
++	 * UVC_CTRL_FLAG_AUTO_UPDATE is needed because the RoI may get updated
++	 * by sensors.
++	 * "This RoI should be the same as specified in most recent SET_CUR
++	 * except in the case where the ‘Auto Detect and Track’ and/or
++	 * ‘Image Stabilization’ bit have been set."
++	 * 4.2.2.1.20 Digital Region of Interest (ROI) Control
++	 */
++	{
++		.entity		= UVC_GUID_UVC_CAMERA,
++		.selector	= UVC_CT_REGION_OF_INTEREST_CONTROL,
++		.index		= 21,
++		.size		= 10,
++		.flags		= UVC_CTRL_FLAG_SET_CUR | UVC_CTRL_FLAG_GET_CUR
++				| UVC_CTRL_FLAG_GET_MIN | UVC_CTRL_FLAG_GET_MAX
++				| UVC_CTRL_FLAG_GET_DEF
++				| UVC_CTRL_FLAG_AUTO_UPDATE,
++	},
+ };
+ 
+ static const u32 uvc_control_classes[] = {
+@@ -603,6 +621,44 @@ static const struct uvc_control_mapping *uvc_ctrl_filter_plf_mapping(
+ 	return out_mapping;
+ }
+ 
++static int uvc_get_rect(struct uvc_control_mapping *mapping, u8 query,
++			const void *uvc_in, size_t v4l2_size, void *v4l2_out)
++{
++	const struct uvc_rect *uvc_rect = uvc_in;
++	struct v4l2_rect *v4l2_rect = v4l2_out;
++
++	if (WARN_ON(v4l2_size != sizeof(struct v4l2_rect)))
++		return -EINVAL;
++
++	if (uvc_rect->left > uvc_rect->right ||
++	    uvc_rect->top > uvc_rect->bottom)
++		return -EIO;
++
++	v4l2_rect->top = uvc_rect->top;
++	v4l2_rect->left = uvc_rect->left;
++	v4l2_rect->height = uvc_rect->bottom - uvc_rect->top + 1;
++	v4l2_rect->width = uvc_rect->right - uvc_rect->left + 1;
++
++	return 0;
++}
++
++static int uvc_set_rect(struct uvc_control_mapping *mapping, size_t v4l2_size,
++			const void *v4l2_in, void *uvc_out)
++{
++	struct uvc_rect *uvc_rect = uvc_out;
++	const struct v4l2_rect *v4l2_rect = v4l2_in;
++
++	if (WARN_ON(v4l2_size != sizeof(struct v4l2_rect)))
++		return -EINVAL;
++
++	uvc_rect->top = min(0xffff, v4l2_rect->top);
++	uvc_rect->left = min(0xffff, v4l2_rect->left);
++	uvc_rect->bottom = min(0xffff, v4l2_rect->top + v4l2_rect->height - 1);
++	uvc_rect->right = min(0xffff, v4l2_rect->left + v4l2_rect->width - 1);
++
++	return 0;
++}
++
+ static const struct uvc_control_mapping uvc_ctrl_mappings[] = {
+ 	{
+ 		.id		= V4L2_CID_BRIGHTNESS,
+@@ -897,6 +953,28 @@ static const struct uvc_control_mapping uvc_ctrl_mappings[] = {
+ 		.selector	= UVC_PU_POWER_LINE_FREQUENCY_CONTROL,
+ 		.filter_mapping	= uvc_ctrl_filter_plf_mapping,
+ 	},
++	{
++		.id		= V4L2_CID_UVC_REGION_OF_INTEREST_RECT,
++		.entity		= UVC_GUID_UVC_CAMERA,
++		.selector	= UVC_CT_REGION_OF_INTEREST_CONTROL,
++		.size		= sizeof(struct uvc_rect) * 8,
++		.offset		= 0,
++		.v4l2_type	= V4L2_CTRL_TYPE_RECT,
++		.data_type	= UVC_CTRL_DATA_TYPE_RECT,
++		.get		= uvc_get_rect,
++		.set		= uvc_set_rect,
++		.name		= "Region of Interest Rectangle",
++	},
++	{
++		.id		= V4L2_CID_UVC_REGION_OF_INTEREST_AUTO,
++		.entity		= UVC_GUID_UVC_CAMERA,
++		.selector	= UVC_CT_REGION_OF_INTEREST_CONTROL,
++		.size		= 16,
++		.offset		= 64,
++		.v4l2_type	= V4L2_CTRL_TYPE_BITMASK,
++		.data_type	= UVC_CTRL_DATA_TYPE_BITMASK,
++		.name		= "Region of Interest Auto Ctrls",
++	},
+ };
+ 
+ /* ------------------------------------------------------------------------
+@@ -1473,6 +1551,9 @@ static int __uvc_queryctrl_boundaries(struct uvc_video_chain *chain,
+ 
+ static size_t uvc_mapping_v4l2_size(struct uvc_control_mapping *mapping)
+ {
++	if (mapping->v4l2_type == V4L2_CTRL_TYPE_RECT)
++		return sizeof(struct v4l2_rect);
++
+ 	if (uvc_ctrl_mapping_is_compound(mapping))
+ 		return DIV_ROUND_UP(mapping->size, 8);
+ 
+diff --git a/drivers/media/usb/uvc/uvcvideo.h b/drivers/media/usb/uvc/uvcvideo.h
+index 6fc1cb9e99d1..b63720e21075 100644
+--- a/drivers/media/usb/uvc/uvcvideo.h
++++ b/drivers/media/usb/uvc/uvcvideo.h
+@@ -543,6 +543,13 @@ struct uvc_device_info {
+ 	u16	uvc_version;
+ };
+ 
++struct uvc_rect {
++	u16 top;
++	u16 left;
++	u16 bottom;
++	u16 right;
++} __packed;
++
+ struct uvc_status_streaming {
+ 	u8	button;
+ } __packed;
+diff --git a/include/uapi/linux/usb/video.h b/include/uapi/linux/usb/video.h
+index 526b5155e23c..e1d9f5773187 100644
+--- a/include/uapi/linux/usb/video.h
++++ b/include/uapi/linux/usb/video.h
+@@ -104,6 +104,7 @@
+ #define UVC_CT_ROLL_ABSOLUTE_CONTROL			0x0f
+ #define UVC_CT_ROLL_RELATIVE_CONTROL			0x10
+ #define UVC_CT_PRIVACY_CONTROL				0x11
++#define UVC_CT_REGION_OF_INTEREST_CONTROL		0x14
+ 
+ /* A.9.5. Processing Unit Control Selectors */
+ #define UVC_PU_CONTROL_UNDEFINED			0x00
+diff --git a/include/uapi/linux/uvcvideo.h b/include/uapi/linux/uvcvideo.h
+index f86185456dc5..cbe15bca9569 100644
+--- a/include/uapi/linux/uvcvideo.h
++++ b/include/uapi/linux/uvcvideo.h
+@@ -16,6 +16,7 @@
+ #define UVC_CTRL_DATA_TYPE_BOOLEAN	3
+ #define UVC_CTRL_DATA_TYPE_ENUM		4
+ #define UVC_CTRL_DATA_TYPE_BITMASK	5
++#define UVC_CTRL_DATA_TYPE_RECT		6
+ 
+ /* Control flags */
+ #define UVC_CTRL_FLAG_SET_CUR		(1 << 0)
+@@ -38,6 +39,18 @@
+ 
+ #define UVC_MENU_NAME_LEN 32
+ 
++/* V4L2 driver-specific controls */
++#define V4L2_CID_UVC_REGION_OF_INTEREST_RECT	(V4L2_CID_USER_UVC_BASE + 1)
++#define V4L2_CID_UVC_REGION_OF_INTEREST_AUTO	(V4L2_CID_USER_UVC_BASE + 2)
++#define V4L2_UVC_REGION_OF_INTEREST_AUTO_EXPOSURE		(1 << 0)
++#define V4L2_UVC_REGION_OF_INTEREST_AUTO_IRIS			(1 << 1)
++#define V4L2_UVC_REGION_OF_INTEREST_AUTO_WHITE_BALANCE		(1 << 2)
++#define V4L2_UVC_REGION_OF_INTEREST_AUTO_FOCUS			(1 << 3)
++#define V4L2_UVC_REGION_OF_INTEREST_AUTO_FACE_DETECT		(1 << 4)
++#define V4L2_UVC_REGION_OF_INTEREST_AUTO_DETECT_AND_TRACK	(1 << 5)
++#define V4L2_UVC_REGION_OF_INTEREST_AUTO_IMAGE_STABILIZATION	(1 << 6)
++#define V4L2_UVC_REGION_OF_INTEREST_AUTO_HIGHER_QUALITY		(1 << 7)
++
+ struct uvc_menu_info {
+ 	__u32 value;
+ 	__u8 name[UVC_MENU_NAME_LEN];
+diff --git a/include/uapi/linux/v4l2-controls.h b/include/uapi/linux/v4l2-controls.h
+index 974fd254e573..72e32814ea83 100644
+--- a/include/uapi/linux/v4l2-controls.h
++++ b/include/uapi/linux/v4l2-controls.h
+@@ -215,6 +215,13 @@ enum v4l2_colorfx {
+  */
+ #define V4L2_CID_USER_THP7312_BASE		(V4L2_CID_USER_BASE + 0x11c0)
+ 
++/*
++ * The base for the uvc driver controls.
++ * See linux/uvcvideo.h for the list of controls.
++ * We reserve 64 controls for this driver.
++ */
++#define V4L2_CID_USER_UVC_BASE			(V4L2_CID_USER_BASE + 0x11e0)
++
+ /* MPEG-class control IDs */
+ /* The MPEG controls are applicable to all codec controls
+  * and the 'MPEG' part of the define is historical */
+-- 
+2.53.0
+
