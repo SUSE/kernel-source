@@ -4,7 +4,7 @@ Date: Wed, 24 Sep 2025 23:19:14 +0800
 Subject: amd/amdkfd: enhance kfd process check in switch partition
 Git-commit: 45da20e00d5da842e17dfc633072b127504f0d0e
 Patch-mainline: v6.18-rc1
-References: CVE-2025-68174 bsc#1255327
+References: CVE-2025-68174 bsc#1255327 jsc#PED-13979 jsc#PED-14039 jsc#PED-14046 jsc#PED-14211 jsc#PED-14333 jsc#PED-14487 jsc#PED-14488 jsc#PED-14497 jsc#PED-14499 jsc#PED-15868
 
 current switch partition only check if kfd_processes_table is empty.
 kfd_prcesses_table entry is deleted in kfd_process_notifier_release, but
@@ -22,7 +22,7 @@ This patch is to resolve the race by adding an atomic kfd_process counter
 kfd_processes_count, it increment as create kfd process, decrement as
 finish kfd_process_wq_release.
 
-v2: Put kfd_processes_count per kfd_dev, move decrement to kfd_process_destroy_pdds
+V2: Put kfd_processes_count per kfd_dev, move decrement to kfd_process_destroy_pdds
 and bug fix. (Philip Yang)
 
 [3966658.307702] divide error: 0000 [#1] SMP NOPTI
@@ -82,48 +82,18 @@ Signed-off-by: Yifan Zhang <yifan1.zhang@amd.com>
 Reviewed-by: Philip.Yang<Philip.Yang@amd.com>
 Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
 Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
----
- drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c |    2 +-
- drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h |    4 ++--
- drivers/gpu/drm/amd/amdkfd/kfd_device.c    |   13 ++++++++++++-
- drivers/gpu/drm/amd/amdkfd/kfd_priv.h      |    2 ++
- drivers/gpu/drm/amd/amdkfd/kfd_process.c   |    4 ++++
- 5 files changed, 21 insertions(+), 4 deletions(-)
 
---- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
-+++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
-@@ -786,7 +786,7 @@ int amdgpu_amdkfd_send_close_event_drain
- 
- int amdgpu_amdkfd_check_and_lock_kfd(struct amdgpu_device *adev)
- {
--	return kgd2kfd_check_and_lock_kfd();
-+	return kgd2kfd_check_and_lock_kfd(adev->kfd.dev);
- }
- 
- void amdgpu_amdkfd_unlock_kfd(struct amdgpu_device *adev)
---- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
-+++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
-@@ -423,7 +423,7 @@ int kgd2kfd_post_reset(struct kfd_dev *k
- void kgd2kfd_interrupt(struct kfd_dev *kfd, const void *ih_ring_entry);
- void kgd2kfd_set_sram_ecc_flag(struct kfd_dev *kfd);
- void kgd2kfd_smi_event_throttle(struct kfd_dev *kfd, uint64_t throttle_bitmask);
--int kgd2kfd_check_and_lock_kfd(void);
-+int kgd2kfd_check_and_lock_kfd(struct kfd_dev *kfd);
- void kgd2kfd_unlock_kfd(void);
- int kgd2kfd_start_sched(struct kfd_dev *kfd, uint32_t node_id);
- int kgd2kfd_stop_sched(struct kfd_dev *kfd, uint32_t node_id);
-@@ -489,7 +489,7 @@ void kgd2kfd_smi_event_throttle(struct k
- {
- }
- 
--static inline int kgd2kfd_check_and_lock_kfd(void)
-+static inline int kgd2kfd_check_and_lock_kfd(struct kfd_dev *kfd)
- {
- 	return 0;
- }
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_device.c  | 10 ++++++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h    |  2 ++
+ drivers/gpu/drm/amd/amdkfd/kfd_process.c |  4 ++++
+ 3 files changed, 16 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_device.c b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+index 051a00152b08..e9cfb80bd436 100644
 --- a/drivers/gpu/drm/amd/amdkfd/kfd_device.c
 +++ b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
-@@ -487,6 +487,7 @@ struct kfd_dev *kgd2kfd_probe(struct amd
+@@ -495,6 +495,7 @@ struct kfd_dev *kgd2kfd_probe(struct amdgpu_device *adev, bool vf)
  	mutex_init(&kfd->doorbell_mutex);
  
  	ida_init(&kfd->doorbell_ida);
@@ -131,41 +101,40 @@ Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
  
  	return kfd;
  }
-@@ -1430,9 +1431,19 @@ unsigned int kfd_get_num_xgmi_sdma_engin
- 		kfd_get_num_sdma_engines(node);
- }
+@@ -1493,6 +1494,15 @@ int kgd2kfd_check_and_lock_kfd(struct kfd_dev *kfd)
  
--int kgd2kfd_check_and_lock_kfd(void)
-+int kgd2kfd_check_and_lock_kfd(struct kfd_dev *kfd)
- {
  	mutex_lock(&kfd_processes_mutex);
-+
+ 
 +	/* kfd_processes_count is per kfd_dev, return -EBUSY without
 +	 * further check
 +	 */
 +	if (!!atomic_read(&kfd->kfd_processes_count)) {
 +		pr_debug("process_wq_release not finished\n");
-+		mutex_unlock(&kfd_processes_mutex);
-+		return -EBUSY;
++		r = -EBUSY;
++		goto out;
 +	}
 +
- 	if (!hash_empty(kfd_processes_table) || kfd_is_locked()) {
- 		mutex_unlock(&kfd_processes_mutex);
- 		return -EBUSY;
+ 	if (hash_empty(kfd_processes_table) && !kfd_is_locked(kfd))
+ 		goto out;
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+index d01ef5ac0766..70ef051511bb 100644
 --- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
 +++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
-@@ -379,6 +379,8 @@ struct kfd_dev {
+@@ -382,6 +382,8 @@ struct kfd_dev {
  
- 	/* bitmap for dynamic doorbell allocation from doorbell object */
- 	unsigned long *doorbell_bitmap;
+ 	/* for dynamic partitioning */
+ 	int kfd_dev_lock;
 +
 +	atomic_t kfd_processes_count;
  };
  
  enum kfd_mempool {
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process.c b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+index 5be28c6c4f6a..ddfe30c13e9d 100644
 --- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
 +++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
-@@ -1091,6 +1091,8 @@ static void kfd_process_destroy_pdds(str
+@@ -1088,6 +1088,8 @@ static void kfd_process_destroy_pdds(struct kfd_process *p)
  			pdd->runtime_inuse = false;
  		}
  
@@ -174,7 +143,7 @@ Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
  		kfree(pdd);
  		p->pdds[i] = NULL;
  	}
-@@ -1662,6 +1664,8 @@ struct kfd_process_device *kfd_create_pr
+@@ -1649,6 +1651,8 @@ struct kfd_process_device *kfd_create_process_device_data(struct kfd_node *dev,
  	/* Init idr used for memory handle translation */
  	idr_init(&pdd->alloc_idr);
  
@@ -183,3 +152,6 @@ Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
  	return pdd;
  }
  
+-- 
+2.53.0
+
