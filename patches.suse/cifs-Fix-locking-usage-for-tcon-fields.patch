@@ -1,0 +1,107 @@
+From: Shyam Prasad N <sprasad@microsoft.com>
+Date: Sun, 1 Feb 2026 00:21:13 +0530
+Subject: [PATCH] cifs: Fix locking usage for tcon fields
+Git-commit: 96c4af418586ee9a6aab61738644366426e05316
+References: git-fixes
+Patch-mainline: v7.0-rc1
+
+We used to use the cifs_tcp_ses_lock to protect a lot of objects
+that are not just the server, ses or tcon lists. We later introduced
+srv_lock, ses_lock and tc_lock to protect fields within the
+corresponding structs. This was done to provide a more granular
+protection and avoid unnecessary serialization.
+
+There were still a couple of uses of cifs_tcp_ses_lock to provide
+tcon fields. In this patch, I've replaced them with tc_lock.
+
+Cc: stable@vger.kernel.org
+Signed-off-by: Shyam Prasad N <sprasad@microsoft.com>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Henrique Carvalho <henrique.carvalho@suse.com>
+---
+ fs/smb/client/cached_dir.c |    4 ++--
+ fs/smb/client/smb2misc.c   |    6 +++---
+ fs/smb/client/smb2ops.c    |   11 +++++------
+ fs/smb/client/smb2pdu.c    |    2 ++
+ 4 files changed, 12 insertions(+), 11 deletions(-)
+
+--- a/fs/smb/client/cached_dir.c
++++ b/fs/smb/client/cached_dir.c
+@@ -765,9 +765,9 @@ static void cfids_laundromat_worker(stru
+ 		cfid->dentry = NULL;
+ 
+ 		if (cfid->is_open) {
+-			spin_lock(&cifs_tcp_ses_lock);
++			spin_lock(&cfid->tcon->tc_lock);
+ 			++cfid->tcon->tc_count;
+-			spin_unlock(&cifs_tcp_ses_lock);
++			spin_unlock(&cfid->tcon->tc_lock);
+ 			queue_work(serverclose_wq, &cfid->close_work);
+ 		} else
+ 			/*
+--- a/fs/smb/client/smb2misc.c
++++ b/fs/smb/client/smb2misc.c
+@@ -813,12 +813,12 @@ smb2_handle_cancelled_close(struct cifs_
+ 	int rc;
+ 
+ 	cifs_dbg(FYI, "%s: tc_count=%d\n", __func__, tcon->tc_count);
+-	spin_lock(&cifs_tcp_ses_lock);
++	spin_lock(&tcon->tc_lock);
+ 	if (tcon->tc_count <= 0) {
+ 		struct TCP_Server_Info *server = NULL;
+ 
+ 		WARN_ONCE(tcon->tc_count < 0, "tcon refcount is negative");
+-		spin_unlock(&cifs_tcp_ses_lock);
++		spin_unlock(&tcon->tc_lock);
+ 
+ 		if (tcon->ses) {
+ 			server = tcon->ses->server;
+@@ -830,7 +830,7 @@ smb2_handle_cancelled_close(struct cifs_
+ 		return 0;
+ 	}
+ 	tcon->tc_count++;
+-	spin_unlock(&cifs_tcp_ses_lock);
++	spin_unlock(&tcon->tc_lock);
+ 
+ 	rc = __smb2_handle_cancelled_cmd(tcon, SMB2_CLOSE_HE, 0,
+ 					 persistent_fid, volatile_fid);
+--- a/fs/smb/client/smb2ops.c
++++ b/fs/smb/client/smb2ops.c
+@@ -2911,8 +2911,11 @@ smb2_get_dfs_refer(const unsigned int xi
+ 		tcon = list_first_entry_or_null(&ses->tcon_list,
+ 						struct cifs_tcon,
+ 						tcon_list);
+-		if (tcon)
++		if (tcon) {
++                        spin_lock(&tcon->tc_lock);
+ 			tcon->tc_count++;
++                        spin_unlock(&tcon->tc_lock);
++                }
+ 		spin_unlock(&cifs_tcp_ses_lock);
+ 	}
+ 
+@@ -2972,11 +2975,7 @@ smb2_get_dfs_refer(const unsigned int xi
+  out:
+ 	if (tcon && !tcon->ipc) {
+ 		/* ipc tcons are not refcounted */
+-		spin_lock(&cifs_tcp_ses_lock);
+-		tcon->tc_count--;
+-		/* tc_count can never go negative */
+-		WARN_ON(tcon->tc_count < 0);
+-		spin_unlock(&cifs_tcp_ses_lock);
++                cifs_put_tcon(tcon);
+ 	}
+ 	kfree(utf16_path);
+ 	kfree(dfs_req);
+--- a/fs/smb/client/smb2pdu.c
++++ b/fs/smb/client/smb2pdu.c
+@@ -4138,7 +4138,9 @@ void smb2_reconnect_server(struct work_s
+ 
+ 		list_for_each_entry(tcon, &ses->tcon_list, tcon_list) {
+ 			if (tcon->need_reconnect || tcon->need_reopen_files) {
++                                spin_lock(&tcon->tc_lock);
+ 				tcon->tc_count++;
++                                spin_unlock(&tcon->tc_lock);
+ 				list_add_tail(&tcon->rlist, &tmp_list);
+ 				tcon_selected = tcon_exist = true;
+ 			}
