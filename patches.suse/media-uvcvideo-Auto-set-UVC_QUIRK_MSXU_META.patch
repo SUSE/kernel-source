@@ -1,0 +1,180 @@
+From 6cb786f040ad35b23b4a7bff8b9d772f22909d48 Mon Sep 17 00:00:00 2001
+From: Ricardo Ribalda <ribalda@chromium.org>
+Date: Mon, 7 Jul 2025 18:34:05 +0000
+Subject: [PATCH] media: uvcvideo: Auto-set UVC_QUIRK_MSXU_META
+Git-commit: 6cb786f040ad35b23b4a7bff8b9d772f22909d48
+References: jsc#PED-14445
+Patch-mainline: v6.17-rc1
+
+If the camera supports the MSXU_CONTROL_METADATA control, auto set the
+MSXU_META quirk.
+
+Reviewed-by: Hans de Goede <hansg@kernel.org>
+Signed-off-by: Ricardo Ribalda <ribalda@chromium.org>
+Link: https://lore.kernel.org/r/20250707-uvc-meta-v8-5-ed17f8b1218b@chromium.org
+Signed-off-by: Hans de Goede <hansg@kernel.org>
+Signed-off-by: Hans Verkuil <hverkuil@xs4all.nl>
+Signed-off-by: Oliver Neukum <oneukum@suse.com>
+
+---
+ drivers/media/usb/uvc/uvc_driver.c   |  7 ++-
+ drivers/media/usb/uvc/uvc_metadata.c | 75 +++++++++++++++++++++++++++-
+ drivers/media/usb/uvc/uvcvideo.h     |  2 +-
+ include/linux/usb/uvc.h              |  3 ++
+ 4 files changed, 84 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/media/usb/uvc/uvc_driver.c b/drivers/media/usb/uvc/uvc_driver.c
+index b12c95fe8b0a..775bede0d93d 100644
+--- a/drivers/media/usb/uvc/uvc_driver.c
++++ b/drivers/media/usb/uvc/uvc_driver.c
+@@ -2293,7 +2293,12 @@ static int uvc_probe(struct usb_interface *intf,
+ 		goto error;
+ 	}
+ 
+-	uvc_meta_init(dev);
++	ret = uvc_meta_init(dev);
++	if (ret < 0) {
++		dev_err(&dev->udev->dev,
++			"Error initializing the metadata formats (%d)\n", ret);
++		goto error;
++	}
+ 
+ 	if (dev->quirks & UVC_QUIRK_NO_RESET_RESUME)
+ 		udev->quirks &= ~USB_QUIRK_RESET_RESUME;
+diff --git a/drivers/media/usb/uvc/uvc_metadata.c b/drivers/media/usb/uvc/uvc_metadata.c
+index d0ee139dbda7..12972527ab8d 100644
+--- a/drivers/media/usb/uvc/uvc_metadata.c
++++ b/drivers/media/usb/uvc/uvc_metadata.c
+@@ -10,6 +10,7 @@
+ #include <linux/list.h>
+ #include <linux/module.h>
+ #include <linux/usb.h>
++#include <linux/usb/uvc.h>
+ #include <linux/videodev2.h>
+ 
+ #include <media/v4l2-ioctl.h>
+@@ -166,6 +167,71 @@ static const struct v4l2_file_operations uvc_meta_fops = {
+ 	.mmap = vb2_fop_mmap,
+ };
+ 
++static struct uvc_entity *uvc_meta_find_msxu(struct uvc_device *dev)
++{
++	static const u8 uvc_msxu_guid[16] = UVC_GUID_MSXU_1_5;
++	struct uvc_entity *entity;
++
++	list_for_each_entry(entity, &dev->entities, list) {
++		if (!memcmp(entity->guid, uvc_msxu_guid, sizeof(entity->guid)))
++			return entity;
++	}
++
++	return NULL;
++}
++
++#define MSXU_CONTROL_METADATA 0x9
++static int uvc_meta_detect_msxu(struct uvc_device *dev)
++{
++	u32 *data __free(kfree) = NULL;
++	struct uvc_entity *entity;
++	int ret;
++
++	entity = uvc_meta_find_msxu(dev);
++	if (!entity)
++		return 0;
++
++	/*
++	 * USB requires buffers aligned in a special way, simplest way is to
++	 * make sure that query_ctrl will work is to kmalloc() them.
++	 */
++	data = kmalloc(sizeof(*data), GFP_KERNEL);
++	if (!data)
++		return -ENOMEM;
++
++	/* Check if the metadata is already enabled. */
++	ret = uvc_query_ctrl(dev, UVC_GET_CUR, entity->id, dev->intfnum,
++			     MSXU_CONTROL_METADATA, data, sizeof(*data));
++	if (ret)
++		return 0;
++
++	if (*data) {
++		dev->quirks |= UVC_QUIRK_MSXU_META;
++		return 0;
++	}
++
++	/*
++	 * We have seen devices that require 1 to enable the metadata, others
++	 * requiring a value != 1 and others requiring a value >1. Luckily for
++	 * us, the value from GET_MAX seems to work all the time.
++	 */
++	ret = uvc_query_ctrl(dev, UVC_GET_MAX, entity->id, dev->intfnum,
++			     MSXU_CONTROL_METADATA, data, sizeof(*data));
++	if (ret || !*data)
++		return 0;
++
++	/*
++	 * If we can set MSXU_CONTROL_METADATA, the device will report
++	 * metadata.
++	 */
++	ret = uvc_query_ctrl(dev, UVC_SET_CUR, entity->id, dev->intfnum,
++			     MSXU_CONTROL_METADATA, data, sizeof(*data));
++	if (!ret)
++		dev->quirks |= UVC_QUIRK_MSXU_META;
++
++	return 0;
++}
++
+ int uvc_meta_register(struct uvc_streaming *stream)
+ {
+ 	struct uvc_device *dev = stream->dev;
+@@ -179,9 +245,14 @@ int uvc_meta_register(struct uvc_streaming *stream)
+ 					 &uvc_meta_fops, &uvc_meta_ioctl_ops);
+ }
+ 
+-void uvc_meta_init(struct uvc_device *dev)
++int uvc_meta_init(struct uvc_device *dev)
+ {
+ 	unsigned int i = 0;
++	int ret;
++
++	ret = uvc_meta_detect_msxu(dev);
++	if (ret)
++		return ret;
+ 
+ 	dev->meta_formats[i++] = V4L2_META_FMT_UVC;
+ 
+@@ -195,4 +266,6 @@ void uvc_meta_init(struct uvc_device *dev)
+ 
+ 	 /* IMPORTANT: for new meta-formats update UVC_MAX_META_DATA_FORMATS. */
+ 	dev->meta_formats[i++] = 0;
++
++	return 0;
+ }
+diff --git a/drivers/media/usb/uvc/uvcvideo.h b/drivers/media/usb/uvc/uvcvideo.h
+index eb164d063199..b34c1914ff39 100644
+--- a/drivers/media/usb/uvc/uvcvideo.h
++++ b/drivers/media/usb/uvc/uvcvideo.h
+@@ -728,7 +728,7 @@ int uvc_query_ctrl(struct uvc_device *dev, u8 query, u8 unit,
+ void uvc_video_clock_update(struct uvc_streaming *stream,
+ 			    struct vb2_v4l2_buffer *vbuf,
+ 			    struct uvc_buffer *buf);
+-void uvc_meta_init(struct uvc_device *dev);
++int uvc_meta_init(struct uvc_device *dev);
+ int uvc_meta_register(struct uvc_streaming *stream);
+ 
+ int uvc_register_video_device(struct uvc_device *dev,
+diff --git a/include/linux/usb/uvc.h b/include/linux/usb/uvc.h
+index bce95153e5a6..ee19e9f915b8 100644
+--- a/include/linux/usb/uvc.h
++++ b/include/linux/usb/uvc.h
+@@ -29,6 +29,9 @@
+ #define UVC_GUID_EXT_GPIO_CONTROLLER \
+ 	{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, \
+ 	 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x03}
++#define UVC_GUID_MSXU_1_5 \
++	{0xdc, 0x95, 0x3f, 0x0f, 0x32, 0x26, 0x4e, 0x4c, \
++	 0x92, 0xc9, 0xa0, 0x47, 0x82, 0xf4, 0x3b, 0xc8}
+ 
+ #define UVC_GUID_FORMAT_MJPEG \
+ 	{ 'M',  'J',  'P',  'G', 0x00, 0x00, 0x10, 0x00, \
+-- 
+2.53.0
+
