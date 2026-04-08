@@ -1,0 +1,148 @@
+From 0bb51c8897395de5bd5f571874130aec214ef534 Mon Sep 17 00:00:00 2001
+From: Ricardo Ribalda <ribalda@chromium.org>
+Date: Mon, 7 Jul 2025 18:34:03 +0000
+Subject: [PATCH] media: uvcvideo: Introduce dev->meta_formats
+Git-commit: 0bb51c8897395de5bd5f571874130aec214ef534
+References: jsc#PED-14445
+Patch-mainline: v6.17-rc1
+
+Right now, there driver supports devices with one or two metadata
+formats. Prepare it to support more than two metadata formats.
+
+This is achieved with the introduction of a new field `meta_formats`,
+that contains the array of metadata formats supported by the device, in
+the order expected by userspace.
+
+Suggested-by: Hans de Goede <hansg@kernel.org>
+Signed-off-by: Ricardo Ribalda <ribalda@chromium.org>
+Reviewed-by: Hans de Goede <hansg@kernel.org>
+Link: https://lore.kernel.org/r/20250707-uvc-meta-v8-3-ed17f8b1218b@chromium.org
+Signed-off-by: Hans de Goede <hansg@kernel.org>
+Signed-off-by: Hans Verkuil <hverkuil@xs4all.nl>
+Signed-off-by: Oliver Neukum <oneukum@suse.com>
+
+---
+ drivers/media/usb/uvc/uvc_driver.c   |  2 ++
+ drivers/media/usb/uvc/uvc_metadata.c | 38 +++++++++++++++++++++++-----
+ drivers/media/usb/uvc/uvcvideo.h     |  6 +++++
+ 3 files changed, 39 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/media/usb/uvc/uvc_driver.c b/drivers/media/usb/uvc/uvc_driver.c
+index accfb4ca3c72..b12c95fe8b0a 100644
+--- a/drivers/media/usb/uvc/uvc_driver.c
++++ b/drivers/media/usb/uvc/uvc_driver.c
+@@ -2293,6 +2293,8 @@ static int uvc_probe(struct usb_interface *intf,
+ 		goto error;
+ 	}
+ 
++	uvc_meta_init(dev);
++
+ 	if (dev->quirks & UVC_QUIRK_NO_RESET_RESUME)
+ 		udev->quirks &= ~USB_QUIRK_RESET_RESUME;
+ 
+diff --git a/drivers/media/usb/uvc/uvc_metadata.c b/drivers/media/usb/uvc/uvc_metadata.c
+index d3aab22f91ce..58691df60dd3 100644
+--- a/drivers/media/usb/uvc/uvc_metadata.c
++++ b/drivers/media/usb/uvc/uvc_metadata.c
+@@ -64,14 +64,20 @@ static int uvc_meta_v4l2_try_format(struct file *file, void *fh,
+ 	struct uvc_device *dev = stream->dev;
+ 	struct v4l2_meta_format *fmt = &format->fmt.meta;
+ 	u32 fmeta = fmt->dataformat;
++	u32 i;
+ 
+ 	if (format->type != vfh->vdev->queue->type)
+ 		return -EINVAL;
+ 
++	for (i = 0; (fmeta != dev->meta_formats[i]) && dev->meta_formats[i];
++	     i++)
++		;
++	if (!dev->meta_formats[i])
++		fmeta = V4L2_META_FMT_UVC;
++
+ 	memset(fmt, 0, sizeof(*fmt));
+ 
+-	fmt->dataformat = fmeta == dev->info->meta_format
+-			? fmeta : V4L2_META_FMT_UVC;
++	fmt->dataformat = fmeta;
+ 	fmt->buffersize = UVC_METADATA_BUF_SIZE;
+ 
+ 	return 0;
+@@ -112,17 +118,21 @@ static int uvc_meta_v4l2_enum_formats(struct file *file, void *fh,
+ 	struct v4l2_fh *vfh = file->private_data;
+ 	struct uvc_streaming *stream = video_get_drvdata(vfh->vdev);
+ 	struct uvc_device *dev = stream->dev;
+-	u32 index = fdesc->index;
++	u32 i;
++
++	if (fdesc->type != vfh->vdev->queue->type)
++		return -EINVAL;
+ 
+-	if (fdesc->type != vfh->vdev->queue->type ||
+-	    index > 1U || (index && !dev->info->meta_format))
++	for (i = 0; (i < fdesc->index) && dev->meta_formats[i]; i++)
++		;
++	if (!dev->meta_formats[i])
+ 		return -EINVAL;
+ 
+ 	memset(fdesc, 0, sizeof(*fdesc));
+ 
+ 	fdesc->type = vfh->vdev->queue->type;
+-	fdesc->index = index;
+-	fdesc->pixelformat = index ? dev->info->meta_format : V4L2_META_FMT_UVC;
++	fdesc->index = i;
++	fdesc->pixelformat = dev->meta_formats[i];
+ 
+ 	return 0;
+ }
+@@ -168,3 +178,17 @@ int uvc_meta_register(struct uvc_streaming *stream)
+ 					 V4L2_BUF_TYPE_META_CAPTURE,
+ 					 &uvc_meta_fops, &uvc_meta_ioctl_ops);
+ }
++
++void uvc_meta_init(struct uvc_device *dev)
++{
++	unsigned int i = 0;
++
++	dev->meta_formats[i++] = V4L2_META_FMT_UVC;
++
++	if (dev->info->meta_format &&
++	    !WARN_ON(dev->info->meta_format == V4L2_META_FMT_UVC))
++		dev->meta_formats[i++] = dev->info->meta_format;
++
++	 /* IMPORTANT: for new meta-formats update UVC_MAX_META_DATA_FORMATS. */
++	dev->meta_formats[i++] = 0;
++}
+diff --git a/drivers/media/usb/uvc/uvcvideo.h b/drivers/media/usb/uvc/uvcvideo.h
+index 3e6d2d912f3a..81ec171fdfde 100644
+--- a/drivers/media/usb/uvc/uvcvideo.h
++++ b/drivers/media/usb/uvc/uvcvideo.h
+@@ -575,6 +575,8 @@ struct uvc_status {
+ 	};
+ } __packed;
+ 
++#define UVC_MAX_META_DATA_FORMATS 3
++
+ struct uvc_device {
+ 	struct usb_device *udev;
+ 	struct usb_interface *intf;
+@@ -585,6 +587,9 @@ struct uvc_device {
+ 
+ 	const struct uvc_device_info *info;
+ 
++	/* Zero-ended list of meta formats */
++	u32 meta_formats[UVC_MAX_META_DATA_FORMATS + 1];
++
+ 	atomic_t nmappings;
+ 
+ 	/* Video control interface */
+@@ -722,6 +727,7 @@ int uvc_query_ctrl(struct uvc_device *dev, u8 query, u8 unit,
+ void uvc_video_clock_update(struct uvc_streaming *stream,
+ 			    struct vb2_v4l2_buffer *vbuf,
+ 			    struct uvc_buffer *buf);
++void uvc_meta_init(struct uvc_device *dev);
+ int uvc_meta_register(struct uvc_streaming *stream);
+ 
+ int uvc_register_video_device(struct uvc_device *dev,
+-- 
+2.53.0
+
