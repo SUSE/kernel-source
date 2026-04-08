@@ -1,0 +1,184 @@
+From: Dave Jiang <dave.jiang@intel.com>
+Date: Fri, 29 Aug 2025 15:29:06 -0700
+Subject: [PATCH] cxl, acpi/hmat: Update CXL access coordinates directly
+ instead of through HMAT
+Git-commit: 2e454fb8056df6da4bba7d89a57bf60e217463c0
+Patch-mainline: v6.18-rc1
+References: jsc#PED-15409
+
+The current implementation of CXL memory hotplug notifier gets called
+before the HMAT memory hotplug notifier. The CXL driver calculates the
+access coordinates (bandwidth and latency values) for the CXL end to
+end path (i.e. CPU to endpoint). When the CXL region is onlined, the CXL
+memory hotplug notifier writes the access coordinates to the HMAT target
+structs. Then the HMAT memory hotplug notifier is called and it creates
+the access coordinates for the node sysfs attributes.
+
+During testing on an Intel platform, it was found that although the
+newly calculated coordinates were pushed to sysfs, the sysfs attributes for
+the access coordinates showed up with the wrong initiator. The system has
+4 nodes (0, 1, 2, 3) where node 0 and 1 are CPU nodes and node 2 and 3 are
+CXL nodes. The expectation is that node 2 would show up as a target to node
+0:
+/sys/devices/system/node/node2/access0/initiators/node0
+
+However it was observed that node 2 showed up as a target under node 1:
+/sys/devices/system/node/node2/access0/initiators/node1
+
+The original intent of the 'ext_updated' flag in HMAT handling code was to
+stop HMAT memory hotplug callback from clobbering the access coordinates
+after CXL has injected its calculated coordinates and replaced the generic
+target access coordinates provided by the HMAT table in the HMAT target
+structs. However the flag is hacky at best and blocks the updates from
+other CXL regions that are onlined in the same node later on. Remove the
+'ext_updated' flag usage and just update the access coordinates for the
+nodes directly without touching HMAT target data.
+
+The hotplug memory callback ordering is changed. Instead of changing CXL,
+move HMAT back so there's room for the levels rather than have CXL share
+the same level as SLAB_CALLBACK_PRI. The change will resulting in the CXL
+callback to be executed after the HMAT callback.
+
+With the change, the CXL hotplug memory notifier runs after the HMAT
+callback. The HMAT callback will create the node sysfs attributes for
+access coordinates. The CXL callback will write the access coordinates to
+the now created node sysfs attributes directly and will not pollute the
+HMAT target values.
+
+A nodemask is introduced to keep track if a node has been updated and
+prevents further updates.
+
+Fixes: 067353a46d8c ("cxl/region: Add memory hotplug notifier for cxl region")
+Cc: stable@vger.kernel.org
+Tested-by: Marc Herbert <marc.herbert@linux.intel.com>
+Reviewed-by: Dan Williams <dan.j.williams@intel.com>
+Reviewed-by: Jonathan Cameron <jonathan.cameron@huawei.com>
+Link: https://patch.msgid.link/20250829222907.1290912-4-dave.jiang@intel.com
+Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/acpi/numa/hmat.c  |  6 ------
+ drivers/cxl/core/cdat.c   |  5 -----
+ drivers/cxl/core/core.h   |  1 -
+ drivers/cxl/core/region.c | 20 ++++++++++++--------
+ include/linux/memory.h    |  2 +-
+ 5 files changed, 13 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/acpi/numa/hmat.c b/drivers/acpi/numa/hmat.c
+index 4958301f5417..5d32490dc4ab 100644
+--- a/drivers/acpi/numa/hmat.c
++++ b/drivers/acpi/numa/hmat.c
+@@ -74,7 +74,6 @@ struct memory_target {
+ 	struct node_cache_attrs cache_attrs;
+ 	u8 gen_port_device_handle[ACPI_SRAT_DEVICE_HANDLE_SIZE];
+ 	bool registered;
+-	bool ext_updated;	/* externally updated */
+ };
+ 
+ struct memory_initiator {
+@@ -391,7 +390,6 @@ int hmat_update_target_coordinates(int nid, struct access_coordinate *coord,
+ 				  coord->read_bandwidth, access);
+ 	hmat_update_target_access(target, ACPI_HMAT_WRITE_BANDWIDTH,
+ 				  coord->write_bandwidth, access);
+-	target->ext_updated = true;
+ 
+ 	return 0;
+ }
+@@ -773,10 +771,6 @@ static void hmat_update_target_attrs(struct memory_target *target,
+ 	u32 best = 0;
+ 	int i;
+ 
+-	/* Don't update if an external agent has changed the data.  */
+-	if (target->ext_updated)
+-		return;
+-
+ 	/* Don't update for generic port if there's no device handle */
+ 	if ((access == NODE_ACCESS_CLASS_GENPORT_SINK_LOCAL ||
+ 	     access == NODE_ACCESS_CLASS_GENPORT_SINK_CPU) &&
+diff --git a/drivers/cxl/core/cdat.c b/drivers/cxl/core/cdat.c
+index c0af645425f4..c891fd618cfd 100644
+--- a/drivers/cxl/core/cdat.c
++++ b/drivers/cxl/core/cdat.c
+@@ -1081,8 +1081,3 @@ int cxl_update_hmat_access_coordinates(int nid, struct cxl_region *cxlr,
+ {
+ 	return hmat_update_target_coordinates(nid, &cxlr->coord[access], access);
+ }
+-
+-bool cxl_need_node_perf_attrs_update(int nid)
+-{
+-	return !acpi_node_backed_by_real_pxm(nid);
+-}
+diff --git a/drivers/cxl/core/core.h b/drivers/cxl/core/core.h
+index 2669f251d677..a253d308f3c9 100644
+--- a/drivers/cxl/core/core.h
++++ b/drivers/cxl/core/core.h
+@@ -139,7 +139,6 @@ long cxl_pci_get_latency(struct pci_dev *pdev);
+ int cxl_pci_get_bandwidth(struct pci_dev *pdev, struct access_coordinate *c);
+ int cxl_update_hmat_access_coordinates(int nid, struct cxl_region *cxlr,
+ 				       enum access_coordinate_class access);
+-bool cxl_need_node_perf_attrs_update(int nid);
+ int cxl_port_get_switch_dport_bandwidth(struct cxl_port *port,
+ 					struct access_coordinate *c);
+ 
+diff --git a/drivers/cxl/core/region.c b/drivers/cxl/core/region.c
+index 71cc42d05248..0ed95cbc5d5b 100644
+--- a/drivers/cxl/core/region.c
++++ b/drivers/cxl/core/region.c
+@@ -30,6 +30,12 @@
+  * 3. Decoder targets
+  */
+ 
++/*
++ * nodemask that sets per node when the access_coordinates for the node has
++ * been updated by the CXL memory hotplug notifier.
++ */
++static nodemask_t nodemask_region_seen = NODE_MASK_NONE;
++
+ static struct cxl_region *to_cxl_region(struct device *dev);
+ 
+ #define __ACCESS_ATTR_RO(_level, _name) {				\
+@@ -2442,14 +2448,8 @@ static bool cxl_region_update_coordinates(struct cxl_region *cxlr, int nid)
+ 
+ 	for (int i = 0; i < ACCESS_COORDINATE_MAX; i++) {
+ 		if (cxlr->coord[i].read_bandwidth) {
+-			rc = 0;
+-			if (cxl_need_node_perf_attrs_update(nid))
+-				node_set_perf_attrs(nid, &cxlr->coord[i], i);
+-			else
+-				rc = cxl_update_hmat_access_coordinates(nid, cxlr, i);
+-
+-			if (rc == 0)
+-				cset++;
++			node_update_perf_attrs(nid, &cxlr->coord[i], i);
++			cset++;
+ 		}
+ 	}
+ 
+@@ -2487,6 +2487,10 @@ static int cxl_region_perf_attrs_callback(struct notifier_block *nb,
+ 	if (nid != region_nid)
+ 		return NOTIFY_DONE;
+ 
++	/* No action needed if node bit already set */
++	if (node_test_and_set(nid, nodemask_region_seen))
++		return NOTIFY_DONE;
++
+ 	if (!cxl_region_update_coordinates(cxlr, nid))
+ 		return NOTIFY_DONE;
+ 
+diff --git a/include/linux/memory.h b/include/linux/memory.h
+index 1305102688d0..0b755d1ef1ec 100644
+--- a/include/linux/memory.h
++++ b/include/linux/memory.h
+@@ -120,8 +120,8 @@ struct mem_section;
+  */
+ #define DEFAULT_CALLBACK_PRI	0
+ #define SLAB_CALLBACK_PRI	1
+-#define HMAT_CALLBACK_PRI	2
+ #define CXL_CALLBACK_PRI	5
++#define HMAT_CALLBACK_PRI	6
+ #define MM_COMPUTE_BATCH_PRI	10
+ #define CPUSET_CALLBACK_PRI	10
+ #define MEMTIER_HOTPLUG_PRI	100
+-- 
+2.43.0
+
