@@ -1,0 +1,149 @@
+From 0aa112e4a880ff809ecd3426d9c7c9e1f4ad3826 Mon Sep 17 00:00:00 2001
+From: Ricardo Ribalda <ribalda@chromium.org>
+Date: Fri, 9 May 2025 18:24:13 +0000
+Subject: [PATCH] media: uvcvideo: Refactor uvc_ctrl_set_handle()
+Git-commit: 0aa112e4a880ff809ecd3426d9c7c9e1f4ad3826
+References: jsc#PED-14445
+Patch-mainline: v6.17-rc1
+
+Today uvc_ctrl_set_handle() covers two use-uses: setting the handle and
+clearing the handle. The only common code between the two cases is the
+lockdep_assert_held.
+
+The code looks cleaner if we split these two usecases in two functions.
+
+We also take this opportunity to use pending_async_ctrls from ctrl where
+possible.
+
+Signed-off-by: Ricardo Ribalda <ribalda@chromium.org>
+Reviewed-by: Laurent Pinchart <laurent.pinchart@ideasonboard.com>
+Link: https://lore.kernel.org/r/20250509-uvc-followup-v1-1-73bcde30d2b5@chromium.org
+Signed-off-by: Laurent Pinchart <laurent.pinchart@ideasonboard.com>
+Signed-off-by: Hans Verkuil <hverkuil@xs4all.nl>
+Signed-off-by: Oliver Neukum <oneukum@suse.com>
+
+---
+ drivers/media/usb/uvc/uvc_ctrl.c |   72 +++++++++++++++++++--------------------
+ 1 file changed, 36 insertions(+), 36 deletions(-)
+
+--- a/drivers/media/usb/uvc/uvc_ctrl.c
++++ b/drivers/media/usb/uvc/uvc_ctrl.c
+@@ -1851,48 +1851,48 @@ static void uvc_ctrl_send_slave_event(st
+ 	uvc_ctrl_send_event(chain, handle, ctrl, mapping, val, changes);
+ }
+ 
+-static int uvc_ctrl_set_handle(struct uvc_fh *handle, struct uvc_control *ctrl,
+-			       struct uvc_fh *new_handle)
++static int uvc_ctrl_set_handle(struct uvc_control *ctrl, struct uvc_fh *handle)
+ {
+-	lockdep_assert_held(&handle->chain->ctrl_mutex);
++	int ret;
+ 
+-	if (new_handle) {
+-		int ret;
++	lockdep_assert_held(&handle->chain->ctrl_mutex);
+ 
+-		if (ctrl->handle)
+-			dev_warn_ratelimited(&handle->stream->dev->udev->dev,
+-					     "UVC non compliance: Setting an async control with a pending operation.");
++	if (ctrl->handle) {
++		dev_warn_ratelimited(&handle->stream->dev->udev->dev,
++				     "UVC non compliance: Setting an async control with a pending operation.");
+ 
+-		if (new_handle == ctrl->handle)
++		if (ctrl->handle == handle)
+ 			return 0;
+ 
+-		if (ctrl->handle) {
+-			WARN_ON(!ctrl->handle->pending_async_ctrls);
+-			if (ctrl->handle->pending_async_ctrls)
+-				ctrl->handle->pending_async_ctrls--;
+-			ctrl->handle = new_handle;
+-			handle->pending_async_ctrls++;
+-			return 0;
+-		}
+-
+-		ret = uvc_pm_get(handle->chain->dev);
+-		if (ret)
+-			return ret;
+-
+-		ctrl->handle = new_handle;
+-		handle->pending_async_ctrls++;
++		WARN_ON(!ctrl->handle->pending_async_ctrls);
++		if (ctrl->handle->pending_async_ctrls)
++			ctrl->handle->pending_async_ctrls--;
++		ctrl->handle = handle;
++		ctrl->handle->pending_async_ctrls++;
+ 		return 0;
+ 	}
+ 
+-	/* Cannot clear the handle for a control not owned by us.*/
+-	if (WARN_ON(ctrl->handle != handle))
++	ret = uvc_pm_get(handle->chain->dev);
++	if (ret)
++		return ret;
++
++	ctrl->handle = handle;
++	ctrl->handle->pending_async_ctrls++;
++	return 0;
++}
++
++static int uvc_ctrl_clear_handle(struct uvc_control *ctrl)
++{
++	lockdep_assert_held(&ctrl->handle->chain->ctrl_mutex);
++
++	if (WARN_ON(!ctrl->handle->pending_async_ctrls)) {
++		ctrl->handle = NULL;
+ 		return -EINVAL;
++	}
+ 
++	ctrl->handle->pending_async_ctrls--;
++	uvc_pm_put(ctrl->handle->chain->dev);
+ 	ctrl->handle = NULL;
+-	if (WARN_ON(!handle->pending_async_ctrls))
+-		return -EINVAL;
+-	handle->pending_async_ctrls--;
+-	uvc_pm_put(handle->chain->dev);
+ 	return 0;
+ }
+ 
+@@ -1910,7 +1910,7 @@ void uvc_ctrl_status_event(struct uvc_vi
+ 
+ 	handle = ctrl->handle;
+ 	if (handle)
+-		uvc_ctrl_set_handle(handle, ctrl, NULL);
++		uvc_ctrl_clear_handle(ctrl);
+ 
+ 	list_for_each_entry(mapping, &ctrl->info.mappings, list) {
+ 		s32 value;
+@@ -2198,6 +2198,10 @@ static int uvc_ctrl_commit_entity(struct
+ 
+ 		ctrl->dirty = 0;
+ 
++		if (!rollback && handle && !ret &&
++		    ctrl->info.flags & UVC_CTRL_FLAG_ASYNCHRONOUS)
++			ret = uvc_ctrl_set_handle(ctrl, handle);
++
+ 		if (ret < 0 && !rollback) {
+ 			if (err_ctrl)
+ 				*err_ctrl = ctrl;
+@@ -2207,10 +2211,6 @@ static int uvc_ctrl_commit_entity(struct
+ 			 */
+ 			rollback = 1;
+ 		}
+-
+-		if (!rollback && handle && !ret &&
+-		    ctrl->info.flags & UVC_CTRL_FLAG_ASYNCHRONOUS)
+-			ret = uvc_ctrl_set_handle(handle, ctrl, handle);
+ 	}
+ 
+ 	if (ret)
+@@ -3310,7 +3310,7 @@ void uvc_ctrl_cleanup_fh(struct uvc_fh *
+ 		for (unsigned int i = 0; i < entity->ncontrols; ++i) {
+ 			if (entity->controls[i].handle != handle)
+ 				continue;
+-			uvc_ctrl_set_handle(handle, &entity->controls[i], NULL);
++			uvc_ctrl_clear_handle(&entity->controls[i]);
+ 		}
+ 	}
+ 
