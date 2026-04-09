@@ -94,17 +94,22 @@ class TeaAPI(api.API):
     def repo_exists(self, org, repo):
         return self.check_exists(self.repo_path(org, repo))
 
-    def fork_repo(self, src, user, repo):
+    def fork_repo(self, src, srcrepo, dst, dstrepo):
         if self.repo_exists(src, repo):
-            self.check_post(self.repo_path(src, repo) + '/forks', json={
-                'name' : repo,
-                })
+            args = {
+                'name' : dstrepo,
+                }
+            if dst != self.get_user():
+                args['organization'] = dst
+            self.check_post(self.repo_path(src, srcrepo) + '/forks', json=args)
         else:
+            if dst != self.get_user():
+                raise APIError('Do not know how to create repository for ' + dst)
             self.check_post('/api/v1/user/repos', json={
-                'name' : repo,
+                'name' : dstrepo,
                 'object_format_name' : 'sha256',
                 })
-        self.check_patch(self.repo_path(user, repo), json={
+        self.check_patch(self.repo_path(dst, dstrepo), json={
             'description' : 'Automatically generated; do not edit',
             'has_actions' : False,
             'has_issues' : False,
@@ -114,7 +119,7 @@ class TeaAPI(api.API):
             'has_releases' : False,
             'has_wiki' : False,
             })
-        return self.repoinfo(user, repo)
+        return self.repoinfo(dst, dstrepo)
 
     def repoinfo(self, org, repo):
         r = self.check_get(self.repo_path(org, repo))

@@ -342,7 +342,7 @@ Constraint: hardware:disk:size unit=G %i
                 self.log_progress('Forking repository %s/%s from %s/%s.\n' % (downstream_repo.org, downstream_repo.repo, upstream_repo.org, upstream_repo.repo))
             else:
                 self.log_progress('Creating repository %s/%s.\n' % (downstream_repo.org, downstream_repo.repo))
-            downstream_info = self.tea.fork_repo(upstream_repo.org, downstream_repo.org, upstream_repo.repo)
+            downstream_info = self.tea.fork_repo(upstream_repo.org, upstream_repo.repo, downstream_repo.org, upstream_repo.repo)
         if upstream_info and upstream_repo.branch:
             self.log_progress('Merging upstream branch %s..' % (upstream_repo.branch,))
             pull = self.tea.merge_upstream_branch(downstream_repo.org, downstream_repo.repo, upstream_repo.branch)
