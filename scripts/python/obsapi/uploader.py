@@ -314,7 +314,7 @@ Constraint: hardware:disk:size unit=G %i
                     data_decoded[self.package] = maintainers
                 data_massaged = json_custom_dump(data_decoded)
                 sys.stderr.write('\n'.join(difflib.unified_diff(data.splitlines(), data_massaged.splitlines(), lineterm='')))
-                self.fork_repo(prjrepo, True)
+                self.fork_repo(prjrepo, True, True)
                 self.log_progress('Updating %s.\n' % (maintfile,))
                 self.tea.update_file(self.user, prjrepo.repo, self.user_branch, maintfile, data_massaged)
                 commit = self.tea.repo_branches(self.user, prjrepo.repo)[self.user_branch]['commit']['id']
@@ -322,7 +322,7 @@ Constraint: hardware:disk:size unit=G %i
                 self._submit(prjrepo, 'Update ' + self.package + ' maintainer list.' if maintainers else
                 'Normalize ' + maintfile + ' formatting\nThe ' + maintfile + ' formatting is not entirely consistent.\nMake the formatting uniform across the whole file to facilitate automated updates.')
 
-    def fork_repo(self, upstream_repo, reset_branch):
+    def fork_repo(self, upstream_repo, reset_branch, re_fork):
         upstream_info = self.tea.repo_exists(upstream_repo.org, upstream_repo.repo)
         if upstream_info:
             upstream_info = upstream_info.json()
@@ -336,7 +336,11 @@ Constraint: hardware:disk:size unit=G %i
             downstream_info = downstream_info.json()
         if upstream_info and downstream_info:
             if not downstream_info['fork'] or downstream_info['parent']['full_name'] != upstream_repo.org + '/' + upstream_repo.repo:
-                raise APIError('Fork of ' + upstream_repo.org + '/' + upstream_repo.repo + ' needed.')
+                if not re_fork:
+                    raise APIError('Fork of ' + upstream_repo.org + '/' + upstream_repo.repo + ' needed.')
+                else:
+                    self.downstream_info = None
+                    self.tea.delete_repo(downstream_repo.org, downstream_repo.repo)
         if not downstream_info:
             if upstream_info:
                 self.log_progress('Forking repository %s/%s from %s/%s.\n' % (downstream_repo.org, downstream_repo.repo, upstream_repo.org, upstream_repo.repo))
@@ -361,7 +365,7 @@ Constraint: hardware:disk:size unit=G %i
 
 
 class Uploader(UploaderBase):
-    def __init__(self, api, data, user_project, reset_branch=False, logfile=None, progress=True, ignore_kabi=False, upload_all=False):
+    def __init__(self, api, data, user_project, reset_branch=False, re_fork=False, logfile=None, progress=True, ignore_kabi=False, upload_all=False):
         self.progress = sys.stderr if progress else None
         self.data = data
         self.upstream_project, self.package = get_kernel_project_package(self.data)
@@ -377,5 +381,6 @@ class Uploader(UploaderBase):
         self.user_branch = user_project.translate(str.maketrans(':', '/')) if user_project else self.upstream.branch
         self.ignore_kabi_badness = ignore_kabi
         self.reset_branch = reset_branch
+        self.re_fork = re_fork
         self.upload_all = upload_all
-        self.fork_repo(self.upstream, self.reset_branch)
+        self.fork_repo(self.upstream, self.reset_branch, self.re_fork)
