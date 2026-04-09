@@ -1,7 +1,7 @@
 from kutil.config import get_kernel_projects, get_package_archs, get_source_timestamp, read_source_timestamp, get_kernel_project_package, list_files, list_specs
 import xml.etree.ElementTree as ET
 from obsapi.teaapi import TeaAPI, json_custom_dump
-from obsapi.obsapi import OBSAPI
+from obsapi.obsapi import OBSAPI, PkgRepo
 from obsapi.api import APIError
 import subprocess
 import tempfile
@@ -330,7 +330,8 @@ Constraint: hardware:disk:size unit=G %i
             assert upstream_repo.branch in self.tea.repo_branches(upstream_repo.org, upstream_repo.repo)
         if upstream_repo.commit:  # Maybe check it's part of the branch as well?
             self.tea.repo_commit_exists(upstream_repo.org, upstream_repo.repo, upstream_repo.commit)  # may be missing because of sync error
-        downstream_info = self.tea.repo_exists(self.user, upstream_repo.repo)
+        downstream_repo = PkgRepo(self.tea.url, self.user, upstream_repo.repo, None, None)
+        downstream_info = self.tea.repo_exists(downstream_repo.org, downstream_repo.repo)
         if downstream_info:
             downstream_info = downstream_info.json()
         if upstream_info and downstream_info:
@@ -338,13 +339,13 @@ Constraint: hardware:disk:size unit=G %i
                 raise APIError('Fork of ' + upstream_repo.org + '/' + upstream_repo.repo + ' needed.')
         if not downstream_info:
             if upstream_info:
-                self.log_progress('Forking repository %s/%s from %s/%s.\n' % (self.user, upstream_repo.repo, upstream_repo.org, upstream_repo.repo))
+                self.log_progress('Forking repository %s/%s from %s/%s.\n' % (downstream_repo.org, downstream_repo.repo, upstream_repo.org, upstream_repo.repo))
             else:
-                self.log_progress('Creating repository %s/%s.\n' % (self.user, upstream_repo.repo))
-            downstream_info = self.tea.fork_repo(upstream_repo.org, self.user, upstream_repo.repo)
+                self.log_progress('Creating repository %s/%s.\n' % (downstream_repo.org, downstream_repo.repo))
+            downstream_info = self.tea.fork_repo(upstream_repo.org, downstream_repo.org, upstream_repo.repo)
         if upstream_info and upstream_repo.branch:
             self.log_progress('Merging upstream branch %s..' % (upstream_repo.branch,))
-            pull = self.tea.merge_upstream_branch(self.user, upstream_repo.repo, upstream_repo.branch)
+            pull = self.tea.merge_upstream_branch(downstream_repo.org, downstream_repo.repo, upstream_repo.branch)
             if not pull.ok:
                 self.log_progress(' '.join([pull.status_message_pretty, repr(pull.json())]) + '\n')
             else:
@@ -356,7 +357,7 @@ Constraint: hardware:disk:size unit=G %i
                 self.log_progress('Resetting branch %s.\n' % (self.user_branch,))
             else:
                 self.log_progress('Creating branch %s.\n' % (self.user_branch,))
-            self.tea.create_or_reset_branch(self.user, upstream_repo.repo, self.user_branch, upstream_repo.branch, upstream_repo.commit, reset_branch)
+            self.tea.create_or_reset_branch(downstream_repo.org, downstream_repo.repo, self.user_branch, upstream_repo.branch, upstream_repo.commit, reset_branch)
 
 
 class Uploader(UploaderBase):
