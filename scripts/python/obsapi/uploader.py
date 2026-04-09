@@ -340,7 +340,7 @@ Constraint: hardware:disk:size unit=G %i
                     raise APIError('Fork of ' + upstream_repo.org + '/' + upstream_repo.repo + ' needed.')
                 else:
                     self.downstream_info = None
-                    self.tea.delete_repo(downstream_repo.org, downstream_repo.repo)
+                    self.tea.check_delete(self.tea.repo_path(downstream_repo.org, downstream_repo.repo))
         if not downstream_info:
             if upstream_info:
                 self.log_progress('Forking repository %s/%s from %s/%s.\n' % (downstream_repo.org, downstream_repo.repo, upstream_repo.org, upstream_repo.repo))
