@@ -326,16 +326,16 @@ Constraint: hardware:disk:size unit=G %i
         upstream_info = self.tea.repo_exists(upstream_repo.org, upstream_repo.repo)
         if upstream_info:
             upstream_info = upstream_info.json()
+        if upstream_repo.branch:
+            assert upstream_repo.branch in self.tea.repo_branches(upstream_repo.org, upstream_repo.repo)
+        if upstream_repo.commit:  # Maybe check it's part of the branch as well?
+            self.tea.repo_commit_exists(upstream_repo.org, upstream_repo.repo, upstream_repo.commit)  # may be missing because of sync error
         downstream_info = self.tea.repo_exists(self.user, upstream_repo.repo)
         if downstream_info:
             downstream_info = downstream_info.json()
         if upstream_info and downstream_info:
             if not downstream_info['fork'] or downstream_info['parent']['full_name'] != upstream_repo.org + '/' + upstream_repo.repo:
                 raise APIError('Fork of ' + upstream_repo.org + '/' + upstream_repo.repo + ' needed.')
-        if upstream_repo.branch:
-            assert upstream_repo.branch in self.tea.repo_branches(upstream_repo.org, upstream_repo.repo)
-        if upstream_repo.commit:  # Maybe check it's part of the branch as well?
-            self.tea.repo_commit_exists(upstream_repo.org, upstream_repo.repo, upstream_repo.commit)  # may be missing because of sync error
         if not downstream_info:
             if upstream_info:
                 self.log_progress('Forking repository %s/%s from %s/%s.\n' % (self.user, upstream_repo.repo, upstream_repo.org, upstream_repo.repo))
