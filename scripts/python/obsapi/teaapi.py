@@ -21,6 +21,7 @@ def json_custom_dump(data):
 
 class TeaAPI(api.API):
     def __init__(self, URL, logfile=None, config=None, ca=None, progress=sys.stderr):
+        self._user = None
         self.progress = progress
         self.config = config
         URL = URL.rstrip('/')
@@ -47,9 +48,10 @@ class TeaAPI(api.API):
         return {'Authorization' : 'token ' + self.token}
 
     def get_user(self):
-        r = self.check_get('/api/v1/user')
-        user = r.json()['login']
-        return user
+        if self._user is None:
+            r = self.check_get('/api/v1/user')
+            self._user = r.json()['login']
+        return self._user
 
     def log_progress(self, string):
         if self.progress:
