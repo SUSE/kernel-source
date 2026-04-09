@@ -95,7 +95,7 @@ class TeaAPI(api.API):
         return self.check_exists(self.repo_path(org, repo))
 
     def fork_repo(self, src, srcrepo, dst, dstrepo):
-        if self.repo_exists(src, repo):
+        if self.repo_exists(src, srcrepo):
             args = {
                 'name' : dstrepo,
                 }
