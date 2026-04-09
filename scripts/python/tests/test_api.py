@@ -395,7 +395,7 @@ class TestOBS(unittest.TestCase):
         self.assertFalse(st.data_consumed)
 
     def test_Y(self):
-        st = ServerThread('tests/api/obsapi_log_in')
+        st = ServerThread('tests/api/obsapi_log_in_ssh')
         st.start_server(obsconfig=self.config)
         os.unlink(self.cookiejar)
         config = configparser.ConfigParser(delimiters=('='), interpolation=None)
@@ -423,7 +423,7 @@ class TestOBS(unittest.TestCase):
                                  commit='b20dbdf296c74a2897e61205e5c9edcb7f85340ede6bbfd18c05dbfce87c267b'))
         self.assertTrue(st.data_consumed)
 
-    def test_pkgrepo_defalt(self):
+    def test_pkgrepo_default(self):
         st = ServerThread('tests/api/obsapi_pkgrepo_no_scmsync')
         st.start_server(obsconfig=self.config)
         api = OBSAPI(st.url(), config=self.config, cookiejar=self.cookiejar, ca=st.servercert)
@@ -646,7 +646,7 @@ class TestUploader(unittest.TestCase):
         ul.obs.url = 'https://api.suse.de'
         reference = '''
 <project name="Devel:Kernel:SLE15-SP6">
-  <title>Kernel builds for branch SLE15-SP6</title>
+  <title>Kernel builds for branch unknown</title>
   <description/>
   <group groupid="kernel-maintainers" role="maintainer"/>
   <person userid="jones_tony" role="maintainer"/>
@@ -694,7 +694,7 @@ class TestUploader(unittest.TestCase):
 
         reference = '''
 <project name="Devel:Kernel:SLE15-SP6">
-  <title>Kernel builds for branch SLE15-SP6</title>
+  <title>Kernel builds for branch unknown</title>
   <description/>
   <group groupid="kernel-maintainers" role="maintainer"/>
   <person userid="jones_tony" role="maintainer"/>
