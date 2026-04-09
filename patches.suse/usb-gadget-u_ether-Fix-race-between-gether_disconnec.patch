@@ -1,0 +1,83 @@
+From e1eabb072c75681f78312c484ccfffb7430f206e Mon Sep 17 00:00:00 2001
+From: Kuen-Han Tsai <khtsai@google.com>
+Date: Wed, 11 Mar 2026 17:12:15 +0800
+Subject: [PATCH] usb: gadget: u_ether: Fix race between gether_disconnect and eth_stop
+Git-commit: e1eabb072c75681f78312c484ccfffb7430f206e
+Patch-mainline: v7.0-rc7
+References: git-fixes
+
+A race condition between gether_disconnect() and eth_stop() leads to a
+NULL pointer dereference. Specifically, if eth_stop() is triggered
+concurrently while gether_disconnect() is tearing down the endpoints,
+eth_stop() attempts to access the cleared endpoint descriptor, causing
+the following NPE:
+
+  Unable to handle kernel NULL pointer dereference
+  Call trace:
+   __dwc3_gadget_ep_enable+0x60/0x788
+   dwc3_gadget_ep_enable+0x70/0xe4
+   usb_ep_enable+0x60/0x15c
+   eth_stop+0xb8/0x108
+
+Because eth_stop() crashes while holding the dev->lock, the thread
+running gether_disconnect() fails to acquire the same lock and spins
+forever, resulting in a hardlockup:
+
+  Core - Debugging Information for Hardlockup core(7)
+  Call trace:
+   queued_spin_lock_slowpath+0x94/0x488
+   _raw_spin_lock+0x64/0x6c
+   gether_disconnect+0x19c/0x1e8
+   ncm_set_alt+0x68/0x1a0
+   composite_setup+0x6a0/0xc50
+
+The root cause is that the clearing of dev->port_usb in
+gether_disconnect() is delayed until the end of the function.
+
+Move the clearing of dev->port_usb to the very beginning of
+gether_disconnect() while holding dev->lock. This cuts off the link
+immediately, ensuring eth_stop() will see dev->port_usb as NULL and
+safely bail out.
+
+Fixes: 2b3d942c4878 ("usb ethernet gadget: split out network core")
+Cc: stable <stable@kernel.org>
+Signed-off-by: Kuen-Han Tsai <khtsai@google.com>
+Link: https://patch.msgid.link/20260311-gether-disconnect-npe-v1-1-454966adf7c7@google.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/usb/gadget/function/u_ether.c | 10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/usb/gadget/function/u_ether.c b/drivers/usb/gadget/function/u_ether.c
+index 1a9e7c495e2e..23c7c0cdf202 100644
+--- a/drivers/usb/gadget/function/u_ether.c
++++ b/drivers/usb/gadget/function/u_ether.c
+@@ -1223,6 +1223,11 @@ void gether_disconnect(struct gether *link)
+ 
+ 	DBG(dev, "%s\n", __func__);
+ 
++	spin_lock(&dev->lock);
++	dev->port_usb = NULL;
++	link->is_suspend = false;
++	spin_unlock(&dev->lock);
++
+ 	netif_stop_queue(dev->net);
+ 	netif_carrier_off(dev->net);
+ 
+@@ -1260,11 +1265,6 @@ void gether_disconnect(struct gether *link)
+ 	dev->header_len = 0;
+ 	dev->unwrap = NULL;
+ 	dev->wrap = NULL;
+-
+-	spin_lock(&dev->lock);
+-	dev->port_usb = NULL;
+-	link->is_suspend = false;
+-	spin_unlock(&dev->lock);
+ }
+ EXPORT_SYMBOL_GPL(gether_disconnect);
+ 
+-- 
+2.53.0
+
