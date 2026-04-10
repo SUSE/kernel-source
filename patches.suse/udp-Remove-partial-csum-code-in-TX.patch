@@ -1,0 +1,343 @@
+From: Kuniyuki Iwashima <kuniyu@google.com>
+Date: Wed, 11 Mar 2026 05:19:55 +0000
+Subject: udp: Remove partial csum code in TX.
+Patch-mainline: Queued in subsystem maintainer repository
+Git-repo: https://git.kernel.org/pub/scm/linux/kernel/git/netdev/net-next.git/
+Git-commit: b2a1d719be4f8e9d970038ecd4db983f6e42d377
+References: jsc#PED-16048
+
+UDP TX paths also have some code for UDP-Lite partial
+checksum:
+
+  * udplite_csum() in udp_send_skb() and udp_v6_send_skb()
+  * udplite_getfrag() in udp_sendmsg() and udpv6_sendmsg()
+
+Let's remove such code.
+
+Now, we can use IPPROTO_UDP directly instead of sk->sk_protocol
+or fl6->flowi6_proto for csum_tcpudp_magic() and csum_ipv6_magic().
+
+Signed-off-by: Kuniyuki Iwashima <kuniyu@google.com>
+Reviewed-by: Willem de Bruijn <willemb@google.com>
+Link: https://patch.msgid.link/20260311052020.1213705-9-kuniyu@google.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Fernando Fernandez Mancera <fmancera@suse.de>
+---
+ include/net/udplite.h |   35 ------------------------------
+ net/ipv4/udp.c        |   58 ++++++++++++++++++--------------------------------
+ net/ipv6/udp.c        |   54 +++++++++++++++++++++-------------------------
+ 3 files changed, 47 insertions(+), 100 deletions(-)
+
+--- a/include/net/udplite.h
++++ b/include/net/udplite.h
+@@ -12,39 +12,4 @@
+ #define UDPLITE_SEND_CSCOV   10 /* sender partial coverage (as sent)      */
+ #define UDPLITE_RECV_CSCOV   11 /* receiver partial coverage (threshold ) */
+ 
+-/*
+- *	Checksum computation is all in software, hence simpler getfrag.
+- */
+-static __inline__ int udplite_getfrag(void *from, char *to, int  offset,
+-				      int len, int odd, struct sk_buff *skb)
+-{
+-	struct msghdr *msg = from;
+-	return copy_from_iter_full(to, len, &msg->msg_iter) ? 0 : -EFAULT;
+-}
+-
+-/*
+- * 	Checksumming routines
+- */
+-
+-/* Fast-path computation of checksum. Socket may not be locked. */
+-static inline __wsum udplite_csum(struct sk_buff *skb)
+-{
+-	const int off = skb_transport_offset(skb);
+-	const struct sock *sk = skb->sk;
+-	int len = skb->len - off;
+-
+-	if (udp_test_bit(UDPLITE_SEND_CC, sk)) {
+-		u16 pcslen = READ_ONCE(udp_sk(sk)->pcslen);
+-
+-		if (pcslen < len) {
+-			if (pcslen > 0)
+-				len = pcslen;
+-			udp_hdr(skb)->len = htons(pcslen);
+-		}
+-	}
+-	skb->ip_summed = CHECKSUM_NONE;     /* no HW support for checksumming */
+-
+-	return skb_checksum(skb, off, len, 0);
+-}
+-
+ #endif	/* _UDPLITE_H */
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -964,20 +964,19 @@ static int udp_send_skb(struct sk_buff *
+ 			struct inet_cork *cork)
+ {
+ 	struct sock *sk = skb->sk;
+-	struct inet_sock *inet = inet_sk(sk);
++	int offset, len, datalen;
+ 	struct udphdr *uh;
+ 	int err;
+-	int is_udplite = IS_UDPLITE(sk);
+-	int offset = skb_transport_offset(skb);
+-	int len = skb->len - offset;
+-	int datalen = len - sizeof(*uh);
+-	__wsum csum = 0;
++
++	offset = skb_transport_offset(skb);
++	len = skb->len - offset;
++	datalen = len - sizeof(*uh);
+ 
+ 	/*
+ 	 * Create a UDP header
+ 	 */
+ 	uh = udp_hdr(skb);
+-	uh->source = inet->inet_sport;
++	uh->source = inet_sk(sk)->inet_sport;
+ 	uh->dest = fl4->fl4_dport;
+ 	uh->len = htons(len);
+ 	uh->check = 0;
+@@ -998,7 +997,7 @@ static int udp_send_skb(struct sk_buff *
+ 			kfree_skb(skb);
+ 			return -EINVAL;
+ 		}
+-		if (is_udplite || dst_xfrm(skb_dst(skb))) {
++		if (dst_xfrm(skb_dst(skb))) {
+ 			kfree_skb(skb);
+ 			return -EIO;
+ 		}
+@@ -1014,26 +1013,18 @@ static int udp_send_skb(struct sk_buff *
+ 		}
+ 	}
+ 
+-	if (is_udplite)  				 /*     UDP-Lite      */
+-		csum = udplite_csum(skb);
+-
+-	else if (sk->sk_no_check_tx) {			 /* UDP csum off */
+-
++	if (sk->sk_no_check_tx) {			 /* UDP csum off */
+ 		skb->ip_summed = CHECKSUM_NONE;
+ 		goto send;
+-
+ 	} else if (skb->ip_summed == CHECKSUM_PARTIAL) { /* UDP hardware csum */
+ csum_partial:
+-
+ 		udp4_hwcsum(skb, fl4->saddr, fl4->daddr);
+ 		goto send;
+-
+-	} else
+-		csum = udp_csum(skb);
++	}
+ 
+ 	/* add protocol-dependent pseudo-header */
+ 	uh->check = csum_tcpudp_magic(fl4->saddr, fl4->daddr, len,
+-				      sk->sk_protocol, csum);
++				      IPPROTO_UDP, udp_csum(skb));
+ 	if (uh->check == 0)
+ 		uh->check = CSUM_MANGLED_0;
+ 
+@@ -1114,25 +1105,22 @@ EXPORT_SYMBOL_GPL(udp_cmsg_send);
+ 
+ int udp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
+ {
++	int corkreq = udp_test_bit(CORK, sk) || msg->msg_flags & MSG_MORE;
++	DECLARE_SOCKADDR(struct sockaddr_in *, usin, msg->msg_name);
++	int ulen = len, free = 0, connected = 0;
+ 	struct inet_sock *inet = inet_sk(sk);
+ 	struct udp_sock *up = udp_sk(sk);
+-	DECLARE_SOCKADDR(struct sockaddr_in *, usin, msg->msg_name);
++	struct ip_options_data opt_copy;
++	__be32 daddr, faddr, saddr;
++	struct rtable *rt = NULL;
+ 	struct flowi4 fl4_stack;
+-	struct flowi4 *fl4;
+-	int ulen = len;
+ 	struct ipcm_cookie ipc;
+-	struct rtable *rt = NULL;
+-	int free = 0;
+-	int connected = 0;
+-	__be32 daddr, faddr, saddr;
++	struct sk_buff *skb;
++	struct flowi4 *fl4;
+ 	u8 tos, scope;
+ 	__be16 dport;
+-	int err, is_udplite = IS_UDPLITE(sk);
+-	int corkreq = udp_test_bit(CORK, sk) || msg->msg_flags & MSG_MORE;
+-	int (*getfrag)(void *, char *, int, int, int, struct sk_buff *);
+-	struct sk_buff *skb;
+-	struct ip_options_data opt_copy;
+ 	int uc_index;
++	int err;
+ 
+ 	if (len > 0xFFFF)
+ 		return -EMSGSIZE;
+@@ -1144,8 +1132,6 @@ int udp_sendmsg(struct sock *sk, struct
+ 	if (msg->msg_flags & MSG_OOB) /* Mirror BSD error message compatibility */
+ 		return -EOPNOTSUPP;
+ 
+-	getfrag = is_udplite ? udplite_getfrag : ip_generic_getfrag;
+-
+ 	fl4 = &inet->cork.fl.u.ip4;
+ 	if (READ_ONCE(up->pending)) {
+ 		/*
+@@ -1287,7 +1273,7 @@ int udp_sendmsg(struct sock *sk, struct
+ 		fl4 = &fl4_stack;
+ 
+ 		flowi4_init_output(fl4, ipc.oif, ipc.sockc.mark, tos, scope,
+-				   sk->sk_protocol, flow_flags, faddr, saddr,
++				   IPPROTO_UDP, flow_flags, faddr, saddr,
+ 				   dport, inet->inet_sport, sk->sk_uid);
+ 
+ 		security_sk_classify_flow(sk, flowi4_to_flowi_common(fl4));
+@@ -1320,7 +1306,7 @@ back_from_confirm:
+ 	if (!corkreq) {
+ 		struct inet_cork cork;
+ 
+-		skb = ip_make_skb(sk, fl4, getfrag, msg, ulen,
++		skb = ip_make_skb(sk, fl4, ip_generic_getfrag, msg, ulen,
+ 				  sizeof(struct udphdr), &ipc, &rt,
+ 				  &cork, msg->msg_flags);
+ 		err = PTR_ERR(skb);
+@@ -1351,7 +1337,7 @@ back_from_confirm:
+ 
+ do_append_data:
+ 	up->len += ulen;
+-	err = ip_append_data(sk, fl4, getfrag, msg, ulen,
++	err = ip_append_data(sk, fl4, ip_generic_getfrag, msg, ulen,
+ 			     sizeof(struct udphdr), &ipc, &rt,
+ 			     corkreq ? msg->msg_flags|MSG_MORE : msg->msg_flags);
+ 	if (err)
+--- a/net/ipv6/udp.c
++++ b/net/ipv6/udp.c
+@@ -1239,13 +1239,13 @@ static int udp_v6_send_skb(struct sk_buf
+ 			   struct inet_cork *cork)
+ {
+ 	struct sock *sk = skb->sk;
++	int offset, len, datalen;
+ 	struct udphdr *uh;
+ 	int err = 0;
+-	int is_udplite = IS_UDPLITE(sk);
+-	__wsum csum = 0;
+-	int offset = skb_transport_offset(skb);
+-	int len = skb->len - offset;
+-	int datalen = len - sizeof(*uh);
++
++	offset = skb_transport_offset(skb);
++	len = skb->len - offset;
++	datalen = len - sizeof(*uh);
+ 
+ 	/*
+ 	 * Create a UDP header
+@@ -1272,7 +1272,7 @@ static int udp_v6_send_skb(struct sk_buf
+ 			kfree_skb(skb);
+ 			return -EINVAL;
+ 		}
+-		if (is_udplite || dst_xfrm(skb_dst(skb))) {
++		if (dst_xfrm(skb_dst(skb))) {
+ 			kfree_skb(skb);
+ 			return -EIO;
+ 		}
+@@ -1288,21 +1288,18 @@ static int udp_v6_send_skb(struct sk_buf
+ 		}
+ 	}
+ 
+-	if (is_udplite)
+-		csum = udplite_csum(skb);
+-	else if (udp_get_no_check6_tx(sk)) {   /* UDP csum disabled */
++	if (udp_get_no_check6_tx(sk)) {   /* UDP csum disabled */
+ 		skb->ip_summed = CHECKSUM_NONE;
+ 		goto send;
+ 	} else if (skb->ip_summed == CHECKSUM_PARTIAL) { /* UDP hardware csum */
+ csum_partial:
+ 		udp6_hwcsum_outgoing(sk, skb, &fl6->saddr, &fl6->daddr, len);
+ 		goto send;
+-	} else
+-		csum = udp_csum(skb);
++	}
+ 
+ 	/* add protocol-dependent pseudo-header */
+ 	uh->check = csum_ipv6_magic(&fl6->saddr, &fl6->daddr,
+-				    len, fl6->flowi6_proto, csum);
++				    len, IPPROTO_UDP, udp_csum(skb));
+ 	if (uh->check == 0)
+ 		uh->check = CSUM_MANGLED_0;
+ 
+@@ -1342,27 +1339,26 @@ out:
+ 
+ int udpv6_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
+ {
+-	struct ipv6_txoptions opt_space;
+-	struct udp_sock *up = udp_sk(sk);
+-	struct inet_sock *inet = inet_sk(sk);
+-	struct ipv6_pinfo *np = inet6_sk(sk);
++	int corkreq = udp_test_bit(CORK, sk) || msg->msg_flags & MSG_MORE;
+ 	DECLARE_SOCKADDR(struct sockaddr_in6 *, sin6, msg->msg_name);
+-	struct in6_addr *daddr, *final_p, final;
+-	struct ipv6_txoptions *opt = NULL;
+ 	struct ipv6_txoptions *opt_to_free = NULL;
++	struct in6_addr *daddr, *final_p, final;
+ 	struct ip6_flowlabel *flowlabel = NULL;
++	struct inet_sock *inet = inet_sk(sk);
++	struct ipv6_pinfo *np = inet6_sk(sk);
++	struct ipv6_txoptions *opt = NULL;
++	struct udp_sock *up = udp_sk(sk);
++	struct ipv6_txoptions opt_space;
++	int addr_len = msg->msg_namelen;
+ 	struct inet_cork_full cork;
+-	struct flowi6 *fl6 = &cork.fl.u.ip6;
+-	struct dst_entry *dst;
+ 	struct ipcm6_cookie ipc6;
+-	int addr_len = msg->msg_namelen;
+ 	bool connected = false;
++	struct dst_entry *dst;
++	struct flowi6 *fl6;
+ 	int ulen = len;
+-	int corkreq = udp_test_bit(CORK, sk) || msg->msg_flags & MSG_MORE;
+ 	int err;
+-	int is_udplite = IS_UDPLITE(sk);
+-	int (*getfrag)(void *, char *, int, int, int, struct sk_buff *);
+ 
++	fl6 = &cork.fl.u.ip6;
+ 	ipcm6_init(&ipc6);
+ 	ipc6.gso_size = READ_ONCE(up->gso_size);
+ 	ipc6.sockc.tsflags = READ_ONCE(sk->sk_tsflags);
+@@ -1423,7 +1419,6 @@ do_udp_sendmsg:
+ 	if (len > INT_MAX - sizeof(struct udphdr))
+ 		return -EMSGSIZE;
+ 
+-	getfrag  =  is_udplite ?  udplite_getfrag : ip_generic_getfrag;
+ 	if (READ_ONCE(up->pending)) {
+ 		if (READ_ONCE(up->pending) == AF_INET)
+ 			return udp_sendmsg(sk, msg, len);
+@@ -1525,7 +1520,7 @@ do_udp_sendmsg:
+ 	opt = ipv6_fixup_options(&opt_space, opt);
+ 	ipc6.opt = opt;
+ 
+-	fl6->flowi6_proto = sk->sk_protocol;
++	fl6->flowi6_proto = IPPROTO_UDP;
+ 	fl6->flowi6_mark = ipc6.sockc.mark;
+ 	fl6->daddr = *daddr;
+ 	if (ipv6_addr_any(&fl6->saddr) && !ipv6_addr_any(&np->saddr))
+@@ -1595,7 +1590,7 @@ back_from_confirm:
+ 	if (!corkreq) {
+ 		struct sk_buff *skb;
+ 
+-		skb = ip6_make_skb(sk, getfrag, msg, ulen,
++		skb = ip6_make_skb(sk, ip_generic_getfrag, msg, ulen,
+ 				   sizeof(struct udphdr), &ipc6,
+ 				   dst_rt6_info(dst),
+ 				   msg->msg_flags, &cork);
+@@ -1623,8 +1618,9 @@ do_append_data:
+ 	if (ipc6.dontfrag < 0)
+ 		ipc6.dontfrag = inet6_test_bit(DONTFRAG, sk);
+ 	up->len += ulen;
+-	err = ip6_append_data(sk, getfrag, msg, ulen, sizeof(struct udphdr),
+-			      &ipc6, fl6, dst_rt6_info(dst),
++	err = ip6_append_data(sk, ip_generic_getfrag, msg, ulen,
++			      sizeof(struct udphdr), &ipc6, fl6,
++			      dst_rt6_info(dst),
+ 			      corkreq ? msg->msg_flags|MSG_MORE : msg->msg_flags);
+ 	if (err)
+ 		udp_v6_flush_pending_frames(sk);
