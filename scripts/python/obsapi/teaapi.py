@@ -175,7 +175,7 @@ class TeaAPI(api.API):
                 sys.stderr.write('Resetting branch %s (commit mismatch %s %s)\n' %
                                  (branch, current_commit, ref_commit))
                 try:
-                    self.update_branch(org, repo, branch, ref_commit, old_commit=current_commit, force=1)
+                    return self.update_branch(org, repo, branch, ref_commit, old_commit=current_commit, force=1)
                 except api.APIError as e:
                     if e.status == 405:
                         sys.stderr.write('%s\n' % (e,))
