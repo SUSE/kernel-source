@@ -1,0 +1,320 @@
+From: Kuniyuki Iwashima <kuniyu@google.com>
+Date: Wed, 11 Mar 2026 05:19:49 +0000
+Subject: ipv6: Retire UDP-Lite.
+Patch-mainline: Queued in subsystem maintainer repository
+Git-repo: https://git.kernel.org/pub/scm/linux/kernel/git/netdev/net-next.git/
+Git-commit: 62554a51c5844feebe0466d8b31980e110b481de
+References: jsc#PED-16048
+
+As announced in commit be28c14ac8bb ("udplite: Print deprecation
+notice."), it's time to deprecate UDP-Lite.
+
+As a first step, let's drop support for IPv6 UDP-Lite sockets.
+
+We will remove the remaining dead code gradually.
+
+Along with the removal of udplite.c, most of the functions exposed
+via udp_impl.h are made static.
+
+The prototypes of udpv6_sendmsg() and udpv6_recvmsg() are moved
+to udp.h, but only udpv6_recvmsg() has INDIRECT_CALLABLE_DECLARE()
+because udpv6_sendmsg() is exported for rxrpc since commit ed472b0c8783
+("rxrpc: Call udp_sendmsg() directly").
+
+Also, udpv6_recvmsg() needs INDIRECT_CALLABLE_SCOPE for
+CONFIG_MITIGATION_RETPOLINE=n.
+
+Note that udplite.h is included temporarily for udplite_csum().
+
+Signed-off-by: Kuniyuki Iwashima <kuniyu@google.com>
+Reviewed-by: Willem de Bruijn <willemb@google.com>
+Link: https://patch.msgid.link/20260311052020.1213705-3-kuniyu@google.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Fernando Fernandez Mancera <fmancera@suse.de>
+---
+ include/net/ipv6.h      |    2 --
+ include/net/transp_v6.h |    3 ---
+ include/net/udp.h       |    4 ++++
+ net/ipv6/Makefile       |    2 +-
+ net/ipv6/af_inet6.c     |   23 +----------------------
+ net/ipv6/proc.c         |    2 --
+ net/ipv6/udp.c          |   31 ++++++++++++++++---------------
+ net/rxrpc/output.c      |    2 --
+ 8 files changed, 22 insertions(+), 47 deletions(-)
+
+--- a/include/net/ipv6.h
++++ b/include/net/ipv6.h
+@@ -1252,8 +1252,6 @@ int tcp6_proc_init(struct net *net);
+ void tcp6_proc_exit(struct net *net);
+ int udp6_proc_init(struct net *net);
+ void udp6_proc_exit(struct net *net);
+-int udplite6_proc_init(void);
+-void udplite6_proc_exit(void);
+ int ipv6_misc_proc_init(void);
+ void ipv6_misc_proc_exit(void);
+ int snmp6_register_dev(struct inet6_dev *idev);
+--- a/include/net/transp_v6.h
++++ b/include/net/transp_v6.h
+@@ -8,7 +8,6 @@
+ /* IPv6 transport protocols */
+ extern struct proto rawv6_prot;
+ extern struct proto udpv6_prot;
+-extern struct proto udplitev6_prot;
+ extern struct proto tcpv6_prot;
+ extern struct proto pingv6_prot;
+ 
+@@ -28,8 +27,6 @@ int rawv6_init(void);
+ void rawv6_exit(void);
+ int udpv6_init(void);
+ void udpv6_exit(void);
+-int udplitev6_init(void);
+-void udplitev6_exit(void);
+ int tcpv6_init(void);
+ void tcpv6_exit(void);
+ 
+--- a/include/net/udp.h
++++ b/include/net/udp.h
+@@ -173,6 +173,10 @@ typedef struct sock *(*udp_lookup_t)(con
+ void udp_v6_early_demux(struct sk_buff *skb);
+ INDIRECT_CALLABLE_DECLARE(int udpv6_rcv(struct sk_buff *));
+ 
++int udpv6_sendmsg(struct sock *sk, struct msghdr *msg, size_t len);
++INDIRECT_CALLABLE_DECLARE(int udpv6_recvmsg(struct sock *sk, struct msghdr *msg,
++					    size_t len, int flags, int *addr_len));
++
+ struct sk_buff *__udp_gso_segment(struct sk_buff *gso_skb,
+ 				  netdev_features_t features, bool is_ipv6);
+ 
+--- a/net/ipv6/Makefile
++++ b/net/ipv6/Makefile
+@@ -7,7 +7,7 @@ obj-$(CONFIG_IPV6) += ipv6.o
+ 
+ ipv6-y :=	af_inet6.o anycast.o ip6_output.o ip6_input.o addrconf.o \
+ 		addrlabel.o \
+-		route.o ip6_fib.o ipv6_sockglue.o ndisc.o udp.o udplite.o \
++		route.o ip6_fib.o ipv6_sockglue.o ndisc.o udp.o \
+ 		raw.o icmp.o mcast.o reassembly.o tcp_ipv6.o ping.o \
+ 		exthdrs.o datagram.o ip6_flowlabel.o inet6_connection_sock.o \
+ 		udp_offload.o seg6.o fib6_notifier.o rpl.o ioam6.o
+--- a/net/ipv6/af_inet6.c
++++ b/net/ipv6/af_inet6.c
+@@ -43,7 +43,6 @@
+ #include <net/ip.h>
+ #include <net/ipv6.h>
+ #include <net/udp.h>
+-#include <net/udplite.h>
+ #include <net/tcp.h>
+ #include <net/ping.h>
+ #include <net/protocol.h>
+@@ -644,8 +643,6 @@ int inet6_compat_ioctl(struct socket *so
+ EXPORT_SYMBOL_GPL(inet6_compat_ioctl);
+ #endif /* CONFIG_COMPAT */
+ 
+-INDIRECT_CALLABLE_DECLARE(int udpv6_sendmsg(struct sock *, struct msghdr *,
+-					    size_t));
+ int inet6_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
+ {
+ 	struct sock *sk = sock->sk;
+@@ -660,8 +657,6 @@ int inet6_sendmsg(struct socket *sock, s
+ 			       sk, msg, size);
+ }
+ 
+-INDIRECT_CALLABLE_DECLARE(int udpv6_recvmsg(struct sock *, struct msghdr *,
+-					    size_t, int, int *));
+ int inet6_recvmsg(struct socket *sock, struct msghdr *msg, size_t size,
+ 		  int flags)
+ {
+@@ -1096,13 +1091,9 @@ static int __init inet6_init(void)
+ 	if (err)
+ 		goto out_unregister_tcp_proto;
+ 
+-	err = proto_register(&udplitev6_prot, 1);
+-	if (err)
+-		goto out_unregister_udp_proto;
+-
+ 	err = proto_register(&rawv6_prot, 1);
+ 	if (err)
+-		goto out_unregister_udplite_proto;
++		goto out_unregister_udp_proto;
+ 
+ 	err = proto_register(&pingv6_prot, 1);
+ 	if (err)
+@@ -1153,8 +1144,6 @@ static int __init inet6_init(void)
+ 	err = -ENOMEM;
+ 	if (raw6_proc_init())
+ 		goto proc_raw6_fail;
+-	if (udplite6_proc_init())
+-		goto proc_udplite6_fail;
+ 	if (ipv6_misc_proc_init())
+ 		goto proc_misc6_fail;
+ 	if (if6_proc_init())
+@@ -1190,10 +1179,6 @@ static int __init inet6_init(void)
+ 	if (err)
+ 		goto udpv6_fail;
+ 
+-	err = udplitev6_init();
+-	if (err)
+-		goto udplitev6_fail;
+-
+ 	err = udpv6_offload_init();
+ 	if (err)
+ 		goto udpv6_offload_fail;
+@@ -1264,8 +1249,6 @@ ipv6_packet_fail:
+ tcpv6_fail:
+ 	udpv6_offload_exit();
+ udpv6_offload_fail:
+-	udplitev6_exit();
+-udplitev6_fail:
+ 	udpv6_exit();
+ udpv6_fail:
+ 	ipv6_frag_exit();
+@@ -1287,8 +1270,6 @@ ip6_route_fail:
+ proc_if6_fail:
+ 	ipv6_misc_proc_exit();
+ proc_misc6_fail:
+-	udplite6_proc_exit();
+-proc_udplite6_fail:
+ 	raw6_proc_exit();
+ proc_raw6_fail:
+ #endif
+@@ -1312,8 +1293,6 @@ out_unregister_ping_proto:
+ 	proto_unregister(&pingv6_prot);
+ out_unregister_raw_proto:
+ 	proto_unregister(&rawv6_prot);
+-out_unregister_udplite_proto:
+-	proto_unregister(&udplitev6_prot);
+ out_unregister_udp_proto:
+ 	proto_unregister(&udpv6_prot);
+ out_unregister_tcp_proto:
+--- a/net/ipv6/proc.c
++++ b/net/ipv6/proc.c
+@@ -39,8 +39,6 @@ static int sockstat6_seq_show(struct seq
+ 		       sock_prot_inuse_get(net, &tcpv6_prot));
+ 	seq_printf(seq, "UDP6: inuse %d\n",
+ 		       sock_prot_inuse_get(net, &udpv6_prot));
+-	seq_printf(seq, "UDPLITE6: inuse %d\n",
+-			sock_prot_inuse_get(net, &udplitev6_prot));
+ 	seq_printf(seq, "RAW6: inuse %d\n",
+ 		       sock_prot_inuse_get(net, &rawv6_prot));
+ 	seq_printf(seq, "FRAG6: inuse %u memory %lu\n",
+--- a/net/ipv6/udp.c
++++ b/net/ipv6/udp.c
+@@ -56,7 +56,7 @@
+ #include <linux/proc_fs.h>
+ #include <linux/seq_file.h>
+ #include <trace/events/skb.h>
+-#include "udp_impl.h"
++#include <net/udplite.h>
+ 
+ static void udpv6_destruct_sock(struct sock *sk)
+ {
+@@ -64,7 +64,7 @@ static void udpv6_destruct_sock(struct s
+ 	inet6_sock_destruct(sk);
+ }
+ 
+-int udpv6_init_sock(struct sock *sk)
++static int udpv6_init_sock(struct sock *sk)
+ {
+ 	udp_lib_init_sock(sk);
+ 	sk->sk_destruct = udpv6_destruct_sock;
+@@ -93,7 +93,7 @@ u32 udp6_ehashfn(const struct net *net,
+ 			       udp6_ehash_secret + net_hash_mix(net));
+ }
+ 
+-int udp_v6_get_port(struct sock *sk, unsigned short snum)
++static int udp_v6_get_port(struct sock *sk, unsigned short snum)
+ {
+ 	unsigned int hash2_nulladdr =
+ 		ipv6_portaddr_hash(sock_net(sk), &in6addr_any, snum);
+@@ -105,7 +105,7 @@ int udp_v6_get_port(struct sock *sk, uns
+ 	return udp_lib_get_port(sk, snum, hash2_nulladdr);
+ }
+ 
+-void udp_v6_rehash(struct sock *sk)
++static void udp_v6_rehash(struct sock *sk)
+ {
+ 	u16 new_hash = ipv6_portaddr_hash(sock_net(sk),
+ 					  &sk->sk_v6_rcv_saddr,
+@@ -378,6 +378,7 @@ static int udp6_skb_len(struct sk_buff *
+  *	return it, otherwise we block.
+  */
+ 
++INDIRECT_CALLABLE_SCOPE
+ int udpv6_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
+ 		  int flags, int *addr_len)
+ {
+@@ -614,9 +615,9 @@ out:
+ 	return sk;
+ }
+ 
+-int __udp6_lib_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
+-		   u8 type, u8 code, int offset, __be32 info,
+-		   struct udp_table *udptable)
++static int __udp6_lib_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
++			  u8 type, u8 code, int offset, __be32 info,
++			  struct udp_table *udptable)
+ {
+ 	struct ipv6_pinfo *np;
+ 	const struct ipv6hdr *hdr = (const struct ipv6hdr *)skb->data;
+@@ -983,8 +984,8 @@ static int udp6_unicast_rcv_skb(struct s
+ 	return 0;
+ }
+ 
+-int __udp6_lib_rcv(struct sk_buff *skb, struct udp_table *udptable,
+-		   int proto)
++static int __udp6_lib_rcv(struct sk_buff *skb, struct udp_table *udptable,
++			  int proto)
+ {
+ 	enum skb_drop_reason reason = SKB_DROP_REASON_NOT_SPECIFIED;
+ 	const struct in6_addr *saddr, *daddr;
+@@ -1717,7 +1718,7 @@ static void udpv6_splice_eof(struct sock
+ 	release_sock(sk);
+ }
+ 
+-void udpv6_destroy_sock(struct sock *sk)
++static void udpv6_destroy_sock(struct sock *sk)
+ {
+ 	struct udp_sock *up = udp_sk(sk);
+ 	lock_sock(sk);
+@@ -1744,8 +1745,8 @@ void udpv6_destroy_sock(struct sock *sk)
+ /*
+  *	Socket option code for UDP
+  */
+-int udpv6_setsockopt(struct sock *sk, int level, int optname, sockptr_t optval,
+-		     unsigned int optlen)
++static int udpv6_setsockopt(struct sock *sk, int level, int optname,
++			    sockptr_t optval, unsigned int optlen)
+ {
+ 	if (level == SOL_UDP  ||  level == SOL_UDPLITE || level == SOL_SOCKET)
+ 		return udp_lib_setsockopt(sk, level, optname,
+@@ -1754,8 +1755,8 @@ int udpv6_setsockopt(struct sock *sk, in
+ 	return ipv6_setsockopt(sk, level, optname, optval, optlen);
+ }
+ 
+-int udpv6_getsockopt(struct sock *sk, int level, int optname,
+-		     char __user *optval, int __user *optlen)
++static int udpv6_getsockopt(struct sock *sk, int level, int optname,
++			    char __user *optval, int __user *optlen)
+ {
+ 	if (level == SOL_UDP  ||  level == SOL_UDPLITE)
+ 		return udp_lib_getsockopt(sk, level, optname, optval, optlen);
+@@ -1780,7 +1781,7 @@ static int udp6_seq_show(struct seq_file
+ 	return 0;
+ }
+ 
+-const struct seq_operations udp6_seq_ops = {
++static const struct seq_operations udp6_seq_ops = {
+ 	.start		= udp_seq_start,
+ 	.next		= udp_seq_next,
+ 	.stop		= udp_seq_stop,
+--- a/net/rxrpc/output.c
++++ b/net/rxrpc/output.c
+@@ -16,8 +16,6 @@
+ #include <net/udp.h>
+ #include "ar-internal.h"
+ 
+-extern int udpv6_sendmsg(struct sock *sk, struct msghdr *msg, size_t len);
+-
+ static ssize_t do_udp_sendmsg(struct socket *socket, struct msghdr *msg, size_t len)
+ {
+ 	struct sockaddr *sa = msg->msg_name;
