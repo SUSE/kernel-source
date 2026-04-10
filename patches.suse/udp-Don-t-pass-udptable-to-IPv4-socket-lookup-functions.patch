@@ -1,0 +1,402 @@
+From: Kuniyuki Iwashima <kuniyu@google.com>
+Date: Wed, 11 Mar 2026 05:20:01 +0000
+Subject: udp: Don't pass udptable to IPv4 socket lookup functions.
+Patch-mainline: Queued in subsystem maintainer repository
+Git-repo: https://git.kernel.org/pub/scm/linux/kernel/git/netdev/net-next.git/
+Git-commit: 68aeb21ef0e183ff3675fb82e22573e959505f95
+References: jsc#PED-16048
+
+Since UDP and UDP-Lite had dedicated socket hash tables for
+each, we have had to pass the pointer down to many socket
+lookup functions.
+
+UDP-Lite gone, and we do not need to do that.
+
+Let's fetch net->ipv4.udp_table only where needed in IPv4
+stack: __udp4_lib_lookup(), __udp4_lib_mcast_deliver(),
+and udp_diag_dump().
+
+Some functions are renamed as the wrapper functions are no
+longer needed.
+
+  __udp4_lib_err()     -> udp_err()
+  __udp_diag_destroy() -> udp_diag_destroy()
+  udp_dump_one()       -> udp_diag_dump_one()
+  udp_dump()           -> udp_diag_dump()
+
+Signed-off-by: Kuniyuki Iwashima <kuniyu@google.com>
+Reviewed-by: Willem de Bruijn <willemb@google.com>
+Link: https://patch.msgid.link/20260311052020.1213705-15-kuniyu@google.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Fernando Fernandez Mancera <fmancera@suse.de>
+---
+ include/net/udp.h      |    5 +--
+ net/core/filter.c      |    2 -
+ net/ipv4/udp.c         |   75 ++++++++++++++++++++++---------------------------
+ net/ipv4/udp_diag.c    |   61 +++++++++++++--------------------------
+ net/ipv4/udp_offload.c |    3 -
+ 5 files changed, 59 insertions(+), 87 deletions(-)
+
+--- a/include/net/udp.h
++++ b/include/net/udp.h
+@@ -298,9 +298,8 @@ int udp_lib_setsockopt(struct sock *sk,
+ struct sock *udp4_lib_lookup(const struct net *net, __be32 saddr, __be16 sport,
+ 			     __be32 daddr, __be16 dport, int dif);
+ struct sock *__udp4_lib_lookup(const struct net *net, __be32 saddr,
+-			       __be16 sport,
+-			       __be32 daddr, __be16 dport, int dif, int sdif,
+-			       struct udp_table *tbl, struct sk_buff *skb);
++			       __be16 sport, __be32 daddr, __be16 dport,
++			       int dif, int sdif, struct sk_buff *skb);
+ struct sock *udp4_lib_lookup_skb(const struct sk_buff *skb,
+ 				 __be16 sport, __be16 dport);
+ struct sock *udp6_lib_lookup(const struct net *net,
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -6731,7 +6731,7 @@ static struct sock *sk_lookup(struct net
+ 		else
+ 			sk = __udp4_lib_lookup(net, src4, tuple->ipv4.sport,
+ 					       dst4, tuple->ipv4.dport,
+-					       dif, sdif, net->ipv4.udp_table, NULL);
++					       dif, sdif, NULL);
+ #if IS_ENABLED(CONFIG_IPV6)
+ 	} else {
+ 		struct in6_addr *src6 = (struct in6_addr *)&tuple->ipv6.saddr;
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -523,9 +523,10 @@ rescore:
+  * harder than this. -DaveM
+  */
+ struct sock *__udp4_lib_lookup(const struct net *net, __be32 saddr,
+-		__be16 sport, __be32 daddr, __be16 dport, int dif,
+-		int sdif, struct udp_table *udptable, struct sk_buff *skb)
++			       __be16 sport, __be32 daddr, __be16 dport,
++			       int dif, int sdif, struct sk_buff *skb)
+ {
++	struct udp_table *udptable = net->ipv4.udp_table;
+ 	unsigned short hnum = ntohs(dport);
+ 	unsigned int hash2, slot2;
+ 	struct udp_hslot *hslot2;
+@@ -586,14 +587,13 @@ done:
+ EXPORT_SYMBOL_GPL(__udp4_lib_lookup);
+ 
+ static inline struct sock *__udp4_lib_lookup_skb(struct sk_buff *skb,
+-						 __be16 sport, __be16 dport,
+-						 struct udp_table *udptable)
++						 __be16 sport, __be16 dport)
+ {
+ 	const struct iphdr *iph = ip_hdr(skb);
+ 
+ 	return __udp4_lib_lookup(dev_net(skb->dev), iph->saddr, sport,
+ 				 iph->daddr, dport, inet_iif(skb),
+-				 inet_sdif(skb), udptable, skb);
++				 inet_sdif(skb), skb);
+ }
+ 
+ struct sock *udp4_lib_lookup_skb(const struct sk_buff *skb,
+@@ -601,14 +601,12 @@ struct sock *udp4_lib_lookup_skb(const s
+ {
+ 	const u16 offset = NAPI_GRO_CB(skb)->network_offsets[skb->encapsulation];
+ 	const struct iphdr *iph = (struct iphdr *)(skb->data + offset);
+-	struct net *net = dev_net(skb->dev);
+ 	int iif, sdif;
+ 
+ 	inet_get_iif_sdif(skb, &iif, &sdif);
+ 
+-	return __udp4_lib_lookup(net, iph->saddr, sport,
+-				 iph->daddr, dport, iif,
+-				 sdif, net->ipv4.udp_table, NULL);
++	return __udp4_lib_lookup(dev_net(skb->dev), iph->saddr, sport,
++				 iph->daddr, dport, iif, sdif, NULL);
+ }
+ 
+ /* Must be called under rcu_read_lock().
+@@ -620,8 +618,7 @@ struct sock *udp4_lib_lookup(const struc
+ {
+ 	struct sock *sk;
+ 
+-	sk = __udp4_lib_lookup(net, saddr, sport, daddr, dport,
+-			       dif, 0, net->ipv4.udp_table, NULL);
++	sk = __udp4_lib_lookup(net, saddr, sport, daddr, dport, dif, 0, NULL);
+ 	if (sk && !refcount_inc_not_zero(&sk->sk_refcnt))
+ 		sk = NULL;
+ 	return sk;
+@@ -711,7 +708,6 @@ static int __udp4_lib_err_encap_no_sk(st
+ static struct sock *__udp4_lib_err_encap(struct net *net,
+ 					 const struct iphdr *iph,
+ 					 struct udphdr *uh,
+-					 struct udp_table *udptable,
+ 					 struct sock *sk,
+ 					 struct sk_buff *skb, u32 info)
+ {
+@@ -739,8 +735,7 @@ static struct sock *__udp4_lib_err_encap
+ 	}
+ 
+ 	sk = __udp4_lib_lookup(net, iph->daddr, uh->source,
+-			       iph->saddr, uh->dest, skb->dev->ifindex, 0,
+-			       udptable, NULL);
++			       iph->saddr, uh->dest, skb->dev->ifindex, 0, NULL);
+ 	if (sk) {
+ 		up = udp_sk(sk);
+ 
+@@ -769,29 +764,28 @@ out:
+  * header points to the first 8 bytes of the udp header.  We need
+  * to find the appropriate port.
+  */
+-
+-static int __udp4_lib_err(struct sk_buff *skb, u32 info, struct udp_table *udptable)
++int udp_err(struct sk_buff *skb, u32 info)
+ {
+-	struct inet_sock *inet;
+ 	const struct iphdr *iph = (const struct iphdr *)skb->data;
+-	struct udphdr *uh = (struct udphdr *)(skb->data+(iph->ihl<<2));
+ 	const int type = icmp_hdr(skb)->type;
+ 	const int code = icmp_hdr(skb)->code;
++	struct net *net = dev_net(skb->dev);
++	struct inet_sock *inet;
+ 	bool tunnel = false;
++	struct udphdr *uh;
+ 	struct sock *sk;
+ 	int harderr;
+ 	int err;
+-	struct net *net = dev_net(skb->dev);
+ 
++	uh = (struct udphdr *)(skb->data + (iph->ihl << 2));
+ 	sk = __udp4_lib_lookup(net, iph->daddr, uh->dest,
+ 			       iph->saddr, uh->source, skb->dev->ifindex,
+-			       inet_sdif(skb), udptable, NULL);
++			       inet_sdif(skb), NULL);
+ 
+ 	if (!sk || READ_ONCE(udp_sk(sk)->encap_type)) {
+ 		/* No socket for error: try tunnels before discarding */
+ 		if (static_branch_unlikely(&udp_encap_needed_key)) {
+-			sk = __udp4_lib_err_encap(net, iph, uh, udptable, sk, skb,
+-						  info);
++			sk = __udp4_lib_err_encap(net, iph, uh, sk, skb, info);
+ 			if (!sk)
+ 				return 0;
+ 		} else
+@@ -864,11 +858,6 @@ out:
+ 	return 0;
+ }
+ 
+-int udp_err(struct sk_buff *skb, u32 info)
+-{
+-	return __udp4_lib_err(skb, info, dev_net(skb->dev)->ipv4.udp_table);
+-}
+-
+ /*
+  * Throw away all pending data and cancel the corking. Socket is locked.
+  */
+@@ -2242,18 +2231,24 @@ EXPORT_SYMBOL(udp_sk_rx_dst_set);
+ static int __udp4_lib_mcast_deliver(struct net *net, struct sk_buff *skb,
+ 				    struct udphdr  *uh,
+ 				    __be32 saddr, __be32 daddr,
+-				    struct udp_table *udptable,
+ 				    int proto)
+ {
+-	struct sock *sk, *first = NULL;
++	struct udp_table *udptable = net->ipv4.udp_table;
++	unsigned int hash2, hash2_any, offset;
+ 	unsigned short hnum = ntohs(uh->dest);
+-	struct udp_hslot *hslot = udp_hashslot(udptable, net, hnum);
+-	unsigned int hash2 = 0, hash2_any = 0, use_hash2 = (hslot->count > 10);
+-	unsigned int offset = offsetof(typeof(*sk), sk_node);
++	struct sock *sk, *first = NULL;
+ 	int dif = skb->dev->ifindex;
+ 	int sdif = inet_sdif(skb);
+ 	struct hlist_node *node;
++	struct udp_hslot *hslot;
+ 	struct sk_buff *nskb;
++	bool use_hash2;
++
++	hash2_any = 0;
++	hash2 = 0;
++	hslot = udp_hashslot(udptable, net, hnum);
++	use_hash2 = hslot->count > 10;
++	offset = offsetof(typeof(*sk), sk_node);
+ 
+ 	if (use_hash2) {
+ 		hash2_any = ipv4_portaddr_hash(net, htonl(INADDR_ANY), hnum) &
+@@ -2358,15 +2353,14 @@ static int udp_unicast_rcv_skb(struct so
+  *	All we need to do is get the socket, and then do a checksum.
+  */
+ 
+-static int __udp4_lib_rcv(struct sk_buff *skb, struct udp_table *udptable,
+-			  int proto)
++static int __udp4_lib_rcv(struct sk_buff *skb, int proto)
+ {
++	struct rtable *rt = skb_rtable(skb);
++	struct net *net = dev_net(skb->dev);
+ 	struct sock *sk = NULL;
+-	struct udphdr *uh;
+ 	unsigned short ulen;
+-	struct rtable *rt = skb_rtable(skb);
+ 	__be32 saddr, daddr;
+-	struct net *net = dev_net(skb->dev);
++	struct udphdr *uh;
+ 	bool refcounted;
+ 	int drop_reason;
+ 
+@@ -2418,10 +2412,9 @@ static int __udp4_lib_rcv(struct sk_buff
+ 	}
+ 
+ 	if (rt->rt_flags & (RTCF_BROADCAST|RTCF_MULTICAST))
+-		return __udp4_lib_mcast_deliver(net, skb, uh,
+-						saddr, daddr, udptable, proto);
++		return __udp4_lib_mcast_deliver(net, skb, uh, saddr, daddr, proto);
+ 
+-	sk = __udp4_lib_lookup_skb(skb, uh->source, uh->dest, udptable);
++	sk = __udp4_lib_lookup_skb(skb, uh->source, uh->dest);
+ 	if (sk)
+ 		return udp_unicast_rcv_skb(sk, skb, uh);
+ no_sk:
+@@ -2606,7 +2599,7 @@ int udp_v4_early_demux(struct sk_buff *s
+ 
+ int udp_rcv(struct sk_buff *skb)
+ {
+-	return __udp4_lib_rcv(skb, dev_net(skb->dev)->ipv4.udp_table, IPPROTO_UDP);
++	return __udp4_lib_rcv(skb, IPPROTO_UDP);
+ }
+ 
+ static void udp_destroy_sock(struct sock *sk)
+--- a/net/ipv4/udp_diag.c
++++ b/net/ipv4/udp_diag.c
+@@ -24,23 +24,24 @@ static int sk_diag_dump(struct sock *sk,
+ 				 net_admin);
+ }
+ 
+-static int udp_dump_one(struct udp_table *tbl,
+-			struct netlink_callback *cb,
+-			const struct inet_diag_req_v2 *req)
++static int udp_diag_dump_one(struct netlink_callback *cb,
++			     const struct inet_diag_req_v2 *req)
+ {
+ 	struct sk_buff *in_skb = cb->skb;
+-	int err;
+ 	struct sock *sk = NULL;
+ 	struct sk_buff *rep;
+-	struct net *net = sock_net(in_skb->sk);
++	struct net *net;
++	int err;
++
++	net = sock_net(in_skb->sk);
+ 
+ 	rcu_read_lock();
+ 	if (req->sdiag_family == AF_INET)
+ 		/* src and dst are swapped for historical reasons */
+ 		sk = __udp4_lib_lookup(net,
+-				req->id.idiag_src[0], req->id.idiag_sport,
+-				req->id.idiag_dst[0], req->id.idiag_dport,
+-				req->id.idiag_if, 0, tbl, NULL);
++				       req->id.idiag_src[0], req->id.idiag_sport,
++				       req->id.idiag_dst[0], req->id.idiag_dport,
++				       req->id.idiag_if, 0, NULL);
+ #if IS_ENABLED(CONFIG_IPV6)
+ 	else if (req->sdiag_family == AF_INET6)
+ 		sk = __udp6_lib_lookup(net,
+@@ -85,18 +86,19 @@ out_nosk:
+ 	return err;
+ }
+ 
+-static void udp_dump(struct udp_table *table, struct sk_buff *skb,
+-		     struct netlink_callback *cb,
+-		     const struct inet_diag_req_v2 *r)
++static void udp_diag_dump(struct sk_buff *skb, struct netlink_callback *cb,
++			  const struct inet_diag_req_v2 *r)
+ {
+ 	bool net_admin = netlink_net_capable(cb->skb, CAP_NET_ADMIN);
+ 	struct net *net = sock_net(skb->sk);
+ 	struct inet_diag_dump_data *cb_data;
+ 	int num, s_num, slot, s_slot;
+ 	struct nlattr *bc;
++	struct udp_table *table;
+ 
+ 	cb_data = cb->data;
+ 	bc = cb_data->inet_diag_nla_bc;
++	table = net->ipv4.udp_table;
+ 	s_slot = cb->args[0];
+ 	num = s_num = cb->args[1];
+ 
+@@ -143,18 +145,6 @@ done:
+ 	cb->args[1] = num;
+ }
+ 
+-static void udp_diag_dump(struct sk_buff *skb, struct netlink_callback *cb,
+-			  const struct inet_diag_req_v2 *r)
+-{
+-	udp_dump(sock_net(cb->skb->sk)->ipv4.udp_table, skb, cb, r);
+-}
+-
+-static int udp_diag_dump_one(struct netlink_callback *cb,
+-			     const struct inet_diag_req_v2 *req)
+-{
+-	return udp_dump_one(sock_net(cb->skb->sk)->ipv4.udp_table, cb, req);
+-}
+-
+ static void udp_diag_get_info(struct sock *sk, struct inet_diag_msg *r,
+ 		void *info)
+ {
+@@ -163,9 +153,8 @@ static void udp_diag_get_info(struct soc
+ }
+ 
+ #ifdef CONFIG_INET_DIAG_DESTROY
+-static int __udp_diag_destroy(struct sk_buff *in_skb,
+-			      const struct inet_diag_req_v2 *req,
+-			      struct udp_table *tbl)
++static int udp_diag_destroy(struct sk_buff *in_skb,
++			    const struct inet_diag_req_v2 *req)
+ {
+ 	struct net *net = sock_net(in_skb->sk);
+ 	struct sock *sk;
+@@ -175,18 +164,17 @@ static int __udp_diag_destroy(struct sk_
+ 
+ 	if (req->sdiag_family == AF_INET)
+ 		sk = __udp4_lib_lookup(net,
+-				req->id.idiag_dst[0], req->id.idiag_dport,
+-				req->id.idiag_src[0], req->id.idiag_sport,
+-				req->id.idiag_if, 0, tbl, NULL);
++				       req->id.idiag_dst[0], req->id.idiag_dport,
++				       req->id.idiag_src[0], req->id.idiag_sport,
++				       req->id.idiag_if, 0, NULL);
+ #if IS_ENABLED(CONFIG_IPV6)
+ 	else if (req->sdiag_family == AF_INET6) {
+ 		if (ipv6_addr_v4mapped((struct in6_addr *)req->id.idiag_dst) &&
+ 		    ipv6_addr_v4mapped((struct in6_addr *)req->id.idiag_src))
+ 			sk = __udp4_lib_lookup(net,
+-					req->id.idiag_dst[3], req->id.idiag_dport,
+-					req->id.idiag_src[3], req->id.idiag_sport,
+-					req->id.idiag_if, 0, tbl, NULL);
+-
++					       req->id.idiag_dst[3], req->id.idiag_dport,
++					       req->id.idiag_src[3], req->id.idiag_sport,
++					       req->id.idiag_if, 0, NULL);
+ 		else
+ 			sk = __udp6_lib_lookup(net,
+ 					       (struct in6_addr *)req->id.idiag_dst,
+@@ -220,13 +208,6 @@ static int __udp_diag_destroy(struct sk_
+ 
+ 	return err;
+ }
+-
+-static int udp_diag_destroy(struct sk_buff *in_skb,
+-			    const struct inet_diag_req_v2 *req)
+-{
+-	return __udp_diag_destroy(in_skb, req, sock_net(in_skb->sk)->ipv4.udp_table);
+-}
+-
+ #endif
+ 
+ static const struct inet_diag_handler udp_diag_handler = {
+--- a/net/ipv4/udp_offload.c
++++ b/net/ipv4/udp_offload.c
+@@ -706,8 +706,7 @@ static struct sock *udp4_gro_lookup_skb(
+ 	inet_get_iif_sdif(skb, &iif, &sdif);
+ 
+ 	return __udp4_lib_lookup(net, iph->saddr, sport,
+-				 iph->daddr, dport, iif,
+-				 sdif, net->ipv4.udp_table, NULL);
++				 iph->daddr, dport, iif, sdif, NULL);
+ }
+ 
+ INDIRECT_CALLABLE_SCOPE
