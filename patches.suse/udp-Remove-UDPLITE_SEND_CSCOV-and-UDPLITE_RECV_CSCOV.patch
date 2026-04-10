@@ -1,0 +1,233 @@
+From: Kuniyuki Iwashima <kuniyu@google.com>
+Date: Wed, 11 Mar 2026 05:19:56 +0000
+Subject: udp: Remove UDPLITE_SEND_CSCOV and UDPLITE_RECV_CSCOV.
+Patch-mainline: Queued in subsystem maintainer repository
+Git-repo: https://git.kernel.org/pub/scm/linux/kernel/git/netdev/net-next.git/
+Git-commit: 74f0cca1100b6d1f1ea28178435aff8078d06603
+References: jsc#PED-16048
+
+UDP-Lite supports variable-length checksum and has two socket
+options, UDPLITE_SEND_CSCOV and UDPLITE_RECV_CSCOV, to control
+the checksum coverage.
+
+Let's remove the support.
+
+setsockopt(UDPLITE_SEND_CSCOV / UDPLITE_RECV_CSCOV) was only
+available for UDP-Lite and returned -ENOPROTOOPT for UDP.
+
+Now, the options are handled in ip_setsockopt() and
+ipv6_setsockopt(), which still return the same error.
+
+getsockopt(UDPLITE_SEND_CSCOV / UDPLITE_RECV_CSCOV) was available
+for UDP and always returned 0, meaning full checksum, but now
+-ENOPROTOOPT is returned.
+
+Given that getsockopt() is meaningless for UDP and even the options
+are not defined under include/uapi/, this should not be a problem.
+
+  $ man 7 udplite
+  ...
+  BUGS
+       Where glibc support is missing, the following definitions
+       are needed:
+
+           #define IPPROTO_UDPLITE     136
+           #define UDPLITE_SEND_CSCOV  10
+           #define UDPLITE_RECV_CSCOV  11
+
+Signed-off-by: Kuniyuki Iwashima <kuniyu@google.com>
+Reviewed-by: Willem de Bruijn <willemb@google.com>
+Link: https://patch.msgid.link/20260311052020.1213705-10-kuniyu@google.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Fernando Fernandez Mancera <fmancera@suse.de>
+---
+ include/linux/udp.h      |    8 +-------
+ include/net/udplite.h    |   15 ---------------
+ include/uapi/linux/udp.h |    2 ++
+ net/ipv4/udp.c           |   46 ++--------------------------------------------
+ net/ipv6/ip6_checksum.c  |    2 +-
+ net/ipv6/udp.c           |    5 ++---
+ 6 files changed, 8 insertions(+), 70 deletions(-)
+
+--- a/include/linux/udp.h
++++ b/include/linux/udp.h
+@@ -40,8 +40,6 @@ enum {
+ 	UDP_FLAGS_ACCEPT_FRAGLIST,
+ 	UDP_FLAGS_ACCEPT_L4,
+ 	UDP_FLAGS_ENCAP_ENABLED, /* This socket enabled encap */
+-	UDP_FLAGS_UDPLITE_SEND_CC, /* set via udplite setsockopt */
+-	UDP_FLAGS_UDPLITE_RECV_CC, /* set via udplite setsockopt */
+ };
+ 
+ struct udp_sock {
+@@ -62,11 +60,7 @@ struct udp_sock {
+ 	 */
+ 	__u16		 len;		/* total length of pending frames */
+ 	__u16		 gso_size;
+-	/*
+-	 * Fields specific to UDP-Lite.
+-	 */
+-	__u16		 pcslen;
+-	__u16		 pcrlen;
++
+ 	/*
+ 	 * For encapsulation sockets.
+ 	 */
+--- a/include/net/udplite.h
++++ /dev/null
+@@ -1,15 +0,0 @@
+-/* SPDX-License-Identifier: GPL-2.0 */
+-/*
+- *	Definitions for the UDP-Lite (RFC 3828) code.
+- */
+-#ifndef _UDPLITE_H
+-#define _UDPLITE_H
+-
+-#include <net/ip6_checksum.h>
+-#include <net/udp.h>
+-
+-/* UDP-Lite socket options */
+-#define UDPLITE_SEND_CSCOV   10 /* sender partial coverage (as sent)      */
+-#define UDPLITE_RECV_CSCOV   11 /* receiver partial coverage (threshold ) */
+-
+-#endif	/* _UDPLITE_H */
+--- a/include/uapi/linux/udp.h
++++ b/include/uapi/linux/udp.h
+@@ -29,6 +29,8 @@ struct udphdr {
+ 
+ /* UDP socket options */
+ #define UDP_CORK	1	/* Never send partially complete segments */
++/* Deprecated, reserved for UDPLITE_SEND_CSCOV 10 */
++/* Deprecated, reserved for UDPLITE_RECV_CSCOV 11 */
+ #define UDP_ENCAP	100	/* Set the socket to accept encapsulated packets */
+ #define UDP_NO_CHECK6_TX 101	/* Disable sending checksum for UDP6X */
+ #define UDP_NO_CHECK6_RX 102	/* Disable accpeting checksum for UDP6 */
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -115,7 +115,6 @@
+ #include <net/sock_reuseport.h>
+ #include <net/addrconf.h>
+ #include <net/udp_tunnel.h>
+-#include <net/udplite.h>
+ #include <net/gro.h>
+ #include <net/inet_dscp.h>
+ #if IS_ENABLED(CONFIG_IPV6)
+@@ -2654,7 +2653,6 @@ int udp_lib_setsockopt(struct sock *sk,
+ 	struct udp_sock *up = udp_sk(sk);
+ 	int val, valbool;
+ 	int err = 0;
+-	int is_udplite = IS_UDPLITE(sk);
+ 
+ 	if (level == SOL_SOCKET) {
+ 		err = sk_setsockopt(sk, level, optname, optval, optlen);
+@@ -2738,36 +2736,6 @@ int udp_lib_setsockopt(struct sock *sk,
+ 		set_xfrm_gro_udp_encap_rcv(up->encap_type, sk->sk_family, sk);
+ 		break;
+ 
+-	/*
+-	 * 	UDP-Lite's partial checksum coverage (RFC 3828).
+-	 */
+-	/* The sender sets actual checksum coverage length via this option.
+-	 * The case coverage > packet length is handled by send module. */
+-	case UDPLITE_SEND_CSCOV:
+-		if (!is_udplite)         /* Disable the option on UDP sockets */
+-			return -ENOPROTOOPT;
+-		if (val != 0 && val < 8) /* Illegal coverage: use default (8) */
+-			val = 8;
+-		else if (val > USHRT_MAX)
+-			val = USHRT_MAX;
+-		WRITE_ONCE(up->pcslen, val);
+-		udp_set_bit(UDPLITE_SEND_CC, sk);
+-		break;
+-
+-	/* The receiver specifies a minimum checksum coverage value. To make
+-	 * sense, this should be set to at least 8 (as done below). If zero is
+-	 * used, this again means full checksum coverage.                     */
+-	case UDPLITE_RECV_CSCOV:
+-		if (!is_udplite)         /* Disable the option on UDP sockets */
+-			return -ENOPROTOOPT;
+-		if (val != 0 && val < 8) /* Avoid silly minimal values.       */
+-			val = 8;
+-		else if (val > USHRT_MAX)
+-			val = USHRT_MAX;
+-		WRITE_ONCE(up->pcrlen, val);
+-		udp_set_bit(UDPLITE_RECV_CC, sk);
+-		break;
+-
+ 	default:
+ 		err = -ENOPROTOOPT;
+ 		break;
+@@ -2780,7 +2748,7 @@ EXPORT_SYMBOL(udp_lib_setsockopt);
+ static int udp_setsockopt(struct sock *sk, int level, int optname, sockptr_t optval,
+ 			  unsigned int optlen)
+ {
+-	if (level == SOL_UDP  ||  level == SOL_UDPLITE || level == SOL_SOCKET)
++	if (level == SOL_UDP || level == SOL_SOCKET)
+ 		return udp_lib_setsockopt(sk, level, optname,
+ 					  optval, optlen,
+ 					  udp_push_pending_frames);
+@@ -2826,16 +2794,6 @@ int udp_lib_getsockopt(struct sock *sk,
+ 		val = udp_test_bit(GRO_ENABLED, sk);
+ 		break;
+ 
+-	/* The following two cannot be changed on UDP sockets, the return is
+-	 * always 0 (which corresponds to the full checksum coverage of UDP). */
+-	case UDPLITE_SEND_CSCOV:
+-		val = READ_ONCE(up->pcslen);
+-		break;
+-
+-	case UDPLITE_RECV_CSCOV:
+-		val = READ_ONCE(up->pcrlen);
+-		break;
+-
+ 	default:
+ 		return -ENOPROTOOPT;
+ 	}
+@@ -2851,7 +2809,7 @@ EXPORT_SYMBOL(udp_lib_getsockopt);
+ static int udp_getsockopt(struct sock *sk, int level, int optname,
+ 			  char __user *optval, int __user *optlen)
+ {
+-	if (level == SOL_UDP  ||  level == SOL_UDPLITE)
++	if (level == SOL_UDP)
+ 		return udp_lib_getsockopt(sk, level, optname, optval, optlen);
+ 	return ip_getsockopt(sk, level, optname, optval, optlen);
+ }
+--- a/net/ipv6/ip6_checksum.c
++++ b/net/ipv6/ip6_checksum.c
+@@ -1,7 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0
+ #include <net/ip.h>
++#include <net/ip6_checksum.h>
+ #include <net/udp.h>
+-#include <net/udplite.h>
+ #include <asm/checksum.h>
+ 
+ #ifndef _HAVE_ARCH_IPV6_CSUM
+--- a/net/ipv6/udp.c
++++ b/net/ipv6/udp.c
+@@ -57,7 +57,6 @@
+ #include <linux/proc_fs.h>
+ #include <linux/seq_file.h>
+ #include <trace/events/skb.h>
+-#include <net/udplite.h>
+ 
+ static void udpv6_destruct_sock(struct sock *sk)
+ {
+@@ -1707,7 +1706,7 @@ static void udpv6_destroy_sock(struct so
+ static int udpv6_setsockopt(struct sock *sk, int level, int optname,
+ 			    sockptr_t optval, unsigned int optlen)
+ {
+-	if (level == SOL_UDP  ||  level == SOL_UDPLITE || level == SOL_SOCKET)
++	if (level == SOL_UDP || level == SOL_SOCKET)
+ 		return udp_lib_setsockopt(sk, level, optname,
+ 					  optval, optlen,
+ 					  udp_v6_push_pending_frames);
+@@ -1717,7 +1716,7 @@ static int udpv6_setsockopt(struct sock
+ static int udpv6_getsockopt(struct sock *sk, int level, int optname,
+ 			    char __user *optval, int __user *optlen)
+ {
+-	if (level == SOL_UDP  ||  level == SOL_UDPLITE)
++	if (level == SOL_UDP)
+ 		return udp_lib_getsockopt(sk, level, optname, optval, optlen);
+ 	return ipv6_getsockopt(sk, level, optname, optval, optlen);
+ }
