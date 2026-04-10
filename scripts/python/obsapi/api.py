@@ -155,7 +155,7 @@ class API:
                         try:
                             result['content_decoded'] = base64.standard_b64decode(data[i]).decode(errors='surrogateescape')
                         except binascii.Error:
-                            None
+                            pass
                     result[i] = self.redact_content(data[i])
             return result
         return data
@@ -198,7 +198,7 @@ class API:
             try:
                 data['text'] = r.text
             except UnicodeDecodeError:
-                None
+                pass
             data['content'] = r.content
         return '---\n' + yaml.dump(self.redact_content(data))
 
