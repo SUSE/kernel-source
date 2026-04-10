@@ -104,7 +104,7 @@ class TeaAPI(api.API):
             self.check_post(self.repo_path(src, srcrepo) + '/forks', json=args)
         else:
             if dst != self.get_user():
-                raise APIError('Do not know how to create repository for ' + dst)
+                raise api.APIError('Do not know how to create repository for ' + dst)
             self.check_post('/api/v1/user/repos', json={
                 'name' : dstrepo,
                 'object_format_name' : 'sha256',
@@ -175,11 +175,11 @@ class TeaAPI(api.API):
                 sys.stderr.write('Resetting branch %s (commit mismatch %s %s)\n' %
                                  (branch, current_commit, ref_commit))
                 try:
-                    self.update_branch(org, repo, branch, ref_commit, old_commit=current_commit, force=1)
+                    self.update_branch(org, repo, branch, ref_commit, old_commit=current_commit, force=True)
                 except api.APIError as e:
                     if e.status == 405:
                         sys.stderr.write('%s\n' % (e,))
-                        None # UpdateBranch not supported
+                        # UpdateBranch not supported
                     else:
                         raise
                 sys.stderr.write('Deleting branch %s (commit mismatch %s %s)\n' %
