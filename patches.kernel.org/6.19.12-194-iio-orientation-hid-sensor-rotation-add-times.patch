@@ -1,0 +1,86 @@
+From: David Lechner <dlechner@baylibre.com>
+Date: Sat, 7 Mar 2026 19:44:09 -0600
+Subject: [PATCH] iio: orientation: hid-sensor-rotation: add timestamp hack to
+ not break userspace
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+References: bsc#1012628
+Patch-mainline: 6.19.12
+Git-commit: 79a86a6cc3669416a21fef32d0767d39ba84b3aa
+
+commit 79a86a6cc3669416a21fef32d0767d39ba84b3aa upstream.
+
+Add a hack to push two timestamps in the hid-sensor-rotation scan data
+to avoid breaking userspace applications that depend on the timestamp
+being at the incorrect location in the scan data due to unintentional
+misalignment in older kernels.
+
+When this driver was written, the timestamp was in the correct location
+because of the way iio_compute_scan_bytes() was implemented at the time.
+(Samples were 24 bytes each.) Then commit 883f61653069 ("iio: buffer:
+align the size of scan bytes to size of the largest element") changed
+the computed scan_bytes to be a different size (32 bytes), which caused
+iio_push_to_buffers_with_timestamp() to place the timestamp at an
+incorrect offset.
+
+There have been long periods of time (6 years each) where the timestamp
+was in either location, so to not break either case, we open-code the
+timestamps to be pushed to both locations in the scan data.
+
+Reported-by: Jonathan Cameron <jic23@kernel.org>
+Closes: https://lore.kernel.org/linux-iio/20260215162351.79f40b32@jic23-huawei/
+Fixes: 883f61653069 ("iio: buffer: align the size of scan bytes to size of the largest element")
+Signed-off-by: David Lechner <dlechner@baylibre.com>
+Reviewed-by: Nuno Sá <nuno.sa@analog.com>
+Cc: <Stable@vger.kernel.org>
+Signed-off-by: Jonathan Cameron <Jonathan.Cameron@huawei.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/iio/orientation/hid-sensor-rotation.c | 22 ++++++++++++++++---
+ 1 file changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/iio/orientation/hid-sensor-rotation.c b/drivers/iio/orientation/hid-sensor-rotation.c
+index 6806481873be..5a5e6e4fbe34 100644
+--- a/drivers/iio/orientation/hid-sensor-rotation.c
++++ b/drivers/iio/orientation/hid-sensor-rotation.c
+@@ -20,7 +20,12 @@ struct dev_rot_state {
+ 	struct hid_sensor_hub_attribute_info quaternion;
+ 	struct {
+ 		IIO_DECLARE_QUATERNION(s32, sampled_vals);
+-		aligned_s64 timestamp;
++		/*
++		 * ABI regression avoidance: There are two copies of the same
++		 * timestamp in case of userspace depending on broken alignment
++		 * from older kernels.
++		 */
++		aligned_s64 timestamp[2];
+ 	} scan;
+ 	int scale_pre_decml;
+ 	int scale_post_decml;
+@@ -154,8 +159,19 @@ static int dev_rot_proc_event(struct hid_sensor_hub_device *hsdev,
+ 		if (!rot_state->timestamp)
+ 			rot_state->timestamp = iio_get_time_ns(indio_dev);
+ 
+-		iio_push_to_buffers_with_timestamp(indio_dev, &rot_state->scan,
+-						   rot_state->timestamp);
++		/*
++		 * ABI regression avoidance: IIO previously had an incorrect
++		 * implementation of iio_push_to_buffers_with_timestamp() that
++		 * put the timestamp in the last 8 bytes of the buffer, which
++		 * was incorrect according to the IIO ABI. To avoid breaking
++		 * userspace that may be depending on this broken behavior, we
++		 * put the timestamp in both the correct place [0] and the old
++		 * incorrect place [1].
++		 */
++		rot_state->scan.timestamp[0] = rot_state->timestamp;
++		rot_state->scan.timestamp[1] = rot_state->timestamp;
++
++		iio_push_to_buffers(indio_dev, &rot_state->scan);
+ 
+ 		rot_state->timestamp = 0;
+ 	}
+-- 
+2.53.0
+

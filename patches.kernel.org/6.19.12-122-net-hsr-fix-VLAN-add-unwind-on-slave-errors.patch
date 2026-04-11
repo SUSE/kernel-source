@@ -1,0 +1,94 @@
+From: Luka Gejak <luka.gejak@linux.dev>
+Date: Wed, 1 Apr 2026 11:22:43 +0200
+Subject: [PATCH] net: hsr: fix VLAN add unwind on slave errors
+References: bsc#1012628
+Patch-mainline: 6.19.12
+Git-commit: 2e3514e63bfb0e972b1f19668547a455d0129e88
+
+[ Upstream commit 2e3514e63bfb0e972b1f19668547a455d0129e88 ]
+
+When vlan_vid_add() fails for a secondary slave, the error path calls
+vlan_vid_del() on the failing port instead of the peer slave that had
+already succeeded. This results in asymmetric VLAN state across the HSR
+pair.
+
+Fix this by switching to a centralized unwind path that removes the VID
+from any slave device that was already programmed.
+
+Fixes: 1a8a63a5305e ("net: hsr: Add VLAN CTAG filter support")
+Signed-off-by: Luka Gejak <luka.gejak@linux.dev>
+Link: https://patch.msgid.link/20260401092243.52121-3-luka.gejak@linux.dev
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ net/hsr/hsr_device.c | 32 +++++++++++++++++---------------
+ 1 file changed, 17 insertions(+), 15 deletions(-)
+
+diff --git a/net/hsr/hsr_device.c b/net/hsr/hsr_device.c
+index d1bfc49b5f01..fd2fea25eff0 100644
+--- a/net/hsr/hsr_device.c
++++ b/net/hsr/hsr_device.c
+@@ -532,8 +532,8 @@ static void hsr_change_rx_flags(struct net_device *dev, int change)
+ static int hsr_ndo_vlan_rx_add_vid(struct net_device *dev,
+ 				   __be16 proto, u16 vid)
+ {
+-	bool is_slave_a_added = false;
+-	bool is_slave_b_added = false;
++	struct net_device *slave_a_dev = NULL;
++	struct net_device *slave_b_dev = NULL;
+ 	struct hsr_port *port;
+ 	struct hsr_priv *hsr;
+ 	int ret = 0;
+@@ -549,33 +549,35 @@ static int hsr_ndo_vlan_rx_add_vid(struct net_device *dev,
+ 		switch (port->type) {
+ 		case HSR_PT_SLAVE_A:
+ 			if (ret) {
+-				/* clean up Slave-B */
+ 				netdev_err(dev, "add vid failed for Slave-A\n");
+-				if (is_slave_b_added)
+-					vlan_vid_del(port->dev, proto, vid);
+-				return ret;
++				goto unwind;
+ 			}
+-
+-			is_slave_a_added = true;
++			slave_a_dev = port->dev;
+ 			break;
+-
+ 		case HSR_PT_SLAVE_B:
+ 			if (ret) {
+-				/* clean up Slave-A */
+ 				netdev_err(dev, "add vid failed for Slave-B\n");
+-				if (is_slave_a_added)
+-					vlan_vid_del(port->dev, proto, vid);
+-				return ret;
++				goto unwind;
+ 			}
+-
+-			is_slave_b_added = true;
++			slave_b_dev = port->dev;
+ 			break;
+ 		default:
++			if (ret)
++				goto unwind;
+ 			break;
+ 		}
+ 	}
+ 
+ 	return 0;
++
++unwind:
++	if (slave_a_dev)
++		vlan_vid_del(slave_a_dev, proto, vid);
++
++	if (slave_b_dev)
++		vlan_vid_del(slave_b_dev, proto, vid);
++
++	return ret;
+ }
+ 
+ static int hsr_ndo_vlan_rx_kill_vid(struct net_device *dev,
+-- 
+2.53.0
+

@@ -1,0 +1,61 @@
+From: David Carlier <devnexen@gmail.com>
+Date: Wed, 25 Mar 2026 12:51:30 +0000
+Subject: [PATCH] net: ti: icssg-prueth: fix missing data copy and wrong
+ recycle in ZC RX dispatch
+References: bsc#1012628
+Patch-mainline: 6.19.12
+Git-commit: 5597dd284ff8c556c0b00f6a34473677426e3f81
+
+[ Upstream commit 5597dd284ff8c556c0b00f6a34473677426e3f81 ]
+
+emac_dispatch_skb_zc() allocates a new skb via napi_alloc_skb() but
+never copies the packet data from the XDP buffer into it. The skb is
+passed up the stack containing uninitialized heap memory instead of
+the actual received packet, leaking kernel heap contents to userspace.
+
+Copy the received packet data from the XDP buffer into the skb using
+skb_copy_to_linear_data().
+
+Additionally, remove the skb_mark_for_recycle() call since the skb is
+backed by the NAPI page frag allocator, not page_pool. Marking a
+non-page_pool skb for recycle causes the free path to return pages to
+a page_pool that does not own them, corrupting page_pool state.
+
+The non-ZC path (emac_rx_packet) does not have these issues because it
+uses napi_build_skb() to wrap the existing page_pool page directly,
+requiring no copy, and correctly marks for recycle since the page comes
+from page_pool_dev_alloc_pages().
+
+Fixes: 7a64bb388df3 ("net: ti: icssg-prueth: Add AF_XDP zero copy for RX")
+Signed-off-by: David Carlier <devnexen@gmail.com>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/net/ethernet/ti/icssg/icssg_common.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/ti/icssg/icssg_common.c b/drivers/net/ethernet/ti/icssg/icssg_common.c
+index 11d5b23a61ba..a74a41ad59c8 100644
+--- a/drivers/net/ethernet/ti/icssg/icssg_common.c
++++ b/drivers/net/ethernet/ti/icssg/icssg_common.c
+@@ -902,6 +902,7 @@ static void emac_dispatch_skb_zc(struct prueth_emac *emac, struct xdp_buff *xdp,
+ 
+ 	skb_reserve(skb, headroom);
+ 	skb_put(skb, pkt_len);
++	skb_copy_to_linear_data(skb, xdp->data, pkt_len);
+ 	skb->dev = ndev;
+ 
+ 	/* RX HW timestamp */
+@@ -912,7 +913,6 @@ static void emac_dispatch_skb_zc(struct prueth_emac *emac, struct xdp_buff *xdp,
+ 		skb->offload_fwd_mark = emac->offload_fwd_mark;
+ 	skb->protocol = eth_type_trans(skb, ndev);
+ 
+-	skb_mark_for_recycle(skb);
+ 	napi_gro_receive(&emac->napi_rx, skb);
+ 	ndev->stats.rx_bytes += pkt_len;
+ 	ndev->stats.rx_packets++;
+-- 
+2.53.0
+
