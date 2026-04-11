@@ -72,7 +72,7 @@ class OBSAPI(api.API):
         try:
             self.cookiejar.load()
         except FileNotFoundError:
-            None
+            pass
         except Exception as e:
             sys.stderr.write("Error loading cookies: %s\n" % (repr(e),))
         cp = configparser.ConfigParser(delimiters=('=', ':'), interpolation=None)
@@ -124,7 +124,7 @@ class OBSAPI(api.API):
             fn = os.path.join(td, 'data')
             with open(fn, 'w') as f:
                 f.write('(created): ' + str(created))
-            for i in range(0,3):
+            for _ in range(0,3):
                 try:
                     subprocess.check_call(['ssh-keygen', '-Y', 'sign', '-f', sshkey, '-n', realm, '-q', fn])
                     break
@@ -178,7 +178,7 @@ class OBSAPI(api.API):
         self.check_put('/'.join(['/source', project, '_config']), headers={'Content-type': 'text/plain'}, data=conf)
 
     def delete_project(self, project):
-        return self.check_delete('/'.join(['/source', project] + '?force=1'))
+        return self.check_delete('/'.join(['/source', project]) + '?force=1')
 
     def package_exists(self, project, package):
         return self.file_exists(project, package, '_meta')
