@@ -1,0 +1,89 @@
+From: Yufan Chen <yufan.chen@linux.dev>
+Date: Sun, 29 Mar 2026 00:32:57 +0800
+Subject: [PATCH] net: ftgmac100: fix ring allocation unwind on open failure
+References: bsc#1258210
+Patch-mainline: 6.18.22
+Git-commit: c0fd0fe745f5e8c568d898cd1513d0083e46204a
+
+commit c0fd0fe745f5e8c568d898cd1513d0083e46204a upstream.
+
+ftgmac100_alloc_rings() allocates rx_skbs, tx_skbs, rxdes, txdes, and
+rx_scratch in stages. On intermediate failures it returned -ENOMEM
+directly, leaking resources allocated earlier in the function.
+
+Rework the failure path to use staged local unwind labels and free
+allocated resources in reverse order before returning -ENOMEM. This
+matches common netdev allocation cleanup style.
+
+Fixes: d72e01a0430f ("ftgmac100: Use a scratch buffer for failed RX allocations")
+Cc: stable@vger.kernel.org
+Signed-off-by: Yufan Chen <yufan.chen@linux.dev>
+Link: https://patch.msgid.link/20260328163257.60836-1-yufan.chen@linux.dev
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/net/ethernet/faraday/ftgmac100.c | 28 ++++++++++++++++++++----
+ 1 file changed, 24 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/ethernet/faraday/ftgmac100.c b/drivers/net/ethernet/faraday/ftgmac100.c
+index a863f7841210..06ee7af7fdb9 100644
+--- a/drivers/net/ethernet/faraday/ftgmac100.c
++++ b/drivers/net/ethernet/faraday/ftgmac100.c
+@@ -964,19 +964,19 @@ static int ftgmac100_alloc_rings(struct ftgmac100 *priv)
+ 	priv->tx_skbs = kcalloc(MAX_TX_QUEUE_ENTRIES, sizeof(void *),
+ 				GFP_KERNEL);
+ 	if (!priv->tx_skbs)
+-		return -ENOMEM;
++		goto err_free_rx_skbs;
+ 
+ 	/* Allocate descriptors */
+ 	priv->rxdes = dma_alloc_coherent(priv->dev,
+ 					 MAX_RX_QUEUE_ENTRIES * sizeof(struct ftgmac100_rxdes),
+ 					 &priv->rxdes_dma, GFP_KERNEL);
+ 	if (!priv->rxdes)
+-		return -ENOMEM;
++		goto err_free_tx_skbs;
+ 	priv->txdes = dma_alloc_coherent(priv->dev,
+ 					 MAX_TX_QUEUE_ENTRIES * sizeof(struct ftgmac100_txdes),
+ 					 &priv->txdes_dma, GFP_KERNEL);
+ 	if (!priv->txdes)
+-		return -ENOMEM;
++		goto err_free_rxdes;
+ 
+ 	/* Allocate scratch packet buffer */
+ 	priv->rx_scratch = dma_alloc_coherent(priv->dev,
+@@ -984,9 +984,29 @@ static int ftgmac100_alloc_rings(struct ftgmac100 *priv)
+ 					      &priv->rx_scratch_dma,
+ 					      GFP_KERNEL);
+ 	if (!priv->rx_scratch)
+-		return -ENOMEM;
++		goto err_free_txdes;
+ 
+ 	return 0;
++
++err_free_txdes:
++	dma_free_coherent(priv->dev,
++			  MAX_TX_QUEUE_ENTRIES *
++			  sizeof(struct ftgmac100_txdes),
++			  priv->txdes, priv->txdes_dma);
++	priv->txdes = NULL;
++err_free_rxdes:
++	dma_free_coherent(priv->dev,
++			  MAX_RX_QUEUE_ENTRIES *
++			  sizeof(struct ftgmac100_rxdes),
++			  priv->rxdes, priv->rxdes_dma);
++	priv->rxdes = NULL;
++err_free_tx_skbs:
++	kfree(priv->tx_skbs);
++	priv->tx_skbs = NULL;
++err_free_rx_skbs:
++	kfree(priv->rx_skbs);
++	priv->rx_skbs = NULL;
++	return -ENOMEM;
+ }
+ 
+ static void ftgmac100_init_rings(struct ftgmac100 *priv)
+-- 
+2.51.0
+

@@ -1,0 +1,97 @@
+From: Alice Ryhl <aliceryhl@google.com>
+Date: Sat, 14 Mar 2026 11:19:51 +0000
+Subject: [PATCH] rust_binder: use AssertSync for BINDER_VM_OPS
+References: bsc#1258210
+Patch-mainline: 6.18.22
+Git-commit: ec327abae5edd1d5b60ea9f920212970133171d2
+
+commit ec327abae5edd1d5b60ea9f920212970133171d2 upstream.
+
+When declaring an immutable global variable in Rust, the compiler checks
+that it looks thread safe, because it is generally safe to access said
+global variable. When using C bindings types for these globals, we don't
+really want this check, because it is conservative and assumes pointers
+are not thread safe.
+
+In the case of BINDER_VM_OPS, this is a challenge when combined with the
+patch 'userfaultfd: introduce vm_uffd_ops' [1], which introduces a
+pointer field to vm_operations_struct. It previously only held function
+pointers, which are considered thread safe.
+
+Rust Binder should not be assuming that vm_operations_struct contains no
+pointer fields, so to fix this, use AssertSync (which Rust Binder has
+already declared for another similar global of type struct
+file_operations with the same problem). This ensures that even if
+another commit adds a pointer field to vm_operations_struct, this does
+not cause problems.
+
+Fixes: 8ef2c15aeae0 ("rust_binder: check ownership before using vma")
+Cc: stable <stable@kernel.org>
+Reported-by: kernel test robot <lkp@intel.com>
+Closes: https://lore.kernel.org/oe-kbuild-all/202603121235.tpnRxFKO-lkp@intel.com/
+Link: https://lore.kernel.org/r/20260306171815.3160826-8-rppt@kernel.org [1]
+Signed-off-by: Alice Ryhl <aliceryhl@google.com>
+Reviewed-by: Gary Guo <gary@garyguo.net>
+Link: https://patch.msgid.link/20260314111951.4139029-1-aliceryhl@google.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/android/binder/page_range.rs       | 8 +++++---
+ drivers/android/binder/rust_binder_main.rs | 2 +-
+ 2 files changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/android/binder/page_range.rs b/drivers/android/binder/page_range.rs
+index 67aae783e8b8..3d5bfaeda4a3 100644
+--- a/drivers/android/binder/page_range.rs
++++ b/drivers/android/binder/page_range.rs
+@@ -13,6 +13,8 @@
+ //
+ // The shrinker will use trylock methods because it locks them in a different order.
+ 
++use crate::AssertSync;
++
+ use core::{
+     marker::PhantomPinned,
+     mem::{size_of, size_of_val, MaybeUninit},
+@@ -143,14 +145,14 @@ pub(crate) struct ShrinkablePageRange {
+ }
+ 
+ // We do not define any ops. For now, used only to check identity of vmas.
+-static BINDER_VM_OPS: bindings::vm_operations_struct = pin_init::zeroed();
++static BINDER_VM_OPS: AssertSync<bindings::vm_operations_struct> = AssertSync(pin_init::zeroed());
+ 
+ // To ensure that we do not accidentally install pages into or zap pages from the wrong vma, we
+ // check its vm_ops and private data before using it.
+ fn check_vma(vma: &virt::VmaRef, owner: *const ShrinkablePageRange) -> Option<&virt::VmaMixedMap> {
+     // SAFETY: Just reading the vm_ops pointer of any active vma is safe.
+     let vm_ops = unsafe { (*vma.as_ptr()).vm_ops };
+-    if !ptr::eq(vm_ops, &BINDER_VM_OPS) {
++    if !ptr::eq(vm_ops, &BINDER_VM_OPS.0) {
+         return None;
+     }
+ 
+@@ -342,7 +344,7 @@ pub(crate) fn register_with_vma(&self, vma: &virt::VmaNew) -> Result<usize> {
+ 
+         // SAFETY: We own the vma, and we don't use any methods on VmaNew that rely on
+         // `vm_ops`.
+-        unsafe { (*vma.as_ptr()).vm_ops = &BINDER_VM_OPS };
++        unsafe { (*vma.as_ptr()).vm_ops = &BINDER_VM_OPS.0 };
+ 
+         Ok(num_pages)
+     }
+diff --git a/drivers/android/binder/rust_binder_main.rs b/drivers/android/binder/rust_binder_main.rs
+index 6773b7c273ec..2b04e83835f6 100644
+--- a/drivers/android/binder/rust_binder_main.rs
++++ b/drivers/android/binder/rust_binder_main.rs
+@@ -300,7 +300,7 @@ fn init(_module: &'static kernel::ThisModule) -> Result<Self> {
+ /// Makes the inner type Sync.
+ #[repr(transparent)]
+ pub struct AssertSync<T>(T);
+-// SAFETY: Used only to insert `file_operations` into a global, which is safe.
++// SAFETY: Used only to insert C bindings types into globals, which is safe.
+ unsafe impl<T> Sync for AssertSync<T> {}
+ 
+ /// File operations that rust_binderfs.c can use.
+-- 
+2.51.0
+

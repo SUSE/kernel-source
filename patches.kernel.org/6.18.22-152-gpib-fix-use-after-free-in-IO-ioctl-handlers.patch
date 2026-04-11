@@ -1,0 +1,280 @@
+From: Adam Crosser <adam.crosser@praetorian.com>
+Date: Tue, 17 Mar 2026 19:25:28 +0700
+Subject: [PATCH] gpib: fix use-after-free in IO ioctl handlers
+References: bsc#1258210
+Patch-mainline: 6.18.22
+Git-commit: d1857f8296dceb75d00ab857fc3c61bc00c7f5c6
+
+commit d1857f8296dceb75d00ab857fc3c61bc00c7f5c6 upstream.
+
+The IBRD, IBWRT, IBCMD, and IBWAIT ioctl handlers use a gpib_descriptor
+pointer after board->big_gpib_mutex has been released.  A concurrent
+IBCLOSEDEV ioctl can free the descriptor via close_dev_ioctl() during
+this window, causing a use-after-free.
+
+The IO handlers (read_ioctl, write_ioctl, command_ioctl) explicitly
+release big_gpib_mutex before calling their handler.  wait_ioctl() is
+called with big_gpib_mutex held, but ibwait() releases it internally
+when wait_mask is non-zero.  In all four cases, the descriptor pointer
+obtained from handle_to_descriptor() becomes unprotected.
+
+Fix this by introducing a kernel-only descriptor_busy reference count
+in struct gpib_descriptor.  Each handler atomically increments
+descriptor_busy under file_priv->descriptors_mutex before releasing the
+lock, and decrements it when done.  close_dev_ioctl() checks
+descriptor_busy under the same lock and rejects the close with -EBUSY
+if the count is non-zero.
+
+A reference count rather than a simple flag is necessary because
+multiple handlers can operate on the same descriptor concurrently
+(e.g. IBRD and IBWAIT on the same handle from different threads).
+
+A separate counter is needed because io_in_progress can be cleared from
+unprivileged userspace via the IBWAIT ioctl (through general_ibstatus()
+with set_mask containing CMPL), which would allow an attacker to bypass
+a check based solely on io_in_progress.  The new descriptor_busy
+counter is only modified by the kernel IO paths.
+
+The lock ordering is consistent (big_gpib_mutex -> descriptors_mutex)
+and the handlers only hold descriptors_mutex briefly during the lookup,
+so there is no deadlock risk and no impact on IO throughput.
+
+Signed-off-by: Adam Crosser <adam.crosser@praetorian.com>
+Cc: stable <stable@kernel.org>
+Reviewed-by: Dave Penkler <dpenkler@gmail.com>
+Tested-by: Dave Penkler <dpenkler@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/staging/gpib/common/gpib_os.c     | 96 +++++++++++++++++------
+ drivers/staging/gpib/include/gpib_types.h |  8 ++
+ 2 files changed, 81 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/staging/gpib/common/gpib_os.c b/drivers/staging/gpib/common/gpib_os.c
+index 9dbbac8b8436..baa2fea5ebf7 100644
+--- a/drivers/staging/gpib/common/gpib_os.c
++++ b/drivers/staging/gpib/common/gpib_os.c
+@@ -888,10 +888,6 @@ static int read_ioctl(struct gpib_file_private *file_priv, struct gpib_board *bo
+ 	if (read_cmd.completed_transfer_count > read_cmd.requested_transfer_count)
+ 		return -EINVAL;
+ 
+-	desc = handle_to_descriptor(file_priv, read_cmd.handle);
+-	if (!desc)
+-		return -EINVAL;
+-
+ 	if (WARN_ON_ONCE(sizeof(userbuf) > sizeof(read_cmd.buffer_ptr)))
+ 		return -EFAULT;
+ 
+@@ -904,6 +900,17 @@ static int read_ioctl(struct gpib_file_private *file_priv, struct gpib_board *bo
+ 	if (!access_ok(userbuf, remain))
+ 		return -EFAULT;
+ 
++	/* Lock descriptors to prevent concurrent close from freeing descriptor */
++	if (mutex_lock_interruptible(&file_priv->descriptors_mutex))
++		return -ERESTARTSYS;
++	desc = handle_to_descriptor(file_priv, read_cmd.handle);
++	if (!desc) {
++		mutex_unlock(&file_priv->descriptors_mutex);
++		return -EINVAL;
++	}
++	atomic_inc(&desc->descriptor_busy);
++	mutex_unlock(&file_priv->descriptors_mutex);
++
+ 	atomic_set(&desc->io_in_progress, 1);
+ 
+ 	/* Read buffer loads till we fill the user supplied buffer */
+@@ -937,6 +944,7 @@ static int read_ioctl(struct gpib_file_private *file_priv, struct gpib_board *bo
+ 		retval = copy_to_user((void __user *)arg, &read_cmd, sizeof(read_cmd));
+ 
+ 	atomic_set(&desc->io_in_progress, 0);
++	atomic_dec(&desc->descriptor_busy);
+ 
+ 	wake_up_interruptible(&board->wait);
+ 	if (retval)
+@@ -964,10 +972,6 @@ static int command_ioctl(struct gpib_file_private *file_priv,
+ 	if (cmd.completed_transfer_count > cmd.requested_transfer_count)
+ 		return -EINVAL;
+ 
+-	desc = handle_to_descriptor(file_priv, cmd.handle);
+-	if (!desc)
+-		return -EINVAL;
+-
+ 	userbuf = (u8 __user *)(unsigned long)cmd.buffer_ptr;
+ 	userbuf += cmd.completed_transfer_count;
+ 
+@@ -980,6 +984,17 @@ static int command_ioctl(struct gpib_file_private *file_priv,
+ 	if (!access_ok(userbuf, remain))
+ 		return -EFAULT;
+ 
++	/* Lock descriptors to prevent concurrent close from freeing descriptor */
++	if (mutex_lock_interruptible(&file_priv->descriptors_mutex))
++		return -ERESTARTSYS;
++	desc = handle_to_descriptor(file_priv, cmd.handle);
++	if (!desc) {
++		mutex_unlock(&file_priv->descriptors_mutex);
++		return -EINVAL;
++	}
++	atomic_inc(&desc->descriptor_busy);
++	mutex_unlock(&file_priv->descriptors_mutex);
++
+ 	/*
+ 	 * Write buffer loads till we empty the user supplied buffer.
+ 	 * Call drivers at least once, even if remain is zero, in
+@@ -1003,6 +1018,7 @@ static int command_ioctl(struct gpib_file_private *file_priv,
+ 		userbuf += bytes_written;
+ 		if (retval < 0) {
+ 			atomic_set(&desc->io_in_progress, 0);
++			atomic_dec(&desc->descriptor_busy);
+ 
+ 			wake_up_interruptible(&board->wait);
+ 			break;
+@@ -1022,6 +1038,7 @@ static int command_ioctl(struct gpib_file_private *file_priv,
+ 	 */
+ 	if (!no_clear_io_in_prog || fault)
+ 		atomic_set(&desc->io_in_progress, 0);
++	atomic_dec(&desc->descriptor_busy);
+ 
+ 	wake_up_interruptible(&board->wait);
+ 	if (fault)
+@@ -1047,10 +1064,6 @@ static int write_ioctl(struct gpib_file_private *file_priv, struct gpib_board *b
+ 	if (write_cmd.completed_transfer_count > write_cmd.requested_transfer_count)
+ 		return -EINVAL;
+ 
+-	desc = handle_to_descriptor(file_priv, write_cmd.handle);
+-	if (!desc)
+-		return -EINVAL;
+-
+ 	userbuf = (u8 __user *)(unsigned long)write_cmd.buffer_ptr;
+ 	userbuf += write_cmd.completed_transfer_count;
+ 
+@@ -1060,6 +1073,17 @@ static int write_ioctl(struct gpib_file_private *file_priv, struct gpib_board *b
+ 	if (!access_ok(userbuf, remain))
+ 		return -EFAULT;
+ 
++	/* Lock descriptors to prevent concurrent close from freeing descriptor */
++	if (mutex_lock_interruptible(&file_priv->descriptors_mutex))
++		return -ERESTARTSYS;
++	desc = handle_to_descriptor(file_priv, write_cmd.handle);
++	if (!desc) {
++		mutex_unlock(&file_priv->descriptors_mutex);
++		return -EINVAL;
++	}
++	atomic_inc(&desc->descriptor_busy);
++	mutex_unlock(&file_priv->descriptors_mutex);
++
+ 	atomic_set(&desc->io_in_progress, 1);
+ 
+ 	/* Write buffer loads till we empty the user supplied buffer */
+@@ -1094,6 +1118,7 @@ static int write_ioctl(struct gpib_file_private *file_priv, struct gpib_board *b
+ 		fault = copy_to_user((void __user *)arg, &write_cmd, sizeof(write_cmd));
+ 
+ 	atomic_set(&desc->io_in_progress, 0);
++	atomic_dec(&desc->descriptor_busy);
+ 
+ 	wake_up_interruptible(&board->wait);
+ 	if (fault)
+@@ -1276,6 +1301,9 @@ static int close_dev_ioctl(struct file *filep, struct gpib_board *board, unsigne
+ {
+ 	struct gpib_close_dev_ioctl cmd;
+ 	struct gpib_file_private *file_priv = filep->private_data;
++	struct gpib_descriptor *desc;
++	unsigned int pad;
++	int sad;
+ 	int retval;
+ 
+ 	retval = copy_from_user(&cmd, (void __user *)arg, sizeof(cmd));
+@@ -1284,19 +1312,27 @@ static int close_dev_ioctl(struct file *filep, struct gpib_board *board, unsigne
+ 
+ 	if (cmd.handle >= GPIB_MAX_NUM_DESCRIPTORS)
+ 		return -EINVAL;
+-	if (!file_priv->descriptors[cmd.handle])
+-		return -EINVAL;
+ 
+-	retval = decrement_open_device_count(board, &board->device_list,
+-					     file_priv->descriptors[cmd.handle]->pad,
+-					     file_priv->descriptors[cmd.handle]->sad);
+-	if (retval < 0)
+-		return retval;
+-
+-	kfree(file_priv->descriptors[cmd.handle]);
++	mutex_lock(&file_priv->descriptors_mutex);
++	desc = file_priv->descriptors[cmd.handle];
++	if (!desc) {
++		mutex_unlock(&file_priv->descriptors_mutex);
++		return -EINVAL;
++	}
++	if (atomic_read(&desc->descriptor_busy)) {
++		mutex_unlock(&file_priv->descriptors_mutex);
++		return -EBUSY;
++	}
++	/* Remove from table while holding lock to prevent new IO from starting */
+ 	file_priv->descriptors[cmd.handle] = NULL;
++	pad = desc->pad;
++	sad = desc->sad;
++	mutex_unlock(&file_priv->descriptors_mutex);
+ 
+-	return 0;
++	retval = decrement_open_device_count(board, &board->device_list, pad, sad);
++
++	kfree(desc);
++	return retval;
+ }
+ 
+ static int serial_poll_ioctl(struct gpib_board *board, unsigned long arg)
+@@ -1331,12 +1367,25 @@ static int wait_ioctl(struct gpib_file_private *file_priv, struct gpib_board *bo
+ 	if (retval)
+ 		return -EFAULT;
+ 
++	/*
++	 * Lock descriptors to prevent concurrent close from freeing
++	 * descriptor.  ibwait() releases big_gpib_mutex when wait_mask
++	 * is non-zero, so desc must be pinned with descriptor_busy.
++	 */
++	mutex_lock(&file_priv->descriptors_mutex);
+ 	desc = handle_to_descriptor(file_priv, wait_cmd.handle);
+-	if (!desc)
++	if (!desc) {
++		mutex_unlock(&file_priv->descriptors_mutex);
+ 		return -EINVAL;
++	}
++	atomic_inc(&desc->descriptor_busy);
++	mutex_unlock(&file_priv->descriptors_mutex);
+ 
+ 	retval = ibwait(board, wait_cmd.wait_mask, wait_cmd.clear_mask,
+ 			wait_cmd.set_mask, &wait_cmd.ibsta, wait_cmd.usec_timeout, desc);
++
++	atomic_dec(&desc->descriptor_busy);
++
+ 	if (retval < 0)
+ 		return retval;
+ 
+@@ -2035,6 +2084,7 @@ void init_gpib_descriptor(struct gpib_descriptor *desc)
+ 	desc->is_board = 0;
+ 	desc->autopoll_enabled = 0;
+ 	atomic_set(&desc->io_in_progress, 0);
++	atomic_set(&desc->descriptor_busy, 0);
+ }
+ 
+ int gpib_register_driver(struct gpib_interface *interface, struct module *provider_module)
+diff --git a/drivers/staging/gpib/include/gpib_types.h b/drivers/staging/gpib/include/gpib_types.h
+index 998abb379749..f9b5be1dc366 100644
+--- a/drivers/staging/gpib/include/gpib_types.h
++++ b/drivers/staging/gpib/include/gpib_types.h
+@@ -364,6 +364,14 @@ struct gpib_descriptor {
+ 	unsigned int pad;	/* primary gpib address */
+ 	int sad;	/* secondary gpib address (negative means disabled) */
+ 	atomic_t io_in_progress;
++	/*
++	 * Kernel-only reference count to prevent descriptor from being
++	 * freed while IO handlers hold a pointer to it.  Incremented
++	 * before each IO operation, decremented when done.  Unlike
++	 * io_in_progress, this cannot be modified from userspace via
++	 * general_ibstatus().
++	 */
++	atomic_t descriptor_busy;
+ 	unsigned is_board : 1;
+ 	unsigned autopoll_enabled : 1;
+ };
+-- 
+2.51.0
+
