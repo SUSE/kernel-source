@@ -1,0 +1,160 @@
+From: Pablo Neira Ayuso <pablo@netfilter.org>
+Date: Wed, 25 Mar 2026 22:39:55 +0100
+Subject: [PATCH] netfilter: nf_conntrack_expect: store netns and zone in
+ expectation
+References: bsc#1258210
+Patch-mainline: 6.18.22
+Git-commit: 02a3231b6d82efe750da6554ebf280e4a6f78756
+
+[ Upstream commit 02a3231b6d82efe750da6554ebf280e4a6f78756 ]
+
+__nf_ct_expect_find() and nf_ct_expect_find_get() are called under
+rcu_read_lock() but they dereference the master conntrack via
+exp->master.
+
+Since the expectation does not hold a reference on the master conntrack,
+this could be dying conntrack or different recycled conntrack than the
+real master due to SLAB_TYPESAFE_RCU.
+
+Store the netns, the master_tuple and the zone in struct
+nf_conntrack_expect as a safety measure.
+
+This patch is required by the follow up fix not to dump expectations
+that do not belong to this netns.
+
+Signed-off-by: Florian Westphal <fw@strlen.de>
+Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+Stable-dep-of: 917b61fa2042 ("netfilter: ctnetlink: ignore explicit helper on new expectations")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ include/net/netfilter/nf_conntrack_expect.h | 18 +++++++++++++++++-
+ net/netfilter/nf_conntrack_broadcast.c      |  6 +++++-
+ net/netfilter/nf_conntrack_expect.c         |  9 +++++++--
+ net/netfilter/nf_conntrack_netlink.c        |  5 +++++
+ 4 files changed, 34 insertions(+), 4 deletions(-)
+
+diff --git a/include/net/netfilter/nf_conntrack_expect.h b/include/net/netfilter/nf_conntrack_expect.h
+index 1b01400b10bd..e9a8350e7ccf 100644
+--- a/include/net/netfilter/nf_conntrack_expect.h
++++ b/include/net/netfilter/nf_conntrack_expect.h
+@@ -22,10 +22,16 @@ struct nf_conntrack_expect {
+ 	/* Hash member */
+ 	struct hlist_node hnode;
+ 
++	/* Network namespace */
++	possible_net_t net;
++
+ 	/* We expect this tuple, with the following mask */
+ 	struct nf_conntrack_tuple tuple;
+ 	struct nf_conntrack_tuple_mask mask;
+ 
++#ifdef CONFIG_NF_CONNTRACK_ZONES
++	struct nf_conntrack_zone zone;
++#endif
+ 	/* Usage count. */
+ 	refcount_t use;
+ 
+@@ -62,7 +68,17 @@ struct nf_conntrack_expect {
+ 
+ static inline struct net *nf_ct_exp_net(struct nf_conntrack_expect *exp)
+ {
+-	return nf_ct_net(exp->master);
++	return read_pnet(&exp->net);
++}
++
++static inline bool nf_ct_exp_zone_equal_any(const struct nf_conntrack_expect *a,
++					    const struct nf_conntrack_zone *b)
++{
++#ifdef CONFIG_NF_CONNTRACK_ZONES
++	return a->zone.id == b->id;
++#else
++	return true;
++#endif
+ }
+ 
+ #define NF_CT_EXP_POLICY_NAME_LEN	16
+diff --git a/net/netfilter/nf_conntrack_broadcast.c b/net/netfilter/nf_conntrack_broadcast.c
+index 1964c596c646..4f39bf7c843f 100644
+--- a/net/netfilter/nf_conntrack_broadcast.c
++++ b/net/netfilter/nf_conntrack_broadcast.c
+@@ -21,6 +21,7 @@ int nf_conntrack_broadcast_help(struct sk_buff *skb,
+ 				unsigned int timeout)
+ {
+ 	const struct nf_conntrack_helper *helper;
++	struct net *net = read_pnet(&ct->ct_net);
+ 	struct nf_conntrack_expect *exp;
+ 	struct iphdr *iph = ip_hdr(skb);
+ 	struct rtable *rt = skb_rtable(skb);
+@@ -71,7 +72,10 @@ int nf_conntrack_broadcast_help(struct sk_buff *skb,
+ 	exp->flags                = NF_CT_EXPECT_PERMANENT;
+ 	exp->class		  = NF_CT_EXPECT_CLASS_DEFAULT;
+ 	rcu_assign_pointer(exp->helper, helper);
+-
++	write_pnet(&exp->net, net);
++#ifdef CONFIG_NF_CONNTRACK_ZONES
++	exp->zone = ct->zone;
++#endif
+ 	nf_ct_expect_related(exp, 0);
+ 	nf_ct_expect_put(exp);
+ 
+diff --git a/net/netfilter/nf_conntrack_expect.c b/net/netfilter/nf_conntrack_expect.c
+index b37ff73efb3e..2234c444a320 100644
+--- a/net/netfilter/nf_conntrack_expect.c
++++ b/net/netfilter/nf_conntrack_expect.c
+@@ -112,8 +112,8 @@ nf_ct_exp_equal(const struct nf_conntrack_tuple *tuple,
+ 		const struct net *net)
+ {
+ 	return nf_ct_tuple_mask_cmp(tuple, &i->tuple, &i->mask) &&
+-	       net_eq(net, nf_ct_net(i->master)) &&
+-	       nf_ct_zone_equal_any(i->master, zone);
++	       net_eq(net, read_pnet(&i->net)) &&
++	       nf_ct_exp_zone_equal_any(i, zone);
+ }
+ 
+ bool nf_ct_remove_expect(struct nf_conntrack_expect *exp)
+@@ -321,6 +321,7 @@ void nf_ct_expect_init(struct nf_conntrack_expect *exp, unsigned int class,
+ {
+ 	struct nf_conntrack_helper *helper = NULL;
+ 	struct nf_conn *ct = exp->master;
++	struct net *net = read_pnet(&ct->ct_net);
+ 	struct nf_conn_help *help;
+ 	int len;
+ 
+@@ -338,6 +339,10 @@ void nf_ct_expect_init(struct nf_conntrack_expect *exp, unsigned int class,
+ 		helper = rcu_dereference(help->helper);
+ 
+ 	rcu_assign_pointer(exp->helper, helper);
++	write_pnet(&exp->net, net);
++#ifdef CONFIG_NF_CONNTRACK_ZONES
++	exp->zone = ct->zone;
++#endif
+ 	exp->tuple.src.l3num = family;
+ 	exp->tuple.dst.protonum = proto;
+ 
+diff --git a/net/netfilter/nf_conntrack_netlink.c b/net/netfilter/nf_conntrack_netlink.c
+index f00afa664837..8c5ae0665eaa 100644
+--- a/net/netfilter/nf_conntrack_netlink.c
++++ b/net/netfilter/nf_conntrack_netlink.c
+@@ -3521,6 +3521,7 @@ ctnetlink_alloc_expect(const struct nlattr * const cda[], struct nf_conn *ct,
+ 		       struct nf_conntrack_tuple *tuple,
+ 		       struct nf_conntrack_tuple *mask)
+ {
++	struct net *net = read_pnet(&ct->ct_net);
+ 	struct nf_conntrack_expect *exp;
+ 	struct nf_conn_help *help;
+ 	u32 class = 0;
+@@ -3560,6 +3561,10 @@ ctnetlink_alloc_expect(const struct nlattr * const cda[], struct nf_conn *ct,
+ 
+ 	exp->class = class;
+ 	exp->master = ct;
++	write_pnet(&exp->net, net);
++#ifdef CONFIG_NF_CONNTRACK_ZONES
++	exp->zone = ct->zone;
++#endif
+ 	if (!helper)
+ 		helper = rcu_dereference(help->helper);
+ 	rcu_assign_pointer(exp->helper, helper);
+-- 
+2.51.0
+
