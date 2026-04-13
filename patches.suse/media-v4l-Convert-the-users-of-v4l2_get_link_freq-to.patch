@@ -1,0 +1,360 @@
+From e7bad98c205d17c745de9d83ebf73e53cbf99d48 Mon Sep 17 00:00:00 2001
+From: Sakari Ailus <sakari.ailus@linux.intel.com>
+Date: Mon, 16 Dec 2024 11:25:31 +0200
+Subject: [PATCH] media: v4l: Convert the users of v4l2_get_link_freq to call
+ it on a pad
+Git-commit: e7bad98c205d17c745de9d83ebf73e53cbf99d48
+References: jsc#PED-14445
+Patch-mainline: v6.15-rc1
+
+Call v4l2_get_link_freq() on a pad, instead of a control handler. This way
+we can soon convert v4l2_get_link_freq() to be callable only on a pad and
+remove the compatibility code.
+
+Signed-off-by: Sakari Ailus <sakari.ailus@linux.intel.com>
+Acked-by: Naushir Patuck <naush@raspberrypi.com> # rp1-cfe
+Acked-by: Benjamin Mugnier <benjamin.mugnier@foss.st.com> # st-mipid02
+Reviewed-by: Tomi Valkeinen <tomi.valkeinen@ideasonboard.com>
+Signed-off-by: Hans Verkuil <hverkuil@xs4all.nl>
+Signed-off-by: Oliver Neukum <oneukum@suse.com>
+
+---
+ drivers/media/i2c/st-mipid02.c                     |    5 ++-
+ drivers/media/i2c/tc358746.c                       |    4 ++-
+ drivers/media/pci/intel/ipu3/ipu3-cio2.c           |   11 ++++++--
+ drivers/media/platform/cadence/cdns-csi2rx.c       |    4 ++-
+ drivers/media/platform/nxp/imx-mipi-csis.c         |    5 ++-
+ drivers/media/platform/nxp/imx8mq-mipi-csi2.c      |   11 +++++++-
+ drivers/media/platform/qcom/camss/camss-vfe-gen1.c |    9 +++----
+ drivers/media/platform/qcom/camss/camss-vfe.c      |    9 +++----
+ drivers/media/platform/qcom/camss/camss.c          |   27 +++++++++------------
+ drivers/media/platform/qcom/camss/camss.h          |    2 -
+ drivers/media/platform/raspberrypi/rp1-cfe/cfe.c   |    4 ++-
+ drivers/media/platform/ti/cal/cal-camerarx.c       |    3 +-
+ drivers/media/platform/ti/cal/cal.c                |    4 ++-
+ drivers/media/platform/ti/cal/cal.h                |    1 
+ 14 files changed, 61 insertions(+), 38 deletions(-)
+
+--- a/drivers/media/i2c/st-mipid02.c
++++ b/drivers/media/i2c/st-mipid02.c
+@@ -307,8 +307,9 @@ static int mipid02_detect(struct mipid02
+ static int mipid02_configure_from_rx_speed(struct mipid02_dev *bridge,
+ 					   struct v4l2_mbus_framefmt *fmt)
+ {
++	struct media_pad *remote =
++		&bridge->s_subdev->entity.pads[bridge->s_subdev_pad_id];
+ 	struct i2c_client *client = bridge->i2c_client;
+-	struct v4l2_subdev *subdev = bridge->s_subdev;
+ 	struct v4l2_fwnode_endpoint *ep = &bridge->rx;
+ 	u32 bpp = bpp_from_code(fmt->code);
+ 	/*
+@@ -318,7 +319,7 @@ static int mipid02_configure_from_rx_spe
+ 	u64 ui_4 = 2000000000;
+ 	s64 link_freq;
+ 
+-	link_freq = v4l2_get_link_freq(subdev->ctrl_handler, bpp,
++	link_freq = v4l2_get_link_freq(remote, bpp,
+ 				       2 * ep->bus.mipi_csi2.num_data_lanes);
+ 	if (link_freq < 0) {
+ 		dev_err(&client->dev, "Failed to get link frequency");
+--- a/drivers/media/i2c/tc358746.c
++++ b/drivers/media/i2c/tc358746.c
+@@ -896,6 +896,7 @@ tc358746_link_validate(struct v4l2_subde
+ 	const struct tc358746_format *fmt;
+ 	unsigned int fifo_sz, tmp, n;
+ 	struct v4l2_subdev *source;
++	struct media_pad *src_pad;
+ 	s64 source_link_freq;
+ 	int err;
+ 
+@@ -910,7 +911,8 @@ tc358746_link_validate(struct v4l2_subde
+ 	fmt = tc358746_get_format_by_code(TC358746_SINK, mbusfmt->code);
+ 
+ 	source = media_entity_to_v4l2_subdev(link->source->entity);
+-	source_link_freq = v4l2_get_link_freq(source->ctrl_handler, 0, 0);
++	src_pad = &source->entity.pads[source_fmt->pad];
++	source_link_freq = v4l2_get_link_freq(src_pad, 0, 0);
+ 	if (source_link_freq <= 0) {
+ 		dev_err(tc358746->sd.dev,
+ 			"Failed to query or invalid source link frequency\n");
+--- a/drivers/media/pci/intel/ipu3/ipu3-cio2.c
++++ b/drivers/media/pci/intel/ipu3/ipu3-cio2.c
+@@ -309,12 +309,17 @@ static int cio2_csi2_calc_timing(struct
+ 				 unsigned int bpp, unsigned int lanes)
+ {
+ 	struct device *dev = &cio2->pci_dev->dev;
++	struct media_pad *src_pad;
+ 	s64 freq;
+ 
+-	if (!q->sensor)
+-		return -ENODEV;
++	src_pad = media_entity_remote_source_pad_unique(&q->subdev.entity);
++	if (IS_ERR(src_pad)) {
++		dev_err(dev, "can't get source pad of %s (%ld)\n",
++			q->subdev.name, PTR_ERR(src_pad));
++		return PTR_ERR(src_pad);
++	}
+ 
+-	freq = v4l2_get_link_freq(q->sensor->ctrl_handler, bpp, lanes * 2);
++	freq = v4l2_get_link_freq(src_pad, bpp, lanes * 2);
+ 	if (freq < 0) {
+ 		dev_err(dev, "error %lld, invalid link_freq\n", freq);
+ 		return freq;
+--- a/drivers/media/platform/cadence/cdns-csi2rx.c
++++ b/drivers/media/platform/cadence/cdns-csi2rx.c
+@@ -164,6 +164,8 @@ static void csi2rx_reset(struct csi2rx_p
+ 
+ static int csi2rx_configure_ext_dphy(struct csi2rx_priv *csi2rx)
+ {
++	struct media_pad *src_pad =
++		&csi2rx->source_subdev->entity.pads[csi2rx->source_pad];
+ 	union phy_configure_opts opts = { };
+ 	struct phy_configure_opts_mipi_dphy *cfg = &opts.mipi_dphy;
+ 	struct v4l2_subdev_format sd_fmt = {
+@@ -181,7 +183,7 @@ static int csi2rx_configure_ext_dphy(str
+ 
+ 	fmt = csi2rx_get_fmt_by_code(sd_fmt.format.code);
+ 
+-	link_freq = v4l2_get_link_freq(csi2rx->source_subdev->ctrl_handler,
++	link_freq = v4l2_get_link_freq(src_pad,
+ 				       fmt->bpp, 2 * csi2rx->num_lanes);
+ 	if (link_freq < 0)
+ 		return link_freq;
+--- a/drivers/media/platform/nxp/imx-mipi-csis.c
++++ b/drivers/media/platform/nxp/imx-mipi-csis.c
+@@ -597,12 +597,13 @@ static void __mipi_csis_set_format(struc
+ static int mipi_csis_calculate_params(struct mipi_csis_device *csis,
+ 				      const struct csis_pix_format *csis_fmt)
+ {
++	struct media_pad *src_pad =
++		&csis->source.sd->entity.pads[csis->source.pad->index];
+ 	s64 link_freq;
+ 	u32 lane_rate;
+ 
+ 	/* Calculate the line rate from the pixel rate. */
+-	link_freq = v4l2_get_link_freq(csis->source.sd->ctrl_handler,
+-				       csis_fmt->width,
++	link_freq = v4l2_get_link_freq(src_pad, csis_fmt->width,
+ 				       csis->bus.num_data_lanes * 2);
+ 	if (link_freq < 0) {
+ 		dev_err(csis->dev, "Unable to obtain link frequency: %d\n",
+--- a/drivers/media/platform/nxp/imx8mq-mipi-csi2.c
++++ b/drivers/media/platform/nxp/imx8mq-mipi-csi2.c
+@@ -287,6 +287,7 @@ static int imx8mq_mipi_csi_calc_hs_settl
+ 					  struct v4l2_subdev_state *sd_state,
+ 					  u32 *hs_settle)
+ {
++	struct media_pad *src_pad;
+ 	s64 link_freq;
+ 	u32 lane_rate;
+ 	unsigned long esc_clk_rate;
+@@ -294,13 +295,19 @@ static int imx8mq_mipi_csi_calc_hs_settl
+ 	const struct v4l2_mbus_framefmt *fmt;
+ 	const struct csi2_pix_format *csi2_fmt;
+ 
++	src_pad = media_entity_remote_source_pad_unique(&sd_state->sd->entity);
++	if (IS_ERR(src_pad)) {
++		dev_err(state->dev, "can't get source pad of %s (%ld)\n",
++			sd_state->sd->name, PTR_ERR(src_pad));
++		return PTR_ERR(src_pad);
++	}
++
+ 	/* Calculate the line rate from the pixel rate. */
+ 
+ 	fmt = v4l2_subdev_state_get_format(sd_state, MIPI_CSI2_PAD_SINK);
+ 	csi2_fmt = find_csi2_format(fmt->code);
+ 
+-	link_freq = v4l2_get_link_freq(state->src_sd->ctrl_handler,
+-				       csi2_fmt->width,
++	link_freq = v4l2_get_link_freq(src_pad, csi2_fmt->width,
+ 				       state->bus.num_data_lanes * 2);
+ 	if (link_freq < 0) {
+ 		dev_err(state->dev, "Unable to obtain link frequency: %d\n",
+--- a/drivers/media/platform/qcom/camss/camss-vfe-gen1.c
++++ b/drivers/media/platform/qcom/camss/camss-vfe-gen1.c
+@@ -170,7 +170,7 @@ static int vfe_enable_output(struct vfe_
+ 	struct vfe_device *vfe = to_vfe(line);
+ 	struct vfe_output *output = &line->output;
+ 	const struct vfe_hw_ops *ops = vfe->res->hw_ops;
+-	struct media_entity *sensor;
++	struct media_pad *sensor_pad;
+ 	unsigned long flags;
+ 	unsigned int frame_skip = 0;
+ 	unsigned int i;
+@@ -180,9 +180,10 @@ static int vfe_enable_output(struct vfe_
+ 	if (!ub_size)
+ 		return -EINVAL;
+ 
+-	sensor = camss_find_sensor(&line->subdev.entity);
+-	if (sensor) {
+-		struct v4l2_subdev *subdev = media_entity_to_v4l2_subdev(sensor);
++	sensor_pad = camss_find_sensor_pad(&line->subdev.entity);
++	if (sensor_pad) {
++		struct v4l2_subdev *subdev =
++			media_entity_to_v4l2_subdev(sensor_pad->entity);
+ 
+ 		v4l2_subdev_call(subdev, sensor, g_skip_frames, &frame_skip);
+ 		/* Max frame skip is 29 frames */
+--- a/drivers/media/platform/qcom/camss/camss-vfe.c
++++ b/drivers/media/platform/qcom/camss/camss-vfe.c
+@@ -498,14 +498,15 @@ int vfe_enable_output_v2(struct vfe_line
+ 	struct vfe_device *vfe = to_vfe(line);
+ 	struct vfe_output *output = &line->output;
+ 	const struct vfe_hw_ops *ops = vfe->res->hw_ops;
+-	struct media_entity *sensor;
++	struct media_pad *sensor_pad;
+ 	unsigned long flags;
+ 	unsigned int frame_skip = 0;
+ 	unsigned int i;
+ 
+-	sensor = camss_find_sensor(&line->subdev.entity);
+-	if (sensor) {
+-		struct v4l2_subdev *subdev = media_entity_to_v4l2_subdev(sensor);
++	sensor_pad = camss_find_sensor_pad(&line->subdev.entity);
++	if (sensor_pad) {
++		struct v4l2_subdev *subdev =
++			media_entity_to_v4l2_subdev(sensor_pad->entity);
+ 
+ 		v4l2_subdev_call(subdev, sensor, g_skip_frames, &frame_skip);
+ 		/* Max frame skip is 29 frames */
+--- a/drivers/media/platform/qcom/camss/camss.c
++++ b/drivers/media/platform/qcom/camss/camss.c
+@@ -2001,12 +2001,12 @@ void camss_disable_clocks(int nclocks, s
+ }
+ 
+ /*
+- * camss_find_sensor - Find a linked media entity which represents a sensor
++ * camss_find_sensor_pad - Find the media pad via which the sensor is linked
+  * @entity: Media entity to start searching from
+  *
+- * Return a pointer to sensor media entity or NULL if not found
++ * Return a pointer to sensor media pad or NULL if not found
+  */
+-struct media_entity *camss_find_sensor(struct media_entity *entity)
++struct media_pad *camss_find_sensor_pad(struct media_entity *entity)
+ {
+ 	struct media_pad *pad;
+ 
+@@ -2022,7 +2022,7 @@ struct media_entity *camss_find_sensor(s
+ 		entity = pad->entity;
+ 
+ 		if (entity->function == MEDIA_ENT_F_CAM_SENSOR)
+-			return entity;
++			return pad;
+ 	}
+ }
+ 
+@@ -2037,16 +2037,13 @@ struct media_entity *camss_find_sensor(s
+ s64 camss_get_link_freq(struct media_entity *entity, unsigned int bpp,
+ 			unsigned int lanes)
+ {
+-	struct media_entity *sensor;
+-	struct v4l2_subdev *subdev;
++	struct media_pad *sensor_pad;
+ 
+-	sensor = camss_find_sensor(entity);
+-	if (!sensor)
++	sensor_pad = camss_find_sensor_pad(entity);
++	if (!sensor_pad)
+ 		return -ENODEV;
+ 
+-	subdev = media_entity_to_v4l2_subdev(sensor);
+-
+-	return v4l2_get_link_freq(subdev->ctrl_handler, bpp, 2 * lanes);
++	return v4l2_get_link_freq(sensor_pad, bpp, 2 * lanes);
+ }
+ 
+ /*
+@@ -2058,15 +2055,15 @@ s64 camss_get_link_freq(struct media_ent
+  */
+ int camss_get_pixel_clock(struct media_entity *entity, u64 *pixel_clock)
+ {
+-	struct media_entity *sensor;
++	struct media_pad *sensor_pad;
+ 	struct v4l2_subdev *subdev;
+ 	struct v4l2_ctrl *ctrl;
+ 
+-	sensor = camss_find_sensor(entity);
+-	if (!sensor)
++	sensor_pad = camss_find_sensor_pad(entity);
++	if (!sensor_pad)
+ 		return -ENODEV;
+ 
+-	subdev = media_entity_to_v4l2_subdev(sensor);
++	subdev = media_entity_to_v4l2_subdev(sensor_pad->entity);
+ 
+ 	ctrl = v4l2_ctrl_find(subdev->ctrl_handler, V4L2_CID_PIXEL_RATE);
+ 
+--- a/drivers/media/platform/qcom/camss/camss.h
++++ b/drivers/media/platform/qcom/camss/camss.h
+@@ -153,7 +153,7 @@ void camss_add_clock_margin(u64 *rate);
+ int camss_enable_clocks(int nclocks, struct camss_clock *clock,
+ 			struct device *dev);
+ void camss_disable_clocks(int nclocks, struct camss_clock *clock);
+-struct media_entity *camss_find_sensor(struct media_entity *entity);
++struct media_pad *camss_find_sensor_pad(struct media_entity *entity);
+ s64 camss_get_link_freq(struct media_entity *entity, unsigned int bpp,
+ 			unsigned int lanes);
+ int camss_get_pixel_clock(struct media_entity *entity, u64 *pixel_clock);
+--- a/drivers/media/platform/raspberrypi/rp1-cfe/cfe.c
++++ b/drivers/media/platform/raspberrypi/rp1-cfe/cfe.c
+@@ -1102,6 +1102,8 @@ static void cfe_buffer_queue(struct vb2_
+ 
+ static s64 cfe_get_source_link_freq(struct cfe_device *cfe)
+ {
++	struct media_pad *src_pad =
++		&cfe->source_sd->entity.pads[cfe->source_pad];
+ 	struct v4l2_subdev_state *state;
+ 	s64 link_freq;
+ 	u32 bpp;
+@@ -1136,7 +1138,7 @@ static s64 cfe_get_source_link_freq(stru
+ 		bpp = 0;
+ 	}
+ 
+-	link_freq = v4l2_get_link_freq(cfe->source_sd->ctrl_handler, bpp,
++	link_freq = v4l2_get_link_freq(src_pad, bpp,
+ 				       2 * cfe->csi2.dphy.active_lanes);
+ 	if (link_freq < 0)
+ 		cfe_err(cfe, "failed to get link freq for subdev '%s'\n",
+--- a/drivers/media/platform/ti/cal/cal-camerarx.c
++++ b/drivers/media/platform/ti/cal/cal-camerarx.c
+@@ -65,7 +65,8 @@ static s64 cal_camerarx_get_ext_link_fre
+ 
+ 	bpp = fmtinfo->bpp;
+ 
+-	freq = v4l2_get_link_freq(phy->source->ctrl_handler, bpp, 2 * num_lanes);
++	freq = v4l2_get_link_freq(&phy->source->entity.pads[phy->source_pad],
++				  bpp, 2 * num_lanes);
+ 	if (freq < 0) {
+ 		phy_err(phy, "failed to get link freq for subdev '%s'\n",
+ 			phy->source->name);
+--- a/drivers/media/platform/ti/cal/cal.c
++++ b/drivers/media/platform/ti/cal/cal.c
+@@ -798,7 +798,6 @@ static int cal_async_notifier_bound(stru
+ 		return 0;
+ 	}
+ 
+-	phy->source = subdev;
+ 	phy_dbg(1, phy, "Using source %s for capture\n", subdev->name);
+ 
+ 	pad = media_entity_get_fwnode_pad(&subdev->entity,
+@@ -820,6 +819,9 @@ static int cal_async_notifier_bound(stru
+ 		return ret;
+ 	}
+ 
++	phy->source = subdev;
++	phy->source_pad = pad;
++
+ 	return 0;
+ }
+ 
+--- a/drivers/media/platform/ti/cal/cal.h
++++ b/drivers/media/platform/ti/cal/cal.h
+@@ -174,6 +174,7 @@ struct cal_camerarx {
+ 	struct device_node	*source_ep_node;
+ 	struct device_node	*source_node;
+ 	struct v4l2_subdev	*source;
++	unsigned int		source_pad;
+ 
+ 	struct v4l2_subdev	subdev;
+ 	struct media_pad	pads[CAL_CAMERARX_NUM_PADS];
