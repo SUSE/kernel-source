@@ -130,7 +130,8 @@ class TestRequest(http.server.BaseHTTPRequestHandler):
                 for value in headers.get_all(hdr):
                     self.send_header(hdr, value)
         if body:
-            body = body.encode()
+            if not isinstance(body, bytes):
+                body = body.encode()
             self.send_header('Content-Length', len(body))
             self.end_headers()
             self.wfile.write(body)
@@ -538,6 +539,25 @@ class TestOBS(APITest):
                     ['dtb-aarch64', 'kernel-64kb', 'kernel-default', 'kernel-docs', 'kernel-kvmsmall', 'kernel-obs-build', 'kernel-obs-qa', 'kernel-syms', 'kernel-zfcpdump'])
             self.assertTrue(st.data_consumed)
         self.log_cycle(test_fn, 'tests/api/obsapi_list_links')
+
+    def test_binary_file(self):
+        with open('tests/api/binary_garbage', 'rb') as f:
+            data = f.read()
+        def test_fn(inlog, outlog):
+            st = ServerThread(inlog)
+            st.start_server(obsconfig=self.config)
+            api = OBSAPI(st.url(), config=self.config, cookiejar=self.cookiejar, ca=st.servercert, logfile=outlog)
+            self.assertEqual(api.file_exists('home:michals', 'vertest', 'binary_garbage').content, data)
+            self.assertTrue(st.data_consumed)
+        self.log_cycle(test_fn, 'tests/api/obsapi_binary')
+
+        def test_fn(inlog, outlog):
+            st = ServerThread(inlog)
+            st.start_server(obsconfig=self.config)
+            api = OBSAPI(st.url(), config=self.config, cookiejar=self.cookiejar, ca=st.servercert, logfile=outlog)
+            api.upload_file('home:michals', 'vertest', 'binary_garbage', data)
+            self.assertTrue(st.data_consumed)
+        self.log_cycle(test_fn, 'tests/api/obsapi_binary_put')
 
     def test_create_project(self):
         def test_fn(inlog, outlog):
