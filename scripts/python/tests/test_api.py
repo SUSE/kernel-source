@@ -398,14 +398,14 @@ class TestOBS(unittest.TestCase):
         st = ServerThread('tests/api/obsapi_log_in_ssh')
         st.start_server(obsconfig=self.config)
         os.unlink(self.cookiejar)
+        # permissions not stored exactly in git, ssh refuses to read 644 files
+        key = os.path.join(self.tmpdir.name, 'testkey')
+        shutil.copy('tests/api/testkey', key)
+        os.chmod(key, 0o400)
+        shutil.copy('tests/api/testkey.pub', os.path.join(self.tmpdir.name, 'testkey.pub'))
         config = configparser.ConfigParser(delimiters=('='), interpolation=None)
         config.read(self.config)
-        # permissions not stored exactly in git, ssh refuses to read 666 files
-        try:
-            os.chmod('tests/api/testkey', 0o400)
-        except OSError:  # readonly filesystem in container
-            None
-        config[config.sections()[0]]['sshkey'] = os.path.abspath('tests/api/testkey')
+        config[config.sections()[0]]['sshkey'] = os.path.abspath(key)
         with open(self.config, 'w') as f:
             config.write(f)
         api = OBSAPI(st.url(), config=self.config, cookiejar=self.cookiejar, ca=st.servercert)
