@@ -458,24 +458,34 @@ class TestOBS(APITest):
             self.assertTrue(st.data_consumed)
         self.log_cycle(test_fn, 'tests/api/obsapi_log_in')
 
+    def copy_key(self):
+        # permissions not stored exactly in git, ssh refuses to read 644 files
+        key = os.path.join(self.tmpdir.name, 'testkey')
+        shutil.copy('tests/api/testkey', key)
+        os.chmod(key, 0o400)
+        shutil.copy('tests/api/testkey.pub', os.path.join(self.tmpdir.name, 'testkey.pub'))
+        config = configparser.ConfigParser(delimiters=('='), interpolation=None)
+        config.read(self.config)
+        config[config.sections()[0]]['sshkey'] = os.path.abspath(key)
+        with open(self.config, 'w') as f:
+            config.write(f)
+
+    def test_sig(self):
+        st = ServerThread('/dev/null')
+        st.start_server(obsconfig=self.config)  # Part of configuration only happens when starting the server
+        st.stop_server()
+        self.copy_key()
+        api = OBSAPI(st.url(), config=self.config, cookiejar=self.cookiejar, ca=st.servercert)
+        self.assertEqual(api.ssh_signature(1755779838, api.user, api.sshkey, 'some realm'),
+                         'keyId="obsuser",algorithm="ssh",headers="(created)",created=1755779838,signature="U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAge7Wj9uPdUE8nqD2mPJ8R9tZLZ2Wgwqj1MT7sJlFhJj4AAAAKc29tZSByZWFsbQAAAAAAAAAGc2hhNTEyAAAAUwAAAAtzc2gtZWQyNTUxOQAAAEBNMTVv/cHwZMLNZ2UaNaVUX2fJw8J4LvTCcHTrpXQ2z2pr5ldM+UvKypyBExf42plNYEI3hw59V4Uzej/di5YA"')
+
     def test_Y(self):
         def test_fn(inlog, outlog):
             st = ServerThread(inlog)
             st.start_server(obsconfig=self.config)
             os.unlink(self.cookiejar)
-            # permissions not stored exactly in git, ssh refuses to read 644 files
-            key = os.path.join(self.tmpdir.name, 'testkey')
-            shutil.copy('tests/api/testkey', key)
-            os.chmod(key, 0o400)
-            shutil.copy('tests/api/testkey.pub', os.path.join(self.tmpdir.name, 'testkey.pub'))
-            config = configparser.ConfigParser(delimiters=('='), interpolation=None)
-            config.read(self.config)
-            config[config.sections()[0]]['sshkey'] = os.path.abspath(key)
-            with open(self.config, 'w') as f:
-                config.write(f)
+            self.copy_key()
             api = OBSAPI(st.url(), config=self.config, cookiejar=self.cookiejar, ca=st.servercert, logfile=outlog)
-            self.assertEqual(api.ssh_signature(1755779838, api.user, api.sshkey, 'some realm'),
-                             'keyId="obsuser",algorithm="ssh",headers="(created)",created=1755779838,signature="U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAge7Wj9uPdUE8nqD2mPJ8R9tZLZ2Wgwqj1MT7sJlFhJj4AAAAKc29tZSByZWFsbQAAAAAAAAAGc2hhNTEyAAAAUwAAAAtzc2gtZWQyNTUxOQAAAEBNMTVv/cHwZMLNZ2UaNaVUX2fJw8J4LvTCcHTrpXQ2z2pr5ldM+UvKypyBExf42plNYEI3hw59V4Uzej/di5YA"')
             api.check_login()
             self.assertTrue(st.data_consumed)
         self.log_cycle(test_fn, 'tests/api/obsapi_log_in_ssh')
