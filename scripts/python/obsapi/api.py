@@ -205,9 +205,6 @@ class API:
     def log(self, method, path, args, r):
         self.logfile.write(self.format_request(method, path, args, r))
 
-    def header_json(self):
-        return {'Content-type': 'application/json'}
-
     def call(self, method, path, **kwargs):
         for arg in kwargs.keys():
             if arg not in ['data', 'json', 'params', 'headers', 'redirected', 'reauthenticated']:
