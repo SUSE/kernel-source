@@ -1,0 +1,159 @@
+From: Shanker Donthineni <sdonthineni@nvidia.com>
+Date: Fri, 13 Mar 2026 14:46:12 +0000
+Subject: arm_mpam: Add quirk framework
+Git-commit: fa7745218c9828ac4849ef62bccad684aec0f422
+Patch-mainline: v7.0 or v7.0-rc7 (next release)
+References: jsc#PED-15480
+
+The MPAM specification includes the MPAMF_IIDR, which serves to uniquely
+identify the MSC implementation through a combination of implementer
+details, product ID, variant, and revision. Certain hardware issues/errata
+can be resolved using software workarounds.
+
+Introduce a quirk framework to allow workarounds to be enabled based on the
+MPAMF_IIDR value.
+
+Tested-by: Gavin Shan <gshan@redhat.com>
+Tested-by: Shaopeng Tan <tan.shaopeng@jp.fujitsu.com>
+Tested-by: Zeng Heng <zengheng4@huawei.com>
+Tested-by: Punit Agrawal <punit.agrawal@oss.qualcomm.com>
+Tested-by: Jesse Chick <jessechick@os.amperecomputing.com>
+Reviewed-by: Zeng Heng <zengheng4@huawei.com>
+Reviewed-by: Shaopeng Tan <tan.shaopeng@jp.fujitsu.com>
+Reviewed-by: Jonathan Cameron <jonathan.cameron@huawei.com>
+Reviewed-by: Gavin Shan <gshan@redhat.com>
+Signed-off-by: Shanker Donthineni <sdonthineni@nvidia.com>
+Co-developed-by: Ben Horgan <ben.horgan@arm.com>
+Signed-off-by: Ben Horgan <ben.horgan@arm.com>
+Co-developed-by: James Morse <james.morse@arm.com>
+Signed-off-by: James Morse <james.morse@arm.com>
+Acked-by: Stanimir Varbanov <svarbanov@suse.de>
+---
+ drivers/resctrl/mpam_devices.c  | 32 ++++++++++++++++++++++++++++++++
+ drivers/resctrl/mpam_internal.h | 25 +++++++++++++++++++++++++
+ 2 files changed, 57 insertions(+)
+
+diff --git a/drivers/resctrl/mpam_devices.c b/drivers/resctrl/mpam_devices.c
+index 37b31a1cf376..e66631f3f732 100644
+--- a/drivers/resctrl/mpam_devices.c
++++ b/drivers/resctrl/mpam_devices.c
+@@ -630,6 +630,30 @@ static struct mpam_msc_ris *mpam_get_or_create_ris(struct mpam_msc *msc,
+ 	return ERR_PTR(-ENOENT);
+ }
+ 
++static const struct mpam_quirk mpam_quirks[] = {
++	{ NULL } /* Sentinel */
++};
++
++static void mpam_enable_quirks(struct mpam_msc *msc)
++{
++	const struct mpam_quirk *quirk;
++
++	for (quirk = &mpam_quirks[0]; quirk->iidr_mask; quirk++) {
++		int err = 0;
++
++		if (quirk->iidr != (msc->iidr & quirk->iidr_mask))
++			continue;
++
++		if (quirk->init)
++			err = quirk->init(msc, quirk);
++
++		if (err)
++			continue;
++
++		mpam_set_quirk(quirk->workaround, msc);
++	}
++}
++
+ /*
+  * IHI009A.a has this nugget: "If a monitor does not support automatic behaviour
+  * of NRDY, software can use this bit for any purpose" - so hardware might not
+@@ -864,8 +888,11 @@ static int mpam_msc_hw_probe(struct mpam_msc *msc)
+ 	/* Grab an IDR value to find out how many RIS there are */
+ 	mutex_lock(&msc->part_sel_lock);
+ 	idr = mpam_msc_read_idr(msc);
++	msc->iidr = mpam_read_partsel_reg(msc, IIDR);
+ 	mutex_unlock(&msc->part_sel_lock);
+ 
++	mpam_enable_quirks(msc);
++
+ 	msc->ris_max = FIELD_GET(MPAMF_IDR_RIS_MAX, idr);
+ 
+ 	/* Use these values so partid/pmg always starts with a valid value */
+@@ -1972,6 +1999,7 @@ static bool mpam_has_cmax_wd_feature(struct mpam_props *props)
+  * resulting safe value must be compatible with both. When merging values in
+  * the tree, all the aliasing resources must be handled first.
+  * On mismatch, parent is modified.
++ * Quirks on an MSC will apply to all MSC in that class.
+  */
+ static void __props_mismatch(struct mpam_props *parent,
+ 			     struct mpam_props *child, bool alias)
+@@ -2091,6 +2119,7 @@ static void __props_mismatch(struct mpam_props *parent,
+  * nobble the class feature, as we can't configure all the resources.
+  * e.g. The L3 cache is composed of two resources with 13 and 17 portion
+  * bitmaps respectively.
++ * Quirks on an MSC will apply to all MSC in that class.
+  */
+ static void
+ __class_props_mismatch(struct mpam_class *class, struct mpam_vmsc *vmsc)
+@@ -2104,6 +2133,9 @@ __class_props_mismatch(struct mpam_class *class, struct mpam_vmsc *vmsc)
+ 	dev_dbg(dev, "Merging features for class:0x%lx &= vmsc:0x%lx\n",
+ 		(long)cprops->features, (long)vprops->features);
+ 
++	/* Merge quirks */
++	class->quirks |= vmsc->msc->quirks;
++
+ 	/* Take the safe value for any common features */
+ 	__props_mismatch(cprops, vprops, false);
+ }
+diff --git a/drivers/resctrl/mpam_internal.h b/drivers/resctrl/mpam_internal.h
+index 68906c6ebfb0..01858365cd9e 100644
+--- a/drivers/resctrl/mpam_internal.h
++++ b/drivers/resctrl/mpam_internal.h
+@@ -85,6 +85,8 @@ struct mpam_msc {
+ 	u8			pmg_max;
+ 	unsigned long		ris_idxs;
+ 	u32			ris_max;
++	u32			iidr;
++	u16			quirks;
+ 
+ 	/*
+ 	 * error_irq_lock is taken when registering/unregistering the error
+@@ -216,6 +218,28 @@ struct mpam_props {
+ #define mpam_set_feature(_feat, x)	__set_bit(_feat, (x)->features)
+ #define mpam_clear_feature(_feat, x)	__clear_bit(_feat, (x)->features)
+ 
++/* Workaround bits for msc->quirks */
++enum mpam_device_quirks {
++	MPAM_QUIRK_LAST
++};
++
++#define mpam_has_quirk(_quirk, x)	((1 << (_quirk) & (x)->quirks))
++#define mpam_set_quirk(_quirk, x)	((x)->quirks |= (1 << (_quirk)))
++
++struct mpam_quirk {
++	int (*init)(struct mpam_msc *msc, const struct mpam_quirk *quirk);
++
++	u32 iidr;
++	u32 iidr_mask;
++
++	enum mpam_device_quirks workaround;
++};
++
++#define MPAM_IIDR_MATCH_ONE	(FIELD_PREP_CONST(MPAMF_IIDR_PRODUCTID,   0xfff) | \
++				 FIELD_PREP_CONST(MPAMF_IIDR_VARIANT,     0xf)	 | \
++				 FIELD_PREP_CONST(MPAMF_IIDR_REVISION,    0xf)	 | \
++				 FIELD_PREP_CONST(MPAMF_IIDR_IMPLEMENTER, 0xfff))
++
+ /* The values for MSMON_CFG_MBWU_FLT.RWBW */
+ enum mon_filter_options {
+ 	COUNT_BOTH	= 0,
+@@ -259,6 +283,7 @@ struct mpam_class {
+ 
+ 	struct mpam_props	props;
+ 	u32			nrdy_usec;
++	u16			quirks;
+ 	u8			level;
+ 	enum mpam_class_types	type;
+ 
+

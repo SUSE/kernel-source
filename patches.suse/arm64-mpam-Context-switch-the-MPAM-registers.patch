@@ -1,0 +1,251 @@
+From: James Morse <james.morse@arm.com>
+Date: Fri, 13 Mar 2026 14:45:43 +0000
+Subject: arm64: mpam: Context switch the MPAM registers
+Git-commit: 8e06d04ff1cf764066c62e5677bfb0b0c1d1fbbc
+Patch-mainline: v7.0 or v7.0-rc7 (next release)
+References: jsc#PED-15480
+
+MPAM allows traffic in the SoC to be labeled by the OS, these labels are
+used to apply policy in caches and bandwidth regulators, and to monitor
+traffic in the SoC. The label is made up of a PARTID and PMG value. The x86
+equivalent calls these CLOSID and RMID, but they don't map precisely.
+
+MPAM has two CPU system registers that is used to hold the PARTID and PMG
+values that traffic generated at each exception level will use. These can
+be set per-task by the resctrl file system. (resctrl is the defacto
+interface for controlling this stuff).
+
+Add a helper to switch this.
+
+struct task_struct's separate CLOSID and RMID fields are insufficient to
+implement resctrl using MPAM, as resctrl can change the PARTID (CLOSID) and
+PMG (sort of like the RMID) separately. On x86, the rmid is an independent
+number, so a race that writes a mismatched closid and rmid into hardware is
+benign. On arm64, the pmg bits extend the partid.
+(i.e. partid-5 has a pmg-0 that is not the same as partid-6's pmg-0).  In
+this case, mismatching the values will 'dirty' a pmg value that resctrl
+believes is clean, and is not tracking with its 'limbo' code.
+
+To avoid this, the partid and pmg are always read and written as a
+pair. This requires a new u64 field. In struct task_struct there are two
+u32, rmid and closid for the x86 case, but as we can't use them here do
+something else. Add this new field, mpam_partid_pmg, to struct thread_info
+to avoid adding more architecture specific code to struct task_struct.
+Always use READ_ONCE()/WRITE_ONCE() when accessing this field.
+
+Resctrl allows a per-cpu 'default' value to be set, this overrides the
+values when scheduling a task in the default control-group, which has
+PARTID 0. The way 'code data prioritisation' gets emulated means the
+register value for the default group needs to be a variable.
+
+The current system register value is kept in a per-cpu variable to avoid
+writing to the system register if the value isn't going to change.  Writes
+to this register may reset the hardware state for regulating bandwidth.
+
+Finally, there is no reason to context switch these registers unless there
+is a driver changing the values in struct task_struct. Hide the whole thing
+behind a static key. This also allows the driver to disable MPAM in
+response to errors reported by hardware. Move the existing static key to
+belong to the arch code, as in the future the MPAM driver may become a
+loadable module.
+
+All this should depend on whether there is an MPAM driver, hide it behind
+CONFIG_ARM64_MPAM.
+
+Tested-by: Gavin Shan <gshan@redhat.com>
+Tested-by: Shaopeng Tan <tan.shaopeng@jp.fujitsu.com>
+Tested-by: Peter Newman <peternewman@google.com>
+Tested-by: Zeng Heng <zengheng4@huawei.com>
+Tested-by: Punit Agrawal <punit.agrawal@oss.qualcomm.com>
+Tested-by: Jesse Chick <jessechick@os.amperecomputing.com>
+CC: Amit Singh Tomar <amitsinght@marvell.com>
+Reviewed-by: Zeng Heng <zengheng4@huawei.com>
+Reviewed-by: Shaopeng Tan <tan.shaopeng@jp.fujitsu.com>
+Reviewed-by: Jonathan Cameron <jonathan.cameron@huawei.com>
+Reviewed-by: Gavin Shan <gshan@redhat.com>
+Reviewed-by: Catalin Marinas <catalin.marinas@arm.com>
+Co-developed-by: Ben Horgan <ben.horgan@arm.com>
+Signed-off-by: Ben Horgan <ben.horgan@arm.com>
+Signed-off-by: James Morse <james.morse@arm.com>
+Acked-by: Stanimir Varbanov <svarbanov@suse.de>
+---
+ arch/arm64/Kconfig                   |    2 +
+ arch/arm64/include/asm/mpam.h        |   67 +++++++++++++++++++++++++++++++++++
+ arch/arm64/include/asm/thread_info.h |    3 +
+ arch/arm64/kernel/Makefile           |    1 
+ arch/arm64/kernel/mpam.c             |   13 ++++++
+ arch/arm64/kernel/process.c          |    7 +++
+ drivers/resctrl/mpam_devices.c       |    2 -
+ drivers/resctrl/mpam_internal.h      |    4 +-
+ 8 files changed, 95 insertions(+), 4 deletions(-)
+
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@ -2102,6 +2102,8 @@ config ARM64_MPAM
+ 
+ 	  MPAM is exposed to user-space via the resctrl pseudo filesystem.
+ 
++	  This option enables the extra context switch code.
++
+ endmenu # "ARMv8.4 architectural features"
+ 
+ menu "ARMv8.5 architectural features"
+--- /dev/null
++++ b/arch/arm64/include/asm/mpam.h
+@@ -0,0 +1,67 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* Copyright (C) 2025 Arm Ltd. */
++
++#ifndef __ASM__MPAM_H
++#define __ASM__MPAM_H
++
++#include <linux/jump_label.h>
++#include <linux/percpu.h>
++#include <linux/sched.h>
++
++#include <asm/sysreg.h>
++
++DECLARE_STATIC_KEY_FALSE(mpam_enabled);
++DECLARE_PER_CPU(u64, arm64_mpam_default);
++DECLARE_PER_CPU(u64, arm64_mpam_current);
++
++/*
++ * The value of the MPAM0_EL1 sysreg when a task is in resctrl's default group.
++ * This is used by the context switch code to use the resctrl CPU property
++ * instead. The value is modified when CDP is enabled/disabled by mounting
++ * the resctrl filesystem.
++ */
++extern u64 arm64_mpam_global_default;
++
++/*
++ * The resctrl filesystem writes to the partid/pmg values for threads and CPUs,
++ * which may race with reads in mpam_thread_switch(). Ensure only one of the old
++ * or new values are used. Particular care should be taken with the pmg field as
++ * mpam_thread_switch() may read a partid and pmg that don't match, causing this
++ * value to be stored with cache allocations, despite being considered 'free' by
++ * resctrl.
++ */
++#ifdef CONFIG_ARM64_MPAM
++static inline u64 mpam_get_regval(struct task_struct *tsk)
++{
++	return READ_ONCE(task_thread_info(tsk)->mpam_partid_pmg);
++}
++
++static inline void mpam_thread_switch(struct task_struct *tsk)
++{
++	u64 oldregval;
++	int cpu = smp_processor_id();
++	u64 regval = mpam_get_regval(tsk);
++
++	if (!static_branch_likely(&mpam_enabled))
++		return;
++
++	if (regval == READ_ONCE(arm64_mpam_global_default))
++		regval = READ_ONCE(per_cpu(arm64_mpam_default, cpu));
++
++	oldregval = READ_ONCE(per_cpu(arm64_mpam_current, cpu));
++	if (oldregval == regval)
++		return;
++
++	write_sysreg_s(regval | MPAM1_EL1_MPAMEN, SYS_MPAM1_EL1);
++	isb();
++
++	/* Synchronising the EL0 write is left until the ERET to EL0 */
++	write_sysreg_s(regval, SYS_MPAM0_EL1);
++
++	WRITE_ONCE(per_cpu(arm64_mpam_current, cpu), regval);
++}
++#else
++static inline void mpam_thread_switch(struct task_struct *tsk) {}
++#endif /* CONFIG_ARM64_MPAM */
++
++#endif /* __ASM__MPAM_H */
+--- a/arch/arm64/include/asm/thread_info.h
++++ b/arch/arm64/include/asm/thread_info.h
+@@ -42,6 +42,9 @@ struct thread_info {
+ 	void			*scs_base;
+ 	void			*scs_sp;
+ #endif
++#ifdef CONFIG_ARM64_MPAM
++	u64			mpam_partid_pmg;
++#endif
+ 	u32			cpu;
+ };
+ 
+--- a/arch/arm64/kernel/Makefile
++++ b/arch/arm64/kernel/Makefile
+@@ -68,6 +68,7 @@ obj-$(CONFIG_CRASH_DUMP)		+= crash_dump.
+ obj-$(CONFIG_VMCORE_INFO)		+= vmcore_info.o
+ obj-$(CONFIG_ARM_SDE_INTERFACE)		+= sdei.o
+ obj-$(CONFIG_ARM64_PTR_AUTH)		+= pointer_auth.o
++obj-$(CONFIG_ARM64_MPAM)		+= mpam.o
+ obj-$(CONFIG_ARM64_MTE)			+= mte.o
+ obj-y					+= vdso-wrap.o
+ obj-$(CONFIG_COMPAT_VDSO)		+= vdso32-wrap.o
+--- /dev/null
++++ b/arch/arm64/kernel/mpam.c
+@@ -0,0 +1,13 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (C) 2025 Arm Ltd. */
++
++#include <asm/mpam.h>
++
++#include <linux/jump_label.h>
++#include <linux/percpu.h>
++
++DEFINE_STATIC_KEY_FALSE(mpam_enabled);
++DEFINE_PER_CPU(u64, arm64_mpam_default);
++DEFINE_PER_CPU(u64, arm64_mpam_current);
++
++u64 arm64_mpam_global_default;
+--- a/arch/arm64/kernel/process.c
++++ b/arch/arm64/kernel/process.c
+@@ -50,6 +50,7 @@
+ #include <asm/exec.h>
+ #include <asm/fpsimd.h>
+ #include <asm/mmu_context.h>
++#include <asm/mpam.h>
+ #include <asm/mte.h>
+ #include <asm/processor.h>
+ #include <asm/pointer_auth.h>
+@@ -643,6 +644,12 @@ struct task_struct *__switch_to(struct t
+ 	if (prev->thread.sctlr_user != next->thread.sctlr_user)
+ 		update_sctlr_el1(next->thread.sctlr_user);
+ 
++	/*
++	 * MPAM thread switch happens after the DSB to ensure prev's accesses
++	 * use prev's MPAM settings.
++	 */
++	mpam_thread_switch(next);
++
+ 	/* the actual thread switch */
+ 	last = cpu_switch_to(prev, next);
+ 
+--- a/drivers/resctrl/mpam_devices.c
++++ b/drivers/resctrl/mpam_devices.c
+@@ -29,8 +29,6 @@
+ 
+ #include "mpam_internal.h"
+ 
+-DEFINE_STATIC_KEY_FALSE(mpam_enabled); /* This moves to arch code */
+-
+ /*
+  * mpam_list_lock protects the SRCU lists when writing. Once the
+  * mpam_enabled key is enabled these lists are read-only,
+--- a/drivers/resctrl/mpam_internal.h
++++ b/drivers/resctrl/mpam_internal.h
+@@ -16,12 +16,12 @@
+ #include <linux/srcu.h>
+ #include <linux/types.h>
+ 
++#include <asm/mpam.h>
++
+ #define MPAM_MSC_MAX_NUM_RIS	16
+ 
+ struct platform_device;
+ 
+-DECLARE_STATIC_KEY_FALSE(mpam_enabled);
+-
+ #ifdef CONFIG_MPAM_KUNIT_TEST
+ #define PACKED_FOR_KUNIT __packed
+ #else

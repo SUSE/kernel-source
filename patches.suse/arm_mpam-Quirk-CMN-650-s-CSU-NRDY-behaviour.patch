@@ -1,0 +1,113 @@
+From: James Morse <james.morse@arm.com>
+Date: Fri, 13 Mar 2026 14:46:16 +0000
+Subject: arm_mpam: Quirk CMN-650's CSU NRDY behaviour
+Git-commit: aeb8595a5f8ba4aac8b5c265a8bcc3f18b473cb5
+Patch-mainline: v7.0 or v7.0-rc7 (next release)
+References: jsc#PED-15480
+
+CMN-650 is afflicted with an erratum where the CSU NRDY bit never clears.
+This tells us the monitor never finishes scanning the cache. The erratum
+document says to wait the maximum time, then ignore the field.
+
+Add a flag to indicate whether this is the final attempt to read the
+counter, and when this quirk is applied, ignore the NRDY field.
+
+This means accesses to this counter will always retry, even if the counter
+was previously programmed to the same values.
+
+The counter value is not expected to be stable, it drifts up and down with
+each allocation and eviction. The CSU register provides the value for a
+point in time.
+
+Tested-by: Punit Agrawal <punit.agrawal@oss.qualcomm.com>
+Tested-by: Gavin Shan <gshan@redhat.com>
+Tested-by: Shaopeng Tan <tan.shaopeng@jp.fujitsu.com>
+Tested-by: Jesse Chick <jessechick@os.amperecomputing.com>
+Reviewed-by: Zeng Heng <zengheng4@huawei.com>
+Reviewed-by: Gavin Shan <gshan@redhat.com>
+Co-developed-by: Ben Horgan <ben.horgan@arm.com>
+Signed-off-by: Ben Horgan <ben.horgan@arm.com>
+Signed-off-by: James Morse <james.morse@arm.com>
+Acked-by: Stanimir Varbanov <svarbanov@suse.de>
+---
+ Documentation/arch/arm64/silicon-errata.rst |    3 +++
+ drivers/resctrl/mpam_devices.c              |   12 ++++++++++++
+ drivers/resctrl/mpam_internal.h             |    6 ++++++
+ 3 files changed, 21 insertions(+)
+
+--- a/Documentation/arch/arm64/silicon-errata.rst
++++ b/Documentation/arch/arm64/silicon-errata.rst
+@@ -212,6 +212,9 @@ stable kernels.
+ | ARM            | GIC-700         | #2941627        | ARM64_ERRATUM_2941627       |
+ +----------------+-----------------+-----------------+-----------------------------+
+ +----------------+-----------------+-----------------+-----------------------------+
++| ARM            | CMN-650         | #3642720        | N/A                         |
+++----------------+-----------------+-----------------+-----------------------------+
+++----------------+-----------------+-----------------+-----------------------------+
+ | Broadcom       | Brahma-B53      | N/A             | ARM64_ERRATUM_845719        |
+ +----------------+-----------------+-----------------+-----------------------------+
+ | Broadcom       | Brahma-B53      | N/A             | ARM64_ERRATUM_843419        |
+--- a/drivers/resctrl/mpam_devices.c
++++ b/drivers/resctrl/mpam_devices.c
+@@ -691,6 +691,12 @@ static const struct mpam_quirk mpam_quir
+ 		.iidr_mask  = MPAM_IIDR_MATCH_ONE,
+ 		.workaround = T241_MBW_COUNTER_SCALE_64,
+ 	},
++	{
++	/* ARM CMN-650 CSU erratum 3642720 */
++	.iidr       = MPAM_IIDR_ARM_CMN_650,
++	.iidr_mask  = MPAM_IIDR_MATCH_ONE,
++	.workaround = IGNORE_CSU_NRDY,
++	},
+ 	{ NULL } /* Sentinel */
+ };
+ 
+@@ -1003,6 +1009,7 @@ struct mon_read {
+ 	enum mpam_device_features	type;
+ 	u64				*val;
+ 	int				err;
++	bool				waited_timeout;
+ };
+ 
+ static bool mpam_ris_has_mbwu_long_counter(struct mpam_msc_ris *ris)
+@@ -1249,6 +1256,10 @@ static void __ris_msmon_read(void *arg)
+ 		if (mpam_has_feature(mpam_feat_msmon_csu_hw_nrdy, rprops))
+ 			nrdy = now & MSMON___NRDY;
+ 		now = FIELD_GET(MSMON___VALUE, now);
++
++		if (mpam_has_quirk(IGNORE_CSU_NRDY, msc) && m->waited_timeout)
++			nrdy = false;
++
+ 		break;
+ 	case mpam_feat_msmon_mbwu_31counter:
+ 	case mpam_feat_msmon_mbwu_44counter:
+@@ -1386,6 +1397,7 @@ int mpam_msmon_read(struct mpam_componen
+ 			.ctx = ctx,
+ 			.type = type,
+ 			.val = val,
++			.waited_timeout = true,
+ 		};
+ 		*val = 0;
+ 
+--- a/drivers/resctrl/mpam_internal.h
++++ b/drivers/resctrl/mpam_internal.h
+@@ -226,6 +226,7 @@ enum mpam_device_quirks {
+ 	T241_SCRUB_SHADOW_REGS,
+ 	T241_FORCE_MBW_MIN_TO_ONE,
+ 	T241_MBW_COUNTER_SCALE_64,
++	IGNORE_CSU_NRDY,
+ 	MPAM_QUIRK_LAST
+ };
+ 
+@@ -251,6 +252,11 @@ struct mpam_quirk {
+ 				 FIELD_PREP_CONST(MPAMF_IIDR_REVISION,    0)	 | \
+ 				 FIELD_PREP_CONST(MPAMF_IIDR_IMPLEMENTER, 0x36b))
+ 
++#define MPAM_IIDR_ARM_CMN_650	(FIELD_PREP_CONST(MPAMF_IIDR_PRODUCTID,   0)	 | \
++				 FIELD_PREP_CONST(MPAMF_IIDR_VARIANT,     0)	 | \
++				 FIELD_PREP_CONST(MPAMF_IIDR_REVISION,    0)	 | \
++				 FIELD_PREP_CONST(MPAMF_IIDR_IMPLEMENTER, 0x43b))
++
+ /* The values for MSMON_CFG_MBWU_FLT.RWBW */
+ enum mon_filter_options {
+ 	COUNT_BOTH	= 0,
