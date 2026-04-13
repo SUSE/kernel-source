@@ -268,6 +268,15 @@ class TestTea(unittest.TestCase):
         self.tmpdir.cleanup()
         self.tmpdir = None
 
+    def test_getuser(self):
+        st = ServerThread('tests/api/user')
+        st.start_server(teaconfig=self.config)
+        api = TeaAPI(st.url(), config=self.config, ca=st.servercert)
+        self.assertEqual(api.get_user(), 'michals')
+        self.assertTrue(st.data_consumed)
+        st.stop_server()
+        self.assertEqual(api.get_user(), 'michals')  # cached value, no server comm
+
     def test_gitattr_up_to_date(self):
         st = ServerThread('tests/api/gitattr_up_to_date')
         st.start_server(teaconfig=self.config)
