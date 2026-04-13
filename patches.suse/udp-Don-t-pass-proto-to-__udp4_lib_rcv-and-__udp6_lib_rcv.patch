@@ -1,0 +1,199 @@
+From: Kuniyuki Iwashima <kuniyu@google.com>
+Date: Wed, 11 Mar 2026 05:20:02 +0000
+Subject: udp: Don't pass proto to __udp4_lib_rcv() and __udp6_lib_rcv().
+Patch-mainline: Queued in subsystem maintainer repository
+Git-repo: https://git.kernel.org/pub/scm/linux/kernel/git/netdev/net-next.git/
+Git-commit: 14ce9a47c5b7497193cb4fdf9980b847482bd289
+References: jsc#PED-16048
+
+UDP and UDP-Lite shared __udp4_lib_rcv() and __udp6_lib_rcv()
+by passing IPPROTO_UDP or IPPROTO_UDPLITE.
+
+Now, @proto is always IPPROTO_UDP.
+
+Let's not pass it and rename the functions accordingly.
+
+With this series removing a bunch of conditionals for UDP-Lite
+from the fast path, udp_rr with 20,000 flows sees a 10% increase
+in pps (13.3 Mpps -> 14.7 Mpps)  on an AMD EPYC 7B12 (Zen 2)
+64-Core Processor platform.
+
+[ With FDO, the baseline is much higher and the delta was ~3%,
+  20.1 Mpps -> 20.7 Mpps ]
+
+Before:
+
+$ nstat > /dev/null; sleep 1; nstat | grep Udp
+Udp6InDatagrams                 14013408           0.0
+Udp6OutDatagrams                14013128           0.0
+
+After:
+
+$ nstat > /dev/null; sleep 1; nstat | grep Udp
+Udp6InDatagrams                 15491971           0.0
+Udp6OutDatagrams                15491671           0.0
+
+$ ./scripts/bloat-o-meter vmlinux.before vmlinux.after
+add/remove: 13/75 grow/shrink: 11/75 up/down: 13777/-18401 (-4624)
+Function                                     old     new   delta
+udp4_gro_receive                             872     866      -6
+udp6_gro_receive                             910     903      -7
+udp_rcv                                       32    1727   +1695
+udpv6_rcv                                     32    1450   +1418
+__udp4_lib_rcv                              2045       -   -2045
+__udp6_lib_rcv                              2084       -   -2084
+udp_unicast_rcv_skb                          160     149     -11
+udp6_unicast_rcv_skb                         196     181     -15
+__udp4_lib_mcast_deliver                     925     846     -79
+__udp6_lib_mcast_deliver                     922     810    -112
+__udp4_lib_lookup                            973     969      -4
+__udp6_lib_lookup                            940     929     -11
+__udp4_lib_lookup_skb                        106     100      -6
+__udp6_lib_lookup_skb                         71      66      -5
+udp4_lib_lookup_skb                          132     127      -5
+udp6_lib_lookup_skb                           87      81      -6
+udp_queue_rcv_skb                            326     356     +30
+udpv6_queue_rcv_skb                          331     361     +30
+udp_queue_rcv_one_skb                       1233     914    -319
+udpv6_queue_rcv_one_skb                     1250     930    -320
+__udp_enqueue_schedule_skb                  1067     995     -72
+udp_rcv_segment                              520     480     -40
+udp_post_segment_fix_csum                    120       -    -120
+udp_lib_checksum_complete                    200      84    -116
+udp_err                                       27    1103   +1076
+udpv6_err                                     36    1417   +1381
+__udp4_lib_err                              1112       -   -1112
+__udp6_lib_err                              1448       -   -1448
+udp_recvmsg                                 1149     994    -155
+udpv6_recvmsg                               1349    1294     -55
+udp_sendmsg                                 2730    2648     -82
+udp_send_skb                                 909     681    -228
+udpv6_sendmsg                               3022    2861    -161
+udp_v6_send_skb                             1214     952    -262
+...
+Total: Before=18446744073748075501, After=18446744073748070877, chg -0.00%
+
+Signed-off-by: Kuniyuki Iwashima <kuniyu@google.com>
+Reviewed-by: Willem de Bruijn <willemb@google.com>
+Link: https://patch.msgid.link/20260311052020.1213705-16-kuniyu@google.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Fernando Fernandez Mancera <fmancera@suse.de>
+---
+ net/ipv4/udp.c |   18 +++++-------------
+ net/ipv6/udp.c |   15 ++++-----------
+ 2 files changed, 9 insertions(+), 24 deletions(-)
+
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -2230,8 +2230,7 @@ EXPORT_SYMBOL(udp_sk_rx_dst_set);
+  */
+ static int __udp4_lib_mcast_deliver(struct net *net, struct sk_buff *skb,
+ 				    struct udphdr  *uh,
+-				    __be32 saddr, __be32 daddr,
+-				    int proto)
++				    __be32 saddr, __be32 daddr)
+ {
+ 	struct udp_table *udptable = net->ipv4.udp_table;
+ 	unsigned int hash2, hash2_any, offset;
+@@ -2353,7 +2352,7 @@ static int udp_unicast_rcv_skb(struct so
+  *	All we need to do is get the socket, and then do a checksum.
+  */
+ 
+-static int __udp4_lib_rcv(struct sk_buff *skb, int proto)
++int udp_rcv(struct sk_buff *skb)
+ {
+ 	struct rtable *rt = skb_rtable(skb);
+ 	struct net *net = dev_net(skb->dev);
+@@ -2412,7 +2411,7 @@ static int __udp4_lib_rcv(struct sk_buff
+ 	}
+ 
+ 	if (rt->rt_flags & (RTCF_BROADCAST|RTCF_MULTICAST))
+-		return __udp4_lib_mcast_deliver(net, skb, uh, saddr, daddr, proto);
++		return __udp4_lib_mcast_deliver(net, skb, uh, saddr, daddr);
+ 
+ 	sk = __udp4_lib_lookup_skb(skb, uh->source, uh->dest);
+ 	if (sk)
+@@ -2439,8 +2438,7 @@ no_sk:
+ 
+ short_packet:
+ 	drop_reason = SKB_DROP_REASON_PKT_TOO_SMALL;
+-	net_dbg_ratelimited("UDP%s: short packet: From %pI4:%u %d/%d to %pI4:%u\n",
+-			    proto == IPPROTO_UDPLITE ? "Lite" : "",
++	net_dbg_ratelimited("UDP: short packet: From %pI4:%u %d/%d to %pI4:%u\n",
+ 			    &saddr, ntohs(uh->source),
+ 			    ulen, skb->len,
+ 			    &daddr, ntohs(uh->dest));
+@@ -2452,8 +2450,7 @@ csum_error:
+ 	 * the network is concerned, anyway) as per 4.1.3.4 (MUST).
+ 	 */
+ 	drop_reason = SKB_DROP_REASON_UDP_CSUM;
+-	net_dbg_ratelimited("UDP%s: bad checksum. From %pI4:%u to %pI4:%u ulen %d\n",
+-			    proto == IPPROTO_UDPLITE ? "Lite" : "",
++	net_dbg_ratelimited("UDP: bad checksum. From %pI4:%u to %pI4:%u ulen %d\n",
+ 			    &saddr, ntohs(uh->source), &daddr, ntohs(uh->dest),
+ 			    ulen);
+ 	__UDP_INC_STATS(net, UDP_MIB_CSUMERRORS);
+@@ -2597,11 +2594,6 @@ int udp_v4_early_demux(struct sk_buff *s
+ 	return 0;
+ }
+ 
+-int udp_rcv(struct sk_buff *skb)
+-{
+-	return __udp4_lib_rcv(skb, IPPROTO_UDP);
+-}
+-
+ static void udp_destroy_sock(struct sock *sk)
+ {
+ 	struct udp_sock *up = udp_sk(sk);
+--- a/net/ipv6/udp.c
++++ b/net/ipv6/udp.c
+@@ -849,8 +849,7 @@ static void udp6_csum_zero_error(struct
+  */
+ static int __udp6_lib_mcast_deliver(struct net *net, struct sk_buff *skb,
+ 				    const struct in6_addr *saddr,
+-				    const struct in6_addr *daddr,
+-				    int proto)
++				    const struct in6_addr *daddr)
+ {
+ 	struct udp_table *udptable = net->ipv4.udp_table;
+ 	const struct udphdr *uh = udp_hdr(skb);
+@@ -946,7 +945,7 @@ static int udp6_unicast_rcv_skb(struct s
+ 	return 0;
+ }
+ 
+-static int __udp6_lib_rcv(struct sk_buff *skb, int proto)
++INDIRECT_CALLABLE_SCOPE int udpv6_rcv(struct sk_buff *skb)
+ {
+ 	enum skb_drop_reason reason = SKB_DROP_REASON_NOT_SPECIFIED;
+ 	const struct in6_addr *saddr, *daddr;
+@@ -1014,7 +1013,7 @@ static int __udp6_lib_rcv(struct sk_buff
+ 	 *	Multicast receive code
+ 	 */
+ 	if (ipv6_addr_is_multicast(daddr))
+-		return __udp6_lib_mcast_deliver(net, skb, saddr, daddr, proto);
++		return __udp6_lib_mcast_deliver(net, skb, saddr, daddr);
+ 
+ 	/* Unicast */
+ 	sk = __udp6_lib_lookup_skb(skb, uh->source, uh->dest);
+@@ -1045,8 +1044,7 @@ no_sk:
+ short_packet:
+ 	if (reason == SKB_DROP_REASON_NOT_SPECIFIED)
+ 		reason = SKB_DROP_REASON_PKT_TOO_SMALL;
+-	net_dbg_ratelimited("UDP%sv6: short packet: From [%pI6c]:%u %d/%d to [%pI6c]:%u\n",
+-			    proto == IPPROTO_UDPLITE ? "-Lite" : "",
++	net_dbg_ratelimited("UDPv6: short packet: From [%pI6c]:%u %d/%d to [%pI6c]:%u\n",
+ 			    saddr, ntohs(uh->source),
+ 			    ulen, skb->len,
+ 			    daddr, ntohs(uh->dest));
+@@ -1134,11 +1132,6 @@ void udp_v6_early_demux(struct sk_buff *
+ 	}
+ }
+ 
+-INDIRECT_CALLABLE_SCOPE int udpv6_rcv(struct sk_buff *skb)
+-{
+-	return __udp6_lib_rcv(skb, IPPROTO_UDP);
+-}
+-
+ /*
+  * Throw away all pending data and cancel the corking. Socket is locked.
+  */

@@ -1,0 +1,449 @@
+From: Kuniyuki Iwashima <kuniyu@google.com>
+Date: Wed, 11 Mar 2026 05:19:54 +0000
+Subject: udp: Remove partial csum code in RX.
+Patch-mainline: Queued in subsystem maintainer repository
+Git-repo: https://git.kernel.org/pub/scm/linux/kernel/git/netdev/net-next.git/
+Git-commit: c2539d4f2df7a9889b71bad97b97ddfd9e47add1
+References: jsc#PED-16048
+
+UDP-Lite supports the partial checksum and the coverage is
+stored in the position of the length field of struct udphdr.
+
+In RX paths, udp4_csum_init() / udp6_csum_init() save the value
+in UDP_SKB_CB(skb)->cscov and set UDP_SKB_CB(skb)->partial_cov
+to 1 if the coverage is not full.
+
+The subsequent processing diverges depending on the value,
+but such paths are now dead.
+
+Also, these functions have some code guarded for UDP:
+
+  * udp_unicast_rcv_skb / udp6_unicast_rcv_skb
+  * __udp4_lib_rcv() and __udp6_lib_rcv().
+
+Let's remove the partial csum code and the unnecessary
+guard for UDP-Lite in RX.
+
+Signed-off-by: Kuniyuki Iwashima <kuniyu@google.com>
+Reviewed-by: Willem de Bruijn <willemb@google.com>
+Link: https://patch.msgid.link/20260311052020.1213705-8-kuniyu@google.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Fernando Fernandez Mancera <fmancera@suse.de>
+---
+ include/net/ip6_checksum.h |    2 -
+ include/net/udp.h          |   17 +--------
+ include/net/udplite.h      |   34 ------------------
+ net/ipv4/udp.c             |   84 ++++++++-------------------------------------
+ net/ipv6/ip6_checksum.c    |   18 +--------
+ net/ipv6/udp.c             |   64 +++++++++-------------------------
+ 6 files changed, 40 insertions(+), 179 deletions(-)
+
+--- a/include/net/ip6_checksum.h
++++ b/include/net/ip6_checksum.h
+@@ -83,5 +83,5 @@ void udp6_set_csum(bool nocheck, struct
+ 		   const struct in6_addr *saddr,
+ 		   const struct in6_addr *daddr, int len);
+ 
+-int udp6_csum_init(struct sk_buff *skb, struct udphdr *uh, int proto);
++int udp6_csum_init(struct sk_buff *skb, struct udphdr *uh);
+ #endif
+--- a/include/net/udp.h
++++ b/include/net/udp.h
+@@ -31,11 +31,9 @@
+ #include <linux/indirect_call_wrapper.h>
+ 
+ /**
+- *	struct udp_skb_cb  -  UDP(-Lite) private variables
++ *	struct udp_skb_cb  -  UDP private variables
+  *
+  *	@header:      private variables used by IPv4/IPv6
+- *	@cscov:       checksum coverage length (UDP-Lite only)
+- *	@partial_cov: if set indicates partial csum coverage
+  */
+ struct udp_skb_cb {
+ 	union {
+@@ -44,8 +42,6 @@ struct udp_skb_cb {
+ 		struct inet6_skb_parm	h6;
+ #endif
+ 	} header;
+-	__u16		cscov;
+-	__u8		partial_cov;
+ };
+ #define UDP_SKB_CB(__skb)	((struct udp_skb_cb *)((__skb)->cb))
+ 
+@@ -107,13 +103,11 @@ extern int sysctl_udp_wmem_min;
+ struct sk_buff;
+ 
+ /*
+- *	Generic checksumming routines for UDP(-Lite) v4 and v6
++ *	Generic checksumming routines for UDP v4 and v6
+  */
+ static inline __sum16 __udp_lib_checksum_complete(struct sk_buff *skb)
+ {
+-	return (UDP_SKB_CB(skb)->cscov == skb->len ?
+-		__skb_checksum_complete(skb) :
+-		__skb_checksum_complete_head(skb, UDP_SKB_CB(skb)->cscov));
++	return __skb_checksum_complete(skb);
+ }
+ 
+ static inline int udp_lib_checksum_complete(struct sk_buff *skb)
+@@ -164,7 +158,6 @@ static inline void udp_csum_pull_header(
+ 		skb->csum = csum_partial(skb->data, sizeof(struct udphdr),
+ 					 skb->csum);
+ 	skb_pull_rcsum(skb, sizeof(struct udphdr));
+-	UDP_SKB_CB(skb)->cscov -= sizeof(struct udphdr);
+ }
+ 
+ typedef struct sock *(*udp_lookup_t)(const struct sk_buff *skb, __be16 sport,
+@@ -502,9 +495,6 @@ drop:
+ 
+ static inline void udp_post_segment_fix_csum(struct sk_buff *skb)
+ {
+-	/* UDP-lite can't land here - no GRO */
+-	WARN_ON_ONCE(UDP_SKB_CB(skb)->partial_cov);
+-
+ 	/* UDP packets generated with UDP_SEGMENT and traversing:
+ 	 *
+ 	 * UDP tunnel(xmit) -> veth (segmentation) -> veth (gro) -> UDP tunnel (rx)
+@@ -518,7 +508,6 @@ static inline void udp_post_segment_fix_
+ 	 * a valid csum after the segmentation.
+ 	 * Additionally fixup the UDP CB.
+ 	 */
+-	UDP_SKB_CB(skb)->cscov = skb->len;
+ 	if (skb->ip_summed == CHECKSUM_NONE && !skb->csum_valid)
+ 		skb->csum_valid = 1;
+ }
+--- a/include/net/udplite.h
++++ b/include/net/udplite.h
+@@ -25,40 +25,6 @@ static __inline__ int udplite_getfrag(vo
+ /*
+  * 	Checksumming routines
+  */
+-static inline int udplite_checksum_init(struct sk_buff *skb, struct udphdr *uh)
+-{
+-	u16 cscov;
+-
+-        /* In UDPv4 a zero checksum means that the transmitter generated no
+-         * checksum. UDP-Lite (like IPv6) mandates checksums, hence packets
+-         * with a zero checksum field are illegal.                            */
+-	if (uh->check == 0) {
+-		net_dbg_ratelimited("UDPLite: zeroed checksum field\n");
+-		return 1;
+-	}
+-
+-	cscov = ntohs(uh->len);
+-
+-	if (cscov == 0)		 /* Indicates that full coverage is required. */
+-		;
+-	else if (cscov < 8  || cscov > skb->len) {
+-		/*
+-		 * Coverage length violates RFC 3828: log and discard silently.
+-		 */
+-		net_dbg_ratelimited("UDPLite: bad csum coverage %d/%d\n",
+-				    cscov, skb->len);
+-		return 1;
+-
+-	} else if (cscov < skb->len) {
+-        	UDP_SKB_CB(skb)->partial_cov = 1;
+-		UDP_SKB_CB(skb)->cscov = cscov;
+-		if (skb->ip_summed == CHECKSUM_COMPLETE)
+-			skb->ip_summed = CHECKSUM_NONE;
+-		skb->csum_valid = 0;
+-        }
+-
+-	return 0;
+-}
+ 
+ /* Fast-path computation of checksum. Socket may not be locked. */
+ static inline __wsum udplite_csum(struct sk_buff *skb)
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -1866,14 +1866,13 @@ INDIRECT_CALLABLE_SCOPE
+ int udp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags,
+ 		int *addr_len)
+ {
+-	struct inet_sock *inet = inet_sk(sk);
+ 	DECLARE_SOCKADDR(struct sockaddr_in *, sin, msg->msg_name);
+-	struct sk_buff *skb;
+-	unsigned int ulen, copied;
+ 	int off, err, peeking = flags & MSG_PEEK;
+-	int is_udplite = IS_UDPLITE(sk);
++	struct inet_sock *inet = inet_sk(sk);
+ 	struct net *net = sock_net(sk);
+ 	bool checksum_valid = false;
++	unsigned int ulen, copied;
++	struct sk_buff *skb;
+ 
+ 	if (flags & MSG_ERRQUEUE)
+ 		return ip_recv_error(sk, msg, len, addr_len);
+@@ -1891,14 +1890,10 @@ try_again:
+ 	else if (copied < ulen)
+ 		msg->msg_flags |= MSG_TRUNC;
+ 
+-	/*
+-	 * If checksum is needed at all, try to do it while copying the
+-	 * data.  If the data is truncated, or if we only want a partial
+-	 * coverage checksum (UDP-Lite), do it before the copy.
++	/* If checksum is needed at all, try to do it while copying the
++	 * data.  If the data is truncated, do it before the copy.
+ 	 */
+-
+-	if (copied < ulen || peeking ||
+-	    (is_udplite && UDP_SKB_CB(skb)->partial_cov)) {
++	if (copied < ulen || peeking) {
+ 		checksum_valid = udp_skb_csum_unnecessary(skb) ||
+ 				!__udp_lib_checksum_complete(skb);
+ 		if (!checksum_valid)
+@@ -2190,41 +2185,6 @@ static int udp_queue_rcv_one_skb(struct
+ 		/* FALLTHROUGH -- it's a UDP Packet */
+ 	}
+ 
+-	/*
+-	 * 	UDP-Lite specific tests, ignored on UDP sockets
+-	 */
+-	if (udp_test_bit(UDPLITE_RECV_CC, sk) && UDP_SKB_CB(skb)->partial_cov) {
+-		u16 pcrlen = READ_ONCE(up->pcrlen);
+-
+-		/*
+-		 * MIB statistics other than incrementing the error count are
+-		 * disabled for the following two types of errors: these depend
+-		 * on the application settings, not on the functioning of the
+-		 * protocol stack as such.
+-		 *
+-		 * RFC 3828 here recommends (sec 3.3): "There should also be a
+-		 * way ... to ... at least let the receiving application block
+-		 * delivery of packets with coverage values less than a value
+-		 * provided by the application."
+-		 */
+-		if (pcrlen == 0) {          /* full coverage was set  */
+-			net_dbg_ratelimited("UDPLite: partial coverage %d while full coverage %d requested\n",
+-					    UDP_SKB_CB(skb)->cscov, skb->len);
+-			goto drop;
+-		}
+-		/* The next case involves violating the min. coverage requested
+-		 * by the receiver. This is subtle: if receiver wants x and x is
+-		 * greater than the buffersize/MTU then receiver will complain
+-		 * that it wants x while sender emits packets of smaller size y.
+-		 * Therefore the above ...()->partial_cov statement is essential.
+-		 */
+-		if (UDP_SKB_CB(skb)->cscov < pcrlen) {
+-			net_dbg_ratelimited("UDPLite: coverage %d too small, need min %d\n",
+-					    UDP_SKB_CB(skb)->cscov, pcrlen);
+-			goto drop;
+-		}
+-	}
+-
+ 	prefetch(&sk->sk_rmem_alloc);
+ 	if (rcu_access_pointer(sk->sk_filter) &&
+ 	    udp_lib_checksum_complete(skb))
+@@ -2360,29 +2320,14 @@ start_lookup:
+  * Otherwise, csum completion requires checksumming packet body,
+  * including udp header and folding it to skb->csum.
+  */
+-static inline int udp4_csum_init(struct sk_buff *skb, struct udphdr *uh,
+-				 int proto)
++static inline int udp4_csum_init(struct sk_buff *skb, struct udphdr *uh)
+ {
+ 	int err;
+ 
+-	UDP_SKB_CB(skb)->partial_cov = 0;
+-	UDP_SKB_CB(skb)->cscov = skb->len;
+-
+-	if (proto == IPPROTO_UDPLITE) {
+-		err = udplite_checksum_init(skb, uh);
+-		if (err)
+-			return err;
+-
+-		if (UDP_SKB_CB(skb)->partial_cov) {
+-			skb->csum = inet_compute_pseudo(skb, proto);
+-			return 0;
+-		}
+-	}
+-
+ 	/* Note, we are only interested in != 0 or == 0, thus the
+ 	 * force to int.
+ 	 */
+-	err = (__force int)skb_checksum_init_zero_check(skb, proto, uh->check,
++	err = (__force int)skb_checksum_init_zero_check(skb, IPPROTO_UDP, uh->check,
+ 							inet_compute_pseudo);
+ 	if (err)
+ 		return err;
+@@ -2410,7 +2355,7 @@ static int udp_unicast_rcv_skb(struct so
+ {
+ 	int ret;
+ 
+-	if (inet_get_convert_csum(sk) && uh->check && !IS_UDPLITE(sk))
++	if (inet_get_convert_csum(sk) && uh->check)
+ 		skb_checksum_try_convert(skb, IPPROTO_UDP, inet_compute_pseudo);
+ 
+ 	ret = udp_queue_rcv_skb(sk, skb);
+@@ -2455,14 +2400,17 @@ static int __udp4_lib_rcv(struct sk_buff
+ 	if (ulen > skb->len)
+ 		goto short_packet;
+ 
+-	if (proto == IPPROTO_UDP) {
+-		/* UDP validates ulen. */
+-		if (ulen < sizeof(*uh) || pskb_trim_rcsum(skb, ulen))
++	if (ulen < sizeof(*uh))
++		goto short_packet;
++
++	if (ulen < skb->len) {
++		if (pskb_trim_rcsum(skb, ulen))
+ 			goto short_packet;
++
+ 		uh = udp_hdr(skb);
+ 	}
+ 
+-	if (udp4_csum_init(skb, uh, proto))
++	if (udp4_csum_init(skb, uh))
+ 		goto csum_error;
+ 
+ 	sk = inet_steal_sock(net, skb, sizeof(struct udphdr), saddr, uh->source, daddr, uh->dest,
+--- a/net/ipv6/ip6_checksum.c
++++ b/net/ipv6/ip6_checksum.c
+@@ -62,24 +62,10 @@ __sum16 csum_ipv6_magic(const struct in6
+ EXPORT_SYMBOL(csum_ipv6_magic);
+ #endif
+ 
+-int udp6_csum_init(struct sk_buff *skb, struct udphdr *uh, int proto)
++int udp6_csum_init(struct sk_buff *skb, struct udphdr *uh)
+ {
+ 	int err;
+ 
+-	UDP_SKB_CB(skb)->partial_cov = 0;
+-	UDP_SKB_CB(skb)->cscov = skb->len;
+-
+-	if (proto == IPPROTO_UDPLITE) {
+-		err = udplite_checksum_init(skb, uh);
+-		if (err)
+-			return err;
+-
+-		if (UDP_SKB_CB(skb)->partial_cov) {
+-			skb->csum = ip6_compute_pseudo(skb, proto);
+-			return 0;
+-		}
+-	}
+-
+ 	/* To support RFC 6936 (allow zero checksum in UDP/IPV6 for tunnels)
+ 	 * we accept a checksum of zero here. When we find the socket
+ 	 * for the UDP packet we'll check if that socket allows zero checksum
+@@ -88,7 +74,7 @@ int udp6_csum_init(struct sk_buff *skb,
+ 	 * Note, we are only interested in != 0 or == 0, thus the
+ 	 * force to int.
+ 	 */
+-	err = (__force int)skb_checksum_init_zero_check(skb, proto, uh->check,
++	err = (__force int)skb_checksum_init_zero_check(skb, IPPROTO_UDP, uh->check,
+ 							ip6_compute_pseudo);
+ 	if (err)
+ 		return err;
+--- a/net/ipv6/udp.c
++++ b/net/ipv6/udp.c
+@@ -382,15 +382,13 @@ INDIRECT_CALLABLE_SCOPE
+ int udpv6_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
+ 		  int flags, int *addr_len)
+ {
++	int off, is_udp4, err, peeking = flags & MSG_PEEK;
+ 	struct ipv6_pinfo *np = inet6_sk(sk);
+ 	struct inet_sock *inet = inet_sk(sk);
+-	struct sk_buff *skb;
+-	unsigned int ulen, copied;
+-	int off, err, peeking = flags & MSG_PEEK;
+-	int is_udplite = IS_UDPLITE(sk);
+ 	struct udp_mib __percpu *mib;
+ 	bool checksum_valid = false;
+-	int is_udp4;
++	unsigned int ulen, copied;
++	struct sk_buff *skb;
+ 
+ 	if (flags & MSG_ERRQUEUE)
+ 		return ipv6_recv_error(sk, msg, len, addr_len);
+@@ -414,14 +412,10 @@ try_again:
+ 	is_udp4 = (skb->protocol == htons(ETH_P_IP));
+ 	mib = __UDPX_MIB(sk, is_udp4);
+ 
+-	/*
+-	 * If checksum is needed at all, try to do it while copying the
+-	 * data.  If the data is truncated, or if we only want a partial
+-	 * coverage checksum (UDP-Lite), do it before the copy.
++	/* If checksum is needed at all, try to do it while copying the
++	 * data.  If the data is truncated, do it before the copy.
+ 	 */
+-
+-	if (copied < ulen || peeking ||
+-	    (is_udplite && UDP_SKB_CB(skb)->partial_cov)) {
++	if (copied < ulen || peeking) {
+ 		checksum_valid = udp_skb_csum_unnecessary(skb) ||
+ 				!__udp_lib_checksum_complete(skb);
+ 		if (!checksum_valid)
+@@ -782,24 +776,6 @@ static int udpv6_queue_rcv_one_skb(struc
+ 		/* FALLTHROUGH -- it's a UDP Packet */
+ 	}
+ 
+-	/*
+-	 * UDP-Lite specific tests, ignored on UDP sockets (see net/ipv4/udp.c).
+-	 */
+-	if (udp_test_bit(UDPLITE_RECV_CC, sk) && UDP_SKB_CB(skb)->partial_cov) {
+-		u16 pcrlen = READ_ONCE(up->pcrlen);
+-
+-		if (pcrlen == 0) {          /* full coverage was set  */
+-			net_dbg_ratelimited("UDPLITE6: partial coverage %d while full coverage %d requested\n",
+-					    UDP_SKB_CB(skb)->cscov, skb->len);
+-			goto drop;
+-		}
+-		if (UDP_SKB_CB(skb)->cscov < pcrlen) {
+-			net_dbg_ratelimited("UDPLITE6: coverage %d too small, need min %d\n",
+-					    UDP_SKB_CB(skb)->cscov, pcrlen);
+-			goto drop;
+-		}
+-	}
+-
+ 	prefetch(&sk->sk_rmem_alloc);
+ 	if (rcu_access_pointer(sk->sk_filter) &&
+ 	    udp_lib_checksum_complete(skb))
+@@ -966,7 +942,7 @@ static int udp6_unicast_rcv_skb(struct s
+ {
+ 	int ret;
+ 
+-	if (inet_get_convert_csum(sk) && uh->check && !IS_UDPLITE(sk))
++	if (inet_get_convert_csum(sk) && uh->check)
+ 		skb_checksum_try_convert(skb, IPPROTO_UDP, ip6_compute_pseudo);
+ 
+ 	ret = udpv6_queue_rcv_skb(sk, skb);
+@@ -999,26 +975,22 @@ static int __udp6_lib_rcv(struct sk_buff
+ 	if (ulen > skb->len)
+ 		goto short_packet;
+ 
+-	if (proto == IPPROTO_UDP) {
+-		/* UDP validates ulen. */
++	/* Check for jumbo payload */
++	if (ulen == 0)
++		ulen = skb->len;
+ 
+-		/* Check for jumbo payload */
+-		if (ulen == 0)
+-			ulen = skb->len;
++	if (ulen < sizeof(*uh))
++		goto short_packet;
+ 
+-		if (ulen < sizeof(*uh))
++	if (ulen < skb->len) {
++		if (pskb_trim_rcsum(skb, ulen))
+ 			goto short_packet;
+-
+-		if (ulen < skb->len) {
+-			if (pskb_trim_rcsum(skb, ulen))
+-				goto short_packet;
+-			saddr = &ipv6_hdr(skb)->saddr;
+-			daddr = &ipv6_hdr(skb)->daddr;
+-			uh = udp_hdr(skb);
+-		}
++		saddr = &ipv6_hdr(skb)->saddr;
++		daddr = &ipv6_hdr(skb)->daddr;
++		uh = udp_hdr(skb);
+ 	}
+ 
+-	if (udp6_csum_init(skb, uh, proto))
++	if (udp6_csum_init(skb, uh))
+ 		goto csum_error;
+ 
+ 	/* Check if the socket is already available, e.g. due to early demux */

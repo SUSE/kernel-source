@@ -1,0 +1,560 @@
+From: Kuniyuki Iwashima <kuniyu@google.com>
+Date: Wed, 11 Mar 2026 05:19:52 +0000
+Subject: udp: Remove UDP-Lite SNMP stats.
+Patch-mainline: Queued in subsystem maintainer repository
+Git-repo: https://git.kernel.org/pub/scm/linux/kernel/git/netdev/net-next.git/
+Git-commit: 7accba6fd1ab60fb4f3a5c15c52d6fbb3af7f3a3
+References: jsc#PED-16048
+
+Since UDP and UDP-Lite shared most of the code, we have had
+to check the protocol every time we increment SNMP stats.
+
+Now that the UDP-Lite paths are dead, let's remove UDP-Lite
+SNMP stats.
+
+Signed-off-by: Kuniyuki Iwashima <kuniyu@google.com>
+Reviewed-by: Willem de Bruijn <willemb@google.com>
+Link: https://patch.msgid.link/20260311052020.1213705-6-kuniyu@google.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Fernando Fernandez Mancera <fmancera@suse.de>
+---
+ include/net/netns/mib.h |    5 ---
+ include/net/udp.h       |   46 +++++++++++------------------
+ net/ipv4/af_inet.c      |    6 ---
+ net/ipv4/proc.c         |   12 -------
+ net/ipv4/udp.c          |   74 +++++++++++++++++++-----------------------------
+ net/ipv6/af_inet6.c     |   10 +-----
+ net/ipv6/proc.c         |   14 ---------
+ net/ipv6/udp.c          |   48 ++++++++++++-------------------
+ 8 files changed, 70 insertions(+), 145 deletions(-)
+
+--- a/include/net/netns/mib.h
++++ b/include/net/netns/mib.h
+@@ -28,11 +28,6 @@ struct netns_mib {
+ 	DEFINE_SNMP_STAT(struct mptcp_mib, mptcp_statistics);
+ #endif
+ 
+-	DEFINE_SNMP_STAT(struct udp_mib, udplite_statistics);
+-#if IS_ENABLED(CONFIG_IPV6)
+-	DEFINE_SNMP_STAT(struct udp_mib, udplite_stats_in6);
+-#endif
+-
+ 	DEFINE_SNMP_STAT(struct icmp_mib, icmp_statistics);
+ 	DEFINE_SNMP_STAT_ATOMIC(struct icmpmsg_mib, icmpmsg_statistics);
+ #if IS_ENABLED(CONFIG_IPV6)
+--- a/include/net/udp.h
++++ b/include/net/udp.h
+@@ -390,38 +390,28 @@ static inline int copy_linear_skb(struct
+ }
+ 
+ /*
+- * 	SNMP statistics for UDP and UDP-Lite
++ *	SNMP statistics for UDP
+  */
+-#define UDP_INC_STATS(net, field, is_udplite)		      do { \
+-	if (is_udplite) SNMP_INC_STATS((net)->mib.udplite_statistics, field);       \
+-	else		SNMP_INC_STATS((net)->mib.udp_statistics, field);  }  while(0)
+-#define __UDP_INC_STATS(net, field, is_udplite) 	      do { \
+-	if (is_udplite) __SNMP_INC_STATS((net)->mib.udplite_statistics, field);         \
+-	else		__SNMP_INC_STATS((net)->mib.udp_statistics, field);    }  while(0)
+-
+-#define __UDP6_INC_STATS(net, field, is_udplite)	    do { \
+-	if (is_udplite) __SNMP_INC_STATS((net)->mib.udplite_stats_in6, field);\
+-	else		__SNMP_INC_STATS((net)->mib.udp_stats_in6, field);  \
+-} while(0)
+-#define UDP6_INC_STATS(net, field, __lite)		    do { \
+-	if (__lite) SNMP_INC_STATS((net)->mib.udplite_stats_in6, field);  \
+-	else	    SNMP_INC_STATS((net)->mib.udp_stats_in6, field);      \
+-} while(0)
++#define __UDP_INC_STATS(net, field)				\
++	__SNMP_INC_STATS((net)->mib.udp_statistics, field)
++#define UDP_INC_STATS(net, field)				\
++	SNMP_INC_STATS((net)->mib.udp_statistics, field)
++#define __UDP6_INC_STATS(net, field)				\
++	__SNMP_INC_STATS((net)->mib.udp_stats_in6, field)
++#define UDP6_INC_STATS(net, field)				\
++	SNMP_INC_STATS((net)->mib.udp_stats_in6, field)
+ 
+ #if IS_ENABLED(CONFIG_IPV6)
+-#define __UDPX_MIB(sk, ipv4)						\
+-({									\
+-	ipv4 ? (IS_UDPLITE(sk) ? sock_net(sk)->mib.udplite_statistics :	\
+-				 sock_net(sk)->mib.udp_statistics) :	\
+-		(IS_UDPLITE(sk) ? sock_net(sk)->mib.udplite_stats_in6 :	\
+-				 sock_net(sk)->mib.udp_stats_in6);	\
+-})
++#define __UDPX_MIB(sk, ipv4)					\
++	({							\
++		ipv4 ? sock_net(sk)->mib.udp_statistics :	\
++			sock_net(sk)->mib.udp_stats_in6;	\
++	})
+ #else
+-#define __UDPX_MIB(sk, ipv4)						\
+-({									\
+-	IS_UDPLITE(sk) ? sock_net(sk)->mib.udplite_statistics :		\
+-			 sock_net(sk)->mib.udp_statistics;		\
+-})
++#define __UDPX_MIB(sk, ipv4)					\
++	({							\
++		sock_net(sk)->mib.udp_statistics;		\
++	})
+ #endif
+ 
+ #define __UDPX_INC_STATS(sk, field) \
+--- a/net/ipv4/af_inet.c
++++ b/net/ipv4/af_inet.c
+@@ -1737,9 +1737,6 @@ static __net_init int ipv4_mib_init_net(
+ 	net->mib.udp_statistics = alloc_percpu(struct udp_mib);
+ 	if (!net->mib.udp_statistics)
+ 		goto err_udp_mib;
+-	net->mib.udplite_statistics = alloc_percpu(struct udp_mib);
+-	if (!net->mib.udplite_statistics)
+-		goto err_udplite_mib;
+ 	net->mib.icmp_statistics = alloc_percpu(struct icmp_mib);
+ 	if (!net->mib.icmp_statistics)
+ 		goto err_icmp_mib;
+@@ -1754,8 +1751,6 @@ static __net_init int ipv4_mib_init_net(
+ err_icmpmsg_mib:
+ 	free_percpu(net->mib.icmp_statistics);
+ err_icmp_mib:
+-	free_percpu(net->mib.udplite_statistics);
+-err_udplite_mib:
+ 	free_percpu(net->mib.udp_statistics);
+ err_udp_mib:
+ 	free_percpu(net->mib.net_statistics);
+@@ -1771,7 +1766,6 @@ static __net_exit void ipv4_mib_exit_net
+ {
+ 	kfree(net->mib.icmpmsg_statistics);
+ 	free_percpu(net->mib.icmp_statistics);
+-	free_percpu(net->mib.udplite_statistics);
+ 	free_percpu(net->mib.udp_statistics);
+ 	free_percpu(net->mib.net_statistics);
+ 	free_percpu(net->mib.ip_statistics);
+--- a/net/ipv4/proc.c
++++ b/net/ipv4/proc.c
+@@ -440,18 +440,6 @@ static int snmp_seq_show_tcp_udp(struct
+ 	for (i = 0; snmp4_udp_list[i].name; i++)
+ 		seq_printf(seq, " %lu", buff[i]);
+ 
+-	memset(buff, 0, TCPUDP_MIB_MAX * sizeof(unsigned long));
+-
+-	/* the UDP and UDP-Lite MIBs are the same */
+-	seq_puts(seq, "\nUdpLite:");
+-	snmp_get_cpu_field_batch(buff, snmp4_udp_list,
+-				 net->mib.udplite_statistics);
+-	for (i = 0; snmp4_udp_list[i].name; i++)
+-		seq_printf(seq, " %s", snmp4_udp_list[i].name);
+-	seq_puts(seq, "\nUdpLite:");
+-	for (i = 0; snmp4_udp_list[i].name; i++)
+-		seq_printf(seq, " %lu", buff[i]);
+-
+ 	seq_putc(seq, '\n');
+ 	return 0;
+ }
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -1043,13 +1043,12 @@ send:
+ 	if (err) {
+ 		if (err == -ENOBUFS &&
+ 		    !inet_test_bit(RECVERR, sk)) {
+-			UDP_INC_STATS(sock_net(sk),
+-				      UDP_MIB_SNDBUFERRORS, is_udplite);
++			UDP_INC_STATS(sock_net(sk), UDP_MIB_SNDBUFERRORS);
+ 			err = 0;
+ 		}
+-	} else
+-		UDP_INC_STATS(sock_net(sk),
+-			      UDP_MIB_OUTDATAGRAMS, is_udplite);
++	} else {
++		UDP_INC_STATS(sock_net(sk), UDP_MIB_OUTDATAGRAMS);
++	}
+ 	return err;
+ }
+ 
+@@ -1378,10 +1377,9 @@ out_free:
+ 	 * things).  We could add another new stat but at least for now that
+ 	 * seems like overkill.
+ 	 */
+-	if (err == -ENOBUFS || test_bit(SOCK_NOSPACE, &sk->sk_socket->flags)) {
+-		UDP_INC_STATS(sock_net(sk),
+-			      UDP_MIB_SNDBUFERRORS, is_udplite);
+-	}
++	if (err == -ENOBUFS || test_bit(SOCK_NOSPACE, &sk->sk_socket->flags))
++		UDP_INC_STATS(sock_net(sk), UDP_MIB_SNDBUFERRORS);
++
+ 	return err;
+ 
+ do_confirm:
+@@ -1694,10 +1692,8 @@ static struct sk_buff *__first_packet_le
+ 
+ 	while ((skb = skb_peek(rcvq)) != NULL) {
+ 		if (udp_lib_checksum_complete(skb)) {
+-			__UDP_INC_STATS(sock_net(sk), UDP_MIB_CSUMERRORS,
+-					IS_UDPLITE(sk));
+-			__UDP_INC_STATS(sock_net(sk), UDP_MIB_INERRORS,
+-					IS_UDPLITE(sk));
++			__UDP_INC_STATS(sock_net(sk), UDP_MIB_CSUMERRORS);
++			__UDP_INC_STATS(sock_net(sk), UDP_MIB_INERRORS);
+ 			atomic_inc(&sk->sk_drops);
+ 			__skb_unlink(skb, rcvq);
+ 			*total += skb->truesize;
+@@ -1849,11 +1845,8 @@ try_again:
+ 		return err;
+ 
+ 	if (udp_lib_checksum_complete(skb)) {
+-		int is_udplite = IS_UDPLITE(sk);
+-		struct net *net = sock_net(sk);
+-
+-		__UDP_INC_STATS(net, UDP_MIB_CSUMERRORS, is_udplite);
+-		__UDP_INC_STATS(net, UDP_MIB_INERRORS, is_udplite);
++		__UDP_INC_STATS(sock_net(sk), UDP_MIB_CSUMERRORS);
++		__UDP_INC_STATS(sock_net(sk), UDP_MIB_INERRORS);
+ 		atomic_inc(&sk->sk_drops);
+ 		kfree_skb(skb);
+ 		goto try_again;
+@@ -1879,6 +1872,7 @@ int udp_recvmsg(struct sock *sk, struct
+ 	unsigned int ulen, copied;
+ 	int off, err, peeking = flags & MSG_PEEK;
+ 	int is_udplite = IS_UDPLITE(sk);
++	struct net *net = sock_net(sk);
+ 	bool checksum_valid = false;
+ 
+ 	if (flags & MSG_ERRQUEUE)
+@@ -1927,15 +1921,14 @@ try_again:
+ 		if (!peeking) {
+ 			atomic_inc(&sk->sk_drops);
+ 			UDP_INC_STATS(sock_net(sk),
+-				      UDP_MIB_INERRORS, is_udplite);
++				      UDP_MIB_INERRORS);
+ 		}
+ 		kfree_skb(skb);
+ 		return err;
+ 	}
+ 
+ 	if (!peeking)
+-		UDP_INC_STATS(sock_net(sk),
+-			      UDP_MIB_INDATAGRAMS, is_udplite);
++		UDP_INC_STATS(net, UDP_MIB_INDATAGRAMS);
+ 
+ 	sock_recv_cmsgs(msg, sk, skb);
+ 
+@@ -1968,8 +1961,8 @@ try_again:
+ csum_copy_err:
+ 	if (!__sk_queue_drop_skb(sk, &udp_sk(sk)->reader_queue, skb, flags,
+ 				 udp_skb_destructor)) {
+-		UDP_INC_STATS(sock_net(sk), UDP_MIB_CSUMERRORS, is_udplite);
+-		UDP_INC_STATS(sock_net(sk), UDP_MIB_INERRORS, is_udplite);
++		UDP_INC_STATS(net, UDP_MIB_CSUMERRORS);
++		UDP_INC_STATS(net, UDP_MIB_INERRORS);
+ 	}
+ 	kfree_skb(skb);
+ 
+@@ -2120,20 +2113,18 @@ static int __udp_queue_rcv_skb(struct so
+ 
+ 	rc = __udp_enqueue_schedule_skb(sk, skb);
+ 	if (rc < 0) {
+-		int is_udplite = IS_UDPLITE(sk);
++		struct net *net = sock_net(sk);
+ 		int drop_reason;
+ 
+ 		/* Note that an ENOMEM error is charged twice */
+ 		if (rc == -ENOMEM) {
+-			UDP_INC_STATS(sock_net(sk), UDP_MIB_RCVBUFERRORS,
+-					is_udplite);
++			UDP_INC_STATS(net, UDP_MIB_RCVBUFERRORS);
+ 			drop_reason = SKB_DROP_REASON_SOCKET_RCVBUFF;
+ 		} else {
+-			UDP_INC_STATS(sock_net(sk), UDP_MIB_MEMERRORS,
+-				      is_udplite);
++			UDP_INC_STATS(net, UDP_MIB_MEMERRORS);
+ 			drop_reason = SKB_DROP_REASON_PROTO_MEM;
+ 		}
+-		UDP_INC_STATS(sock_net(sk), UDP_MIB_INERRORS, is_udplite);
++		UDP_INC_STATS(net, UDP_MIB_INERRORS);
+ 		trace_udp_fail_queue_rcv_skb(rc, sk, skb);
+ 		sk_skb_reason_drop(sk, skb, drop_reason);
+ 		return -1;
+@@ -2154,7 +2145,7 @@ static int udp_queue_rcv_one_skb(struct
+ {
+ 	int drop_reason = SKB_DROP_REASON_NOT_SPECIFIED;
+ 	struct udp_sock *up = udp_sk(sk);
+-	int is_udplite = IS_UDPLITE(sk);
++	struct net *net = sock_net(sk);
+ 
+ 	/*
+ 	 *	Charge it to the socket, dropping if the queue is full.
+@@ -2191,9 +2182,7 @@ static int udp_queue_rcv_one_skb(struct
+ 
+ 			ret = encap_rcv(sk, skb);
+ 			if (ret <= 0) {
+-				__UDP_INC_STATS(sock_net(sk),
+-						UDP_MIB_INDATAGRAMS,
+-						is_udplite);
++				__UDP_INC_STATS(net, UDP_MIB_INDATAGRAMS);
+ 				return -ret;
+ 			}
+ 		}
+@@ -2253,9 +2242,9 @@ static int udp_queue_rcv_one_skb(struct
+ 
+ csum_error:
+ 	drop_reason = SKB_DROP_REASON_UDP_CSUM;
+-	__UDP_INC_STATS(sock_net(sk), UDP_MIB_CSUMERRORS, is_udplite);
++	__UDP_INC_STATS(net, UDP_MIB_CSUMERRORS);
+ drop:
+-	__UDP_INC_STATS(sock_net(sk), UDP_MIB_INERRORS, is_udplite);
++	__UDP_INC_STATS(sock_net(sk), UDP_MIB_INERRORS);
+ 	atomic_inc(&sk->sk_drops);
+ 	sk_skb_reason_drop(sk, skb, drop_reason);
+ 	return -1;
+@@ -2342,10 +2331,8 @@ start_lookup:
+ 
+ 		if (unlikely(!nskb)) {
+ 			atomic_inc(&sk->sk_drops);
+-			__UDP_INC_STATS(net, UDP_MIB_RCVBUFERRORS,
+-					IS_UDPLITE(sk));
+-			__UDP_INC_STATS(net, UDP_MIB_INERRORS,
+-					IS_UDPLITE(sk));
++			__UDP_INC_STATS(net, UDP_MIB_RCVBUFERRORS);
++			__UDP_INC_STATS(net, UDP_MIB_INERRORS);
+ 			continue;
+ 		}
+ 		if (udp_queue_rcv_skb(sk, nskb) > 0)
+@@ -2363,8 +2350,7 @@ start_lookup:
+ 			consume_skb(skb);
+ 	} else {
+ 		kfree_skb(skb);
+-		__UDP_INC_STATS(net, UDP_MIB_IGNOREDMULTI,
+-				proto == IPPROTO_UDPLITE);
++		__UDP_INC_STATS(net, UDP_MIB_IGNOREDMULTI);
+ 	}
+ 	return 0;
+ }
+@@ -2514,7 +2500,7 @@ no_sk:
+ 		goto csum_error;
+ 
+ 	drop_reason = SKB_DROP_REASON_NO_SOCKET;
+-	__UDP_INC_STATS(net, UDP_MIB_NOPORTS, proto == IPPROTO_UDPLITE);
++	__UDP_INC_STATS(net, UDP_MIB_NOPORTS);
+ 	icmp_send(skb, ICMP_DEST_UNREACH, ICMP_PORT_UNREACH, 0);
+ 
+ 	/*
+@@ -2543,9 +2529,9 @@ csum_error:
+ 			    proto == IPPROTO_UDPLITE ? "Lite" : "",
+ 			    &saddr, ntohs(uh->source), &daddr, ntohs(uh->dest),
+ 			    ulen);
+-	__UDP_INC_STATS(net, UDP_MIB_CSUMERRORS, proto == IPPROTO_UDPLITE);
++	__UDP_INC_STATS(net, UDP_MIB_CSUMERRORS);
+ drop:
+-	__UDP_INC_STATS(net, UDP_MIB_INERRORS, proto == IPPROTO_UDPLITE);
++	__UDP_INC_STATS(net, UDP_MIB_INERRORS);
+ 	sk_skb_reason_drop(sk, skb, drop_reason);
+ 	return 0;
+ }
+--- a/net/ipv6/af_inet6.c
++++ b/net/ipv6/af_inet6.c
+@@ -902,9 +902,7 @@ static int __net_init ipv6_init_mibs(str
+ 	net->mib.udp_stats_in6 = alloc_percpu(struct udp_mib);
+ 	if (!net->mib.udp_stats_in6)
+ 		return -ENOMEM;
+-	net->mib.udplite_stats_in6 = alloc_percpu(struct udp_mib);
+-	if (!net->mib.udplite_stats_in6)
+-		goto err_udplite_mib;
++
+ 	net->mib.ipv6_statistics = alloc_percpu(struct ipstats_mib);
+ 	if (!net->mib.ipv6_statistics)
+ 		goto err_ip_mib;
+@@ -915,12 +913,13 @@ static int __net_init ipv6_init_mibs(str
+ 		u64_stats_init(&af_inet6_stats->syncp);
+ 	}
+ 
+-
+ 	net->mib.icmpv6_statistics = alloc_percpu(struct icmpv6_mib);
+ 	if (!net->mib.icmpv6_statistics)
+ 		goto err_icmp_mib;
++
+ 	net->mib.icmpv6msg_statistics = kzalloc(sizeof(struct icmpv6msg_mib),
+ 						GFP_KERNEL);
++
+ 	if (!net->mib.icmpv6msg_statistics)
+ 		goto err_icmpmsg_mib;
+ 	return 0;
+@@ -930,8 +929,6 @@ err_icmpmsg_mib:
+ err_icmp_mib:
+ 	free_percpu(net->mib.ipv6_statistics);
+ err_ip_mib:
+-	free_percpu(net->mib.udplite_stats_in6);
+-err_udplite_mib:
+ 	free_percpu(net->mib.udp_stats_in6);
+ 	return -ENOMEM;
+ }
+@@ -939,7 +936,6 @@ err_udplite_mib:
+ static void ipv6_cleanup_mibs(struct net *net)
+ {
+ 	free_percpu(net->mib.udp_stats_in6);
+-	free_percpu(net->mib.udplite_stats_in6);
+ 	free_percpu(net->mib.ipv6_statistics);
+ 	free_percpu(net->mib.icmpv6_statistics);
+ 	kfree(net->mib.icmpv6msg_statistics);
+--- a/net/ipv6/proc.c
++++ b/net/ipv6/proc.c
+@@ -130,18 +130,6 @@ static const struct snmp_mib snmp6_udp6_
+ 	SNMP_MIB_SENTINEL
+ };
+ 
+-static const struct snmp_mib snmp6_udplite6_list[] = {
+-	SNMP_MIB_ITEM("UdpLite6InDatagrams", UDP_MIB_INDATAGRAMS),
+-	SNMP_MIB_ITEM("UdpLite6NoPorts", UDP_MIB_NOPORTS),
+-	SNMP_MIB_ITEM("UdpLite6InErrors", UDP_MIB_INERRORS),
+-	SNMP_MIB_ITEM("UdpLite6OutDatagrams", UDP_MIB_OUTDATAGRAMS),
+-	SNMP_MIB_ITEM("UdpLite6RcvbufErrors", UDP_MIB_RCVBUFERRORS),
+-	SNMP_MIB_ITEM("UdpLite6SndbufErrors", UDP_MIB_SNDBUFERRORS),
+-	SNMP_MIB_ITEM("UdpLite6InCsumErrors", UDP_MIB_CSUMERRORS),
+-	SNMP_MIB_ITEM("UdpLite6MemErrors", UDP_MIB_MEMERRORS),
+-	SNMP_MIB_SENTINEL
+-};
+-
+ static void snmp6_seq_show_icmpv6msg(struct seq_file *seq, atomic_long_t *smib)
+ {
+ 	char name[32];
+@@ -223,8 +211,6 @@ static int snmp6_seq_show(struct seq_fil
+ 	snmp6_seq_show_icmpv6msg(seq, net->mib.icmpv6msg_statistics->mibs);
+ 	snmp6_seq_show_item(seq, net->mib.udp_stats_in6,
+ 			    NULL, snmp6_udp6_list);
+-	snmp6_seq_show_item(seq, net->mib.udplite_stats_in6,
+-			    NULL, snmp6_udplite6_list);
+ 	return 0;
+ }
+ 
+--- a/net/ipv6/udp.c
++++ b/net/ipv6/udp.c
+@@ -709,20 +709,18 @@ static int __udpv6_queue_rcv_skb(struct
+ 
+ 	rc = __udp_enqueue_schedule_skb(sk, skb);
+ 	if (rc < 0) {
+-		int is_udplite = IS_UDPLITE(sk);
+ 		enum skb_drop_reason drop_reason;
++		struct net *net = sock_net(sk);
+ 
+ 		/* Note that an ENOMEM error is charged twice */
+ 		if (rc == -ENOMEM) {
+-			UDP6_INC_STATS(sock_net(sk),
+-					 UDP_MIB_RCVBUFERRORS, is_udplite);
++			UDP6_INC_STATS(net, UDP_MIB_RCVBUFERRORS);
+ 			drop_reason = SKB_DROP_REASON_SOCKET_RCVBUFF;
+ 		} else {
+-			UDP6_INC_STATS(sock_net(sk),
+-				       UDP_MIB_MEMERRORS, is_udplite);
++			UDP6_INC_STATS(net, UDP_MIB_MEMERRORS);
+ 			drop_reason = SKB_DROP_REASON_PROTO_MEM;
+ 		}
+-		UDP6_INC_STATS(sock_net(sk), UDP_MIB_INERRORS, is_udplite);
++		UDP6_INC_STATS(net, UDP_MIB_INERRORS);
+ 		trace_udp_fail_queue_rcv_skb(rc, sk, skb);
+ 		sk_skb_reason_drop(sk, skb, drop_reason);
+ 		return -1;
+@@ -743,7 +741,7 @@ static int udpv6_queue_rcv_one_skb(struc
+ {
+ 	enum skb_drop_reason drop_reason = SKB_DROP_REASON_NOT_SPECIFIED;
+ 	struct udp_sock *up = udp_sk(sk);
+-	int is_udplite = IS_UDPLITE(sk);
++	struct net *net = sock_net(sk);
+ 
+ 	if (!xfrm6_policy_check(sk, XFRM_POLICY_IN, skb)) {
+ 		drop_reason = SKB_DROP_REASON_XFRM_POLICY;
+@@ -777,9 +775,7 @@ static int udpv6_queue_rcv_one_skb(struc
+ 
+ 			ret = encap_rcv(sk, skb);
+ 			if (ret <= 0) {
+-				__UDP6_INC_STATS(sock_net(sk),
+-						 UDP_MIB_INDATAGRAMS,
+-						 is_udplite);
++				__UDP6_INC_STATS(net, UDP_MIB_INDATAGRAMS);
+ 				return -ret;
+ 			}
+ 		}
+@@ -823,9 +819,9 @@ static int udpv6_queue_rcv_one_skb(struc
+ 
+ csum_error:
+ 	drop_reason = SKB_DROP_REASON_UDP_CSUM;
+-	__UDP6_INC_STATS(sock_net(sk), UDP_MIB_CSUMERRORS, is_udplite);
++	__UDP6_INC_STATS(net, UDP_MIB_CSUMERRORS);
+ drop:
+-	__UDP6_INC_STATS(sock_net(sk), UDP_MIB_INERRORS, is_udplite);
++	__UDP6_INC_STATS(sock_net(sk), UDP_MIB_INERRORS);
+ 	atomic_inc(&sk->sk_drops);
+ 	sk_skb_reason_drop(sk, skb, drop_reason);
+ 	return -1;
+@@ -932,10 +928,8 @@ start_lookup:
+ 		nskb = skb_clone(skb, GFP_ATOMIC);
+ 		if (unlikely(!nskb)) {
+ 			atomic_inc(&sk->sk_drops);
+-			__UDP6_INC_STATS(net, UDP_MIB_RCVBUFERRORS,
+-					 IS_UDPLITE(sk));
+-			__UDP6_INC_STATS(net, UDP_MIB_INERRORS,
+-					 IS_UDPLITE(sk));
++			__UDP6_INC_STATS(net, UDP_MIB_RCVBUFERRORS);
++			__UDP6_INC_STATS(net, UDP_MIB_INERRORS);
+ 			continue;
+ 		}
+ 
+@@ -954,8 +948,7 @@ start_lookup:
+ 			consume_skb(skb);
+ 	} else {
+ 		kfree_skb(skb);
+-		__UDP6_INC_STATS(net, UDP_MIB_IGNOREDMULTI,
+-				 proto == IPPROTO_UDPLITE);
++		__UDP6_INC_STATS(net, UDP_MIB_IGNOREDMULTI);
+ 	}
+ 	return 0;
+ }
+@@ -1081,7 +1074,7 @@ no_sk:
+ 	if (udp_lib_checksum_complete(skb))
+ 		goto csum_error;
+ 
+-	__UDP6_INC_STATS(net, UDP_MIB_NOPORTS, proto == IPPROTO_UDPLITE);
++	__UDP6_INC_STATS(net, UDP_MIB_NOPORTS);
+ 	icmpv6_send(skb, ICMPV6_DEST_UNREACH, ICMPV6_PORT_UNREACH, 0);
+ 
+ 	sk_skb_reason_drop(sk, skb, reason);
+@@ -1102,9 +1095,9 @@ report_csum_error:
+ csum_error:
+ 	if (reason == SKB_DROP_REASON_NOT_SPECIFIED)
+ 		reason = SKB_DROP_REASON_UDP_CSUM;
+-	__UDP6_INC_STATS(net, UDP_MIB_CSUMERRORS, proto == IPPROTO_UDPLITE);
++	__UDP6_INC_STATS(net, UDP_MIB_CSUMERRORS);
+ discard:
+-	__UDP6_INC_STATS(net, UDP_MIB_INERRORS, proto == IPPROTO_UDPLITE);
++	__UDP6_INC_STATS(net, UDP_MIB_INERRORS);
+ 	sk_skb_reason_drop(sk, skb, reason);
+ 	return 0;
+ }
+@@ -1346,13 +1339,11 @@ send:
+ 	err = ip6_send_skb(skb);
+ 	if (err) {
+ 		if (err == -ENOBUFS && !inet6_test_bit(RECVERR6, sk)) {
+-			UDP6_INC_STATS(sock_net(sk),
+-				       UDP_MIB_SNDBUFERRORS, is_udplite);
++			UDP6_INC_STATS(sock_net(sk), UDP_MIB_SNDBUFERRORS);
+ 			err = 0;
+ 		}
+ 	} else {
+-		UDP6_INC_STATS(sock_net(sk),
+-			       UDP_MIB_OUTDATAGRAMS, is_udplite);
++		UDP6_INC_STATS(sock_net(sk), UDP_MIB_OUTDATAGRAMS);
+ 	}
+ 	return err;
+ }
+@@ -1689,10 +1680,9 @@ out_no_dst:
+ 	 * things).  We could add another new stat but at least for now that
+ 	 * seems like overkill.
+ 	 */
+-	if (err == -ENOBUFS || test_bit(SOCK_NOSPACE, &sk->sk_socket->flags)) {
+-		UDP6_INC_STATS(sock_net(sk),
+-			       UDP_MIB_SNDBUFERRORS, is_udplite);
+-	}
++	if (err == -ENOBUFS || test_bit(SOCK_NOSPACE, &sk->sk_socket->flags))
++		UDP6_INC_STATS(sock_net(sk), UDP_MIB_SNDBUFERRORS);
++
+ 	return err;
+ 
+ do_confirm:
