@@ -112,7 +112,7 @@ class API:
                                                    NonRaisingHTTPErrorProcessor(), cp)
 
     def __del__(self):
-        if self._to_close:
+        if hasattr(self, '_to_close') and self._to_close:
             self._to_close.close()
 
     def redact_auth(self, string):
