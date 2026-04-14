@@ -1,0 +1,242 @@
+From 567ccdd6a2ceb188b3c0f75b7b7d03ec6e5eefa3 Mon Sep 17 00:00:00 2001
+From: Ranjan Kumar <ranjan.kumar@broadcom.com>
+Date: Fri, 16 Jan 2026 11:37:15 +0530
+Subject: [PATCH] scsi: mpi3mr: Use negotiated link rate from DevicePage0
+Git-commit: c273c14b0294f11ce45afc4da2e8f91ab3f07270
+Patch-mainline: v7.0
+References: jsc#PED-15352
+
+Firmware populates the negotiated SAS link rate in DevicePage0 during
+device discovery. Update mpi3mr to cache this value while initializing
+the target device.
+
+When available, the cached link rate is used instead of issuing
+additional SAS PHY or expander PHY page reads.  If the DevicePage0 value
+is missing or invalid, the driver falls back to the existing PHY-based
+mechanism.
+
+Signed-off-by: Ranjan Kumar <ranjan.kumar@broadcom.com>
+Link: https://patch.msgid.link/20260116060719.32937-5-ranjan.kumar@broadcom.com
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit c273c14b0294f11ce45afc4da2e8f91ab3f07270)
+Signed-off-by: Ales Novak <alnovak@suse.com>
+---
+ drivers/scsi/mpi3mr/mpi/mpi30_cnfg.h   |  2 +
+ drivers/scsi/mpi3mr/mpi3mr.h           |  2 +
+ drivers/scsi/mpi3mr/mpi3mr_os.c        | 89 ++++++++++++++++++++++++++
+ drivers/scsi/mpi3mr/mpi3mr_transport.c | 30 +++++----
+ 4 files changed, 111 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/scsi/mpi3mr/mpi/mpi30_cnfg.h b/drivers/scsi/mpi3mr/mpi/mpi30_cnfg.h
+index 8c8bfbbdd34e6..67d72b82cbe0e 100644
+--- a/drivers/scsi/mpi3mr/mpi/mpi30_cnfg.h
++++ b/drivers/scsi/mpi3mr/mpi/mpi30_cnfg.h
+@@ -2314,6 +2314,8 @@ struct mpi3_device0_sas_sata_format {
+ 	u8         attached_phy_identifier;
+ 	u8         max_port_connections;
+ 	u8         zone_group;
++	u8         reserved10[3];
++	u8         negotiated_link_rate;
+ };
+ 
+ #define MPI3_DEVICE0_SASSATA_FLAGS_WRITE_SAME_UNMAP_NCQ (0x0400)
+diff --git a/drivers/scsi/mpi3mr/mpi3mr.h b/drivers/scsi/mpi3mr/mpi3mr.h
+index 611a51a353c97..590c017acf25c 100644
+--- a/drivers/scsi/mpi3mr/mpi3mr.h
++++ b/drivers/scsi/mpi3mr/mpi3mr.h
+@@ -643,6 +643,7 @@ struct mpi3mr_enclosure_node {
+  * @dev_info: Device information bits
+  * @phy_id: Phy identifier provided in device page 0
+  * @attached_phy_id: Attached phy identifier provided in device page 0
++ * @negotiated_link_rate: Negotiated link rate from device page 0
+  * @sas_transport_attached: Is this device exposed to transport
+  * @pend_sas_rphy_add: Flag to check device is in process of add
+  * @hba_port: HBA port entry
+@@ -654,6 +655,7 @@ struct tgt_dev_sas_sata {
+ 	u16 dev_info;
+ 	u8 phy_id;
+ 	u8 attached_phy_id;
++	u8 negotiated_link_rate;
+ 	u8 sas_transport_attached;
+ 	u8 pend_sas_rphy_add;
+ 	struct mpi3mr_hba_port *hba_port;
+diff --git a/drivers/scsi/mpi3mr/mpi3mr_os.c b/drivers/scsi/mpi3mr/mpi3mr_os.c
+index 17fe9a722feea..75757ba59d74a 100644
+--- a/drivers/scsi/mpi3mr/mpi3mr_os.c
++++ b/drivers/scsi/mpi3mr/mpi3mr_os.c
+@@ -1138,6 +1138,89 @@ static void mpi3mr_refresh_tgtdevs(struct mpi3mr_ioc *mrioc)
+ 	}
+ }
+ 
++/**
++ * mpi3mr_debug_dump_devpg0 - Dump device page0
++ * @mrioc: Adapter instance reference
++ * @dev_pg0: Device page 0.
++ *
++ * Prints pertinent details of the device page 0.
++ *
++ * Return: Nothing.
++ */
++static void
++mpi3mr_debug_dump_devpg0(struct mpi3mr_ioc *mrioc, struct mpi3_device_page0 *dev_pg0)
++{
++	ioc_info(mrioc,
++	    "device_pg0: handle(0x%04x), perst_id(%d), wwid(0x%016llx), encl_handle(0x%04x), slot(%d)\n",
++	    le16_to_cpu(dev_pg0->dev_handle),
++	    le16_to_cpu(dev_pg0->persistent_id),
++	    le64_to_cpu(dev_pg0->wwid), le16_to_cpu(dev_pg0->enclosure_handle),
++	    le16_to_cpu(dev_pg0->slot));
++	ioc_info(mrioc, "device_pg0: access_status(0x%02x), flags(0x%04x), device_form(0x%02x), queue_depth(%d)\n",
++	    dev_pg0->access_status, le16_to_cpu(dev_pg0->flags),
++	    dev_pg0->device_form, le16_to_cpu(dev_pg0->queue_depth));
++	ioc_info(mrioc, "device_pg0: parent_handle(0x%04x), iounit_port(%d)\n",
++	    le16_to_cpu(dev_pg0->parent_dev_handle), dev_pg0->io_unit_port);
++
++	switch (dev_pg0->device_form) {
++	case MPI3_DEVICE_DEVFORM_SAS_SATA:
++	{
++
++		struct mpi3_device0_sas_sata_format *sasinf =
++		    &dev_pg0->device_specific.sas_sata_format;
++		ioc_info(mrioc,
++		    "device_pg0: sas_sata: sas_address(0x%016llx),flags(0x%04x),\n"
++		    "device_info(0x%04x), phy_num(%d), attached_phy_id(%d),negotiated_link_rate(0x%02x)\n",
++		    le64_to_cpu(sasinf->sas_address),
++		    le16_to_cpu(sasinf->flags),
++		    le16_to_cpu(sasinf->device_info), sasinf->phy_num,
++		    sasinf->attached_phy_identifier, sasinf->negotiated_link_rate);
++		break;
++	}
++	case MPI3_DEVICE_DEVFORM_PCIE:
++	{
++
++		struct mpi3_device0_pcie_format *pcieinf =
++		    &dev_pg0->device_specific.pcie_format;
++		ioc_info(mrioc,
++		    "device_pg0: pcie: port_num(%d), device_info(0x%04x), mdts(%d), page_sz(0x%02x)\n",
++		    pcieinf->port_num, le16_to_cpu(pcieinf->device_info),
++		    le32_to_cpu(pcieinf->maximum_data_transfer_size),
++		    pcieinf->page_size);
++		ioc_info(mrioc,
++		    "device_pg0: pcie: abort_timeout(%d), reset_timeout(%d) capabilities (0x%08x)\n",
++		    pcieinf->nvme_abort_to, pcieinf->controller_reset_to,
++		    le32_to_cpu(pcieinf->capabilities));
++		break;
++	}
++	case MPI3_DEVICE_DEVFORM_VD:
++	{
++
++		struct mpi3_device0_vd_format *vdinf =
++		    &dev_pg0->device_specific.vd_format;
++
++		ioc_info(mrioc,
++		    "device_pg0: vd: state(0x%02x), raid_level(%d), flags(0x%04x),\n"
++		    "device_info(0x%04x) abort_timeout(%d), reset_timeout(%d)\n",
++		    vdinf->vd_state, vdinf->raid_level,
++		    le16_to_cpu(vdinf->flags),
++		    le16_to_cpu(vdinf->device_info),
++		    vdinf->vd_abort_to, vdinf->vd_reset_to);
++		ioc_info(mrioc,
++		    "device_pg0: vd: tg_id(%d), high(%dMiB), low(%dMiB), qd_reduction_factor(%d)\n",
++		    vdinf->io_throttle_group,
++		    le16_to_cpu(vdinf->io_throttle_group_high),
++		    le16_to_cpu(vdinf->io_throttle_group_low),
++		    ((le16_to_cpu(vdinf->flags) &
++		       MPI3_DEVICE0_VD_FLAGS_IO_THROTTLE_GROUP_QD_MASK) >> 12));
++		break;
++
++	}
++	default:
++		break;
++	}
++}
++
+ /**
+  * mpi3mr_update_tgtdev - DevStatusChange evt bottomhalf
+  * @mrioc: Adapter instance reference
+@@ -1159,6 +1242,10 @@ static void mpi3mr_update_tgtdev(struct mpi3mr_ioc *mrioc,
+ 	struct mpi3mr_enclosure_node *enclosure_dev = NULL;
+ 	u8 prot_mask = 0;
+ 
++	if (mrioc->logging_level &
++	    (MPI3_DEBUG_EVENT | MPI3_DEBUG_EVENT_WORK_TASK))
++		mpi3mr_debug_dump_devpg0(mrioc, dev_pg0);
++
+ 	tgtdev->perst_id = le16_to_cpu(dev_pg0->persistent_id);
+ 	tgtdev->dev_handle = le16_to_cpu(dev_pg0->dev_handle);
+ 	tgtdev->dev_type = dev_pg0->device_form;
+@@ -1237,6 +1324,8 @@ static void mpi3mr_update_tgtdev(struct mpi3mr_ioc *mrioc,
+ 		tgtdev->dev_spec.sas_sata_inf.phy_id = sasinf->phy_num;
+ 		tgtdev->dev_spec.sas_sata_inf.attached_phy_id =
+ 		    sasinf->attached_phy_identifier;
++		tgtdev->dev_spec.sas_sata_inf.negotiated_link_rate =
++			sasinf->negotiated_link_rate;
+ 		if ((dev_info & MPI3_SAS_DEVICE_INFO_DEVICE_TYPE_MASK) !=
+ 		    MPI3_SAS_DEVICE_INFO_DEVICE_TYPE_END_DEVICE)
+ 			tgtdev->is_hidden = 1;
+diff --git a/drivers/scsi/mpi3mr/mpi3mr_transport.c b/drivers/scsi/mpi3mr/mpi3mr_transport.c
+index a76ae88eaec5a..8bcfb915b48ed 100644
+--- a/drivers/scsi/mpi3mr/mpi3mr_transport.c
++++ b/drivers/scsi/mpi3mr/mpi3mr_transport.c
+@@ -2284,11 +2284,11 @@ void mpi3mr_expander_remove(struct mpi3mr_ioc *mrioc, u64 sas_address,
+  * @mrioc: Adapter instance reference
+  * @tgtdev: Target device
+  *
+- * This function identifies whether the target device is
+- * attached directly or through expander and issues sas phy
+- * page0 or expander phy page1 and gets the link rate, if there
+- * is any failure in reading the pages then this returns link
+- * rate of 1.5.
++ * This function first tries to use the link rate from DevicePage0
++ * (populated by firmware during device discovery). If the cached
++ * value is not available or invalid, it falls back to reading from
++ * sas phy page0 or expander phy page1.
++ *
+  *
+  * Return: logical link rate.
+  */
+@@ -2301,6 +2301,14 @@ static u8 mpi3mr_get_sas_negotiated_logical_linkrate(struct mpi3mr_ioc *mrioc,
+ 	u32 phynum_handle;
+ 	u16 ioc_status;
+ 
++	/* First, try to use link rate from DevicePage0 (populated by firmware) */
++	if (tgtdev->dev_spec.sas_sata_inf.negotiated_link_rate >=
++	    MPI3_SAS_NEG_LINK_RATE_1_5) {
++		link_rate = tgtdev->dev_spec.sas_sata_inf.negotiated_link_rate;
++		goto out;
++	}
++
++	/* Fallback to reading from phy pages if DevicePage0 value not available */
+ 	phy_number = tgtdev->dev_spec.sas_sata_inf.phy_id;
+ 	if (!(tgtdev->devpg0_flag & MPI3_DEVICE0_FLAGS_ATT_METHOD_DIR_ATTACHED)) {
+ 		phynum_handle = ((phy_number<<MPI3_SAS_EXPAND_PGAD_PHYNUM_SHIFT)
+@@ -2318,9 +2326,7 @@ static u8 mpi3mr_get_sas_negotiated_logical_linkrate(struct mpi3mr_ioc *mrioc,
+ 			    __FILE__, __LINE__, __func__);
+ 			goto out;
+ 		}
+-		link_rate = (expander_pg1.negotiated_link_rate &
+-			     MPI3_SAS_NEG_LINK_RATE_LOGICAL_MASK) >>
+-			MPI3_SAS_NEG_LINK_RATE_LOGICAL_SHIFT;
++		link_rate = expander_pg1.negotiated_link_rate;
+ 		goto out;
+ 	}
+ 	if (mpi3mr_cfg_get_sas_phy_pg0(mrioc, &ioc_status, &phy_pg0,
+@@ -2335,11 +2341,11 @@ static u8 mpi3mr_get_sas_negotiated_logical_linkrate(struct mpi3mr_ioc *mrioc,
+ 		    __FILE__, __LINE__, __func__);
+ 		goto out;
+ 	}
+-	link_rate = (phy_pg0.negotiated_link_rate &
+-		     MPI3_SAS_NEG_LINK_RATE_LOGICAL_MASK) >>
+-		MPI3_SAS_NEG_LINK_RATE_LOGICAL_SHIFT;
++	link_rate = phy_pg0.negotiated_link_rate;
++
+ out:
+-	return link_rate;
++	return ((link_rate & MPI3_SAS_NEG_LINK_RATE_LOGICAL_MASK) >>
++		MPI3_SAS_NEG_LINK_RATE_LOGICAL_SHIFT);
+ }
+ 
+ /**
+-- 
+2.53.0
+
