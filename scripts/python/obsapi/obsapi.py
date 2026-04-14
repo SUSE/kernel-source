@@ -72,7 +72,7 @@ class OBSAPI(api.API):
         try:
             self.cookiejar.load()
         except FileNotFoundError:
-            None
+            pass
         except Exception as e:
             sys.stderr.write("Error loading cookies: %s\n" % (repr(e),))
         cp = configparser.ConfigParser(delimiters=('=', ':'), interpolation=None)
@@ -90,6 +90,7 @@ class OBSAPI(api.API):
         if not self.user:
             raise RuntimeError('No username found in ' + self.url + ' configuration.')
         self.sshkey = None
+        self.passw = None
         if 'sshkey' in config:
             self.sshkey = config['sshkey']
             self.sshkey = expand_home(self.sshkey)
@@ -123,9 +124,17 @@ class OBSAPI(api.API):
             fn = os.path.join(td, 'data')
             with open(fn, 'w') as f:
                 f.write('(created): ' + str(created))
-            subprocess.check_call(['ssh-keygen', '-Y', 'sign', '-f', sshkey, '-n', realm, '-q', fn])
-            with open(fn + '.sig', 'r') as f:
-                sig = f.read().splitlines()
+            for _ in range(0,3):
+                try:
+                    subprocess.check_call(['ssh-keygen', '-Y', 'sign', '-f', sshkey, '-n', realm, '-q', fn])
+                    break
+                except subprocess.CalledProcessError as e:
+                    print(e, file=sys.stderr)
+            try:
+                with open(fn + '.sig', 'r') as f:
+                    sig = f.read().splitlines()
+            except FileNotFoundError:
+                raise RuntimeError('Failed to create a SSH signature')
             if sig[0] != '-----BEGIN SSH SIGNATURE-----' or sig[-1] != '-----END SSH SIGNATURE-----':
                 raise RuntimeError('Failed to create a SSH signature')
         sig = ''.join(sig[1:-1])
@@ -134,13 +143,19 @@ class OBSAPI(api.API):
         return sig
 
     def auth_header(self, wwwa):
-        if self.sshkey:
+        if self.sshkey and wwwa.get('Signature', {}):
             wwwa = wwwa.get('Signature', {})
             if 'realm' not in wwwa:
                 raise RuntimeError('No realm received for SSH authentication')
             sig = self.ssh_signature(int(time.time()), self.user, self.sshkey, wwwa['realm'])
             return {'Authorization' : 'Signature ' + sig }
-        return {'Authorization' : 'Basic ' + base64.standard_b64encode((self.user + ':' + self.passw).encode()).decode()}
+        if self.passw and wwwa.get('Basic', {}):
+            wwwa = wwwa.get('Basic', {})
+            if 'realm' not in wwwa:
+                raise RuntimeError('No realm received for basic authentication')
+            return {'Authorization' : 'Basic ' + base64.standard_b64encode((self.user + ':' + self.passw).encode()).decode()}
+        raise RuntimeError('Authentication required but no usable authentication found\nRequested authorizarion: ' + str(dict(wwwa)) +
+                           '\nAvailable credentials:  password: ' + str(not not self.passw) + '  SSH key: ' + str(not not self.sshkey))
 
     def check_login(self):
         # This redirects creating 3 requests when not authenticated,
@@ -163,7 +178,7 @@ class OBSAPI(api.API):
         self.check_put('/'.join(['/source', project, '_config']), headers={'Content-type': 'text/plain'}, data=conf)
 
     def delete_project(self, project):
-        return self.check_delete('/'.join(['/source', project] + '?force=1'))
+        return self.check_delete('/'.join(['/source', project]) + '?force=1')
 
     def package_exists(self, project, package):
         return self.file_exists(project, package, '_meta')
@@ -200,10 +215,12 @@ class OBSAPI(api.API):
         return self.check_put('/'.join(['/source', project, package, file]), headers={'Content-type': content_type}, data=data)
 
     def package_scmsync(self, project, package):
-        return urllib.parse.urlparse(self.package_meta(project, package).find('scmsync').text)
+        sync = self.package_meta(project, package).find('scmsync')
+        return urllib.parse.urlparse(sync.text) if sync is not None else None
 
     def project_scmsync(self, project):
-        return urllib.parse.urlparse(self.project_meta(project).find('scmsync').text)
+        sync = self.project_meta(project).find('scmsync')
+        return urllib.parse.urlparse(sync.text) if sync is not None else None
 
     def project_repo(self, project):
         if self.project_exists(project) and self.project_meta(project).find('scmsync') != None:
