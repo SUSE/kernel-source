@@ -15,10 +15,12 @@ import http.server
 import tempfile
 import unittest
 import random
+import base64
 import shutil
 import types
 import json
 import yaml
+import bz2
 import ssl
 import sys
 import os
@@ -500,6 +502,53 @@ class TestOBS(APITest):
         api = OBSAPI(st.url(), ca=st.servercert)
         api.check_login()
         self.assertTrue(st.data_consumed)
+
+    def test_config_passw(self):
+        st = ServerThread('tests/api/obsapi_basic')
+        st.start_server(obsconfig=self.config)
+        os.environ['HOME'] = self.tmpdir.name
+        os.makedirs(os.path.join(self.tmpdir.name, '.config/osc'), exist_ok=True)
+        home_config = os.path.join(self.tmpdir.name, '.config/osc/oscrc')
+        config = configparser.ConfigParser(delimiters=('='), interpolation=None, default_section=None)
+        config.read(self.config)
+        section_name = config.sections()[0]
+        config.remove_option(section_name, 'user')
+        with open(home_config, 'w') as f:
+            config.write(f)
+        with self.assertRaisesRegex(RuntimeError, '^No username found for API https://127.0.0.1:'):
+            api = OBSAPI(st.url(), ca=st.servercert)
+        config.read(self.config)
+        passw = config.get(section_name, 'pass')
+        passw_obfuscated = base64.standard_b64encode(bz2.compress(passw.encode())).decode()
+        config.remove_option(section_name, 'pass')
+        with open(home_config, 'w') as f:
+            config.write(f)
+        with self.assertRaisesRegex(RuntimeError, '^No password found for API https://127.0.0.1:.*/.config/osc/oscrc. Authentication type None not supported.'):
+            api = OBSAPI(st.url(), ca=st.servercert)
+        config.set(section_name, 'credentials_mgr_class', 'foobar')
+        with open(home_config, 'w') as f:
+            config.write(f)
+        with self.assertRaisesRegex(RuntimeError, '^No password found for API https://127.0.0.1:.*/.config/osc/oscrc. Authentication type foobar not supported.'):
+            api = OBSAPI(st.url(), ca=st.servercert)
+        config.remove_option(section_name, 'credentials_mgr_class')
+        config.set(section_name, 'passx', passw_obfuscated)
+        with open(home_config, 'w') as f:
+            config.write(f)
+        api = OBSAPI(st.url(), ca=st.servercert)
+        self.assertEqual(api.passw, passw)
+        config.remove_option(section_name, 'passx')
+        config.set(section_name, 'credentials_mgr_class', 'osc.credentials.ObfuscatedConfigFileCredentialsManager')
+        config.set(section_name, 'pass', passw_obfuscated)
+        with open(home_config, 'w') as f:
+            config.write(f)
+        api = OBSAPI(st.url(), ca=st.servercert)
+        self.assertEqual(api.passw, passw)
+        config.remove_option(section_name, 'credentials_mgr_class')
+        config.read(self.config)
+        with open(home_config, 'w') as f:
+            config.write(f)
+        api = OBSAPI(st.url(), ca=st.servercert)
+        self.assertEqual(api.passw, passw)
 
     def test_url_trailing_slash(self):
         st = ServerThread('tests/api/obsapi_basic')

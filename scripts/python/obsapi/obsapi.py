@@ -98,16 +98,16 @@ class OBSAPI(api.API):
                 raise RuntimeError('Key file does not exist ' + self.sshkey)
             return
         passx = None
+        cmc = config.get('credentials_mgr_class', None)
         if 'passx' in config:
             passx = config['passx']
-        elif 'pass' in config and config.get('credentials_mgr_class', None) == 'osc.credentials.ObfuscatedConfigFileCredentialsManager':
+        elif 'pass' in config and cmc == 'osc.credentials.ObfuscatedConfigFileCredentialsManager':
             passx = config['pass']
         if passx:
             passw = bz2.decompress(base64.standard_b64decode(passx)).decode()
         else:
             passw = config.get('pass', None)
         if not passw:
-            cmc = config.get('credentials_mgr_class', None)
             if 'keyring' in config or 'gnome_keyring' in config or cmc == 'osc.credentials.KeyringCredentialsManager:keyring.backends.SecretService.Keyring':
                 assert self.url.startswith('https://')
                 host = self.url[       len('https://'):]
@@ -115,7 +115,7 @@ class OBSAPI(api.API):
                 assert len(passw) > 0
                 passw = passw.decode()
             else:
-                raise RuntimeError('No password found in ' + self.url + ' configuration. Authentication type ' + str(cmc) + ' not supported.')
+                raise RuntimeError('No password found for API ' + self.url + ' in ' + self.config +'. Authentication type ' + str(cmc) + ' not supported.')
         self.passw = passw
 
     def ssh_signature(self, created, user, sshkey, realm):
