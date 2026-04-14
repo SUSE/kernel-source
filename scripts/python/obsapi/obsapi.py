@@ -154,7 +154,7 @@ class OBSAPI(api.API):
             if 'realm' not in wwwa:
                 raise RuntimeError('No realm received for basic authentication')
             return {'Authorization' : 'Basic ' + base64.standard_b64encode((self.user + ':' + self.passw).encode()).decode()}
-        raise RuntimeError('Authentication required but no usable authentication found\nRequested authorizarion: ' + str(dict(wwwa)) +
+        raise RuntimeError('Authentication required but no usable credentials found\nRequested authorizarion: ' + str(dict(wwwa)) +
                            '\nAvailable credentials:  password: ' + str(not not self.passw) + '  SSH key: ' + str(not not self.sshkey))
 
     def check_login(self):

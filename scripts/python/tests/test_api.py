@@ -469,6 +469,7 @@ class TestOBS(APITest):
         config[config.sections()[0]]['sshkey'] = os.path.abspath(key)
         with open(self.config, 'w') as f:
             config.write(f)
+        return key
 
     def test_sig(self):
         st = ServerThread('/dev/null')
@@ -489,6 +490,40 @@ class TestOBS(APITest):
             api.check_login()
             self.assertTrue(st.data_consumed)
         self.log_cycle(test_fn, 'tests/api/obsapi_log_in_ssh')
+
+    def test_missing_key(self):
+        st = ServerThread('/dev/null')
+        st.start_server(obsconfig=self.config)
+        st.stop_server()
+        key = self.copy_key()
+        os.unlink(key)
+        with self.assertRaisesRegex(RuntimeError, '^Key file does not exist'):
+                OBSAPI(st.url(), config=self.config, cookiejar=self.cookiejar, ca=st.servercert)
+
+    def test_invalid_key(self):
+        st = ServerThread('tests/api/obsapi_log_in_ssh')
+        st.start_server(obsconfig=self.config)
+        key = self.copy_key()
+        os.truncate(key, 0)
+        api = OBSAPI(st.url(), config=self.config, cookiejar=self.cookiejar, ca=st.servercert)
+        with self.assertRaisesRegex(RuntimeError, '^Failed to create a SSH signature$'):
+            api.check_login()
+        self.assertFalse(st.data_consumed)
+
+    def test_not_configured_key(self):
+        st = ServerThread('tests/api/obsapi_log_in_ssh')
+        st.start_server(obsconfig=self.config)
+        api = OBSAPI(st.url(), config=self.config, cookiejar=self.cookiejar, ca=st.servercert)
+        if sys.version_info.major == 3 and sys.version_info.minor < 6:
+            re = '''^Authentication required but no usable credentials found
+Requested authorizarion:'''
+        else:
+            re = '''^Authentication required but no usable credentials found
+Requested authorizarion: {'signature': {'realm': 'Use your developer account', 'headers': '[(]created[)]'}}
+Available credentials:  password: True  SSH key: False$'''
+        with self.assertRaisesRegex(RuntimeError, re):
+            api.check_login()
+        self.assertFalse(st.data_consumed)
 
     def test_pkgrepo(self):
         def test_fn(inlog, outlog):
