@@ -39,10 +39,9 @@ class TeaAPI(api.API):
             config = { 'logins': [] }
 
         try:
-            self.token = [login['token'] for login in config['logins'] if login['url'] == self.url][0]
+            self.token = [login['token'] for login in config['logins'] if login['url'].rstrip('/') == self.url][0]
         except IndexError:
-            sys.stderr.write('Cannot find gitea-tea (tea-cli) configuration for ' + self.url + '\nPlease configure tea with a token that has readwrite access to user and repository with\ntea login add\n')
-            exit(1)
+            raise RuntimeError('Cannot find gitea-tea (tea-cli) configuration for ' + self.url + '\nPlease configure tea with a token that has readwrite access to user and repository with\ntea login add')
 
     def auth_header(self, wwwa):
         return {'Authorization' : 'token ' + self.token}
