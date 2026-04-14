@@ -279,6 +279,25 @@ class TestTea(APITest):
         self.tmpdir.cleanup()
         self.tmpdir = None
 
+    def test_url_trailing_slash(self):
+        st = ServerThread('tests/api/user')
+        st.start_server(teaconfig=self.config)
+        api = TeaAPI(st.url() + '/', config=self.config, ca=st.servercert)
+        self.assertEqual(api.get_user(), 'michals')
+        self.assertTrue(st.data_consumed)
+
+    def test_config_trailing_slash(self):
+        st = ServerThread('tests/api/user')
+        st.start_server(teaconfig=self.config)
+        with open(self.config, 'r') as f:
+            config = yaml.safe_load(f)
+        config['logins'][0]['url'] = config['logins'][0]['url'] + '/'
+        with open(self.config, 'w') as f:
+            yaml.dump(config, f)
+        api = TeaAPI(st.url(), config=self.config, ca=st.servercert)
+        self.assertEqual(api.get_user(), 'michals')
+        self.assertTrue(st.data_consumed)
+
     def test_getuser(self):
         def test_fn(inlog, outlog):
             st = ServerThread(inlog)
@@ -430,6 +449,29 @@ class TestOBS(APITest):
         self.config = None
         self.tmpdir.cleanup()
         self.tmpdir = None
+
+    def test_url_trailing_slash(self):
+        st = ServerThread('tests/api/obsapi_basic')
+        st.start_server(obsconfig=self.config)
+        api = OBSAPI(st.url() + '/', config=self.config, cookiejar=self.cookiejar, ca=st.servercert)
+        api.check_login()
+        self.assertTrue(st.data_consumed)
+
+    def test_config_trailing_slash(self):
+        st = ServerThread('tests/api/obsapi_basic')
+        st.start_server(obsconfig=self.config)
+        config = configparser.ConfigParser(delimiters=('='), interpolation=None, default_section=None)
+        config.read(self.config)
+        section_name = config.sections()[0]
+        config.add_section(section_name + '/')
+        for opt, value in config.items(section_name):
+            config.set(section_name + '/', opt, value)
+        config.remove_section(section_name)
+        with open(self.config, 'w') as f:
+            config.write(f)
+        api = OBSAPI(st.url(), config=self.config, cookiejar=self.cookiejar, ca=st.servercert)
+        api.check_login()
+        self.assertTrue(st.data_consumed)
 
     def test_basic(self):
         def test_fn(inlog, outlog):
