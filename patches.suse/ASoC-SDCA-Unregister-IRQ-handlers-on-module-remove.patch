@@ -1,0 +1,99 @@
+From 0b8757b220f94421bd4ff50cce03886387c4e71c Mon Sep 17 00:00:00 2001
+From: Richard Fitzgerald <rf@opensource.cirrus.com>
+Date: Wed, 8 Apr 2026 10:38:34 +0100
+Subject: [PATCH] ASoC: SDCA: Unregister IRQ handlers on module remove
+Git-commit: 0b8757b220f94421bd4ff50cce03886387c4e71c
+Patch-mainline: v7.0
+References: git-fixes
+
+Ensure that all interrupt handlers are unregistered before the parent
+regmap_irq is unregistered.
+
+sdca_irq_cleanup() was only called from the component_remove(). If the
+module was loaded and removed without ever being component probed the
+FDL interrupts would not be unregistered and this would hit a WARN
+when devm called regmap_del_irq_chip() during the removal of the
+parent IRQ.
+
+Fixes: 4e53116437e9 ("ASoC: SDCA: Fix errors in IRQ cleanup")
+Signed-off-by: Richard Fitzgerald <rf@opensource.cirrus.com>
+Signed-off-by: Charles Keepax <ckeepax@opensource.cirrus.com>
+Link: https://patch.msgid.link/20260408093835.2881486-5-ckeepax@opensource.cirrus.com
+Signed-off-by: Mark Brown <broonie@kernel.org>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ include/sound/sdca_interrupts.h      |    4 ++--
+ sound/soc/sdca/sdca_class_function.c |   10 +++++++++-
+ sound/soc/sdca/sdca_interrupts.c     |    7 +++----
+ 3 files changed, 14 insertions(+), 7 deletions(-)
+
+--- a/include/sound/sdca_interrupts.h
++++ b/include/sound/sdca_interrupts.h
+@@ -83,8 +83,8 @@ int sdca_irq_populate_early(struct devic
+ int sdca_irq_populate(struct sdca_function_data *function,
+ 		      struct snd_soc_component *component,
+ 		      struct sdca_interrupt_info *info);
+-void sdca_irq_cleanup(struct sdca_function_data *function,
+-		      struct snd_soc_component *component,
++void sdca_irq_cleanup(struct device *dev,
++		      struct sdca_function_data *function,
+ 		      struct sdca_interrupt_info *info);
+ struct sdca_interrupt_info *sdca_irq_allocate(struct device *dev,
+ 					      struct regmap *regmap, int irq);
+--- a/sound/soc/sdca/sdca_class_function.c
++++ b/sound/soc/sdca/sdca_class_function.c
+@@ -200,7 +200,7 @@ static void class_function_component_rem
+ 	struct class_function_drv *drv = snd_soc_component_get_drvdata(component);
+ 	struct sdca_class_drv *core = drv->core;
+ 
+-	sdca_irq_cleanup(drv->function, component, core->irq_info);
++	sdca_irq_cleanup(component->dev, drv->function, core->irq_info);
+ }
+ 
+ static const struct snd_soc_component_driver class_function_component_drv = {
+@@ -389,6 +389,13 @@ static int class_function_probe(struct a
+ 	return 0;
+ }
+ 
++static void class_function_remove(struct auxiliary_device *auxdev)
++{
++	struct class_function_drv *drv = auxiliary_get_drvdata(auxdev);
++
++	sdca_irq_cleanup(drv->dev, drv->function, drv->core->irq_info);
++}
++
+ static int class_function_runtime_suspend(struct device *dev)
+ {
+ 	struct auxiliary_device *auxdev = to_auxiliary_dev(dev);
+@@ -460,6 +467,7 @@ static struct auxiliary_driver class_fun
+ 	},
+ 
+ 	.probe		= class_function_probe,
++	.remove		= class_function_remove,
+ 	.id_table	= class_function_id_table
+ };
+ module_auxiliary_driver(class_function_drv);
+--- a/sound/soc/sdca/sdca_interrupts.c
++++ b/sound/soc/sdca/sdca_interrupts.c
+@@ -536,17 +536,16 @@ EXPORT_SYMBOL_NS_GPL(sdca_irq_populate,
+ 
+ /**
+  * sdca_irq_cleanup - Free all the individual IRQs for an SDCA Function
++ * @sdev: Device pointer against which the sdca_interrupt_info was allocated.
+  * @function: Pointer to the SDCA Function.
+- * @component: Pointer to the ASoC component for the Function.
+  * @info: Pointer to the SDCA interrupt info for this device.
+  *
+  * Typically this would be called from the driver for a single SDCA Function.
+  */
+-void sdca_irq_cleanup(struct sdca_function_data *function,
+-		      struct snd_soc_component *component,
++void sdca_irq_cleanup(struct device *dev,
++		      struct sdca_function_data *function,
+ 		      struct sdca_interrupt_info *info)
+ {
+-	struct device *dev = component->dev;
+ 	int i;
+ 
+ 	guard(mutex)(&info->irq_lock);
