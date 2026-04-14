@@ -32,12 +32,12 @@ class TeaAPI(api.API):
         if self.config == None:
             self.config = os.environ['HOME'] + '/.config/tea/config.yml'
         try:
-            with open(self.config, 'r') as file:
+            with open(self.config, 'rb') as file:
                 config = yaml.safe_load(file)
-        except (FileNotFoundError, PermissionError, yaml.YAMLError) as e:
-            sys.stderr.write('Error loading gitea-tea configuration file ' + self.config + ' : ' + str(e) + '\n')
-            config = { 'logins': [] }
-
+                if not isinstance(config, dict):
+                    raise yaml.YAMLError('gitea-tea configuration is expected to be a dictionary')
+        except (FileNotFoundError, PermissionError, UnicodeError, yaml.YAMLError) as e:
+            raise RuntimeError('Error loading gitea-tea configuration file ' + self.config + ': ' + str(e))
         try:
             self.token = [login['token'] for login in config['logins'] if login['url'].rstrip('/') == self.url][0]
         except IndexError:

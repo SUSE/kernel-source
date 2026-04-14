@@ -74,12 +74,12 @@ class OBSAPI(api.API):
         except FileNotFoundError:
             pass
         except Exception as e:
-            sys.stderr.write("Error loading cookies: %s\n" % (repr(e),))
+            raise RuntimeError('Error loading cookies: ' + cookiejar + ': ' + str(e))
         cp = configparser.ConfigParser(delimiters=('=', ':'), interpolation=None)
         try:
             cp.read(self.config)
-        except (FileNotFoundError, PermissionError) as e:
-            sys.stderr.write('Error loading osc configuration file ' + self.config + ' : ' + str(e) + '\n')
+        except (FileNotFoundError, PermissionError, UnicodeError, configparser.Error) as e:
+            raise RuntimeError('Error loading osc configuration file ' + self.config + ' : ' + str(e))
         try:
             config_section = [sec for sec in cp.sections() if sec.rstrip('/') == self.url][0]
         except IndexError:
@@ -87,7 +87,7 @@ class OBSAPI(api.API):
         config = cp[config_section]
         self.user = config.get('user', None)
         if not self.user:
-            raise RuntimeError('No username found in ' + self.url + ' configuration.')
+            raise RuntimeError('No username found for API ' + self.url + ' in ' + self.config)
         self.sshkey = None
         self.passw = None
         if 'sshkey' in config:

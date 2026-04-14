@@ -279,6 +279,32 @@ class TestTea(APITest):
         self.tmpdir.cleanup()
         self.tmpdir = None
 
+    def test_config_search(self):
+        st = ServerThread('tests/api/user')
+        st.start_server(teaconfig=self.config)
+        os.environ['HOME'] = self.tmpdir.name
+        with self.assertRaisesRegex(RuntimeError, '^Error loading gitea-tea configuration file .*[.]config/tea/config.yml:'):
+            api = TeaAPI(st.url(), ca=st.servercert)
+        os.makedirs(os.path.join(self.tmpdir.name, '.config/tea'), exist_ok=True)
+        home_config = os.path.join(self.tmpdir.name, '.config/tea/config.yml')
+        shutil.copy('tests/api/binary_garbage', home_config)
+        with self.assertRaisesRegex(RuntimeError, '^Error loading gitea-tea configuration file .* unacceptable character'):
+            api = TeaAPI(st.url(), ca=st.servercert)
+        shutil.copy('/dev/null', home_config)
+        with self.assertRaisesRegex(RuntimeError, '^Error loading gitea-tea configuration file .* gitea-tea configuration is expected to be a dictionary'):
+            api = TeaAPI(st.url(), ca=st.servercert)
+        with open(self.config, 'r') as f:
+            config = yaml.safe_load(f)
+        config['logins'][0]['url'] = 'foobar'
+        with open(home_config, 'w') as f:
+            yaml.dump(config, f)
+        with self.assertRaisesRegex(RuntimeError, '^Cannot find gitea-tea [(]tea-cli[)] configuration for https://127.0.0.1:'):
+            api = TeaAPI(st.url(), ca=st.servercert)
+        shutil.copy(self.config, home_config)
+        api = TeaAPI(st.url(), ca=st.servercert)
+        self.assertEqual(api.get_user(), 'michals')
+        self.assertTrue(st.data_consumed)
+
     def test_url_trailing_slash(self):
         st = ServerThread('tests/api/user')
         st.start_server(teaconfig=self.config)
@@ -449,6 +475,31 @@ class TestOBS(APITest):
         self.config = None
         self.tmpdir.cleanup()
         self.tmpdir = None
+
+    def test_config_search(self):
+        st = ServerThread('tests/api/obsapi_basic')
+        st.start_server(obsconfig=self.config)
+        os.environ['HOME'] = self.tmpdir.name
+        with self.assertRaisesRegex(RuntimeError, '^Could not find an osc configuration file in .*[.]oscrc .*[.]config/osc/oscrc'):
+            api = OBSAPI(st.url(), ca=st.servercert)
+        os.makedirs(os.path.join(self.tmpdir.name, '.config/osc'), exist_ok=True)
+        home_config = os.path.join(self.tmpdir.name, '.config/osc/oscrc')
+        shutil.copy('tests/api/binary_garbage', home_config)
+        with self.assertRaisesRegex(RuntimeError, '^Error loading osc configuration file .*[.]config/osc/oscrc .* codec can\'t decode byte'):
+            api = OBSAPI(st.url(), ca=st.servercert)
+        shutil.copy('/dev/null', os.path.join(self.tmpdir.name, '.oscrc'))
+        with self.assertRaisesRegex(RuntimeError, '^No configuration for API https://127.0.0.1:'):
+            api = OBSAPI(st.url(), ca=st.servercert)
+        shutil.copy(self.config, os.path.join(self.tmpdir.name, '.oscrc'))
+        os.makedirs(os.path.join(self.tmpdir.name, '.local/state/osc'), exist_ok=True)
+        home_cookiejar = os.path.join(self.tmpdir.name, '.local/state/osc/cookiejar')
+        shutil.copy('tests/api/binary_garbage', home_cookiejar)
+        with self.assertRaisesRegex(RuntimeError, '^Error loading cookies: .* codec can\'t decode byte'):
+            api = OBSAPI(st.url(), ca=st.servercert)
+        shutil.copy(self.cookiejar, home_cookiejar)
+        api = OBSAPI(st.url(), ca=st.servercert)
+        api.check_login()
+        self.assertTrue(st.data_consumed)
 
     def test_url_trailing_slash(self):
         st = ServerThread('tests/api/obsapi_basic')
