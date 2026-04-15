@@ -15,10 +15,12 @@ import http.server
 import tempfile
 import unittest
 import random
+import base64
 import shutil
 import types
 import json
 import yaml
+import bz2
 import ssl
 import sys
 import os
@@ -279,6 +281,32 @@ class TestTea(APITest):
         self.tmpdir.cleanup()
         self.tmpdir = None
 
+    def test_config_search(self):
+        st = ServerThread('tests/api/user')
+        st.start_server(teaconfig=self.config)
+        os.environ['HOME'] = self.tmpdir.name
+        with self.assertRaisesRegex(RuntimeError, '^Error loading gitea-tea configuration file .*[.]config/tea/config.yml:'):
+            api = TeaAPI(st.url(), ca=st.servercert)
+        os.makedirs(os.path.join(self.tmpdir.name, '.config/tea'), exist_ok=True)
+        home_config = os.path.join(self.tmpdir.name, '.config/tea/config.yml')
+        shutil.copy('tests/api/binary_garbage', home_config)
+        with self.assertRaisesRegex(RuntimeError, '^Error loading gitea-tea configuration file .* unacceptable character'):
+            api = TeaAPI(st.url(), ca=st.servercert)
+        shutil.copy('/dev/null', home_config)
+        with self.assertRaisesRegex(RuntimeError, '^Error loading gitea-tea configuration file .* gitea-tea configuration is expected to be a dictionary'):
+            api = TeaAPI(st.url(), ca=st.servercert)
+        with open(self.config, 'r') as f:
+            config = yaml.safe_load(f)
+        config['logins'][0]['url'] = 'foobar'
+        with open(home_config, 'w') as f:
+            yaml.dump(config, f)
+        with self.assertRaisesRegex(RuntimeError, '^Cannot find gitea-tea [(]tea-cli[)] configuration for https://127.0.0.1:'):
+            api = TeaAPI(st.url(), ca=st.servercert)
+        shutil.copy(self.config, home_config)
+        api = TeaAPI(st.url(), ca=st.servercert)
+        self.assertEqual(api.get_user(), 'michals')
+        self.assertTrue(st.data_consumed)
+
     def test_url_trailing_slash(self):
         st = ServerThread('tests/api/user')
         st.start_server(teaconfig=self.config)
@@ -449,6 +477,78 @@ class TestOBS(APITest):
         self.config = None
         self.tmpdir.cleanup()
         self.tmpdir = None
+
+    def test_config_search(self):
+        st = ServerThread('tests/api/obsapi_basic')
+        st.start_server(obsconfig=self.config)
+        os.environ['HOME'] = self.tmpdir.name
+        with self.assertRaisesRegex(RuntimeError, '^Could not find an osc configuration file in .*[.]oscrc .*[.]config/osc/oscrc'):
+            api = OBSAPI(st.url(), ca=st.servercert)
+        os.makedirs(os.path.join(self.tmpdir.name, '.config/osc'), exist_ok=True)
+        home_config = os.path.join(self.tmpdir.name, '.config/osc/oscrc')
+        shutil.copy('tests/api/binary_garbage', home_config)
+        with self.assertRaisesRegex(RuntimeError, '^Error loading osc configuration file .*[.]config/osc/oscrc .* codec can\'t decode byte'):
+            api = OBSAPI(st.url(), ca=st.servercert)
+        shutil.copy('/dev/null', os.path.join(self.tmpdir.name, '.oscrc'))
+        with self.assertRaisesRegex(RuntimeError, '^No configuration for API https://127.0.0.1:'):
+            api = OBSAPI(st.url(), ca=st.servercert)
+        shutil.copy(self.config, os.path.join(self.tmpdir.name, '.oscrc'))
+        os.makedirs(os.path.join(self.tmpdir.name, '.local/state/osc'), exist_ok=True)
+        home_cookiejar = os.path.join(self.tmpdir.name, '.local/state/osc/cookiejar')
+        shutil.copy('tests/api/binary_garbage', home_cookiejar)
+        with self.assertRaisesRegex(RuntimeError, '^Error loading cookies: .* codec can\'t decode byte'):
+            api = OBSAPI(st.url(), ca=st.servercert)
+        shutil.copy(self.cookiejar, home_cookiejar)
+        api = OBSAPI(st.url(), ca=st.servercert)
+        api.check_login()
+        self.assertTrue(st.data_consumed)
+
+    def test_config_passw(self):
+        st = ServerThread('tests/api/obsapi_basic')
+        st.start_server(obsconfig=self.config)
+        os.environ['HOME'] = self.tmpdir.name
+        os.makedirs(os.path.join(self.tmpdir.name, '.config/osc'), exist_ok=True)
+        home_config = os.path.join(self.tmpdir.name, '.config/osc/oscrc')
+        config = configparser.ConfigParser(delimiters=('='), interpolation=None, default_section=None)
+        config.read(self.config)
+        section_name = config.sections()[0]
+        config.remove_option(section_name, 'user')
+        with open(home_config, 'w') as f:
+            config.write(f)
+        with self.assertRaisesRegex(RuntimeError, '^No username found for API https://127.0.0.1:'):
+            api = OBSAPI(st.url(), ca=st.servercert)
+        config.read(self.config)
+        passw = config.get(section_name, 'pass')
+        passw_obfuscated = base64.standard_b64encode(bz2.compress(passw.encode())).decode()
+        config.remove_option(section_name, 'pass')
+        with open(home_config, 'w') as f:
+            config.write(f)
+        with self.assertRaisesRegex(RuntimeError, '^No password found for API https://127.0.0.1:.*/.config/osc/oscrc. Authentication type None not supported.'):
+            api = OBSAPI(st.url(), ca=st.servercert)
+        config.set(section_name, 'credentials_mgr_class', 'foobar')
+        with open(home_config, 'w') as f:
+            config.write(f)
+        with self.assertRaisesRegex(RuntimeError, '^No password found for API https://127.0.0.1:.*/.config/osc/oscrc. Authentication type foobar not supported.'):
+            api = OBSAPI(st.url(), ca=st.servercert)
+        config.remove_option(section_name, 'credentials_mgr_class')
+        config.set(section_name, 'passx', passw_obfuscated)
+        with open(home_config, 'w') as f:
+            config.write(f)
+        api = OBSAPI(st.url(), ca=st.servercert)
+        self.assertEqual(api.passw, passw)
+        config.remove_option(section_name, 'passx')
+        config.set(section_name, 'credentials_mgr_class', 'osc.credentials.ObfuscatedConfigFileCredentialsManager')
+        config.set(section_name, 'pass', passw_obfuscated)
+        with open(home_config, 'w') as f:
+            config.write(f)
+        api = OBSAPI(st.url(), ca=st.servercert)
+        self.assertEqual(api.passw, passw)
+        config.remove_option(section_name, 'credentials_mgr_class')
+        config.read(self.config)
+        with open(home_config, 'w') as f:
+            config.write(f)
+        api = OBSAPI(st.url(), ca=st.servercert)
+        self.assertEqual(api.passw, passw)
 
     def test_url_trailing_slash(self):
         st = ServerThread('tests/api/obsapi_basic')
