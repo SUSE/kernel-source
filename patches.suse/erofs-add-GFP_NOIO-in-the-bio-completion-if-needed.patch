@@ -1,0 +1,60 @@
+From: Jiucheng Xu <jiucheng.xu@amlogic.com>
+Date: Wed, 11 Mar 2026 17:11:31 +0800
+Subject: erofs: add GFP_NOIO in the bio completion if needed
+Git-commit: c23df30915f83e7257c8625b690a1cece94142a0
+Patch-mainline: v7.0-rc6
+References: git-fixes
+
+The bio completion path in the process context (e.g. dm-verity)
+will directly call into decompression rather than trigger another
+workqueue context for minimal scheduling latencies, which can
+then call vm_map_ram() with GFP_KERNEL.
+
+Due to insufficient memory, vm_map_ram() may generate memory
+swapping I/O, which can cause submit_bio_wait to deadlock
+in some scenarios.
+
+Trimmed down the call stack, as follows:
+
+f2fs_submit_read_io
+  submit_bio                      //bio_list is initialized.
+    mmc_blk_mq_recovery
+      z_erofs_endio
+        vm_map_ram
+          __pte_alloc_kernel
+            __alloc_pages_direct_reclaim
+              shrink_folio_list
+                __swap_writepage
+                  submit_bio_wait  //bio_list is non-NULL, hang!!!
+
+Use memalloc_noio_{save,restore}() to wrap up this path.
+
+Reviewed-by: Gao Xiang <hsiangkao@linux.alibaba.com>
+Signed-off-by: Jiucheng Xu <jiucheng.xu@amlogic.com>
+Reviewed-by: Chao Yu <chao@kernel.org>
+Signed-off-by: Gao Xiang <hsiangkao@linux.alibaba.com>
+Acked-by: Goldwyn Rodrigues <rgoldwyn@suse.com>
+---
+ fs/erofs/zdata.c |    3 +++
+ 1 file changed, 3 insertions(+)
+
+--- a/fs/erofs/zdata.c
++++ b/fs/erofs/zdata.c
+@@ -1337,6 +1337,7 @@ static void z_erofs_decompress_kickoff(s
+ 				       int bios)
+ {
+ 	struct erofs_sb_info *const sbi = EROFS_SB(io->sb);
++	int gfp_flag;
+ 
+ 	/* wake up the caller thread for sync decompression */
+ 	if (io->sync) {
+@@ -1370,7 +1371,9 @@ static void z_erofs_decompress_kickoff(s
+ 			sbi->opt.sync_decompress = EROFS_SYNC_DECOMPRESS_FORCE_ON;
+ 		return;
+ 	}
++	gfp_flag = memalloc_noio_save();
+ 	z_erofs_decompressqueue_work(&io->u.work);
++	memalloc_noio_restore(gfp_flag);
+ }
+ 
+ static void z_erofs_fill_bio_vec(struct bio_vec *bvec,
