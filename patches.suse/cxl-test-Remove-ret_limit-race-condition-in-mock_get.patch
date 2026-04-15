@@ -1,0 +1,82 @@
+From: Alison Schofield <alison.schofield@intel.com>
+Date: Sat, 15 Nov 2025 17:37:49 -0800
+Subject: [PATCH] cxl/test: Remove ret_limit race condition in mock_get_event()
+Git-commit: b6369daf0d6a96db5048edd26b07fc1aaed77dd1
+Patch-mainline: v6.19-rc1
+References: jsc#PED-15409
+
+Commit 364ee9f3265e ("cxl/test: Enhance event testing") changed the
+loop iterator in mock_get_event() from a static constant,
+CXL_TEST_EVENT_CNT, to a dynamic global variable, ret_limit. The
+intent was to vary the number of events returned per call to simulate
+events occurring while logs are being read.
+
+However, ret_limit is modified without synchronization. When multiple
+threads call mock_get_event() concurrently, one thread may read
+ret_limit, another thread may increment it, and the first thread's
+loop condition and size calculation see and use the updated value.
+
+This is visible during cxl_test module load when all memdevs are
+initializing simultaneously, which includes getting event records. It
+is not tied to the cxl-events.sh unit test specifically, as that
+operates on a single memdev.
+
+While no actual harm results (the buffer is always large enough and
+the record count fields correctly reflect what was written), this is
+a correctness issue. The race creates an inconsistent state within
+mock_get_event() and adding variability based on a race appears
+unintended.
+
+Make ret_limit a local variable populated from an atomic counter. Each
+call gets a stable value that won't change during execution. That
+preserves the intended behavior of varying the return counts across
+calls while eliminating the race condition.
+
+This implementation uses "+ 1" to produce the full range of 1 to
+CXL_TEST_EVENT_RET_MAX (4) records. Previously only 1, 2, 3 were
+produced.
+
+Signed-off-by: Alison Schofield <alison.schofield@intel.com>
+Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+Reviewed-by: Dave Jiang <dave.jiang@intel.com>> ---
+Link: https://patch.msgid.link/20251116013819.1713780-1-alison.schofield@intel.com
+Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ tools/testing/cxl/test/mem.c | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/tools/testing/cxl/test/mem.c b/tools/testing/cxl/test/mem.c
+index d533481672b7..6809c4a26f5e 100644
+--- a/tools/testing/cxl/test/mem.c
++++ b/tools/testing/cxl/test/mem.c
+@@ -250,22 +250,22 @@ static void mes_add_event(struct mock_event_store *mes,
+  * Vary the number of events returned to simulate events occuring while the
+  * logs are being read.
+  */
+-static int ret_limit = 0;
++static atomic_t event_counter = ATOMIC_INIT(0);
+ 
+ static int mock_get_event(struct device *dev, struct cxl_mbox_cmd *cmd)
+ {
+ 	struct cxl_get_event_payload *pl;
+ 	struct mock_event_log *log;
+ 	u16 nr_overflow;
++	int ret_limit;
+ 	u8 log_type;
+ 	int i;
+ 
+ 	if (cmd->size_in != sizeof(log_type))
+ 		return -EINVAL;
+ 
+-	ret_limit = (ret_limit + 1) % CXL_TEST_EVENT_RET_MAX;
+-	if (!ret_limit)
+-		ret_limit = 1;
++	/* Vary return limit from 1 to CXL_TEST_EVENT_RET_MAX */
++	ret_limit = (atomic_inc_return(&event_counter) % CXL_TEST_EVENT_RET_MAX) + 1;
+ 
+ 	if (cmd->size_out < struct_size(pl, records, ret_limit))
+ 		return -EINVAL;
+-- 
+2.43.0
+
