@@ -1,0 +1,166 @@
+From 8804182445816e25b8d542050f18902333cbb0b1 Mon Sep 17 00:00:00 2001
+From: Christian Loehle <christian.loehle@arm.com>
+Date: Tue, 3 Feb 2026 18:49:39 +0000
+Subject: [PATCH] sched/fair: Skip SCHED_IDLE rq for SCHED_IDLE task
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+References: bsc#1234634 (Scheduler functional and performance backports SL-16.1)
+Git-commit: fd54d81c2c0e6cffd5470c2c27fbb04d0ebe7da0
+Patch-mainline: v7.1-rc1
+
+CPUs whose rq only have SCHED_IDLE tasks running are considered to be
+equivalent to truly idle CPUs during wakeup path. For fork and exec
+SCHED_IDLE is even preferred.
+This is based on the assumption that the SCHED_IDLE CPU is not in an
+idle state and might be in a higher P-state, allowing the task/wakee
+to run immediately without sharing the rq.
+
+However this assumption doesn't hold if the wakee has SCHED_IDLE policy
+itself, as it will share the rq with existing SCHED_IDLE tasks. In this
+case, we are better off continuing to look for a truly idle CPU.
+
+On a Intel Xeon 2-socket with 64 logical cores in total this yields
+for kernel compilation using SCHED_IDLE:
+
++---------+----------------------+----------------------+--------+
+| workers | mainline (seconds)   | patch (seconds)      | delta% |
++=========+======================+======================+========+
+|       1 | 4384.728 ± 21.085    | 3843.250 ± 16.235    | -12.35 |
+|       2 | 2242.513 ± 2.099     | 1971.696 ± 2.842     | -12.08 |
+|       4 | 1199.324 ± 1.823     | 1033.744 ± 1.803     | -13.81 |
+|       8 |  649.083 ± 1.959     |  559.123 ± 4.301     | -13.86 |
+|      16 |  370.425 ± 0.915     |  325.906 ± 4.623     | -12.02 |
+|      32 |  234.651 ± 2.255     |  217.266 ± 0.253     |  -7.41 |
+|      64 |  202.286 ± 1.452     |  197.977 ± 2.275     |  -2.13 |
+|     128 |  217.092 ± 1.687     |  212.164 ± 1.138     |  -2.27 |
++---------+----------------------+----------------------+--------+
+
+Signed-off-by: Christian Loehle <christian.loehle@arm.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Reviewed-by: Vincent Guittot <vincent.guittot@linaro.org>
+Tested-by: K Prateek Nayak <kprateek.nayak@amd.com>
+Link: https://patch.msgid.link/20260203184939.2138022-1-christian.loehle@arm.com
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+---
+ kernel/sched/fair.c | 34 +++++++++++++++++++---------------
+ 1 file changed, 19 insertions(+), 15 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index e14d5deee9e9..ad7e8ab1c52c 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -7124,12 +7124,16 @@ static int sched_idle_rq(struct rq *rq)
+ 			rq->nr_running);
+ }
+ 
+-#ifdef CONFIG_SMP
+-static int sched_idle_cpu(int cpu)
++static int choose_sched_idle_rq(struct rq *rq, struct task_struct *p)
+ {
+-	return sched_idle_rq(cpu_rq(cpu));
++	return sched_idle_rq(rq) && !task_has_idle_policy(p);
++}
++
++static int choose_idle_cpu(int cpu, struct task_struct *p)
++{
++	return available_idle_cpu(cpu) ||
++	       choose_sched_idle_rq(cpu_rq(cpu), p);
+ }
+-#endif
+ 
+ static void
+ requeue_delayed_entity(struct sched_entity *se)
+@@ -7695,7 +7699,7 @@ sched_balance_find_dst_group_cpu(struct sched_group *group, struct task_struct *
+ 		if (!sched_core_cookie_match(rq, p))
+ 			continue;
+ 
+-		if (sched_idle_cpu(i))
++		if (choose_sched_idle_rq(rq, p))
+ 			return i;
+ 
+ 		if (available_idle_cpu(i)) {
+@@ -7786,8 +7790,7 @@ static inline int sched_balance_find_dst_cpu(struct sched_domain *sd, struct tas
+ 
+ static inline int __select_idle_cpu(int cpu, struct task_struct *p)
+ {
+-	if ((available_idle_cpu(cpu) || sched_idle_cpu(cpu)) &&
+-	    sched_cpu_cookie_match(cpu_rq(cpu), p))
++	if (choose_idle_cpu(cpu, p) && sched_cpu_cookie_match(cpu_rq(cpu), p))
+ 		return cpu;
+ 
+ 	return -1;
+@@ -7860,7 +7863,8 @@ static int select_idle_core(struct task_struct *p, int core, struct cpumask *cpu
+ 		if (!available_idle_cpu(cpu)) {
+ 			idle = false;
+ 			if (*idle_cpu == -1) {
+-				if (sched_idle_cpu(cpu) && cpumask_test_cpu(cpu, cpus)) {
++				if (choose_sched_idle_rq(cpu_rq(cpu), p) &&
++				    cpumask_test_cpu(cpu, cpus)) {
+ 					*idle_cpu = cpu;
+ 					break;
+ 				}
+@@ -7895,7 +7899,7 @@ static int select_idle_smt(struct task_struct *p, struct sched_domain *sd, int t
+ 		 */
+ 		if (!cpumask_test_cpu(cpu, sched_domain_span(sd)))
+ 			continue;
+-		if (available_idle_cpu(cpu) || sched_idle_cpu(cpu))
++		if (choose_idle_cpu(cpu, p))
+ 			return cpu;
+ 	}
+ 
+@@ -8017,7 +8021,7 @@ select_idle_capacity(struct task_struct *p, struct sched_domain *sd, int target)
+ 	for_each_cpu_wrap(cpu, cpus, target) {
+ 		unsigned long cpu_cap = capacity_of(cpu);
+ 
+-		if (!available_idle_cpu(cpu) && !sched_idle_cpu(cpu))
++		if (!choose_idle_cpu(cpu, p))
+ 			continue;
+ 
+ 		fits = util_fits_cpu(task_util, util_min, util_max, cpu);
+@@ -8088,7 +8092,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
+ 	 */
+ 	lockdep_assert_irqs_disabled();
+ 
+-	if ((available_idle_cpu(target) || sched_idle_cpu(target)) &&
++	if (choose_idle_cpu(target, p) &&
+ 	    asym_fits_cpu(task_util, util_min, util_max, target))
+ 		return target;
+ 
+@@ -8096,7 +8100,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
+ 	 * If the previous CPU is cache affine and idle, don't be stupid:
+ 	 */
+ 	if (prev != target && cpus_share_cache(prev, target) &&
+-	    (available_idle_cpu(prev) || sched_idle_cpu(prev)) &&
++	    choose_idle_cpu(prev, p) &&
+ 	    asym_fits_cpu(task_util, util_min, util_max, prev)) {
+ 
+ 		if (!static_branch_unlikely(&sched_cluster_active) ||
+@@ -8128,7 +8132,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
+ 	if (recent_used_cpu != prev &&
+ 	    recent_used_cpu != target &&
+ 	    cpus_share_cache(recent_used_cpu, target) &&
+-	    (available_idle_cpu(recent_used_cpu) || sched_idle_cpu(recent_used_cpu)) &&
++	    choose_idle_cpu(recent_used_cpu, p) &&
+ 	    cpumask_test_cpu(recent_used_cpu, p->cpus_ptr) &&
+ 	    asym_fits_cpu(task_util, util_min, util_max, recent_used_cpu)) {
+ 
+@@ -12589,7 +12593,7 @@ static void sched_balance_domains(struct rq *rq, enum cpu_idle_type idle)
+ {
+ 	int continue_balancing = 1;
+ 	int cpu = rq->cpu;
+-	int busy = idle != CPU_IDLE && !sched_idle_cpu(cpu);
++	int busy = idle != CPU_IDLE && !sched_idle_rq(rq);
+ 	unsigned long interval;
+ 	struct sched_domain *sd;
+ 	/* Earliest time when we have to do rebalance again */
+@@ -12627,7 +12631,7 @@ static void sched_balance_domains(struct rq *rq, enum cpu_idle_type idle)
+ 				 * state even if we migrated tasks. Update it.
+ 				 */
+ 				idle = idle_cpu(cpu);
+-				busy = !idle && !sched_idle_cpu(cpu);
++				busy = !idle && !sched_idle_rq(rq);
+ 			}
+ 			sd->last_balance = jiffies;
+ 			interval = get_sd_balance_interval(sd, busy);
