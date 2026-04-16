@@ -697,6 +697,15 @@ Available credentials:  password: True  SSH key: False$'''
             self.assertTrue(st.data_consumed)
         self.log_cycle(test_fn, 'tests/api/obsapi_pkgrepo_nonexistent_pkg')
 
+    def test_project_exists(self):
+        def test_fn(inlog, outlog):
+            st = ServerThread(inlog)
+            st.start_server(obsconfig=self.config)
+            api = OBSAPI(st.url(), config=self.config, cookiejar=self.cookiejar, ca=st.servercert, logfile=outlog)
+            self.assertTrue(api.project_exists('Kernel:HEAD'))
+            self.assertFalse(api.project_exists('nonexistent'))
+        self.log_cycle(test_fn, 'tests/api/obsapi_project_exists')
+
     def test_list_projects(self):
         def test_fn(inlog, outlog):
             st = ServerThread(inlog)
