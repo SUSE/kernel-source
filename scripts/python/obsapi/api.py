@@ -153,7 +153,7 @@ class API:
                 else:
                     if (i == 'content') and data[i] and (isinstance(data[i], str) or isinstance(data[i], bytes)):
                         try:
-                            result['content_decoded'] = base64.standard_b64decode(data[i]).decode(errors='surrogateescape')
+                            result['content_decoded'] = base64.b64decode(data[i], validate=True).decode(errors='surrogateescape')
                         except binascii.Error:
                             pass
                     result[i] = self.redact_content(data[i])
