@@ -1,0 +1,148 @@
+From df4d574ce49ca6eb195c9755da3154f6e45c69f9 Mon Sep 17 00:00:00 2001
+From: Vincent Guittot <vincent.guittot@linaro.org>
+Date: Tue, 31 Mar 2026 18:23:52 +0200
+Subject: [PATCH] sched/fair: Prevent negative lag increase during delayed
+ dequeue
+
+References: bsc#1234634 (Scheduler functional and performance backports SL-16.1)
+Git-commit: 059258b0d424510202b6f2796279dbdbf0c6a83d
+Patch-mainline: v7.1-rc1
+
+Delayed dequeue feature aims to reduce the negative lag of a dequeued
+task while sleeping but it can happens that newly enqueued tasks will
+move backward the avg vruntime and increase its negative lag.
+When the delayed dequeued task wakes up, it has more neg lag compared
+to being dequeued immediately or to other tasks that have been
+dequeued just before theses new enqueues.
+
+Ensure that the negative lag of a delayed dequeued task doesn't
+increase during its delayed dequeued phase while waiting for its neg
+lag to diseappear. Similarly, we remove any positive lag that the
+delayed dequeued task could have gain during thsi period.
+
+Short slice tasks are particularly impacted in overloaded system.
+
+Test on snapdragon rb5:
+
+hackbench -T -p -l 16000000 -g 2 1> /dev/null &
+cyclictest -t 1 -i 2777 -D 333 --policy=fair --mlock  -h 20000 -q
+
+The scheduling latency of cyclictest is:
+
+                       tip/sched/core  tip/sched/core    +this patch
+cyclictest slice  (ms) (default)2.8             8               8
+hackbench slice   (ms) (default)2.8            20              20
+Total Samples          |   115632          119733          119806
+Average           (us) |      364              64(-82%)        61(- 5%)
+Median (P50)      (us) |       60              56(- 7%)        56(  0%)
+90th Percentile   (us) |     1166              62(-95%)        62(  0%)
+99th Percentile   (us) |     4192              73(-98%)        72(- 1%)
+99.9th Percentile (us) |     8528            2707(-68%)      1300(-52%)
+Maximum           (us) |    17735           14273(-20%)     13525(- 5%)
+
+Signed-off-by: Vincent Guittot <vincent.guittot@linaro.org>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://patch.msgid.link/20260331162352.551501-1-vincent.guittot@linaro.org
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+---
+ kernel/sched/fair.c | 56 ++++++++++++++++++++++++++++++++---------------------
+ 1 file changed, 34 insertions(+), 22 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index e1e01d74ebbe..4051ca1734e1 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -842,11 +842,33 @@ static s64 entity_lag(struct cfs_rq *cfs_rq, struct sched_entity *se, u64 avrunt
+ 	return clamp(vlag, -limit, limit);
+ }
+ 
+-static void update_entity_lag(struct cfs_rq *cfs_rq, struct sched_entity *se)
++/*
++ * Delayed dequeue aims to reduce the negative lag of a dequeued task. While
++ * updating the lag of an entity, check that negative lag didn't increase
++ * during the delayed dequeue period which would be unfair.
++ * Similarly, check that the entity didn't gain positive lag when DELAY_ZERO
++ * is set.
++ *
++ * Return true if the lag has been adjusted.
++ */
++static __always_inline
++bool update_entity_lag(struct cfs_rq *cfs_rq, struct sched_entity *se)
+ {
++	s64 vlag = entity_lag(cfs_rq, se, avg_vruntime(cfs_rq));
++	bool ret;
++
+ 	WARN_ON_ONCE(!se->on_rq);
+ 
+-	se->vlag = entity_lag(cfs_rq, se, avg_vruntime(cfs_rq));
++	if (se->sched_delayed) {
++		/* previous vlag < 0 otherwise se would not be delayed */
++		vlag = max(vlag, se->vlag);
++		if (sched_feat(DELAY_ZERO))
++			vlag = min(vlag, 0);
++	}
++	ret = (vlag == se->vlag);
++	se->vlag = vlag;
++
++	return ret;
+ }
+ 
+ /*
+@@ -5620,13 +5642,6 @@ static void clear_delayed(struct sched_entity *se)
+ 	}
+ }
+ 
+-static inline void finish_delayed_dequeue_entity(struct sched_entity *se)
+-{
+-	clear_delayed(se);
+-	if (sched_feat(DELAY_ZERO) && se->vlag > 0)
+-		se->vlag = 0;
+-}
+-
+ static bool
+ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+ {
+@@ -5652,6 +5667,7 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+ 		if (sched_feat(DELAY_DEQUEUE) && delay &&
+ 		    !entity_eligible(cfs_rq, se)) {
+ 			update_load_avg(cfs_rq, se, 0);
++			update_entity_lag(cfs_rq, se);
+ 			set_delayed(se);
+ 			return false;
+ 		}
+@@ -5691,7 +5707,7 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+ 	update_cfs_group(se);
+ 
+ 	if (flags & DEQUEUE_DELAYED)
+-		finish_delayed_dequeue_entity(se);
++		clear_delayed(se);
+ 
+ 	if (cfs_rq->nr_queued == 0) {
+ 		update_idle_cfs_rq_clock_pelt(cfs_rq);
+@@ -7148,18 +7164,14 @@ requeue_delayed_entity(struct sched_entity *se)
+ 	WARN_ON_ONCE(!se->sched_delayed);
+ 	WARN_ON_ONCE(!se->on_rq);
+ 
+-	if (sched_feat(DELAY_ZERO)) {
+-		update_entity_lag(cfs_rq, se);
+-		if (se->vlag > 0) {
+-			cfs_rq->nr_queued--;
+-			if (se != cfs_rq->curr)
+-				__dequeue_entity(cfs_rq, se);
+-			se->vlag = 0;
+-			place_entity(cfs_rq, se, 0);
+-			if (se != cfs_rq->curr)
+-				__enqueue_entity(cfs_rq, se);
+-			cfs_rq->nr_queued++;
+-		}
++	if (update_entity_lag(cfs_rq, se)) {
++		cfs_rq->nr_queued--;
++		if (se != cfs_rq->curr)
++			__dequeue_entity(cfs_rq, se);
++		place_entity(cfs_rq, se, 0);
++		if (se != cfs_rq->curr)
++			__enqueue_entity(cfs_rq, se);
++		cfs_rq->nr_queued++;
+ 	}
+ 
+ 	update_load_avg(cfs_rq, se, 0);
