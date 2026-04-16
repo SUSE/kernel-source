@@ -1,0 +1,221 @@
+From 1b3bb4d69f20be5931abc18a6dbc24ff687fa780 Mon Sep 17 00:00:00 2001
+From: Sergey Senozhatsky <senozhatsky@chromium.org>
+Date: Sat, 26 Oct 2024 01:56:43 +0900
+Subject: [PATCH] media: venus: factor out inst destruction routine
+Git-commit: 1b3bb4d69f20be5931abc18a6dbc24ff687fa780
+References: jsc#PED-14445
+Patch-mainline: v6.13-rc1
+
+Factor out common instance destruction code into
+a common function.
+
+Suggested-by: Bryan O'Donoghue <bryan.odonoghue@linaro.org>
+Signed-off-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+Reviewed-by: Bryan O'Donoghue <bryan.odonoghue@linaro.org>
+Signed-off-by: Stanimir Varbanov <stanimir.k.varbanov@gmail.com>
+Signed-off-by: Hans Verkuil <hverkuil@xs4all.nl>
+Signed-off-by: Oliver Neukum <oneukum@suse.com>
+
+---
+ drivers/media/platform/qcom/venus/core.c      | 25 +++++++++++++++++++
+ drivers/media/platform/qcom/venus/core.h      |  2 ++
+ drivers/media/platform/qcom/venus/vdec.c      | 24 ++----------------
+ drivers/media/platform/qcom/venus/vdec.h      |  1 -
+ .../media/platform/qcom/venus/vdec_ctrls.c    |  5 ----
+ drivers/media/platform/qcom/venus/venc.c      | 24 ++----------------
+ drivers/media/platform/qcom/venus/venc.h      |  1 -
+ .../media/platform/qcom/venus/venc_ctrls.c    |  5 ----
+ 8 files changed, 31 insertions(+), 56 deletions(-)
+
+diff --git a/drivers/media/platform/qcom/venus/core.c b/drivers/media/platform/qcom/venus/core.c
+index 5caa88b932b0..4e26b1879053 100644
+--- a/drivers/media/platform/qcom/venus/core.c
++++ b/drivers/media/platform/qcom/venus/core.c
+@@ -19,6 +19,7 @@
+ #include <linux/pm_domain.h>
+ #include <linux/pm_runtime.h>
+ #include <media/videobuf2-v4l2.h>
++#include <media/v4l2-ctrls.h>
+ #include <media/v4l2-mem2mem.h>
+ #include <media/v4l2-ioctl.h>
+ 
+@@ -502,6 +503,30 @@ static __maybe_unused int venus_runtime_suspend(struct device *dev)
+ 	return ret;
+ }
+ 
++void venus_close_common(struct venus_inst *inst)
++{
++	/*
++	 * First, remove the inst from the ->instances list, so that
++	 * to_instance() will return NULL.
++	 */
++	hfi_session_destroy(inst);
++	/*
++	 * Second, make sure we don't have IRQ/IRQ-thread currently running
++	 * or pending execution, which would race with the inst destruction.
++	 */
++	synchronize_irq(inst->core->irq);
++
++	v4l2_m2m_ctx_release(inst->m2m_ctx);
++	v4l2_m2m_release(inst->m2m_dev);
++	v4l2_fh_del(&inst->fh);
++	v4l2_fh_exit(&inst->fh);
++	v4l2_ctrl_handler_free(&inst->ctrl_handler);
++
++	mutex_destroy(&inst->lock);
++	mutex_destroy(&inst->ctx_q_lock);
++}
++EXPORT_SYMBOL_GPL(venus_close_common);
++
+ static __maybe_unused int venus_runtime_resume(struct device *dev)
+ {
+ 	struct venus_core *core = dev_get_drvdata(dev);
+diff --git a/drivers/media/platform/qcom/venus/core.h b/drivers/media/platform/qcom/venus/core.h
+index fd46a7778d8c..27784fd7082c 100644
+--- a/drivers/media/platform/qcom/venus/core.h
++++ b/drivers/media/platform/qcom/venus/core.h
+@@ -568,4 +568,6 @@ is_fw_rev_or_older(struct venus_core *core, u32 vmajor, u32 vminor, u32 vrev)
+ 		(core)->venus_ver.minor == vminor &&
+ 		(core)->venus_ver.rev <= vrev);
+ }
++
++void venus_close_common(struct venus_inst *inst);
+ #endif
+diff --git a/drivers/media/platform/qcom/venus/vdec.c b/drivers/media/platform/qcom/venus/vdec.c
+index 90fd4cb4eea9..98c22b9f9372 100644
+--- a/drivers/media/platform/qcom/venus/vdec.c
++++ b/drivers/media/platform/qcom/venus/vdec.c
+@@ -1735,7 +1735,7 @@ static int vdec_open(struct file *file)
+ err_session_destroy:
+ 	hfi_session_destroy(inst);
+ err_ctrl_deinit:
+-	vdec_ctrl_deinit(inst);
++	v4l2_ctrl_handler_free(&inst->ctrl_handler);
+ err_free:
+ 	kfree(inst);
+ 	return ret;
+@@ -1746,29 +1746,9 @@ static int vdec_close(struct file *file)
+ 	struct venus_inst *inst = to_inst(file);
+ 
+ 	vdec_pm_get(inst);
+-
+ 	cancel_work_sync(&inst->delayed_process_work);
+-	/*
+-	 * First, remove the inst from the ->instances list, so that
+-	 * to_instance() will return NULL.
+-	 */
+-	hfi_session_destroy(inst);
+-	/*
+-	 * Second, make sure we don't have IRQ/IRQ-thread currently running
+-	 * or pending execution, which would race with the inst destruction.
+-	 */
+-	synchronize_irq(inst->core->irq);
+-
+-	v4l2_m2m_ctx_release(inst->m2m_ctx);
+-	v4l2_m2m_release(inst->m2m_dev);
++	venus_close_common(inst);
+ 	ida_destroy(&inst->dpb_ids);
+-	v4l2_fh_del(&inst->fh);
+-	v4l2_fh_exit(&inst->fh);
+-	vdec_ctrl_deinit(inst);
+-
+-	mutex_destroy(&inst->lock);
+-	mutex_destroy(&inst->ctx_q_lock);
+-
+ 	vdec_pm_put(inst, false);
+ 
+ 	kfree(inst);
+diff --git a/drivers/media/platform/qcom/venus/vdec.h b/drivers/media/platform/qcom/venus/vdec.h
+index 6b262d0bf561..0cf981108ff0 100644
+--- a/drivers/media/platform/qcom/venus/vdec.h
++++ b/drivers/media/platform/qcom/venus/vdec.h
+@@ -9,6 +9,5 @@
+ struct venus_inst;
+ 
+ int vdec_ctrl_init(struct venus_inst *inst);
+-void vdec_ctrl_deinit(struct venus_inst *inst);
+ 
+ #endif
+diff --git a/drivers/media/platform/qcom/venus/vdec_ctrls.c b/drivers/media/platform/qcom/venus/vdec_ctrls.c
+index 7e0f29bf7fae..36ed955b0419 100644
+--- a/drivers/media/platform/qcom/venus/vdec_ctrls.c
++++ b/drivers/media/platform/qcom/venus/vdec_ctrls.c
+@@ -187,8 +187,3 @@ int vdec_ctrl_init(struct venus_inst *inst)
+ 
+ 	return 0;
+ }
+-
+-void vdec_ctrl_deinit(struct venus_inst *inst)
+-{
+-	v4l2_ctrl_handler_free(&inst->ctrl_handler);
+-}
+diff --git a/drivers/media/platform/qcom/venus/venc.c b/drivers/media/platform/qcom/venus/venc.c
+index 00819483bdc4..c1c543535aaf 100644
+--- a/drivers/media/platform/qcom/venus/venc.c
++++ b/drivers/media/platform/qcom/venus/venc.c
+@@ -1528,7 +1528,7 @@ static int venc_open(struct file *file)
+ err_session_destroy:
+ 	hfi_session_destroy(inst);
+ err_ctrl_deinit:
+-	venc_ctrl_deinit(inst);
++	v4l2_ctrl_handler_free(&inst->ctrl_handler);
+ err_free:
+ 	kfree(inst);
+ 	return ret;
+@@ -1539,28 +1539,8 @@ static int venc_close(struct file *file)
+ 	struct venus_inst *inst = to_inst(file);
+ 
+ 	venc_pm_get(inst);
+-
+-	/*
+-	 * First, remove the inst from the ->instances list, so that
+-	 * to_instance() will return NULL.
+-	 */
+-	hfi_session_destroy(inst);
+-	/*
+-	 * Second, make sure we don't have IRQ/IRQ-thread currently running
+-	 * or pending execution, which would race with the inst destruction.
+-	 */
+-	synchronize_irq(inst->core->irq);
+-
+-	v4l2_m2m_ctx_release(inst->m2m_ctx);
+-	v4l2_m2m_release(inst->m2m_dev);
+-	v4l2_fh_del(&inst->fh);
+-	v4l2_fh_exit(&inst->fh);
+-	venc_ctrl_deinit(inst);
+-
++	venus_close_common(inst);
+ 	inst->enc_state = VENUS_ENC_STATE_DEINIT;
+-	mutex_destroy(&inst->lock);
+-	mutex_destroy(&inst->ctx_q_lock);
+-
+ 	venc_pm_put(inst, false);
+ 
+ 	kfree(inst);
+diff --git a/drivers/media/platform/qcom/venus/venc.h b/drivers/media/platform/qcom/venus/venc.h
+index 4ea37fdcd9b8..719d0f73b14b 100644
+--- a/drivers/media/platform/qcom/venus/venc.h
++++ b/drivers/media/platform/qcom/venus/venc.h
+@@ -9,6 +9,5 @@
+ struct venus_inst;
+ 
+ int venc_ctrl_init(struct venus_inst *inst);
+-void venc_ctrl_deinit(struct venus_inst *inst);
+ 
+ #endif
+diff --git a/drivers/media/platform/qcom/venus/venc_ctrls.c b/drivers/media/platform/qcom/venus/venc_ctrls.c
+index e340783a4ef2..51801a962ed2 100644
+--- a/drivers/media/platform/qcom/venus/venc_ctrls.c
++++ b/drivers/media/platform/qcom/venus/venc_ctrls.c
+@@ -733,8 +733,3 @@ int venc_ctrl_init(struct venus_inst *inst)
+ 	v4l2_ctrl_handler_free(&inst->ctrl_handler);
+ 	return ret;
+ }
+-
+-void venc_ctrl_deinit(struct venus_inst *inst)
+-{
+-	v4l2_ctrl_handler_free(&inst->ctrl_handler);
+-}
+-- 
+2.53.0
+
