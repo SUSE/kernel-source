@@ -1,0 +1,98 @@
+From 8d868d3305539c15761f2217c7cff26eb8258b0e Mon Sep 17 00:00:00 2001
+From: Dengjun Su <dengjun.su@mediatek.com>
+Date: Wed, 4 Feb 2026 19:59:29 +0800
+Subject: [PATCH] sched: Fix incorrect schedstats for rt and dl thread
+
+References: bsc#1234634 (Scheduler functional and performance backports SL-16.1)
+Git-commit: c0e1832ba6dad7057acf3f485a87e0adccc23141
+Patch-mainline: v7.1-rc1
+
+For RT and DL thread, only 'set_next_task_(rt/dl)' will call
+'update_stats_wait_end_(rt/dl)' to update schedstats information.
+However, during the migration process,
+'update_stats_wait_start_(rt/dl)' will be called twice, which
+will cause the values of wait_max and wait_sum to be incorrect.
+The specific output as follows:
+$ cat /proc/6046/task/6046/sched | grep wait
+wait_start                                   :             0.000000
+wait_max                                     :        496717.080029
+wait_sum                                     :       7921540.776553
+
+A complete schedstats information update flow of migrate should be
+__update_stats_wait_start() [enter queue A, stage 1] ->
+__update_stats_wait_end()   [leave queue A, stage 2] ->
+__update_stats_wait_start() [enter queue B, stage 3] ->
+__update_stats_wait_end()   [start running on queue B, stage 4]
+
+    Stage 1: prev_wait_start is 0, and in the end, wait_start records the
+    time of entering the queue.
+    Stage 2: task_on_rq_migrating(p) is true, and wait_start is updated to
+    the waiting time on queue A.
+    Stage 3: prev_wait_start is the waiting time on queue A, wait_start is
+    the time of entering queue B, and wait_start is expected to be greater
+    than prev_wait_start. Under this condition, wait_start is updated to
+    (the moment of entering queue B) - (the waiting time on queue A).
+    Stage 4: the final wait time = (time when starting to run on queue B)
+    - (time of entering queue B) + (waiting time on queue A) = waiting
+    time on queue B + waiting time on queue A.
+
+The current problem is that stage 2 does not call __update_stats_wait_end
+to update wait_start, which causes the final computed wait time = waiting
+time on queue B + the moment of entering queue A, leading to incorrect
+wait_max and wait_sum.
+
+Add 'update_stats_wait_end_(rt/dl)' in 'update_stats_dequeue_(rt/dl)' to
+update schedstats information when dequeue_task.
+
+Signed-off-by: Dengjun Su <dengjun.su@mediatek.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://patch.msgid.link/20260204115959.3183567-1-dengjun.su@mediatek.com
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+---
+ kernel/sched/deadline.c | 4 ++++
+ kernel/sched/rt.c       | 7 ++++++-
+ 2 files changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/kernel/sched/deadline.c b/kernel/sched/deadline.c
+index 2e3ec0750454..49b1b4e890ea 100644
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@ -2200,10 +2200,14 @@ update_stats_dequeue_dl(struct dl_rq *dl_rq, struct sched_dl_entity *dl_se,
+ 			int flags)
+ {
+ 	struct task_struct *p = dl_task_of(dl_se);
++	struct rq *rq = rq_of_dl_rq(dl_rq);
+ 
+ 	if (!schedstat_enabled())
+ 		return;
+ 
++	if (p != rq->curr)
++		update_stats_wait_end_dl(dl_rq, dl_se);
++
+ 	if ((flags & DEQUEUE_SLEEP)) {
+ 		unsigned int state;
+ 
+diff --git a/kernel/sched/rt.c b/kernel/sched/rt.c
+index 7c958f6caeb5..bdd5e95af2ce 100644
+--- a/kernel/sched/rt.c
++++ b/kernel/sched/rt.c
+@@ -1353,13 +1353,18 @@ update_stats_dequeue_rt(struct rt_rq *rt_rq, struct sched_rt_entity *rt_se,
+ 			int flags)
+ {
+ 	struct task_struct *p = NULL;
++	struct rq *rq = rq_of_rt_rq(rt_rq);
+ 
+ 	if (!schedstat_enabled())
+ 		return;
+ 
+-	if (rt_entity_is_task(rt_se))
++	if (rt_entity_is_task(rt_se)) {
+ 		p = rt_task_of(rt_se);
+ 
++		if (p != rq->curr)
++			update_stats_wait_end_rt(rt_rq, rt_se);
++	}
++
+ 	if ((flags & DEQUEUE_SLEEP) && p) {
+ 		unsigned int state;
+ 
