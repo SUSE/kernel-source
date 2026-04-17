@@ -1,7 +1,7 @@
 from kutil.config import get_kernel_projects, get_package_archs, get_source_timestamp, read_source_timestamp, get_kernel_project_package, list_files, list_specs
-import xml.etree.ElementTree as ET
-from obsapi.teaapi import TeaAPI, json_custom_dump
+from obsapi.teaapi import TeaAPI, json_custom_dump, update_maintainership
 from obsapi.obsapi import OBSAPI, PkgRepo
+import xml.etree.ElementTree as ET
 from obsapi.api import APIError
 import subprocess
 import tempfile
@@ -322,7 +322,7 @@ Constraint: hardware:disk:size unit=G %i
             current_maintainers = json.loads(data).get(self.package, [])
             if (maintainers and maintainers != current_maintainers) or (not maintainers and data != json_custom_dump(data_decoded)):
                 if maintainers:
-                    data_decoded[self.package] = maintainers
+                    data_decoded = update_maintainership(data_decoded, self.package, maintainers)
                 data_massaged = json_custom_dump(data_decoded)
                 sys.stderr.write('\n'.join(difflib.unified_diff(data.splitlines(), data_massaged.splitlines(), lineterm='')))
                 self.fork_repo(prjrepo, True, True)
