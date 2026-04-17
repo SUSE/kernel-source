@@ -1,0 +1,110 @@
+From d65fb374256a948f000da0903f3d980a01060a67 Mon Sep 17 00:00:00 2001
+From: K Prateek Nayak <kprateek.nayak@amd.com>
+Date: Tue, 7 Apr 2026 13:36:17 +0200
+Subject: [PATCH] sched/fair: Avoid overflow in enqueue_entity()
+
+References: bsc#1234634 (Scheduler functional and performance backports SL-16.1)
+Git-commit: 556146ce5e9476db234134c46ddf0e154ca17028
+Patch-mainline: v7.1-rc1
+
+Here is one scenario which was triggered when running:
+
+    stress-ng --yield=32 -t 10000000s&
+    while true; do perf bench sched messaging -p -t -l 100000 -g 16; done
+
+on a 256CPUs machine after about an hour into the run:
+
+    __enqeue_entity: entity_key(-141245081754) weight(90891264) overflow_mul(5608800059305154560) vlag(57498) delayed?(0)
+    cfs_rq: zero_vruntime(3809707759657809) sum_w_vruntime(0) sum_weight(0) nr_queued(1)
+    cfs_rq->curr: entity_key(0) vruntime(3809707759657809) deadline(3809723966988476) weight(37)
+
+The above comes from __enqueue_entity() after a place_entity(). Breaking
+this down:
+
+    vlag_initial = 57498
+    vlag = (57498 * (37 + 90891264)) / 37 = 141,245,081,754
+
+    vruntime = 3809707759657809 - 141245081754 = 3,809,566,514,576,055
+    entity_key(se, cfs_rq) = -141,245,081,754
+
+Now, multiplying the entity_key with its own weight results to
+5,608,800,059,305,154,560 (same as what overflow_mul() suggests) but
+in Python, without overflow, this would be: -1,2837,944,014,404,397,056
+
+Avoid the overflow (without doing the division for avg_vruntime()), by moving
+zero_vruntime to the new entity when it is heavier.
+
+Fixes: 4823725d9d1d ("sched/fair: Increase weight bits for avg_vruntime")
+Signed-off-by: K Prateek Nayak <kprateek.nayak@amd.com>
+[peterz: suggested 'weight > load' condition]
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://patch.msgid.link/20260407120052.GG3738010@noisy.programming.kicks-ass.net
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+---
+ kernel/sched/fair.c | 32 ++++++++++++++++++++++++++++++--
+ 1 file changed, 30 insertions(+), 2 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 4051ca1734e1..3775f0b4dfa7 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -5408,6 +5408,7 @@ static void
+ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+ {
+ 	u64 vslice, vruntime = avg_vruntime(cfs_rq);
++	bool update_zero = false;
+ 	s64 lag = 0;
+ 
+ 	if (!se->custom_slice)
+@@ -5424,7 +5425,7 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+ 	 */
+ 	if (sched_feat(PLACE_LAG) && cfs_rq->nr_queued && se->vlag) {
+ 		struct sched_entity *curr = cfs_rq->curr;
+-		long load;
++		long load, weight;
+ 
+ 		lag = se->vlag;
+ 
+@@ -5484,14 +5485,41 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+ 		if (curr && curr->on_rq)
+ 			load += avg_vruntime_weight(cfs_rq, curr->load.weight);
+ 
+-		lag *= load + avg_vruntime_weight(cfs_rq, se->load.weight);
++		weight = avg_vruntime_weight(cfs_rq, se->load.weight);
++		lag *= load + weight;
+ 		if (WARN_ON_ONCE(!load))
+ 			load = 1;
+ 		lag = div64_long(lag, load);
++
++		/*
++		 * A heavy entity (relative to the tree) will pull the
++		 * avg_vruntime close to its vruntime position on enqueue. But
++		 * the zero_vruntime point is only updated at the next
++		 * update_deadline()/place_entity()/update_entity_lag().
++		 *
++		 * Specifically (see the comment near avg_vruntime_weight()):
++		 *
++		 *   sum_w_vruntime = \Sum (v_i - v0) * w_i
++		 *
++		 * Note that if v0 is near a light entity, both terms will be
++		 * small for the light entity, while in that case both terms
++		 * are large for the heavy entity, leading to risk of
++		 * overflow.
++		 *
++		 * OTOH if v0 is near the heavy entity, then the difference is
++		 * larger for the light entity, but the factor is small, while
++		 * for the heavy entity the difference is small but the factor
++		 * is large. Avoiding the multiplication overflow.
++		 */
++		if (weight > load)
++			update_zero = true;
+ 	}
+ 
+ 	se->vruntime = vruntime - lag;
+ 
++	if (update_zero)
++		update_zero_vruntime(cfs_rq, -lag);
++
+ 	if (sched_feat(PLACE_REL_DEADLINE) && se->rel_deadline) {
+ 		se->deadline += se->vruntime;
+ 		se->rel_deadline = 0;
