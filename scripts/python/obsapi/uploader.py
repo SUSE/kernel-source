@@ -271,7 +271,11 @@ Constraint: hardware:disk:size unit=G %i
                 self.aggregate_package(package, kob, kob_agg, list(repo_archs.keys()))
             else:
                 self.log_progress('Deleting %s/%s...' % (self.project, kob_agg))
-                self.obs.delete_package(self.project, kob_agg)
+                try:
+                    self.obs.delete_package(self.project, kob_agg)
+                    self.log_progress('ok\n')
+                except APIError as e:
+                    self.log_progress(str(e))
         self.update_package_links(specs, package, multibuild)
 
     def aggregate_package(self, package, agg_src, agg_target, repos):
