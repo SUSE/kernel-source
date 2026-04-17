@@ -9,15 +9,25 @@ import yaml
 import sys
 import os
 
-
 def json_custom_dump(data):
-    return '{' + (
-            '\n  ' + ',\n  '.join([
-                json.dumps(k) + ': [ ' + (','.join([
-                    json.dumps(v) for v in data[k]]) if data[k] else '')
-                + ' ]' for k in sorted(data.keys()) ])
-            if data else '' ) +'\n}\n'
+    return _json_custom_dump(data) + '\n'
 
+def _json_custom_dump(data, indent=0):
+    if isinstance(data, dict):
+        return '{' + (
+                '\n' + '  ' * (indent + 1) + (',\n' + '  ' * (indent + 1)).join([json.dumps(k) + ': ' + _json_custom_dump(data[k], indent + 1) for k in sorted(data.keys())])
+                if data else '' ) + '\n' + '  ' * indent + '}'
+    elif isinstance(data, list):
+        return '[ ' + (','.join([_json_custom_dump(v, indent + 1) for v in data]) if data else '') + ' ]'
+    else:
+        return json.dumps(data)
+
+def update_maintainership(data, package, maintainers):
+    if isinstance(data, dict) and 'header' in data and isinstance(data['header'], dict):
+        data.setdefault('packages', {}).setdefault(package, {})['users'] = maintainers
+    else:
+        data[package] = maintainers
+    return data
 
 class TeaAPI(api.API):
     def __init__(self, URL, logfile=None, config=None, ca=None, progress=sys.stderr):
