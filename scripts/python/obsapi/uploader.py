@@ -266,10 +266,10 @@ Constraint: hardware:disk:size unit=G %i
         self.obs.create_package_meta(self.project, self.package, self.pkgmeta())
         kob = 'kernel-obs-build'
         kob_agg = kob + '.agg'
-        if kob in specs:
-            self.aggregate_package(package, kob, kob_agg, list(repo_archs.keys()))
-        else:
-            if not no_init:
+        if not no_init:
+            if kob in specs:
+                self.aggregate_package(package, kob, kob_agg, list(repo_archs.keys()))
+            else:
                 self.log_progress('Deleting %s/%s...' % (self.project, kob_agg))
                 self.obs.delete_package(self.project, kob_agg)
         self.update_package_links(specs, package, multibuild)
