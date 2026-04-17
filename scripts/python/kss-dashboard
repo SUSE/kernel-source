@@ -551,11 +551,11 @@ class BZApi:
             query['short_desc'] = 'VUL- kernel'
             query['short_desc_type'] = 'allwordssubstr'
 
-        return self.bzapi.query(query)
+        return self.bzapi.query(query), query
 
 # the main display function, a lot of spaghetti code in here
 # a better solution would be to have __str__ function for every component of BugData which would reduce complexity somewhat
-def show_bug(n, b, linux_git, args):
+def show_bug(n, b, linux_git, args, bz_query):
     color = T_RED
     fixes = []
     paths = []
@@ -574,9 +574,26 @@ def show_bug(n, b, linux_git, args):
             fixes = []
     if not args.short:
         yield f'{n:>3}; '
-    middle = b.data.assigned_to if args.short and args.assigned_queue else ('' if not b.shas else color_format(color, b.shas[0]))
-    padding_middle = 30 if args.short and args.assigned_queue else 40
-    yield "{} ; {:<11} ; {:<14} ; {:>{}}".format(b.data.id, b.data.status, color_format(T_RED, b.cve) if b.is_rejected else b.cve, middle, padding_middle)
+    yield "{} ; {:<11} ; {:<14}".format(b.data.id, b.data.status, color_format(T_RED, b.cve) if b.is_rejected else b.cve)
+
+    if args.show_assignee == 'auto':
+        show_assignee = 'assigned_to' not in bz_query or len(bz_query['assigned_to']) != 1
+    else:
+        show_assignee = True if args.show_assignee == 'yes' else False
+
+    sha = '' if not b.shas else color_format(color, b.shas[0])
+    asg = '' if not b.data.assigned_to else b.data.assigned_to
+    if args.short:
+        f = " ; {:>{}}"
+        d = (asg, 40) if show_assignee else (sha, 30)
+    elif show_assignee:
+        f = " ; {:>{}} ; {:>{}}"
+        d = (sha, 30, asg, 40)
+    else:
+        f = " ; {:>{}}"
+        d = (sha, 30)
+    yield f.format(*d)
+
     yield " ; {:>4} ; {} ; {:>3} ; {}\n".format(b.score, b.btime if args.birth_time else b.mtime, b.age, color_format(T_RED, '[cve is rejected] ') + b.data.summary if b.is_rejected else b.data.summary)
     if len(b.shas) > 1:
         for s in b.shas[1:]:
@@ -983,6 +1000,7 @@ def parse_args():
                          action="store_true", default=False)
     q_group.add_argument("-B", "--bugs", help="show only specific bugs; takes a comma separated list of bug numbers, some features are only available to security incidents", default=None, type=str)
     q_group.add_argument("-V", "--cves", help="show only specific CVE bugs; takes a comma separated list of CVE numbers", default=None, type=str)
+    parser.add_argument("--show-assignee", help="Show assignee, default is 'auto' that decides from queried emails", choices=['auto', 'no', 'yes'], default='auto')
     parser.add_argument("-z", "--zdi", help="show only ZDI advisories", action="store_true", default=False)
     parser.add_argument("-o", "--overdue", help="show only bugs that are overdue; 30 days for score >= 7.0 and 90 days fro score >= 4.0", action="store_true", default=False)
     parser.add_argument("-R", "--rejected", help="show rejected CVEs if any", action="store_true", default=False)
@@ -1001,7 +1019,7 @@ def parse_args():
     return parser.parse_args()
 
 # the main output producing generator that yields from other generators, recursively
-def generate_output(linux_git, bugs, args, key_functions, jobs):
+def generate_output(linux_git, bugs, args, key_functions, jobs, bz_query):
     if args.check_kernel_fix:
         ckf_dirs_pair = args.check_kernel_fix.split(',')[:2]
         sucess = False
@@ -1028,7 +1046,7 @@ def generate_output(linux_git, bugs, args, key_functions, jobs):
         if args.exportpatch:
             patches_to_export.append(b)
         else:
-            yield from show_bug(n, b, linux_git, args)
+            yield from show_bug(n, b, linux_git, args, bz_query)
     if patches_to_export:
         yield from exportpatch(patches_to_export, linux_git)
 
@@ -1093,7 +1111,7 @@ def main():
     jobs = handle_parallelism(args.jobs, args.check_kernel_fix)
     bzapi = BZApi(args.rest)
     # here the magic happens when it comes to query to the bugzilla
-    bugs = bzapi.fetch_bugs(email, bug_list, cve_list)
+    bugs, bz_query = bzapi.fetch_bugs(email, bug_list, cve_list)
     linux_git = MainlineRepo()
 
     # by default we show colors in terminal only, see the top of the script, but here we can force it one way or the other
@@ -1206,7 +1224,7 @@ def main():
         dst = sys.stdout
 
     try:
-        for l in generate_output(linux_git, bugs, args, SortActions.key_functions, jobs):
+        for l in generate_output(linux_git, bugs, args, SortActions.key_functions, jobs, bz_query):
             dst.write(l)
     except BrokenPipeError:
         pass
