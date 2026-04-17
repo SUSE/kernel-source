@@ -1,6 +1,6 @@
+from obsapi.teaapi import TeaAPI, json_custom_dump, update_maintainership
 from kutil.config import get_package_archs, get_kernel_projects, uniq
 from obsapi.obsapi import OBSAPI, PkgRepo, process_scmsync
-from obsapi.teaapi import TeaAPI, json_custom_dump
 from obsapi.uploader import UploaderBase
 import xml.etree.ElementTree as ET
 from difflib import unified_diff
@@ -212,7 +212,7 @@ class TestMisc(unittest.TestCase):
   "A": [ "b","c","d" ],
   "E": [ "f" ],
   "G": [  ],
-  "H": [  ]
+  "H": null
 }
 '''
 ],
@@ -220,9 +220,43 @@ class TestMisc(unittest.TestCase):
 }
 '''
                  ],
+                [ {'header': {'document': 'obs-maintainers', 'version': '1.0'}, 'project': {'users': ['project_owner1', 'project_owner2'], 'groups': ['project-maintainer-group']}, 'packages': {'package1': {'users': ['package1-user1-maintainer', 'package1-user2-maintainer']}, 'package2': {'groups': ['package2-group-maintainer']}, 'package3': {'users': ['package3-user-maintainer'], 'groups': ['package3-group1-maintainer', 'package3-group2-maintainer']}}},
+                 '''{
+  "header": {
+    "document": "obs-maintainers",
+    "version": "1.0"
+  },
+  "packages": {
+    "package1": {
+      "users": [ "package1-user1-maintainer","package1-user2-maintainer" ]
+    },
+    "package2": {
+      "groups": [ "package2-group-maintainer" ]
+    },
+    "package3": {
+      "groups": [ "package3-group1-maintainer","package3-group2-maintainer" ],
+      "users": [ "package3-user-maintainer" ]
+    }
+  },
+  "project": {
+    "groups": [ "project-maintainer-group" ],
+    "users": [ "project_owner1","project_owner2" ]
+  }
+}
+'''
+                 ],
                 ]
         for data, result in testdata:
             self.assertEqual(json_custom_dump(data), result)
+
+    def test_update_maintainersip(self):
+        testdata = [
+                [[{}, 'kernel-source', ['maint1', 'maint2']], {'kernel-source' : ['maint1', 'maint2']}],
+                [[{'header': {}}, 'kernel-source', ['maint1', 'maint2']], {'header': {}, 'packages': {'kernel-source': {'users': ['maint1', 'maint2']}}}],
+                [[{'header': {}, 'packages': {'kernel-source': {'users': ['maint4', 'maint5']}}}, 'kernel-source', ['maint1', 'maint2']], {'header': {}, 'packages': {'kernel-source': {'users': ['maint1', 'maint2']}}}],
+                ]
+        for args, result in testdata:
+            self.assertEqual(update_maintainership(*args), result)
 
     def test_uniq(self):
         testdata = [
@@ -336,6 +370,20 @@ class TestTea(APITest):
             st.stop_server()
             self.assertEqual(api.get_user(), 'michals')  # cached value, no server comm
         self.log_cycle(test_fn, 'tests/api/user')
+
+    def test_list_repos(self):
+        def test_fn(inlog, outlog):
+            st = ServerThread(inlog)
+            st.start_server(teaconfig=self.config)
+            api = TeaAPI(st.url(), config=self.config, ca=st.servercert, logfile=outlog)
+            reference = ['kernel-source', 'kernel-livepatch-MICRO-6-0-RT_Update_10', 'kernel-livepatch-MICRO-6-0-RT_Update_11', 'kernel-livepatch-MICRO-6-0-RT_Update_12', 'kernel-livepatch-MICRO-6-0-RT_Update_4', 'kernel-livepatch-MICRO-6-0-RT_Update_5', 'kernel-livepatch-MICRO-6-0-RT_Update_6', 'kernel-livepatch-MICRO-6-0-RT_Update_7', 'kernel-livepatch-MICRO-6-0-RT_Update_8', 'kernel-livepatch-MICRO-6-0-RT_Update_9', 'kernel-livepatch-MICRO-6-0_Update_10', 'kernel-livepatch-MICRO-6-0_Update_11', 'kernel-livepatch-MICRO-6-0_Update_12', 'kernel-livepatch-MICRO-6-0_Update_13', 'kernel-livepatch-MICRO-6-0_Update_4', 'kernel-livepatch-MICRO-6-0_Update_5', 'kernel-livepatch-MICRO-6-0_Update_6', 'kernel-livepatch-MICRO-6-0_Update_7', 'kernel-livepatch-MICRO-6-0_Update_8', 'kernel-livepatch-MICRO-6-0_Update_9', 'kgraft-patch-SLE12-SP5_Update_64', 'kgraft-patch-SLE12-SP5_Update_65', 'kgraft-patch-SLE12-SP5_Update_66', 'kgraft-patch-SLE12-SP5_Update_67', 'kgraft-patch-SLE12-SP5_Update_68', 'kgraft-patch-SLE12-SP5_Update_69', 'kgraft-patch-SLE12-SP5_Update_70', 'kgraft-patch-SLE12-SP5_Update_71', 'kgraft-patch-SLE12-SP5_Update_72', 'kgraft-patch-SLE12-SP5_Update_73', 'kgraft-patch-SLE12-SP5_Update_74', 'kgraft-patch-SLE12-SP5_Update_75', 'kernel-livepatch-SLE15-SP4_Update_35', 'kernel-livepatch-SLE15-SP4_Update_36', 'kernel-livepatch-SLE15-SP4_Update_37', 'kernel-livepatch-SLE15-SP4_Update_38', 'kernel-livepatch-SLE15-SP4_Update_39', 'kernel-livepatch-SLE15-SP4_Update_40', 'kernel-livepatch-SLE15-SP4_Update_41', 'kernel-livepatch-SLE15-SP4_Update_42', 'kernel-livepatch-SLE15-SP4_Update_43', 'kernel-livepatch-SLE15-SP4_Update_44', 'kernel-livepatch-SLE15-SP4_Update_45', 'kernel-livepatch-SLE15-SP4_Update_46', 'kernel-livepatch-SLE15-SP4_Update_47', 'kernel-livepatch-SLE15-SP5_Update_22', 'kernel-livepatch-SLE15-SP5_Update_23', 'kernel-livepatch-SLE15-SP5_Update_24', 'kernel-livepatch-SLE15-SP5_Update_25', 'kernel-livepatch-SLE15-SP5_Update_26', 'kernel-livepatch-SLE15-SP5_Update_27', 'kernel-livepatch-SLE15-SP5_Update_28', 'kernel-livepatch-SLE15-SP5_Update_29', 'kernel-livepatch-SLE15-SP5_Update_30', 'kernel-livepatch-SLE15-SP5_Update_31', 'kernel-livepatch-SLE15-SP5_Update_32', 'kernel-livepatch-SLE15-SP5_Update_33', 'kernel-livepatch-SLE15-SP6_Update_10', 'kernel-livepatch-SLE15-SP6_Update_11', 'kernel-livepatch-SLE15-SP6_Update_12', 'kernel-livepatch-SLE15-SP6_Update_13', 'kernel-livepatch-SLE15-SP6_Update_14', 'kernel-livepatch-SLE15-SP6_Update_15', 'kernel-livepatch-SLE15-SP6_Update_16', 'kernel-livepatch-SLE15-SP6_Update_17', 'kernel-livepatch-SLE15-SP6_Update_18', 'kernel-livepatch-SLE15-SP6_Update_7', 'kernel-livepatch-SLE15-SP6_Update_8', 'kernel-source-rt', 'kernel-livepatch-SLE16_Update_3', 'kernel-livepatch-SLE16_Update_2', 'kernel-livepatch-SLFO-Main_Update_0', 'kernel-livepatch-SLFO-Main-RT_Update_0', 'kernel-livepatch-SLE15-SP6_Update_9', 'kernel-livepatch-SLE15-SP7-RT_Update_0', 'kernel-livepatch-SLE15-SP7-RT_Update_1', 'kernel-livepatch-SLE15-SP7-RT_Update_2', 'kernel-livepatch-SLE15-SP7-RT_Update_3', 'kernel-livepatch-SLE15-SP7-RT_Update_4', 'kernel-livepatch-SLE15-SP7-RT_Update_5', 'kernel-livepatch-SLE15-SP7-RT_Update_6', 'kernel-livepatch-SLE15-SP7-RT_Update_7', 'kernel-livepatch-SLE15-SP7_Update_0', 'kernel-livepatch-SLE15-SP7_Update_1', 'kernel-livepatch-SLE15-SP7_Update_2', 'kernel-livepatch-SLE15-SP7_Update_3', 'kernel-livepatch-SLE15-SP7_Update_4', 'kernel-livepatch-SLE15-SP7_Update_5', 'kernel-livepatch-SLE15-SP7_Update_6', 'kernel-livepatch-SLE15-SP7_Update_7', 'kernel-livepatch-SLE16-RT_Update_0', 'kernel-livepatch-SLE16-RT_Update_1', 'kernel-livepatch-SLE16-RT_Update_2', 'kernel-livepatch-SLE16-RT_Update_3', 'kernel-livepatch-SLE16_Update_0', 'kernel-livepatch-SLE16_Update_1', 'kernel-source-longterm', 'kernel-source-vanilla', 'kernel-livepatch-MICRO-6-0-RT_Update_2', 'kernel-livepatch-MICRO-6-0-RT_Update_3', 'kernel-livepatch-MICRO-6-0_Update_2', 'kernel-livepatch-MICRO-6-0_Update_3', 'kgraft-patch-SLE12-SP5_Update_76', 'kernel-livepatch-SLE15-SP4_Update_48', 'kernel-livepatch-SLE15-SP5_Update_34', 'kernel-livepatch-SLE15-SP6_Update_19', 'kernel-livepatch-SLE15-SP7-RT_Update_8', 'kernel-livepatch-SLE15-SP7_Update_8', 'kernel-livepatch-SLE16-RT_Update_4', 'kernel-livepatch-SLE16_Update_4', 'SLFO', 'kernel-livepatch-MICRO-6-0-RT_Update_14', 'kernel-livepatch-MICRO-6-0-RT_Update_17', 'kgraft-patch-SLE12-SP5_Update_77', 'kernel-livepatch-SLE15-SP4_Update_49', 'kernel-livepatch-SLE15-SP5_Update_35', 'kernel-livepatch-SLE15-SP6_Update_20', 'kernel-livepatch-SLE15-SP7-RT_Update_9', 'kernel-livepatch-SLE15-SP7_Update_9', 'kernel-livepatch-SLE16-RT_Update_5', 'kernel-livepatch-SLE16_Update_5', 'kernel-livepatch-MICRO-6-0-RT_Update_13', 'kernel-livepatch-MICRO-6-0_Update_14', 'kgraft-patch-SLE12-SP5_Update_78', 'kernel-livepatch-SLE15-SP4_Update_50', 'kernel-livepatch-SLE15-SP5_Update_36', 'kernel-livepatch-SLE15-SP6_Update_21', 'kernel-livepatch-SLE15-SP7-RT_Update_10', 'kernel-livepatch-SLE15-SP7_Update_10', 'kernel-livepatch-SLE16-RT_Update_6', 'kernel-livepatch-SLE16_Update_6', 'SLFO_Kernel', 'kernel-livepatch-MICRO-6-0-RT_Update_15', 'kernel-livepatch-MICRO-6-0-RT_Update_19', 'kgraft-patch-SLE12-SP5_Update_79', 'kernel-livepatch-SLE15-SP5_Update_37', 'kernel-livepatch-SLE15-SP6_Update_22', 'kernel-livepatch-SLE15-SP7-RT_Update_11', 'kernel-livepatch-SLE15-SP7_Update_11', 'kernel-livepatch-SLE16-RT_Update_7', 'kernel-livepatch-SLE16_Update_7', 'kernel-livepatch-MICRO-6-0-RT_Update_18', 'kernel-livepatch-MICRO-6-0_Update_16', 'kernel-livepatch-MICRO-6-0_Update_17', 'kernel-livepatch-MICRO-6-0_Update_18']
+            if sys.version_info.major == 3 and sys.version_info.minor < 6:
+                self.assertEqual(sorted(list(api.list_repos('kernelbugs').keys())), sorted(reference))
+            else:
+                self.assertEqual(list(api.list_repos('kernelbugs').keys()), reference)
+            self.assertTrue(st.data_consumed)
+            st.stop_server()
+        self.log_cycle(test_fn, 'tests/api/list_repos')
 
     def test_gitattr_up_to_date(self):
         def test_fn(inlog, outlog):
