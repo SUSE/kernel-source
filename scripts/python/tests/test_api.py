@@ -1,6 +1,6 @@
+from obsapi.teaapi import TeaAPI, json_custom_dump, update_maintainership
 from kutil.config import get_package_archs, get_kernel_projects, uniq
 from obsapi.obsapi import OBSAPI, PkgRepo, process_scmsync
-from obsapi.teaapi import TeaAPI, json_custom_dump
 from obsapi.uploader import UploaderBase
 import xml.etree.ElementTree as ET
 from difflib import unified_diff
@@ -212,7 +212,7 @@ class TestMisc(unittest.TestCase):
   "A": [ "b","c","d" ],
   "E": [ "f" ],
   "G": [  ],
-  "H": [  ]
+  "H": null
 }
 '''
 ],
@@ -220,9 +220,43 @@ class TestMisc(unittest.TestCase):
 }
 '''
                  ],
+                [ {'header': {'document': 'obs-maintainers', 'version': '1.0'}, 'project': {'users': ['project_owner1', 'project_owner2'], 'groups': ['project-maintainer-group']}, 'packages': {'package1': {'users': ['package1-user1-maintainer', 'package1-user2-maintainer']}, 'package2': {'groups': ['package2-group-maintainer']}, 'package3': {'users': ['package3-user-maintainer'], 'groups': ['package3-group1-maintainer', 'package3-group2-maintainer']}}},
+                 '''{
+  "header": {
+    "document": "obs-maintainers",
+    "version": "1.0"
+  },
+  "packages": {
+    "package1": {
+      "users": [ "package1-user1-maintainer","package1-user2-maintainer" ]
+    },
+    "package2": {
+      "groups": [ "package2-group-maintainer" ]
+    },
+    "package3": {
+      "groups": [ "package3-group1-maintainer","package3-group2-maintainer" ],
+      "users": [ "package3-user-maintainer" ]
+    }
+  },
+  "project": {
+    "groups": [ "project-maintainer-group" ],
+    "users": [ "project_owner1","project_owner2" ]
+  }
+}
+'''
+                 ],
                 ]
         for data, result in testdata:
             self.assertEqual(json_custom_dump(data), result)
+
+    def test_update_maintainersip(self):
+        testdata = [
+                [[{}, 'kernel-source', ['maint1', 'maint2']], {'kernel-source' : ['maint1', 'maint2']}],
+                [[{'header': {}}, 'kernel-source', ['maint1', 'maint2']], {'header': {}, 'packages': {'kernel-source': {'users': ['maint1', 'maint2']}}}],
+                [[{'header': {}, 'packages': {'kernel-source': {'users': ['maint4', 'maint5']}}}, 'kernel-source', ['maint1', 'maint2']], {'header': {}, 'packages': {'kernel-source': {'users': ['maint1', 'maint2']}}}],
+                ]
+        for args, result in testdata:
+            self.assertEqual(update_maintainership(*args), result)
 
     def test_uniq(self):
         testdata = [
