@@ -1,7 +1,7 @@
 from kutil.config import get_kernel_projects, get_package_archs, get_source_timestamp, read_source_timestamp, get_kernel_project_package, list_files, list_specs
-import xml.etree.ElementTree as ET
-from obsapi.teaapi import TeaAPI, json_custom_dump
+from obsapi.teaapi import TeaAPI, json_custom_dump, update_maintainership
 from obsapi.obsapi import OBSAPI, PkgRepo
+import xml.etree.ElementTree as ET
 from obsapi.api import APIError
 import subprocess
 import tempfile
@@ -254,7 +254,7 @@ Constraint: hardware:disk:size unit=G %i
         ET.indent(pkgmeta)
         return ET.tostring(pkgmeta)
 
-    def create_package(self, limit_packages=None):
+    def create_package(self, limit_packages=None, no_init=False):
         limit_packages = self.filter_limit_packages(limit_packages)
         repo_archs = self.get_project_repo_archs(limit_packages)
         multibuild = '_multibuild' in list_files(self.data)
@@ -266,22 +266,37 @@ Constraint: hardware:disk:size unit=G %i
         self.obs.create_package_meta(self.project, self.package, self.pkgmeta())
         kob = 'kernel-obs-build'
         kob_agg = kob + '.agg'
-        self.log_progress('Aggregating %s/%s...' % (self.project, kob_agg))
-        self.obs.create_package(self.project, kob_agg)
+        if not no_init:
+            if kob in specs:
+                self.aggregate_package(package, kob, kob_agg, list(repo_archs.keys()))
+            else:
+                self.log_progress('Deleting %s/%s...' % (self.project, kob_agg))
+                try:
+                    self.obs.delete_package(self.project, kob_agg)
+                    self.log_progress('ok\n')
+                except APIError as e:
+                    self.log_progress(str(e))
+        self.update_package_links(specs, package, multibuild)
+
+    def aggregate_package(self, package, agg_src, agg_target, repos):
+        self.log_progress('Aggregating %s/%s...' % (self.project, agg_target))
+        self.obs.create_package(self.project, agg_target)
         aggxml = ET.Element('aggregatelist')
         agg = ET.SubElement(aggxml, 'aggregate', project = self.project)
         pkg = ET.SubElement(agg, 'package')
-        pkg.text = kob
+        pkg.text = agg_src
         pkg = ET.SubElement(agg, 'package')
-        pkg.text = package + ':' + kob
-        for r in repo_archs.keys():
+        pkg.text = package + ':' + agg_src
+        for r in repos:
             ET.SubElement(agg, 'repository', target=self.get_qa_repo(r), source=r)
             # default aggregetio is identity, target=source.
             # target with no souce disables aggregation
             ET.SubElement(agg, 'repository', target=r)
         ET.indent(aggxml)
-        self.obs.upload_file(self.project, kob_agg, '_aggregate', ET.tostring(aggxml), 'application/xml')
+        self.obs.upload_file(self.project, agg_target, '_aggregate', ET.tostring(aggxml), 'application/xml')
         self.log_progress('ok\n')
+
+    def update_package_links(self, specs, package, multibuild):
         links = self.obs.list_package_links(self.project, self.package)
         if not multibuild:
             for s in specs:
@@ -311,7 +326,7 @@ Constraint: hardware:disk:size unit=G %i
             current_maintainers = json.loads(data).get(self.package, [])
             if (maintainers and maintainers != current_maintainers) or (not maintainers and data != json_custom_dump(data_decoded)):
                 if maintainers:
-                    data_decoded[self.package] = maintainers
+                    data_decoded = update_maintainership(data_decoded, self.package, maintainers)
                 data_massaged = json_custom_dump(data_decoded)
                 sys.stderr.write('\n'.join(difflib.unified_diff(data.splitlines(), data_massaged.splitlines(), lineterm='')))
                 self.fork_repo(prjrepo, True, True)

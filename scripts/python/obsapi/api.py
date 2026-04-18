@@ -112,7 +112,7 @@ class API:
                                                    NonRaisingHTTPErrorProcessor(), cp)
 
     def __del__(self):
-        if self._to_close:
+        if hasattr(self, '_to_close') and self._to_close:
             self._to_close.close()
 
     def redact_auth(self, string):
@@ -153,7 +153,7 @@ class API:
                 else:
                     if (i == 'content') and data[i] and (isinstance(data[i], str) or isinstance(data[i], bytes)):
                         try:
-                            result['content_decoded'] = base64.standard_b64decode(data[i]).decode(errors='surrogateescape')
+                            result['content_decoded'] = base64.b64decode(data[i], validate=True).decode(errors='surrogateescape')
                         except binascii.Error:
                             pass
                     result[i] = self.redact_content(data[i])
@@ -204,9 +204,6 @@ class API:
 
     def log(self, method, path, args, r):
         self.logfile.write(self.format_request(method, path, args, r))
-
-    def header_json(self):
-        return {'Content-type': 'application/json'}
 
     def call(self, method, path, **kwargs):
         for arg in kwargs.keys():

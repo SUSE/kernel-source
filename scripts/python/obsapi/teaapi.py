@@ -9,15 +9,25 @@ import yaml
 import sys
 import os
 
-
 def json_custom_dump(data):
-    return '{' + (
-            '\n  ' + ',\n  '.join([
-                json.dumps(k) + ': [ ' + (','.join([
-                    json.dumps(v) for v in data[k]]) if data[k] else '')
-                + ' ]' for k in sorted(data.keys()) ])
-            if data else '' ) +'\n}\n'
+    return _json_custom_dump(data) + '\n'
 
+def _json_custom_dump(data, indent=0):
+    if isinstance(data, dict):
+        return '{' + (
+                '\n' + '  ' * (indent + 1) + (',\n' + '  ' * (indent + 1)).join([json.dumps(k) + ': ' + _json_custom_dump(data[k], indent + 1) for k in sorted(data.keys())])
+                if data else '' ) + '\n' + '  ' * indent + '}'
+    elif isinstance(data, list):
+        return '[ ' + (','.join([_json_custom_dump(v, indent + 1) for v in data]) if data else '') + ' ]'
+    else:
+        return json.dumps(data)
+
+def update_maintainership(data, package, maintainers):
+    if isinstance(data, dict) and 'header' in data and isinstance(data['header'], dict):
+        data.setdefault('packages', {}).setdefault(package, {})['users'] = maintainers
+    else:
+        data[package] = maintainers
+    return data
 
 class TeaAPI(api.API):
     def __init__(self, URL, logfile=None, config=None, ca=None, progress=sys.stderr):
@@ -32,17 +42,16 @@ class TeaAPI(api.API):
         if self.config == None:
             self.config = os.environ['HOME'] + '/.config/tea/config.yml'
         try:
-            with open(self.config, 'r') as file:
+            with open(self.config, 'rb') as file:
                 config = yaml.safe_load(file)
-        except (FileNotFoundError, PermissionError, yaml.YAMLError) as e:
-            sys.stderr.write('Error loading gitea-tea configuration file ' + self.config + ' : ' + str(e) + '\n')
-            config = { 'logins': [] }
-
+                if not isinstance(config, dict):
+                    raise yaml.YAMLError('gitea-tea configuration is expected to be a dictionary')
+        except (FileNotFoundError, PermissionError, UnicodeError, yaml.YAMLError) as e:
+            raise RuntimeError('Error loading gitea-tea configuration file ' + self.config + ': ' + str(e))
         try:
-            self.token = [login['token'] for login in config['logins'] if login['url'] == self.url][0]
+            self.token = [login['token'] for login in config['logins'] if login['url'].rstrip('/') == self.url][0]
         except IndexError:
-            sys.stderr.write('Cannot find gitea-tea (tea-cli) configuration for ' + self.url + '\nPlease configure tea with a token that has readwrite access to user and repository with\ntea login add\n')
-            exit(1)
+            raise RuntimeError('Cannot find gitea-tea (tea-cli) configuration for ' + self.url + '\nPlease configure tea with a token that has readwrite access to user and repository with\ntea login add')
 
     def auth_header(self, wwwa):
         return {'Authorization' : 'token ' + self.token}
