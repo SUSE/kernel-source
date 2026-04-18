@@ -1,0 +1,163 @@
+From: =?UTF-8?q?Jouni=20H=C3=B6gander?= <jouni.hogander@intel.com>
+Date: Fri, 27 Mar 2026 13:45:53 +0200
+Subject: [PATCH] drm/i915/psr: Do not use pipe_src as borders for SU area
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+References: bsc#1258210
+Patch-mainline: 6.18.23
+Git-commit: 75519f5df2a9b23f7bf305e12dc9a6e3e65c24b7
+
+commit 75519f5df2a9b23f7bf305e12dc9a6e3e65c24b7 upstream.
+
+This far using crtc_state->pipe_src as borders for Selective Update area
+haven't caused visible problems as drm_rect_width(crtc_state->pipe_src) ==
+crtc_state->hw.adjusted_mode.crtc_hdisplay and
+drm_rect_height(crtc_state->pipe_src) ==
+crtc_state->hw.adjusted_mode.crtc_vdisplay when pipe scaling is not
+used. On the other hand using pipe scaling is forcing full frame updates and all the
+Selective Update area calculations are skipped. Now this improper usage of
+crtc_state->pipe_src is causing following warnings:
+
+<4> [7771.978166] xe 0000:00:02.0: [drm] drm_WARN_ON_ONCE(su_lines % vdsc_cfg->slice_height)
+
+after WARN_ON_ONCE was added by commit:
+
+"drm/i915/dsc: Add helper for writing DSC Selective Update ET parameters"
+
+These warnings are seen when DSC and pipe scaling are enabled
+simultaneously. This is because on full frame update SU area is improperly
+set as pipe_src which is not aligned with DSC slice height.
+
+Fix these by creating local rectangle using
+crtc_state->hw.adjusted_mode.crtc_hdisplay and
+crtc_state->hw.adjusted_mode.crtc_vdisplay. Use this local rectangle as
+borders for SU area.
+
+Fixes: d6774b8c3c58 ("drm/i915: Ensure damage clip area is within pipe area")
+Cc: <stable@vger.kernel.org> # v6.0+
+Signed-off-by: Jouni Högander <jouni.hogander@intel.com>
+Reviewed-by: Mika Kahola <mika.kahola@intel.com>
+Link: https://patch.msgid.link/20260327114553.195285-1-jouni.hogander@intel.com
+(cherry picked from commit da0cdc1c329dd2ff09c41fbbe9fbd9c92c5d2c6e)
+Signed-off-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/gpu/drm/i915/display/intel_psr.c | 30 +++++++++++++++---------
+ 1 file changed, 19 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_psr.c b/drivers/gpu/drm/i915/display/intel_psr.c
+index 83299fd50ef0..504f6228bf35 100644
+--- a/drivers/gpu/drm/i915/display/intel_psr.c
++++ b/drivers/gpu/drm/i915/display/intel_psr.c
+@@ -2549,9 +2549,9 @@ static u32 psr2_pipe_srcsz_early_tpt_calc(struct intel_crtc_state *crtc_state,
+ 
+ static void clip_area_update(struct drm_rect *overlap_damage_area,
+ 			     struct drm_rect *damage_area,
+-			     struct drm_rect *pipe_src)
++			     struct drm_rect *display_area)
+ {
+-	if (!drm_rect_intersect(damage_area, pipe_src))
++	if (!drm_rect_intersect(damage_area, display_area))
+ 		return;
+ 
+ 	if (overlap_damage_area->y1 == -1) {
+@@ -2602,6 +2602,7 @@ static bool intel_psr2_sel_fetch_pipe_alignment(struct intel_crtc_state *crtc_st
+ static void
+ intel_psr2_sel_fetch_et_alignment(struct intel_atomic_state *state,
+ 				  struct intel_crtc *crtc,
++				  struct drm_rect *display_area,
+ 				  bool *cursor_in_su_area)
+ {
+ 	struct intel_crtc_state *crtc_state = intel_atomic_get_new_crtc_state(state, crtc);
+@@ -2629,7 +2630,7 @@ intel_psr2_sel_fetch_et_alignment(struct intel_atomic_state *state,
+ 			continue;
+ 
+ 		clip_area_update(&crtc_state->psr2_su_area, &new_plane_state->uapi.dst,
+-				 &crtc_state->pipe_src);
++				 display_area);
+ 		*cursor_in_su_area = true;
+ 	}
+ }
+@@ -2725,6 +2726,12 @@ int intel_psr2_sel_fetch_update(struct intel_atomic_state *state,
+ 	struct intel_crtc_state *crtc_state = intel_atomic_get_new_crtc_state(state, crtc);
+ 	struct intel_plane_state *new_plane_state, *old_plane_state;
+ 	struct intel_plane *plane;
++	struct drm_rect display_area = {
++		.x1 = 0,
++		.y1 = 0,
++		.x2 = crtc_state->hw.adjusted_mode.crtc_hdisplay,
++		.y2 = crtc_state->hw.adjusted_mode.crtc_vdisplay,
++	};
+ 	bool full_update = false, su_area_changed;
+ 	int i, ret;
+ 
+@@ -2738,7 +2745,7 @@ int intel_psr2_sel_fetch_update(struct intel_atomic_state *state,
+ 
+ 	crtc_state->psr2_su_area.x1 = 0;
+ 	crtc_state->psr2_su_area.y1 = -1;
+-	crtc_state->psr2_su_area.x2 = drm_rect_width(&crtc_state->pipe_src);
++	crtc_state->psr2_su_area.x2 = drm_rect_width(&display_area);
+ 	crtc_state->psr2_su_area.y2 = -1;
+ 
+ 	/*
+@@ -2776,14 +2783,14 @@ int intel_psr2_sel_fetch_update(struct intel_atomic_state *state,
+ 				damaged_area.y1 = old_plane_state->uapi.dst.y1;
+ 				damaged_area.y2 = old_plane_state->uapi.dst.y2;
+ 				clip_area_update(&crtc_state->psr2_su_area, &damaged_area,
+-						 &crtc_state->pipe_src);
++						 &display_area);
+ 			}
+ 
+ 			if (new_plane_state->uapi.visible) {
+ 				damaged_area.y1 = new_plane_state->uapi.dst.y1;
+ 				damaged_area.y2 = new_plane_state->uapi.dst.y2;
+ 				clip_area_update(&crtc_state->psr2_su_area, &damaged_area,
+-						 &crtc_state->pipe_src);
++						 &display_area);
+ 			}
+ 			continue;
+ 		} else if (new_plane_state->uapi.alpha != old_plane_state->uapi.alpha) {
+@@ -2791,7 +2798,7 @@ int intel_psr2_sel_fetch_update(struct intel_atomic_state *state,
+ 			damaged_area.y1 = new_plane_state->uapi.dst.y1;
+ 			damaged_area.y2 = new_plane_state->uapi.dst.y2;
+ 			clip_area_update(&crtc_state->psr2_su_area, &damaged_area,
+-					 &crtc_state->pipe_src);
++					 &display_area);
+ 			continue;
+ 		}
+ 
+@@ -2807,7 +2814,7 @@ int intel_psr2_sel_fetch_update(struct intel_atomic_state *state,
+ 		damaged_area.x1 += new_plane_state->uapi.dst.x1 - src.x1;
+ 		damaged_area.x2 += new_plane_state->uapi.dst.x1 - src.x1;
+ 
+-		clip_area_update(&crtc_state->psr2_su_area, &damaged_area, &crtc_state->pipe_src);
++		clip_area_update(&crtc_state->psr2_su_area, &damaged_area, &display_area);
+ 	}
+ 
+ 	/*
+@@ -2842,7 +2849,8 @@ int intel_psr2_sel_fetch_update(struct intel_atomic_state *state,
+ 		 * cursor is added into affected planes even when
+ 		 * cursor is not updated by itself.
+ 		 */
+-		intel_psr2_sel_fetch_et_alignment(state, crtc, &cursor_in_su_area);
++		intel_psr2_sel_fetch_et_alignment(state, crtc, &display_area,
++						  &cursor_in_su_area);
+ 
+ 		su_area_changed = intel_psr2_sel_fetch_pipe_alignment(crtc_state);
+ 
+@@ -2918,8 +2926,8 @@ int intel_psr2_sel_fetch_update(struct intel_atomic_state *state,
+ 
+ skip_sel_fetch_set_loop:
+ 	if (full_update)
+-		clip_area_update(&crtc_state->psr2_su_area, &crtc_state->pipe_src,
+-				 &crtc_state->pipe_src);
++		clip_area_update(&crtc_state->psr2_su_area, &display_area,
++				 &display_area);
+ 
+ 	psr2_man_trk_ctl_calc(crtc_state, full_update);
+ 	crtc_state->pipe_srcsz_early_tpt =
+-- 
+2.53.0
+

@@ -1,0 +1,100 @@
+From: Hao Li <hao.li@linux.dev>
+Date: Mon, 30 Mar 2026 11:57:49 +0800
+Subject: [PATCH] mm/memory_hotplug: maintain N_NORMAL_MEMORY during hotplug
+References: bsc#1258210
+Patch-mainline: 6.18.23
+Git-commit: 2ecbe06abf9bfb2261cd6464a6bc3a3615625402
+
+commit 2ecbe06abf9bfb2261cd6464a6bc3a3615625402 upstream.
+
+N_NORMAL_MEMORY is initialized from zone population at boot, but memory
+hotplug currently only updates N_MEMORY.  As a result, a node that gains
+normal memory via hotplug can remain invisible to users iterating over
+N_NORMAL_MEMORY, while a node that loses its last normal memory can stay
+incorrectly marked as such.
+
+The most visible effect is that
+/sys/devices/system/node/has_normal_memory does not report a node even
+after that node has gained normal memory via hotplug.
+
+Also, list_lru-based shrinkers can undercount objects on such a node
+and may skip reclaim on that node entirely, which can lead to a higher
+memory footprint than expected.
+
+Restore N_NORMAL_MEMORY maintenance directly in online_pages() and
+offline_pages().  Set the bit when a node that currently lacks normal
+memory onlines pages into a zone <= ZONE_NORMAL, and clear it when
+offlining removes the last present pages from zones <= ZONE_NORMAL.
+
+This restores the intended semantics without bringing back the old
+status_change_nid_normal notifier plumbing which was removed in
+8d2882a8edb8.
+
+Current users that benefit include list_lru, zswap, nfsd filecache,
+hugetlb_cgroup, and has_normal_memory sysfs reporting.
+
+Link: https://lkml.kernel.org/r/20260330035941.518186-1-hao.li@linux.dev
+Fixes: 8d2882a8edb8 ("mm,memory_hotplug: remove status_change_nid_normal and update documentation")
+Signed-off-by: Hao Li <hao.li@linux.dev>
+Reviewed-by: Harry Yoo (Oracle) <harry@kernel.org>
+Acked-by: Vlastimil Babka (SUSE) <vbabka@kernel.org>
+Reviewed-by: Joshua Hahn <joshua.hahnjy@gmail.com>
+Acked-by: David Hildenbrand (Arm) <david@kernel.org>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ mm/memory_hotplug.c | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/mm/memory_hotplug.c b/mm/memory_hotplug.c
+index 0be83039c3b5..aa1f74414307 100644
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@ -1218,6 +1218,13 @@ int online_pages(unsigned long pfn, unsigned long nr_pages,
+ 
+ 	if (node_arg.nid >= 0)
+ 		node_set_state(nid, N_MEMORY);
++	/*
++	 * Check whether we are adding normal memory to the node for the first
++	 * time.
++	 */
++	if (!node_state(nid, N_NORMAL_MEMORY) && zone_idx(zone) <= ZONE_NORMAL)
++		node_set_state(nid, N_NORMAL_MEMORY);
++
+ 	if (need_zonelists_rebuild)
+ 		build_all_zonelists(NULL);
+ 
+@@ -1919,6 +1926,8 @@ int offline_pages(unsigned long start_pfn, unsigned long nr_pages,
+ 	unsigned long flags;
+ 	char *reason;
+ 	int ret;
++	unsigned long normal_pages = 0;
++	enum zone_type zt;
+ 
+ 	/*
+ 	 * {on,off}lining is constrained to full memory sections (or more
+@@ -2066,6 +2075,17 @@ int offline_pages(unsigned long start_pfn, unsigned long nr_pages,
+ 	/* reinitialise watermarks and update pcp limits */
+ 	init_per_zone_wmark_min();
+ 
++	/*
++	 * Check whether this operation removes the last normal memory from
++	 * the node. We do this before clearing N_MEMORY to avoid the possible
++	 * transient "!N_MEMORY && N_NORMAL_MEMORY" state.
++	 */
++	if (zone_idx(zone) <= ZONE_NORMAL) {
++		for (zt = 0; zt <= ZONE_NORMAL; zt++)
++			normal_pages += pgdat->node_zones[zt].present_pages;
++		if (!normal_pages)
++			node_clear_state(node, N_NORMAL_MEMORY);
++	}
+ 	/*
+ 	 * Make sure to mark the node as memory-less before rebuilding the zone
+ 	 * list. Otherwise this node would still appear in the fallback lists.
+-- 
+2.53.0
+
