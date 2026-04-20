@@ -1,0 +1,107 @@
+From 62f666df765ecaf9cc1892ca056d5c071a335d85 Mon Sep 17 00:00:00 2001
+From: Pavel Begunkov <asml.silence@gmail.com>
+Date: Thu, 24 Apr 2025 12:31:16 +0100
+Subject: [PATCH] io_uring/eventfd: dedup signalling helpers
+Git-commit: 62f666df765ecaf9cc1892ca056d5c071a335d85
+Patch-mainline: v6.16-rc1
+References: git-fixes
+
+Consolidate io_eventfd_flush_signal() and io_eventfd_signal(). Not much
+of a difference for now, but it prepares it for following changes.
+
+Signed-off-by: Pavel Begunkov <asml.silence@gmail.com>
+Link: https://lore.kernel.org/r/5beecd4da65d8d2d83df499196f84b329387f6a2.1745493845.git.asml.silence@gmail.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Gabriel Krisman Bertazi <krisman@suse.de>
+---
+ io_uring/eventfd.c  | 26 +++++++++-----------------
+ io_uring/eventfd.h  |  3 +--
+ io_uring/io_uring.c |  4 ++--
+ 3 files changed, 12 insertions(+), 21 deletions(-)
+
+diff --git a/io_uring/eventfd.c b/io_uring/eventfd.c
+index 100d5da94cb9..a9da2d0d7510 100644
+--- a/io_uring/eventfd.c
++++ b/io_uring/eventfd.c
+@@ -112,23 +112,16 @@ static struct io_ev_fd *io_eventfd_grab(struct io_ring_ctx *ctx)
+ 	return NULL;
+ }
+ 
+-void io_eventfd_signal(struct io_ring_ctx *ctx)
++void io_eventfd_signal(struct io_ring_ctx *ctx, bool cqe_event)
+ {
++	bool skip = false, put_ref = true;
+ 	struct io_ev_fd *ev_fd;
+ 
+ 	ev_fd = io_eventfd_grab(ctx);
+-	if (ev_fd)
+-		io_eventfd_release(ev_fd, __io_eventfd_signal(ev_fd));
+-}
+-
+-void io_eventfd_flush_signal(struct io_ring_ctx *ctx)
+-{
+-	struct io_ev_fd *ev_fd;
+-
+-	ev_fd = io_eventfd_grab(ctx);
+-	if (ev_fd) {
+-		bool skip, put_ref = true;
++	if (!ev_fd)
++		return;
+ 
++	if (cqe_event) {
+ 		/*
+ 		 * Eventfd should only get triggered when at least one event
+ 		 * has been posted. Some applications rely on the eventfd
+@@ -142,12 +135,11 @@ void io_eventfd_flush_signal(struct io_ring_ctx *ctx)
+ 		skip = ctx->cached_cq_tail == ev_fd->last_cq_tail;
+ 		ev_fd->last_cq_tail = ctx->cached_cq_tail;
+ 		spin_unlock(&ctx->completion_lock);
+-
+-		if (!skip)
+-			put_ref = __io_eventfd_signal(ev_fd);
+-
+-		io_eventfd_release(ev_fd, put_ref);
+ 	}
++
++	if (!skip)
++		put_ref = __io_eventfd_signal(ev_fd);
++	io_eventfd_release(ev_fd, put_ref);
+ }
+ 
+ int io_eventfd_register(struct io_ring_ctx *ctx, void __user *arg,
+diff --git a/io_uring/eventfd.h b/io_uring/eventfd.h
+index d394f49c6321..e2f1985c2cf9 100644
+--- a/io_uring/eventfd.h
++++ b/io_uring/eventfd.h
+@@ -4,5 +4,4 @@ int io_eventfd_register(struct io_ring_ctx *ctx, void __user *arg,
+ 			unsigned int eventfd_async);
+ int io_eventfd_unregister(struct io_ring_ctx *ctx);
+ 
+-void io_eventfd_flush_signal(struct io_ring_ctx *ctx);
+-void io_eventfd_signal(struct io_ring_ctx *ctx);
++void io_eventfd_signal(struct io_ring_ctx *ctx, bool cqe_event);
+diff --git a/io_uring/io_uring.c b/io_uring/io_uring.c
+index 0dc6c2f1295e..2e4d8e76316a 100644
+--- a/io_uring/io_uring.c
++++ b/io_uring/io_uring.c
+@@ -584,7 +584,7 @@ void __io_commit_cqring_flush(struct io_ring_ctx *ctx)
+ 	if (ctx->drain_active)
+ 		io_queue_deferred(ctx);
+ 	if (ctx->has_evfd)
+-		io_eventfd_flush_signal(ctx);
++		io_eventfd_signal(ctx, true);
+ }
+ 
+ static inline void __io_cq_lock(struct io_ring_ctx *ctx)
+@@ -1199,7 +1199,7 @@ static void io_req_local_work_add(struct io_kiocb *req, unsigned flags)
+ 		if (ctx->flags & IORING_SETUP_TASKRUN_FLAG)
+ 			atomic_or(IORING_SQ_TASKRUN, &ctx->rings->sq_flags);
+ 		if (ctx->has_evfd)
+-			io_eventfd_signal(ctx);
++			io_eventfd_signal(ctx, false);
+ 	}
+ 
+ 	nr_wait = atomic_read(&ctx->cq_wait_nr);
+-- 
+2.52.0
+
