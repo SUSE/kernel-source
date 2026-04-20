@@ -1,0 +1,66 @@
+From bf9a38803b2626b01cc769aaf13485d8650f576f Mon Sep 17 00:00:00 2001
+From: Mashiro Chen <mashiro.chen@mailbox.org>
+Date: Wed, 8 Apr 2026 01:31:01 +0800
+Subject: [PATCH] net: hamradio: 6pack: fix uninit-value in sixpack_receive_buf
+Git-commit: bf9a38803b2626b01cc769aaf13485d8650f576f
+Patch-mainline: v7.1-rc1
+References: git-fixes
+
+sixpack_receive_buf() does not properly skip bytes with TTY error flags.
+The while loop iterates through the flags buffer but never advances the
+data pointer (cp), and passes the original count (including error bytes)
+to sixpack_decode(). This causes sixpack_decode() to process bytes that
+should have been skipped due to TTY errors.  The TTY layer does not
+guarantee that cp[i] holds a meaningful value when fp[i] is set, so
+passing those positions to sixpack_decode() results in KMSAN reporting
+an uninit-value read.
+
+Fix this by processing bytes one at a time, advancing cp on each
+iteration, and only passing valid (non-error) bytes to sixpack_decode().
+This matches the pattern used by slip_receive_buf() and
+mkiss_receive_buf() for the same purpose.
+
+Reported-by: syzbot+ecdb8c9878a81eb21e54@syzkaller.appspotmail.com
+Closes: https://syzkaller.appspot.com/bug?extid=ecdb8c9878a81eb21e54
+Fixes: 1da177e4c3f4 ("Linux-2.6.12-rc2")
+Signed-off-by: Mashiro Chen <mashiro.chen@mailbox.org>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Link: https://patch.msgid.link/20260407173101.107352-1-mashiro.chen@mailbox.org
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/net/hamradio/6pack.c |    9 ++++-----
+ 1 file changed, 4 insertions(+), 5 deletions(-)
+
+--- a/drivers/net/hamradio/6pack.c
++++ b/drivers/net/hamradio/6pack.c
+@@ -425,7 +425,6 @@ static void sixpack_receive_buf(struct t
+ 				const u8 *fp, size_t count)
+ {
+ 	struct sixpack *sp;
+-	size_t count1;
+ 
+ 	if (!count)
+ 		return;
+@@ -435,16 +434,16 @@ static void sixpack_receive_buf(struct t
+ 		return;
+ 
+ 	/* Read the characters out of the buffer */
+-	count1 = count;
+-	while (count) {
+-		count--;
++	while (count--) {
+ 		if (fp && *fp++) {
+ 			if (!test_and_set_bit(SIXPF_ERROR, &sp->flags))
+ 				sp->dev->stats.rx_errors++;
++			cp++;
+ 			continue;
+ 		}
++		sixpack_decode(sp, cp, 1);
++		cp++;
+ 	}
+-	sixpack_decode(sp, cp, count1);
+ 
+ 	sp_put(sp);
+ 	tty_unthrottle(tty);
