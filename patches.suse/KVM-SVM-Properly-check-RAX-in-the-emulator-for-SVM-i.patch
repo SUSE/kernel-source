@@ -1,0 +1,77 @@
+From: Yosry Ahmed <yosry@kernel.org>
+Date: Mon, 16 Mar 2026 20:27:24 +0000
+Subject: KVM: SVM: Properly check RAX in the emulator for SVM instructions
+Patch-mainline: Queued in subsystem maintainer repository
+Git-repo: git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
+Git-commit: c85aaff26d55920d783adac431a59ec738a35aef
+References: git-fixes
+
+Architecturally, VMRUN/VMLOAD/VMSAVE should generate a #GP if the
+physical address in RAX is not supported. check_svme_pa() hardcodes this
+to checking that bits 63-48 are not set. This is incorrect on HW
+supporting 52 bits of physical address space. Additionally, the emulator
+does not check if the address is not aligned, which should also result
+in #GP.
+
+Use page_address_valid() which properly checks alignment and the address
+legality based on the guest's MAXPHYADDR. Plumb it through
+x86_emulate_ops, similar to is_canonical_addr(), to avoid directly
+accessing the vCPU object in emulator code.
+
+Fixes: 01de8b09e606 ("KVM: SVM: Add intercept checks for SVM instructions")
+Suggested-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Yosry Ahmed <yosry@kernel.org>
+Link: https://patch.msgid.link/20260316202732.3164936-2-yosry@kernel.org
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Acked-by: Carlos López <clopez@suse.de>
+---
+ arch/x86/kvm/emulate.c     |    3 +--
+ arch/x86/kvm/kvm_emulate.h |    2 ++
+ arch/x86/kvm/x86.c         |    6 ++++++
+ 3 files changed, 9 insertions(+), 2 deletions(-)
+
+--- a/arch/x86/kvm/emulate.c
++++ b/arch/x86/kvm/emulate.c
+@@ -3894,8 +3894,7 @@ static int check_svme_pa(struct x86_emul
+ {
+ 	u64 rax = reg_read(ctxt, VCPU_REGS_RAX);
+ 
+-	/* Valid physical address? */
+-	if (rax & 0xffff000000000000ULL)
++	if (!ctxt->ops->page_address_valid(ctxt, rax))
+ 		return emulate_gp(ctxt, 0);
+ 
+ 	return check_svme(ctxt);
+--- a/arch/x86/kvm/kvm_emulate.h
++++ b/arch/x86/kvm/kvm_emulate.h
+@@ -242,6 +242,8 @@ struct x86_emulate_ops {
+ 
+ 	bool (*is_canonical_addr)(struct x86_emulate_ctxt *ctxt, gva_t addr,
+ 				  unsigned int flags);
++
++	bool (*page_address_valid)(struct x86_emulate_ctxt *ctxt, gpa_t gpa);
+ };
+ 
+ /* Type, address-of, and value of an instruction's operand. */
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -8675,6 +8675,11 @@ static bool emulator_is_canonical_addr(s
+ 	return !is_noncanonical_address(addr, emul_to_vcpu(ctxt), flags);
+ }
+ 
++static bool emulator_page_address_valid(struct x86_emulate_ctxt *ctxt, gpa_t gpa)
++{
++	return page_address_valid(emul_to_vcpu(ctxt), gpa);
++}
++
+ static const struct x86_emulate_ops emulate_ops = {
+ 	.vm_bugged           = emulator_vm_bugged,
+ 	.read_gpr            = emulator_read_gpr,
+@@ -8722,6 +8727,7 @@ static const struct x86_emulate_ops emul
+ 	.set_xcr             = emulator_set_xcr,
+ 	.get_untagged_addr   = emulator_get_untagged_addr,
+ 	.is_canonical_addr   = emulator_is_canonical_addr,
++	.page_address_valid  = emulator_page_address_valid,
+ };
+ 
+ static void toggle_interruptibility(struct kvm_vcpu *vcpu, u32 mask)
