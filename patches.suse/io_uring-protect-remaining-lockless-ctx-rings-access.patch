@@ -1,0 +1,250 @@
+From 61a11cf4812726aceaee17c96432e1c08f6ed6cb Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Tue, 31 Mar 2026 07:07:47 -0600
+Subject: [PATCH] io_uring: protect remaining lockless ctx->rings accesses with
+ RCU
+Git-commit: 61a11cf4812726aceaee17c96432e1c08f6ed6cb
+Patch-mainline: v7.0-rc7
+References: git-fixes
+
+Commit 96189080265e addressed one case of ctx->rings being potentially
+accessed while a resize is happening on the ring, but there are still
+a few others that need handling. Add a helper for retrieving the
+rings associated with an io_uring context, and add some sanity checking
+to that to catch bad uses. ->rings_rcu is always valid, as long as it's
+used within RCU read lock. Any use of ->rings_rcu or ->rings inside
+either ->uring_lock or ->completion_lock is sane as well.
+
+Do the minimum fix for the current kernel, but set it up such that this
+basic infra can be extended for later kernels to make this harder to
+mess up in the future.
+
+Thanks to Junxi Qian for finding and debugging this issue.
+
+Cc: stable@vger.kernel.org
+Fixes: 79cfe9e59c2a ("io_uring/register: add IORING_REGISTER_RESIZE_RINGS")
+Reviewed-by: Junxi Qian <qjx1298677004@gmail.com>
+Tested-by: Junxi Qian <qjx1298677004@gmail.com>
+Link: https://lore.kernel.org/io-uring/20260330172348.89416-1-qjx1298677004@gmail.com/
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Gabriel Krisman Bertazi <krisman@suse.de>
+---
+ io_uring/io_uring.c |   63 +++++++++++++++++++++++++++++++++-------------------
+ io_uring/io_uring.h |   34 +++++++++++++++++++++++-----
+ 2 files changed, 69 insertions(+), 28 deletions(-)
+
+--- a/io_uring/io_uring.c
++++ b/io_uring/io_uring.c
+@@ -180,12 +180,15 @@ static struct ctl_table kernel_io_uring_
+ 
+ static inline unsigned int __io_cqring_events(struct io_ring_ctx *ctx)
+ {
+-	return ctx->cached_cq_tail - READ_ONCE(ctx->rings->cq.head);
++	struct io_rings *rings = io_get_rings(ctx);
++	return ctx->cached_cq_tail - READ_ONCE(rings->cq.head);
+ }
+ 
+ static inline unsigned int __io_cqring_events_user(struct io_ring_ctx *ctx)
+ {
+-	return READ_ONCE(ctx->rings->cq.tail) - READ_ONCE(ctx->rings->cq.head);
++	struct io_rings *rings = io_get_rings(ctx);
++
++	return READ_ONCE(rings->cq.tail) - READ_ONCE(rings->cq.head);
+ }
+ 
+ static bool io_match_linked(struct io_kiocb *head)
+@@ -2462,13 +2465,16 @@ static enum hrtimer_restart io_cqring_mi
+ 	/* work we may need to run, wake function will see if we need to wake */
+ 	if (io_has_work(ctx))
+ 		goto out_wake;
+-	/* got events since we started waiting, min timeout is done */
+-	if (iowq->cq_min_tail != READ_ONCE(ctx->rings->cq.tail))
+-		goto out_wake;
+-	/* if we have any events and min timeout expired, we're done */
+-	if (io_cqring_events(ctx))
+-		goto out_wake;
++	scoped_guard(rcu) {
++		struct io_rings *rings = io_get_rings(ctx);
+ 
++		/* got events since we started waiting, min timeout is done */
++		if (iowq->cq_min_tail != READ_ONCE(rings->cq.tail))
++			goto out_wake;
++		/* if we have any events and min timeout expired, we're done */
++		if (io_cqring_events(ctx))
++			goto out_wake;
++	}
+ 	/*
+ 	 * If using deferred task_work running and application is waiting on
+ 	 * more than one request, ensure we reset it now where we are switching
+@@ -2576,9 +2582,9 @@ static int io_cqring_wait(struct io_ring
+ 			  struct ext_arg *ext_arg)
+ {
+ 	struct io_wait_queue iowq;
+-	struct io_rings *rings = ctx->rings;
++	struct io_rings *rings;
+ 	ktime_t start_time;
+-	int ret;
++	int ret, nr_wait;
+ 
+ 	if (!io_allowed_run_tw(ctx))
+ 		return -EEXIST;
+@@ -2589,16 +2595,24 @@ static int io_cqring_wait(struct io_ring
+ 
+ 	if (unlikely(test_bit(IO_CHECK_CQ_OVERFLOW_BIT, &ctx->check_cq)))
+ 		io_cqring_do_overflow_flush(ctx);
+-	if (__io_cqring_events_user(ctx) >= min_events)
++
++	rcu_read_lock();
++	rings = io_get_rings(ctx);
++	if (__io_cqring_events_user(ctx) >= min_events) {
++		rcu_read_unlock();
+ 		return 0;
++	}
+ 
+ 	init_waitqueue_func_entry(&iowq.wq, io_wake_function);
+ 	iowq.wq.private = current;
+ 	INIT_LIST_HEAD(&iowq.wq.entry);
+ 	iowq.ctx = ctx;
+-	iowq.cq_tail = READ_ONCE(ctx->rings->cq.head) + min_events;
+-	iowq.cq_min_tail = READ_ONCE(ctx->rings->cq.tail);
++	iowq.cq_tail = READ_ONCE(rings->cq.head) + min_events;
++	iowq.cq_min_tail = READ_ONCE(rings->cq.tail);
++	nr_wait = (int) iowq.cq_tail - READ_ONCE(rings->cq.tail);
+ 	iowq.nr_timeouts = atomic_read(&ctx->cq_timeouts);
++	rcu_read_unlock();
++	rings = NULL;
+ 	iowq.hit_timeout = 0;
+ 	iowq.min_timeout = ext_arg->min_time;
+ 	iowq.timeout = KTIME_MAX;
+@@ -2628,14 +2642,6 @@ static int io_cqring_wait(struct io_ring
+ 	trace_io_uring_cqring_wait(ctx, min_events);
+ 	do {
+ 		unsigned long check_cq;
+-		int nr_wait;
+-
+-		/* if min timeout has been hit, don't reset wait count */
+-		if (!iowq.hit_timeout)
+-			nr_wait = (int) iowq.cq_tail -
+-					READ_ONCE(ctx->rings->cq.tail);
+-		else
+-			nr_wait = 1;
+ 
+ 		if (ctx->flags & IORING_SETUP_DEFER_TASKRUN) {
+ 			atomic_set(&ctx->cq_wait_nr, nr_wait);
+@@ -2686,13 +2692,21 @@ static int io_cqring_wait(struct io_ring
+ 			break;
+ 		}
+ 		cond_resched();
++
++		/* if min timeout has been hit, don't reset wait count */
++		if (!iowq.hit_timeout)
++			scoped_guard(rcu)
++				nr_wait = (int) iowq.cq_tail -
++					  READ_ONCE(io_get_rings(ctx)->cq.tail);
++		else
++			nr_wait = 1;
+ 	} while (1);
+ 
+ 	if (!(ctx->flags & IORING_SETUP_DEFER_TASKRUN))
+ 		finish_wait(&ctx->cq_wait, &iowq.wq);
+ 	restore_saved_sigmask_unless(ret == -EINTR);
+ 
+-	return READ_ONCE(rings->cq.head) == READ_ONCE(rings->cq.tail) ? ret : 0;
++	return READ_ONCE(io_get_rings(ctx)->cq.head) == READ_ONCE(io_get_rings(ctx)->cq.tail) ? ret : 0;
+ }
+ 
+ static void io_rings_free(struct io_ring_ctx *ctx)
+@@ -2850,7 +2864,9 @@ static __poll_t io_uring_poll(struct fil
+ 	 */
+ 	poll_wait(file, &ctx->poll_wq, wait);
+ 
+-	if (!io_sqring_full(ctx))
++	rcu_read_lock();
++
++	if (!__io_sqring_full(ctx))
+ 		mask |= EPOLLOUT | EPOLLWRNORM;
+ 
+ 	/*
+@@ -2870,6 +2886,7 @@ static __poll_t io_uring_poll(struct fil
+ 	if (__io_cqring_events_user(ctx) || io_has_work(ctx))
+ 		mask |= EPOLLIN | EPOLLRDNORM;
+ 
++	rcu_read_unlock();
+ 	return mask;
+ }
+ 
+--- a/io_uring/io_uring.h
++++ b/io_uring/io_uring.h
+@@ -54,16 +54,28 @@ struct io_wait_queue {
+ #endif
+ };
+ 
++static inline struct io_rings *io_get_rings(struct io_ring_ctx *ctx)
++{
++	return rcu_dereference_check(ctx->rings_rcu,
++			lockdep_is_held(&ctx->uring_lock) ||
++			lockdep_is_held(&ctx->completion_lock));
++}
++
+ static inline bool io_should_wake(struct io_wait_queue *iowq)
+ {
+ 	struct io_ring_ctx *ctx = iowq->ctx;
+-	int dist = READ_ONCE(ctx->rings->cq.tail) - (int) iowq->cq_tail;
++	struct io_rings *rings;
++	int dist;
++
++	guard(rcu)();
++	rings = io_get_rings(ctx);
+ 
+ 	/*
+ 	 * Wake up if we have enough events, or if a timeout occurred since we
+ 	 * started waiting. For timeouts, we always want to return to userspace,
+ 	 * regardless of event count.
+ 	 */
++	dist = READ_ONCE(rings->cq.tail) - (int) iowq->cq_tail;
+ 	return dist >= 0 || atomic_read(&ctx->cq_timeouts) != iowq->nr_timeouts;
+ }
+ 
+@@ -309,9 +321,9 @@ static inline void io_cqring_wake(struct
+ 				poll_to_key(EPOLL_URING_WAKE | EPOLLIN));
+ }
+ 
+-static inline bool io_sqring_full(struct io_ring_ctx *ctx)
++static inline bool __io_sqring_full(struct io_ring_ctx *ctx)
+ {
+-	struct io_rings *r = ctx->rings;
++	struct io_rings *r = io_get_rings(ctx);
+ 
+ 	/*
+ 	 * SQPOLL must use the actual sqring head, as using the cached_sq_head
+@@ -323,9 +335,15 @@ static inline bool io_sqring_full(struct
+ 	return READ_ONCE(r->sq.tail) - READ_ONCE(r->sq.head) == ctx->sq_entries;
+ }
+ 
+-static inline unsigned int io_sqring_entries(struct io_ring_ctx *ctx)
++static inline bool io_sqring_full(struct io_ring_ctx *ctx)
+ {
+-	struct io_rings *rings = ctx->rings;
++	guard(rcu)();
++	return __io_sqring_full(ctx);
++}
++
++static inline unsigned int __io_sqring_entries(struct io_ring_ctx *ctx)
++{
++	struct io_rings *rings = io_get_rings(ctx);
+ 	unsigned int entries;
+ 
+ 	/* make sure SQ entry isn't read before tail */
+@@ -386,6 +404,12 @@ static inline void io_tw_lock(struct io_
+ 	lockdep_assert_held(&ctx->uring_lock);
+ }
+ 
++static inline unsigned int io_sqring_entries(struct io_ring_ctx *ctx)
++{
++	guard(rcu)();
++	return __io_sqring_entries(ctx);
++}
++
+ /*
+  * Don't complete immediately but use deferred completion infrastructure.
+  * Protected by ->uring_lock and can only be used either with

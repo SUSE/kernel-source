@@ -1,0 +1,86 @@
+From da01f60f8ad144a8a0844833a8d0f0005b0a7c51 Mon Sep 17 00:00:00 2001
+From: Pavel Begunkov <asml.silence@gmail.com>
+Date: Thu, 24 Apr 2025 12:31:17 +0100
+Subject: [PATCH] io_uring/eventfd: clean up rcu locking
+Git-commit: da01f60f8ad144a8a0844833a8d0f0005b0a7c51
+Patch-mainline: v6.16-rc1
+References: git-fixes
+
+Conditional locking is never welcome if there are better options. Move
+rcu locking into io_eventfd_signal(), make it unconditional and use
+guards. It also helps with sparse warnings.
+
+Signed-off-by: Pavel Begunkov <asml.silence@gmail.com>
+Link: https://lore.kernel.org/r/91a925e708ca8a5aa7fee61f96d29b24ea9adeaf.1745493845.git.asml.silence@gmail.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Gabriel Krisman Bertazi <krisman@suse.de>
+---
+ io_uring/eventfd.c | 24 +++++++-----------------
+ 1 file changed, 7 insertions(+), 17 deletions(-)
+
+diff --git a/io_uring/eventfd.c b/io_uring/eventfd.c
+index a9da2d0d7510..8c2835ac17a0 100644
+--- a/io_uring/eventfd.c
++++ b/io_uring/eventfd.c
+@@ -47,13 +47,6 @@ static void io_eventfd_do_signal(struct rcu_head *rcu)
+ 	io_eventfd_put(ev_fd);
+ }
+ 
+-static void io_eventfd_release(struct io_ev_fd *ev_fd, bool put_ref)
+-{
+-	if (put_ref)
+-		io_eventfd_put(ev_fd);
+-	rcu_read_unlock();
+-}
+-
+ /*
+  * Returns true if the caller should put the ev_fd reference, false if not.
+  */
+@@ -89,11 +82,6 @@ static struct io_ev_fd *io_eventfd_grab(struct io_ring_ctx *ctx)
+ {
+ 	struct io_ev_fd *ev_fd;
+ 
+-	if (READ_ONCE(ctx->rings->cq_flags) & IORING_CQ_EVENTFD_DISABLED)
+-		return NULL;
+-
+-	rcu_read_lock();
+-
+ 	/*
+ 	 * rcu_dereference ctx->io_ev_fd once and use it for both for checking
+ 	 * and eventfd_signal
+@@ -108,15 +96,18 @@ static struct io_ev_fd *io_eventfd_grab(struct io_ring_ctx *ctx)
+ 	if (io_eventfd_trigger(ev_fd) && refcount_inc_not_zero(&ev_fd->refs))
+ 		return ev_fd;
+ 
+-	rcu_read_unlock();
+ 	return NULL;
+ }
+ 
+ void io_eventfd_signal(struct io_ring_ctx *ctx, bool cqe_event)
+ {
+-	bool skip = false, put_ref = true;
++	bool skip = false;
+ 	struct io_ev_fd *ev_fd;
+ 
++	if (READ_ONCE(ctx->rings->cq_flags) & IORING_CQ_EVENTFD_DISABLED)
++		return;
++
++	guard(rcu)();
+ 	ev_fd = io_eventfd_grab(ctx);
+ 	if (!ev_fd)
+ 		return;
+@@ -137,9 +128,8 @@ void io_eventfd_signal(struct io_ring_ctx *ctx, bool cqe_event)
+ 		spin_unlock(&ctx->completion_lock);
+ 	}
+ 
+-	if (!skip)
+-		put_ref = __io_eventfd_signal(ev_fd);
+-	io_eventfd_release(ev_fd, put_ref);
++	if (skip || __io_eventfd_signal(ev_fd))
++		io_eventfd_put(ev_fd);
+ }
+ 
+ int io_eventfd_register(struct io_ring_ctx *ctx, void __user *arg,
+-- 
+2.52.0
+
