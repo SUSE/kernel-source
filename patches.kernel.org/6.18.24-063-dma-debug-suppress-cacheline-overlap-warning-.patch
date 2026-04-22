@@ -1,0 +1,68 @@
+From: Mikhail Gavrilov <mikhail.v.gavrilov@gmail.com>
+Date: Fri, 27 Mar 2026 17:41:56 +0500
+Subject: [PATCH] dma-debug: suppress cacheline overlap warning when arch has
+ no DMA alignment requirement
+References: bsc#1258210
+Patch-mainline: 6.18.24
+Git-commit: 3d48c9fd78dd0b1809669ec49c4d0997b8127512
+
+[ Upstream commit 3d48c9fd78dd0b1809669ec49c4d0997b8127512 ]
+
+When CONFIG_DMA_API_DEBUG is enabled, the DMA debug infrastructure
+tracks active mappings per cacheline and warns if two different DMA
+mappings share the same cacheline ("cacheline tracking EEXIST,
+overlapping mappings aren't supported").
+
+On x86_64, ARCH_KMALLOC_MINALIGN defaults to 8, so small kmalloc
+allocations (e.g. the 8-byte hub->buffer and hub->status in the USB
+hub driver) frequently land in the same 64-byte cacheline.  When both
+are DMA-mapped, this triggers a false positive warning.
+
+This has been reported repeatedly since v5.14 (when the EEXIST check
+was added) across various USB host controllers and devices including
+xhci_hcd with USB hubs, USB audio devices, and USB ethernet adapters.
+
+The cacheline overlap is only a real concern on architectures that
+require DMA buffer alignment to cacheline boundaries (i.e. where
+ARCH_DMA_MINALIGN >= L1_CACHE_BYTES).  On architectures like x86_64
+where dma_get_cache_alignment() returns 1, the hardware is
+cache-coherent and overlapping cacheline mappings are harmless.
+
+Suppress the EEXIST warning when dma_get_cache_alignment() is less
+than L1_CACHE_BYTES, indicating the architecture does not require
+cacheline-aligned DMA buffers.
+
+Verified with a kernel module reproducer that performs two kmalloc(8)
+allocations back-to-back and DMA-maps both:
+
+  Before: allocations share a cacheline, EEXIST fires within ~50 pairs
+  After:  same cacheline pair found, but no warning emitted
+
+Fixes: 2b4bbc6231d7 ("dma-debug: report -EEXIST errors in add_dma_entry")
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=215740
+Suggested-by: Harry Yoo <harry@kernel.org>
+Tested-by: Mikhail Gavrilov <mikhail.v.gavrilov@gmail.com>
+Signed-off-by: Mikhail Gavrilov <mikhail.v.gavrilov@gmail.com>
+Signed-off-by: Marek Szyprowski <m.szyprowski@samsung.com>
+Link: https://lore.kernel.org/r/20260327124156.24820-1-mikhail.v.gavrilov@gmail.com
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ kernel/dma/debug.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/kernel/dma/debug.c b/kernel/dma/debug.c
+index 43d6a996d7a7..596ea7abbda1 100644
+--- a/kernel/dma/debug.c
++++ b/kernel/dma/debug.c
+@@ -614,6 +614,7 @@ static void add_dma_entry(struct dma_debug_entry *entry, unsigned long attrs)
+ 	} else if (rc == -EEXIST &&
+ 		   !(attrs & DMA_ATTR_SKIP_CPU_SYNC) &&
+ 		   !(entry->is_cache_clean && overlap_cache_clean) &&
++		   dma_get_cache_alignment() >= L1_CACHE_BYTES &&
+ 		   !(IS_ENABLED(CONFIG_DMA_BOUNCE_UNALIGNED_KMALLOC) &&
+ 		     is_swiotlb_active(entry->dev))) {
+ 		err_printk(entry->dev, entry,
+-- 
+2.53.0
+

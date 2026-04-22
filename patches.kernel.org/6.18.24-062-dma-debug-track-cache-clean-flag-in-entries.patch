@@ -1,0 +1,112 @@
+From: "Michael S. Tsirkin" <mst@redhat.com>
+Date: Mon, 29 Dec 2025 14:38:31 -0500
+Subject: [PATCH] dma-debug: track cache clean flag in entries
+References: bsc#1258210
+Patch-mainline: 6.18.24
+Git-commit: d5d846513128c1a3bc2f2d371f6e903177dea443
+
+[ Upstream commit d5d846513128c1a3bc2f2d371f6e903177dea443 ]
+
+If a driver is buggy and has 2 overlapping mappings but only
+sets cache clean flag on the 1st one of them, we warn.
+But if it only does it for the 2nd one, we don't.
+
+Fix by tracking cache clean flag in the entry.
+
+Message-ID: <0ffb3513d18614539c108b4548cdfbc64274a7d1.1767601130.git.mst@redhat.com>
+Reviewed-by: Petr Tesarik <ptesarik@suse.com>
+Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+Stable-dep-of: 3d48c9fd78dd ("dma-debug: suppress cacheline overlap warning when arch has no DMA alignment requirement")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ kernel/dma/debug.c | 27 ++++++++++++++++++++++-----
+ 1 file changed, 22 insertions(+), 5 deletions(-)
+
+diff --git a/kernel/dma/debug.c b/kernel/dma/debug.c
+index 7e66d863d573..43d6a996d7a7 100644
+--- a/kernel/dma/debug.c
++++ b/kernel/dma/debug.c
+@@ -63,6 +63,7 @@ enum map_err_types {
+  * @sg_mapped_ents: 'mapped_ents' from dma_map_sg
+  * @paddr: physical start address of the mapping
+  * @map_err_type: track whether dma_mapping_error() was checked
++ * @is_cache_clean: driver promises not to write to buffer while mapped
+  * @stack_len: number of backtrace entries in @stack_entries
+  * @stack_entries: stack of backtrace history
+  */
+@@ -76,7 +77,8 @@ struct dma_debug_entry {
+ 	int		 sg_call_ents;
+ 	int		 sg_mapped_ents;
+ 	phys_addr_t	 paddr;
+-	enum map_err_types  map_err_type;
++	enum map_err_types map_err_type;
++	bool		 is_cache_clean;
+ #ifdef CONFIG_STACKTRACE
+ 	unsigned int	stack_len;
+ 	unsigned long	stack_entries[DMA_DEBUG_STACKTRACE_ENTRIES];
+@@ -472,12 +474,15 @@ static int active_cacheline_dec_overlap(phys_addr_t cln)
+ 	return active_cacheline_set_overlap(cln, --overlap);
+ }
+ 
+-static int active_cacheline_insert(struct dma_debug_entry *entry)
++static int active_cacheline_insert(struct dma_debug_entry *entry,
++				   bool *overlap_cache_clean)
+ {
+ 	phys_addr_t cln = to_cacheline_number(entry);
+ 	unsigned long flags;
+ 	int rc;
+ 
++	*overlap_cache_clean = false;
++
+ 	/* If the device is not writing memory then we don't have any
+ 	 * concerns about the cpu consuming stale data.  This mitigates
+ 	 * legitimate usages of overlapping mappings.
+@@ -487,8 +492,16 @@ static int active_cacheline_insert(struct dma_debug_entry *entry)
+ 
+ 	spin_lock_irqsave(&radix_lock, flags);
+ 	rc = radix_tree_insert(&dma_active_cacheline, cln, entry);
+-	if (rc == -EEXIST)
++	if (rc == -EEXIST) {
++		struct dma_debug_entry *existing;
++
+ 		active_cacheline_inc_overlap(cln);
++		existing = radix_tree_lookup(&dma_active_cacheline, cln);
++		/* A lookup failure here after we got -EEXIST is unexpected. */
++		WARN_ON(!existing);
++		if (existing)
++			*overlap_cache_clean = existing->is_cache_clean;
++	}
+ 	spin_unlock_irqrestore(&radix_lock, flags);
+ 
+ 	return rc;
+@@ -583,20 +596,24 @@ DEFINE_SHOW_ATTRIBUTE(dump);
+  */
+ static void add_dma_entry(struct dma_debug_entry *entry, unsigned long attrs)
+ {
++	bool overlap_cache_clean;
+ 	struct hash_bucket *bucket;
+ 	unsigned long flags;
+ 	int rc;
+ 
++	entry->is_cache_clean = !!(attrs & DMA_ATTR_CPU_CACHE_CLEAN);
++
+ 	bucket = get_hash_bucket(entry, &flags);
+ 	hash_bucket_add(bucket, entry);
+ 	put_hash_bucket(bucket, flags);
+ 
+-	rc = active_cacheline_insert(entry);
++	rc = active_cacheline_insert(entry, &overlap_cache_clean);
+ 	if (rc == -ENOMEM) {
+ 		pr_err_once("cacheline tracking ENOMEM, dma-debug disabled\n");
+ 		global_disable = true;
+ 	} else if (rc == -EEXIST &&
+-		   !(attrs & (DMA_ATTR_SKIP_CPU_SYNC | DMA_ATTR_CPU_CACHE_CLEAN)) &&
++		   !(attrs & DMA_ATTR_SKIP_CPU_SYNC) &&
++		   !(entry->is_cache_clean && overlap_cache_clean) &&
+ 		   !(IS_ENABLED(CONFIG_DMA_BOUNCE_UNALIGNED_KMALLOC) &&
+ 		     is_swiotlb_active(entry->dev))) {
+ 		err_printk(entry->dev, entry,
+-- 
+2.53.0
+
