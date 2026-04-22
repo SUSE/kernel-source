@@ -1,0 +1,160 @@
+From: Sumit Gupta <sumitg@nvidia.com>
+Date: Fri, 6 Feb 2026 19:56:52 +0530
+Subject: ACPI: CPPC: Add cppc_get_perf() API to read performance controls
+Git-commit: 658fa7b1c47a857af484c5c5dff8d0164b7c7bfb
+Patch-mainline: v7.1-rc1
+References: jsc#PED-15508
+
+Add cppc_get_perf() function to read values of performance control
+registers including desired_perf, min_perf, max_perf, energy_perf,
+and auto_sel.
+
+This provides a read interface to complement the existing
+cppc_set_perf() write interface for performance control registers.
+
+Note that auto_sel is read by cppc_get_perf() but not written by
+cppc_set_perf() to avoid unintended mode changes during performance
+updates. It can be updated with existing dedicated cppc_set_auto_sel()
+API.
+
+Use cppc_get_perf() in cppc_cpufreq_get_cpu_data() to initialize
+perf_ctrls with current hardware register values during cpufreq
+policy initialization.
+
+Signed-off-by: Sumit Gupta <sumitg@nvidia.com>
+Reviewed-by: Pierre Gondois <pierre.gondois@arm.com>
+Reviewed-by: Lifeng Zheng <zhenglifeng1@huawei.com>
+Link: https://patch.msgid.link/20260206142658.72583-2-sumitg@nvidia.com
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Acked-by: Ivan T. Ivanov <iivanov@suse.de>
+---
+ drivers/acpi/cppc_acpi.c       |   80 +++++++++++++++++++++++++++++++++++++++++
+ drivers/cpufreq/cppc_cpufreq.c |    6 +++
+ include/acpi/cppc_acpi.h       |    5 ++
+ 3 files changed, 91 insertions(+)
+
+--- a/drivers/acpi/cppc_acpi.c
++++ b/drivers/acpi/cppc_acpi.c
+@@ -1744,6 +1744,86 @@ int cppc_set_enable(int cpu, bool enable
+ EXPORT_SYMBOL_GPL(cppc_set_enable);
+ 
+ /**
++ * cppc_get_perf - Get a CPU's performance controls.
++ * @cpu: CPU for which to get performance controls.
++ * @perf_ctrls: ptr to cppc_perf_ctrls. See cppc_acpi.h
++ *
++ * Return: 0 for success with perf_ctrls, -ERRNO otherwise.
++ */
++int cppc_get_perf(int cpu, struct cppc_perf_ctrls *perf_ctrls)
++{
++	struct cpc_desc *cpc_desc = per_cpu(cpc_desc_ptr, cpu);
++	struct cpc_register_resource *desired_perf_reg,
++				     *min_perf_reg, *max_perf_reg,
++				     *energy_perf_reg, *auto_sel_reg;
++	u64 desired_perf = 0, min = 0, max = 0, energy_perf = 0, auto_sel = 0;
++	int pcc_ss_id = per_cpu(cpu_pcc_subspace_idx, cpu);
++	struct cppc_pcc_data *pcc_ss_data = NULL;
++	int ret = 0, regs_in_pcc = 0;
++
++	if (!cpc_desc) {
++		pr_debug("No CPC descriptor for CPU:%d\n", cpu);
++		return -ENODEV;
++	}
++
++	if (!perf_ctrls) {
++		pr_debug("Invalid perf_ctrls pointer\n");
++		return -EINVAL;
++	}
++
++	desired_perf_reg = &cpc_desc->cpc_regs[DESIRED_PERF];
++	min_perf_reg = &cpc_desc->cpc_regs[MIN_PERF];
++	max_perf_reg = &cpc_desc->cpc_regs[MAX_PERF];
++	energy_perf_reg = &cpc_desc->cpc_regs[ENERGY_PERF];
++	auto_sel_reg = &cpc_desc->cpc_regs[AUTO_SEL_ENABLE];
++
++	/* Are any of the regs PCC ?*/
++	if (CPC_IN_PCC(desired_perf_reg) || CPC_IN_PCC(min_perf_reg) ||
++	    CPC_IN_PCC(max_perf_reg) || CPC_IN_PCC(energy_perf_reg) ||
++	    CPC_IN_PCC(auto_sel_reg)) {
++		if (pcc_ss_id < 0) {
++			pr_debug("Invalid pcc_ss_id for CPU:%d\n", cpu);
++			return -ENODEV;
++		}
++		pcc_ss_data = pcc_data[pcc_ss_id];
++		regs_in_pcc = 1;
++		down_write(&pcc_ss_data->pcc_lock);
++		/* Ring doorbell once to update PCC subspace */
++		if (send_pcc_cmd(pcc_ss_id, CMD_READ) < 0) {
++			ret = -EIO;
++			goto out_err;
++		}
++	}
++
++	/* Read optional elements if present */
++	if (CPC_SUPPORTED(max_perf_reg))
++		cpc_read(cpu, max_perf_reg, &max);
++	perf_ctrls->max_perf = max;
++
++	if (CPC_SUPPORTED(min_perf_reg))
++		cpc_read(cpu, min_perf_reg, &min);
++	perf_ctrls->min_perf = min;
++
++	if (CPC_SUPPORTED(desired_perf_reg))
++		cpc_read(cpu, desired_perf_reg, &desired_perf);
++	perf_ctrls->desired_perf = desired_perf;
++
++	if (CPC_SUPPORTED(energy_perf_reg))
++		cpc_read(cpu, energy_perf_reg, &energy_perf);
++	perf_ctrls->energy_perf = energy_perf;
++
++	if (CPC_SUPPORTED(auto_sel_reg))
++		cpc_read(cpu, auto_sel_reg, &auto_sel);
++	perf_ctrls->auto_sel = (bool)auto_sel;
++
++out_err:
++	if (regs_in_pcc)
++		up_write(&pcc_ss_data->pcc_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(cppc_get_perf);
++
++/**
+  * cppc_set_perf - Set a CPU's performance controls.
+  * @cpu: CPU for which to set performance controls.
+  * @perf_ctrls: ptr to cppc_perf_ctrls. See cppc_acpi.h
+--- a/drivers/cpufreq/cppc_cpufreq.c
++++ b/drivers/cpufreq/cppc_cpufreq.c
+@@ -600,6 +600,12 @@ static struct cppc_cpudata *cppc_cpufreq
+ 
+ 	list_add(&cpu_data->node, &cpu_data_list);
+ 
++	ret = cppc_get_perf(cpu, &cpu_data->perf_ctrls);
++	if (ret) {
++		pr_debug("Err reading CPU%d perf ctrls: ret:%d\n", cpu, ret);
++		goto free_mask;
++	}
++
+ 	return cpu_data;
+ 
+ free_mask:
+--- a/include/acpi/cppc_acpi.h
++++ b/include/acpi/cppc_acpi.h
+@@ -152,6 +152,7 @@ extern int cppc_get_desired_perf(int cpu
+ extern int cppc_get_nominal_perf(int cpunum, u64 *nominal_perf);
+ extern int cppc_get_highest_perf(int cpunum, u64 *highest_perf);
+ extern int cppc_get_perf_ctrs(int cpu, struct cppc_perf_fb_ctrs *perf_fb_ctrs);
++extern int cppc_get_perf(int cpu, struct cppc_perf_ctrls *perf_ctrls);
+ extern int cppc_set_perf(int cpu, struct cppc_perf_ctrls *perf_ctrls);
+ extern int cppc_set_enable(int cpu, bool enable);
+ extern int cppc_get_perf_caps(int cpu, struct cppc_perf_caps *caps);
+@@ -193,6 +194,10 @@ static inline int cppc_get_perf_ctrs(int
+ {
+ 	return -EOPNOTSUPP;
+ }
++static inline int cppc_get_perf(int cpu, struct cppc_perf_ctrls *perf_ctrls)
++{
++	return -EOPNOTSUPP;
++}
+ static inline int cppc_set_perf(int cpu, struct cppc_perf_ctrls *perf_ctrls)
+ {
+ 	return -EOPNOTSUPP;
