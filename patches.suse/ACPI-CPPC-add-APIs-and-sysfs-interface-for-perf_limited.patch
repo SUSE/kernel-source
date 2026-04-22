@@ -1,0 +1,170 @@
+From: Sumit Gupta <sumitg@nvidia.com>
+Date: Fri, 6 Feb 2026 19:56:57 +0530
+Subject: ACPI: CPPC: add APIs and sysfs interface for perf_limited
+Git-commit: 13c45a26635fa51a68911aa57e6778bdad18b103
+Patch-mainline: v7.1-rc1
+References: jsc#PED-15508
+
+Add sysfs interface to read/write the Performance Limited register.
+
+The Performance Limited register indicates to the OS that an
+unpredictable event (like thermal throttling) has limited processor
+performance. It contains two sticky bits set by the platform:
+  - Bit 0 (Desired_Excursion): Set when delivered performance is
+    constrained below desired performance. Not used when Autonomous
+    Selection is enabled.
+  - Bit 1 (Minimum_Excursion): Set when delivered performance is
+    constrained below minimum performance.
+
+These bits remain set until OSPM explicitly clears them. The write
+operation accepts a bitmask of bits to clear:
+  - Write 0x1 to clear bit 0
+  - Write 0x2 to clear bit 1
+  - Write 0x3 to clear both bits
+
+This enables users to detect if platform throttling impacted a workload.
+Users clear the register before execution, run the workload, then check
+afterward - if set, hardware throttling occurred during that time window.
+
+The interface is exposed as:
+  /sys/devices/system/cpu/cpuX/cpufreq/perf_limited
+
+Signed-off-by: Sumit Gupta <sumitg@nvidia.com>
+Reviewed-by: Pierre Gondois <pierre.gondois@arm.com>
+Reviewed-by: Lifeng Zheng <zhenglifeng1@huawei.com>
+Link: https://patch.msgid.link/20260206142658.72583-7-sumitg@nvidia.com
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Acked-by: Ivan T. Ivanov <iivanov@suse.de>
+---
+ drivers/acpi/cppc_acpi.c       |   56 +++++++++++++++++++++++++++++++++++++++++
+ drivers/cpufreq/cppc_cpufreq.c |    5 +++
+ include/acpi/cppc_acpi.h       |   15 ++++++++++
+ 3 files changed, 76 insertions(+)
+
+--- a/drivers/acpi/cppc_acpi.c
++++ b/drivers/acpi/cppc_acpi.c
+@@ -1984,6 +1984,62 @@ int cppc_set_perf(int cpu, struct cppc_p
+ EXPORT_SYMBOL_GPL(cppc_set_perf);
+ 
+ /**
++ * cppc_get_perf_limited - Get the Performance Limited register value.
++ * @cpu: CPU from which to get Performance Limited register.
++ * @perf_limited: Pointer to store the Performance Limited value.
++ *
++ * The returned value contains sticky status bits indicating platform-imposed
++ * performance limitations.
++ *
++ * Return: 0 for success, -EIO on failure, -EOPNOTSUPP if not supported.
++ */
++int cppc_get_perf_limited(int cpu, u64 *perf_limited)
++{
++	return cppc_get_reg_val(cpu, PERF_LIMITED, perf_limited);
++}
++EXPORT_SYMBOL_GPL(cppc_get_perf_limited);
++
++/**
++ * cppc_set_perf_limited() - Clear bits in the Performance Limited register.
++ * @cpu: CPU on which to write register.
++ * @bits_to_clear: Bitmask of bits to clear in the perf_limited register.
++ *
++ * The Performance Limited register contains two sticky bits set by platform:
++ *   - Bit 0 (Desired_Excursion): Set when delivered performance is constrained
++ *     below desired performance. Not used when Autonomous Selection is enabled.
++ *   - Bit 1 (Minimum_Excursion): Set when delivered performance is constrained
++ *     below minimum performance.
++ *
++ * These bits are sticky and remain set until OSPM explicitly clears them.
++ * This function only allows clearing bits (the platform sets them).
++ *
++ * Return: 0 for success, -EINVAL for invalid bits, -EIO on register
++ *         access failure, -EOPNOTSUPP if not supported.
++ */
++int cppc_set_perf_limited(int cpu, u64 bits_to_clear)
++{
++	u64 current_val, new_val;
++	int ret;
++
++	/* Only bits 0 and 1 are valid */
++	if (bits_to_clear & ~CPPC_PERF_LIMITED_MASK)
++		return -EINVAL;
++
++	if (!bits_to_clear)
++		return 0;
++
++	ret = cppc_get_perf_limited(cpu, &current_val);
++	if (ret)
++		return ret;
++
++	/* Clear the specified bits */
++	new_val = current_val & ~bits_to_clear;
++
++	return cppc_set_reg_val(cpu, PERF_LIMITED, new_val);
++}
++EXPORT_SYMBOL_GPL(cppc_set_perf_limited);
++
++/**
+  * cppc_get_transition_latency - returns frequency transition latency in ns
+  * @cpu_num: CPU number for per_cpu().
+  *
+--- a/drivers/cpufreq/cppc_cpufreq.c
++++ b/drivers/cpufreq/cppc_cpufreq.c
+@@ -1000,16 +1000,21 @@ store_energy_performance_preference_val(
+ 	return count;
+ }
+ 
++CPPC_CPUFREQ_ATTR_RW_U64(perf_limited, cppc_get_perf_limited,
++			 cppc_set_perf_limited)
++
+ cpufreq_freq_attr_ro(freqdomain_cpus);
+ cpufreq_freq_attr_rw(auto_select);
+ cpufreq_freq_attr_rw(auto_act_window);
+ cpufreq_freq_attr_rw(energy_performance_preference_val);
++cpufreq_freq_attr_rw(perf_limited);
+ 
+ static struct freq_attr *cppc_cpufreq_attr[] = {
+ 	&freqdomain_cpus,
+ 	&auto_select,
+ 	&auto_act_window,
+ 	&energy_performance_preference_val,
++	&perf_limited,
+ 	NULL,
+ };
+ 
+--- a/include/acpi/cppc_acpi.h
++++ b/include/acpi/cppc_acpi.h
+@@ -42,6 +42,11 @@
+ #define CPPC_EPP_PERFORMANCE_PREF		0x00
+ #define CPPC_EPP_ENERGY_EFFICIENCY_PREF		0xFF
+ 
++#define CPPC_PERF_LIMITED_DESIRED_EXCURSION	BIT(0)
++#define CPPC_PERF_LIMITED_MINIMUM_EXCURSION	BIT(1)
++#define CPPC_PERF_LIMITED_MASK		(CPPC_PERF_LIMITED_DESIRED_EXCURSION | \
++					 CPPC_PERF_LIMITED_MINIMUM_EXCURSION)
++
+ /* Each register has the folowing format. */
+ struct cpc_reg {
+ 	u8 descriptor;
+@@ -174,6 +179,8 @@ extern int cppc_get_auto_act_window(int
+ extern int cppc_set_auto_act_window(int cpu, u64 auto_act_window);
+ extern int cppc_get_auto_sel(int cpu, bool *enable);
+ extern int cppc_set_auto_sel(int cpu, bool enable);
++extern int cppc_get_perf_limited(int cpu, u64 *perf_limited);
++extern int cppc_set_perf_limited(int cpu, u64 bits_to_clear);
+ extern int amd_get_highest_perf(unsigned int cpu, u32 *highest_perf);
+ extern int amd_get_boost_ratio_numerator(unsigned int cpu, u64 *numerator);
+ extern int amd_detect_prefcore(bool *detected);
+@@ -266,6 +273,14 @@ static inline int cppc_set_auto_sel(int
+ {
+ 	return -EOPNOTSUPP;
+ }
++static inline int cppc_get_perf_limited(int cpu, u64 *perf_limited)
++{
++	return -EOPNOTSUPP;
++}
++static inline int cppc_set_perf_limited(int cpu, u64 bits_to_clear)
++{
++	return -EOPNOTSUPP;
++}
+ static inline int amd_get_highest_perf(unsigned int cpu, u32 *highest_perf)
+ {
+ 	return -ENODEV;
