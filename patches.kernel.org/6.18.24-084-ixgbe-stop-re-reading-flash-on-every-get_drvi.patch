@@ -1,0 +1,140 @@
+From: Aleksandr Loktionov <aleksandr.loktionov@intel.com>
+Date: Wed, 4 Mar 2026 09:42:32 +0100
+Subject: [PATCH] ixgbe: stop re-reading flash on every get_drvinfo for e610
+References: bsc#1258210
+Patch-mainline: 6.18.24
+Git-commit: d8ae40dc20cbd7bb6e6b36a928e2db2296060ad2
+
+[ Upstream commit d8ae40dc20cbd7bb6e6b36a928e2db2296060ad2 ]
+
+ixgbe_get_drvinfo() calls ixgbe_refresh_fw_version() on every ethtool
+query for e610 adapters.  That ends up in ixgbe_discover_flash_size(),
+which bisects the full 16 MB NVM space issuing one ACI command per
+step (~20 ms each, ~24 steps total = ~500 ms).
+
+Profiling on an idle E610-XAT2 system with telegraf scraping ethtool
+stats every 10 seconds:
+
+  kretprobe:ixgbe_get_drvinfo took 527603 us
+  kretprobe:ixgbe_get_drvinfo took 523978 us
+  kretprobe:ixgbe_get_drvinfo took 552975 us
+  kretprobe:ice_get_drvinfo   took       3 us
+  kretprobe:igb_get_drvinfo   took       2 us
+  kretprobe:i40e_get_drvinfo  took       5 us
+
+The half-second stall happens under the RTNL lock, causing visible
+latency on ip-link and friends.
+
+The FW version can only change after an EMPR reset.  All flash data is
+already populated at probe time and the cached adapter->eeprom_id is
+what get_drvinfo should be returning.  The only place that needs to
+trigger a re-read is ixgbe_devlink_reload_empr_finish(), right after
+the EMPR completes and new firmware is running.  Additionally, refresh
+the FW version in ixgbe_reinit_locked() so that any PF that undergoes a
+reinit after an EMPR (e.g. triggered by another PF's devlink reload)
+also picks up the new version in adapter->eeprom_id.
+
+ixgbe_devlink_info_get() keeps its refresh call for explicit
+"devlink dev info" queries, which is fine given those are user-initiated.
+
+Fixes: c9e563cae19e ("ixgbe: add support for devlink reload")
+Co-developed-by: Jedrzej Jagielski <jedrzej.jagielski@intel.com>
+Signed-off-by: Jedrzej Jagielski <jedrzej.jagielski@intel.com>
+Signed-off-by: Aleksandr Loktionov <aleksandr.loktionov@intel.com>
+Reviewed-by: Simon Horman <horms@kernel.org>
+Tested-by: Rinitha S <sx.rinitha@intel.com> (A Contingent worker at Intel)
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Robert Frohl <rfrohl@suse.com>
+---
+ drivers/net/ethernet/intel/ixgbe/devlink/devlink.c |  2 +-
+ drivers/net/ethernet/intel/ixgbe/ixgbe.h           |  2 +-
+ drivers/net/ethernet/intel/ixgbe/ixgbe_ethtool.c   | 13 +++++++------
+ drivers/net/ethernet/intel/ixgbe/ixgbe_main.c      | 10 ++++++++++
+ 4 files changed, 19 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/net/ethernet/intel/ixgbe/devlink/devlink.c b/drivers/net/ethernet/intel/ixgbe/devlink/devlink.c
+index d227f4d2a2d1..f32e640ef4ac 100644
+--- a/drivers/net/ethernet/intel/ixgbe/devlink/devlink.c
++++ b/drivers/net/ethernet/intel/ixgbe/devlink/devlink.c
+@@ -474,7 +474,7 @@ static int ixgbe_devlink_reload_empr_finish(struct devlink *devlink,
+ 	adapter->flags2 &= ~(IXGBE_FLAG2_API_MISMATCH |
+ 			     IXGBE_FLAG2_FW_ROLLBACK);
+ 
+-	return 0;
++	return ixgbe_refresh_fw_version(adapter);
+ }
+ 
+ static const struct devlink_ops ixgbe_devlink_ops = {
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe.h b/drivers/net/ethernet/intel/ixgbe/ixgbe.h
+index dce4936708eb..047f04045585 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe.h
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe.h
+@@ -973,7 +973,7 @@ int ixgbe_init_interrupt_scheme(struct ixgbe_adapter *adapter);
+ bool ixgbe_wol_supported(struct ixgbe_adapter *adapter, u16 device_id,
+ 			 u16 subdevice_id);
+ void ixgbe_set_fw_version_e610(struct ixgbe_adapter *adapter);
+-void ixgbe_refresh_fw_version(struct ixgbe_adapter *adapter);
++int ixgbe_refresh_fw_version(struct ixgbe_adapter *adapter);
+ #ifdef CONFIG_PCI_IOV
+ void ixgbe_full_sync_mac_table(struct ixgbe_adapter *adapter);
+ #endif
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_ethtool.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_ethtool.c
+index 2d660e9edb80..0c8f31068977 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_ethtool.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_ethtool.c
+@@ -1153,12 +1153,17 @@ static int ixgbe_set_eeprom(struct net_device *netdev,
+ 	return ret_val;
+ }
+ 
+-void ixgbe_refresh_fw_version(struct ixgbe_adapter *adapter)
++int ixgbe_refresh_fw_version(struct ixgbe_adapter *adapter)
+ {
+ 	struct ixgbe_hw *hw = &adapter->hw;
++	int err;
++
++	err = ixgbe_get_flash_data(hw);
++	if (err)
++		return err;
+ 
+-	ixgbe_get_flash_data(hw);
+ 	ixgbe_set_fw_version_e610(adapter);
++	return 0;
+ }
+ 
+ static void ixgbe_get_drvinfo(struct net_device *netdev,
+@@ -1166,10 +1171,6 @@ static void ixgbe_get_drvinfo(struct net_device *netdev,
+ {
+ 	struct ixgbe_adapter *adapter = ixgbe_from_netdev(netdev);
+ 
+-	/* need to refresh info for e610 in case fw reloads in runtime */
+-	if (adapter->hw.mac.type == ixgbe_mac_e610)
+-		ixgbe_refresh_fw_version(adapter);
+-
+ 	strscpy(drvinfo->driver, ixgbe_driver_name, sizeof(drvinfo->driver));
+ 
+ 	strscpy(drvinfo->fw_version, adapter->eeprom_id,
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+index 501216970e61..240f7cc3f213 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@ -6289,6 +6289,16 @@ void ixgbe_reinit_locked(struct ixgbe_adapter *adapter)
+ 	if (adapter->flags & IXGBE_FLAG_SRIOV_ENABLED)
+ 		msleep(2000);
+ 	ixgbe_up(adapter);
++
++	/* E610 has no FW event to notify all PFs of an EMPR reset, so
++	 * refresh the FW version here to pick up any new FW version after
++	 * a hardware reset (e.g. EMPR triggered by another PF's devlink
++	 * reload).  ixgbe_refresh_fw_version() updates both hw->flash and
++	 * adapter->eeprom_id so ethtool -i reports the correct string.
++	 */
++	if (adapter->hw.mac.type == ixgbe_mac_e610)
++		(void)ixgbe_refresh_fw_version(adapter);
++
+ 	clear_bit(__IXGBE_RESETTING, &adapter->state);
+ }
+ 
+-- 
+2.53.0
+
