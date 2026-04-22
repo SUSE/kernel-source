@@ -1,0 +1,139 @@
+From: Alison Schofield <alison.schofield@intel.com>
+Date: Mon, 4 Aug 2025 01:00:12 -0700
+Subject: [PATCH] cxl/core: Add locked variants of the poison inject and clear
+ funcs
+Git-commit: 25a0207828bc52f1ebb6588f9417eb43ca4960a3
+Patch-mainline: v6.17-rc2
+References: jsc#PED-15409
+
+The core functions that validate and send inject and clear commands
+to the memdev devices require holding both the dpa_rwsem and the
+region_rwsem.
+
+In preparation for another caller of these functions that must hold
+the locks upon entry, split the work into a locked and unlocked pair.
+
+Consideration was given to moving the locking to both callers,
+however, the existing caller is not in the core (mem.c) and cannot
+access the locks.
+
+Signed-off-by: Alison Schofield <alison.schofield@intel.com>
+Reviewed-by: Dave Jiang <dave.jiang@intel.com>
+Reviewed-by: Jonathan Cameron <jonathan.cameron@huawei.com>
+Link: https://patch.msgid.link/1d601f586975195733984ca63d1b5789bbe8690f.1754290144.git.alison.schofield@intel.com
+Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/cxl/core/memdev.c | 52 +++++++++++++++++++++++++++------------
+ drivers/cxl/cxlmem.h      |  2 ++
+ 2 files changed, 38 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/cxl/core/memdev.c b/drivers/cxl/core/memdev.c
+index c569e00a511f..90d3390d9c7c 100644
+--- a/drivers/cxl/core/memdev.c
++++ b/drivers/cxl/core/memdev.c
+@@ -276,7 +276,7 @@ static int cxl_validate_poison_dpa(struct cxl_memdev *cxlmd, u64 dpa)
+ 	return 0;
+ }
+ 
+-int cxl_inject_poison(struct cxl_memdev *cxlmd, u64 dpa)
++int cxl_inject_poison_locked(struct cxl_memdev *cxlmd, u64 dpa)
+ {
+ 	struct cxl_mailbox *cxl_mbox = &cxlmd->cxlds->cxl_mbox;
+ 	struct cxl_mbox_inject_poison inject;
+@@ -288,13 +288,8 @@ int cxl_inject_poison(struct cxl_memdev *cxlmd, u64 dpa)
+ 	if (!IS_ENABLED(CONFIG_DEBUG_FS))
+ 		return 0;
+ 
+-	ACQUIRE(rwsem_read_intr, region_rwsem)(&cxl_rwsem.region);
+-	if ((rc = ACQUIRE_ERR(rwsem_read_intr, &region_rwsem)))
+-		return rc;
+-
+-	ACQUIRE(rwsem_read_intr, dpa_rwsem)(&cxl_rwsem.dpa);
+-	if ((rc = ACQUIRE_ERR(rwsem_read_intr, &dpa_rwsem)))
+-		return rc;
++	lockdep_assert_held(&cxl_rwsem.dpa);
++	lockdep_assert_held(&cxl_rwsem.region);
+ 
+ 	rc = cxl_validate_poison_dpa(cxlmd, dpa);
+ 	if (rc)
+@@ -324,9 +319,24 @@ int cxl_inject_poison(struct cxl_memdev *cxlmd, u64 dpa)
+ 
+ 	return 0;
+ }
++
++int cxl_inject_poison(struct cxl_memdev *cxlmd, u64 dpa)
++{
++	int rc;
++
++	ACQUIRE(rwsem_read_intr, region_rwsem)(&cxl_rwsem.region);
++	if ((rc = ACQUIRE_ERR(rwsem_read_intr, &region_rwsem)))
++		return rc;
++
++	ACQUIRE(rwsem_read_intr, dpa_rwsem)(&cxl_rwsem.dpa);
++	if ((rc = ACQUIRE_ERR(rwsem_read_intr, &dpa_rwsem)))
++		return rc;
++
++	return cxl_inject_poison_locked(cxlmd, dpa);
++}
+ EXPORT_SYMBOL_NS_GPL(cxl_inject_poison, CXL);
+ 
+-int cxl_clear_poison(struct cxl_memdev *cxlmd, u64 dpa)
++int cxl_clear_poison_locked(struct cxl_memdev *cxlmd, u64 dpa)
+ {
+ 	struct cxl_mailbox *cxl_mbox = &cxlmd->cxlds->cxl_mbox;
+ 	struct cxl_mbox_clear_poison clear;
+@@ -338,13 +348,8 @@ int cxl_clear_poison(struct cxl_memdev *cxlmd, u64 dpa)
+ 	if (!IS_ENABLED(CONFIG_DEBUG_FS))
+ 		return 0;
+ 
+-	ACQUIRE(rwsem_read_intr, region_rwsem)(&cxl_rwsem.region);
+-	if ((rc = ACQUIRE_ERR(rwsem_read_intr, &region_rwsem)))
+-		return rc;
+-
+-	ACQUIRE(rwsem_read_intr, dpa_rwsem)(&cxl_rwsem.dpa);
+-	if ((rc = ACQUIRE_ERR(rwsem_read_intr, &dpa_rwsem)))
+-		return rc;
++	lockdep_assert_held(&cxl_rwsem.dpa);
++	lockdep_assert_held(&cxl_rwsem.region);
+ 
+ 	rc = cxl_validate_poison_dpa(cxlmd, dpa);
+ 	if (rc)
+@@ -383,6 +388,21 @@ int cxl_clear_poison(struct cxl_memdev *cxlmd, u64 dpa)
+ 
+ 	return 0;
+ }
++
++int cxl_clear_poison(struct cxl_memdev *cxlmd, u64 dpa)
++{
++	int rc;
++
++	ACQUIRE(rwsem_read_intr, region_rwsem)(&cxl_rwsem.region);
++	if ((rc = ACQUIRE_ERR(rwsem_read_intr, &region_rwsem)))
++		return rc;
++
++	ACQUIRE(rwsem_read_intr, dpa_rwsem)(&cxl_rwsem.dpa);
++	if ((rc = ACQUIRE_ERR(rwsem_read_intr, &dpa_rwsem)))
++		return rc;
++
++	return cxl_clear_poison_locked(cxlmd, dpa);
++}
+ EXPORT_SYMBOL_NS_GPL(cxl_clear_poison, CXL);
+ 
+ static struct attribute *cxl_memdev_attributes[] = {
+diff --git a/drivers/cxl/cxlmem.h b/drivers/cxl/cxlmem.h
+index 751478dfc410..434031a0c1f7 100644
+--- a/drivers/cxl/cxlmem.h
++++ b/drivers/cxl/cxlmem.h
+@@ -869,6 +869,8 @@ int cxl_mem_get_poison(struct cxl_memdev *cxlmd, u64 offset, u64 len,
+ int cxl_trigger_poison_list(struct cxl_memdev *cxlmd);
+ int cxl_inject_poison(struct cxl_memdev *cxlmd, u64 dpa);
+ int cxl_clear_poison(struct cxl_memdev *cxlmd, u64 dpa);
++int cxl_inject_poison_locked(struct cxl_memdev *cxlmd, u64 dpa);
++int cxl_clear_poison_locked(struct cxl_memdev *cxlmd, u64 dpa);
+ 
+ #ifdef CONFIG_CXL_EDAC_MEM_FEATURES
+ int devm_cxl_memdev_edac_register(struct cxl_memdev *cxlmd);
+-- 
+2.43.0
+

@@ -1,0 +1,138 @@
+From: Dave Jiang <dave.jiang@intel.com>
+Date: Wed, 5 Nov 2025 13:18:26 -0700
+Subject: [PATCH] cxl: Add handling of locked CXL decoder
+Git-commit: 2230c4bdc4120417799c74326ade3123da226d54
+Patch-mainline: v6.19-rc1
+References: jsc#PED-15409
+
+When a decoder is locked, it means that its configuration cannot be
+changed. CXL spec r3.2 8.2.4.20.13 discusses the details regarding
+locked decoders. Locking happens when bit 8 of the decoder control
+register is set and then the decoder is committed afterwards (CXL
+spec r3.2 8.2.4.20.7).
+
+Given that the driver creates a virtual decoder for each CFMWS, the
+Fixed Device Configuration (bit 4) of the Window Restriction field is
+considered as locking for the virtual decoder by the driver.
+
+The current driver code disregards the locked status and a region can
+be destroyed regardless of the locking state.
+
+Add a region flag to indicate the region is in a locked configuration.
+The driver will considered a region locked if the CFMWS or any decoder
+is configured as locked. The consideration is all or nothing regarding
+the locked state. It is reasonable to determine the region "locked"
+status while the region is being assembled based on the decoders.
+
+Add a check in region commit_store() to intercept when a 0 is written
+to the commit sysfs attribute in order to prevent the destruction of a
+region when in locked state. This should be the only entry point from user
+space to destroy a region.
+
+Add a check is added to cxl_decoder_reset() to prevent resetting a locked
+decoder within the kernel driver.
+
+Reviewed-by: Jonathan Cameron <jonathan.cameron@huawei.com>
+Link: https://patch.msgid.link/20251105201826.2901915-1-dave.jiang@intel.com
+Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/cxl/core/hdm.c    |  3 +++
+ drivers/cxl/core/region.c | 19 +++++++++++++++++++
+ drivers/cxl/cxl.h         |  8 ++++++++
+ 3 files changed, 30 insertions(+)
+
+diff --git a/drivers/cxl/core/hdm.c b/drivers/cxl/core/hdm.c
+index d3a094ca01ad..1c5d2022c87a 100644
+--- a/drivers/cxl/core/hdm.c
++++ b/drivers/cxl/core/hdm.c
+@@ -905,6 +905,9 @@ static void cxl_decoder_reset(struct cxl_decoder *cxld)
+ 	if ((cxld->flags & CXL_DECODER_F_ENABLE) == 0)
+ 		return;
+ 
++	if (test_bit(CXL_DECODER_F_LOCK, &cxld->flags))
++		return;
++
+ 	if (port->commit_end == id)
+ 		cxl_port_commit_reap(cxld);
+ 	else
+diff --git a/drivers/cxl/core/region.c b/drivers/cxl/core/region.c
+index b06fee1978ba..b52738e46b5d 100644
+--- a/drivers/cxl/core/region.c
++++ b/drivers/cxl/core/region.c
+@@ -245,6 +245,9 @@ static void cxl_region_decode_reset(struct cxl_region *cxlr, int count)
+ 	struct cxl_region_params *p = &cxlr->params;
+ 	int i;
+ 
++	if (test_bit(CXL_REGION_F_LOCK, &cxlr->flags))
++		return;
++
+ 	/*
+ 	 * Before region teardown attempt to flush, evict any data cached for
+ 	 * this region, or scream loudly about missing arch / platform support
+@@ -419,6 +422,9 @@ static ssize_t commit_store(struct device *dev, struct device_attribute *attr,
+ 		return len;
+ 	}
+ 
++	if (test_bit(CXL_REGION_F_LOCK, &cxlr->flags))
++		return -EPERM;
++
+ 	rc = queue_reset(cxlr);
+ 	if (rc)
+ 		return rc;
+@@ -1059,6 +1065,16 @@ static int cxl_rr_assign_decoder(struct cxl_port *port, struct cxl_region *cxlr,
+ 	return 0;
+ }
+ 
++static void cxl_region_set_lock(struct cxl_region *cxlr,
++				struct cxl_decoder *cxld)
++{
++	if (!test_bit(CXL_DECODER_F_LOCK, &cxld->flags))
++		return;
++
++	set_bit(CXL_REGION_F_LOCK, &cxlr->flags);
++	clear_bit(CXL_REGION_F_NEEDS_RESET, &cxlr->flags);
++}
++
+ /**
+  * cxl_port_attach_region() - track a region's interest in a port by endpoint
+  * @port: port to add a new region reference 'struct cxl_region_ref'
+@@ -1170,6 +1186,8 @@ static int cxl_port_attach_region(struct cxl_port *port,
+ 		}
+ 	}
+ 
++	cxl_region_set_lock(cxlr, cxld);
++
+ 	rc = cxl_rr_ep_add(cxl_rr, cxled);
+ 	if (rc) {
+ 		dev_dbg(&cxlr->dev,
+@@ -2439,6 +2457,7 @@ static struct cxl_region *cxl_region_alloc(struct cxl_root_decoder *cxlrd, int i
+ 	dev->bus = &cxl_bus_type;
+ 	dev->type = &cxl_region_type;
+ 	cxlr->id = id;
++	cxl_region_set_lock(cxlr, &cxlrd->cxlsd.cxld);
+ 
+ 	return cxlr;
+ }
+diff --git a/drivers/cxl/cxl.h b/drivers/cxl/cxl.h
+index 231ddccf8977..6382f1983865 100644
+--- a/drivers/cxl/cxl.h
++++ b/drivers/cxl/cxl.h
+@@ -517,6 +517,14 @@ enum cxl_partition_mode {
+  */
+ #define CXL_REGION_F_NEEDS_RESET 1
+ 
++/*
++ * Indicate whether this region is locked due to 1 or more decoders that have
++ * been locked. The approach of all or nothing is taken with regard to the
++ * locked attribute. CXL_REGION_F_NEEDS_RESET should not be set if this flag is
++ * set.
++ */
++#define CXL_REGION_F_LOCK 2
++
+ /**
+  * struct cxl_region - CXL region
+  * @dev: This region's device
+-- 
+2.43.0
+

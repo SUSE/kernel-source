@@ -1,0 +1,148 @@
+From: Dave Jiang <dave.jiang@intel.com>
+Date: Wed, 22 Oct 2025 13:30:52 -0700
+Subject: [PATCH] cxl/region: Add support to indicate region has extended
+Git-commit: d6602e25819dea2c239972e98e09ba5db4aebd22
+ linear cache
+Patch-mainline: v6.19-rc1
+References: jsc#PED-15409
+
+Add a region sysfs attribute to show the size of the extended linear
+cache if there is any. The attribute is invisible when the cache
+size is 0, which indicates it does not exist.
+
+Moved the cxl_region_visible() location in order to pick up the
+new sysfs attribute definition.
+
+[ dj: Fixed spelling errors noted by Benjamin ]
+
+Reviewed-by: Alison Schofield <alison.schofield@intel.com>
+Reviewed-by: Ben Cheatham <benjamin.cheatham@amd.com>
+Reviewed-by: Jonathan Cameron <jonathan.cameron@huawei.com>
+Link: https://patch.msgid.link/20251022203052.4078527-1-dave.jiang@intel.com
+Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ Documentation/ABI/testing/sysfs-bus-cxl | 11 ++++-
+ drivers/cxl/core/region.c               | 59 ++++++++++++++++++-------
+ 2 files changed, 54 insertions(+), 16 deletions(-)
+
+diff --git a/Documentation/ABI/testing/sysfs-bus-cxl b/Documentation/ABI/testing/sysfs-bus-cxl
+index 6b4e8c7a963d..c80a1b5a03db 100644
+--- a/Documentation/ABI/testing/sysfs-bus-cxl
++++ b/Documentation/ABI/testing/sysfs-bus-cxl
+@@ -496,8 +496,17 @@ Description:
+ 		changed, only freed by writing 0. The kernel makes no guarantees
+ 		that data is maintained over an address space freeing event, and
+ 		there is no guarantee that a free followed by an allocate
+-		results in the same address being allocated.
++		results in the same address being allocated. If extended linear
++		cache is present, the size indicates extended linear cache size
++		plus the CXL region size.
+ 
++What:		/sys/bus/cxl/devices/regionZ/extended_linear_cache_size
++Date:		October, 2025
++KernelVersion:	v6.19
++Contact:	linux-cxl@vger.kernel.org
++Description:
++		(RO) The size of extended linear cache, if there is an extended
++		linear cache. Otherwise the attribute will not be visible.
+ 
+ What:		/sys/bus/cxl/devices/regionZ/mode
+ Date:		January, 2023
+diff --git a/drivers/cxl/core/region.c b/drivers/cxl/core/region.c
+index b06fee1978ba..8711d7c9c2e3 100644
+--- a/drivers/cxl/core/region.c
++++ b/drivers/cxl/core/region.c
+@@ -461,21 +461,6 @@ static ssize_t commit_show(struct device *dev, struct device_attribute *attr,
+ }
+ static DEVICE_ATTR_RW(commit);
+ 
+-static umode_t cxl_region_visible(struct kobject *kobj, struct attribute *a,
+-				  int n)
+-{
+-	struct device *dev = kobj_to_dev(kobj);
+-	struct cxl_region *cxlr = to_cxl_region(dev);
+-
+-	/*
+-	 * Support tooling that expects to find a 'uuid' attribute for all
+-	 * regions regardless of mode.
+-	 */
+-	if (a == &dev_attr_uuid.attr && cxlr->mode != CXL_PARTMODE_PMEM)
+-		return 0444;
+-	return a->mode;
+-}
+-
+ static ssize_t interleave_ways_show(struct device *dev,
+ 				    struct device_attribute *attr, char *buf)
+ {
+@@ -754,6 +739,21 @@ static ssize_t size_show(struct device *dev, struct device_attribute *attr,
+ }
+ static DEVICE_ATTR_RW(size);
+ 
++static ssize_t extended_linear_cache_size_show(struct device *dev,
++					       struct device_attribute *attr,
++					       char *buf)
++{
++	struct cxl_region *cxlr = to_cxl_region(dev);
++	struct cxl_region_params *p = &cxlr->params;
++	ssize_t rc;
++
++	ACQUIRE(rwsem_read_intr, rwsem)(&cxl_rwsem.region);
++	if ((rc = ACQUIRE_ERR(rwsem_read_intr, &rwsem)))
++		return rc;
++	return sysfs_emit(buf, "%#llx\n", p->cache_size);
++}
++static DEVICE_ATTR_RO(extended_linear_cache_size);
++
+ static struct attribute *cxl_region_attrs[] = {
+ 	&dev_attr_uuid.attr,
+ 	&dev_attr_commit.attr,
+@@ -762,9 +762,34 @@ static struct attribute *cxl_region_attrs[] = {
+ 	&dev_attr_resource.attr,
+ 	&dev_attr_size.attr,
+ 	&dev_attr_mode.attr,
++	&dev_attr_extended_linear_cache_size.attr,
+ 	NULL,
+ };
+ 
++static umode_t cxl_region_visible(struct kobject *kobj, struct attribute *a,
++				  int n)
++{
++	struct device *dev = kobj_to_dev(kobj);
++	struct cxl_region *cxlr = to_cxl_region(dev);
++
++	/*
++	 * Support tooling that expects to find a 'uuid' attribute for all
++	 * regions regardless of mode.
++	 */
++	if (a == &dev_attr_uuid.attr && cxlr->mode != CXL_PARTMODE_PMEM)
++		return 0444;
++
++	/*
++	 * Don't display extended linear cache attribute if there is no
++	 * extended linear cache.
++	 */
++	if (a == &dev_attr_extended_linear_cache_size.attr &&
++	    cxlr->params.cache_size == 0)
++		return 0;
++
++	return a->mode;
++}
++
+ static const struct attribute_group cxl_region_group = {
+ 	.attrs = cxl_region_attrs,
+ 	.is_visible = cxl_region_visible,
+@@ -3479,6 +3504,10 @@ static int __construct_region(struct cxl_region *cxlr,
+ 			 "Extended linear cache calculation failed rc:%d\n", rc);
+ 	}
+ 
++	rc = sysfs_update_group(&cxlr->dev.kobj, &cxl_region_group);
++	if (rc)
++		return rc;
++
+ 	rc = insert_resource(cxlrd->res, res);
+ 	if (rc) {
+ 		/*
+-- 
+2.43.0
+

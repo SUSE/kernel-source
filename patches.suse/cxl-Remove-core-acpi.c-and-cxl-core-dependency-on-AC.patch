@@ -1,0 +1,226 @@
+From: Robert Richter <rrichter@amd.com>
+Date: Fri, 11 Jul 2025 17:15:27 +0200
+Subject: [PATCH] cxl: Remove core/acpi.c and cxl core dependency on ACPI
+Git-commit: 12b3d697c812aaf356e82d9e1f351fbb2ea97500
+Patch-mainline: v6.17-rc1
+References: jsc#PED-15409
+
+From Dave [1]:
+
+"""
+It was a mistake to introduce core/acpi.c and putting ACPI dependency on
+cxl_core when adding the extended linear cache support.
+"""
+
+Current implementation calls hmat_get_extended_linear_cache_size() of
+the ACPI subsystem. That external reference causes issue running
+cxl_test as there is no way to "mock" that function and ignore it when
+using cxl test.
+
+Instead of working around that using cxlrd ops and extensively
+expanding cxl_test code [1], just move HMAT calls out of the core
+module to cxl_acpi. Implement this by adding a @cache_size member to
+struct cxl_root_decoder. During initialization the cache size is
+determined and added to the root decoder object in cxl_acpi. Later on
+in cxl_core the cache_size parameter is used to setup extended linear
+caching.
+
+[1] https://patch.msgid.link/20250610172938.139428-1-dave.jiang@intel.com
+
+[ dj: Remove core/acpi.o from tools/testing/cxl/Kbuild ]
+[ dj: Add kdoc for cxlrd->cache_size ]
+
+Cc: Dave Jiang <dave.jiang@intel.com>
+Signed-off-by: Robert Richter <rrichter@amd.com>
+Reviewed-by: Alison Schofield <alison.schofield@intel.com>
+Reviewed-by: Jonathan Cameron <jonathan.cameron@huawei.com>
+Reviewed-by: Dave Jiang <dave.jiang@intel.com>
+Link: https://patch.msgid.link/20250711151529.787470-1-rrichter@amd.com
+Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/cxl/acpi.c        | 59 +++++++++++++++++++++++++++++++++++++++
+ drivers/cxl/core/Makefile |  1 -
+ drivers/cxl/core/acpi.c   | 11 --------
+ drivers/cxl/core/core.h   |  2 --
+ drivers/cxl/core/region.c |  7 +----
+ drivers/cxl/cxl.h         |  2 ++
+ tools/testing/cxl/Kbuild  |  1 -
+ 7 files changed, 62 insertions(+), 21 deletions(-)
+ delete mode 100644 drivers/cxl/core/acpi.c
+
+diff --git a/drivers/cxl/acpi.c b/drivers/cxl/acpi.c
+index a1a99ec3f12c..712624cba2b6 100644
+--- a/drivers/cxl/acpi.c
++++ b/drivers/cxl/acpi.c
+@@ -335,6 +335,63 @@ static int add_or_reset_cxl_resource(struct resource *parent, struct resource *r
+ 	return rc;
+ }
+ 
++static int cxl_acpi_set_cache_size(struct cxl_root_decoder *cxlrd)
++{
++	struct cxl_decoder *cxld = &cxlrd->cxlsd.cxld;
++	struct range *hpa = &cxld->hpa_range;
++	resource_size_t size = range_len(hpa);
++	resource_size_t start = hpa->start;
++	resource_size_t cache_size;
++	struct resource res;
++	int nid, rc;
++
++	res = DEFINE_RES(start, size, 0);
++	nid = phys_to_target_node(start);
++
++	rc = hmat_get_extended_linear_cache_size(&res, nid, &cache_size);
++	if (rc)
++		return rc;
++
++	/*
++	 * The cache range is expected to be within the CFMWS.
++	 * Currently there is only support cache_size == cxl_size. CXL
++	 * size is then half of the total CFMWS window size.
++	 */
++	size = size >> 1;
++	if (cache_size && size != cache_size) {
++		dev_warn(&cxld->dev,
++			 "Extended Linear Cache size %pa != CXL size %pa. No Support!",
++			 &cache_size, &size);
++		return -ENXIO;
++	}
++
++	cxlrd->cache_size = cache_size;
++
++	return 0;
++}
++
++static void cxl_setup_extended_linear_cache(struct cxl_root_decoder *cxlrd)
++{
++	int rc;
++
++	rc = cxl_acpi_set_cache_size(cxlrd);
++	if (!rc)
++		return;
++
++	if (rc != -EOPNOTSUPP) {
++		/*
++		 * Failing to support extended linear cache region resize does not
++		 * prevent the region from functioning. Only causes cxl list showing
++		 * incorrect region size.
++		 */
++		dev_warn(cxlrd->cxlsd.cxld.dev.parent,
++			 "Extended linear cache calculation failed rc:%d\n", rc);
++	}
++
++	/* Ignoring return code */
++	cxlrd->cache_size = 0;
++}
++
+ DEFINE_FREE(put_cxlrd, struct cxl_root_decoder *,
+ 	    if (!IS_ERR_OR_NULL(_T)) put_device(&_T->cxlsd.cxld.dev))
+ DEFINE_FREE(del_cxl_resource, struct resource *, if (_T) del_cxl_resource(_T))
+@@ -394,6 +451,8 @@ static int __cxl_parse_cfmws(struct acpi_cedt_cfmws *cfmws,
+ 		ig = CXL_DECODER_MIN_GRANULARITY;
+ 	cxld->interleave_granularity = ig;
+ 
++	cxl_setup_extended_linear_cache(cxlrd);
++
+ 	if (cfmws->interleave_arithmetic == ACPI_CEDT_CFMWS_ARITHMETIC_XOR) {
+ 		if (ways != 1 && ways != 3) {
+ 			cxims_ctx = (struct cxl_cxims_context) {
+diff --git a/drivers/cxl/core/Makefile b/drivers/cxl/core/Makefile
+index 79e2ef81fde8..5ad8fef210b5 100644
+--- a/drivers/cxl/core/Makefile
++++ b/drivers/cxl/core/Makefile
+@@ -15,7 +15,6 @@ cxl_core-y += hdm.o
+ cxl_core-y += pmu.o
+ cxl_core-y += cdat.o
+ cxl_core-y += ras.o
+-cxl_core-y += acpi.o
+ cxl_core-$(CONFIG_TRACING) += trace.o
+ cxl_core-$(CONFIG_CXL_REGION) += region.o
+ cxl_core-$(CONFIG_CXL_MCE) += mce.o
+diff --git a/drivers/cxl/core/acpi.c b/drivers/cxl/core/acpi.c
+deleted file mode 100644
+index f13b4dae6ac5..000000000000
+--- a/drivers/cxl/core/acpi.c
++++ /dev/null
+@@ -1,11 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0-only
+-/* Copyright(c) 2024 Intel Corporation. All rights reserved. */
+-#include <linux/acpi.h>
+-#include "cxl.h"
+-#include "core.h"
+-
+-int cxl_acpi_get_extended_linear_cache_size(struct resource *backing_res,
+-					    int nid, resource_size_t *size)
+-{
+-	return hmat_get_extended_linear_cache_size(backing_res, nid, size);
+-}
+diff --git a/drivers/cxl/core/core.h b/drivers/cxl/core/core.h
+index 6b78b10da3e1..2250c05cecc3 100644
+--- a/drivers/cxl/core/core.h
++++ b/drivers/cxl/core/core.h
+@@ -121,8 +121,6 @@ int cxl_port_get_switch_dport_bandwidth(struct cxl_port *port,
+ int cxl_ras_init(void);
+ void cxl_ras_exit(void);
+ int cxl_gpf_port_setup(struct cxl_dport *dport);
+-int cxl_acpi_get_extended_linear_cache_size(struct resource *backing_res,
+-					    int nid, resource_size_t *size);
+ 
+ #ifdef CONFIG_CXL_FEATURES
+ struct cxl_feat_entry *
+diff --git a/drivers/cxl/core/region.c b/drivers/cxl/core/region.c
+index 91ff3a495fbd..08ac7f483562 100644
+--- a/drivers/cxl/core/region.c
++++ b/drivers/cxl/core/region.c
+@@ -3282,15 +3282,11 @@ static int cxl_extended_linear_cache_resize(struct cxl_region *cxlr,
+ {
+ 	struct cxl_root_decoder *cxlrd = to_cxl_root_decoder(cxlr->dev.parent);
+ 	struct cxl_region_params *p = &cxlr->params;
+-	int nid = phys_to_target_node(res->start);
+ 	resource_size_t size = resource_size(res);
+ 	resource_size_t cache_size, start;
+ 	int rc;
+-
+-	rc = cxl_acpi_get_extended_linear_cache_size(res, nid, &cache_size);
+-	if (rc)
+-		return rc;
+ 
++	cache_size = cxlrd->cache_size;
+ 	if (!cache_size)
+ 		return 0;
+ 
+diff --git a/drivers/cxl/cxl.h b/drivers/cxl/cxl.h
+index e7b66ca1d423..0730f92df038 100644
+--- a/drivers/cxl/cxl.h
++++ b/drivers/cxl/cxl.h
+@@ -423,6 +423,7 @@ typedef u64 (*cxl_hpa_to_spa_fn)(struct cxl_root_decoder *cxlrd, u64 hpa);
+ /**
+  * struct cxl_root_decoder - Static platform CXL address decoder
+  * @res: host / parent resource for region allocations
++ * @cache_size: extended linear cache size if exists, otherwise zero.
+  * @region_id: region id for next region provisioning event
+  * @hpa_to_spa: translate CXL host-physical-address to Platform system-physical-address
+  * @platform_data: platform specific configuration data
+@@ -432,6 +433,7 @@ typedef u64 (*cxl_hpa_to_spa_fn)(struct cxl_root_decoder *cxlrd, u64 hpa);
+  */
+ struct cxl_root_decoder {
+ 	struct resource *res;
++	resource_size_t cache_size;
+ 	atomic_t region_id;
+ 	cxl_hpa_to_spa_fn hpa_to_spa;
+ 	void *platform_data;
+diff --git a/tools/testing/cxl/Kbuild b/tools/testing/cxl/Kbuild
+index 31a2d73c963f..d07f14cb7aa4 100644
+--- a/tools/testing/cxl/Kbuild
++++ b/tools/testing/cxl/Kbuild
+@@ -62,7 +62,6 @@ cxl_core-y += $(CXL_CORE_SRC)/hdm.o
+ cxl_core-y += $(CXL_CORE_SRC)/pmu.o
+ cxl_core-y += $(CXL_CORE_SRC)/cdat.o
+ cxl_core-y += $(CXL_CORE_SRC)/ras.o
+-cxl_core-y += $(CXL_CORE_SRC)/acpi.o
+ cxl_core-$(CONFIG_TRACING) += $(CXL_CORE_SRC)/trace.o
+ cxl_core-$(CONFIG_CXL_REGION) += $(CXL_CORE_SRC)/region.o
+ cxl_core-$(CONFIG_CXL_MCE) += $(CXL_CORE_SRC)/mce.o
+-- 
+2.43.0
+

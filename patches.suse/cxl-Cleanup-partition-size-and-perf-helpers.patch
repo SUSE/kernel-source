@@ -1,0 +1,255 @@
+From: Dan Williams <dan.j.williams@intel.com>
+Date: Mon, 3 Feb 2025 20:24:35 -0800
+Subject: [PATCH] cxl: Cleanup partition size and perf helpers
+Git-commit: 58d60bbe0a99539afb1f29d03c28f06747f94531
+Patch-mainline: v6.15
+References: jsc#PED-15409
+
+Now that the 'struct cxl_dpa_partition' array contains both size and
+performance information, all paths that iterate over that information
+can use a loop rather than hard-code 'ram' and 'pmem' lookups.
+
+Remove, or reduce the scope of the temporary helpers that bridged the
+pre-'struct cxl_dpa_partition' state of the code to the post-'struct
+cxl_dpa_partition' state.
+
+- to_{ram,pmem}_perf(): scope reduced to just sysfs_emit + is_visible()
+  helpers
+
+- to_{ram,pmem}_res(): fold into their only users cxl_{ram,pmem}_size()
+
+- cxl_ram_size(): scope reduced to ram_size_show() (Note,
+  cxl_pmem_size() also used to gate nvdimm registration)
+
+In short, memdev sysfs ABI already made the promise that 0-sized
+partitions will show for memdevs, but that can be avoided for future
+partitions by using dynamic sysfs group visibility (new relative to when
+the partition ABI first shipped upstream).
+
+[ hare: backported to SL16.1 ]
+
+Cc: Dave Jiang <dave.jiang@intel.com>
+Cc: Alejandro Lucero <alucerop@amd.com>
+Cc: Ira Weiny <ira.weiny@intel.com>
+Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+Reviewed-by: Jonathan Cameron <Jonathan.Cameron@huawei.com>
+Tested-by: Alejandro Lucero <alucerop@amd.com>
+Link: https://patch.msgid.link/173864307519.668823.10800104022426067621.stgit@dwillia2-xfh.jf.intel.com
+Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/cxl/core/cdat.c   | 51 ++++++++++++++++++-----------------
+ drivers/cxl/core/memdev.c | 23 ++++++++++++++++
+ drivers/cxl/cxlmem.h      | 56 +++++----------------------------------
+ 3 files changed, 57 insertions(+), 73 deletions(-)
+
+diff --git a/drivers/cxl/core/cdat.c b/drivers/cxl/core/cdat.c
+index f96ae28022b0..bfba7f5019cf 100644
+--- a/drivers/cxl/core/cdat.c
++++ b/drivers/cxl/core/cdat.c
+@@ -306,9 +306,6 @@ static int match_cxlrd_qos_class(struct device *dev, void *data)
+ 
+ static void reset_dpa_perf(struct cxl_dpa_perf *dpa_perf)
+ {
+-	if (!dpa_perf)
+-		return;
+-
+ 	*dpa_perf = (struct cxl_dpa_perf) {
+ 		.qos_class = CXL_QOS_CLASS_INVALID,
+ 	};
+@@ -317,9 +314,6 @@ static void reset_dpa_perf(struct cxl_dpa_perf *dpa_perf)
+ static bool cxl_qos_match(struct cxl_port *root_port,
+ 			  struct cxl_dpa_perf *dpa_perf)
+ {
+-	if (!dpa_perf)
+-		return false;
+-
+ 	if (dpa_perf->qos_class == CXL_QOS_CLASS_INVALID)
+ 		return false;
+ 
+@@ -351,37 +345,46 @@ static int match_cxlrd_hb(struct device *dev, void *data)
+ 	return 0;
+ }
+ 
+-static int cxl_qos_class_verify(struct cxl_memdev *cxlmd)
++static void cxl_qos_class_verify(struct cxl_memdev *cxlmd)
+ {
+ 	struct cxl_dev_state *cxlds = cxlmd->cxlds;
+-	struct cxl_dpa_perf *ram_perf = to_ram_perf(cxlds),
+-			    *pmem_perf = to_pmem_perf(cxlds);
+ 	struct cxl_port *root_port;
+-	int rc;
+ 
+ 	struct cxl_root *cxl_root __free(put_cxl_root) =
+ 		find_cxl_root(cxlmd->endpoint);
+ 
++	/*
++	 * No need to reset_dpa_perf() here as find_cxl_root() is guaranteed to
++	 * succeed when called in the cxl_endpoint_port_probe() path.
++	 */
+ 	if (!cxl_root)
+-		return -ENODEV;
++		return;
+ 
+ 	root_port = &cxl_root->port;
+ 
+-	/* Check that the QTG IDs are all sane between end device and root decoders */
+-	if (!cxl_qos_match(root_port, ram_perf))
+-		reset_dpa_perf(ram_perf);
+-	if (!cxl_qos_match(root_port, pmem_perf))
+-		reset_dpa_perf(pmem_perf);
+-
+-	/* Check to make sure that the device's host bridge is under a root decoder */
+-	rc = device_for_each_child(&root_port->dev,
+-				   cxlmd->endpoint->host_bridge, match_cxlrd_hb);
+-	if (!rc) {
+-		reset_dpa_perf(ram_perf);
+-		reset_dpa_perf(pmem_perf);
++	/*
++	 * Save userspace from needing to check if a qos class has any matches
++	 * by hiding qos class info if the memdev is not mapped by a root
++	 * decoder, or the partition class does not match any root decoder
++	 * class.
++	 */
++	if (!device_for_each_child(&root_port->dev,
++				   cxlmd->endpoint->host_bridge,
++				   match_cxlrd_hb)) {
++		for (int i = 0; i < cxlds->nr_partitions; i++) {
++			struct cxl_dpa_perf *perf = &cxlds->part[i].perf;
++
++			reset_dpa_perf(perf);
++		}
++		return;
+ 	}
+ 
+-	return rc;
++	for (int i = 0; i < cxlds->nr_partitions; i++) {
++		struct cxl_dpa_perf *perf = &cxlds->part[i].perf;
++
++		if (!cxl_qos_match(root_port, perf))
++			reset_dpa_perf(perf);
++	}
+ }
+ 
+ static void discard_dsmas(struct xarray *xa)
+diff --git a/drivers/cxl/core/memdev.c b/drivers/cxl/core/memdev.c
+index 615cbd861f66..63c6c681125d 100644
+--- a/drivers/cxl/core/memdev.c
++++ b/drivers/cxl/core/memdev.c
+@@ -75,6 +75,14 @@ static ssize_t label_storage_size_show(struct device *dev,
+ }
+ static DEVICE_ATTR_RO(label_storage_size);
+ 
++static resource_size_t cxl_ram_size(struct cxl_dev_state *cxlds)
++{
++	/* Static RAM is only expected at partition 0. */
++	if (cxlds->part[0].mode != CXL_PARTMODE_RAM)
++		return 0;
++	return resource_size(&cxlds->part[0].res);
++}
++
+ static ssize_t ram_size_show(struct device *dev, struct device_attribute *attr,
+ 			     char *buf)
+ {
+@@ -399,6 +407,14 @@ static struct attribute *cxl_memdev_attributes[] = {
+ 	NULL,
+ };
+ 
++static struct cxl_dpa_perf *to_pmem_perf(struct cxl_dev_state *cxlds)
++{
++	for (int i = 0; i < cxlds->nr_partitions; i++)
++		if (cxlds->part[i].mode == CXL_PARTMODE_PMEM)
++			return &cxlds->part[i].perf;
++	return NULL;
++}
++
+ static ssize_t pmem_qos_class_show(struct device *dev,
+ 				   struct device_attribute *attr, char *buf)
+ {
+@@ -417,6 +433,13 @@ static struct attribute *cxl_memdev_pmem_attributes[] = {
+ 	NULL,
+ };
+ 
++static struct cxl_dpa_perf *to_ram_perf(struct cxl_dev_state *cxlds)
++{
++	if (cxlds->part[0].mode != CXL_PARTMODE_RAM)
++		return NULL;
++	return &cxlds->part[0].perf;
++}
++
+ static ssize_t ram_qos_class_show(struct device *dev,
+ 				  struct device_attribute *attr, char *buf)
+ {
+diff --git a/drivers/cxl/cxlmem.h b/drivers/cxl/cxlmem.h
+index f218d43dec9f..36a091597066 100644
+--- a/drivers/cxl/cxlmem.h
++++ b/drivers/cxl/cxlmem.h
+@@ -470,58 +470,16 @@ struct cxl_dev_state {
+ #endif
+ };
+ 
+-
+-/* Static RAM is only expected at partition 0. */
+-static inline const struct resource *to_ram_res(struct cxl_dev_state *cxlds)
+-{
+-	if (cxlds->part[0].mode != CXL_PARTMODE_RAM)
+-		return NULL;
+-	return &cxlds->part[0].res;
+-}
+-
+-/*
+- * Static PMEM may be at partition index 0 when there is no static RAM
+- * capacity.
+- */
+-static inline const struct resource *to_pmem_res(struct cxl_dev_state *cxlds)
+-{
+-	for (int i = 0; i < cxlds->nr_partitions; i++)
+-		if (cxlds->part[i].mode == CXL_PARTMODE_PMEM)
+-			return &cxlds->part[i].res;
+-	return NULL;
+-}
+-
+-static inline struct cxl_dpa_perf *to_ram_perf(struct cxl_dev_state *cxlds)
+-{
+-	if (cxlds->part[0].mode != CXL_PARTMODE_RAM)
+-		return NULL;
+-	return &cxlds->part[0].perf;
+-}
+-
+-static inline struct cxl_dpa_perf *to_pmem_perf(struct cxl_dev_state *cxlds)
++static inline resource_size_t cxl_pmem_size(struct cxl_dev_state *cxlds)
+ {
++	/*
++	 * Static PMEM may be at partition index 0 when there is no static RAM
++	 * capacity.
++	 */
+ 	for (int i = 0; i < cxlds->nr_partitions; i++)
+ 		if (cxlds->part[i].mode == CXL_PARTMODE_PMEM)
+-			return &cxlds->part[i].perf;
+-	return NULL;
+-}
+-
+-static inline resource_size_t cxl_ram_size(struct cxl_dev_state *cxlds)
+-{
+-	const struct resource *res = to_ram_res(cxlds);
+-
+-	if (!res)
+-		return 0;
+-	return resource_size(res);
+-}
+-
+-static inline resource_size_t cxl_pmem_size(struct cxl_dev_state *cxlds)
+-{
+-	const struct resource *res = to_pmem_res(cxlds);
+-
+-	if (!res)
+-		return 0;
+-	return resource_size(res);
++			return resource_size(&cxlds->part[i].res);
++	return 0;
+ }
+ 
+ static inline struct cxl_dev_state *mbox_to_cxlds(struct cxl_mailbox *cxl_mbox)
+-- 
+2.43.0
+

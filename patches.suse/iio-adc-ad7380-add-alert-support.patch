@@ -1,0 +1,280 @@
+From: Julien Stephan <jstephan@baylibre.com>
+Date: Wed, 8 Jan 2025 13:49:36 +0100
+Subject: [PATCH] iio: adc: ad7380: add alert support
+Git-commit: 27d1a4dbe1e150692c39a9056af018cb792234fd
+Patch-mainline: v6.15-rc1
+References: jsc#PED-15409
+
+The alert functionality is an out of range indicator and can be used as
+an early indicator of an out of bounds conversion result.
+
+ALERT_LOW_THRESHOLD and ALERT_HIGH_THRESHOLD registers are common to all
+channels.
+
+When using 1 SDO line (only mode supported by the driver right now), i.e
+data outputs only on SDOA, SDOB (or SDOD for 4 channels variants) is
+used as an alert pin. The alert pin is updated at the end of the
+conversion (set to low if an alert occurs) and is cleared on a falling
+edge of CS.
+
+The ALERT register contains information about the exact alert status:
+channel and direction. ALERT register can be accessed using debugfs if
+enabled.
+
+User can set high/low thresholds and enable alert detection using the
+regular iio events attributes:
+
+  events/in_thresh_falling_value events/in_thresh_rising_value
+  events/thresh_either_en
+
+In most use cases, user will hardwire the alert pin to trigger a shutdown.
+
+In theory, we could generate userspace IIO events for alerts, but this
+is not implemented yet for several reasons [1]. This can be implemented
+later if a real use case actually requires it.
+
+Signed-off-by: Julien Stephan <jstephan@baylibre.com>
+
+[1] https://lore.kernel.org/all/4be16272-5197-4fa1-918c-c4cdfcaee02e@baylibre.com/
+
+Reviewed-by: David Lechner <dlechner@baylibre.com>
+Link: https://patch.msgid.link/20250108-ad7380-add-alert-support-v4-4-1751802471ba@baylibre.com
+Signed-off-by: Jonathan Cameron <Jonathan.Cameron@huawei.com>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/iio/adc/ad7380.c | 192 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 192 insertions(+)
+
+diff --git a/drivers/iio/adc/ad7380.c b/drivers/iio/adc/ad7380.c
+index a532de442208..a18dcd664c1b 100644
+--- a/drivers/iio/adc/ad7380.c
++++ b/drivers/iio/adc/ad7380.c
+@@ -34,6 +34,7 @@
+ #include <linux/spi/spi.h>
+ 
+ #include <linux/iio/buffer.h>
++#include <linux/iio/events.h>
+ #include <linux/iio/iio.h>
+ #include <linux/iio/trigger_consumer.h>
+ #include <linux/iio/triggered_buffer.h>
+@@ -112,6 +113,24 @@ struct ad7380_chip_info {
+ 	const struct ad7380_timing_specs *timing_specs;
+ };
+ 
++static const struct iio_event_spec ad7380_events[] = {
++	{
++		.type = IIO_EV_TYPE_THRESH,
++		.dir = IIO_EV_DIR_RISING,
++		.mask_shared_by_dir = BIT(IIO_EV_INFO_VALUE),
++	},
++	{
++		.type = IIO_EV_TYPE_THRESH,
++		.dir = IIO_EV_DIR_FALLING,
++		.mask_shared_by_dir = BIT(IIO_EV_INFO_VALUE),
++	},
++	{
++		.type = IIO_EV_TYPE_THRESH,
++		.dir = IIO_EV_DIR_EITHER,
++		.mask_shared_by_all = BIT(IIO_EV_INFO_ENABLE),
++	},
++};
++
+ enum {
+ 	AD7380_SCAN_TYPE_NORMAL,
+ 	AD7380_SCAN_TYPE_RESOLUTION_BOOST,
+@@ -214,6 +233,8 @@ static const struct iio_scan_type ad7380_scan_type_16_u[] = {
+ 	.has_ext_scan_type = 1,							\
+ 	.ext_scan_type = ad7380_scan_type_##bits##_##sign,			\
+ 	.num_ext_scan_type = ARRAY_SIZE(ad7380_scan_type_##bits##_##sign),	\
++	.event_spec = ad7380_events,						\
++	.num_event_specs = ARRAY_SIZE(ad7380_events),				\
+ }
+ 
+ #define DEFINE_AD7380_2_CHANNEL(name, bits, diff, sign)	\
+@@ -1157,12 +1178,183 @@ static int ad7380_get_current_scan_type(const struct iio_dev *indio_dev,
+ 					    : AD7380_SCAN_TYPE_NORMAL;
+ }
+ 
++static int ad7380_read_event_config(struct iio_dev *indio_dev,
++				    const struct iio_chan_spec *chan,
++				    enum iio_event_type type,
++				    enum iio_event_direction dir)
++{
++	struct ad7380_state *st = iio_priv(indio_dev);
++	int tmp, ret;
++
++	ret = iio_device_claim_direct_mode(indio_dev);
++	if (ret)
++		return ret;
++
++	ret = regmap_read(st->regmap, AD7380_REG_ADDR_CONFIG1, &tmp);
++
++	iio_device_release_direct_mode(indio_dev);
++
++	if (ret)
++		return ret;
++
++	return FIELD_GET(AD7380_CONFIG1_ALERTEN, tmp);
++}
++
++static int ad7380_write_event_config(struct iio_dev *indio_dev,
++				     const struct iio_chan_spec *chan,
++				     enum iio_event_type type,
++				     enum iio_event_direction dir,
++				     bool state)
++{
++	struct ad7380_state *st = iio_priv(indio_dev);
++	int ret;
++
++	ret = iio_device_claim_direct_mode(indio_dev);
++	if (ret)
++		return ret;
++
++	ret = regmap_update_bits(st->regmap,
++				 AD7380_REG_ADDR_CONFIG1,
++				 AD7380_CONFIG1_ALERTEN,
++				 FIELD_PREP(AD7380_CONFIG1_ALERTEN, state));
++
++	iio_device_release_direct_mode(indio_dev);
++
++	return ret;
++}
++
++static int ad7380_get_alert_th(struct ad7380_state *st,
++			       enum iio_event_direction dir,
++			       int *val)
++{
++	int ret, tmp;
++
++	switch (dir) {
++	case IIO_EV_DIR_RISING:
++		ret = regmap_read(st->regmap,
++				  AD7380_REG_ADDR_ALERT_HIGH_TH,
++				  &tmp);
++		if (ret)
++			return ret;
++
++		*val = FIELD_GET(AD7380_ALERT_HIGH_TH, tmp);
++		return IIO_VAL_INT;
++	case IIO_EV_DIR_FALLING:
++		ret = regmap_read(st->regmap,
++				  AD7380_REG_ADDR_ALERT_LOW_TH,
++				  &tmp);
++		if (ret)
++			return ret;
++
++		*val = FIELD_GET(AD7380_ALERT_LOW_TH, tmp);
++		return IIO_VAL_INT;
++	default:
++		return -EINVAL;
++	}
++}
++
++static int ad7380_read_event_value(struct iio_dev *indio_dev,
++				   const struct iio_chan_spec *chan,
++				   enum iio_event_type type,
++				   enum iio_event_direction dir,
++				   enum iio_event_info info,
++				   int *val, int *val2)
++{
++	struct ad7380_state *st = iio_priv(indio_dev);
++	int ret;
++
++	switch (info) {
++	case IIO_EV_INFO_VALUE:
++		ret = iio_device_claim_direct_mode(indio_dev);
++		if (ret)
++			return ret;
++
++		ret = ad7380_get_alert_th(st, dir, val);
++
++		iio_device_release_direct_mode(indio_dev);
++		return ret;
++	default:
++		return -EINVAL;
++	}
++}
++
++static int ad7380_set_alert_th(struct iio_dev *indio_dev,
++			       const struct iio_chan_spec *chan,
++			       enum iio_event_direction dir,
++			       int val)
++{
++	struct ad7380_state *st = iio_priv(indio_dev);
++	const struct iio_scan_type *scan_type;
++	u16 th;
++
++	/*
++	 * According to the datasheet,
++	 * AD7380_REG_ADDR_ALERT_HIGH_TH[11:0] are the 12 MSB of the
++	 * 16-bits internal alert high register. LSB are set to 0xf.
++	 * AD7380_REG_ADDR_ALERT_LOW_TH[11:0] are the 12 MSB of the
++	 * 16 bits internal alert low register. LSB are set to 0x0.
++	 *
++	 * When alert is enabled the conversion from the adc is compared
++	 * immediately to the alert high/low thresholds, before any
++	 * oversampling. This means that the thresholds are the same for
++	 * normal mode and oversampling mode.
++	 */
++
++	/* Extract the 12 MSB of val */
++	scan_type = iio_get_current_scan_type(indio_dev, chan);
++	if (IS_ERR(scan_type))
++		return PTR_ERR(scan_type);
++
++	th = val >> (scan_type->realbits - 12);
++
++	switch (dir) {
++	case IIO_EV_DIR_RISING:
++		return regmap_write(st->regmap,
++				    AD7380_REG_ADDR_ALERT_HIGH_TH,
++				    th);
++	case IIO_EV_DIR_FALLING:
++		return regmap_write(st->regmap,
++				    AD7380_REG_ADDR_ALERT_LOW_TH,
++				    th);
++	default:
++		return -EINVAL;
++	}
++}
++
++static int ad7380_write_event_value(struct iio_dev *indio_dev,
++				    const struct iio_chan_spec *chan,
++				    enum iio_event_type type,
++				    enum iio_event_direction dir,
++				    enum iio_event_info info,
++				    int val, int val2)
++{
++	int ret;
++
++	switch (info) {
++	case IIO_EV_INFO_VALUE:
++		ret = iio_device_claim_direct_mode(indio_dev);
++		if (ret)
++			return ret;
++
++		ret = ad7380_set_alert_th(indio_dev, chan, dir, val);
++
++		iio_device_release_direct_mode(indio_dev);
++		return ret;
++	default:
++		return -EINVAL;
++	}
++}
++
+ static const struct iio_info ad7380_info = {
+ 	.read_raw = &ad7380_read_raw,
+ 	.read_avail = &ad7380_read_avail,
+ 	.write_raw = &ad7380_write_raw,
+ 	.get_current_scan_type = &ad7380_get_current_scan_type,
+ 	.debugfs_reg_access = &ad7380_debugfs_reg_access,
++	.read_event_config = &ad7380_read_event_config,
++	.write_event_config = &ad7380_write_event_config,
++	.read_event_value = &ad7380_read_event_value,
++	.write_event_value = &ad7380_write_event_value,
+ };
+ 
+ static int ad7380_init(struct ad7380_state *st, bool external_ref_en)
+-- 
+2.43.0
+

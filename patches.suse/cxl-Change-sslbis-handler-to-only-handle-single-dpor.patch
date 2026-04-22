@@ -1,0 +1,117 @@
+From: Dave Jiang <dave.jiang@intel.com>
+Date: Fri, 29 Aug 2025 11:09:28 -0700
+Subject: [PATCH] cxl: Change sslbis handler to only handle single dport
+Git-commit: d64035a5a37741b25712fb9c2f6aca535c2967ea
+Patch-mainline: v6.18-rc1
+References: jsc#PED-15409
+
+While cxl_switch_parse_cdat() is harmless to be run multiple times, it is
+not efficient in the current scheme where one dport is being updated at
+a time by the memdev probe path. Change the input parameter to the
+specific dport being updated to pick up the SSLBIS information for just
+that dport.
+
+Reviewed-by: Gregory Price <gourry@gourry.net>
+Reviewed-by: Jonathan Cameron <Jonathan.Cameron@huawei.com>
+Reviewed-by: Li Ming <ming.li@zohomail.com>
+Reviewed-by: Alison Schofield <alison.schofield@intel.com>
+Reviewed-by: Dan Williams <dan.j.williams@intel.com>
+Tested-by: Robert Richter <rrichter@amd.com>
+Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/cxl/core/cdat.c | 23 ++++++++++-------------
+ drivers/cxl/core/port.c |  2 +-
+ drivers/cxl/cxl.h       |  2 +-
+ 3 files changed, 12 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/cxl/core/cdat.c b/drivers/cxl/core/cdat.c
+index b156b81a9b20..84c50e7e8d0a 100644
+--- a/drivers/cxl/core/cdat.c
++++ b/drivers/cxl/core/cdat.c
+@@ -440,8 +440,8 @@ static int cdat_sslbis_handler(union acpi_subtable_headers *header, void *arg,
+ 	} *tbl = (struct acpi_cdat_sslbis_table *)header;
+ 	int size = sizeof(header->cdat) + sizeof(tbl->sslbis_header);
+ 	struct acpi_cdat_sslbis *sslbis;
+-	struct cxl_port *port = arg;
+-	struct device *dev = &port->dev;
++	struct cxl_dport *dport = arg;
++	struct device *dev = &dport->port->dev;
+ 	int remain, entries, i;
+ 	u16 len;
+ 
+@@ -467,8 +467,6 @@ static int cdat_sslbis_handler(union acpi_subtable_headers *header, void *arg,
+ 		u16 y = le16_to_cpu((__force __le16)tbl->entries[i].porty_id);
+ 		__le64 le_base;
+ 		__le16 le_val;
+-		struct cxl_dport *dport;
+-		unsigned long index;
+ 		u16 dsp_id;
+ 		u64 val;
+ 
+@@ -499,28 +497,27 @@ static int cdat_sslbis_handler(union acpi_subtable_headers *header, void *arg,
+ 		val = cdat_normalize(le16_to_cpu(le_val), le64_to_cpu(le_base),
+ 				     sslbis->data_type);
+ 
+-		xa_for_each(&port->dports, index, dport) {
+-			if (dsp_id == ACPI_CDAT_SSLBIS_ANY_PORT ||
+-			    dsp_id == dport->port_id) {
+-				cxl_access_coordinate_set(dport->coord,
+-							  sslbis->data_type,
+-							  val);
+-			}
++		if (dsp_id == ACPI_CDAT_SSLBIS_ANY_PORT ||
++		    dsp_id == dport->port_id) {
++			cxl_access_coordinate_set(dport->coord,
++						  sslbis->data_type, val);
++			return 0;
+ 		}
+ 	}
+ 
+ 	return 0;
+ }
+ 
+-void cxl_switch_parse_cdat(struct cxl_port *port)
++void cxl_switch_parse_cdat(struct cxl_dport *dport)
+ {
++	struct cxl_port *port = dport->port;
+ 	int rc;
+ 
+ 	if (!port->cdat.table)
+ 		return;
+ 
+ 	rc = cdat_table_parse(ACPI_CDAT_TYPE_SSLBIS, cdat_sslbis_handler,
+-			      port, port->cdat.table, port->cdat.length);
++			      dport, port->cdat.table, port->cdat.length);
+ 	rc = cdat_table_parse_output(rc);
+ 	if (rc)
+ 		dev_dbg(&port->dev, "Failed to parse SSLBIS: %d\n", rc);
+diff --git a/drivers/cxl/core/port.c b/drivers/cxl/core/port.c
+index bcdb6fdaa18c..18547a217f88 100644
+--- a/drivers/cxl/core/port.c
++++ b/drivers/cxl/core/port.c
+@@ -1607,7 +1607,7 @@ static struct cxl_dport *cxl_port_add_dport(struct cxl_port *port,
+ 	if (IS_ERR(new_dport))
+ 		return new_dport;
+ 
+-	cxl_switch_parse_cdat(port);
++	cxl_switch_parse_cdat(new_dport);
+ 
+ 	if (ida_is_empty(&port->decoder_ida)) {
+ 		rc = devm_cxl_switch_port_decoders_setup(port);
+diff --git a/drivers/cxl/cxl.h b/drivers/cxl/cxl.h
+index c995ae334b1b..e7f4c929785b 100644
+--- a/drivers/cxl/cxl.h
++++ b/drivers/cxl/cxl.h
+@@ -892,7 +892,7 @@ static inline u64 cxl_port_get_spa_cache_alias(struct cxl_port *endpoint,
+ #endif
+ 
+ void cxl_endpoint_parse_cdat(struct cxl_port *port);
+-void cxl_switch_parse_cdat(struct cxl_port *port);
++void cxl_switch_parse_cdat(struct cxl_dport *dport);
+ 
+ int cxl_endpoint_get_perf_coordinates(struct cxl_port *port,
+ 				      struct access_coordinate *coord);
+-- 
+2.43.0
+

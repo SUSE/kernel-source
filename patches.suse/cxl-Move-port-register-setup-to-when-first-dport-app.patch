@@ -1,0 +1,103 @@
+From: Dave Jiang <dave.jiang@intel.com>
+Date: Thu, 14 Aug 2025 15:21:44 -0700
+Subject: [PATCH] cxl: Move port register setup to when first dport appear
+Git-commit: f6ee24913de24dbda8d49213e1a27f5e1a5204cc
+Patch-mainline: v6.17-rc1
+References: jsc#PED-15409
+
+This patch moves the port register setup to when the first dport appears
+via the memdev probe path. At this point, the CXL link should be
+established and the register access is expected to succeed. This change
+addresses an error message observed when PCIe hotplug is enabled on
+an Intel platform. The error messages "cxl portN: Couldn't locate the
+CXL.cache and CXL.mem capability array header" is observed for the
+host bridge (CHBCR) during cxl_acpi driver probe. If the cxl_acpi module
+probe is running before the CXL link between the endpoint device and the
+RP is established, then the platform may not have exposed DVSEC ID 3
+and/or DVSEC ID 7 blocks which will trigger the error message. This
+behavior is defined by the CXL spec r3.2 9.12.3 for RPs and DSPs, however
+the Intel platform also added this behavior to the host bridge.
+
+This change also needs the dport enumeration to be moved to the memdev
+probe path in order to address the issue. This change is not a wholly
+contained solution by itself.
+
+[dj: Add missing var init during port alloc]
+
+Suggested-by: Dan Williams <dan.j.williams@intel.com>
+Reviewed-by: Jonathan Cameron <jonathan.cameron@huawei.com>
+Tested-by: Robert Richter <rrichter@amd.com>
+Reviewed-by: Alison Schofield <alison.schofield@intel.com>
+Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/cxl/core/port.c | 17 ++++++++++++++---
+ drivers/cxl/cxl.h       |  2 ++
+ 2 files changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/cxl/core/port.c b/drivers/cxl/core/port.c
+index 18547a217f88..e0a505f78ebc 100644
+--- a/drivers/cxl/core/port.c
++++ b/drivers/cxl/core/port.c
+@@ -749,6 +749,7 @@ static struct cxl_port *cxl_port_alloc(struct device *uport_dev,
+ 	xa_init(&port->dports);
+ 	xa_init(&port->endpoints);
+ 	xa_init(&port->regions);
++	port->component_reg_phys = CXL_RESOURCE_NONE;
+ 
+ 	device_initialize(dev);
+ 	lockdep_set_class_and_subclass(&dev->mutex, &cxl_port_key, port->depth);
+@@ -867,9 +868,7 @@ static int cxl_port_add(struct cxl_port *port,
+ 		if (rc)
+ 			return rc;
+ 
+-		rc = cxl_port_setup_regs(port, component_reg_phys);
+-		if (rc)
+-			return rc;
++		port->component_reg_phys = component_reg_phys;
+ 	} else {
+ 		rc = dev_set_name(dev, "root%d", port->id);
+ 		if (rc)
+@@ -1200,6 +1199,18 @@ __devm_cxl_add_dport(struct cxl_port *port, struct device *dport_dev,
+ 
+ 	cxl_debugfs_create_dport_dir(dport);
+ 
++	/*
++	 * Setup port register if this is the first dport showed up. Having
++	 * a dport also means that there is at least 1 active link.
++	 */
++	if (port->nr_dports == 1 &&
++	    port->component_reg_phys != CXL_RESOURCE_NONE) {
++		rc = cxl_port_setup_regs(port, port->component_reg_phys);
++		if (rc)
++			return ERR_PTR(rc);
++		port->component_reg_phys = CXL_RESOURCE_NONE;
++	}
++
+ 	return dport;
+ }
+ 
+diff --git a/drivers/cxl/cxl.h b/drivers/cxl/cxl.h
+index e7f4c929785b..4784f0670f3e 100644
+--- a/drivers/cxl/cxl.h
++++ b/drivers/cxl/cxl.h
+@@ -599,6 +599,7 @@ struct cxl_dax_region {
+  * @cdat: Cached CDAT data
+  * @cdat_available: Should a CDAT attribute be available in sysfs
+  * @pci_latency: Upstream latency in picoseconds
++ * @component_reg_phys: Physical address of component register
+  */
+ struct cxl_port {
+ 	struct device dev;
+@@ -622,6 +623,7 @@ struct cxl_port {
+ 	} cdat;
+ 	bool cdat_available;
+ 	long pci_latency;
++	resource_size_t component_reg_phys;
+ };
+ 
+ /**
+-- 
+2.43.0
+

@@ -1,0 +1,112 @@
+From: Jonathan Cameron <Jonathan.Cameron@huawei.com>
+Date: Mon, 17 Feb 2025 14:16:23 +0000
+Subject: [PATCH] iio: adc: max1027: Move claim of direct mode up one level and
+ use guard()
+Git-commit: 2ce5314c689cd1541b9e96aceed98708309c49c8
+Patch-mainline: v6.15-rc1
+References: jsc#PED-15409
+
+Move iio_device_claim_direct_mode() into the read_raw() callback
+and use guard() to release a mutex. This enables simpler error
+handling via direct returns.
+
+Reviewed-by: Miquel Raynal <miquel.raynal@bootlin.com>
+Link: https://patch.msgid.link/20250217141630.897334-24-jic23@kernel.org
+Signed-off-by: Jonathan Cameron <Jonathan.Cameron@huawei.com>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/iio/adc/max1027.c | 38 +++++++++++++-------------------------
+ 1 file changed, 13 insertions(+), 25 deletions(-)
+
+diff --git a/drivers/iio/adc/max1027.c b/drivers/iio/adc/max1027.c
+index f5ba4a1b5a7d..3cab89464fb5 100644
+--- a/drivers/iio/adc/max1027.c
++++ b/drivers/iio/adc/max1027.c
+@@ -336,10 +336,6 @@ static int max1027_read_single_value(struct iio_dev *indio_dev,
+ 	int ret;
+ 	struct max1027_state *st = iio_priv(indio_dev);
+ 
+-	ret = iio_device_claim_direct_mode(indio_dev);
+-	if (ret)
+-		return ret;
+-
+ 	/* Configure conversion register with the requested chan */
+ 	st->reg = MAX1027_CONV_REG | MAX1027_CHAN(chan->channel) |
+ 		  MAX1027_NOSCAN;
+@@ -349,7 +345,7 @@ static int max1027_read_single_value(struct iio_dev *indio_dev,
+ 	if (ret < 0) {
+ 		dev_err(&indio_dev->dev,
+ 			"Failed to configure conversion register\n");
+-		goto release;
++		return ret;
+ 	}
+ 
+ 	/*
+@@ -359,14 +355,10 @@ static int max1027_read_single_value(struct iio_dev *indio_dev,
+ 	 */
+ 	ret = max1027_wait_eoc(indio_dev);
+ 	if (ret)
+-		goto release;
++		return ret;
+ 
+ 	/* Read result */
+ 	ret = spi_read(st->spi, st->buffer, (chan->type == IIO_TEMP) ? 4 : 2);
+-
+-release:
+-	iio_device_release_direct_mode(indio_dev);
+-
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -382,37 +374,33 @@ static int max1027_read_raw(struct iio_dev *indio_dev,
+ 	int ret = 0;
+ 	struct max1027_state *st = iio_priv(indio_dev);
+ 
+-	mutex_lock(&st->lock);
++	guard(mutex)(&st->lock);
+ 
+ 	switch (mask) {
+ 	case IIO_CHAN_INFO_RAW:
++		ret = iio_device_claim_direct_mode(indio_dev);
++		if (ret)
++			return ret;
++
+ 		ret = max1027_read_single_value(indio_dev, chan, val);
+-		break;
++		iio_device_release_direct_mode(indio_dev);
++		return ret;
+ 	case IIO_CHAN_INFO_SCALE:
+ 		switch (chan->type) {
+ 		case IIO_TEMP:
+ 			*val = 1;
+ 			*val2 = 8;
+-			ret = IIO_VAL_FRACTIONAL;
+-			break;
++			return IIO_VAL_FRACTIONAL;
+ 		case IIO_VOLTAGE:
+ 			*val = 2500;
+ 			*val2 = chan->scan_type.realbits;
+-			ret = IIO_VAL_FRACTIONAL_LOG2;
+-			break;
++			return IIO_VAL_FRACTIONAL_LOG2;
+ 		default:
+-			ret = -EINVAL;
+-			break;
++			return -EINVAL;
+ 		}
+-		break;
+ 	default:
+-		ret = -EINVAL;
+-		break;
++		return -EINVAL;
+ 	}
+-
+-	mutex_unlock(&st->lock);
+-
+-	return ret;
+ }
+ 
+ static int max1027_debugfs_reg_access(struct iio_dev *indio_dev,
+-- 
+2.43.0
+

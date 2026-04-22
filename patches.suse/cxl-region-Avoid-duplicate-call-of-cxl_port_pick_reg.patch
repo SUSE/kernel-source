@@ -1,0 +1,120 @@
+From: Robert Richter <rrichter@amd.com>
+Date: Fri, 9 May 2025 17:06:51 +0200
+Subject: [PATCH] cxl/region: Avoid duplicate call of
+ cxl_port_pick_region_decoder()
+Git-commit: 0ee2d97810b9b1626d31a63f4a166f0a310b78e5
+Patch-mainline: v6.16-rc1
+References: jsc#PED-15409
+
+Function cxl_port_pick_region_decoder() is called twice, in
+alloc_region_ref() and cxl_rr_alloc_decoder(). Both functions are
+subsequently called from cxl_port_attach_region(). Make the decoder a
+function argument to both which avoids a duplicate call of
+cxl_port_pick_region_decoder().
+
+Now, cxl_rr_alloc_decoder() no longer allocates the decoder. Instead,
+the previously picked decoder is assigned to the region reference.
+Hence, rename the function to cxl_rr_assign_decoder().
+
+Moving the call out of alloc_region_ref() also moves it out of the
+xa_for_each() loop in there. Now, cxld is determined no longer only
+for each auto-generated region, but now once for all regions
+regardless of auto-generated or not. This is fine as the cxld argument
+is needed for all regions in cxl_rr_assign_decoder() and an error would
+be returned otherwise anyway. So it is better to determine the decoder
+in front of all this and fail early if missing instead of running
+through all that code with multiple calls of
+cxl_port_pick_region_decoder().
+
+Signed-off-by: Robert Richter <rrichter@amd.com>
+Reviewed-by: Gregory Price <gourry@gourry.net>
+Reviewed-by: Dave Jiang <dave.jiang@intel.com>
+Reviewed-by: Jonathan Cameron <Jonathan.Cameron@huawei.com>
+Reviewed-by: "Fabio M. De Francesco" <fabio.m.de.francesco@linux.intel.com>
+Tested-by: Gregory Price <gourry@gourry.net>
+Acked-by: Dan Williams <dan.j.williams@intel.com>
+Link: https://patch.msgid.link/20250509150700.2817697-7-rrichter@amd.com
+Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/cxl/core/region.c | 35 +++++++++++++++++------------------
+ 1 file changed, 17 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/cxl/core/region.c b/drivers/cxl/core/region.c
+index 51fb40d38f2c..efa5953df449 100644
+--- a/drivers/cxl/core/region.c
++++ b/drivers/cxl/core/region.c
+@@ -928,7 +928,8 @@ static bool auto_order_ok(struct cxl_port *port, struct cxl_region *cxlr_iter,
+ 
+ static struct cxl_region_ref *
+ alloc_region_ref(struct cxl_port *port, struct cxl_region *cxlr,
+-		 struct cxl_endpoint_decoder *cxled)
++		 struct cxl_endpoint_decoder *cxled,
++		 struct cxl_decoder *cxld)
+ {
+ 	struct cxl_region_params *p = &cxlr->params;
+ 	struct cxl_region_ref *cxl_rr, *iter;
+@@ -942,9 +943,6 @@ alloc_region_ref(struct cxl_port *port, struct cxl_region *cxlr,
+ 			continue;
+ 
+ 		if (test_bit(CXL_REGION_F_AUTO, &cxlr->flags)) {
+-			struct cxl_decoder *cxld;
+-
+-			cxld = cxl_port_pick_region_decoder(port, cxled, cxlr);
+ 			if (auto_order_ok(port, iter->region, cxld))
+ 				continue;
+ 		}
+@@ -1026,19 +1024,11 @@ static int cxl_rr_ep_add(struct cxl_region_ref *cxl_rr,
+ 	return 0;
+ }
+ 
+-static int cxl_rr_alloc_decoder(struct cxl_port *port, struct cxl_region *cxlr,
+-				struct cxl_endpoint_decoder *cxled,
+-				struct cxl_region_ref *cxl_rr)
++static int cxl_rr_assign_decoder(struct cxl_port *port, struct cxl_region *cxlr,
++				 struct cxl_endpoint_decoder *cxled,
++				 struct cxl_region_ref *cxl_rr,
++				 struct cxl_decoder *cxld)
+ {
+-	struct cxl_decoder *cxld;
+-
+-	cxld = cxl_port_pick_region_decoder(port, cxled, cxlr);
+-	if (!cxld) {
+-		dev_dbg(&cxlr->dev, "%s: no decoder available\n",
+-			dev_name(&port->dev));
+-		return -EBUSY;
+-	}
+-
+ 	if (cxld->region) {
+ 		dev_dbg(&cxlr->dev, "%s: %s already attached to %s\n",
+ 			dev_name(&port->dev), dev_name(&cxld->dev),
+@@ -1129,7 +1119,16 @@ static int cxl_port_attach_region(struct cxl_port *port,
+ 			nr_targets_inc = true;
+ 		}
+ 	} else {
+-		cxl_rr = alloc_region_ref(port, cxlr, cxled);
++		struct cxl_decoder *cxld;
++
++		cxld = cxl_port_pick_region_decoder(port, cxled, cxlr);
++		if (!cxld) {
++			dev_dbg(&cxlr->dev, "%s: no decoder available\n",
++				dev_name(&port->dev));
++			return -EBUSY;
++		}
++
++		cxl_rr = alloc_region_ref(port, cxlr, cxled, cxld);
+ 		if (IS_ERR(cxl_rr)) {
+ 			dev_dbg(&cxlr->dev,
+ 				"%s: failed to allocate region reference\n",
+@@ -1138,7 +1137,7 @@ static int cxl_port_attach_region(struct cxl_port *port,
+ 		}
+ 		nr_targets_inc = true;
+ 
+-		rc = cxl_rr_alloc_decoder(port, cxlr, cxled, cxl_rr);
++		rc = cxl_rr_assign_decoder(port, cxlr, cxled, cxl_rr, cxld);
+ 		if (rc)
+ 			goto out_erase;
+ 	}
+-- 
+2.43.0
+

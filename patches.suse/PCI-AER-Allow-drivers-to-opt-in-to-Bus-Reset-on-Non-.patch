@@ -1,0 +1,132 @@
+From: Lukas Wunner <lukas@wunner.de>
+Date: Wed, 13 Aug 2025 07:11:01 +0200
+Subject: [PATCH] PCI/AER: Allow drivers to opt in to Bus Reset on Non-Fatal
+ Errors
+Git-commit: d0a2dee7d4585a7ebab45bf63eebeb8b6944e88f
+Patch-mainline: v6.18-rc1
+References: jsc#PED-15409
+
+When Advanced Error Reporting was introduced in September 2006 by commit
+6c2b374d7485 ("PCI-Express AER implemetation: AER core and aerdriver"), it
+sought to adhere to the recovery flow and callbacks specified in
+Documentation/PCI/pci-error-recovery.rst.
+
+That document had been added in January 2006, when Enhanced Error Handling
+(EEH) was introduced for PowerPC with commit 065c6359071c ("[PATCH] PCI
+Error Recovery: documentation").
+
+However the AER driver deviates from the document in that it never
+performs a Secondary Bus Reset on Non-Fatal Errors, but always on Fatal
+Errors.  By contrast, EEH allows drivers to opt in or out of a Bus Reset
+regardless of error severity, by returning PCI_ERS_RESULT_NEED_RESET or
+PCI_ERS_RESULT_CAN_RECOVER from their ->error_detected() callback.  If all
+drivers agree that they can recover without a Bus Reset, EEH skips it.
+Should one of them request a Bus Reset, it overrides all other drivers.
+
+This inconsistency between EEH and AER seems problematic because drivers
+need to be aware of and cope with it.
+
+The file Documentation/PCI/pcieaer-howto.rst hints at a rationale for
+always performing a Bus Reset on Fatal Errors:  "Fatal errors [...] cause
+the link to be unreliable.  [...] This [reset_link] callback is used to
+reset the PCIe physical link when a fatal error happens.  If an error
+message indicates a fatal error, [...] performing link reset at upstream
+is necessary."
+
+There's no such rationale provided for never performing a Bus Reset on
+Non-Fatal Errors.
+
+The "xe" driver has a need to attempt a reset of local units on graphics
+cards upon a Non-Fatal Error.  If that is insufficient for recovery, the
+driver wants to opt in to a Bus Reset.
+
+Accommodate such use cases and align AER more closely with EEH by
+performing a Bus Reset in pcie_do_recovery() if drivers request it and the
+faulting device's channel_state is pci_channel_io_normal.  The AER driver
+sets this channel_state for Non-Fatal Errors.  For Fatal Errors, it uses
+pci_channel_io_frozen.
+
+This limits the deviation from Documentation/PCI/pci-error-recovery.rst
+and EEH to the unconditional Bus Reset on Fatal Errors.
+
+pcie_do_recovery() is also invoked by the Downstream Port Containment and
+Error Disconnect Recover drivers.  They both set the channel_state to
+pci_channel_io_frozen, hence pcie_do_recovery() continues to always invoke
+the ->reset_subordinates() callback in their case.  That is necessary
+because the callback brings the link back up at the containing Downstream
+Port.
+
+There are two behavioral changes resulting from this commit:
+
+First, if channel_state is pci_channel_io_normal and one of the affected
+drivers returns PCI_ERS_RESULT_NEED_RESET from its ->error_detected()
+callback, a Bus Reset will now be performed.  There are drivers doing this
+and although it would be possible to avoid a behavioral change by letting
+them return PCI_ERS_RESULT_CAN_RECOVER instead, the impression I got from
+examination of all drivers is that they actually expect or want a Bus
+Reset (cxl_error_detected() is a case in point).  In any case, if they can
+cope with a Bus Reset on Fatal Errors, they shouldn't have issues with a
+Bus Reset on Non-Fatal Errors.
+
+Second, if channel_state is pci_channel_io_frozen and all affected drivers
+return PCI_ERS_RESULT_CAN_RECOVER from ->error_detected(), their
+->mmio_enabled() callback is now invoked prior to performing a Bus Reset,
+instead of afterwards.  This actually makes sense:  For example,
+drivers/scsi/sym53c8xx_2/sym_glue.c dumps debug registers in its
+->mmio_enabled() callback.  Doing so after reset right now captures the
+post-reset state instead of the faulting state, which is useless.
+
+There is only one other driver which implements ->mmio_enabled() and
+returns PCI_ERS_RESULT_CAN_RECOVER from ->error_detected() for
+channel_state pci_channel_io_frozen, drivers/scsi/ipr.c (IBM Power RAID).
+It appears to only be used on EEH platforms.  So the second behavioral
+change is limited to these two drivers.
+
+Signed-off-by: Lukas Wunner <lukas@wunner.de>
+Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+Link: https://patch.msgid.link/28fd805043bb57af390168d05abb30898cf4fc58.1755008151.git.lukas@wunner.de
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/pci/pcie/err.c | 17 ++++++++++-------
+ 1 file changed, 10 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/pci/pcie/err.c b/drivers/pci/pcie/err.c
+index de6381c690f5..e795e5ae6b03 100644
+--- a/drivers/pci/pcie/err.c
++++ b/drivers/pci/pcie/err.c
+@@ -217,15 +217,10 @@ pci_ers_result_t pcie_do_recovery(struct pci_dev *dev,
+ 	pci_walk_bridge(bridge, pci_pm_runtime_get_sync, NULL);
+ 
+ 	pci_dbg(bridge, "broadcast error_detected message\n");
+-	if (state == pci_channel_io_frozen) {
++	if (state == pci_channel_io_frozen)
+ 		pci_walk_bridge(bridge, report_frozen_detected, &status);
+-		if (reset_subordinates(bridge) != PCI_ERS_RESULT_RECOVERED) {
+-			pci_warn(bridge, "subordinate device reset failed\n");
+-			goto failed;
+-		}
+-	} else {
++	else
+ 		pci_walk_bridge(bridge, report_normal_detected, &status);
+-	}
+ 
+ 	if (status == PCI_ERS_RESULT_CAN_RECOVER) {
+ 		status = PCI_ERS_RESULT_RECOVERED;
+@@ -233,6 +228,14 @@ pci_ers_result_t pcie_do_recovery(struct pci_dev *dev,
+ 		pci_walk_bridge(bridge, report_mmio_enabled, &status);
+ 	}
+ 
++	if (status == PCI_ERS_RESULT_NEED_RESET ||
++	    state == pci_channel_io_frozen) {
++		if (reset_subordinates(bridge) != PCI_ERS_RESULT_RECOVERED) {
++			pci_warn(bridge, "subordinate device reset failed\n");
++			goto failed;
++		}
++	}
++
+ 	if (status == PCI_ERS_RESULT_NEED_RESET) {
+ 		/*
+ 		 * TODO: Should call platform-specific
+-- 
+2.43.0
+

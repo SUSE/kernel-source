@@ -1,0 +1,137 @@
+From: Robert Richter <rrichter@amd.com>
+Date: Fri, 9 May 2025 17:06:54 +0200
+Subject: [PATCH] cxl/region: Factor out code to find the root decoder
+Git-commit: 9466ee981647a8655e7f8312ae89aba665d78918
+Patch-mainline: v6.16-rc1
+References: jsc#PED-15409
+
+In function cxl_add_to_region() there is code to determine the root
+decoder associated to an endpoint decoder. Factor out that code for
+later reuse. This has the benefit of reducing cxl_add_to_region()'s
+function complexity.
+
+The reference count must be decremented after using the root decoder.
+cxl_find_root_decoder() is paired with the put_cxl_root_decoder
+cleanup helper that can be used for this.
+
+[dj: Fixed up "obj __free(...) = NULL" pattern]
+
+Signed-off-by: Robert Richter <rrichter@amd.com>
+Reviewed-by: Gregory Price <gourry@gourry.net>
+Reviewed-by: Jonathan Cameron <Jonathan.Cameron@huawei.com>
+Reviewed-by: Dave Jiang <dave.jiang@intel.com>
+Reviewed-by: Dan Williams <dan.j.williams@intel.com>
+Reviewed-by: Alison Schofield <alison.schofield@intel.com>
+Reviewed-by: "Fabio M. De Francesco" <fabio.m.de.francesco@linux.intel.com>
+Tested-by: Gregory Price <gourry@gourry.net>
+Acked-by: Dan Williams <dan.j.williams@intel.com>
+Link: https://patch.msgid.link/20250509150700.2817697-10-rrichter@amd.com
+Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/cxl/core/region.c | 48 +++++++++++++++++++++++----------------
+ drivers/cxl/cxl.h         |  1 +
+ 2 files changed, 30 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/cxl/core/region.c b/drivers/cxl/core/region.c
+index b78f19519469..e76f1cf2e790 100644
+--- a/drivers/cxl/core/region.c
++++ b/drivers/cxl/core/region.c
+@@ -3216,6 +3216,29 @@ static int match_root_decoder_by_range(struct device *dev,
+ 	return range_contains(r1, r2);
+ }
+ 
++static struct cxl_root_decoder *
++cxl_find_root_decoder(struct cxl_endpoint_decoder *cxled)
++{
++	struct cxl_memdev *cxlmd = cxled_to_memdev(cxled);
++	struct cxl_port *port = cxled_to_port(cxled);
++	struct cxl_root *cxl_root __free(put_cxl_root) = find_cxl_root(port);
++	struct cxl_decoder *cxld = &cxled->cxld;
++	struct range *hpa = &cxld->hpa_range;
++	struct device *cxlrd_dev;
++
++	cxlrd_dev = device_find_child(&cxl_root->port.dev, hpa,
++				      match_root_decoder_by_range);
++	if (!cxlrd_dev) {
++		dev_err(cxlmd->dev.parent,
++			"%s:%s no CXL window for range %#llx:%#llx\n",
++			dev_name(&cxlmd->dev), dev_name(&cxld->dev),
++			cxld->hpa_range.start, cxld->hpa_range.end);
++		return NULL;
++	}
++
++	return to_cxl_root_decoder(cxlrd_dev);
++}
++
+ static int match_region_by_range(struct device *dev, const void *data)
+ {
+ 	struct cxl_region_params *p;
+@@ -3384,29 +3407,17 @@ static struct cxl_region *construct_region(struct cxl_root_decoder *cxlrd,
+ 
+ int cxl_add_to_region(struct cxl_endpoint_decoder *cxled)
+ {
+-	struct cxl_memdev *cxlmd = cxled_to_memdev(cxled);
+-	struct cxl_port *port = cxled_to_port(cxled);
+-	struct cxl_root *cxl_root __free(put_cxl_root) = find_cxl_root(port);
+ 	struct range *hpa = &cxled->cxld.hpa_range;
+-	struct cxl_decoder *cxld = &cxled->cxld;
+-	struct device *cxlrd_dev, *region_dev;
+-	struct cxl_root_decoder *cxlrd;
++	struct device *region_dev;
+ 	struct cxl_region_params *p;
+ 	struct cxl_region *cxlr;
+ 	bool attach = false;
+ 	int rc;
+ 
+-	cxlrd_dev = device_find_child(&cxl_root->port.dev, &cxld->hpa_range,
+-				      match_root_decoder_by_range);
+-	if (!cxlrd_dev) {
+-		dev_err(cxlmd->dev.parent,
+-			"%s:%s no CXL window for range %#llx:%#llx\n",
+-			dev_name(&cxlmd->dev), dev_name(&cxld->dev),
+-			cxld->hpa_range.start, cxld->hpa_range.end);
++	struct cxl_root_decoder *cxlrd __free(put_cxl_root_decoder) =
++		cxl_find_root_decoder(cxled);
++	if (!cxlrd)
+ 		return -ENXIO;
+-	}
+-
+-	cxlrd = to_cxl_root_decoder(cxlrd_dev);
+ 
+ 	/*
+ 	 * Ensure that if multiple threads race to construct_region() for @hpa
+@@ -3424,7 +3435,7 @@ int cxl_add_to_region(struct cxl_endpoint_decoder *cxled)
+ 
+ 	rc = PTR_ERR_OR_ZERO(cxlr);
+ 	if (rc)
+-		goto out;
++		return rc;
+ 
+ 	attach_target(cxlr, cxled, -1, TASK_UNINTERRUPTIBLE);
+ 
+@@ -3445,8 +3456,7 @@ int cxl_add_to_region(struct cxl_endpoint_decoder *cxled)
+ 	}
+ 
+ 	put_device(region_dev);
+-out:
+-	put_device(cxlrd_dev);
++
+ 	return rc;
+ }
+ EXPORT_SYMBOL_NS_GPL(cxl_add_to_region, CXL);
+diff --git a/drivers/cxl/cxl.h b/drivers/cxl/cxl.h
+index c3f50f2d5933..371f9dcfb61a 100644
+--- a/drivers/cxl/cxl.h
++++ b/drivers/cxl/cxl.h
+@@ -740,6 +740,7 @@ struct cxl_root *find_cxl_root(struct cxl_port *port);
+ 
+ DEFINE_FREE(put_cxl_root, struct cxl_root *, if (_T) put_device(&_T->port.dev))
+ DEFINE_FREE(put_cxl_port, struct cxl_port *, if (!IS_ERR_OR_NULL(_T)) put_device(&_T->dev))
++DEFINE_FREE(put_cxl_root_decoder, struct cxl_root_decoder *, if (!IS_ERR_OR_NULL(_T)) put_device(&_T->cxlsd.cxld.dev))
+ 
+ int devm_cxl_enumerate_ports(struct cxl_memdev *cxlmd);
+ void cxl_bus_rescan(void);
+-- 
+2.43.0
+

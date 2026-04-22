@@ -1,0 +1,139 @@
+From: Robert Richter <rrichter@amd.com>
+Date: Fri, 9 May 2025 17:06:52 +0200
+Subject: [PATCH] cxl/region: Move find_cxl_root() to cxl_add_to_region()
+Git-commit: 5ed826fc4bc6073e0083ed30c10f6a54da06b83b
+Patch-mainline: v6.16-rc1
+References: jsc#PED-15409
+
+When adding an endpoint to a region, the root port is determined
+first. Move this directly into cxl_add_to_region(). This is in
+preparation of the initialization of endpoints that iterates the port
+hierarchy from the endpoint up to the root port.
+
+As a side-effect the root argument is removed from the argument lists
+of cxl_add_to_region() and related functions. Now, the endpoint is the
+only parameter to add a region. This simplifies the function
+interface.
+
+Signed-off-by: Robert Richter <rrichter@amd.com>
+Reviewed-by: Gregory Price <gourry@gourry.net>
+Reviewed-by: Jonathan Cameron <Jonathan.Cameron@huawei.com>
+Reviewed-by: Dave Jiang <dave.jiang@intel.com>
+Reviewed-by: Dan Williams <dan.j.williams@intel.com>
+Reviewed-by: Alison Schofield <alison.schofield@intel.com>
+Reviewed-by: "Fabio M. De Francesco" <fabio.m.de.francesco@linux.intel.com>
+Tested-by: Gregory Price <gourry@gourry.net>
+Acked-by: Dan Williams <dan.j.williams@intel.com>
+Link: https://patch.msgid.link/20250509150700.2817697-8-rrichter@amd.com
+Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/cxl/core/region.c |  6 ++++--
+ drivers/cxl/cxl.h         |  6 ++----
+ drivers/cxl/port.c        | 15 +++------------
+ 3 files changed, 9 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/cxl/core/region.c b/drivers/cxl/core/region.c
+index efa5953df449..b78f19519469 100644
+--- a/drivers/cxl/core/region.c
++++ b/drivers/cxl/core/region.c
+@@ -3382,9 +3382,11 @@ static struct cxl_region *construct_region(struct cxl_root_decoder *cxlrd,
+ 	return cxlr;
+ }
+ 
+-int cxl_add_to_region(struct cxl_port *root, struct cxl_endpoint_decoder *cxled)
++int cxl_add_to_region(struct cxl_endpoint_decoder *cxled)
+ {
+ 	struct cxl_memdev *cxlmd = cxled_to_memdev(cxled);
++	struct cxl_port *port = cxled_to_port(cxled);
++	struct cxl_root *cxl_root __free(put_cxl_root) = find_cxl_root(port);
+ 	struct range *hpa = &cxled->cxld.hpa_range;
+ 	struct cxl_decoder *cxld = &cxled->cxld;
+ 	struct device *cxlrd_dev, *region_dev;
+@@ -3394,7 +3396,7 @@ int cxl_add_to_region(struct cxl_port *root, struct cxl_endpoint_decoder *cxled)
+ 	bool attach = false;
+ 	int rc;
+ 
+-	cxlrd_dev = device_find_child(&root->dev, &cxld->hpa_range,
++	cxlrd_dev = device_find_child(&cxl_root->port.dev, &cxld->hpa_range,
+ 				      match_root_decoder_by_range);
+ 	if (!cxlrd_dev) {
+ 		dev_err(cxlmd->dev.parent,
+diff --git a/drivers/cxl/cxl.h b/drivers/cxl/cxl.h
+index 14e20b44f2f4..3266be2fe5ea 100644
+--- a/drivers/cxl/cxl.h
++++ b/drivers/cxl/cxl.h
+@@ -857,8 +857,7 @@ struct cxl_nvdimm_bridge *cxl_find_nvdimm_bridge(struct cxl_port *port);
+ #ifdef CONFIG_CXL_REGION
+ bool is_cxl_pmem_region(struct device *dev);
+ struct cxl_pmem_region *to_cxl_pmem_region(struct device *dev);
+-int cxl_add_to_region(struct cxl_port *root,
+-		      struct cxl_endpoint_decoder *cxled);
++int cxl_add_to_region(struct cxl_endpoint_decoder *cxled);
+ struct cxl_dax_region *to_cxl_dax_region(struct device *dev);
+ u64 cxl_port_get_spa_cache_alias(struct cxl_port *endpoint, u64 spa);
+ #else
+@@ -870,8 +869,7 @@ static inline struct cxl_pmem_region *to_cxl_pmem_region(struct device *dev)
+ {
+ 	return NULL;
+ }
+-static inline int cxl_add_to_region(struct cxl_port *root,
+-				    struct cxl_endpoint_decoder *cxled)
++static inline int cxl_add_to_region(struct cxl_endpoint_decoder *cxled)
+ {
+ 	return 0;
+ }
+diff --git a/drivers/cxl/port.c b/drivers/cxl/port.c
+index a35fc5552845..fe4b593331da 100644
+--- a/drivers/cxl/port.c
++++ b/drivers/cxl/port.c
+@@ -30,7 +30,7 @@ static void schedule_detach(void *cxlmd)
+ 	schedule_cxl_memdev_detach(cxlmd);
+ }
+ 
+-static int discover_region(struct device *dev, void *root)
++static int discover_region(struct device *dev, void *unused)
+ {
+ 	struct cxl_endpoint_decoder *cxled;
+ 	int rc;
+@@ -49,7 +49,7 @@ static int discover_region(struct device *dev, void *root)
+ 	 * Region enumeration is opportunistic, if this add-event fails,
+ 	 * continue to the next endpoint decoder.
+ 	 */
+-	rc = cxl_add_to_region(root, cxled);
++	rc = cxl_add_to_region(cxled);
+ 	if (rc)
+ 		dev_dbg(dev, "failed to add to region: %#llx-%#llx\n",
+ 			cxled->cxld.hpa_range.start, cxled->cxld.hpa_range.end);
+@@ -95,7 +95,6 @@ static int cxl_endpoint_port_probe(struct cxl_port *port)
+ 	struct cxl_memdev *cxlmd = to_cxl_memdev(port->uport_dev);
+ 	struct cxl_dev_state *cxlds = cxlmd->cxlds;
+ 	struct cxl_hdm *cxlhdm;
+-	struct cxl_port *root;
+ 	int rc;
+ 
+ 	rc = cxl_dvsec_rr_decode(cxlds, &info);
+@@ -126,19 +125,11 @@ static int cxl_endpoint_port_probe(struct cxl_port *port)
+ 	if (rc)
+ 		return rc;
+ 
+-	/*
+-	 * This can't fail in practice as CXL root exit unregisters all
+-	 * descendant ports and that in turn synchronizes with cxl_port_probe()
+-	 */
+-	struct cxl_root *cxl_root __free(put_cxl_root) = find_cxl_root(port);
+-
+-	root = &cxl_root->port;
+-
+ 	/*
+ 	 * Now that all endpoint decoders are successfully enumerated, try to
+ 	 * assemble regions from committed decoders
+ 	 */
+-	device_for_each_child(&port->dev, root, discover_region);
++	device_for_each_child(&port->dev, NULL, discover_region);
+ 
+ 	return 0;
+ }
+-- 
+2.43.0
+

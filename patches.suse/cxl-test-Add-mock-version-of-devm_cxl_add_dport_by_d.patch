@@ -1,0 +1,330 @@
+From: Dave Jiang <dave.jiang@intel.com>
+Date: Fri, 29 Aug 2025 11:09:25 -0700
+Subject: [PATCH] cxl/test: Add mock version of devm_cxl_add_dport_by_dev()
+Git-commit: d96eb90d9ca6e4652c8a23d48c94364aa061fdc4
+Patch-mainline: v6.18-rc1
+References: jsc#PED-15409
+
+devm_cxl_add_dport_by_dev() outside of cxl_test is done through PCI
+hierarchy. However with cxl_test, it needs to be done through the
+platform device hierarchy. Add the mock function for
+devm_cxl_add_dport_by_dev().
+
+When cxl_core calls a cxl_core exported function and that function is
+mocked by cxl_test, the call chain causes a circular dependency issue. Dan
+provided a workaround to avoid this issue. Apply the method to changes from
+the late dport allocation changes in order to enable cxl-test.
+
+In cxl_core they are defined with "__" added in front of the function. A
+macro is used to define the original function names for when non-test
+version of the kernel is built. A bit of macros and typedefs are used to
+allow mocking of those functions in cxl_test.
+
+Co-developed-by: Dan Williams <dan.j.williams@intel.com>
+Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+Reviewed-by: Jonathan Cameron <jonathan.cameron@huawei.com>
+Reviewed-by: Li Ming <ming.li@zohomail.com>
+Tested-by: Alison Schofield <alison.schofield@intel.com>
+Tested-by: Robert Richter <rrichter@amd.com>
+Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/cxl/core/core.h              |  2 --
+ drivers/cxl/core/pci.c               |  7 ++--
+ drivers/cxl/cxl.h                    | 20 +++++++++++
+ tools/testing/cxl/Kbuild             |  1 +
+ tools/testing/cxl/cxl_core_exports.c | 12 +++++++
+ tools/testing/cxl/exports.h          | 10 ++++++
+ tools/testing/cxl/test/cxl.c         | 53 ++++++++++++++++++++++++++--
+ tools/testing/cxl/test/mock.c        | 23 ++++++++++++
+ tools/testing/cxl/test/mock.h        |  2 ++
+ 9 files changed, 123 insertions(+), 7 deletions(-)
+ create mode 100644 tools/testing/cxl/exports.h
+
+diff --git a/drivers/cxl/core/core.h b/drivers/cxl/core/core.h
+index e18425f119bd..b07490aa93c7 100644
+--- a/drivers/cxl/core/core.h
++++ b/drivers/cxl/core/core.h
+@@ -146,8 +146,6 @@ int cxl_port_get_switch_dport_bandwidth(struct cxl_port *port,
+ int cxl_ras_init(void);
+ void cxl_ras_exit(void);
+ int cxl_gpf_port_setup(struct cxl_dport *dport);
+-struct cxl_dport *devm_cxl_add_dport_by_dev(struct cxl_port *port,
+-					    struct device *dport_dev);
+ 
+ struct cxl_hdm;
+ int cxl_hdm_decode_init(struct cxl_dev_state *cxlds, struct cxl_hdm *cxlhdm,
+diff --git a/drivers/cxl/core/pci.c b/drivers/cxl/core/pci.c
+index 9ec288ed39ae..18825e1505d6 100644
+--- a/drivers/cxl/core/pci.c
++++ b/drivers/cxl/core/pci.c
+@@ -41,14 +41,14 @@ static int pci_get_port_num(struct pci_dev *pdev)
+ }
+ 
+ /**
+- * devm_cxl_add_dport_by_dev - allocate a dport by the dport device
++ * __devm_cxl_add_dport_by_dev - allocate a dport by dport device
+  * @port: cxl_port that hosts the dport
+  * @dport_dev: 'struct device' of the dport
+  *
+  * Returns the allocated dport on success or ERR_PTR() of -errno on error
+  */
+-struct cxl_dport *devm_cxl_add_dport_by_dev(struct cxl_port *port,
+-					    struct device *dport_dev)
++struct cxl_dport *__devm_cxl_add_dport_by_dev(struct cxl_port *port,
++					      struct device *dport_dev)
+ {
+ 	struct cxl_register_map map;
+ 	struct pci_dev *pdev;
+@@ -69,6 +69,7 @@ struct cxl_dport *devm_cxl_add_dport_by_dev(struct cxl_port *port,
+ 	device_lock_assert(&port->dev);
+ 	return devm_cxl_add_dport(port, dport_dev, port_num, map.resource);
+ }
++EXPORT_SYMBOL_NS_GPL(__devm_cxl_add_dport_by_dev, CXL);
+ 
+ struct cxl_walk_context {
+ 	struct pci_bus *bus;
+diff --git a/drivers/cxl/cxl.h b/drivers/cxl/cxl.h
+index 672f43b7a87f..99d358455032 100644
+--- a/drivers/cxl/cxl.h
++++ b/drivers/cxl/cxl.h
+@@ -906,6 +906,10 @@ void cxl_coordinates_combine(struct access_coordinate *out,
+ 			     struct access_coordinate *c2);
+ 
+ bool cxl_endpoint_decoder_reset_detected(struct cxl_port *port);
++struct cxl_dport *devm_cxl_add_dport_by_dev(struct cxl_port *port,
++					    struct device *dport_dev);
++struct cxl_dport *__devm_cxl_add_dport_by_dev(struct cxl_port *port,
++					      struct device *dport_dev);
+ 
+ /*
+  * Unit test builds overrides this to __weak, find the 'strong' version
+@@ -916,4 +920,20 @@ bool cxl_endpoint_decoder_reset_detected(struct cxl_port *port);
+ #endif
+ 
+ u16 cxl_gpf_get_dvsec(struct device *dev);
++
++/*
++ * Declaration for functions that are mocked by cxl_test that are called by
++ * cxl_core. The respective functions are defined as __foo() and called by
++ * cxl_core as foo(). The macros below ensures that those functions would
++ * exist as foo(). See tools/testing/cxl/cxl_core_exports.c and
++ * tools/testing/cxl/exports.h for setting up the mock functions. The dance
++ * is done to avoid a circular dependency where cxl_core calls a function that
++ * ends up being a mock function and goes to * cxl_test where it calls a
++ * cxl_core function.
++ */
++#ifndef CXL_TEST_ENABLE
++#define DECLARE_TESTABLE(x) __##x
++#define devm_cxl_add_dport_by_dev DECLARE_TESTABLE(devm_cxl_add_dport_by_dev)
++#endif
++
+ #endif /* __CXL_H__ */
+diff --git a/tools/testing/cxl/Kbuild b/tools/testing/cxl/Kbuild
+index 51b8ab289eae..81e3795673c5 100644
+--- a/tools/testing/cxl/Kbuild
++++ b/tools/testing/cxl/Kbuild
+@@ -18,6 +18,7 @@ CXL_SRC := $(DRIVERS)/cxl
+ CXL_CORE_SRC := $(DRIVERS)/cxl/core
+ ccflags-y := -I$(srctree)/drivers/cxl/
+ ccflags-y += -D__mock=__weak
++ccflags-y += -DCXL_TEST_ENABLE=1
+ ccflags-y += -DTRACE_INCLUDE_PATH=$(CXL_CORE_SRC) -I$(srctree)/drivers/cxl/core/
+ 
+ obj-m += cxl_acpi.o
+diff --git a/tools/testing/cxl/cxl_core_exports.c b/tools/testing/cxl/cxl_core_exports.c
+index f088792a8925..0d18abc1f5a3 100644
+--- a/tools/testing/cxl/cxl_core_exports.c
++++ b/tools/testing/cxl/cxl_core_exports.c
+@@ -2,6 +2,18 @@
+ /* Copyright(c) 2022 Intel Corporation. All rights reserved. */
+ 
+ #include "cxl.h"
++#include "exports.h"
+ 
+ /* Exporting of cxl_core symbols that are only used by cxl_test */
+ EXPORT_SYMBOL_NS_GPL(cxl_num_decoders_committed, CXL);
++
++cxl_add_dport_by_dev_fn _devm_cxl_add_dport_by_dev =
++	__devm_cxl_add_dport_by_dev;
++EXPORT_SYMBOL_NS_GPL(_devm_cxl_add_dport_by_dev, CXL);
++
++struct cxl_dport *devm_cxl_add_dport_by_dev(struct cxl_port *port,
++					    struct device *dport_dev)
++{
++	return _devm_cxl_add_dport_by_dev(port, dport_dev);
++}
++EXPORT_SYMBOL_NS_GPL(devm_cxl_add_dport_by_dev, CXL);
+diff --git a/tools/testing/cxl/exports.h b/tools/testing/cxl/exports.h
+new file mode 100644
+index 000000000000..9261ce6f1197
+--- /dev/null
++++ b/tools/testing/cxl/exports.h
+@@ -0,0 +1,10 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* Copyright(c) 2025 Intel Corporation */
++#ifndef __MOCK_CXL_EXPORTS_H_
++#define __MOCK_CXL_EXPORTS_H_
++
++typedef struct cxl_dport *(*cxl_add_dport_by_dev_fn)(struct cxl_port *port,
++							  struct device *dport_dev);
++extern cxl_add_dport_by_dev_fn _devm_cxl_add_dport_by_dev;
++
++#endif
+diff --git a/tools/testing/cxl/test/cxl.c b/tools/testing/cxl/test/cxl.c
+index 8b5c559a4a8c..e3b4dc265a3b 100644
+--- a/tools/testing/cxl/test/cxl.c
++++ b/tools/testing/cxl/test/cxl.c
+@@ -944,10 +944,12 @@ static int mock_cxl_endpoint_decoders_setup(struct cxl_port *port)
+ 	return __mock_cxl_decoders_setup(port);
+ }
+ 
+-static int mock_cxl_port_enumerate_dports(struct cxl_port *port)
++static int get_port_array(struct cxl_port *port,
++			  struct platform_device ***port_array,
++			  int *port_array_size)
+ {
+ 	struct platform_device **array;
+-	int i, array_size;
++	int array_size;
+ 
+ 	if (port->depth == 1) {
+ 		if (is_multi_bridge(port->uport_dev)) {
+@@ -981,6 +983,22 @@ static int mock_cxl_port_enumerate_dports(struct cxl_port *port)
+ 		return -ENXIO;
+ 	}
+ 
++	*port_array = array;
++	*port_array_size = array_size;
++
++	return 0;
++}
++
++static int mock_cxl_port_enumerate_dports(struct cxl_port *port)
++{
++	struct platform_device **array;
++	int i, array_size;
++	int rc;
++
++	rc = get_port_array(port, &array, &array_size);
++	if (rc)
++		return rc;
++
+ 	for (i = 0; i < array_size; i++) {
+ 		struct platform_device *pdev = array[i];
+ 		struct cxl_dport *dport;
+@@ -1002,6 +1020,36 @@ static int mock_cxl_port_enumerate_dports(struct cxl_port *port)
+ 	return 0;
+ }
+ 
++static struct cxl_dport *mock_cxl_add_dport_by_dev(struct cxl_port *port,
++						   struct device *dport_dev)
++{
++	struct platform_device **array;
++	int rc, i, array_size;
++
++	rc = get_port_array(port, &array, &array_size);
++	if (rc)
++		return ERR_PTR(rc);
++
++	for (i = 0; i < array_size; i++) {
++		struct platform_device *pdev = array[i];
++
++		if (pdev->dev.parent != port->uport_dev) {
++			dev_dbg(&port->dev, "%s: mismatch parent %s\n",
++				dev_name(port->uport_dev),
++				dev_name(pdev->dev.parent));
++			continue;
++		}
++
++		if (&pdev->dev != dport_dev)
++			continue;
++
++		return devm_cxl_add_dport(port, &pdev->dev, pdev->id,
++					  CXL_RESOURCE_NONE);
++	}
++
++	return ERR_PTR(-ENODEV);
++}
++
+ /*
+  * Faking the cxl_dpa_perf for the memdev when appropriate.
+  */
+@@ -1062,6 +1110,7 @@ static struct cxl_mock_ops cxl_mock_ops = {
+ 	.devm_cxl_endpoint_decoders_setup = mock_cxl_endpoint_decoders_setup,
+ 	.devm_cxl_port_enumerate_dports = mock_cxl_port_enumerate_dports,
+ 	.cxl_endpoint_parse_cdat = mock_cxl_endpoint_parse_cdat,
++	.devm_cxl_add_dport_by_dev = mock_cxl_add_dport_by_dev,
+ 	.list = LIST_HEAD_INIT(cxl_mock_ops.list),
+ };
+ 
+diff --git a/tools/testing/cxl/test/mock.c b/tools/testing/cxl/test/mock.c
+index f335889b7756..e98101f083cd 100644
+--- a/tools/testing/cxl/test/mock.c
++++ b/tools/testing/cxl/test/mock.c
+@@ -10,12 +10,18 @@
+ #include <cxlmem.h>
+ #include <cxlpci.h>
+ #include "mock.h"
++#include "../exports.h"
+ 
+ static LIST_HEAD(mock);
+ 
++static struct cxl_dport *
++redirect_devm_cxl_add_dport_by_dev(struct cxl_port *port,
++				   struct device *dport_dev);
++
+ void register_cxl_mock_ops(struct cxl_mock_ops *ops)
+ {
+ 	list_add_rcu(&ops->list, &mock);
++	_devm_cxl_add_dport_by_dev = redirect_devm_cxl_add_dport_by_dev;
+ }
+ EXPORT_SYMBOL_GPL(register_cxl_mock_ops);
+ 
+@@ -23,6 +29,7 @@ DEFINE_STATIC_SRCU(cxl_mock_srcu);
+ 
+ void unregister_cxl_mock_ops(struct cxl_mock_ops *ops)
+ {
++	_devm_cxl_add_dport_by_dev = __devm_cxl_add_dport_by_dev;
+ 	list_del_rcu(&ops->list);
+ 	synchronize_srcu(&cxl_mock_srcu);
+ }
+@@ -258,6 +265,22 @@ void __wrap_cxl_dport_init_ras_reporting(struct cxl_dport *dport, struct device
+ }
+ EXPORT_SYMBOL_NS_GPL(__wrap_cxl_dport_init_ras_reporting, CXL);
+ 
++struct cxl_dport *redirect_devm_cxl_add_dport_by_dev(struct cxl_port *port,
++						     struct device *dport_dev)
++{
++	int index;
++	struct cxl_mock_ops *ops = get_cxl_mock_ops(&index);
++	struct cxl_dport *dport;
++
++	if (ops && ops->is_mock_port(port->uport_dev))
++		dport = ops->devm_cxl_add_dport_by_dev(port, dport_dev);
++	else
++		dport = __devm_cxl_add_dport_by_dev(port, dport_dev);
++	put_cxl_mock_ops(index);
++
++	return dport;
++}
++
+ MODULE_LICENSE("GPL v2");
+ MODULE_DESCRIPTION("cxl_test: emulation module");
+ MODULE_IMPORT_NS(ACPI);
+diff --git a/tools/testing/cxl/test/mock.h b/tools/testing/cxl/test/mock.h
+index 9d5ad3fd55ec..4ed932e76aae 100644
+--- a/tools/testing/cxl/test/mock.h
++++ b/tools/testing/cxl/test/mock.h
+@@ -23,6 +23,8 @@ struct cxl_mock_ops {
+ 	int (*devm_cxl_switch_port_decoders_setup)(struct cxl_port *port);
+ 	int (*devm_cxl_endpoint_decoders_setup)(struct cxl_port *port);
+ 	void (*cxl_endpoint_parse_cdat)(struct cxl_port *port);
++	struct cxl_dport *(*devm_cxl_add_dport_by_dev)(struct cxl_port *port,
++						       struct device *dport_dev);
+ };
+ 
+ void register_cxl_mock_ops(struct cxl_mock_ops *ops);
+-- 
+2.43.0
+
