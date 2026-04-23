@@ -1,0 +1,126 @@
+From b990b0088bee579447ec3cc001914d91cf2764df Mon Sep 17 00:00:00 2001
+From: "Jackson.lee" <jackson.lee@chipsnmedia.com>
+Date: Mon, 12 Aug 2024 16:08:20 +0900
+Subject: [PATCH] media: chips-media: wave5: Support SPS/PPS generation for
+ each IDR
+Git-commit: b990b0088bee579447ec3cc001914d91cf2764df
+References: jsc#PED-14445
+Patch-mainline: v6.13-rc1
+
+Provide a control to toggle (0 = off / 1 = on), whether the SPS and
+PPS are generated for every IDR.
+
+Signed-off-by: Jackson.lee <jackson.lee@chipsnmedia.com>
+Signed-off-by: Nas Chung <nas.chung@chipsnmedia.com>
+Reviewed-by: Nicolas Dufresne <nicolas.dufresne@collabora.com>
+Signed-off-by: Nicolas Dufresne <nicolas.dufresne@collabora.com>
+Signed-off-by: Sebastian Fricke <sebastian.fricke@collabora.com>
+Signed-off-by: Hans Verkuil <hverkuil-cisco@xs4all.nl>
+Signed-off-by: Oliver Neukum <oneukum@suse.com>
+
+---
+ .../platform/chips-media/wave5/wave5-hw.c     | 26 +++++++++++++++----
+ .../chips-media/wave5/wave5-vpu-enc.c         |  7 +++++
+ .../platform/chips-media/wave5/wave5-vpuapi.h |  1 +
+ 3 files changed, 29 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/media/platform/chips-media/wave5/wave5-hw.c b/drivers/media/platform/chips-media/wave5/wave5-hw.c
+index c89aafabc742..2a98bab446d0 100644
+--- a/drivers/media/platform/chips-media/wave5/wave5-hw.c
++++ b/drivers/media/platform/chips-media/wave5/wave5-hw.c
+@@ -23,6 +23,15 @@
+ #define W521_FEATURE_AVC_ENCODER	BIT(1)
+ #define W521_FEATURE_HEVC_ENCODER	BIT(0)
+ 
++#define ENC_AVC_INTRA_IDR_PARAM_MASK	0x7ff
++#define ENC_AVC_INTRA_PERIOD_SHIFT		6
++#define ENC_AVC_IDR_PERIOD_SHIFT		17
++#define ENC_AVC_FORCED_IDR_HEADER_SHIFT		28
++
++#define ENC_HEVC_INTRA_QP_SHIFT			3
++#define ENC_HEVC_FORCED_IDR_HEADER_SHIFT	9
++#define ENC_HEVC_INTRA_PERIOD_SHIFT		16
++
+ /* Decoder support fields */
+ #define W521_FEATURE_AVC_DECODER	BIT(3)
+ #define W521_FEATURE_HEVC_DECODER	BIT(2)
+@@ -35,7 +44,7 @@
+ 
+ #define REMAP_CTRL_MAX_SIZE_BITS	((W5_REMAP_MAX_SIZE >> 12) & 0x1ff)
+ #define REMAP_CTRL_REGISTER_VALUE(index)	(			\
+-	(BIT(31) | (index << 12) | BIT(11) | REMAP_CTRL_MAX_SIZE_BITS)	\
++	(BIT(31) | ((index) << 12) | BIT(11) | REMAP_CTRL_MAX_SIZE_BITS)\
+ )
+ 
+ #define FASTIO_ADDRESS_MASK		GENMASK(15, 0)
+@@ -1772,12 +1781,19 @@ int wave5_vpu_enc_init_seq(struct vpu_instance *inst)
+ 
+ 	if (inst->std == W_AVC_ENC)
+ 		vpu_write_reg(inst->dev, W5_CMD_ENC_SEQ_INTRA_PARAM, p_param->intra_qp |
+-				((p_param->intra_period & 0x7ff) << 6) |
+-				((p_param->avc_idr_period & 0x7ff) << 17));
++			      ((p_param->intra_period & ENC_AVC_INTRA_IDR_PARAM_MASK)
++				<< ENC_AVC_INTRA_PERIOD_SHIFT) |
++			      ((p_param->avc_idr_period & ENC_AVC_INTRA_IDR_PARAM_MASK)
++				<< ENC_AVC_IDR_PERIOD_SHIFT) |
++			      (p_param->forced_idr_header_enable
++			       << ENC_AVC_FORCED_IDR_HEADER_SHIFT));
+ 	else if (inst->std == W_HEVC_ENC)
+ 		vpu_write_reg(inst->dev, W5_CMD_ENC_SEQ_INTRA_PARAM,
+-			      p_param->decoding_refresh_type | (p_param->intra_qp << 3) |
+-				(p_param->intra_period << 16));
++			      p_param->decoding_refresh_type |
++			      (p_param->intra_qp << ENC_HEVC_INTRA_QP_SHIFT) |
++			      (p_param->forced_idr_header_enable
++			       << ENC_HEVC_FORCED_IDR_HEADER_SHIFT) |
++			      (p_param->intra_period << ENC_HEVC_INTRA_PERIOD_SHIFT));
+ 
+ 	reg_val = (p_param->rdo_skip << 2) |
+ 		(p_param->lambda_scaling_enable << 3) |
+diff --git a/drivers/media/platform/chips-media/wave5/wave5-vpu-enc.c b/drivers/media/platform/chips-media/wave5/wave5-vpu-enc.c
+index 3e35a05c2d8d..b731decbfda6 100644
+--- a/drivers/media/platform/chips-media/wave5/wave5-vpu-enc.c
++++ b/drivers/media/platform/chips-media/wave5/wave5-vpu-enc.c
+@@ -1061,6 +1061,9 @@ static int wave5_vpu_enc_s_ctrl(struct v4l2_ctrl *ctrl)
+ 	case V4L2_CID_MPEG_VIDEO_H264_ENTROPY_MODE:
+ 		inst->enc_param.entropy_coding_mode = ctrl->val;
+ 		break;
++	case V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR:
++		inst->enc_param.forced_idr_header_enable = ctrl->val;
++		break;
+ 	case V4L2_CID_MIN_BUFFERS_FOR_OUTPUT:
+ 		break;
+ 	default:
+@@ -1219,6 +1222,7 @@ static void wave5_set_enc_openparam(struct enc_open_param *open_param,
+ 		else
+ 			open_param->wave_param.intra_refresh_arg = num_ctu_row;
+ 	}
++	open_param->wave_param.forced_idr_header_enable = input.forced_idr_header_enable;
+ }
+ 
+ static int initialize_sequence(struct vpu_instance *inst)
+@@ -1701,6 +1705,9 @@ static int wave5_vpu_open_enc(struct file *filp)
+ 			  0, 1, 1, 0);
+ 	v4l2_ctrl_new_std(v4l2_ctrl_hdl, &wave5_vpu_enc_ctrl_ops,
+ 			  V4L2_CID_MIN_BUFFERS_FOR_OUTPUT, 1, 32, 1, 1);
++	v4l2_ctrl_new_std(v4l2_ctrl_hdl, &wave5_vpu_enc_ctrl_ops,
++			  V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR,
++			  0, 1, 1, 0);
+ 
+ 	if (v4l2_ctrl_hdl->error) {
+ 		ret = -ENODEV;
+diff --git a/drivers/media/platform/chips-media/wave5/wave5-vpuapi.h b/drivers/media/platform/chips-media/wave5/wave5-vpuapi.h
+index d2370511faf8..45615c15beca 100644
+--- a/drivers/media/platform/chips-media/wave5/wave5-vpuapi.h
++++ b/drivers/media/platform/chips-media/wave5/wave5-vpuapi.h
+@@ -568,6 +568,7 @@ struct enc_wave_param {
+ 	u32 lambda_scaling_enable: 1; /* enable lambda scaling using custom GOP */
+ 	u32 transform8x8_enable: 1; /* enable 8x8 intra prediction and 8x8 transform */
+ 	u32 mb_level_rc_enable: 1; /* enable MB-level rate control */
++	u32 forced_idr_header_enable: 1; /* enable header encoding before IDR frame */
+ };
+ 
+ struct enc_open_param {
+-- 
+2.53.0
+

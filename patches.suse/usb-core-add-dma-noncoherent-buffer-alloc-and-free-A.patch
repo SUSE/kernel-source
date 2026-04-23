@@ -1,0 +1,215 @@
+From 488e6eaab88cfa4b6fd2e2bb72fac9cfdc8c403b Mon Sep 17 00:00:00 2001
+From: Xu Yang <xu.yang_2@nxp.com>
+Date: Fri, 4 Jul 2025 17:57:49 +0800
+Subject: [PATCH] usb: core: add dma-noncoherent buffer alloc and free API
+Git-commit: 488e6eaab88cfa4b6fd2e2bb72fac9cfdc8c403b
+References: jsc#PED-14445
+Patch-mainline: v6.17-rc1
+
+This will add usb_alloc_noncoherent() and usb_free_noncoherent()
+functions to support alloc and free buffer in a dma-noncoherent way.
+
+To explicit manage the memory ownership for the kernel and device,
+this will also add usb_dma_noncoherent_sync_for_cpu/device() functions
+and call it at proper time.  The management requires the user save
+sg_table returned by usb_alloc_noncoherent() to urb->sgt.
+
+Signed-off-by: Xu Yang <xu.yang_2@nxp.com>
+Reviewed-by: Alan Stern <stern@rowland.harvard.edu>
+Link: https://lore.kernel.org/r/20250704095751.73765-2-xu.yang_2@nxp.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Oliver Neukum <oneukum@suse.com>
+
+---
+ drivers/usb/core/hcd.c | 29 ++++++++++-----
+ drivers/usb/core/usb.c | 80 ++++++++++++++++++++++++++++++++++++++++++
+ include/linux/usb.h    | 11 ++++++
+ 3 files changed, 112 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/usb/core/hcd.c b/drivers/usb/core/hcd.c
+index c22de97432a0..03771bbc6c01 100644
+--- a/drivers/usb/core/hcd.c
++++ b/drivers/usb/core/hcd.c
+@@ -1342,29 +1342,35 @@ void usb_hcd_unmap_urb_for_dma(struct usb_hcd *hcd, struct urb *urb)
+ 
+ 	dir = usb_urb_dir_in(urb) ? DMA_FROM_DEVICE : DMA_TO_DEVICE;
+ 	if (IS_ENABLED(CONFIG_HAS_DMA) &&
+-	    (urb->transfer_flags & URB_DMA_MAP_SG))
++	    (urb->transfer_flags & URB_DMA_MAP_SG)) {
+ 		dma_unmap_sg(hcd->self.sysdev,
+ 				urb->sg,
+ 				urb->num_sgs,
+ 				dir);
+-	else if (IS_ENABLED(CONFIG_HAS_DMA) &&
+-		 (urb->transfer_flags & URB_DMA_MAP_PAGE))
++	} else if (IS_ENABLED(CONFIG_HAS_DMA) &&
++		 (urb->transfer_flags & URB_DMA_MAP_PAGE)) {
+ 		dma_unmap_page(hcd->self.sysdev,
+ 				urb->transfer_dma,
+ 				urb->transfer_buffer_length,
+ 				dir);
+-	else if (IS_ENABLED(CONFIG_HAS_DMA) &&
+-		 (urb->transfer_flags & URB_DMA_MAP_SINGLE))
++	} else if (IS_ENABLED(CONFIG_HAS_DMA) &&
++		 (urb->transfer_flags & URB_DMA_MAP_SINGLE)) {
+ 		dma_unmap_single(hcd->self.sysdev,
+ 				urb->transfer_dma,
+ 				urb->transfer_buffer_length,
+ 				dir);
+-	else if (urb->transfer_flags & URB_MAP_LOCAL)
++	} else if (urb->transfer_flags & URB_MAP_LOCAL) {
+ 		hcd_free_coherent(urb->dev->bus,
+ 				&urb->transfer_dma,
+ 				&urb->transfer_buffer,
+ 				urb->transfer_buffer_length,
+ 				dir);
++	} else if ((urb->transfer_flags & URB_NO_TRANSFER_DMA_MAP) && urb->sgt) {
++		dma_sync_sgtable_for_cpu(hcd->self.sysdev, urb->sgt, dir);
++		if (dir == DMA_FROM_DEVICE)
++			invalidate_kernel_vmap_range(urb->transfer_buffer,
++						     urb->transfer_buffer_length);
++	}
+ 
+ 	/* Make it safe to call this routine more than once */
+ 	urb->transfer_flags &= ~(URB_DMA_MAP_SG | URB_DMA_MAP_PAGE |
+@@ -1425,8 +1431,15 @@ int usb_hcd_map_urb_for_dma(struct usb_hcd *hcd, struct urb *urb,
+ 	}
+ 
+ 	dir = usb_urb_dir_in(urb) ? DMA_FROM_DEVICE : DMA_TO_DEVICE;
+-	if (urb->transfer_buffer_length != 0
+-	    && !(urb->transfer_flags & URB_NO_TRANSFER_DMA_MAP)) {
++	if (urb->transfer_flags & URB_NO_TRANSFER_DMA_MAP) {
++		if (!urb->sgt)
++			return 0;
++
++		if (dir == DMA_TO_DEVICE)
++			flush_kernel_vmap_range(urb->transfer_buffer,
++						urb->transfer_buffer_length);
++		dma_sync_sgtable_for_device(hcd->self.sysdev, urb->sgt, dir);
++	} else if (urb->transfer_buffer_length != 0) {
+ 		if (hcd->localmem_pool) {
+ 			ret = hcd_alloc_coherent(
+ 					urb->dev->bus, mem_flags,
+diff --git a/drivers/usb/core/usb.c b/drivers/usb/core/usb.c
+index 118fa4c93a79..fca7735fc660 100644
+--- a/drivers/usb/core/usb.c
++++ b/drivers/usb/core/usb.c
+@@ -1030,6 +1030,86 @@ void usb_free_coherent(struct usb_device *dev, size_t size, void *addr,
+ }
+ EXPORT_SYMBOL_GPL(usb_free_coherent);
+ 
++/**
++ * usb_alloc_noncoherent - allocate dma-noncoherent buffer for URB_NO_xxx_DMA_MAP
++ * @dev: device the buffer will be used with
++ * @size: requested buffer size
++ * @mem_flags: affect whether allocation may block
++ * @dma: used to return DMA address of buffer
++ * @dir: DMA transfer direction
++ * @table: used to return sg_table of allocated memory
++ *
++ * To explicit manage the memory ownership for the kernel vs the device by
++ * USB core, the user needs save sg_table to urb->sgt. Then USB core will
++ * do DMA sync for CPU and device properly.
++ *
++ * When the buffer is no longer used, free it with usb_free_noncoherent().
++ *
++ * Return: Either null (indicating no buffer could be allocated), or the
++ * cpu-space pointer to a buffer that may be used to perform DMA to the
++ * specified device.  Such cpu-space buffers are returned along with the DMA
++ * address (through the pointer provided).
++ */
++void *usb_alloc_noncoherent(struct usb_device *dev, size_t size,
++			    gfp_t mem_flags, dma_addr_t *dma,
++			    enum dma_data_direction dir,
++			    struct sg_table **table)
++{
++	struct device *dmadev;
++	struct sg_table *sgt;
++	void *buffer;
++
++	if (!dev || !dev->bus)
++		return NULL;
++
++	dmadev = bus_to_hcd(dev->bus)->self.sysdev;
++
++	sgt = dma_alloc_noncontiguous(dmadev, size, dir, mem_flags, 0);
++	if (!sgt)
++		return NULL;
++
++	buffer = dma_vmap_noncontiguous(dmadev, size, sgt);
++	if (!buffer) {
++		dma_free_noncontiguous(dmadev, size, sgt, dir);
++		return NULL;
++	}
++
++	*table = sgt;
++	*dma = sg_dma_address(sgt->sgl);
++
++	return buffer;
++}
++EXPORT_SYMBOL_GPL(usb_alloc_noncoherent);
++
++/**
++ * usb_free_noncoherent - free memory allocated with usb_alloc_noncoherent()
++ * @dev: device the buffer was used with
++ * @size: requested buffer size
++ * @addr: CPU address of buffer
++ * @dir: DMA transfer direction
++ * @table: describe the allocated and DMA mapped memory,
++ *
++ * This reclaims an I/O buffer, letting it be reused.  The memory must have
++ * been allocated using usb_alloc_noncoherent(), and the parameters must match
++ * those provided in that allocation request.
++ */
++void usb_free_noncoherent(struct usb_device *dev, size_t size,
++			  void *addr, enum dma_data_direction dir,
++			  struct sg_table *table)
++{
++	struct device *dmadev;
++
++	if (!dev || !dev->bus)
++		return;
++	if (!addr)
++		return;
++
++	dmadev = bus_to_hcd(dev->bus)->self.sysdev;
++	dma_vunmap_noncontiguous(dmadev, addr);
++	dma_free_noncontiguous(dmadev, size, table, dir);
++}
++EXPORT_SYMBOL_GPL(usb_free_noncoherent);
++
+ /*
+  * Notifications of device and interface registration
+  */
+diff --git a/include/linux/usb.h b/include/linux/usb.h
+index 68166718ab30..535ac37198a1 100644
+--- a/include/linux/usb.h
++++ b/include/linux/usb.h
+@@ -1621,6 +1621,7 @@ struct urb {
+ 	void *transfer_buffer;		/* (in) associated data buffer */
+ 	dma_addr_t transfer_dma;	/* (in) dma addr for transfer_buffer */
+ 	struct scatterlist *sg;		/* (in) scatter gather buffer list */
++	struct sg_table *sgt;		/* (in) scatter gather table for noncoherent buffer */
+ 	int num_mapped_sgs;		/* (internal) mapped sg entries */
+ 	int num_sgs;			/* (in) number of entries in the sg list */
+ 	u32 transfer_buffer_length;	/* (in) data buffer length */
+@@ -1826,6 +1827,16 @@ void *usb_alloc_coherent(struct usb_device *dev, size_t size,
+ void usb_free_coherent(struct usb_device *dev, size_t size,
+ 	void *addr, dma_addr_t dma);
+ 
++enum dma_data_direction;
++
++void *usb_alloc_noncoherent(struct usb_device *dev, size_t size,
++			    gfp_t mem_flags, dma_addr_t *dma,
++			    enum dma_data_direction dir,
++			    struct sg_table **table);
++void usb_free_noncoherent(struct usb_device *dev, size_t size,
++			  void *addr, enum dma_data_direction dir,
++			  struct sg_table *table);
++
+ /*-------------------------------------------------------------------*
+  *                         SYNCHRONOUS CALL SUPPORT                  *
+  *-------------------------------------------------------------------*/
+-- 
+2.53.0
+

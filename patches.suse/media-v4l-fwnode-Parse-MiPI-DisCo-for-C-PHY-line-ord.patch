@@ -1,0 +1,145 @@
+From 573b4adddbd22baf14c5022b8e4b1dd93bac22ee Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Niklas=20S=C3=B6derlund?=
+ <niklas.soderlund+renesas@ragnatech.se>
+Date: Thu, 21 Nov 2024 14:41:06 +0100
+Subject: [PATCH] media: v4l: fwnode: Parse MiPI DisCo for C-PHY line-orders
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 573b4adddbd22baf14c5022b8e4b1dd93bac22ee
+References: jsc#PED-14445
+Patch-mainline: v6.14-rc1
+
+Extend the fwnode parsing to validate and fill in the CSI-2 C-PHY
+line-orders order properties as defined in MIPI Discovery and
+Configuration (DisCo) Specification for Imaging.
+
+Signed-off-by: Niklas Söderlund <niklas.soderlund+renesas@ragnatech.se>
+[Sakari Ailus: Use ARRAY_SIZE() instead of an integer.]
+
+Signed-off-by: Sakari Ailus <sakari.ailus@linux.intel.com>
+Signed-off-by: Mauro Carvalho Chehab <mchehab+huawei@kernel.org>
+Signed-off-by: Oliver Neukum <oneukum@suse.com>
+
+---
+ drivers/media/v4l2-core/v4l2-fwnode.c | 43 ++++++++++++++++++++++++++-
+ include/media/v4l2-mediabus.h         | 21 +++++++++++++
+ 2 files changed, 63 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/v4l2-core/v4l2-fwnode.c b/drivers/media/v4l2-core/v4l2-fwnode.c
+index f19c8adf2c61..cb153ce42c45 100644
+--- a/drivers/media/v4l2-core/v4l2-fwnode.c
++++ b/drivers/media/v4l2-core/v4l2-fwnode.c
+@@ -127,7 +127,7 @@ static int v4l2_fwnode_endpoint_parse_csi2_bus(struct fwnode_handle *fwnode,
+ {
+ 	struct v4l2_mbus_config_mipi_csi2 *bus = &vep->bus.mipi_csi2;
+ 	bool have_clk_lane = false, have_data_lanes = false,
+-		have_lane_polarities = false;
++		have_lane_polarities = false, have_line_orders = false;
+ 	unsigned int flags = 0, lanes_used = 0;
+ 	u32 array[1 + V4L2_MBUS_CSI2_MAX_DATA_LANES];
+ 	u32 clock_lane = 0;
+@@ -197,6 +197,17 @@ static int v4l2_fwnode_endpoint_parse_csi2_bus(struct fwnode_handle *fwnode,
+ 		have_lane_polarities = true;
+ 	}
+ 
++	rval = fwnode_property_count_u32(fwnode, "line-orders");
++	if (rval > 0) {
++		if (rval != num_data_lanes) {
++			pr_warn("invalid number of line-orders entries (need %u, got %u)\n",
++				num_data_lanes, rval);
++			return -EINVAL;
++		}
++
++		have_line_orders = true;
++	}
++
+ 	if (!fwnode_property_read_u32(fwnode, "clock-lanes", &v)) {
+ 		clock_lane = v;
+ 		pr_debug("clock lane position %u\n", v);
+@@ -250,6 +261,36 @@ static int v4l2_fwnode_endpoint_parse_csi2_bus(struct fwnode_handle *fwnode,
+ 		} else {
+ 			pr_debug("no lane polarities defined, assuming not inverted\n");
+ 		}
++
++		if (have_line_orders) {
++			fwnode_property_read_u32_array(fwnode,
++						       "line-orders", array,
++						       num_data_lanes);
++
++			for (i = 0; i < num_data_lanes; i++) {
++				static const char * const orders[] = {
++					"ABC", "ACB", "BAC", "BCA", "CAB", "CBA"
++				};
++
++				if (array[i] >= ARRAY_SIZE(orders)) {
++					pr_warn("lane %u invalid line-order assuming ABC (got %u)\n",
++						i, array[i]);
++					bus->line_orders[i] =
++						V4L2_MBUS_CSI2_CPHY_LINE_ORDER_ABC;
++					continue;
++				}
++
++				bus->line_orders[i] = array[i];
++				pr_debug("lane %u line order %s", i,
++					 orders[array[i]]);
++			}
++		} else {
++			for (i = 0; i < num_data_lanes; i++)
++				bus->line_orders[i] =
++					V4L2_MBUS_CSI2_CPHY_LINE_ORDER_ABC;
++
++			pr_debug("no line orders defined, assuming ABC\n");
++		}
+ 	}
+ 
+ 	return 0;
+diff --git a/include/media/v4l2-mediabus.h b/include/media/v4l2-mediabus.h
+index 5bce6e423e94..e7f019f68c8d 100644
+--- a/include/media/v4l2-mediabus.h
++++ b/include/media/v4l2-mediabus.h
+@@ -73,6 +73,24 @@
+ 
+ #define V4L2_MBUS_CSI2_MAX_DATA_LANES		8
+ 
++/**
++ * enum v4l2_mbus_csi2_cphy_line_orders_type - CSI-2 C-PHY line order
++ * @V4L2_MBUS_CSI2_CPHY_LINE_ORDER_ABC: C-PHY line order ABC (default)
++ * @V4L2_MBUS_CSI2_CPHY_LINE_ORDER_ACB: C-PHY line order ACB
++ * @V4L2_MBUS_CSI2_CPHY_LINE_ORDER_BAC: C-PHY line order BAC
++ * @V4L2_MBUS_CSI2_CPHY_LINE_ORDER_BCA: C-PHY line order BCA
++ * @V4L2_MBUS_CSI2_CPHY_LINE_ORDER_CAB: C-PHY line order CAB
++ * @V4L2_MBUS_CSI2_CPHY_LINE_ORDER_CBA: C-PHY line order CBA
++ */
++enum v4l2_mbus_csi2_cphy_line_orders_type {
++	V4L2_MBUS_CSI2_CPHY_LINE_ORDER_ABC,
++	V4L2_MBUS_CSI2_CPHY_LINE_ORDER_ACB,
++	V4L2_MBUS_CSI2_CPHY_LINE_ORDER_BAC,
++	V4L2_MBUS_CSI2_CPHY_LINE_ORDER_BCA,
++	V4L2_MBUS_CSI2_CPHY_LINE_ORDER_CAB,
++	V4L2_MBUS_CSI2_CPHY_LINE_ORDER_CBA,
++};
++
+ /**
+  * struct v4l2_mbus_config_mipi_csi2 - MIPI CSI-2 data bus configuration
+  * @flags: media bus (V4L2_MBUS_*) flags
+@@ -81,6 +99,8 @@
+  * @num_data_lanes: number of data lanes
+  * @lane_polarities: polarity of the lanes. The order is the same of
+  *		   the physical lanes.
++ * @line_orders: line order of the data lanes. The order is the same of the
++ *		   physical lanes.
+  */
+ struct v4l2_mbus_config_mipi_csi2 {
+ 	unsigned int flags;
+@@ -88,6 +108,7 @@ struct v4l2_mbus_config_mipi_csi2 {
+ 	unsigned char clock_lane;
+ 	unsigned char num_data_lanes;
+ 	bool lane_polarities[1 + V4L2_MBUS_CSI2_MAX_DATA_LANES];
++	enum v4l2_mbus_csi2_cphy_line_orders_type line_orders[V4L2_MBUS_CSI2_MAX_DATA_LANES];
+ };
+ 
+ /**
+-- 
+2.53.0
+

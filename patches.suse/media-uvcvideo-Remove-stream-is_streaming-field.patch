@@ -1,0 +1,158 @@
+From 7dd56c47784a466b03df62ca766207f483353cdc Mon Sep 17 00:00:00 2001
+From: Ricardo Ribalda <ribalda@chromium.org>
+Date: Mon, 16 Jun 2025 15:24:41 +0000
+Subject: [PATCH] media: uvcvideo: Remove stream->is_streaming field
+Git-commit: 7dd56c47784a466b03df62ca766207f483353cdc
+References: jsc#PED-14445
+Patch-mainline: v6.17-rc1
+
+The is_streaming field is used by modular PM to know if the device is
+currently streaming or not.
+
+With the transition to vb2 and fop helpers, we can use vb2 functions for
+the same functionality. The great benefit is that vb2 already tracks the
+streaming state for us.
+
+Reviewed-by: Hans de Goede <hansg@kernel.org>
+Signed-off-by: Ricardo Ribalda <ribalda@chromium.org>
+Link: https://lore.kernel.org/r/20250616-uvc-fop-v4-4-250286570ee7@chromium.org
+Reviewed-by: Hans Verkuil <hverkuil@xs4all.nl>
+Signed-off-by: Hans de Goede <hansg@kernel.org>
+Signed-off-by: Hans Verkuil <hverkuil@xs4all.nl>
+Signed-off-by: Oliver Neukum <oneukum@suse.com>
+
+---
+ drivers/media/usb/uvc/uvc_queue.c |  9 ++++++
+ drivers/media/usb/uvc/uvc_v4l2.c  | 51 ++-----------------------------
+ drivers/media/usb/uvc/uvcvideo.h  |  1 -
+ 3 files changed, 11 insertions(+), 50 deletions(-)
+
+diff --git a/drivers/media/usb/uvc/uvc_queue.c b/drivers/media/usb/uvc/uvc_queue.c
+index b11f56d62ec0..790184c9843d 100644
+--- a/drivers/media/usb/uvc/uvc_queue.c
++++ b/drivers/media/usb/uvc/uvc_queue.c
+@@ -175,12 +175,18 @@ static int uvc_start_streaming_video(struct vb2_queue *vq, unsigned int count)
+ 
+ 	lockdep_assert_irqs_enabled();
+ 
++	ret = uvc_pm_get(stream->dev);
++	if (ret)
++		return ret;
++
+ 	queue->buf_used = 0;
+ 
+ 	ret = uvc_video_start_streaming(stream);
+ 	if (ret == 0)
+ 		return 0;
+ 
++	uvc_pm_put(stream->dev);
++
+ 	uvc_queue_return_buffers(queue, UVC_BUF_STATE_QUEUED);
+ 
+ 	return ret;
+@@ -189,11 +195,14 @@ static int uvc_start_streaming_video(struct vb2_queue *vq, unsigned int count)
+ static void uvc_stop_streaming_video(struct vb2_queue *vq)
+ {
+ 	struct uvc_video_queue *queue = vb2_get_drv_priv(vq);
++	struct uvc_streaming *stream = uvc_queue_to_stream(queue);
+ 
+ 	lockdep_assert_irqs_enabled();
+ 
+ 	uvc_video_stop_streaming(uvc_queue_to_stream(queue));
+ 
++	uvc_pm_put(stream->dev);
++
+ 	uvc_queue_return_buffers(queue, UVC_BUF_STATE_ERROR);
+ }
+ 
+diff --git a/drivers/media/usb/uvc/uvc_v4l2.c b/drivers/media/usb/uvc/uvc_v4l2.c
+index d06ecf3418a9..7ab1bdcfb493 100644
+--- a/drivers/media/usb/uvc/uvc_v4l2.c
++++ b/drivers/media/usb/uvc/uvc_v4l2.c
+@@ -617,9 +617,6 @@ static int uvc_v4l2_release(struct file *file)
+ 
+ 	uvc_ctrl_cleanup_fh(handle);
+ 
+-	if (handle->is_streaming)
+-		uvc_pm_put(stream->dev);
+-
+ 	/* Release the file handle. */
+ 	vb2_fop_release(file);
+ 
+@@ -676,50 +673,6 @@ static int uvc_ioctl_try_fmt(struct file *file, void *fh,
+ 	return uvc_v4l2_try_format(stream, fmt, &probe, NULL, NULL);
+ }
+ 
+-static int uvc_ioctl_streamon(struct file *file, void *fh,
+-			      enum v4l2_buf_type type)
+-{
+-	struct uvc_fh *handle = fh;
+-	struct uvc_streaming *stream = handle->stream;
+-	int ret;
+-
+-	if (handle->is_streaming)
+-		return 0;
+-
+-	ret = uvc_pm_get(stream->dev);
+-	if (ret)
+-		return ret;
+-
+-	ret = vb2_ioctl_streamon(file, fh, type);
+-	if (ret) {
+-		uvc_pm_put(stream->dev);
+-		return ret;
+-	}
+-
+-	handle->is_streaming = true;
+-
+-	return 0;
+-}
+-
+-static int uvc_ioctl_streamoff(struct file *file, void *fh,
+-			       enum v4l2_buf_type type)
+-{
+-	struct uvc_fh *handle = fh;
+-	struct uvc_streaming *stream = handle->stream;
+-	int ret;
+-
+-	ret = vb2_ioctl_streamoff(file, fh, type);
+-	if (ret)
+-		return ret;
+-
+-	if (handle->is_streaming) {
+-		handle->is_streaming = false;
+-		uvc_pm_put(stream->dev);
+-	}
+-
+-	return 0;
+-}
+-
+ static int uvc_ioctl_enum_input(struct file *file, void *fh,
+ 				struct v4l2_input *input)
+ {
+@@ -1320,8 +1273,8 @@ const struct v4l2_ioctl_ops uvc_ioctl_ops = {
+ 	.vidioc_expbuf = vb2_ioctl_expbuf,
+ 	.vidioc_dqbuf = vb2_ioctl_dqbuf,
+ 	.vidioc_create_bufs = vb2_ioctl_create_bufs,
+-	.vidioc_streamon = uvc_ioctl_streamon,
+-	.vidioc_streamoff = uvc_ioctl_streamoff,
++	.vidioc_streamon = vb2_ioctl_streamon,
++	.vidioc_streamoff = vb2_ioctl_streamoff,
+ 	.vidioc_enum_input = uvc_ioctl_enum_input,
+ 	.vidioc_g_input = uvc_ioctl_g_input,
+ 	.vidioc_s_input = uvc_ioctl_s_input,
+diff --git a/drivers/media/usb/uvc/uvcvideo.h b/drivers/media/usb/uvc/uvcvideo.h
+index b300487e6ec9..3e6d2d912f3a 100644
+--- a/drivers/media/usb/uvc/uvcvideo.h
++++ b/drivers/media/usb/uvc/uvcvideo.h
+@@ -629,7 +629,6 @@ struct uvc_fh {
+ 	struct uvc_video_chain *chain;
+ 	struct uvc_streaming *stream;
+ 	unsigned int pending_async_ctrls;
+-	bool is_streaming;
+ };
+ 
+ /* ------------------------------------------------------------------------
+-- 
+2.53.0
+

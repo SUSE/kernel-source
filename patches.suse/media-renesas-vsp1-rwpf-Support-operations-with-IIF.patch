@@ -1,0 +1,124 @@
+From 8ebd5f70c2600a499b656fc5eb4d8f0888b66a4f Mon Sep 17 00:00:00 2001
+From: Jacopo Mondi <jacopo.mondi+renesas@ideasonboard.com>
+Date: Tue, 1 Apr 2025 16:22:04 +0200
+Subject: [PATCH] media: renesas: vsp1: rwpf: Support operations with IIF
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 8ebd5f70c2600a499b656fc5eb4d8f0888b66a4f
+References: jsc#PED-14445
+Patch-mainline: v6.16-rc1
+
+When the RPF/WPF units are used for ISP interfacing through
+the IIF, the set of accessible registers is limited compared to
+the regular VSPD operations.
+
+Support ISP interfacing in the rpf and wpf entities by checking if
+the pipe features an IIF instance and writing only the relevant
+registers.
+
+Reviewed-by: Laurent Pinchart <laurent.pinchart+renesas@ideasonboard.com>
+Reviewed-by: Niklas Söderlund <niklas.soderlund+renesas@ragnatech.se>
+Tested-by: Niklas Söderlund <niklas.soderlund+renesas@ragnatech.se>
+Signed-off-by: Jacopo Mondi <jacopo.mondi+renesas@ideasonboard.com>
+Link: https://lore.kernel.org/r/20250401-v4h-iif-v7-4-cc547c0bddd5@ideasonboard.com
+Signed-off-by: Laurent Pinchart <laurent.pinchart@ideasonboard.com>
+Signed-off-by: Hans Verkuil <hverkuil@xs4all.nl>
+Signed-off-by: Oliver Neukum <oneukum@suse.com>
+
+---
+ drivers/media/platform/renesas/vsp1/vsp1_iif.h |  3 +++
+ drivers/media/platform/renesas/vsp1/vsp1_rpf.c |  9 ++++++++-
+ drivers/media/platform/renesas/vsp1/vsp1_wpf.c | 14 ++++++++++----
+ 3 files changed, 21 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/media/platform/renesas/vsp1/vsp1_iif.h b/drivers/media/platform/renesas/vsp1/vsp1_iif.h
+index 165996a822c1..46f327851c35 100644
+--- a/drivers/media/platform/renesas/vsp1/vsp1_iif.h
++++ b/drivers/media/platform/renesas/vsp1/vsp1_iif.h
+@@ -12,6 +12,9 @@
+ 
+ #include "vsp1_entity.h"
+ 
++#define VSPX_IIF_SINK_PAD_IMG		0
++#define VSPX_IIF_SINK_PAD_CONFIG	2
++
+ struct vsp1_iif {
+ 	struct vsp1_entity entity;
+ };
+diff --git a/drivers/media/platform/renesas/vsp1/vsp1_rpf.c b/drivers/media/platform/renesas/vsp1/vsp1_rpf.c
+index 5c8b3ba1bd3c..5e84536f0cdd 100644
+--- a/drivers/media/platform/renesas/vsp1/vsp1_rpf.c
++++ b/drivers/media/platform/renesas/vsp1/vsp1_rpf.c
+@@ -84,7 +84,7 @@ static void rpf_configure_stream(struct vsp1_entity *entity,
+ 	sink_format = v4l2_subdev_state_get_format(state, RWPF_PAD_SINK);
+ 	source_format = v4l2_subdev_state_get_format(state, RWPF_PAD_SOURCE);
+ 
+-	infmt = VI6_RPF_INFMT_CIPM
++	infmt = (pipe->iif ? 0 : VI6_RPF_INFMT_CIPM)
+ 	      | (fmtinfo->hwfmt << VI6_RPF_INFMT_RDFMT_SHIFT);
+ 
+ 	if (fmtinfo->swap_yc)
+@@ -98,6 +98,13 @@ static void rpf_configure_stream(struct vsp1_entity *entity,
+ 	vsp1_rpf_write(rpf, dlb, VI6_RPF_INFMT, infmt);
+ 	vsp1_rpf_write(rpf, dlb, VI6_RPF_DSWAP, fmtinfo->swap);
+ 
++	/* No further configuration for VSPX. */
++	if (pipe->iif) {
++		/* VSPX wants alpha_sel to be set to 0. */
++		vsp1_rpf_write(rpf, dlb, VI6_RPF_ALPH_SEL, 0);
++		return;
++	}
++
+ 	if (entity->vsp1->info->gen == 4) {
+ 		u32 ext_infmt0;
+ 		u32 ext_infmt1;
+diff --git a/drivers/media/platform/renesas/vsp1/vsp1_wpf.c b/drivers/media/platform/renesas/vsp1/vsp1_wpf.c
+index da651a882bbb..f3ea3b17e4cb 100644
+--- a/drivers/media/platform/renesas/vsp1/vsp1_wpf.c
++++ b/drivers/media/platform/renesas/vsp1/vsp1_wpf.c
+@@ -247,8 +247,11 @@ static void wpf_configure_stream(struct vsp1_entity *entity,
+ 	sink_format = v4l2_subdev_state_get_format(state, RWPF_PAD_SINK);
+ 	source_format = v4l2_subdev_state_get_format(state, RWPF_PAD_SOURCE);
+ 
+-	/* Format */
+-	if (!pipe->lif || wpf->writeback) {
++	/*
++	 * Format configuration. Skip for IIF (VSPX) or if the pipe doesn't
++	 * write to memory.
++	 */
++	if (!pipe->iif && (!pipe->lif || wpf->writeback)) {
+ 		const struct v4l2_pix_format_mplane *format = &wpf->format;
+ 		const struct vsp1_format_info *fmtinfo = wpf->fmtinfo;
+ 
+@@ -291,7 +294,7 @@ static void wpf_configure_stream(struct vsp1_entity *entity,
+ 	 * Sources. If the pipeline has a single input and BRx is not used,
+ 	 * configure it as the master layer. Otherwise configure all
+ 	 * inputs as sub-layers and select the virtual RPF as the master
+-	 * layer.
++	 * layer. For VSPX configure the enabled sources as masters.
+ 	 */
+ 	for (i = 0; i < vsp1->info->rpf_count; ++i) {
+ 		struct vsp1_rwpf *input = pipe->inputs[i];
+@@ -299,7 +302,7 @@ static void wpf_configure_stream(struct vsp1_entity *entity,
+ 		if (!input)
+ 			continue;
+ 
+-		srcrpf |= (!pipe->brx && pipe->num_inputs == 1)
++		srcrpf |= (pipe->iif || (!pipe->brx && pipe->num_inputs == 1))
+ 			? VI6_WPF_SRCRPF_RPF_ACT_MST(input->entity.index)
+ 			: VI6_WPF_SRCRPF_RPF_ACT_SUB(input->entity.index);
+ 	}
+@@ -316,6 +319,9 @@ static void wpf_configure_stream(struct vsp1_entity *entity,
+ 	vsp1_dl_body_write(dlb, VI6_WPF_IRQ_ENB(index),
+ 			   VI6_WPF_IRQ_ENB_DFEE);
+ 
++	if (pipe->iif)
++		return;
++
+ 	/*
+ 	 * Configure writeback for display pipelines (the wpf writeback flag is
+ 	 * never set for memory-to-memory pipelines). Start by adding a chained
+-- 
+2.53.0
+

@@ -1,0 +1,96 @@
+From b7ef53670321327f45de8bde5d38f1215927336f Mon Sep 17 00:00:00 2001
+From: Ricardo Ribalda <ribalda@chromium.org>
+Date: Mon, 16 Jun 2025 15:24:39 +0000
+Subject: [PATCH] media: uvcvideo: Handle locks in uvc_queue_return_buffers
+Git-commit: b7ef53670321327f45de8bde5d38f1215927336f
+References: jsc#PED-14445
+Patch-mainline: v6.17-rc1
+
+Most of the calls to uvc_queue_return_buffers() wrap the call with
+spin_lock_irq()/spin_unlock_irq().
+
+Rename uvc_queue_return_buffers to __uvc_queue_return_buffers to
+indicate that this is the version that does not handle locks and create
+a new version of the function that handles the lock.
+
+Reviewed-by: Hans de Goede <hansg@kernel.org>
+Signed-off-by: Ricardo Ribalda <ribalda@chromium.org>
+Link: https://lore.kernel.org/r/20250616-uvc-fop-v4-2-250286570ee7@chromium.org
+Reviewed-by: Hans Verkuil <hverkuil@xs4all.nl>
+Signed-off-by: Hans de Goede <hansg@kernel.org>
+Signed-off-by: Hans Verkuil <hverkuil@xs4all.nl>
+Signed-off-by: Oliver Neukum <oneukum@suse.com>
+
+---
+ drivers/media/usb/uvc/uvc_queue.c | 20 +++++++++++++-------
+ 1 file changed, 13 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/media/usb/uvc/uvc_queue.c b/drivers/media/usb/uvc/uvc_queue.c
+index 72c5494dee9f..8f9737ac7295 100644
+--- a/drivers/media/usb/uvc/uvc_queue.c
++++ b/drivers/media/usb/uvc/uvc_queue.c
+@@ -42,13 +42,15 @@ static inline struct uvc_buffer *uvc_vbuf_to_buffer(struct vb2_v4l2_buffer *buf)
+  *
+  * This function must be called with the queue spinlock held.
+  */
+-static void uvc_queue_return_buffers(struct uvc_video_queue *queue,
+-			       enum uvc_buffer_state state)
++static void __uvc_queue_return_buffers(struct uvc_video_queue *queue,
++				       enum uvc_buffer_state state)
+ {
+ 	enum vb2_buffer_state vb2_state = state == UVC_BUF_STATE_ERROR
+ 					? VB2_BUF_STATE_ERROR
+ 					: VB2_BUF_STATE_QUEUED;
+ 
++	lockdep_assert_held(&queue->irqlock);
++
+ 	while (!list_empty(&queue->irqqueue)) {
+ 		struct uvc_buffer *buf = list_first_entry(&queue->irqqueue,
+ 							  struct uvc_buffer,
+@@ -59,6 +61,14 @@ static void uvc_queue_return_buffers(struct uvc_video_queue *queue,
+ 	}
+ }
+ 
++static void uvc_queue_return_buffers(struct uvc_video_queue *queue,
++				     enum uvc_buffer_state state)
++{
++	spin_lock_irq(&queue->irqlock);
++	__uvc_queue_return_buffers(queue, state);
++	spin_unlock_irq(&queue->irqlock);
++}
++
+ /* -----------------------------------------------------------------------------
+  * videobuf2 queue operations
+  */
+@@ -171,9 +181,7 @@ static int uvc_start_streaming(struct vb2_queue *vq, unsigned int count)
+ 	if (ret == 0)
+ 		return 0;
+ 
+-	spin_lock_irq(&queue->irqlock);
+ 	uvc_queue_return_buffers(queue, UVC_BUF_STATE_QUEUED);
+-	spin_unlock_irq(&queue->irqlock);
+ 
+ 	return ret;
+ }
+@@ -187,9 +195,7 @@ static void uvc_stop_streaming(struct vb2_queue *vq)
+ 	if (vq->type != V4L2_BUF_TYPE_META_CAPTURE)
+ 		uvc_video_stop_streaming(uvc_queue_to_stream(queue));
+ 
+-	spin_lock_irq(&queue->irqlock);
+ 	uvc_queue_return_buffers(queue, UVC_BUF_STATE_ERROR);
+-	spin_unlock_irq(&queue->irqlock);
+ }
+ 
+ static const struct vb2_ops uvc_queue_qops = {
+@@ -263,7 +269,7 @@ void uvc_queue_cancel(struct uvc_video_queue *queue, int disconnect)
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&queue->irqlock, flags);
+-	uvc_queue_return_buffers(queue, UVC_BUF_STATE_ERROR);
++	__uvc_queue_return_buffers(queue, UVC_BUF_STATE_ERROR);
+ 	/*
+ 	 * This must be protected by the irqlock spinlock to avoid race
+ 	 * conditions between uvc_buffer_queue and the disconnection event that
+-- 
+2.53.0
+

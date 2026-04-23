@@ -1,0 +1,202 @@
+From 39d2c891c96eea7af8e7a5b0c8bb05acdddd2ac2 Mon Sep 17 00:00:00 2001
+From: Yunke Cao <yunkec@google.com>
+Date: Mon, 3 Feb 2025 11:55:48 +0000
+Subject: [PATCH] media: uvcvideo: support V4L2_CTRL_WHICH_MIN/MAX_VAL
+Git-commit: 39d2c891c96eea7af8e7a5b0c8bb05acdddd2ac2
+References: jsc#PED-14445
+Patch-mainline: v6.15-rc1
+
+Add support for V4L2_CTRL_WHICH_MIN/MAX_VAL in uvc driver.
+It is needed for the V4L2_CID_UVC_REGION_OF_INTEREST_RECT control.
+
+Signed-off-by: Yunke Cao <yunkec@google.com>
+Tested-by: Yunke Cao <yunkec@google.com>
+Reviewed-by: Hans de Goede <hdegoede@redhat.com>
+Signed-off-by: Ricardo Ribalda <ribalda@chromium.org>
+Link: https://lore.kernel.org/r/20250203-uvc-roi-v17-12-5900a9fed613@chromium.org
+Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+Signed-off-by: Hans Verkuil <hverkuil@xs4all.nl>
+Signed-off-by: Oliver Neukum <oneukum@suse.com>
+
+---
+ drivers/media/usb/uvc/uvc_ctrl.c | 96 +++++++++++++++++++++++++-------
+ drivers/media/usb/uvc/uvc_v4l2.c |  2 +
+ 2 files changed, 79 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/media/usb/uvc/uvc_ctrl.c b/drivers/media/usb/uvc/uvc_ctrl.c
+index 6e27075939ac..4e29db334b2d 100644
+--- a/drivers/media/usb/uvc/uvc_ctrl.c
++++ b/drivers/media/usb/uvc/uvc_ctrl.c
+@@ -1277,6 +1277,37 @@ static int uvc_query_v4l2_class(struct uvc_video_chain *chain, u32 req_id,
+ 	return 0;
+ }
+ 
++static bool uvc_ctrl_is_readable(u32 which, struct uvc_control *ctrl,
++				 struct uvc_control_mapping *mapping)
++{
++	if (which == V4L2_CTRL_WHICH_CUR_VAL)
++		return !!(ctrl->info.flags & UVC_CTRL_FLAG_GET_CUR);
++
++	if (which == V4L2_CTRL_WHICH_DEF_VAL)
++		return !!(ctrl->info.flags & UVC_CTRL_FLAG_GET_DEF);
++
++	/* Types with implicit boundaries. */
++	switch (mapping->v4l2_type) {
++	case V4L2_CTRL_TYPE_MENU:
++	case V4L2_CTRL_TYPE_BOOLEAN:
++	case V4L2_CTRL_TYPE_BUTTON:
++		return true;
++	case V4L2_CTRL_TYPE_BITMASK:
++		return (ctrl->info.flags & UVC_CTRL_FLAG_GET_RES) ||
++			(ctrl->info.flags & UVC_CTRL_FLAG_GET_MAX);
++	default:
++		break;
++	}
++
++	if (which == V4L2_CTRL_WHICH_MIN_VAL)
++		return !!(ctrl->info.flags & UVC_CTRL_FLAG_GET_MIN);
++
++	if (which == V4L2_CTRL_WHICH_MAX_VAL)
++		return !!(ctrl->info.flags & UVC_CTRL_FLAG_GET_MAX);
++
++	return false;
++}
++
+ /*
+  * Check if control @v4l2_id can be accessed by the given control @ioctl
+  * (VIDIOC_G_EXT_CTRLS, VIDIOC_TRY_EXT_CTRLS or VIDIOC_S_EXT_CTRLS).
+@@ -1295,7 +1326,6 @@ int uvc_ctrl_is_accessible(struct uvc_video_chain *chain, u32 v4l2_id,
+ 	struct uvc_control *master_ctrl = NULL;
+ 	struct uvc_control_mapping *mapping;
+ 	struct uvc_control *ctrl;
+-	bool read = ioctl == VIDIOC_G_EXT_CTRLS;
+ 	s32 val;
+ 	int ret;
+ 	int i;
+@@ -1307,10 +1337,10 @@ int uvc_ctrl_is_accessible(struct uvc_video_chain *chain, u32 v4l2_id,
+ 	if (!ctrl)
+ 		return -EINVAL;
+ 
+-	if (!(ctrl->info.flags & UVC_CTRL_FLAG_GET_CUR) && read)
+-		return -EACCES;
++	if (ioctl == VIDIOC_G_EXT_CTRLS)
++		return uvc_ctrl_is_readable(ctrls->which, ctrl, mapping);
+ 
+-	if (!(ctrl->info.flags & UVC_CTRL_FLAG_SET_CUR) && !read)
++	if (!(ctrl->info.flags & UVC_CTRL_FLAG_SET_CUR))
+ 		return -EACCES;
+ 
+ 	if (ioctl != VIDIOC_S_EXT_CTRLS || !mapping->master_id)
+@@ -1459,6 +1489,9 @@ static int __uvc_query_v4l2_ctrl(struct uvc_video_chain *chain,
+ 		v4l2_ctrl->flags |= V4L2_CTRL_FLAG_WRITE_ONLY;
+ 	if (!(ctrl->info.flags & UVC_CTRL_FLAG_SET_CUR))
+ 		v4l2_ctrl->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++	if ((ctrl->info.flags & UVC_CTRL_FLAG_GET_MAX) &&
++	    (ctrl->info.flags & UVC_CTRL_FLAG_GET_MIN))
++		v4l2_ctrl->flags |= V4L2_CTRL_FLAG_HAS_WHICH_MIN_MAX;
+ 
+ 	if (mapping->master_id)
+ 		__uvc_find_control(ctrl->entity, mapping->master_id,
+@@ -2088,16 +2121,18 @@ static int uvc_mapping_get_xctrl_compound(struct uvc_video_chain *chain,
+ 
+ 	switch (which) {
+ 	case V4L2_CTRL_WHICH_CUR_VAL:
+-		ret = __uvc_ctrl_load_cur(chain, ctrl);
+-		if (ret < 0)
+-			return ret;
+ 		id = UVC_CTRL_DATA_CURRENT;
+ 		query = UVC_GET_CUR;
+ 		break;
++	case V4L2_CTRL_WHICH_MIN_VAL:
++		id = UVC_CTRL_DATA_MIN;
++		query = UVC_GET_MIN;
++		break;
++	case V4L2_CTRL_WHICH_MAX_VAL:
++		id = UVC_CTRL_DATA_MAX;
++		query = UVC_GET_MAX;
++		break;
+ 	case V4L2_CTRL_WHICH_DEF_VAL:
+-		ret = uvc_ctrl_populate_cache(chain, ctrl);
+-		if (ret < 0)
+-			return ret;
+ 		id = UVC_CTRL_DATA_DEF;
+ 		query = UVC_GET_DEF;
+ 		break;
+@@ -2115,6 +2150,14 @@ static int uvc_mapping_get_xctrl_compound(struct uvc_video_chain *chain,
+ 	if (!data)
+ 		return -ENOMEM;
+ 
++	if (which == V4L2_CTRL_WHICH_CUR_VAL)
++		ret = __uvc_ctrl_load_cur(chain, ctrl);
++	else
++		ret = uvc_ctrl_populate_cache(chain, ctrl);
++
++	if (ret < 0)
++		return ret;
++
+ 	ret = mapping->get(mapping, query, uvc_ctrl_data(ctrl, id), size, data);
+ 	if (ret < 0)
+ 		return ret;
+@@ -2132,22 +2175,37 @@ static int uvc_mapping_get_xctrl_std(struct uvc_video_chain *chain,
+ 				     struct uvc_control_mapping *mapping,
+ 				     u32 which, struct v4l2_ext_control *xctrl)
+ {
++	struct v4l2_queryctrl qc;
++	int ret;
++
+ 	switch (which) {
+ 	case V4L2_CTRL_WHICH_CUR_VAL:
+ 		return __uvc_ctrl_get(chain, ctrl, mapping, &xctrl->value);
+ 	case V4L2_CTRL_WHICH_DEF_VAL:
+-		if (!ctrl->cached) {
+-			int ret = uvc_ctrl_populate_cache(chain, ctrl);
++	case V4L2_CTRL_WHICH_MIN_VAL:
++	case V4L2_CTRL_WHICH_MAX_VAL:
++		break;
++	default:
++		return -EINVAL;
++	}
+ 
+-			if (ret < 0)
+-				return ret;
+-		}
+-		xctrl->value = uvc_mapping_get_s32(mapping, UVC_GET_DEF,
+-						   uvc_ctrl_data(ctrl, UVC_CTRL_DATA_DEF));
+-		return 0;
++	ret = __uvc_queryctrl_boundaries(chain, ctrl, mapping, &qc);
++	if (ret < 0)
++		return ret;
++
++	switch (which) {
++	case V4L2_CTRL_WHICH_DEF_VAL:
++		xctrl->value = qc.default_value;
++		break;
++	case V4L2_CTRL_WHICH_MIN_VAL:
++		xctrl->value = qc.minimum;
++		break;
++	case V4L2_CTRL_WHICH_MAX_VAL:
++		xctrl->value = qc.maximum;
++		break;
+ 	}
+ 
+-	return -EINVAL;
++	return 0;
+ }
+ 
+ static int uvc_mapping_get_xctrl(struct uvc_video_chain *chain,
+diff --git a/drivers/media/usb/uvc/uvc_v4l2.c b/drivers/media/usb/uvc/uvc_v4l2.c
+index 4025811fb9e7..ff7d0fd9e458 100644
+--- a/drivers/media/usb/uvc/uvc_v4l2.c
++++ b/drivers/media/usb/uvc/uvc_v4l2.c
+@@ -1036,6 +1036,8 @@ static int uvc_ioctl_g_ext_ctrls(struct file *file, void *fh,
+ 	switch (ctrls->which) {
+ 	case V4L2_CTRL_WHICH_DEF_VAL:
+ 	case V4L2_CTRL_WHICH_CUR_VAL:
++	case V4L2_CTRL_WHICH_MAX_VAL:
++	case V4L2_CTRL_WHICH_MIN_VAL:
+ 		which = ctrls->which;
+ 		break;
+ 	default:
+-- 
+2.53.0
+

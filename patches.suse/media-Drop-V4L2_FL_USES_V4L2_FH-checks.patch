@@ -1,0 +1,341 @@
+From bb4d6be205dae94aa2d3c3a1ad814dad90d4fd62 Mon Sep 17 00:00:00 2001
+From: Laurent Pinchart <laurent.pinchart+renesas@ideasonboard.com>
+Date: Sun, 10 Aug 2025 04:30:14 +0300
+Subject: [PATCH] media: Drop V4L2_FL_USES_V4L2_FH checks
+Git-commit: bb4d6be205dae94aa2d3c3a1ad814dad90d4fd62
+References: jsc#PED-14445
+Patch-mainline: v6.18-rc1
+
+Now that all drivers use v4l2_fh, we can drop the V4L2_FL_USES_V4L2_FH
+checks through the V4L2 core.
+
+To ensure that all new drivers use v4l2_fh, keep setting the
+V4L2_FL_USES_V4L2_FH flag in v4l2_fh_init(), and verify it is set after
+the .open() file operation returns.
+
+Signed-off-by: Laurent Pinchart <laurent.pinchart+renesas@ideasonboard.com>
+Signed-off-by: Hans Verkuil <hverkuil+cisco@kernel.org>
+Signed-off-by: Oliver Neukum <oneukum@suse.com>
+
+---
+ Documentation/driver-api/media/v4l2-fh.rst                      |   15 ----
+ Documentation/translations/zh_CN/video4linux/v4l2-framework.txt |    5 -
+ drivers/media/common/videobuf2/videobuf2-v4l2.c                 |   12 +--
+ drivers/media/v4l2-core/v4l2-compat-ioctl32.c                   |    7 -
+ drivers/media/v4l2-core/v4l2-ctrls-api.c                        |    2 
+ drivers/media/v4l2-core/v4l2-dev.c                              |   21 ++++-
+ drivers/media/v4l2-core/v4l2-ioctl.c                            |   37 +++-------
+ drivers/media/v4l2-core/v4l2-mem2mem.c                          |   12 +--
+ include/media/v4l2-dev.h                                        |    2 
+ include/media/v4l2-fh.h                                         |    2 
+ 10 files changed, 43 insertions(+), 72 deletions(-)
+
+--- a/Documentation/driver-api/media/v4l2-fh.rst
++++ b/Documentation/driver-api/media/v4l2-fh.rst
+@@ -3,13 +3,8 @@
+ V4L2 File handles
+ -----------------
+ 
+-struct v4l2_fh provides a way to easily keep file handle specific
+-data that is used by the V4L2 framework.
+-
+-.. attention::
+-	New drivers must use struct v4l2_fh
+-	since it is also used to implement priority handling
+-	(:ref:`VIDIOC_G_PRIORITY`).
++struct v4l2_fh provides a way to easily keep file handle specific data that is
++used by the V4L2 framework. Its usage is mandatory in all drivers.
+ 
+ struct v4l2_fh is allocated in the driver's ``open()`` file operation handler.
+ It is typically embedded in a larger driver-specific structure. The
+@@ -134,12 +129,6 @@ associated device node:
+ 
+ - Same, but it calls v4l2_fh_is_singular with filp->private_data.
+ 
+-.. note::
+-        The V4L2 framework knows whether a driver uses :c:type:`v4l2_fh` as its
+-        ``file->private_data`` pointer by testing the ``V4L2_FL_USES_V4L2_FH``
+-        bit in :c:type:`video_device`->flags. This bit is set whenever
+-        :c:func:`v4l2_fh_init` is called.
+-
+ 
+ V4L2 fh functions and data structures
+ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+--- a/drivers/media/common/videobuf2/videobuf2-v4l2.c
++++ b/drivers/media/common/videobuf2/videobuf2-v4l2.c
+@@ -973,18 +973,14 @@ EXPORT_SYMBOL_GPL(vb2_queue_change_type)
+ 
+ __poll_t vb2_poll(struct vb2_queue *q, struct file *file, poll_table *wait)
+ {
+-	struct video_device *vfd = video_devdata(file);
++	struct v4l2_fh *fh = file_to_v4l2_fh(file);
+ 	__poll_t res;
+ 
+ 	res = vb2_core_poll(q, file, wait);
+ 
+-	if (test_bit(V4L2_FL_USES_V4L2_FH, &vfd->flags)) {
+-		struct v4l2_fh *fh = file_to_v4l2_fh(file);
+-
+-		poll_wait(file, &fh->wait, wait);
+-		if (v4l2_event_pending(fh))
+-			res |= EPOLLPRI;
+-	}
++	poll_wait(file, &fh->wait, wait);
++	if (v4l2_event_pending(fh))
++		res |= EPOLLPRI;
+ 
+ 	return res;
+ }
+--- a/drivers/media/v4l2-core/v4l2-compat-ioctl32.c
++++ b/drivers/media/v4l2-core/v4l2-compat-ioctl32.c
+@@ -672,15 +672,12 @@ struct v4l2_ext_control32 {
+ static inline bool ctrl_is_pointer(struct file *file, u32 id)
+ {
+ 	struct video_device *vdev = video_devdata(file);
+-	struct v4l2_fh *fh = NULL;
++	struct v4l2_fh *fh = file_to_v4l2_fh(file);
+ 	struct v4l2_ctrl_handler *hdl = NULL;
+ 	struct v4l2_query_ext_ctrl qec = { id };
+ 	const struct v4l2_ioctl_ops *ops = vdev->ioctl_ops;
+ 
+-	if (test_bit(V4L2_FL_USES_V4L2_FH, &vdev->flags))
+-		fh = file_to_v4l2_fh(file);
+-
+-	if (fh && fh->ctrl_handler)
++	if (fh->ctrl_handler)
+ 		hdl = fh->ctrl_handler;
+ 	else if (vdev->ctrl_handler)
+ 		hdl = vdev->ctrl_handler;
+--- a/drivers/media/v4l2-core/v4l2-ctrls-api.c
++++ b/drivers/media/v4l2-core/v4l2-ctrls-api.c
+@@ -1254,7 +1254,7 @@ int v4l2_ctrl_log_status(struct file *fi
+ {
+ 	struct video_device *vfd = video_devdata(file);
+ 
+-	if (test_bit(V4L2_FL_USES_V4L2_FH, &vfd->flags) && vfd->v4l2_dev) {
++	if (vfd->v4l2_dev) {
+ 		struct v4l2_fh *vfh = file_to_v4l2_fh(file);
+ 
+ 		v4l2_ctrl_handler_log_status(vfh->ctrl_handler,
+--- a/drivers/media/v4l2-core/v4l2-dev.c
++++ b/drivers/media/v4l2-core/v4l2-dev.c
+@@ -425,12 +425,24 @@ static int v4l2_open(struct inode *inode
+ 	video_get(vdev);
+ 	mutex_unlock(&videodev_lock);
+ 	if (vdev->fops->open) {
+-		if (video_is_registered(vdev))
+-			ret = vdev->fops->open(filp);
+-		else
++		if (!video_is_registered(vdev)) {
+ 			ret = -ENODEV;
++			goto done;
++		}
++
++		ret = vdev->fops->open(filp);
++		if (ret)
++			goto done;
++
++		/* All drivers must use v4l2_fh. */
++		if (WARN_ON(!test_bit(V4L2_FL_USES_V4L2_FH, &vdev->flags))) {
++			vdev->fops->release(filp);
++			ret = -ENODEV;
++		}
+ 	}
+ 
++done:
++
+ 	if (vdev->dev_debug & V4L2_DEV_DEBUG_FOP)
+ 		dprintk("%s: open (%d)\n",
+ 			video_device_node_name(vdev), ret);
+@@ -1114,8 +1126,7 @@ void video_unregister_device(struct vide
+ 	 */
+ 	clear_bit(V4L2_FL_REGISTERED, &vdev->flags);
+ 	mutex_unlock(&videodev_lock);
+-	if (test_bit(V4L2_FL_USES_V4L2_FH, &vdev->flags))
+-		v4l2_event_wake_all(vdev);
++	v4l2_event_wake_all(vdev);
+ 	device_unregister(&vdev->dev);
+ }
+ EXPORT_SYMBOL(video_unregister_device);
+--- a/drivers/media/v4l2-core/v4l2-ioctl.c
++++ b/drivers/media/v4l2-core/v4l2-ioctl.c
+@@ -1195,8 +1195,6 @@ static int v4l_s_priority(const struct v
+ 	u32 *p = arg;
+ 
+ 	vfd = video_devdata(file);
+-	if (!test_bit(V4L2_FL_USES_V4L2_FH, &vfd->flags))
+-		return -ENOTTY;
+ 	vfh = file_to_v4l2_fh(file);
+ 	return v4l2_prio_change(vfd->prio, &vfh->prio, *p);
+ }
+@@ -2297,8 +2295,7 @@ static int v4l_queryctrl(const struct v4
+ 	struct video_device *vfd = video_devdata(file);
+ 	struct v4l2_query_ext_ctrl qec = {};
+ 	struct v4l2_queryctrl *p = arg;
+-	struct v4l2_fh *vfh =
+-		test_bit(V4L2_FL_USES_V4L2_FH, &vfd->flags) ? fh : NULL;
++	struct v4l2_fh *vfh = fh;
+ 	int ret;
+ 
+ 	if (vfh && vfh->ctrl_handler)
+@@ -2322,8 +2319,7 @@ static int v4l_query_ext_ctrl(const stru
+ {
+ 	struct video_device *vfd = video_devdata(file);
+ 	struct v4l2_query_ext_ctrl *p = arg;
+-	struct v4l2_fh *vfh =
+-		test_bit(V4L2_FL_USES_V4L2_FH, &vfd->flags) ? fh : NULL;
++	struct v4l2_fh *vfh = fh;
+ 
+ 	if (vfh && vfh->ctrl_handler)
+ 		return v4l2_query_ext_ctrl(vfh->ctrl_handler, p);
+@@ -2339,8 +2335,7 @@ static int v4l_querymenu(const struct v4
+ {
+ 	struct video_device *vfd = video_devdata(file);
+ 	struct v4l2_querymenu *p = arg;
+-	struct v4l2_fh *vfh =
+-		test_bit(V4L2_FL_USES_V4L2_FH, &vfd->flags) ? fh : NULL;
++	struct v4l2_fh *vfh = fh;
+ 
+ 	if (vfh && vfh->ctrl_handler)
+ 		return v4l2_querymenu(vfh->ctrl_handler, p);
+@@ -2356,8 +2351,7 @@ static int v4l_g_ctrl(const struct v4l2_
+ {
+ 	struct video_device *vfd = video_devdata(file);
+ 	struct v4l2_control *p = arg;
+-	struct v4l2_fh *vfh =
+-		test_bit(V4L2_FL_USES_V4L2_FH, &vfd->flags) ? fh : NULL;
++	struct v4l2_fh *vfh = fh;
+ 	struct v4l2_ext_controls ctrls;
+ 	struct v4l2_ext_control ctrl;
+ 
+@@ -2388,8 +2382,7 @@ static int v4l_s_ctrl(const struct v4l2_
+ {
+ 	struct video_device *vfd = video_devdata(file);
+ 	struct v4l2_control *p = arg;
+-	struct v4l2_fh *vfh =
+-		test_bit(V4L2_FL_USES_V4L2_FH, &vfd->flags) ? fh : NULL;
++	struct v4l2_fh *vfh = fh;
+ 	struct v4l2_ext_controls ctrls;
+ 	struct v4l2_ext_control ctrl;
+ 	int ret;
+@@ -2418,8 +2411,7 @@ static int v4l_g_ext_ctrls(const struct
+ {
+ 	struct video_device *vfd = video_devdata(file);
+ 	struct v4l2_ext_controls *p = arg;
+-	struct v4l2_fh *vfh =
+-		test_bit(V4L2_FL_USES_V4L2_FH, &vfd->flags) ? fh : NULL;
++	struct v4l2_fh *vfh = fh;
+ 
+ 	p->error_idx = p->count;
+ 	if (vfh && vfh->ctrl_handler)
+@@ -2439,8 +2431,7 @@ static int v4l_s_ext_ctrls(const struct
+ {
+ 	struct video_device *vfd = video_devdata(file);
+ 	struct v4l2_ext_controls *p = arg;
+-	struct v4l2_fh *vfh =
+-		test_bit(V4L2_FL_USES_V4L2_FH, &vfd->flags) ? fh : NULL;
++	struct v4l2_fh *vfh = fh;
+ 
+ 	p->error_idx = p->count;
+ 	if (vfh && vfh->ctrl_handler)
+@@ -2460,8 +2451,7 @@ static int v4l_try_ext_ctrls(const struc
+ {
+ 	struct video_device *vfd = video_devdata(file);
+ 	struct v4l2_ext_controls *p = arg;
+-	struct v4l2_fh *vfh =
+-		test_bit(V4L2_FL_USES_V4L2_FH, &vfd->flags) ? fh : NULL;
++	struct v4l2_fh *vfh = fh;
+ 
+ 	p->error_idx = p->count;
+ 	if (vfh && vfh->ctrl_handler)
+@@ -3073,7 +3063,7 @@ static long __video_do_ioctl(struct file
+ 	struct v4l2_ioctl_info default_info;
+ 	const struct v4l2_ioctl_info *info;
+ 	void *fh = file->private_data;
+-	struct v4l2_fh *vfh = NULL;
++	struct v4l2_fh *vfh = file_to_v4l2_fh(file);
+ 	int dev_debug = vfd->dev_debug;
+ 	long ret = -ENOTTY;
+ 
+@@ -3083,9 +3073,6 @@ static long __video_do_ioctl(struct file
+ 		return ret;
+ 	}
+ 
+-	if (test_bit(V4L2_FL_USES_V4L2_FH, &vfd->flags))
+-		vfh = file_to_v4l2_fh(file);
+-
+ 	/*
+ 	 * We need to serialize streamon/off with queueing new requests.
+ 	 * These ioctls may trigger the cancellation of a streaming
+@@ -3117,10 +3104,10 @@ static long __video_do_ioctl(struct file
+ 		info = &v4l2_ioctls[_IOC_NR(cmd)];
+ 
+ 		if (!is_valid_ioctl(vfd, cmd) &&
+-		    !((info->flags & INFO_FL_CTRL) && vfh && vfh->ctrl_handler))
++		    !((info->flags & INFO_FL_CTRL) && vfh->ctrl_handler))
+ 			goto done;
+ 
+-		if (vfh && (info->flags & INFO_FL_PRIO)) {
++		if (info->flags & INFO_FL_PRIO) {
+ 			ret = v4l2_prio_check(vfd->prio, vfh->prio);
+ 			if (ret)
+ 				goto done;
+@@ -3139,7 +3126,7 @@ static long __video_do_ioctl(struct file
+ 		ret = -ENOTTY;
+ 	} else {
+ 		ret = ops->vidioc_default(file, fh,
+-			vfh ? v4l2_prio_check(vfd->prio, vfh->prio) >= 0 : 0,
++			v4l2_prio_check(vfd->prio, vfh->prio) >= 0,
+ 			cmd, arg);
+ 	}
+ 
+--- a/drivers/media/v4l2-core/v4l2-mem2mem.c
++++ b/drivers/media/v4l2-core/v4l2-mem2mem.c
+@@ -951,7 +951,7 @@ static __poll_t v4l2_m2m_poll_for_data(s
+ __poll_t v4l2_m2m_poll(struct file *file, struct v4l2_m2m_ctx *m2m_ctx,
+ 		       struct poll_table_struct *wait)
+ {
+-	struct video_device *vfd = video_devdata(file);
++	struct v4l2_fh *fh = file_to_v4l2_fh(file);
+ 	struct vb2_queue *src_q = v4l2_m2m_get_src_vq(m2m_ctx);
+ 	struct vb2_queue *dst_q = v4l2_m2m_get_dst_vq(m2m_ctx);
+ 	__poll_t req_events = poll_requested_events(wait);
+@@ -970,13 +970,9 @@ __poll_t v4l2_m2m_poll(struct file *file
+ 	if (req_events & (EPOLLOUT | EPOLLWRNORM | EPOLLIN | EPOLLRDNORM))
+ 		rc = v4l2_m2m_poll_for_data(file, m2m_ctx, wait);
+ 
+-	if (test_bit(V4L2_FL_USES_V4L2_FH, &vfd->flags)) {
+-		struct v4l2_fh *fh = file_to_v4l2_fh(file);
+-
+-		poll_wait(file, &fh->wait, wait);
+-		if (v4l2_event_pending(fh))
+-			rc |= EPOLLPRI;
+-	}
++	poll_wait(file, &fh->wait, wait);
++	if (v4l2_event_pending(fh))
++		rc |= EPOLLPRI;
+ 
+ 	return rc;
+ }
+--- a/include/media/v4l2-dev.h
++++ b/include/media/v4l2-dev.h
+@@ -74,7 +74,7 @@ struct dentry;
+  * @V4L2_FL_USES_V4L2_FH:
+  *	indicates that file->private_data points to &struct v4l2_fh.
+  *	This flag is set by the core when v4l2_fh_init() is called.
+- *	All new drivers should use it.
++ *	All drivers must use it.
+  * @V4L2_FL_QUIRK_INVERTED_CROP:
+  *	some old M2M drivers use g/s_crop/cropcap incorrectly: crop and
+  *	compose are swapped. If this flag is set, then the selection
+--- a/include/media/v4l2-fh.h
++++ b/include/media/v4l2-fh.h
+@@ -3,7 +3,7 @@
+  * v4l2-fh.h
+  *
+  * V4L2 file handle. Store per file handle data for the V4L2
+- * framework. Using file handles is optional for the drivers.
++ * framework. Using file handles is mandatory for the drivers.
+  *
+  * Copyright (C) 2009--2010 Nokia Corporation.
+  *
