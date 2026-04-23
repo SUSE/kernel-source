@@ -1,0 +1,87 @@
+From: Nikunj A Dadhania <nikunj@amd.com>
+Date: Wed, 18 Mar 2026 07:56:54 +0000
+Subject: x86/fred: Fix early boot failures on SEV-ES/SNP guests
+Patch-mainline: v7.0-rc6
+Git-commit: 3645eb7e3915990a149460c151a00894cb586253
+References: git-fixes
+
+FRED-enabled SEV-(ES,SNP) guests fail to boot due to the following issues
+in the early boot sequence:
+
+* FRED does not have a #VC exception handler in the dispatch logic
+
+* Early FRED #VC exceptions attempt to use uninitialized per-CPU GHCBs
+  instead of boot_ghcb
+
+Add X86_TRAP_VC case to fred_hwexc() with a new exc_vmm_communication()
+function that provides the unified entry point FRED requires, dispatching
+to existing user/kernel handlers based on privilege level. The function is
+already declared via DECLARE_IDTENTRY_VC().
+
+Fix early GHCB access by falling back to boot_ghcb in
+__sev_{get,put}_ghcb() when per-CPU GHCBs are not yet initialized.
+
+Fixes: 14619d912b65 ("x86/fred: FRED entry/exit and dispatch code")
+Signed-off-by: Nikunj A Dadhania <nikunj@amd.com>
+Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+Reviewed-by: Tom Lendacky <thomas.lendacky@amd.com>
+Cc: <stable@kernel.org>  # 6.12+
+Link: https://patch.msgid.link/20260318075654.1792916-4-nikunj@amd.com
+Acked-by: Carlos López <clopez@suse.de>
+---
+ arch/x86/coco/sev/core.c    |    6 ++++++
+ arch/x86/entry/entry_fred.c |   14 ++++++++++++++
+ 2 files changed, 20 insertions(+)
+
+--- a/arch/x86/coco/sev/core.c
++++ b/arch/x86/coco/sev/core.c
+@@ -240,6 +240,9 @@ static noinstr struct ghcb *__sev_get_gh
+ 
+ 	WARN_ON(!irqs_disabled());
+ 
++	if (!sev_cfg.ghcbs_initialized)
++		return boot_ghcb;
++
+ 	data = this_cpu_read(runtime_data);
+ 	ghcb = &data->ghcb_page;
+ 
+@@ -636,6 +639,9 @@ static noinstr void __sev_put_ghcb(struc
+ 
+ 	WARN_ON(!irqs_disabled());
+ 
++	if (!sev_cfg.ghcbs_initialized)
++		return;
++
+ 	data = this_cpu_read(runtime_data);
+ 	ghcb = &data->ghcb_page;
+ 
+--- a/arch/x86/entry/entry_fred.c
++++ b/arch/x86/entry/entry_fred.c
+@@ -176,6 +176,16 @@ static noinstr void fred_extint(struct p
+ 	}
+ }
+ 
++#ifdef CONFIG_AMD_MEM_ENCRYPT
++noinstr void exc_vmm_communication(struct pt_regs *regs, unsigned long error_code)
++{
++	if (user_mode(regs))
++		return user_exc_vmm_communication(regs, error_code);
++	else
++		return kernel_exc_vmm_communication(regs, error_code);
++}
++#endif
++
+ static noinstr void fred_hwexc(struct pt_regs *regs, unsigned long error_code)
+ {
+ 	/* Optimize for #PF. That's the only exception which matters performance wise */
+@@ -206,6 +216,10 @@ static noinstr void fred_hwexc(struct pt
+ #ifdef CONFIG_X86_CET
+ 	case X86_TRAP_CP: return exc_control_protection(regs, error_code);
+ #endif
++#ifdef CONFIG_AMD_MEM_ENCRYPT
++	case X86_TRAP_VC: return exc_vmm_communication(regs, error_code);
++#endif
++
+ 	default: return fred_bad_type(regs, error_code);
+ 	}
+ 
