@@ -1,0 +1,105 @@
+From: Ankit Agrawal <ankita@nvidia.com>
+Date: Sat, 5 Jul 2025 07:17:14 +0000
+Subject: KVM: arm64: Block cacheable PFNMAP mapping
+Patch-mainline: v6.17-rc1
+Git-commit: 2a8dfab26677ae37243a40d170704588f791cfd3
+References: git-fixes
+
+Fixes a security bug due to mismatched attributes between S1 and
+S2 mapping.
+
+Currently, it is possible for a region to be cacheable in the userspace
+VMA, but mapped non cached in S2. This creates a potential issue where
+the VMM may sanitize cacheable memory across VMs using cacheable stores,
+ensuring it is zeroed. However, if KVM subsequently assigns this memory
+to a VM as uncached, the VM could end up accessing stale, non-zeroed data
+from a previous VM, leading to unintended data exposure. This is a security
+risk.
+
+Block such mismatch attributes case by returning EINVAL when userspace
+try to map PFNMAP cacheable. Only allow NORMAL_NC and DEVICE_*.
+
+CC: Oliver Upton <oliver.upton@linux.dev>
+CC: Catalin Marinas <catalin.marinas@arm.com>
+CC: Sean Christopherson <seanjc@google.com>
+Suggested-by: Jason Gunthorpe <jgg@nvidia.com>
+Reviewed-by: Jason Gunthorpe <jgg@nvidia.com>
+Reviewed-by: David Hildenbrand <david@redhat.com>
+Tested-by: Donald Dutile <ddutile@redhat.com>
+Signed-off-by: Ankit Agrawal <ankita@nvidia.com>
+Reviewed-by: Catalin Marinas <catalin.marinas@arm.com>
+Link: https://lore.kernel.org/r/20250705071717.5062-4-ankita@nvidia.com
+Signed-off-by: Oliver Upton <oliver.upton@linux.dev>
+Acked-by: Carlos López <clopez@suse.de>
+---
+ arch/arm64/kvm/mmu.c |   31 ++++++++++++++++++++++++++++++-
+ 1 file changed, 30 insertions(+), 1 deletion(-)
+
+--- a/arch/arm64/kvm/mmu.c
++++ b/arch/arm64/kvm/mmu.c
+@@ -1438,6 +1438,18 @@ static bool kvm_vma_mte_allowed(struct v
+ 	return vma->vm_flags & VM_MTE_ALLOWED;
+ }
+ 
++static bool kvm_vma_is_cacheable(struct vm_area_struct *vma)
++{
++	switch (FIELD_GET(PTE_ATTRINDX_MASK, pgprot_val(vma->vm_page_prot))) {
++	case MT_NORMAL_NC:
++	case MT_DEVICE_nGnRnE:
++	case MT_DEVICE_nGnRE:
++		return false;
++	default:
++		return true;
++	}
++}
++
+ static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
+ 			  struct kvm_s2_trans *nested,
+ 			  struct kvm_memory_slot *memslot, unsigned long hva,
+@@ -1445,7 +1457,7 @@ static int user_mem_abort(struct kvm_vcp
+ {
+ 	int ret = 0;
+ 	bool write_fault, writable, force_pte = false;
+-	bool exec_fault, mte_allowed;
++	bool exec_fault, mte_allowed, is_vma_cacheable;
+ 	bool s2_force_noncacheable = false, vfio_allow_any_uc = false;
+ 	unsigned long mmu_seq;
+ 	phys_addr_t ipa = fault_ipa;
+@@ -1590,6 +1602,8 @@ static int user_mem_abort(struct kvm_vcp
+ 
+ 	vm_flags = vma->vm_flags;
+ 
++	is_vma_cacheable = kvm_vma_is_cacheable(vma);
++
+ 	/* Don't use the VMA after the unlock -- it may have vanished */
+ 	vma = NULL;
+ 
+@@ -1633,6 +1647,15 @@ static int user_mem_abort(struct kvm_vcp
+ 		writable = false;
+ 	}
+ 
++	/*
++	 * Prevent non-cacheable mappings in the stage-2 if a region of memory
++	 * is cacheable in the primary MMU and the kernel lacks a cacheable
++	 * alias. KVM cannot guarantee coherency between the guest/host aliases
++	 * without the ability to perform CMOs.
++	 */
++	if (is_vma_cacheable && s2_force_noncacheable)
++		return -EINVAL;
++
+ 	if (exec_fault && s2_force_noncacheable)
+ 		return -ENOEXEC;
+ 
+@@ -2185,6 +2208,12 @@ int kvm_arch_prepare_memory_region(struc
+ 				ret = -EINVAL;
+ 				break;
+ 			}
++
++			/* Cacheable PFNMAP is not allowed */
++			if (kvm_vma_is_cacheable(vma)) {
++				ret = -EINVAL;
++				break;
++			}
+ 		}
+ 		hva = min(reg_end, vma->vm_end);
+ 	} while (hva < reg_end);
