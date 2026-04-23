@@ -1,0 +1,140 @@
+From d3d199dfa7dd9cb5cff5d97ad65f2ee520147345 Mon Sep 17 00:00:00 2001
+From: Sean Christopherson <seanjc@google.com>
+Date: Tue, 19 Aug 2025 16:48:29 -0700
+Subject: [PATCH 2/7] KVM: SVM: Move SEV-ES VMSA allocation to a dedicated
+ sev_vcpu_create() helper
+Git-commit: 34bd82aab15b8b9e8e9d923267283c84aa8c2789
+Patch-mainline: v6.18-rc1
+References: jsc#PED-13705
+
+Add a dedicated sev_vcpu_create() helper to allocate the VMSA page for
+SEV-ES+ vCPUs, and to allow for consolidating a variety of related SEV+
+code in the near future.
+
+No functional change intended.
+
+Reviewed-by: Nikunj A Dadhania <nikunj@amd.com>
+Link: https://lore.kernel.org/r/20250819234833.3080255-5-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Acked-by: Vaishali Thakkar <vthakkar@suse.de>
+---
+ arch/x86/kvm/svm/sev.c | 20 ++++++++++++++++++++
+ arch/x86/kvm/svm/svm.c | 25 +++++++------------------
+ arch/x86/kvm/svm/svm.h |  2 ++
+ 3 files changed, 29 insertions(+), 18 deletions(-)
+
+diff --git a/arch/x86/kvm/svm/sev.c b/arch/x86/kvm/svm/sev.c
+index 15311f8c7b05d..825115e2bc7bb 100644
+--- a/arch/x86/kvm/svm/sev.c
++++ b/arch/x86/kvm/svm/sev.c
+@@ -4588,6 +4588,26 @@ void sev_init_vmcb(struct vcpu_svm *svm)
+ 		sev_es_init_vmcb(svm);
+ }
+ 
++int sev_vcpu_create(struct kvm_vcpu *vcpu)
++{
++	struct vcpu_svm *svm = to_svm(vcpu);
++	struct page *vmsa_page;
++
++	if (!sev_es_guest(vcpu->kvm))
++		return 0;
++
++	/*
++	 * SEV-ES guests require a separate (from the VMCB) VMSA page used to
++	 * contain the encrypted register state of the guest.
++	 */
++	vmsa_page = snp_safe_alloc_page();
++	if (!vmsa_page)
++		return -ENOMEM;
++
++	svm->sev_es.vmsa = page_address(vmsa_page);
++	return 0;
++}
++
+ void sev_es_vcpu_reset(struct vcpu_svm *svm)
+ {
+ 	struct kvm_vcpu *vcpu = &svm->vcpu;
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index 1aa0b00469309..d7474441ba5b3 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -1283,7 +1283,6 @@ static int svm_vcpu_create(struct kvm_vcpu *vcpu)
+ {
+ 	struct vcpu_svm *svm;
+ 	struct page *vmcb01_page;
+-	struct page *vmsa_page = NULL;
+ 	int err;
+ 
+ 	BUILD_BUG_ON(offsetof(struct vcpu_svm, vcpu) != 0);
+@@ -1294,24 +1293,18 @@ static int svm_vcpu_create(struct kvm_vcpu *vcpu)
+ 	if (!vmcb01_page)
+ 		goto out;
+ 
+-	if (sev_es_guest(vcpu->kvm)) {
+-		/*
+-		 * SEV-ES guests require a separate VMSA page used to contain
+-		 * the encrypted register state of the guest.
+-		 */
+-		vmsa_page = snp_safe_alloc_page();
+-		if (!vmsa_page)
+-			goto error_free_vmcb_page;
+-	}
++	err = sev_vcpu_create(vcpu);
++	if (err)
++		goto error_free_vmcb_page;
+ 
+ 	err = avic_init_vcpu(svm);
+ 	if (err)
+-		goto error_free_vmsa_page;
++		goto error_free_sev;
+ 
+ 	svm->msrpm = svm_vcpu_alloc_msrpm();
+ 	if (!svm->msrpm) {
+ 		err = -ENOMEM;
+-		goto error_free_vmsa_page;
++		goto error_free_sev;
+ 	}
+ 
+ 	svm->x2avic_msrs_intercepted = true;
+@@ -1320,16 +1313,12 @@ static int svm_vcpu_create(struct kvm_vcpu *vcpu)
+ 	svm->vmcb01.pa = __sme_set(page_to_pfn(vmcb01_page) << PAGE_SHIFT);
+ 	svm_switch_vmcb(svm, &svm->vmcb01);
+ 
+-	if (vmsa_page)
+-		svm->sev_es.vmsa = page_address(vmsa_page);
+-
+ 	svm->guest_state_loaded = false;
+ 
+ 	return 0;
+ 
+-error_free_vmsa_page:
+-	if (vmsa_page)
+-		__free_page(vmsa_page);
++error_free_sev:
++	sev_free_vcpu(vcpu);
+ error_free_vmcb_page:
+ 	__free_page(vmcb01_page);
+ out:
+diff --git a/arch/x86/kvm/svm/svm.h b/arch/x86/kvm/svm/svm.h
+index a5975066ac50b..8d7d1495d4f15 100644
+--- a/arch/x86/kvm/svm/svm.h
++++ b/arch/x86/kvm/svm/svm.h
+@@ -820,6 +820,7 @@ static inline struct page *snp_safe_alloc_page(void)
+ 	return snp_safe_alloc_page_node(numa_node_id(), GFP_KERNEL_ACCOUNT);
+ }
+ 
++int sev_vcpu_create(struct kvm_vcpu *vcpu);
+ void sev_free_vcpu(struct kvm_vcpu *vcpu);
+ void sev_vm_destroy(struct kvm *kvm);
+ void __init sev_set_cpu_caps(void);
+@@ -844,6 +845,7 @@ static inline struct page *snp_safe_alloc_page(void)
+ 	return snp_safe_alloc_page_node(numa_node_id(), GFP_KERNEL_ACCOUNT);
+ }
+ 
++static inline int sev_vcpu_create(struct kvm_vcpu *vcpu) { return 0; }
+ static inline void sev_free_vcpu(struct kvm_vcpu *vcpu) {}
+ static inline void sev_vm_destroy(struct kvm *kvm) {}
+ static inline void __init sev_set_cpu_caps(void) {}
+-- 
+2.51.0
+

@@ -1,0 +1,135 @@
+From ba4e488045f23609acf472927263ca7508e2fec2 Mon Sep 17 00:00:00 2001
+From: Nikunj A Dadhania <nikunj@amd.com>
+Date: Tue, 19 Aug 2025 16:48:33 -0700
+Subject: [PATCH 7/7] KVM: SVM: Enable Secure TSC for SNP guests
+Git-commit: a311fce2b694599cede76c5d7a0905336bc09803
+Patch-mainline: v6.18-rc1
+References: jsc#PED-13705
+
+Add support for Secure TSC, allowing userspace to configure the Secure TSC
+feature for SNP guests. Use the SNP specification's desired TSC frequency
+parameter during the SNP_LAUNCH_START command to set the mean TSC
+frequency in KHz for Secure TSC enabled guests.
+
+Always use kvm->arch.arch.default_tsc_khz as the TSC frequency that is
+passed to SNP guests in the SNP_LAUNCH_START command.  The default value
+is the host TSC frequency.  The userspace can optionally change the TSC
+frequency via the KVM_SET_TSC_KHZ ioctl before calling the
+SNP_LAUNCH_START ioctl.
+
+Introduce the read-only MSR GUEST_TSC_FREQ (0xc0010134) that returns
+guest's effective frequency in MHZ when Secure TSC is enabled for SNP
+guests. Disable interception of this MSR when Secure TSC is enabled. Note
+that GUEST_TSC_FREQ MSR is accessible only to the guest and not from the
+hypervisor context.
+
+Co-developed-by: Ketan Chaturvedi <Ketan.Chaturvedi@amd.com>
+Signed-off-by: Ketan Chaturvedi <Ketan.Chaturvedi@amd.com>
+Reviewed-by: Kai Huang <kai.huang@intel.com>
+Reviewed-by: Tom Lendacky <thomas.lendacky@amd.com>
+Signed-off-by: Nikunj A Dadhania <nikunj@amd.com>
+[sean: contain Secure TSC to sev.c]
+Link: https://lore.kernel.org/r/20250819234833.3080255-9-seanjc@google.com
+[sean: return -EINVAL if TSC frequency is '0']
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Acked-by: Vaishali Thakkar <vthakkar@suse.de>
+---
+ arch/x86/include/asm/svm.h |  1 +
+ arch/x86/kvm/svm/sev.c     | 28 ++++++++++++++++++++++++++++
+ 2 files changed, 29 insertions(+)
+
+diff --git a/arch/x86/include/asm/svm.h b/arch/x86/include/asm/svm.h
+index a86af2cf2ebb0..ecfa5df5b50ee 100644
+--- a/arch/x86/include/asm/svm.h
++++ b/arch/x86/include/asm/svm.h
+@@ -294,6 +294,7 @@ static_assert((X2AVIC_MAX_PHYSICAL_ID & AVIC_PHYSICAL_MAX_INDEX_MASK) == X2AVIC_
+ #define SVM_SEV_FEAT_RESTRICTED_INJECTION		BIT(3)
+ #define SVM_SEV_FEAT_ALTERNATE_INJECTION		BIT(4)
+ #define SVM_SEV_FEAT_DEBUG_SWAP				BIT(5)
++#define SVM_SEV_FEAT_SECURE_TSC				BIT(9)
+ 
+ #define SVM_SEV_FEAT_INT_INJ_MODES		\
+ 	(SVM_SEV_FEAT_RESTRICTED_INJECTION |	\
+diff --git a/arch/x86/kvm/svm/sev.c b/arch/x86/kvm/svm/sev.c
+index 7d56c46649758..2f2fdfe403e54 100644
+--- a/arch/x86/kvm/svm/sev.c
++++ b/arch/x86/kvm/svm/sev.c
+@@ -155,6 +155,14 @@ static bool sev_vcpu_has_debug_swap(struct vcpu_svm *svm)
+ 	return sev->vmsa_features & SVM_SEV_FEAT_DEBUG_SWAP;
+ }
+ 
++static bool snp_is_secure_tsc_enabled(struct kvm *kvm)
++{
++	struct kvm_sev_info *sev = to_kvm_sev_info(kvm);
++
++	return (sev->vmsa_features & SVM_SEV_FEAT_SECURE_TSC) &&
++	       !WARN_ON_ONCE(!sev_snp_guest(kvm));
++}
++
+ /* Must be called with the sev_bitmap_lock held */
+ static bool __sev_recycle_asids(unsigned int min_asid, unsigned int max_asid)
+ {
+@@ -426,6 +434,9 @@ static int __sev_guest_init(struct kvm *kvm, struct kvm_sev_cmd *argp,
+ 	if (data->flags)
+ 		return -EINVAL;
+ 
++	if (!snp_active)
++		valid_vmsa_features &= ~SVM_SEV_FEAT_SECURE_TSC;
++
+ 	if (data->vmsa_features & ~valid_vmsa_features)
+ 		return -EINVAL;
+ 
+@@ -2177,12 +2188,20 @@ static int snp_launch_start(struct kvm *kvm, struct kvm_sev_cmd *argp)
+ 	if (params.policy & SNP_POLICY_MASK_SINGLE_SOCKET)
+ 		return -EINVAL;
+ 
++	if (snp_is_secure_tsc_enabled(kvm)) {
++		if (WARN_ON_ONCE(!kvm->arch.default_tsc_khz))
++			return -EINVAL;
++
++		start.desired_tsc_khz = kvm->arch.default_tsc_khz;
++	}
++
+ 	sev->snp_context = snp_context_create(kvm, argp);
+ 	if (!sev->snp_context)
+ 		return -ENOTTY;
+ 
+ 	start.gctx_paddr = __psp_pa(sev->snp_context);
+ 	start.policy = params.policy;
++
+ 	memcpy(start.gosvw, params.gosvw, sizeof(params.gosvw));
+ 	rc = __sev_issue_cmd(argp->sev_fd, SEV_CMD_SNP_LAUNCH_START, &start, &argp->error);
+ 	if (rc) {
+@@ -3049,6 +3068,9 @@ void __init sev_hardware_setup(void)
+ 	sev_supported_vmsa_features = 0;
+ 	if (sev_es_debug_swap_enabled)
+ 		sev_supported_vmsa_features |= SVM_SEV_FEAT_DEBUG_SWAP;
++
++	if (sev_snp_enabled && tsc_khz && cpu_feature_enabled(X86_FEATURE_SNP_SECURE_TSC))
++		sev_supported_vmsa_features |= SVM_SEV_FEAT_SECURE_TSC;
+ }
+ 
+ void sev_hardware_unsetup(void)
+@@ -4485,6 +4507,9 @@ void sev_es_recalc_msr_intercepts(struct kvm_vcpu *vcpu)
+ 					  !guest_cpu_cap_has(vcpu, X86_FEATURE_RDTSCP) &&
+ 					  !guest_cpu_cap_has(vcpu, X86_FEATURE_RDPID));
+ 
++	svm_set_intercept_for_msr(vcpu, MSR_AMD64_GUEST_TSC_FREQ, MSR_TYPE_R,
++				  !snp_is_secure_tsc_enabled(vcpu->kvm));
++
+ 	/*
+ 	 * For SEV-ES, accesses to MSR_IA32_XSS should not be intercepted if
+ 	 * the host/guest supports its use.
+@@ -4618,6 +4643,9 @@ int sev_vcpu_create(struct kvm_vcpu *vcpu)
+ 		return -ENOMEM;
+ 
+ 	svm->sev_es.vmsa = page_address(vmsa_page);
++
++	vcpu->arch.guest_tsc_protected = snp_is_secure_tsc_enabled(vcpu->kvm);
++
+ 	return 0;
+ }
+ 
+-- 
+2.51.0
+

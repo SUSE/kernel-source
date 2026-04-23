@@ -1,0 +1,156 @@
+From 2da910ac7a58b6477ba63ccea13d59039f95a2e4 Mon Sep 17 00:00:00 2001
+From: Sean Christopherson <seanjc@google.com>
+Date: Tue, 19 Aug 2025 16:48:30 -0700
+Subject: [PATCH 3/7] KVM: SEV: Move init of SNP guest state into
+ sev_init_vmcb()
+Git-commit: 3d4e882e3439593b406fa226bcdd48c92d2222a6
+Patch-mainline: v6.18-rc1
+References: jsc#PED-13705
+
+Move the initialization of SNP guest state from svm_vcpu_reset() into
+sev_init_vmcb() to reduce the number of paths that deal with INIT/RESET
+for SEV+ vCPUs from 4+ to 1.  Plumb in @init_event as necessary.
+
+Opportunistically check for an SNP guest outside of
+sev_snp_init_protected_guest_state() so that sev_init_vmcb() is consistent
+with respect to checking for SEV-ES+ and SNP+ guests.
+
+No functional change intended.
+
+Reviewed-by: Nikunj A Dadhania <nikunj@amd.com>
+Link: https://lore.kernel.org/r/20250819234833.3080255-6-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Acked-by: Vaishali Thakkar <vthakkar@suse.de>
+---
+ arch/x86/kvm/svm/sev.c | 17 +++++++++--------
+ arch/x86/kvm/svm/svm.c |  9 +++------
+ arch/x86/kvm/svm/svm.h |  4 +---
+ 3 files changed, 13 insertions(+), 17 deletions(-)
+
+diff --git a/arch/x86/kvm/svm/sev.c b/arch/x86/kvm/svm/sev.c
+index 825115e2bc7bb..8c8b19878feec 100644
+--- a/arch/x86/kvm/svm/sev.c
++++ b/arch/x86/kvm/svm/sev.c
+@@ -1969,7 +1969,7 @@ static void sev_migrate_from(struct kvm *dst_kvm, struct kvm *src_kvm)
+ 	kvm_for_each_vcpu(i, dst_vcpu, dst_kvm) {
+ 		dst_svm = to_svm(dst_vcpu);
+ 
+-		sev_init_vmcb(dst_svm);
++		sev_init_vmcb(dst_svm, false);
+ 
+ 		if (!dst->es_active)
+ 			continue;
+@@ -3837,7 +3837,6 @@ static int snp_begin_psc(struct vcpu_svm *svm, struct psc_buffer *psc)
+ static int __sev_snp_update_protected_guest_state(struct kvm_vcpu *vcpu)
+ {
+ 	struct vcpu_svm *svm = to_svm(vcpu);
+-
+ 	WARN_ON(!mutex_is_locked(&svm->sev_es.snp_vmsa_mutex));
+ 
+ 	/* Mark the vCPU as offline and not runnable */
+@@ -3904,14 +3903,11 @@ static int __sev_snp_update_protected_guest_state(struct kvm_vcpu *vcpu)
+ /*
+  * Invoked as part of svm_vcpu_reset() processing of an init event.
+  */
+-void sev_snp_init_protected_guest_state(struct kvm_vcpu *vcpu)
++static void sev_snp_init_protected_guest_state(struct kvm_vcpu *vcpu)
+ {
+ 	struct vcpu_svm *svm = to_svm(vcpu);
+ 	int ret;
+ 
+-	if (!sev_snp_guest(vcpu->kvm))
+-		return;
+-
+ 	mutex_lock(&svm->sev_es.snp_vmsa_mutex);
+ 
+ 	if (!svm->sev_es.snp_ap_waiting_for_reset)
+@@ -4573,8 +4569,10 @@ static void sev_es_init_vmcb(struct vcpu_svm *svm)
+ 	svm_clr_intercept(svm, INTERCEPT_XSETBV);
+ }
+ 
+-void sev_init_vmcb(struct vcpu_svm *svm)
++void sev_init_vmcb(struct vcpu_svm *svm, bool init_event)
+ {
++	struct kvm_vcpu *vcpu = &svm->vcpu;
++
+ 	svm->vmcb->control.nested_ctl |= SVM_NESTED_CTL_SEV_ENABLE;
+ 	clr_exception_intercept(svm, UD_VECTOR);
+ 
+@@ -4584,7 +4582,10 @@ void sev_init_vmcb(struct vcpu_svm *svm)
+ 	 */
+ 	clr_exception_intercept(svm, GP_VECTOR);
+ 
+-	if (sev_es_guest(svm->vcpu.kvm))
++	if (init_event && sev_snp_guest(vcpu->kvm))
++		sev_snp_init_protected_guest_state(vcpu);
++
++	if (sev_es_guest(vcpu->kvm))
+ 		sev_es_init_vmcb(svm);
+ }
+ 
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index d7474441ba5b3..1f718b8584941 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -1092,7 +1092,7 @@ static void svm_recalc_intercepts_after_set_cpuid(struct kvm_vcpu *vcpu)
+ 	svm_recalc_msr_intercepts(vcpu);
+ }
+ 
+-static void init_vmcb(struct kvm_vcpu *vcpu)
++static void init_vmcb(struct kvm_vcpu *vcpu, bool init_event)
+ {
+ 	struct vcpu_svm *svm = to_svm(vcpu);
+ 	struct vmcb *vmcb = svm->vmcb01.ptr;
+@@ -1229,7 +1229,7 @@ static void init_vmcb(struct kvm_vcpu *vcpu)
+ 		svm_set_intercept(svm, INTERCEPT_BUSLOCK);
+ 
+ 	if (sev_guest(vcpu->kvm))
+-		sev_init_vmcb(svm);
++		sev_init_vmcb(svm, init_event);
+ 
+ 	svm_hv_init_vmcb(vmcb);
+ 
+@@ -1264,10 +1264,7 @@ static void svm_vcpu_reset(struct kvm_vcpu *vcpu, bool init_event)
+ 	svm->spec_ctrl = 0;
+ 	svm->virt_spec_ctrl = 0;
+ 
+-	if (init_event)
+-		sev_snp_init_protected_guest_state(vcpu);
+-
+-	init_vmcb(vcpu);
++	init_vmcb(vcpu, init_event);
+ 
+ 	if (!init_event)
+ 		__svm_vcpu_reset(vcpu);
+diff --git a/arch/x86/kvm/svm/svm.h b/arch/x86/kvm/svm/svm.h
+index 8d7d1495d4f15..1fb27ea092a4d 100644
+--- a/arch/x86/kvm/svm/svm.h
++++ b/arch/x86/kvm/svm/svm.h
+@@ -792,7 +792,7 @@ void avic_refresh_virtual_apic_mode(struct kvm_vcpu *vcpu);
+ /* sev.c */
+ 
+ int pre_sev_run(struct vcpu_svm *svm, int cpu);
+-void sev_init_vmcb(struct vcpu_svm *svm);
++void sev_init_vmcb(struct vcpu_svm *svm, bool init_event);
+ void sev_vcpu_after_set_cpuid(struct vcpu_svm *svm);
+ int sev_es_string_io(struct vcpu_svm *svm, int size, unsigned int port, int in);
+ void sev_es_vcpu_reset(struct vcpu_svm *svm);
+@@ -830,7 +830,6 @@ int sev_cpu_init(struct svm_cpu_data *sd);
+ int sev_dev_get_attr(u32 group, u64 attr, u64 *val);
+ extern unsigned int max_sev_asid;
+ void sev_handle_rmp_fault(struct kvm_vcpu *vcpu, gpa_t gpa, u64 error_code);
+-void sev_snp_init_protected_guest_state(struct kvm_vcpu *vcpu);
+ int sev_gmem_prepare(struct kvm *kvm, kvm_pfn_t pfn, gfn_t gfn, int max_order);
+ void sev_gmem_invalidate(kvm_pfn_t start, kvm_pfn_t end);
+ int sev_private_max_mapping_level(struct kvm *kvm, kvm_pfn_t pfn);
+@@ -855,7 +854,6 @@ static inline int sev_cpu_init(struct svm_cpu_data *sd) { return 0; }
+ static inline int sev_dev_get_attr(u32 group, u64 attr, u64 *val) { return -ENXIO; }
+ #define max_sev_asid 0
+ static inline void sev_handle_rmp_fault(struct kvm_vcpu *vcpu, gpa_t gpa, u64 error_code) {}
+-static inline void sev_snp_init_protected_guest_state(struct kvm_vcpu *vcpu) {}
+ static inline int sev_gmem_prepare(struct kvm *kvm, kvm_pfn_t pfn, gfn_t gfn, int max_order)
+ {
+ 	return 0;
+-- 
+2.51.0
+
