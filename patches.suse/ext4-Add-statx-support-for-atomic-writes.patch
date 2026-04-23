@@ -1,0 +1,126 @@
+From: "Ritesh Harjani (IBM)" <ritesh.list@gmail.com>
+Date: Mon, 4 Nov 2024 16:22:57 -0800
+Subject: ext4: Add statx support for atomic writes
+Git-commit: 6dfc1c1d597f8b6ebffe25f51f013494994f9b84
+Patch-mainline: v6.13-rc1
+References: jsc#PED-15624
+
+This patch adds base support for atomic writes via statx getattr.
+On bs < ps systems, we can create FS with say bs of 16k. That means
+both atomic write min and max unit can be set to 16k for supporting
+atomic writes.
+
+Co-developed-by: Ojaswin Mujoo <ojaswin@linux.ibm.com>
+Signed-off-by: Ojaswin Mujoo <ojaswin@linux.ibm.com>
+Signed-off-by: Ritesh Harjani (IBM) <ritesh.list@gmail.com>
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Acked-by: Goldwyn Rodrigues <rgoldwyn@suse.com>
+---
+ fs/ext4/ext4.h  | 10 ++++++++++
+ fs/ext4/inode.c | 12 ++++++++++++
+ fs/ext4/super.c | 31 +++++++++++++++++++++++++++++++
+ 3 files changed, 53 insertions(+)
+
+diff --git a/fs/ext4/ext4.h b/fs/ext4/ext4.h
+index 44b0d418143c..494d443e9fc9 100644
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@ -1729,6 +1729,10 @@ struct ext4_sb_info {
+ 	 */
+ 	struct work_struct s_sb_upd_work;
+ 
++	/* Atomic write unit values in bytes */
++	unsigned int s_awu_min;
++	unsigned int s_awu_max;
++
+ 	/* Ext4 fast commit sub transaction ID */
+ 	atomic_t s_fc_subtid;
+ 
+@@ -3855,6 +3859,12 @@ static inline int ext4_buffer_uptodate(struct buffer_head *bh)
+ 	return buffer_uptodate(bh);
+ }
+ 
++static inline bool ext4_inode_can_atomic_write(struct inode *inode)
++{
++
++	return S_ISREG(inode->i_mode) && EXT4_SB(inode->i_sb)->s_awu_min > 0;
++}
++
+ extern int ext4_block_write_begin(handle_t *handle, struct folio *folio,
+ 				  loff_t pos, unsigned len,
+ 				  get_block_t *get_block);
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 54bdd4884fe6..3e827cfa762e 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -5578,6 +5578,18 @@ int ext4_getattr(struct mnt_idmap *idmap, const struct path *path,
+ 		}
+ 	}
+ 
++	if ((request_mask & STATX_WRITE_ATOMIC) && S_ISREG(inode->i_mode)) {
++		struct ext4_sb_info *sbi = EXT4_SB(inode->i_sb);
++		unsigned int awu_min = 0, awu_max = 0;
++
++		if (ext4_inode_can_atomic_write(inode)) {
++			awu_min = sbi->s_awu_min;
++			awu_max = sbi->s_awu_max;
++		}
++
++		generic_fill_statx_atomic_writes(stat, awu_min, awu_max);
++	}
++
+ 	flags = ei->i_flags & EXT4_FL_USER_VISIBLE;
+ 	if (flags & EXT4_APPEND_FL)
+ 		stat->attributes |= STATX_ATTR_APPEND;
+diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+index 16a4ce704460..ebe1660bd840 100644
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -4425,6 +4425,36 @@ static int ext4_handle_clustersize(struct super_block *sb)
+ 	return 0;
+ }
+ 
++/*
++ * ext4_atomic_write_init: Initializes filesystem min & max atomic write units.
++ * @sb: super block
++ * TODO: Later add support for bigalloc
++ */
++static void ext4_atomic_write_init(struct super_block *sb)
++{
++	struct ext4_sb_info *sbi = EXT4_SB(sb);
++	struct block_device *bdev = sb->s_bdev;
++
++	if (!bdev_can_atomic_write(bdev))
++		return;
++
++	if (!ext4_has_feature_extents(sb))
++		return;
++
++	sbi->s_awu_min = max(sb->s_blocksize,
++			      bdev_atomic_write_unit_min_bytes(bdev));
++	sbi->s_awu_max = min(sb->s_blocksize,
++			      bdev_atomic_write_unit_max_bytes(bdev));
++	if (sbi->s_awu_min && sbi->s_awu_max &&
++	    sbi->s_awu_min <= sbi->s_awu_max) {
++		ext4_msg(sb, KERN_NOTICE, "Supports (experimental) DIO atomic writes awu_min: %u, awu_max: %u",
++			 sbi->s_awu_min, sbi->s_awu_max);
++	} else {
++		sbi->s_awu_min = 0;
++		sbi->s_awu_max = 0;
++	}
++}
++
+ static void ext4_fast_commit_init(struct super_block *sb)
+ {
+ 	struct ext4_sb_info *sbi = EXT4_SB(sb);
+@@ -5336,6 +5366,7 @@ static int __ext4_fill_super(struct fs_context *fc, struct super_block *sb)
+ 
+ 	spin_lock_init(&sbi->s_bdev_wb_lock);
+ 
++	ext4_atomic_write_init(sb);
+ 	ext4_fast_commit_init(sb);
+ 
+ 	sb->s_root = NULL;
+
