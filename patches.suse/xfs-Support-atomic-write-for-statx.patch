@@ -1,0 +1,125 @@
+From: John Garry <john.g.garry@oracle.com>
+Date: Mon, 4 Nov 2024 16:14:03 -0800
+Subject: xfs: Support atomic write for statx
+Git-commit: 6432c6e723fffd93e5cb65117ff48a3aa734e259
+Patch-mainline: v6.13-rc1
+References: jsc#PED-15624
+
+Support providing info on atomic write unit min and max for an inode.
+
+For simplicity, currently we limit the min at the FS block size. As for
+max, we limit also at FS block size, as there is no current method to
+guarantee extent alignment or granularity for regular files.
+
+Reviewed-by: "Darrick J. Wong" <djwong@kernel.org>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: John Garry <john.g.garry@oracle.com>
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Acked-by: Goldwyn Rodrigues <rgoldwyn@suse.com>
+---
+ fs/xfs/xfs_buf.c   |  7 +++++++
+ fs/xfs/xfs_buf.h   |  4 ++++
+ fs/xfs/xfs_inode.h | 15 +++++++++++++++
+ fs/xfs/xfs_iops.c  | 22 ++++++++++++++++++++++
+ 4 files changed, 48 insertions(+)
+
+diff --git a/fs/xfs/xfs_buf.c b/fs/xfs/xfs_buf.c
+index aa4dbda7b536..e8196f5778e2 100644
+--- a/fs/xfs/xfs_buf.c
++++ b/fs/xfs/xfs_buf.c
+@@ -2115,6 +2115,13 @@ xfs_alloc_buftarg(
+ 	btp->bt_daxdev = fs_dax_get_by_bdev(btp->bt_bdev, &btp->bt_dax_part_off,
+ 					    mp, ops);
+ 
++	if (bdev_can_atomic_write(btp->bt_bdev)) {
++		btp->bt_bdev_awu_min = bdev_atomic_write_unit_min_bytes(
++						btp->bt_bdev);
++		btp->bt_bdev_awu_max = bdev_atomic_write_unit_max_bytes(
++						btp->bt_bdev);
++	}
++
+ 	/*
+ 	 * When allocating the buftargs we have not yet read the super block and
+ 	 * thus don't know the file system sector size yet.
+diff --git a/fs/xfs/xfs_buf.h b/fs/xfs/xfs_buf.h
+index 209a389f2abc..3d56bc7a35cc 100644
+--- a/fs/xfs/xfs_buf.h
++++ b/fs/xfs/xfs_buf.h
+@@ -124,6 +124,10 @@ struct xfs_buftarg {
+ 	struct percpu_counter	bt_io_count;
+ 	struct ratelimit_state	bt_ioerror_rl;
+ 
++	/* Atomic write unit values */
++	unsigned int		bt_bdev_awu_min;
++	unsigned int		bt_bdev_awu_max;
++
+ 	/* built-in cache, if we're not using the perag one */
+ 	struct xfs_buf_cache	bt_cache[];
+ };
+diff --git a/fs/xfs/xfs_inode.h b/fs/xfs/xfs_inode.h
+index 97ed912306fd..73009a25a119 100644
+--- a/fs/xfs/xfs_inode.h
++++ b/fs/xfs/xfs_inode.h
+@@ -327,6 +327,21 @@ static inline bool xfs_inode_has_bigrtalloc(struct xfs_inode *ip)
+ 	(XFS_IS_REALTIME_INODE(ip) ? \
+ 		(ip)->i_mount->m_rtdev_targp : (ip)->i_mount->m_ddev_targp)
+ 
++static inline bool
++xfs_inode_can_atomicwrite(
++	struct xfs_inode	*ip)
++{
++	struct xfs_mount	*mp = ip->i_mount;
++	struct xfs_buftarg	*target = xfs_inode_buftarg(ip);
++
++	if (mp->m_sb.sb_blocksize < target->bt_bdev_awu_min)
++		return false;
++	if (mp->m_sb.sb_blocksize > target->bt_bdev_awu_max)
++		return false;
++
++	return true;
++}
++
+ /*
+  * In-core inode flags.
+  */
+diff --git a/fs/xfs/xfs_iops.c b/fs/xfs/xfs_iops.c
+index ee79cf161312..5cd804812efd 100644
+--- a/fs/xfs/xfs_iops.c
++++ b/fs/xfs/xfs_iops.c
+@@ -570,6 +570,20 @@ xfs_stat_blksize(
+ 	return max_t(uint32_t, PAGE_SIZE, mp->m_sb.sb_blocksize);
+ }
+ 
++static void
++xfs_get_atomic_write_attr(
++	struct xfs_inode	*ip,
++	unsigned int		*unit_min,
++	unsigned int		*unit_max)
++{
++	if (!xfs_inode_can_atomicwrite(ip)) {
++		*unit_min = *unit_max = 0;
++		return;
++	}
++
++	*unit_min = *unit_max = ip->i_mount->m_sb.sb_blocksize;
++}
++
+ STATIC int
+ xfs_vn_getattr(
+ 	struct mnt_idmap	*idmap,
+@@ -643,6 +657,14 @@ xfs_vn_getattr(
+ 			stat->dio_mem_align = bdev_dma_alignment(bdev) + 1;
+ 			stat->dio_offset_align = bdev_logical_block_size(bdev);
+ 		}
++		if (request_mask & STATX_WRITE_ATOMIC) {
++			unsigned int	unit_min, unit_max;
++
++			xfs_get_atomic_write_attr(ip, &unit_min,
++					&unit_max);
++			generic_fill_statx_atomic_writes(stat,
++					unit_min, unit_max);
++		}
+ 		fallthrough;
+ 	default:
+ 		stat->blksize = xfs_stat_blksize(ip);
+
