@@ -1,0 +1,107 @@
+From: Alan Adamson <alan.adamson@oracle.com>
+Date: Thu, 8 May 2025 15:38:01 -0700
+Subject: nvme: all namespaces in a subsystem must adhere to a common atomic
+ write size
+Patch-mainline: v6.15-rc7
+Git-commit: 8695f060a02953b33ac6240895dcb9c7ce16c91c
+References: bsc#1259754
+
+The first namespace configured in a subsystem sets the subsystem's
+atomic write size based on its AWUPF or NAWUPF. Subsequent namespaces
+must have an atomic write size (per their AWUPF or NAWUPF) less than or
+equal to the subsystem's atomic write size, or their probing will be
+rejected.
+
+Signed-off-by: Alan Adamson <alan.adamson@oracle.com>
+[hch: fold in review comments from John Garry]
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: John Garry <john.g.garry@oracle.com>
+Acked-by: Daniel Wagner <dwagner@suse.de>
+---
+ drivers/nvme/host/core.c |   30 +++++++++++++++++++++++++++---
+ drivers/nvme/host/nvme.h |    3 ++-
+ 2 files changed, 29 insertions(+), 4 deletions(-)
+
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -2059,7 +2059,21 @@ static bool nvme_update_disk_info(struct
+ 		if (id->nsfeat & NVME_NS_FEAT_ATOMICS && id->nawupf)
+ 			atomic_bs = (1 + le16_to_cpu(id->nawupf)) * bs;
+ 		else
+-			atomic_bs = (1 + ns->ctrl->subsys->awupf) * bs;
++			atomic_bs = (1 + ns->ctrl->awupf) * bs;
++
++		/*
++		 * Set subsystem atomic bs.
++		 */
++		if (ns->ctrl->subsys->atomic_bs) {
++			if (atomic_bs != ns->ctrl->subsys->atomic_bs) {
++				dev_err_ratelimited(ns->ctrl->device,
++					"%s: Inconsistent Atomic Write Size, Namespace will not be added: Subsystem=%d bytes, Controller/Namespace=%d bytes\n",
++					ns->disk ? ns->disk->disk_name : "?",
++					ns->ctrl->subsys->atomic_bs,
++					atomic_bs);
++			}
++		} else
++			ns->ctrl->subsys->atomic_bs = atomic_bs;
+ 
+ 		nvme_update_atomic_write_disk_info(ns, id, lim, bs, atomic_bs);
+ 	}
+@@ -2201,6 +2215,17 @@ static int nvme_update_ns_info_block(str
+ 	nvme_set_chunk_sectors(ns, id, &lim);
+ 	if (!nvme_update_disk_info(ns, id, &lim))
+ 		capacity = 0;
++
++	/*
++	 * Validate the max atomic write size fits within the subsystem's
++	 * atomic write capabilities.
++	 */
++	if (lim.atomic_write_hw_max > ns->ctrl->subsys->atomic_bs) {
++		blk_mq_unfreeze_queue(ns->disk->queue, memflags);
++		ret = -ENXIO;
++		goto out;
++	}
++
+ 	nvme_config_discard(ns, &lim);
+ 	if (IS_ENABLED(CONFIG_BLK_DEV_ZONED) &&
+ 	    ns->head->ids.csi == NVME_CSI_ZNS)
+@@ -3031,7 +3056,6 @@ static int nvme_init_subsystem(struct nv
+ 		kfree(subsys);
+ 		return -EINVAL;
+ 	}
+-	subsys->awupf = le16_to_cpu(id->awupf);
+ 	nvme_mpath_default_iopolicy(subsys);
+ 
+ 	subsys->dev.class = &nvme_subsys_class;
+@@ -3441,7 +3465,7 @@ static int nvme_init_identify(struct nvm
+ 		dev_pm_qos_expose_latency_tolerance(ctrl->device);
+ 	else if (!ctrl->apst_enabled && prev_apst_enabled)
+ 		dev_pm_qos_hide_latency_tolerance(ctrl->device);
+-
++	ctrl->awupf = le16_to_cpu(id->awupf);
+ out_free:
+ 	kfree(id);
+ 	return ret;
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -410,6 +410,7 @@ struct nvme_ctrl {
+ 
+ 	enum nvme_ctrl_type cntrltype;
+ 	enum nvme_dctype dctype;
++	u16 awupf; /* 0's based value. */
+ };
+ 
+ static inline enum nvme_ctrl_state nvme_ctrl_state(struct nvme_ctrl *ctrl)
+@@ -442,11 +443,11 @@ struct nvme_subsystem {
+ 	u8			cmic;
+ 	enum nvme_subsys_type	subtype;
+ 	u16			vendor_id;
+-	u16			awupf;	/* 0's based awupf value. */
+ 	struct ida		ns_ida;
+ #ifdef CONFIG_NVME_MULTIPATH
+ 	enum nvme_iopolicy	iopolicy;
+ #endif
++	u32			atomic_bs;
+ };
+ 
+ /*
