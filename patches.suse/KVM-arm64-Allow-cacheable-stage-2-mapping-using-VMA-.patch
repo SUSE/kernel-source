@@ -1,0 +1,156 @@
+From: Ankit Agrawal <ankita@nvidia.com>
+Date: Sat, 5 Jul 2025 07:17:15 +0000
+Subject: KVM: arm64: Allow cacheable stage 2 mapping using VMA flags
+Patch-mainline: v6.17-rc1
+Git-commit: 0c67288e0c8bc1e39d7057fbae65bf57ca943676
+References: git-fixes
+
+KVM currently forces non-cacheable memory attributes (either Normal-NC
+or Device-nGnRE) for a region based on pfn_is_map_memory(), i.e. whether
+or not the kernel has a cacheable alias for it. This is necessary in
+situations where KVM needs to perform CMOs on the region but is
+unnecessarily restrictive when hardware obviates the need for CMOs.
+
+KVM doesn't need to perform any CMOs on hardware with FEAT_S2FWB and
+CTR_EL0.DIC. As luck would have it, there are implementations in the
+wild that need to map regions of a device with cacheable attributes to
+function properly. An example of this is Nvidia's Grace Hopper/Blackwell
+systems where GPU memory is interchangeable with DDR and retains
+properties such as cacheability, unaligned accesses, atomics and
+handling of executable faults. Of course, for this to work in a VM the
+GPU memory needs to have a cacheable mapping at stage-2.
+
+Allow cacheable stage-2 mappings to be created on supporting hardware
+when the VMA has cacheable memory attributes. Check these preconditions
+during memslot creation (in addition to fault handling) to potentially
+'fail-fast' as a courtesy to userspace.
+
+CC: Oliver Upton <oliver.upton@linux.dev>
+CC: Sean Christopherson <seanjc@google.com>
+Suggested-by: Jason Gunthorpe <jgg@nvidia.com>
+Suggested-by: Catalin Marinas <catalin.marinas@arm.com>
+Suggested-by: David Hildenbrand <david@redhat.com>
+Tested-by: Donald Dutile <ddutile@redhat.com>
+Signed-off-by: Ankit Agrawal <ankita@nvidia.com>
+Reviewed-by: David Hildenbrand <david@redhat.com>
+Reviewed-by: Jason Gunthorpe <jgg@nvidia.com>
+Reviewed-by: Catalin Marinas <catalin.marinas@arm.com>
+Link: https://lore.kernel.org/r/20250705071717.5062-6-ankita@nvidia.com
+[ Oliver: refine changelog, squash kvm_supports_cacheable_pfnmap() patch ]
+Signed-off-by: Oliver Upton <oliver.upton@linux.dev>
+Acked-by: Carlos López <clopez@suse.de>
+---
+ arch/arm64/include/asm/kvm_mmu.h |   18 +++++++++++
+ arch/arm64/kvm/mmu.c             |   59 ++++++++++++++++++++++++---------------
+ 2 files changed, 55 insertions(+), 22 deletions(-)
+
+--- a/arch/arm64/include/asm/kvm_mmu.h
++++ b/arch/arm64/include/asm/kvm_mmu.h
+@@ -371,6 +371,24 @@ static inline void kvm_fault_unlock(stru
+ 		read_unlock(&kvm->mmu_lock);
+ }
+ 
++/*
++ * ARM64 KVM relies on a simple conversion from physaddr to a kernel
++ * virtual address (KVA) when it does cache maintenance as the CMO
++ * instructions work on virtual addresses. This is incompatible with
++ * VM_PFNMAP VMAs which may not have a kernel direct mapping to a
++ * virtual address.
++ *
++ * With S2FWB and CACHE DIC features, KVM need not do cache flushing
++ * and CMOs are NOP'd. This has the effect of no longer requiring a
++ * KVA for addresses mapped into the S2. The presence of these features
++ * are thus necessary to support cacheable S2 mapping of VM_PFNMAP.
++ */
++static inline bool kvm_supports_cacheable_pfnmap(void)
++{
++	return cpus_have_final_cap(ARM64_HAS_STAGE2_FWB) &&
++	       cpus_have_final_cap(ARM64_HAS_CACHE_DIC);
++}
++
+ #ifdef CONFIG_PTDUMP_STAGE2_DEBUGFS
+ void kvm_s2_ptdump_create_debugfs(struct kvm *kvm);
+ #else
+--- a/arch/arm64/kvm/mmu.c
++++ b/arch/arm64/kvm/mmu.c
+@@ -1627,18 +1627,39 @@ static int user_mem_abort(struct kvm_vcp
+ 	if (is_error_noslot_pfn(pfn))
+ 		return -EFAULT;
+ 
++	/*
++	 * Check if this is non-struct page memory PFN, and cannot support
++	 * CMOs. It could potentially be unsafe to access as cachable.
++	 */
+ 	if (vm_flags & (VM_PFNMAP | VM_MIXEDMAP) && !pfn_is_map_memory(pfn)) {
+-		/*
+-		 * If the page was identified as device early by looking at
+-		 * the VMA flags, vma_pagesize is already representing the
+-		 * largest quantity we can map.  If instead it was mapped
+-		 * via __kvm_faultin_pfn(), vma_pagesize is set to PAGE_SIZE
+-		 * and must not be upgraded.
+-		 *
+-		 * In both cases, we don't let transparent_hugepage_adjust()
+-		 * change things at the last minute.
+-		 */
+-		s2_force_noncacheable = true;
++		if (is_vma_cacheable) {
++			/*
++			 * Whilst the VMA owner expects cacheable mapping to this
++			 * PFN, hardware also has to support the FWB and CACHE DIC
++			 * features.
++			 *
++			 * ARM64 KVM relies on kernel VA mapping to the PFN to
++			 * perform cache maintenance as the CMO instructions work on
++			 * virtual addresses. VM_PFNMAP region are not necessarily
++			 * mapped to a KVA and hence the presence of hardware features
++			 * S2FWB and CACHE DIC are mandatory to avoid the need for
++			 * cache maintenance.
++			 */
++			if (!kvm_supports_cacheable_pfnmap())
++				return -EFAULT;
++		} else {
++			/*
++			 * If the page was identified as device early by looking at
++			 * the VMA flags, vma_pagesize is already representing the
++			 * largest quantity we can map.  If instead it was mapped
++			 * via __kvm_faultin_pfn(), vma_pagesize is set to PAGE_SIZE
++			 * and must not be upgraded.
++			 *
++			 * In both cases, we don't let transparent_hugepage_adjust()
++			 * change things at the last minute.
++			 */
++			s2_force_noncacheable = true;
++		}
+ 	} else if (logging_active && !write_fault) {
+ 		/*
+ 		 * Only actually map the page as writable if this was a write
+@@ -1647,15 +1668,6 @@ static int user_mem_abort(struct kvm_vcp
+ 		writable = false;
+ 	}
+ 
+-	/*
+-	 * Prevent non-cacheable mappings in the stage-2 if a region of memory
+-	 * is cacheable in the primary MMU and the kernel lacks a cacheable
+-	 * alias. KVM cannot guarantee coherency between the guest/host aliases
+-	 * without the ability to perform CMOs.
+-	 */
+-	if (is_vma_cacheable && s2_force_noncacheable)
+-		return -EINVAL;
+-
+ 	if (exec_fault && s2_force_noncacheable)
+ 		return -ENOEXEC;
+ 
+@@ -2209,8 +2221,11 @@ int kvm_arch_prepare_memory_region(struc
+ 				break;
+ 			}
+ 
+-			/* Cacheable PFNMAP is not allowed */
+-			if (kvm_vma_is_cacheable(vma)) {
++			/*
++			 * Cacheable PFNMAP is allowed only if the hardware
++			 * supports it.
++			 */
++			if (kvm_vma_is_cacheable(vma) && !kvm_supports_cacheable_pfnmap()) {
+ 				ret = -EINVAL;
+ 				break;
+ 			}
