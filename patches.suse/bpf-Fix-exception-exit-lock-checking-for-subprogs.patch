@@ -1,0 +1,94 @@
+From: Ihor Solodrai <ihor.solodrai@linux.dev>
+Date: Thu, 19 Mar 2026 17:08:08 -0700
+Subject: bpf: Fix exception exit lock checking for subprogs
+Patch-mainline: v7.0-rc5
+Git-commit: 6c2128505f61b504c79a20b89596feba61388112
+References: CVE-2026-31526 bsc#1262662
+
+process_bpf_exit_full() passes check_lock = !curframe to
+check_resource_leak(), which is false in cases when bpf_throw() is
+called from a static subprog. This makes check_resource_leak() to skip
+validation of active_rcu_locks, active_preempt_locks, and
+active_irq_id on exception exits from subprogs.
+
+At runtime bpf_throw() unwinds the stack via ORC without releasing any
+user-acquired locks, which may cause various issues as the result.
+
+Fix by setting check_lock = true for exception exits regardless of
+curframe, since exceptions bypass all intermediate frame
+cleanup. Update the error message prefix to "bpf_throw" for exception
+exits to distinguish them from normal BPF_EXIT.
+
+Fix reject_subprog_with_rcu_read_lock test which was previously
+passing for the wrong reason. Test program returned directly from the
+subprog call without closing the RCU section, so the error was
+triggered by the unclosed RCU lock on normal exit, not by
+bpf_throw. Update __msg annotations for affected tests to match the
+new "bpf_throw" error prefix.
+
+The spin_lock case is not affected because they are already checked [1]
+at the call site in do_check_insn() before bpf_throw can run.
+
+[1] https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/kernel/bpf/verifier.c?h=v7.0-rc4#n21098
+
+Assisted-by: Claude:claude-opus-4-6
+Fixes: f18b03fabaa9 ("bpf: Implement BPF exceptions")
+Signed-off-by: Ihor Solodrai <ihor.solodrai@linux.dev>
+Acked-by: Yonghong Song <yonghong.song@linux.dev>
+Acked-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Link: https://lore.kernel.org/r/20260320000809.643798-1-ihor.solodrai@linux.dev
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Hoyeon Lee <hoyeon.lee@suse.com>
+---
+ kernel/bpf/verifier.c                               |    4 +++-
+ tools/testing/selftests/bpf/progs/exceptions_fail.c |    9 ++++++---
+ 2 files changed, 9 insertions(+), 4 deletions(-)
+
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -18804,7 +18804,9 @@
+ 				 * function, for which reference_state must
+ 				 * match caller reference state when it exits.
+ 				 */
+-				err = check_resource_leak(env, exception_exit, !env->cur_state->curframe,
++				err = check_resource_leak(env, exception_exit,
++							  exception_exit || !env->cur_state->curframe,
++							  exception_exit ? "bpf_throw" :
+ 							  "BPF_EXIT instruction");
+ 				if (err)
+ 					return err;
+--- a/tools/testing/selftests/bpf/progs/exceptions_fail.c
++++ b/tools/testing/selftests/bpf/progs/exceptions_fail.c
+@@ -8,6 +8,7 @@
+ #include "bpf_experimental.h"
+ 
+ extern void bpf_rcu_read_lock(void) __ksym;
++extern void bpf_rcu_read_unlock(void) __ksym;
+ 
+ #define private(name) SEC(".bss." #name) __hidden __attribute__((aligned(8)))
+ 
+@@ -131,7 +132,7 @@
+ }
+ 
+ SEC("?tc")
+-__failure __msg("BPF_EXIT instruction cannot be used inside bpf_rcu_read_lock-ed region")
++__failure __msg("bpf_throw cannot be used inside bpf_rcu_read_lock-ed region")
+ int reject_with_rcu_read_lock(void *ctx)
+ {
+ 	bpf_rcu_read_lock();
+@@ -147,11 +148,13 @@
+ }
+ 
+ SEC("?tc")
+-__failure __msg("BPF_EXIT instruction cannot be used inside bpf_rcu_read_lock-ed region")
++__failure __msg("bpf_throw cannot be used inside bpf_rcu_read_lock-ed region")
+ int reject_subprog_with_rcu_read_lock(void *ctx)
+ {
+ 	bpf_rcu_read_lock();
+-	return throwing_subprog(ctx);
++	throwing_subprog(ctx);
++	bpf_rcu_read_unlock();
++	return 0;
+ }
+ 
+ static bool rbless(struct bpf_rb_node *n1, const struct bpf_rb_node *n2)
