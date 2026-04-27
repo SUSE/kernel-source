@@ -1,0 +1,90 @@
+From 752a6c9596dd25efd6978a73ff21f3b592668f4a Mon Sep 17 00:00:00 2001
+From: Shaurya Rane <ssrane_b23@ee.vjti.ac.in>
+Date: Thu, 6 Nov 2025 23:50:16 +0530
+Subject: [PATCH] Bluetooth: L2CAP: Fix use-after-free in l2cap_unregister_user
+Git-commit: 752a6c9596dd25efd6978a73ff21f3b592668f4a
+Patch-mainline: v7.0-rc5
+References: CVE-2026-23461 bsc#1261707
+
+After commit ab4eedb790ca ("Bluetooth: L2CAP: Fix corrupted list in
+hci_chan_del"), l2cap_conn_del() uses conn->lock to protect access to
+conn->users. However, l2cap_register_user() and l2cap_unregister_user()
+don't use conn->lock, creating a race condition where these functions can
+access conn->users and conn->hchan concurrently with l2cap_conn_del().
+
+This can lead to use-after-free and list corruption bugs, as reported
+by syzbot.
+
+Fix this by changing l2cap_register_user() and l2cap_unregister_user()
+to use conn->lock instead of hci_dev_lock(), ensuring consistent locking
+for the l2cap_conn structure.
+
+Reported-by: syzbot+14b6d57fb728e27ce23c@syzkaller.appspotmail.com
+Closes: https://syzkaller.appspot.com/bug?extid=14b6d57fb728e27ce23c
+Fixes: ab4eedb790ca ("Bluetooth: L2CAP: Fix corrupted list in hci_chan_del")
+Signed-off-by: Shaurya Rane <ssrane_b23@ee.vjti.ac.in>
+Signed-off-by: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ net/bluetooth/l2cap_core.c | 20 ++++++++------------
+ 1 file changed, 8 insertions(+), 12 deletions(-)
+
+diff --git a/net/bluetooth/l2cap_core.c b/net/bluetooth/l2cap_core.c
+index 0f400051f093..780136e18aae 100644
+--- a/net/bluetooth/l2cap_core.c
++++ b/net/bluetooth/l2cap_core.c
+@@ -1678,17 +1678,15 @@ static void l2cap_info_timeout(struct work_struct *work)
+ 
+ int l2cap_register_user(struct l2cap_conn *conn, struct l2cap_user *user)
+ {
+-	struct hci_dev *hdev = conn->hcon->hdev;
+ 	int ret;
+ 
+ 	/* We need to check whether l2cap_conn is registered. If it is not, we
+-	 * must not register the l2cap_user. l2cap_conn_del() is unregisters
+-	 * l2cap_conn objects, but doesn't provide its own locking. Instead, it
+-	 * relies on the parent hci_conn object to be locked. This itself relies
+-	 * on the hci_dev object to be locked. So we must lock the hci device
+-	 * here, too. */
++	 * must not register the l2cap_user. l2cap_conn_del() unregisters
++	 * l2cap_conn objects under conn->lock, and we use the same lock here
++	 * to protect access to conn->users and conn->hchan.
++	 */
+ 
+-	hci_dev_lock(hdev);
++	mutex_lock(&conn->lock);
+ 
+ 	if (!list_empty(&user->list)) {
+ 		ret = -EINVAL;
+@@ -1709,16 +1707,14 @@ int l2cap_register_user(struct l2cap_conn *conn, struct l2cap_user *user)
+ 	ret = 0;
+ 
+ out_unlock:
+-	hci_dev_unlock(hdev);
++	mutex_unlock(&conn->lock);
+ 	return ret;
+ }
+ EXPORT_SYMBOL(l2cap_register_user);
+ 
+ void l2cap_unregister_user(struct l2cap_conn *conn, struct l2cap_user *user)
+ {
+-	struct hci_dev *hdev = conn->hcon->hdev;
+-
+-	hci_dev_lock(hdev);
++	mutex_lock(&conn->lock);
+ 
+ 	if (list_empty(&user->list))
+ 		goto out_unlock;
+@@ -1727,7 +1723,7 @@ void l2cap_unregister_user(struct l2cap_conn *conn, struct l2cap_user *user)
+ 	user->remove(conn, user);
+ 
+ out_unlock:
+-	hci_dev_unlock(hdev);
++	mutex_unlock(&conn->lock);
+ }
+ EXPORT_SYMBOL(l2cap_unregister_user);
+ 
+-- 
+2.53.0
+
