@@ -228,19 +228,34 @@ class TestMisc(unittest.TestCase):
   },
   "packages": {
     "package1": {
-      "users": [ "package1-user1-maintainer","package1-user2-maintainer" ]
+      "users": [
+        "package1-user1-maintainer",
+        "package1-user2-maintainer"
+      ]
     },
     "package2": {
-      "groups": [ "package2-group-maintainer" ]
+      "groups": [
+        "package2-group-maintainer"
+      ]
     },
     "package3": {
-      "groups": [ "package3-group1-maintainer","package3-group2-maintainer" ],
-      "users": [ "package3-user-maintainer" ]
+      "groups": [
+        "package3-group1-maintainer",
+        "package3-group2-maintainer"
+      ],
+      "users": [
+        "package3-user-maintainer"
+      ]
     }
   },
   "project": {
-    "groups": [ "project-maintainer-group" ],
-    "users": [ "project_owner1","project_owner2" ]
+    "groups": [
+      "project-maintainer-group"
+    ],
+    "users": [
+      "project_owner1",
+      "project_owner2"
+    ]
   }
 }
 '''
