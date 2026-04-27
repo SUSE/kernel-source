@@ -9,7 +9,12 @@ import yaml
 import sys
 import os
 
+def maintainership_is_new_format(data):
+    return isinstance(data, dict) and 'header' in data and isinstance(data['header'], dict)
+
 def json_custom_dump(data):
+    if maintainership_is_new_format(data):
+        return json.dumps(data, sort_keys=True, indent=2) + '\n'
     return _json_custom_dump(data) + '\n'
 
 def _json_custom_dump(data, indent=0):
@@ -23,7 +28,7 @@ def _json_custom_dump(data, indent=0):
         return json.dumps(data)
 
 def update_maintainership(data, package, maintainers):
-    if isinstance(data, dict) and 'header' in data and isinstance(data['header'], dict):
+    if maintainership_is_new_format(data):
         data.setdefault('packages', {}).setdefault(package, {})['users'] = maintainers
     else:
         data[package] = maintainers
