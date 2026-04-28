@@ -1,0 +1,88 @@
+From ac57eb3b7d2ad649025b5a0fa207315f755ac4f6 Mon Sep 17 00:00:00 2001
+From: Imre Deak <imre.deak@intel.com>
+Date: Mon, 9 Mar 2026 18:48:03 +0200
+Subject: drm/i915/dmc: Fix an unlikely NULL pointer deference at probe
+Git-commit: ac57eb3b7d2ad649025b5a0fa207315f755ac4f6
+Patch-mainline: v7.0-rc5
+References: CVE-2026-23467 bsc#1261586
+
+intel_dmc_update_dc6_allowed_count() oopses when DMC hasn't been
+initialized, and dmc is thus NULL.
+
+That would be the case when the call path is
+intel_power_domains_init_hw() -> {skl,bxt,icl}_display_core_init() ->
+gen9_set_dc_state() -> intel_dmc_update_dc6_allowed_count(), as
+intel_power_domains_init_hw() is called *before* intel_dmc_init().
+
+However, gen9_set_dc_state() calls intel_dmc_update_dc6_allowed_count()
+conditionally, depending on the current and target DC states. At probe,
+the target is disabled, but if DC6 is enabled, the function is called,
+and an oops follows. Apparently it's quite unlikely that DC6 is enabled
+at probe, as we haven't seen this failure mode before.
+
+It is also strange to have DC6 enabled at boot, since that would require
+the DMC firmware (loaded by BIOS); the BIOS loading the DMC firmware and
+the driver stopping / reprogramming the firmware is a poorly specified
+sequence and as such unlikely an intentional BIOS behaviour. It's more
+likely that BIOS is leaving an unintentionally enabled DC6 HW state
+behind (without actually loading the required DMC firmware for this).
+
+The tracking of the DC6 allowed counter only works if starting /
+stopping the counter depends on the _SW_ DC6 state vs. the current _HW_
+DC6 state (since stopping the counter requires the DC5 counter captured
+when the counter was started). Thus, using the HW DC6 state is incorrect
+and it also leads to the above oops. Fix both issues by using the SW DC6
+state for the tracking.
+
+This is v2 of the fix originally sent by Jani, updated based on the
+first Link: discussion below.
+
+Link: https://lore.kernel.org/all/3626411dc9e556452c432d0919821b76d9991217@intel.com
+Link: https://lore.kernel.org/all/20260228130946.50919-2-ltao@redhat.com
+Fixes: 88c1f9a4d36d ("drm/i915/dmc: Create debugfs entry for dc6 counter")
+Cc: Mohammed Thasleem <mohammed.thasleem@intel.com>
+Cc: Jani Nikula <jani.nikula@linux.intel.com>
+Cc: Tao Liu <ltao@redhat.com>
+Cc: <stable@vger.kernel.org> # v6.16+
+Tested-by: Tao Liu <ltao@redhat.com>
+Reviewed-by: Jani Nikula <jani.nikula@intel.com>
+Signed-off-by: Imre Deak <imre.deak@intel.com>
+Link: https://patch.msgid.link/20260309164803.1918158-1-imre.deak@intel.com
+(cherry picked from commit 2344b93af8eb5da5d496b4e0529d35f0f559eaf0)
+Signed-off-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Acked-by: Patrik Jakobsson <pjakobsson@suse.de>
+---
+ drivers/gpu/drm/i915/display/intel_display_power_well.c | 2 +-
+ drivers/gpu/drm/i915/display/intel_dmc.c                | 3 +--
+ 2 files changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display_power_well.c b/drivers/gpu/drm/i915/display/intel_display_power_well.c
+index db185a859133..fba9fa41f827 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_power_well.c
++++ b/drivers/gpu/drm/i915/display/intel_display_power_well.c
+@@ -806,7 +806,7 @@ void gen9_set_dc_state(struct intel_display *display, u32 state)
+ 			power_domains->dc_state, val & mask);
+ 
+ 	enable_dc6 = state & DC_STATE_EN_UPTO_DC6;
+-	dc6_was_enabled = val & DC_STATE_EN_UPTO_DC6;
++	dc6_was_enabled = power_domains->dc_state & DC_STATE_EN_UPTO_DC6;
+ 	if (!dc6_was_enabled && enable_dc6)
+ 		intel_dmc_update_dc6_allowed_count(display, true);
+ 
+diff --git a/drivers/gpu/drm/i915/display/intel_dmc.c b/drivers/gpu/drm/i915/display/intel_dmc.c
+index 1006b060c3f3..0b15cb764b1d 100644
+--- a/drivers/gpu/drm/i915/display/intel_dmc.c
++++ b/drivers/gpu/drm/i915/display/intel_dmc.c
+@@ -1599,8 +1599,7 @@ static bool intel_dmc_get_dc6_allowed_count(struct intel_display *display, u32 *
+ 		return false;
+ 
+ 	mutex_lock(&power_domains->lock);
+-	dc6_enabled = intel_de_read(display, DC_STATE_EN) &
+-		      DC_STATE_EN_UPTO_DC6;
++	dc6_enabled = power_domains->dc_state & DC_STATE_EN_UPTO_DC6;
+ 	if (dc6_enabled)
+ 		intel_dmc_update_dc6_allowed_count(display, false);
+ 
+-- 
+2.54.0
+
