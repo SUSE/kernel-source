@@ -1,0 +1,128 @@
+From d92ef3b07fe4e88cd1197787d0a93d76f6c7b8cc Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Wed, 22 Apr 2026 10:34:12 +0200
+Subject: btrfs: Limit size of bios submitted from writeback
+References: bsc#1261337
+Patch-mainline: Submitted, April 27 2026
+
+Currently btrfs_writepages() just accumulates as large bio as possible
+(within writeback_control constraints) and then submits it. This can
+however lead to significant latency in writeback IO submission (I have
+observed tens of miliseconds) because the submitted bio easily has over
+hundred of megabytes. Consequently this leads to IO pipeline stalls and
+reduced throughput.
+
+At the same time beyond certain size submitting so large bio provides
+diminishing returns because the bio is split by the block layer
+immediately anyway. So compute (estimate of) bio size beyond which we
+are unlikely to improve performance and just submit the bio for
+writeback once we accumulate that much to keep the IO pipeline busy.
+This improves writeback throughput for sequential writes by about 15% on
+the test machine I was using.
+
+Signed-off-by: Jan Kara <jack@suse.cz>
+---
+ fs/btrfs/disk-io.c   |    7 +++++++
+ fs/btrfs/extent_io.c |   10 ++++++++++
+ fs/btrfs/fs.h        |    1 +
+ fs/btrfs/volumes.c   |   29 +++++++++++++++++++++++++++++
+ fs/btrfs/volumes.h   |    1 +
+ 5 files changed, 48 insertions(+)
+
+Changes since v1:
+- moved limit checks to submit_extent_folio
+- simplified computation of maximum bio size
+
+--- a/fs/btrfs/disk-io.c
++++ b/fs/btrfs/disk-io.c
+@@ -3474,6 +3474,13 @@ int __cold open_ctree(struct super_block
+ 		goto fail_sysfs;
+ 	}
+ 
++	ret = btrfs_init_writeback_bio_size(fs_info);
++	if (ret) {
++		btrfs_err(fs_info, "failed to get optimum writeback size: %d",
++			  ret);
++		goto fail_sysfs;
++	}
++
+ 	btrfs_free_zone_cache(fs_info);
+ 
+ 	btrfs_check_active_zone_reservation(fs_info);
+--- a/fs/btrfs/extent_io.c
++++ b/fs/btrfs/extent_io.c
+@@ -845,6 +845,16 @@ static void submit_extent_folio(struct b
+ 		/* Ordered extent boundary: move on to a new bio. */
+ 		if (bio_ctrl->len_to_oe_boundary == 0)
+ 			submit_one_bio(bio_ctrl);
++		/*
++		 * If we have accumulated decent amount of IO, send it to the
++		 * block layer so that IO can run while we are accumulating
++		 * more folios to write.
++		 */
++		else if (bio_ctrl->wbc &&
++			 bio_ctrl->bbio->bio.bi_iter.bi_size >=
++			    inode->root->fs_info->writeback_bio_size)
++			submit_one_bio(bio_ctrl);
++
+ 	} while (size);
+ }
+ 
+--- a/fs/btrfs/fs.h
++++ b/fs/btrfs/fs.h
+@@ -798,6 +798,7 @@ struct btrfs_fs_info {
+ 	u32 csum_size;
+ 	u32 csums_per_leaf;
+ 	u32 stripesize;
++	u32 writeback_bio_size;
+ 
+ 	/*
+ 	 * Maximum size of an extent. BTRFS_MAX_EXTENT_SIZE on regular
+--- a/fs/btrfs/volumes.c
++++ b/fs/btrfs/volumes.c
+@@ -7615,6 +7615,35 @@ out:
+ 	return ret;
+ }
+ 
++int btrfs_init_writeback_bio_size(struct btrfs_fs_info *fs_info)
++{
++	struct btrfs_fs_devices *fs_devices = fs_info->fs_devices;
++	struct btrfs_device *device;
++	u32 writeback_bio_size = fs_info->sectorsize;
++
++	mutex_lock(&fs_devices->device_list_mutex);
++	/*
++	 * Let's take maximum over optimal request sizes for all devices. For
++	 * RAID profiles writeback will submit stripe (64k) sized bios anyway
++	 * so our value doesn't matter and for simple profiles this is a good
++	 * approximation of sensible IO chunking.
++	 */
++	list_for_each_entry(device, &fs_devices->devices, dev_list) {
++		struct request_queue *queue;
++		unsigned int io_opt;
++
++		queue = bdev_get_queue(device->bdev);
++		io_opt = queue_io_opt(queue) ? :
++				queue_max_sectors(queue) << SECTOR_SHIFT;
++		writeback_bio_size = max(writeback_bio_size, io_opt);
++	}
++	mutex_unlock(&fs_devices->device_list_mutex);
++
++	fs_info->writeback_bio_size = writeback_bio_size;
++
++	return 0;
++}
++
+ static int update_dev_stat_item(struct btrfs_trans_handle *trans,
+ 				struct btrfs_device *device)
+ {
+--- a/fs/btrfs/volumes.h
++++ b/fs/btrfs/volumes.h
+@@ -737,6 +737,7 @@ int btrfs_get_dev_stats(struct btrfs_fs_
+ 			struct btrfs_ioctl_get_dev_stats *stats);
+ int btrfs_init_devices_late(struct btrfs_fs_info *fs_info);
+ int btrfs_init_dev_stats(struct btrfs_fs_info *fs_info);
++int btrfs_init_writeback_bio_size(struct btrfs_fs_info *fs_info);
+ int btrfs_run_dev_stats(struct btrfs_trans_handle *trans);
+ void btrfs_rm_dev_replace_remove_srcdev(struct btrfs_device *srcdev);
+ void btrfs_rm_dev_replace_free_srcdev(struct btrfs_device *srcdev);
